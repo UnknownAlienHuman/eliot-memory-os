@@ -11,10 +11,10 @@
 //! and actual route; the local-port call with observed input/output digests
 //! and an exact ORS owner-row reference for retrieving retained bytes; observed
 //! side effects; canonical receipts; the finish decision; and an
-//! explicit missing-parts list. I16.12 slots this path cannot produce (the
-//! semantic principal, a policy snapshot without a policy-bound fence, the
-//! Active View/packet manifest, the independent verifier result, and executor
-//! identity when the owner does not name one) are enumerated in `unavailable`
+//! explicit missing-parts list. I16.12 slots absent on this result (for
+//! example, the Active View/packet manifest, the independent verifier result,
+//! or executor identity when
+//! the owner does not name one) are enumerated in `unavailable`
 //! and `missing_parts`:
 //! missing evidence limits replay and is never silently treated as success.
 //!
@@ -48,10 +48,14 @@
 use eliot_contracts::StateFence;
 use eliot_ipc::Session;
 use eliot_ors::HostRequestRecord;
-use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
+use eliot_protocol::{
+    AgentActivationResolutionResult, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
+    HostRequestInvokeReadPayload, HostRequestResultBody, LocalReadAttempt,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::kernel_audit::{AuditEventKind, AuditRecord, authority_epoch_text};
+use crate::kernel_audit::{AuditEventKind, AuditLineage, AuditRecord, authority_epoch_text};
 
 /// Canonical trace-manifest format version.
 pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 2;
@@ -172,16 +176,21 @@ pub struct TraceManifest {
     pub work_scope_id: Option<String>,
     /// Fenced attempt identity of the completing lease.
     pub lease_attempt_id: Option<String>,
-    /// Fencing generation of the completing attempt.
+    /// Fencing generation of the ORS claim attempt.
     pub fencing_generation: Option<u64>,
+    /// Exact fenced local-read attempt retained with the original completion.
+    /// This remains a distinct identity from the ORS claim attempt above.
+    pub local_read_attempt: Option<LocalReadAttempt>,
     /// Authority epoch `lineage_id:sequence` text.
     pub authority_epoch: Option<String>,
     /// Module/process generation text.
     pub module_generation: Option<String>,
     /// Requested route (capability selector).
     pub requested_route: Option<String>,
-    /// Actual route taken (observed actual-route receipt digest).
+    /// Actual route receipt digest, bound to its retained original receipt body.
     pub actual_route: Option<String>,
+    /// Exact original receipt body that carries the observed local-read route.
+    pub actual_route_receipt: Option<Value>,
     /// Invoked local-port operation.
     pub invoked_operation: Option<String>,
     /// Executor-observed immutable input handle (envelope digest).
@@ -194,7 +203,7 @@ pub struct TraceManifest {
     pub executor_identity: Option<String>,
     /// Observed side-effect declaration (`none` or an effect reference).
     pub side_effects: Option<String>,
-    /// Semantic principal (resolved by eliotd, never by Kernel).
+    /// Semantic principal from the original retained activation result.
     pub principal: Option<String>,
     /// Policy revision snapshot, when the fence is policy-bound.
     pub policy_snapshot: Option<String>,
@@ -208,6 +217,10 @@ pub struct TraceManifest {
     pub result_bytes_retained: bool,
     /// Canonical semantic receipt retained with the exact result, if any.
     pub result_receipt: Option<String>,
+    /// Original canonical Kernel audit record binding the persisted result.
+    /// This is distinct from a semantic receipt and remains replayable only
+    /// when the exact record precedes this manifest in the same audit chain.
+    pub result_binding_receipt: Option<AuditRecord>,
     /// Durable ORS state at bind time.
     pub durable_state: Option<String>,
     /// Finish decision for the bound result.
@@ -242,15 +255,66 @@ impl TraceManifest {
         persisted: &HostRequestRecord,
         _envelope: Option<&HostRequestEnvelope>,
         lane: &'static str,
+        result_binding_receipt: Option<&AuditRecord>,
     ) -> Self {
-        let capability = Some(persisted.capability_ref.as_str().to_owned());
-        let payload_digest = Some(persisted.payload_digest.clone());
-        let state_fence = persisted.admitted_state_fence.clone();
-        let session_id = persisted
-            .session_ref
-            .as_ref()
+        // This is a read model of the original ORS owner row. Validate its
+        // retained bindings before projecting any of its claims; if the row
+        // is contradictory, the seal records no owner evidence and cannot
+        // make a proof-bearing completion claim.
+        let owner_row_valid = persisted.validate().is_ok();
+        let capability = owner_row_valid
+            .then(|| persisted.capability_ref.as_str().to_owned());
+        let payload_digest = owner_row_valid.then(|| persisted.payload_digest.clone());
+        let admitted_envelope = owner_row_valid
+            .then(|| original_admitted_envelope(persisted))
+            .flatten();
+        let state_fence = owner_row_valid
+            .then(|| persisted.admitted_state_fence.clone())
+            .flatten()
+            .or_else(|| admitted_envelope.as_ref().map(|envelope| envelope.state_fence.clone()));
+        let session_id = owner_row_valid
+            .then(|| persisted.session_ref.as_ref())
+            .flatten()
             .map(|session| session.as_str().to_owned());
-        let evidence = persisted.result_evidence.as_ref();
+        let evidence = owner_row_valid
+            .then_some(persisted.result_evidence.as_ref())
+            .flatten();
+        let principal = evidence
+            .and_then(|evidence| evidence.activation_resolution_result.clone())
+            .and_then(|value| serde_json::from_value::<AgentActivationResolutionResult>(value).ok())
+            .filter(|result| {
+                result.validate().is_ok()
+                    && admitted_envelope.as_ref().is_some_and(|envelope| {
+                        activation_result_matches_envelope(result, envelope)
+                    })
+            })
+            .and_then(|result| {
+                result
+                    .resolved_binding()
+                    .map(|binding| binding.principal_id.clone())
+            });
+        let local_read_attempt = evidence
+            .and_then(|evidence| evidence.local_read_attempt.clone())
+            .and_then(|value| serde_json::from_value::<LocalReadAttempt>(value).ok())
+            .filter(|attempt| {
+                admitted_envelope.as_ref().is_some_and(|envelope| {
+                    local_read_attempt_matches_row(attempt, envelope, persisted)
+                })
+            });
+        let requested_route = admitted_envelope
+            .as_ref()
+            .map(|envelope| envelope.identity.capability.clone());
+        let input_handle = evidence
+            .and_then(|evidence| evidence.input_handle.as_deref())
+            .filter(|handle| {
+                admitted_envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.compute_digest().ok())
+                    .as_deref()
+                    == Some(*handle)
+                    && *handle == persisted.request_digest
+            })
+            .map(str::to_owned);
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
             fence
                 .policy_revision
@@ -267,59 +331,85 @@ impl TraceManifest {
             format_version: TRACE_MANIFEST_FORMAT_VERSION,
             trace_id: persisted.request_id.as_str().to_owned(),
             operation_id: persisted.operation_id.as_str().to_owned(),
-            retained_request_digest: Some(persisted.request_digest.clone()),
+            retained_request_digest: owner_row_valid.then(|| persisted.request_digest.clone()),
             lane: Some(lane.to_owned()),
             capability: capability.clone(),
-            action_contract_ref: persisted
-                .payload_schema_id
-                .as_ref()
+            action_contract_ref: owner_row_valid
+                .then(|| persisted.payload_schema_id.as_ref())
+                .flatten()
                 .map(|schema| schema.as_str().to_owned()),
-            admitted_payload_retained: persisted.payload_body.is_some(),
+            admitted_payload_retained: owner_row_valid && persisted.payload_body.is_some(),
             payload_digest,
             state_fence,
-            connection_id: Some(persisted.connection_ref.as_str().to_owned()),
+            connection_id: owner_row_valid
+                .then(|| persisted.connection_ref.as_str().to_owned()),
             session_id,
-            task_id: persisted
-                .task_ref
-                .as_ref()
+            task_id: owner_row_valid
+                .then(|| persisted.task_ref.as_ref())
+                .flatten()
                 .map(|task| task.as_str().to_owned()),
-            work_scope_id: persisted
-                .scope_ref
-                .as_ref()
+            work_scope_id: owner_row_valid
+                .then(|| persisted.scope_ref.as_ref())
+                .flatten()
                 .map(|scope| scope.as_str().to_owned()),
-            lease_attempt_id: persisted
-                .attempt
-                .as_ref()
+            // This slot names the original ORS claim lease. It remains distinct
+            // from the LocalReadAttempt carried by a result submission.
+            lease_attempt_id: owner_row_valid
+                .then(|| persisted.attempt.as_ref())
+                .flatten()
                 .map(|attempt| attempt.attempt_id.clone()),
-            fencing_generation: persisted
-                .attempt
-                .as_ref()
-                .map(|attempt| attempt.fencing_generation),
+            fencing_generation: owner_row_valid
+                .then(|| persisted.attempt.as_ref())
+                .flatten()
+                .map(|attempt| attempt.generation),
+            local_read_attempt,
             authority_epoch,
             module_generation,
-            requested_route: capability,
-            actual_route: evidence.and_then(|evidence| evidence.actual_route.clone()),
+            // Requested route and input handle require the original retained
+            // admitted envelope bytes. The ORS capability label and a bare
+            // input digest do not stand in for that owner source.
+            requested_route,
+            actual_route: None,
+            actual_route_receipt: None,
             invoked_operation: evidence.and_then(|evidence| evidence.invoked_operation.clone()),
-            input_handle: evidence.and_then(|evidence| evidence.input_handle.clone()),
+            input_handle,
             output_handle: evidence.and_then(|evidence| evidence.output_handle.clone()),
             adapter_identity: evidence.and_then(|evidence| evidence.adapter_identity.clone()),
             executor_identity: evidence.and_then(|evidence| evidence.executor_identity.clone()),
             side_effects: evidence.and_then(|evidence| evidence.side_effects.clone()),
-            principal: None,
+            principal,
             policy_snapshot,
             active_view_packet_manifest: None,
             verifier_result: None,
-            result_digest: persisted.result_digest.clone(),
-            result_bytes_retained: persisted.result_response.is_some(),
-            result_receipt: persisted
-                .result_lineage
-                .as_ref()
+            result_digest: owner_row_valid
+                .then(|| persisted.result_digest.clone())
+                .flatten(),
+            result_bytes_retained: owner_row_valid && persisted.result_response.is_some(),
+            result_receipt: owner_row_valid
+                .then(|| persisted.result_lineage.as_ref())
+                .flatten()
                 .and_then(|lineage| lineage.semantic_receipt_ref.clone()),
-            durable_state: Some(format!("{:?}", persisted.state)),
+            result_binding_receipt: None,
+            durable_state: owner_row_valid.then(|| format!("{:?}", persisted.state)),
             finish: TraceFinish::VerifiedComplete,
             missing_parts: Vec::new(),
             unavailable: Vec::new(),
         };
+        if let Some(evidence) = evidence {
+            if let (Some(digest), Some(receipt)) = (
+                evidence.actual_route.as_deref(),
+                evidence.actual_route_receipt.as_ref(),
+            ) && manifest.route_receipt_matches(digest, receipt)
+            {
+                manifest.actual_route = Some(digest.to_owned());
+                manifest.actual_route_receipt = Some(receipt.clone());
+            }
+        }
+        if let Some(receipt) = result_binding_receipt
+            && manifest.result_binding_receipt_matches(receipt)
+        {
+            manifest.result_binding_receipt = Some(receipt.clone());
+        }
         let missing = manifest.missing_parts();
         manifest.finish = if missing.is_empty() {
             TraceFinish::VerifiedComplete
@@ -333,7 +423,7 @@ impl TraceManifest {
 
     /// Reads back the latest sealed manifest for one operation.
     ///
-    /// Scans retained chain records for the newest
+    /// Scans verified retained chain records for the newest
     /// `trace.manifest_sealed` entry bound to `operation_id` and decodes its
     /// sealed body. Returns `None` when no seal exists, when the sealed body
     /// does not decode, when it carries a foreign
@@ -341,44 +431,205 @@ impl TraceManifest {
     /// claim is not supported by the slots that very body records: replay is
     /// then limited, never invented.
     ///
-    /// The check reads only the recorded body. It never re-derives the
-    /// classification from live request state, so a readback either
-    /// reproduces the sealed record or reports no manifest.
+    /// A result-binding receipt must be the exact original record in the same
+    /// chain prefix before the seal; it is never rebuilt from row digests.
+    /// The check otherwise reads only the recorded body and never re-derives
+    /// classification from live request state.
     #[must_use]
     pub fn find_sealed(records: &[AuditRecord], operation_id: &str) -> Option<Self> {
         records
             .iter()
+            .enumerate()
             .rev()
-            .find(|record| {
+            .find(|(_, record)| {
                 record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
                     && record.lineage.operation_id.as_deref() == Some(operation_id)
             })
-            .and_then(|record| serde_json::from_value(record.event_body.clone()).ok())
-            .filter(|manifest| manifest.records_supported_completion(operation_id))
+            .and_then(|(seal_index, record)| {
+                let manifest: Self = serde_json::from_value(record.event_body.clone()).ok()?;
+                (manifest.records_supported_completion(operation_id)
+                    && manifest.matches_sealed_lineage(&record.lineage)
+                    && manifest.has_original_binding_receipt_before(&records[..seal_index], record))
+                .then_some(manifest)
+            })
     }
 
     /// Returns true when the recorded completion claim is carried by the
     /// recorded required slots.
     ///
-    /// The guarantee is one-directional on purpose: a recorded
-    /// [`TraceFinish::VerifiedComplete`] whose own slots leave a required
-    /// absence is a self-contradicting body and is refused, so replay never
-    /// serves an unqualified success. A recorded degraded or partial
-    /// classification over complete slots is conservative, never an
-    /// over-claim, so it is served as recorded.
+    /// The finish must exactly reflect the required slots this format can
+    /// produce: `VERIFIED_COMPLETE` when none are missing and
+    /// `DEGRADED_NO_PROOF` when any are missing. Other finish states belong to
+    /// lifecycle owners and are not produced by this result-binding path.
     fn records_supported_completion(&self, operation_id: &str) -> bool {
         if self.format_version != TRACE_MANIFEST_FORMAT_VERSION
             || operation_id.trim().is_empty()
             || self.operation_id.trim().is_empty()
             || self.operation_id != operation_id
+            || !nonblank(&self.trace_id)
+            || !self.projection_is_consistent()
         {
             return false;
         }
 
         let missing = self.missing_parts();
+        let expected_finish = if missing.is_empty() {
+            TraceFinish::VerifiedComplete
+        } else {
+            TraceFinish::DegradedNoProof
+        };
         self.missing_parts == missing
             && self.unavailable == self.unavailable_parts()
-            && (!self.finish.is_complete() || missing.is_empty())
+            && self.finish == expected_finish
+    }
+
+    /// Checks that the audit envelope repeats the identity and authority
+    /// values bound by the sealed manifest body.
+    fn matches_sealed_lineage(&self, lineage: &AuditLineage) -> bool {
+        lineage.trace_id.as_deref() == Some(self.trace_id.as_str())
+            && lineage.operation_id.as_deref() == Some(self.operation_id.as_str())
+            && lineage.work_item.as_deref() == Some(self.operation_id.as_str())
+            && lineage.task_id.as_deref() == self.task_id.as_deref()
+            && lineage.session_id.as_deref() == self.session_id.as_deref()
+            && lineage.work_scope.as_deref() == self.work_scope_id.as_deref()
+            && lineage.attempt_id.as_deref()
+                == self
+                    .lease_attempt_id
+                    .as_deref()
+                    .or_else(|| {
+                        self.local_read_attempt
+                            .as_ref()
+                            .map(|attempt| attempt.attempt_id.as_str())
+                    })
+            && lineage.environment_lease.as_deref()
+                == self
+                    .lease_attempt_id
+                    .as_deref()
+                    .or_else(|| {
+                        self.local_read_attempt
+                            .as_ref()
+                            .map(|attempt| attempt.attempt_id.as_str())
+                    })
+            && lineage.state_fence == self.state_fence
+            && lineage.adapter_instance.as_deref() == self.adapter_identity.as_deref()
+            && lineage.process_identity.as_deref() == self.executor_identity.as_deref()
+            && lineage.principal.as_deref() == self.principal.as_deref()
+            && lineage.route_receipt_requested.as_deref() == self.requested_route.as_deref()
+            && lineage.route_receipt_actual.as_deref() == self.actual_route.as_deref()
+            && lineage.module_generation.as_deref() == self.module_generation.as_deref()
+            && lineage.authority_epoch.as_deref() == self.authority_epoch.as_deref()
+            && lineage.controller.as_deref() == Some("kernel")
+    }
+
+    /// Rejects malformed claims before a missing-evidence classification is
+    /// accepted. A well-formed absence remains replayable as degraded, while
+    /// contradictory duplicates cannot be reclassified as mere absence.
+    fn projection_is_consistent(&self) -> bool {
+        [
+            self.lane.as_deref(),
+            self.capability.as_deref(),
+            self.action_contract_ref.as_deref(),
+            self.retained_request_digest.as_deref(),
+            self.payload_digest.as_deref(),
+            self.connection_id.as_deref(),
+            self.session_id.as_deref(),
+            self.task_id.as_deref(),
+            self.work_scope_id.as_deref(),
+            self.lease_attempt_id.as_deref(),
+            self.authority_epoch.as_deref(),
+            self.module_generation.as_deref(),
+            self.requested_route.as_deref(),
+            self.actual_route.as_deref(),
+            self.invoked_operation.as_deref(),
+            self.input_handle.as_deref(),
+            self.output_handle.as_deref(),
+            self.adapter_identity.as_deref(),
+            self.executor_identity.as_deref(),
+            self.side_effects.as_deref(),
+            self.principal.as_deref(),
+            self.policy_snapshot.as_deref(),
+            self.active_view_packet_manifest.as_deref(),
+            self.result_digest.as_deref(),
+            self.result_receipt.as_deref(),
+            self.durable_state.as_deref(),
+            self.verifier_result.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(nonblank)
+            && self
+                .retained_request_digest
+                .as_deref()
+                .is_none_or(|digest| {
+                    is_lowercase_sha256(digest)
+                        && self.operation_id == format!("hostreq:{digest}")
+                })
+            && self
+                .payload_digest
+                .as_deref()
+                .is_none_or(is_lowercase_sha256)
+            && self.result_digest.as_deref().is_none_or(is_lowercase_sha256)
+            && self
+                .result_binding_receipt
+                .as_ref()
+                .is_none_or(|receipt| self.result_binding_receipt_matches(receipt))
+            && self.local_read_attempt.as_ref().is_none_or(|attempt| {
+                local_read_attempt_matches_manifest(attempt, self)
+            })
+            && self.input_handle.as_deref().is_none_or(|handle| {
+                is_lowercase_sha256(handle)
+                    && self.retained_request_digest.as_deref() == Some(handle)
+            })
+            && self.output_handle.as_deref().is_none_or(|handle| {
+                is_lowercase_sha256(handle) && self.result_digest.as_deref() == Some(handle)
+            })
+            && match (
+                self.lease_attempt_id.as_deref(),
+                self.fencing_generation,
+            ) {
+                (None, None) => true,
+                (Some(attempt), Some(generation)) => nonblank(attempt) && generation > 0,
+                _ => false,
+            }
+            && match (
+                self.capability.as_deref(),
+                self.requested_route.as_deref(),
+            ) {
+                (Some(capability), Some(route)) => capability == route,
+                _ => true,
+            }
+            && match (
+                self.actual_route.as_deref(),
+                self.actual_route_receipt.as_ref(),
+            ) {
+                (Some(digest), Some(receipt)) => {
+                    self.route_receipt_matches(digest, receipt)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && self.fence_snapshot_is_consistent()
+    }
+
+    /// Checks that a retained State Fence and its denormalized identity fields
+    /// describe the same original snapshot.
+    fn fence_snapshot_is_consistent(&self) -> bool {
+        let Some(fence) = self.state_fence.as_ref() else {
+            return self.authority_epoch.is_none()
+                && self.module_generation.is_none()
+                && self.policy_snapshot.is_none();
+        };
+        if fence.validate().is_err() {
+            return false;
+        }
+        let authority_epoch = authority_epoch_text(&fence.authority_epoch);
+        let module_generation = fence.resource_generation.value().to_string();
+        let policy_snapshot = fence
+            .policy_revision
+            .map(|revision| revision.value().to_string());
+        self.authority_epoch.as_deref() == Some(authority_epoch.as_str())
+            && self.module_generation.as_deref() == Some(module_generation.as_str())
+            && self.policy_snapshot.as_deref() == policy_snapshot.as_deref()
     }
 
     /// Returns the required slots with no value, in stable order.
@@ -400,19 +651,25 @@ impl TraceManifest {
     fn required_slot_present(&self, slot: &str) -> bool {
         match slot {
             "retained_owner_row" => {
-                nonblank(&self.operation_id)
+                nonblank(&self.trace_id)
                     && self
                         .retained_request_digest
                         .as_deref()
-                        .is_some_and(nonblank)
+                        .is_some_and(|digest| {
+                            is_lowercase_sha256(digest)
+                                && self.operation_id == format!("hostreq:{digest}")
+                        })
             }
             "action_contract" => {
                 self.capability.as_deref().is_some_and(nonblank)
                     && self.action_contract_ref.as_deref().is_some_and(nonblank)
-                    && self.payload_digest.as_deref().is_some_and(nonblank)
+                    && self
+                        .payload_digest
+                        .as_deref()
+                        .is_some_and(is_lowercase_sha256)
                     && self.admitted_payload_retained
             }
-            "state_fence" => self.state_fence.is_some(),
+            "state_fence" => self.state_fence.is_some() && self.fence_snapshot_is_consistent(),
             "active_view_packet_manifest" => self
                 .active_view_packet_manifest
                 .as_deref()
@@ -426,52 +683,388 @@ impl TraceManifest {
                     && self.session_id.as_deref().is_some_and(nonblank)
             }
             "lease" => {
-                self.lease_attempt_id.as_deref().is_some_and(nonblank)
-                    && self.fencing_generation.is_some()
+                (self.lease_attempt_id.as_deref().is_some_and(nonblank)
+                    && self.fencing_generation.is_some_and(|generation| generation > 0))
+                    || self
+                        .local_read_attempt
+                        .as_ref()
+                        .is_some_and(|attempt| local_read_attempt_matches_manifest(attempt, self))
             }
-            "policy_snapshot" => self.policy_snapshot.as_deref().is_some_and(nonblank),
-            "requested_route" => self.requested_route.as_deref().is_some_and(nonblank),
-            "actual_route" => self.actual_route.as_deref().is_some_and(nonblank),
+            "policy_snapshot" => {
+                self.policy_snapshot.as_deref().is_some_and(nonblank)
+                    && self.fence_snapshot_is_consistent()
+            }
+            "requested_route" => self
+                .requested_route
+                .as_deref()
+                .is_some_and(|route| nonblank(route) && self.capability.as_deref() == Some(route)),
+            "actual_route" => self
+                .actual_route
+                .as_deref()
+                .zip(self.actual_route_receipt.as_ref())
+                .is_some_and(|(digest, receipt)| self.route_receipt_matches(digest, receipt)),
             "invoked_operation" => self.invoked_operation.as_deref().is_some_and(nonblank),
-            "input_handle" => self.input_handle.as_deref().is_some_and(nonblank),
-            "output_handle" => self.output_handle.as_deref().is_some_and(nonblank),
+            "input_handle" => self.input_handle.as_deref().is_some_and(|handle| {
+                is_lowercase_sha256(handle)
+                    && self.retained_request_digest.as_deref() == Some(handle)
+            }),
+            "output_handle" => self.output_handle.as_deref().is_some_and(|handle| {
+                is_lowercase_sha256(handle) && self.result_digest.as_deref() == Some(handle)
+            }),
             "side_effects" => self.side_effects.as_deref().is_some_and(nonblank),
             "adapter_identity" => self.adapter_identity.as_deref().is_some_and(nonblank),
             "executor_identity" => self.executor_identity.as_deref().is_some_and(nonblank),
             "result_receipt" => {
-                self.result_digest.as_deref().is_some_and(nonblank)
+                self.result_digest
+                    .as_deref()
+                    .is_some_and(is_lowercase_sha256)
                     && self.result_bytes_retained
-                    && self.result_receipt.as_deref().is_some_and(nonblank)
-                    && self.durable_state.as_deref().is_some_and(nonblank)
+                    && (self.result_receipt.as_deref().is_some_and(nonblank)
+                        || self
+                            .result_binding_receipt
+                            .as_ref()
+                            .is_some_and(|receipt| self.result_binding_receipt_matches(receipt)))
+                    && self.durable_state.as_deref().is_some_and(|state| {
+                        matches!(state, "ResultReceived" | "Terminal")
+                    })
             }
             "verifier_result" => self.verifier_result.as_deref().is_some_and(nonblank),
             _ => false,
         }
     }
 
-    /// Returns the I16.12 evidence slots this path cannot produce.
-    fn unavailable_parts(&self) -> Vec<String> {
-        let mut unavailable = Vec::new();
-        for (slot, name) in [
-            (self.principal.is_some(), "principal"),
-            (self.policy_snapshot.is_some(), "policy_snapshot"),
-            (
-                self.active_view_packet_manifest.is_some(),
-                "active_view_packet_manifest",
-            ),
-            (self.verifier_result.is_some(), "verifier_result"),
-            (self.executor_identity.is_some(), "executor_identity"),
-        ] {
-            if !slot {
-                unavailable.push(name.to_owned());
-            }
-        }
-        unavailable
+    /// Validates the canonical result-binding record against the retained
+    /// owner identity, result digests, and original fence.
+    fn result_binding_receipt_matches(&self, receipt: &AuditRecord) -> bool {
+        let Some(body) = receipt.event_body.as_object() else {
+            return false;
+        };
+        let attempt_id = self
+            .local_read_attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_id.as_str());
+        receipt.kind == AuditEventKind::RESULT_KERNEL_BOUND
+            && receipt.assurance
+                == crate::kernel_audit::AuditAssuranceClass::Critical
+            && receipt.capture_mode == crate::kernel_audit::AuditCaptureMode::Full
+            && body.len() == 4
+            && body.get("lane").and_then(Value::as_str) == self.lane.as_deref()
+            && body.get("request_digest").and_then(Value::as_str)
+                == self.retained_request_digest.as_deref()
+            && body.get("result_digest").and_then(Value::as_str)
+                == self.result_digest.as_deref()
+            && body.get("durable_state").and_then(Value::as_str)
+                == self.durable_state.as_deref()
+            && receipt.lineage.trace_id.as_deref() == Some(self.trace_id.as_str())
+            && receipt.lineage.operation_id.as_deref() == Some(self.operation_id.as_str())
+            && receipt.lineage.work_item.as_deref() == Some(self.operation_id.as_str())
+            && receipt.lineage.task_id.as_deref() == self.task_id.as_deref()
+            && receipt.lineage.session_id.as_deref() == self.session_id.as_deref()
+            && receipt.lineage.work_scope.as_deref() == self.work_scope_id.as_deref()
+            && receipt.lineage.state_fence == self.state_fence
+            && receipt.lineage.adapter_instance.as_deref() == self.connection_id.as_deref()
+            && receipt.lineage.route_receipt_requested.as_deref()
+                == self.requested_route.as_deref()
+            && receipt.lineage.attempt_id.as_deref() == attempt_id
+            && receipt.lineage.environment_lease.as_deref() == attempt_id
+            && receipt.lineage.module_generation.as_deref() == self.module_generation.as_deref()
+            && receipt.lineage.authority_epoch.as_deref() == self.authority_epoch.as_deref()
+            && receipt.lineage.controller.as_deref() == Some("eliotd")
     }
+
+    /// Requires the exact original binding receipt in the already-verified
+    /// chain prefix before this manifest seal.
+    fn has_original_binding_receipt_before(
+        &self,
+        preceding_records: &[AuditRecord],
+        seal_record: &AuditRecord,
+    ) -> bool {
+        self.result_binding_receipt.as_ref().is_none_or(|receipt| {
+            receipt.seq > 0
+                && receipt.seq < seal_record.seq
+                && receipt.chain_id == seal_record.chain_id
+                && preceding_records.iter().any(|record| {
+                    record == receipt
+                        && record.kind == AuditEventKind::RESULT_KERNEL_BOUND
+                        && record.seq < seal_record.seq
+                        && record.chain_id == seal_record.chain_id
+                })
+        })
+    }
+
+    /// Validates the receipt digest and its original owner bindings.
+    fn route_receipt_matches(&self, digest: &str, receipt: &Value) -> bool {
+        if !is_lowercase_sha256(digest) {
+            return false;
+        }
+        let Some(object) = receipt.as_object() else {
+            return false;
+        };
+        let Some(response_fence_value) = object.get("state_fence") else {
+            return false;
+        };
+        let Some(response_fence) =
+            serde_json::from_value::<StateFence>(response_fence_value.clone()).ok()
+        else {
+            return false;
+        };
+        let Some(route_facts) = object.get("route_facts").and_then(Value::as_object) else {
+            return false;
+        };
+        let expected_authority_epoch = serde_json::to_value(&response_fence.authority_epoch).ok();
+        let expected_route_fact_keys = [
+            "operation",
+            "state_fence",
+            "route_identity",
+            "active_generation",
+            "authority_epoch",
+            "endpoint",
+            "connection_id",
+            "approved_artifact_hash",
+            "approved_config_hash",
+        ];
+        if object.len() != 9
+            || route_facts.len() != expected_route_fact_keys.len()
+            || !expected_route_fact_keys.iter().all(|key| route_facts.contains_key(*key))
+            || response_fence.validate().is_err()
+            || self.state_fence.as_ref() != Some(&response_fence)
+            || self
+                .local_read_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.authority_epoch != response_fence.authority_epoch)
+            || route_facts.get("state_fence") != Some(response_fence_value)
+            || route_facts.get("operation") != object.get("named_operation")
+            || object.get("kind").and_then(Value::as_str) != Some("local_read_actual_route")
+            || object.get("operation_id").and_then(Value::as_str)
+                != Some(self.operation_id.as_str())
+            || object.get("request_digest").and_then(Value::as_str)
+                != self.retained_request_digest.as_deref()
+            || object.get("result_digest").and_then(Value::as_str)
+                != self.result_digest.as_deref()
+            || self.invoked_operation.as_deref() != Some("local_read")
+            || object.get("invoked_operation").and_then(Value::as_str) != Some("local_read")
+            || object
+                .get("named_operation")
+                .and_then(Value::as_str)
+                .is_none_or(|operation| !nonblank(operation))
+            || route_facts
+                .get("active_generation")
+                .and_then(Value::as_u64)
+                != Some(response_fence.resource_generation.value())
+            || route_facts.get("authority_epoch") != expected_authority_epoch.as_ref()
+            || route_facts
+                .get("connection_id")
+                .and_then(Value::as_str)
+                != self.connection_id.as_deref()
+            || route_facts
+                .get("route_identity")
+                .and_then(Value::as_str)
+                .is_none_or(|identity| !nonblank(identity))
+            || route_facts
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .is_none_or(|endpoint| !nonblank(endpoint))
+            || route_facts
+                .get("approved_artifact_hash")
+                .and_then(Value::as_str)
+                .is_none_or(|hash| !is_lowercase_sha256(hash))
+            || route_facts
+                .get("approved_config_hash")
+                .and_then(Value::as_str)
+                .is_none_or(|hash| !is_lowercase_sha256(hash))
+            || object.get("receipt_digest").and_then(Value::as_str) != Some(digest)
+        {
+            return false;
+        }
+        let mut unsigned = receipt.clone();
+        let Some(unsigned_object) = unsigned.as_object_mut() else {
+            return false;
+        };
+        unsigned_object.remove("receipt_digest");
+        crate::sha256_json(&unsigned).is_ok_and(|observed| observed == digest)
+    }
+
+    /// Returns every required slot that is unavailable in this run.
+    fn unavailable_parts(&self) -> Vec<String> {
+        self.missing_parts()
+    }
+}
+
+fn original_admitted_envelope(persisted: &HostRequestRecord) -> Option<HostRequestEnvelope> {
+    let bytes = persisted.admitted_input_bytes.as_deref()?;
+    if crate::sha256_hex(bytes) != persisted.request_digest {
+        return None;
+    }
+    let parsed: HostRequestEnvelope = serde_json::from_slice(bytes).ok()?;
+    let envelope = parsed.with_computed_digest().ok()?;
+    envelope.validate().ok()?;
+    HostRequestInvokeReadPayload {
+        wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: persisted.payload_body.clone()?,
+    }
+    .validate()
+    .ok()?;
+    let identity = &envelope.identity;
+    let same_optional = |observed: Option<&str>, expected: Option<&str>| observed == expected;
+    if envelope.compute_digest().ok().as_deref() != Some(persisted.request_digest.as_str())
+        || persisted.operation_id.as_str() != format!("hostreq:{}", persisted.request_digest)
+        || identity.request_id.as_str() != persisted.request_id.as_str()
+        || identity.idempotency_key != persisted.idempotency_key.as_str()
+        || identity.cancellation_id != persisted.cancellation_id.as_str()
+        || !same_optional(
+            identity.parent_operation_id.as_deref(),
+            persisted.parent_operation_id.as_ref().map(|value| value.as_str()),
+        )
+        || identity.deadline_unix_ms != persisted.deadline_unix_ms
+        || envelope.connection_id != persisted.connection_ref.as_str()
+        || !same_optional(
+            identity.session_id.as_deref(),
+            persisted.session_ref.as_ref().map(|value| value.as_str()),
+        )
+        || !same_optional(
+            identity.task_id.as_deref(),
+            persisted.task_ref.as_ref().map(|value| value.as_str()),
+        )
+        || !same_optional(
+            identity.work_scope_id.as_deref(),
+            persisted.scope_ref.as_ref().map(|value| value.as_str()),
+        )
+        || identity.capability != persisted.capability_ref.as_str()
+        || persisted
+            .payload_schema_id
+            .as_ref()
+            .is_none_or(|schema| identity.payload_schema_id != schema.as_str())
+        || identity.payload_sha256 != persisted.payload_digest
+        || crate::sha256_json(&envelope.state_fence)
+            .ok()
+            .as_deref()
+            != Some(persisted.fence_digest.as_str())
+        || persisted
+            .admitted_state_fence
+            .as_ref()
+            .is_some_and(|fence| fence != &envelope.state_fence)
+        || envelope.state_fence.authority_epoch != persisted.authority_epoch
+        || envelope.state_fence.resource_generation.value() != persisted.generation
+    {
+        return None;
+    }
+    Some(envelope)
+}
+
+fn activation_result_matches_envelope(
+    result: &AgentActivationResolutionResult,
+    envelope: &HostRequestEnvelope,
+) -> bool {
+    let Some(binding) = result.resolved_binding() else {
+        return false;
+    };
+    if envelope.kind != eliot_protocol::HostRequestKind::Invocation
+        || envelope
+            .identity
+            .session_id
+            .as_deref()
+            .is_none_or(|session| session != binding.session_id.as_str())
+        || envelope
+            .identity
+            .task_id
+            .as_deref()
+            .is_some_and(|task| task != binding.task_id.as_str())
+        || envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .is_some_and(|scope| scope != binding.work_scope_id.as_str())
+        || !envelope
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&result.ticket_state_fence.authority_epoch)
+        || envelope.state_fence.resource_generation
+            != result.ticket_state_fence.resource_generation
+        || envelope
+            .state_fence
+            .task_revision
+            .is_some_and(|revision| binding.task_revision != revision.value().to_string())
+        || binding.principal_id.trim().is_empty()
+        || binding.principal_id.chars().any(char::is_control)
+    {
+        return false;
+    }
+    true
+}
+
+fn local_read_attempt_matches_row(
+    attempt: &LocalReadAttempt,
+    envelope: &HostRequestEnvelope,
+    persisted: &HostRequestRecord,
+) -> bool {
+    if attempt.validate().is_err() {
+        return false;
+    }
+    let Some(scope_id) = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .or(envelope.identity.session_id.as_deref())
+    else {
+        return false;
+    };
+    let session_id = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .or(envelope.identity.work_scope_id.as_deref())
+        .unwrap_or(envelope.connection_id.as_str());
+    attempt.operation_id == persisted.operation_id.as_str()
+        && attempt.session_id == session_id
+        && attempt.scope_id == scope_id
+        && attempt.facet_method == envelope.identity.capability
+        && attempt.authority_epoch == envelope.state_fence.authority_epoch
+        && attempt.expires_at_unix_ms == envelope.identity.deadline_unix_ms
+        && attempt.expires_at_unix_ms == persisted.deadline_unix_ms
+        && attempt.use_budget == 1
+}
+
+fn local_read_attempt_matches_manifest(
+    attempt: &LocalReadAttempt,
+    manifest: &TraceManifest,
+) -> bool {
+    if attempt.validate().is_err() {
+        return false;
+    }
+    let Some(scope_id) = manifest
+        .work_scope_id
+        .as_deref()
+        .or(manifest.session_id.as_deref())
+    else {
+        return false;
+    };
+    let session_id = manifest
+        .session_id
+        .as_deref()
+        .or(manifest.work_scope_id.as_deref())
+        .or(manifest.connection_id.as_deref());
+    attempt.operation_id == manifest.operation_id
+        && Some(attempt.session_id.as_str()) == session_id
+        && attempt.scope_id == scope_id
+        && Some(attempt.facet_method.as_str()) == manifest.capability.as_deref()
+        && manifest
+            .state_fence
+            .as_ref()
+            .is_some_and(|fence| attempt.authority_epoch == fence.authority_epoch)
+        && attempt.use_budget == 1
 }
 
 fn nonblank(value: &str) -> bool {
     !value.trim().is_empty()
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -495,13 +1088,13 @@ mod tests {
         TraceManifest {
             format_version: TRACE_MANIFEST_FORMAT_VERSION,
             trace_id: "request:trace-test".to_owned(),
-            operation_id: "hostreq:trace-test".to_owned(),
-            retained_request_digest: Some("request-digest".to_owned()),
+            operation_id: format!("hostreq:{}", "a".repeat(64)),
+            retained_request_digest: Some("a".repeat(64)),
             lane: Some("query".to_owned()),
             capability: Some("eliot.query".to_owned()),
             action_contract_ref: Some("eliot.query.v1".to_owned()),
             admitted_payload_retained: true,
-            payload_digest: Some("payload-digest".to_owned()),
+            payload_digest: Some("c".repeat(64)),
             state_fence: Some(state_fence()),
             connection_id: Some("connection:trace-test".to_owned()),
             session_id: Some("session:trace-test".to_owned()),
@@ -509,13 +1102,15 @@ mod tests {
             work_scope_id: None,
             lease_attempt_id: Some("attempt:trace-test".to_owned()),
             fencing_generation: Some(1),
+            local_read_attempt: None,
             authority_epoch: Some("550e8400-e29b-41d4-a716-446655440000:7".to_owned()),
             module_generation: Some("3".to_owned()),
             requested_route: Some("eliot.query".to_owned()),
-            actual_route: Some("route-receipt".to_owned()),
+            actual_route: None,
+            actual_route_receipt: None,
             invoked_operation: Some("local_read".to_owned()),
-            input_handle: Some("request-digest".to_owned()),
-            output_handle: Some("result-digest".to_owned()),
+            input_handle: None,
+            output_handle: Some("b".repeat(64)),
             adapter_identity: Some("adapter:trace-test".to_owned()),
             executor_identity: Some("executor:trace-test".to_owned()),
             side_effects: Some("none".to_owned()),
@@ -523,9 +1118,10 @@ mod tests {
             policy_snapshot: None,
             active_view_packet_manifest: None,
             verifier_result: None,
-            result_digest: Some("result-digest".to_owned()),
+            result_digest: Some("b".repeat(64)),
             result_bytes_retained: true,
             result_receipt: None,
+            result_binding_receipt: None,
             durable_state: Some("ResultReceived".to_owned()),
             finish: TraceFinish::DegradedNoProof,
             missing_parts: Vec::new(),
@@ -534,13 +1130,21 @@ mod tests {
     }
 
     fn seal_record(manifest: &TraceManifest) -> AuditRecord {
+        seal_record_after(manifest, 1, "0".repeat(64))
+    }
+
+    fn seal_record_after(
+        manifest: &TraceManifest,
+        seq: u64,
+        previous_hash: String,
+    ) -> AuditRecord {
         let mut lineage = AuditLineage::empty();
-        lineage.operation_id = Some(manifest.operation_id.clone());
+        lineage.fill_manifest(manifest);
         AuditRecord {
             format_version: 1,
             chain_id: "chain:trace-test".to_owned(),
-            seq: 1,
-            prev_hash: "0".repeat(64),
+            seq,
+            prev_hash: previous_hash,
             kind: AuditEventKind::TRACE_MANIFEST_SEALED.to_owned(),
             lineage,
             event_digest: "event-digest".to_owned(),
@@ -552,11 +1156,161 @@ mod tests {
         }
     }
 
+    fn actual_route_receipt(manifest: &TraceManifest) -> (String, serde_json::Value) {
+        let fence = manifest.state_fence.as_ref().expect("manifest has fence");
+        let fence_value = serde_json::to_value(fence).expect("fence serializes");
+        let route_facts = serde_json::json!({
+            "operation": "GetEvidencePack",
+            "state_fence": fence_value.clone(),
+            "route_identity": "route:evidence-pack",
+            "active_generation": fence.resource_generation.value(),
+            "authority_epoch": serde_json::to_value(&fence.authority_epoch)
+                .expect("epoch serializes"),
+            "endpoint": "endpoint:evidence-store",
+            "connection_id": manifest.connection_id.as_deref(),
+            "approved_artifact_hash": "d".repeat(64),
+            "approved_config_hash": "e".repeat(64),
+        });
+        let mut receipt = serde_json::json!({
+            "kind": "local_read_actual_route",
+            "operation_id": manifest.operation_id.as_str(),
+            "request_digest": manifest.retained_request_digest.as_deref(),
+            "result_digest": manifest.result_digest.as_deref(),
+            "invoked_operation": "local_read",
+            "named_operation": "GetEvidencePack",
+            "state_fence": fence_value,
+            "route_facts": route_facts,
+        });
+        let digest = crate::sha256_json(&receipt).expect("receipt digest");
+        receipt["receipt_digest"] = serde_json::Value::String(digest.clone());
+        (digest, receipt)
+    }
+
+    fn result_binding_record(manifest: &TraceManifest) -> AuditRecord {
+        let mut lineage = AuditLineage::empty();
+        lineage.trace_id = Some(manifest.trace_id.clone());
+        lineage.operation_id = Some(manifest.operation_id.clone());
+        lineage.work_item = Some(manifest.operation_id.clone());
+        lineage.task_id.clone_from(&manifest.task_id);
+        lineage.session_id.clone_from(&manifest.session_id);
+        lineage.work_scope.clone_from(&manifest.work_scope_id);
+        lineage.state_fence.clone_from(&manifest.state_fence);
+        lineage.adapter_instance.clone_from(&manifest.connection_id);
+        lineage.route_receipt_requested.clone_from(&manifest.requested_route);
+        lineage.module_generation.clone_from(&manifest.module_generation);
+        lineage.authority_epoch.clone_from(&manifest.authority_epoch);
+        lineage.controller = Some("eliotd".to_owned());
+        if let Some(attempt) = manifest.local_read_attempt.as_ref() {
+            lineage.attempt_id = Some(attempt.attempt_id.clone());
+            lineage.environment_lease = Some(attempt.attempt_id.clone());
+        }
+        AuditRecord {
+            format_version: 1,
+            chain_id: "chain:trace-test".to_owned(),
+            seq: 1,
+            prev_hash: "0".repeat(64),
+            kind: AuditEventKind::RESULT_KERNEL_BOUND.to_owned(),
+            lineage,
+            event_digest: "result-bound-event".to_owned(),
+            event_body: serde_json::json!({
+                "lane": manifest.lane.as_deref(),
+                "request_digest": manifest.retained_request_digest,
+                "result_digest": manifest.result_digest,
+                "durable_state": manifest.durable_state.as_deref(),
+            }),
+            assurance: AuditAssuranceClass::Critical,
+            capture_mode: AuditCaptureMode::Full,
+            emitted_at_ms: 1,
+            current_hash: "original-result-bound-record".to_owned(),
+        }
+    }
+
+    #[test]
+    fn find_sealed_replays_actual_route_only_with_exact_fence_and_route_facts() {
+        let mut manifest = absent_evidence_manifest();
+        let (digest, receipt) = actual_route_receipt(&manifest);
+        manifest.actual_route = Some(digest);
+        manifest.actual_route_receipt = Some(receipt.clone());
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::DegradedNoProof;
+        assert!(!manifest.missing_parts.iter().any(|part| part == "actual_route"));
+        let seal = seal_record(&manifest);
+
+        let replay = TraceManifest::find_sealed(&[seal], &manifest.operation_id)
+            .expect("original route facts remain replayable");
+        assert_eq!(replay.actual_route_receipt, manifest.actual_route_receipt);
+
+        let mut substituted = receipt;
+        let altered_fence = StateFence::new(
+            manifest.state_fence.as_ref().expect("fence").authority_epoch.clone(),
+            ResourceGeneration::new(4).expect("nonzero generation"),
+        );
+        let altered_fence_value =
+            serde_json::to_value(altered_fence).expect("altered fence serializes");
+        substituted["state_fence"] = altered_fence_value.clone();
+        substituted["route_facts"]["state_fence"] = altered_fence_value;
+        substituted["route_facts"]["active_generation"] = serde_json::json!(4);
+        let mut unsigned = substituted.clone();
+        unsigned
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("receipt_digest");
+        let substituted_digest = crate::sha256_json(&unsigned).expect("new receipt digest");
+        substituted["receipt_digest"] = serde_json::Value::String(substituted_digest.clone());
+        assert!(!manifest.route_receipt_matches(&substituted_digest, &substituted));
+    }
+
+    #[test]
+    fn find_sealed_accepts_original_kernel_bound_receipt_before_seal() {
+        let mut manifest = absent_evidence_manifest();
+        let receipt = result_binding_record(&manifest);
+        manifest.result_binding_receipt = Some(receipt.clone());
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::DegradedNoProof;
+        assert!(!manifest.missing_parts.iter().any(|part| part == "result_receipt"));
+        let seal = seal_record_after(&manifest, 2, receipt.current_hash.clone());
+
+        let replay = TraceManifest::find_sealed(
+            &[receipt, seal],
+            &manifest.operation_id,
+        )
+        .expect("the exact prior binding record satisfies result receipt");
+
+        assert_eq!(replay.result_binding_receipt, manifest.result_binding_receipt);
+        assert!(!replay.missing_parts.iter().any(|part| part == "result_receipt"));
+        assert_eq!(replay.finish, TraceFinish::DegradedNoProof);
+    }
+
+    #[test]
+    fn find_sealed_refuses_a_substituted_or_late_binding_receipt() {
+        let mut manifest = absent_evidence_manifest();
+        let receipt = result_binding_record(&manifest);
+        manifest.result_binding_receipt = Some(receipt.clone());
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::DegradedNoProof;
+        let seal = seal_record_after(&manifest, 2, receipt.current_hash.clone());
+
+        let mut substituted = receipt.clone();
+        substituted.current_hash = "substituted-record-hash".to_owned();
+        assert!(TraceManifest::find_sealed(
+            &[substituted.clone(), seal.clone()],
+            &manifest.operation_id,
+        ).is_none());
+        assert!(TraceManifest::find_sealed(
+            &[seal, receipt],
+            &manifest.operation_id,
+        ).is_none());
+    }
+
     #[test]
     fn find_sealed_replays_degraded_manifest_with_exact_missing_evidence() {
         let mut manifest = absent_evidence_manifest();
         manifest.missing_parts = manifest.missing_parts();
         manifest.unavailable = manifest.unavailable_parts();
+        assert_eq!(manifest.unavailable, manifest.missing_parts.clone());
         let records = [seal_record(&manifest)];
 
         let replay = TraceManifest::find_sealed(&records, &manifest.operation_id)
@@ -565,7 +1319,14 @@ mod tests {
         assert_eq!(replay.finish, TraceFinish::DegradedNoProof);
         assert_eq!(replay, manifest);
         assert!(replay.state_fence.is_some());
-        for required in ["principal", "active_view_packet_manifest", "verifier_result"] {
+        for required in [
+            "requested_route",
+            "actual_route",
+            "input_handle",
+            "principal",
+            "active_view_packet_manifest",
+            "verifier_result",
+        ] {
             assert!(replay.missing_parts.iter().any(|part| part == required));
         }
     }
@@ -582,6 +1343,50 @@ mod tests {
 
         manifest.operation_id.clear();
         let records = [seal_record(&manifest)];
-        assert!(TraceManifest::find_sealed(&records, "hostreq:trace-test").is_none());
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+    }
+
+    #[test]
+    fn find_sealed_refuses_a_finish_that_disagrees_with_missing_evidence() {
+        let mut manifest = absent_evidence_manifest();
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::Partial;
+        let records = [seal_record(&manifest)];
+
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+
+        manifest.finish = TraceFinish::DegradedNoProof;
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable.clear();
+        let records = [seal_record(&manifest)];
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+    }
+
+    #[test]
+    fn find_sealed_refuses_an_actual_route_digest_without_its_original_receipt() {
+        let mut manifest = absent_evidence_manifest();
+        manifest.actual_route = Some("d".repeat(64));
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::DegradedNoProof;
+        let records = [seal_record(&manifest)];
+
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+    }
+
+    #[test]
+    fn find_sealed_refuses_a_divergent_fence_projection_or_audit_identity() {
+        let mut manifest = absent_evidence_manifest();
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.module_generation = Some("4".to_owned());
+        let records = [seal_record(&manifest)];
+        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+
+        manifest.module_generation = Some("3".to_owned());
+        let mut record = seal_record(&manifest);
+        record.lineage.trace_id = Some("foreign-trace".to_owned());
+        assert!(TraceManifest::find_sealed(&[record], &manifest.operation_id).is_none());
     }
 }
