@@ -1169,7 +1169,8 @@ mod current_position_join_tests {
     fn fence() -> StateFence {
         StateFence::new(
             EpochId::new(
-                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("fixture lineage"),
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("fixture lineage"),
                 NonZeroU64::new(1).expect("nonzero sequence"),
             )
             .expect("fixture epoch"),
@@ -1231,12 +1232,7 @@ mod current_position_join_tests {
     #[test]
     fn the_single_current_position_answering_the_request_is_selected() {
         let current = admitted("scope-1", "position-1", "claim-1", Currentness::Current);
-        let superseded = admitted(
-            "scope-1",
-            "position-1",
-            "claim-0",
-            Currentness::Superseded,
-        );
+        let superseded = admitted("scope-1", "position-1", "claim-0", Currentness::Superseded);
         let selected = select("scope-1", &[superseded, current.clone()])
             .expect("the one current position answers the request");
         assert_eq!(selected, current);
@@ -1293,12 +1289,7 @@ mod current_position_join_tests {
 
     #[test]
     fn no_current_position_is_the_existing_explicit_absence() {
-        let superseded = admitted(
-            "scope-1",
-            "position-1",
-            "claim-1",
-            Currentness::Superseded,
-        );
+        let superseded = admitted("scope-1", "position-1", "claim-1", Currentness::Superseded);
         let error = select("scope-1", &[superseded]).expect_err("absence must fail closed");
         assert!(matches!(
             error,
