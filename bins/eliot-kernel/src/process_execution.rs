@@ -4666,7 +4666,7 @@ fn validate_survey_probe_terminal(
         || binding.job_id() != &expected_job
         || binding.image_id() != &expected_image
         || binding.session_id() != caller.session_id()
-        || binding.state_fence().generation() != owner.state_fence().generation()
+        || binding.state_fence().generation() != owner.generation()
         || binding.state_fence() != state_fence
         || !owner
             .authority_epoch()

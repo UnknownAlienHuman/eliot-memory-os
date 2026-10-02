@@ -110,6 +110,10 @@ pub(super) fn decide_prior_runtime_scope_change(
 /// observe result. The host envelope remains the observation scope and
 /// operation identity; the canonical write uses the existing daemon-owned
 /// request identity producer and the live Kernel fence.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the original observation attempt keeps authenticated inputs, owner commit and exact receipt validation causally ordered"
+)]
 pub(super) async fn capture_installation_survey_observation<P>(
     governor: &GovernorComposition<P>,
     reads: &KernelContextReadClient,
@@ -543,6 +547,19 @@ fn validate_capture_receipt(
     Ok(())
 }
 
+fn capture_operation_identity(
+    host_operation_id: &str,
+    result: &InstallationSurveyProbeResult,
+) -> Result<(OperationId, String, String), String> {
+    validate_result_hashes(result)?;
+    let result_bytes = canonical_json_bytes(result).map_err(|error| error.to_string())?;
+    let result_digest = sha256_hex(&result_bytes);
+    let operation = OperationId::new(format!("{host_operation_id}:{result_digest}"))
+        .map_err(|error| error.to_string())?;
+    let subject = String::from_utf8(result_bytes).map_err(|error| error.to_string())?;
+    Ok((operation.clone(), operation.as_str().to_owned(), subject))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -726,17 +743,4 @@ mod tests {
             },
         }
     }
-}
-
-fn capture_operation_identity(
-    host_operation_id: &str,
-    result: &InstallationSurveyProbeResult,
-) -> Result<(OperationId, String, String), String> {
-    validate_result_hashes(result)?;
-    let result_bytes = canonical_json_bytes(result).map_err(|error| error.to_string())?;
-    let result_digest = sha256_hex(&result_bytes);
-    let operation = OperationId::new(format!("{host_operation_id}:{result_digest}"))
-        .map_err(|error| error.to_string())?;
-    let subject = String::from_utf8(result_bytes).map_err(|error| error.to_string())?;
-    Ok((operation.clone(), operation.as_str().to_owned(), subject))
 }

@@ -5150,7 +5150,9 @@ fn start_observe_poll(
     let kernel_clone = Arc::clone(kernel);
     let composition_clone = Arc::clone(composition);
     Box::pin(async move {
-        ObserveCompletion::Settled(run_observe_poll(&kernel_clone, &composition_clone).await)
+        ObserveCompletion::Settled(
+            Box::pin(run_observe_poll(&kernel_clone, &composition_clone)).await,
+        )
     })
 }
 
@@ -5264,12 +5266,11 @@ async fn run_observe_poll(
             .map_err(|error| format!("original installation survey owner: {error}"))?;
         let body = {
             let mut owner = composition.lock().await;
-            owner
-                .capture_installation_survey_observation(
-                    kernel, &envelope, &tool, &attempt, &result,
-                )
-                .await
-                .map_err(|error| format!("installation observation capture: {error}"))?
+            Box::pin(owner.capture_installation_survey_observation(
+                kernel, &envelope, &tool, &attempt, &result,
+            ))
+            .await
+            .map_err(|error| format!("installation observation capture: {error}"))?
         };
         let submitted = match kernel.submit_observe_result_async(&body).await {
             Ok(outcome) => outcome,

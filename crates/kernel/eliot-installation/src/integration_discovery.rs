@@ -1934,7 +1934,7 @@ pub(crate) mod accepted_managed_change_tests {
         .expect("construct the exact managed child through the transaction owner");
         let SignedAdmissionFixture {
             database_directory,
-            _planner_bundle: planner_bundle,
+            planner_bundle,
             transaction_id,
             store,
             anchor,
@@ -2349,7 +2349,7 @@ pub(crate) mod accepted_managed_change_tests {
             _bundle: bundle,
             _native_target_directory: native_target_directory,
             database_directory: signed.database_directory,
-            _planner_bundle: signed._planner_bundle,
+            _planner_bundle: signed.planner_bundle,
             publication_transaction_id: signed.transaction_id,
             store: Some(signed.store),
             trust_anchor: signed.anchor,
@@ -2448,7 +2448,7 @@ pub(crate) mod accepted_managed_change_tests {
 
     struct SignedAdmissionFixture {
         database_directory: TempDir,
-        _planner_bundle: TempDir,
+        planner_bundle: TempDir,
         transaction_id: PlatformHandle,
         store: RedbInstallationTransactionStore,
         anchor: InitialConfigSnapshotTrustAnchor,
@@ -2480,6 +2480,10 @@ pub(crate) mod accepted_managed_change_tests {
         signed_admission_fixture_with_recipe(profile_root, &recipe, variant, transaction_label)
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the fixture owns the immutable publication variant while assembling its signed snapshot"
+    )]
     fn signed_admission_fixture_with_recipe(
         profile_root: &TempDir,
         recipe: &ManagedEffectRecipe,
@@ -2624,7 +2628,7 @@ pub(crate) mod accepted_managed_change_tests {
             &FirstRunDecision::defaults(),
         )
         .expect("production first-run snapshot producer");
-        let accepted_catalogue = catalogue_with_recipes(&variant, recipes);
+        let accepted_catalogue = catalogue_with_recipes(variant, recipes);
         let approval = ManagedChangeApproval {
             approval_id: h(variant.approval_id.clone()),
             request: variant.approved_request.clone(),
@@ -2742,7 +2746,7 @@ pub(crate) mod accepted_managed_change_tests {
             .expect("production trust-anchor verification admits setup");
         SignedAdmissionFixture {
             database_directory,
-            _planner_bundle: planner_bundle,
+            planner_bundle,
             transaction_id,
             store,
             anchor,
@@ -3554,6 +3558,10 @@ mod catalogue_validation_tests {
     const TEST_OWNER_ID: &str = "owner:catalogue-bounds-test";
     const TEST_KEY_ID: &str = "setup-key:catalogue-bounds-test";
 
+    #[allow(
+        clippy::expect_used,
+        reason = "fixed test handles must be valid before testing signed catalogue refusal"
+    )]
     fn h(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value.into()).expect("test handle is valid")
     }

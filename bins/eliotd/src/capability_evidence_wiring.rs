@@ -1089,93 +1089,6 @@ where
     })
 }
 
-/// Commits a runtime-only change against one exact original capability row.
-///
-/// `affected_skill_id` and `affected_prior_scope` must be the canonical key of
-/// a row already retained by the Governor. The observed hash comes from the
-/// authenticated installation owner; every other route dimension remains
-/// unknown here. This entry first selects that exact prior row, then reuses the
-/// registry's declared runtime dependency rule and the same canonical
-/// restriction commit leg. It cannot invalidate another route or another
-/// skill merely because their runtime hashes differ from the observed one.
-pub async fn commit_targeted_runtime_scope_change_restriction<P>(
-    governor: &GovernorComposition<P>,
-    admission: &mut GovernorCapabilityAdmission,
-    affected_skill_id: &str,
-    affected_prior_scope: &RouteScopeFingerprint,
-    observed_runtime_hash: &str,
-    scope: &ScopeId,
-    fence: &eliot_contracts::StateFence,
-) -> Result<ScopeChangeRestrictionReport, EvidenceBridgeError>
-where
-    P: KernelGenerationPort + ?Sized,
-{
-    if affected_skill_id.trim().is_empty()
-        || affected_skill_id.chars().any(char::is_control)
-        || affected_skill_id.len() > MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES
-    {
-        return Err(EvidenceBridgeError::BlankSkill);
-    }
-    if !eliot_governor::is_evidence_ref(observed_runtime_hash) {
-        return Err(EvidenceBridgeError::ScopeChange(
-            "observed runtime hash is not a lowercase SHA-256 digest".to_owned(),
-        ));
-    }
-    if !affected_prior_scope
-        .runtime_hash
-        .as_deref()
-        .is_some_and(eliot_governor::is_evidence_ref)
-    {
-        return Err(EvidenceBridgeError::ScopeChange(
-            "the original capability row has no valid observed runtime fingerprint".to_owned(),
-        ));
-    }
-
-    let observed = RouteScopeFingerprint {
-        runtime_hash: Some(observed_runtime_hash.to_owned()),
-        ..RouteScopeFingerprint::default()
-    };
-    let changed = ScopeDependencySelector {
-        runtime_hash: true,
-        ..ScopeDependencySelector::none()
-    };
-    let blocking_evidence_ref = observed.reference_digest();
-    let staled = prepare_targeted_runtime_scope_change(
-        admission,
-        affected_skill_id,
-        affected_prior_scope,
-        &observed,
-        changed,
-        &blocking_evidence_ref,
-    )?;
-    install_targeted_restrictions(admission, &staled)?;
-    let restricted = staled.records.len();
-    let mut committed = 0_usize;
-    for retained in &staled.records {
-        let outcome = commit_restriction_leg(
-            governor,
-            admission,
-            &retained.record,
-            retained.revision.owner_revision,
-            &blocking_evidence_ref,
-            scope,
-            fence,
-        )
-        .await;
-        if let Err(error) = outcome {
-            return Err(EvidenceBridgeError::RestrictionCommit(format!(
-                "{error} ({committed} of {restricted} targeted records were committed)"
-            )));
-        }
-        committed += 1;
-    }
-    Ok(ScopeChangeRestrictionReport {
-        blocking_evidence_ref,
-        restricted,
-        committed,
-    })
-}
-
 /// Restricts only canonical evidence rows that name the original runtime
 /// fingerprint retained by the installation owner, and reconciles those
 /// restrictions through the original Kernel receipt port.
@@ -1318,6 +1231,7 @@ fn checked_previous_runtime_hash<'a>(
 /// row in a temporary view. The production caller later commits only these
 /// returned rows into the held/canonical owner; unrelated retained rows never
 /// enter the mutation set.
+#[cfg(test)]
 fn prepare_targeted_runtime_scope_change(
     admission: &GovernorCapabilityAdmission,
     affected_skill_id: &str,
@@ -1471,6 +1385,10 @@ where
 /// receipt is accepted; the post-commit receipt readback must be byte-for-byte
 /// the receipt returned by the canonical writer.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the original restriction attempt keeps prepare, commit and exact receipt readback in one owner sequence"
+)]
 async fn commit_restriction_leg_with_receipt<P, K>(
     governor: &GovernorComposition<P>,
     kernel: &K,

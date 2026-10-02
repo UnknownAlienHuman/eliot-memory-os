@@ -1534,20 +1534,20 @@ impl DaemonKernelClient {
     pub async fn installation_survey_probe(
         &self,
         request: &InstallationSurveyProbeRequest,
-    ) -> Result<InstallationSurveyProbeResult, KernelClientError> {
+    ) -> Result<InstallationSurveyProbeResult, KernelPortError> {
         request
             .request
             .validate()
-            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         if !request.store_path.is_absolute() {
-            return Err(KernelClientError::Contract(
+            return Err(KernelPortError::Contract(
                 "installation survey requires the original absolute journal path".to_owned(),
             ));
         }
         let retained_session = self
             .owner_session_facts()
             .ok_or_else(|| {
-                KernelClientError::Contract(
+                KernelPortError::Contract(
                     "installation survey requires an already validated Kernel owner session"
                         .to_owned(),
                 )
@@ -1555,17 +1555,18 @@ impl DaemonKernelClient {
             .session_binding()
             .to_owned();
         let payload = serde_json::to_value(request)
-            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let response = self
             .transact_async(INSTALLATION_SURVEY_PROBE_OPERATION, payload)
-            .await?;
+            .await
+            .map_err(handshake::kernel_port_error)?;
         let result: InstallationSurveyProbeResult = serde_json::from_value(response)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+            .map_err(|error| KernelPortError::Unknown(error.to_string()))?;
         if result.advertisement.family_id != request.request.target_family
             || result.advertisement.target_identity.as_ref()
                 != Some(&request.request.exact_candidate)
         {
-            return Err(KernelClientError::Unknown(
+            return Err(KernelPortError::Unknown(
                 "Kernel installation survey reply does not bind the requested family and exact candidate"
                     .to_owned(),
             ));
@@ -1578,13 +1579,13 @@ impl DaemonKernelClient {
             ),
         ] {
             if digest.is_some_and(|value| !is_lowercase_sha256(value)) {
-                return Err(KernelClientError::Unknown(format!(
+                return Err(KernelPortError::Unknown(format!(
                     "Kernel installation survey {field} is not a lowercase SHA-256 digest"
                 )));
             }
         }
         if self.validated_session_binding().as_deref() != Some(retained_session.as_str()) {
-            return Err(KernelClientError::Unknown(
+            return Err(KernelPortError::Unknown(
                 "Kernel installation survey reply no longer belongs to the retained owner session"
                     .to_owned(),
             ));

@@ -3167,16 +3167,17 @@ impl DaemonComposition {
             envelope, tool,
         )
         .map_err(DaemonError::Kernel)?;
-        let body =
+        let body = Box::pin(
             crate::installation_capability_observation::capture_installation_survey_observation(
                 &self.governor,
                 &reads,
                 envelope,
                 attempt,
                 result,
-            )
-            .await
-            .map_err(DaemonError::Kernel)?;
+            ),
+        )
+        .await
+        .map_err(DaemonError::Kernel)?;
         match crate::installation_capability_observation::decide_prior_runtime_scope_change(
             &request, result,
         )

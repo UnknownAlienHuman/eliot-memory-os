@@ -651,7 +651,7 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
 /// key. It persists the immutable envelope through the original snapshot
 /// journal, reads it back, verifies the out-of-envelope protected-key pin, and
 /// advances the original setup binding only after that readback. Caller text
-/// for machine, scope, and StateFence values remains signed configuration
+/// for machine, scope, and `StateFence` values remains signed configuration
 /// input; it is not a live Host or Kernel authority observation. Omitted model
 /// roles stay `UNASSIGNED`, so setup finishes without a model subscription.
 pub fn run_setup_initial_config(
