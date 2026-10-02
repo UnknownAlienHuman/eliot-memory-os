@@ -5348,9 +5348,7 @@ async fn submit_local_state_result_idempotent(
         Err(first_error) => kernel
             .submit_local_state_result_async(body)
             .await
-            .map_err(|error| {
-                format!("Kernel state result submit: {first_error}; retry: {error}")
-            }),
+            .map_err(|error| format!("Kernel state result submit: {first_error}; retry: {error}")),
     }
 }
 

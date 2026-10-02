@@ -389,7 +389,7 @@ pub async fn project_state_projection<C: CanonicalReadClient>(
             task_id.as_deref(),
         )
         .await?;
-        for head in &bound.identity.observed_revision_heads {
+        for head in bound.identity.observed_revision_heads() {
             if !observed_heads
                 .iter()
                 .any(|seen: &RevisionHead| seen.key == head.key)
@@ -440,10 +440,7 @@ async fn read_projection_field<C: CanonicalReadClient>(
             let task_id = task_id.ok_or(StateProjectionError::MissingTaskBinding)?;
             (
                 NamedReadOperation::GetTaskState,
-                named_parameters(&[
-                    ("task_id", task_id.to_owned()),
-                    ("max_records", bound),
-                ])?,
+                named_parameters(&[("task_id", task_id.to_owned()), ("max_records", bound)])?,
             )
         }
         StateProjectionField::Attention => (
@@ -615,9 +612,12 @@ fn trusted_state_scope(
             .as_deref()
             .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
     });
-    let scope =
-        ScopeId::new(scope_text.ok_or(StateProjectionError::InvalidInvocation)?.to_owned())
-            .map_err(|_| StateProjectionError::InvalidInvocation)?;
+    let scope = ScopeId::new(
+        scope_text
+            .ok_or(StateProjectionError::InvalidInvocation)?
+            .to_owned(),
+    )
+    .map_err(|_| StateProjectionError::InvalidInvocation)?;
     if scope.as_str() != attempt.scope_id {
         return Err(StateProjectionError::UnboundAttempt);
     }
@@ -674,11 +674,8 @@ fn state_projection_context(
 ) -> Result<RequestMetadata, StateProjectionError> {
     let operation = host_request_operation_id(envelope);
     let context = RequestMetadata {
-        request_id: RequestId::new(format!(
-            "eliotd:state-projection:{}",
-            operation.as_str()
-        ))
-        .map_err(|error| StateProjectionError::ResponseProjection(error.to_string()))?,
+        request_id: RequestId::new(format!("eliotd:state-projection:{}", operation.as_str()))
+            .map_err(|error| StateProjectionError::ResponseProjection(error.to_string()))?,
         session_id: envelope
             .identity
             .session_id
@@ -738,7 +735,8 @@ mod state_projection_tests {
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     fn test_fence(generation: u64) -> TestResult<StateFence> {
-        let lineage = EpochLineageId::new(TEST_LINEAGE).map_err(|error| format!("lineage: {error}"))?;
+        let lineage =
+            EpochLineageId::new(TEST_LINEAGE).map_err(|error| format!("lineage: {error}"))?;
         let sequence = NonZeroU64::new(1).ok_or("non-zero test sequence")?;
         let epoch = EpochId::new(lineage, sequence).map_err(|error| format!("epoch: {error}"))?;
         let generation =
@@ -747,8 +745,8 @@ mod state_projection_tests {
     }
 
     fn tool_digest(tool: &Value) -> TestResult<String> {
-        let bytes = canonical_json_bytes(tool)
-            .map_err(|error| format!("canonical tool bytes: {error}"))?;
+        let bytes =
+            canonical_json_bytes(tool).map_err(|error| format!("canonical tool bytes: {error}"))?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -757,7 +755,12 @@ mod state_projection_tests {
         if let Some(include) = include {
             arguments.insert(
                 "include".to_owned(),
-                Value::Array(include.iter().map(|token| Value::String((*token).to_owned())).collect()),
+                Value::Array(
+                    include
+                        .iter()
+                        .map(|token| Value::String((*token).to_owned()))
+                        .collect(),
+                ),
             );
         }
         json!({"name": STATE_CAPABILITY, "arguments": Value::Object(arguments)})
@@ -870,7 +873,7 @@ mod state_projection_tests {
                 if !query.parameters.contains_key(*key) {
                     return Err(StoreError::InvalidField {
                         field: "operation.parameter",
-                        reason: format!("missing required parameter {key}"),
+                        reason: "the named read declares no value for a required selector",
                     });
                 }
             }
@@ -906,7 +909,7 @@ mod state_projection_tests {
             if query.scope_id.is_none() {
                 return Err(StoreError::InvalidField {
                     field: "scope_id",
-                    reason: "the state projection reads are scope-bound".to_owned(),
+                    reason: "the state projection reads are scope-bound",
                 });
             }
             let revision_heads = vec![self.scope_head()];
@@ -933,18 +936,17 @@ mod state_projection_tests {
                     if !query.parameters.is_empty() {
                         return Err(StoreError::InvalidField {
                             field: "operation.parameters",
-                            reason: "GetScopeRevisionView takes no parameters".to_owned(),
+                            reason: "GetScopeRevisionView takes no parameters",
                         });
                     }
                     serde_json::to_value(ScopeRevisionView {
                         scope_id: query.scope_id.clone().expect("scope checked above"),
                         revision_heads: revision_heads.clone(),
                         ordering_heads: vec![OrderingHead {
-                            scope: OrderingScopeId::new(TEST_SCOPE)
-                                .map_err(|error| StoreError::InvalidField {
-                                    field: "ordering.scope",
-                                    reason: error.to_string(),
-                                })?,
+                            // `OrderingScopeId::new` already answers
+                            // `Result<_, StoreError>`, so its typed refusal
+                            // propagates verbatim rather than being restated.
+                            scope: OrderingScopeId::new(TEST_SCOPE)?,
                             sequence: 1,
                             state_fence: self.fence.clone(),
                         }],
@@ -988,8 +990,14 @@ mod state_projection_tests {
                 .map_err(|error| format!("claim must parse: {error}"))?
                 .ok_or("a queued state pair must claim")?;
         assert_eq!(claimed_envelope.envelope_sha256, envelope.envelope_sha256);
-        assert_eq!(claimed_tool, tool, "the claim returns the exact retained tool bytes");
-        assert_eq!(claimed_attempt, attempt, "the claim returns the exact fenced attempt");
+        assert_eq!(
+            claimed_tool, tool,
+            "the claim returns the exact retained tool bytes"
+        );
+        assert_eq!(
+            claimed_attempt, attempt,
+            "the claim returns the exact fenced attempt"
+        );
         assert_eq!(
             crate::parse_local_read_claimed_pair(&json!({ "pair": null }))
                 .map_err(|error| format!("empty claim must not fail: {error}"))?,
@@ -1015,7 +1023,10 @@ mod state_projection_tests {
         // The owner's receipt is present, binds the exact result bytes, and is the
         // READ class: a bounded read of already-retained owner state, with no
         // semantic receipt.
-        let lineage = body.lineage.as_ref().expect("the owner receipt must ride the result");
+        let lineage = body
+            .lineage
+            .as_ref()
+            .expect("the owner receipt must ride the result");
         assert_eq!(
             lineage.output_digest, body.result_digest,
             "the receipt binds the exact result bytes"
@@ -1041,18 +1052,26 @@ mod state_projection_tests {
         assert!(
             revisions
                 .iter()
-                .any(|revision| revision.key == format!("scope:{TEST_SCOPE}") && revision.revision == 3),
+                .any(|revision| revision.key == format!("scope:{TEST_SCOPE}")
+                    && revision.revision == 3),
             "the receipt names the scope head the owner observed, not one the daemon invented"
         );
-        check_state_result_receipt(&body)
-            .map_err(|error| format!("the owner result must pass the receipt preflight: {error}"))?;
+        check_state_result_receipt(&body).map_err(|error| {
+            format!("the owner result must pass the receipt preflight: {error}")
+        })?;
 
         // The ordinary readback: the stored response IS the bounded MCP
         // projection for THIS request, with the exact correlation triple and the
         // closed canonical tool name the bridge serves.
         let response = &body.response;
-        assert_eq!(response["request_id"], envelope.identity.request_id.as_str());
-        assert_eq!(response["idempotency_key"], envelope.identity.idempotency_key);
+        assert_eq!(
+            response["request_id"],
+            envelope.identity.request_id.as_str()
+        );
+        assert_eq!(
+            response["idempotency_key"],
+            envelope.identity.idempotency_key
+        );
         assert_eq!(response["canonical_tool_name"], STATE_CAPABILITY);
         assert_eq!(response["kind"], "PROJECTION");
         let expected_request_digest = sha256_hex(&canonical_json_bytes(&(
@@ -1070,7 +1089,10 @@ mod state_projection_tests {
             projection["task"]["payload"]["records"][0]["state"], "active",
             "the task projection is the owner read's answer, not daemon-authored content"
         );
-        assert_eq!(projection["attention"]["operation"], "GetAttentionAndProblems");
+        assert_eq!(
+            projection["attention"]["operation"],
+            "GetAttentionAndProblems"
+        );
         assert_eq!(
             projection["attention"]["payload"]["records"][0]["problem_id"], "problem-alpha",
             "the attention projection is the owner read's answer"
@@ -1081,7 +1103,10 @@ mod state_projection_tests {
         // resubmits the identical receipt-bound body and persists once.
         let once = serde_json::to_value(&body)?;
         let twice = serde_json::to_value(&body)?;
-        assert_eq!(once, twice, "an exact replay carries byte-identical material");
+        assert_eq!(
+            once, twice,
+            "an exact replay carries byte-identical material"
+        );
         let replayed: HostRequestResultBody = serde_json::from_value(twice)?;
         replayed
             .validate_local_read_submission()
@@ -1095,15 +1120,13 @@ mod state_projection_tests {
     /// a request naming a field with no owner read is refused with that exact
     /// absence named rather than answered with a placeholder.
     #[tokio::test]
-    async fn state_result_without_the_owner_receipt_is_refused_and_never_persists()
-    -> TestResult {
+    async fn state_result_without_the_owner_receipt_is_refused_and_never_persists() -> TestResult {
         let fence = test_fence(1)?;
         let tool = state_tool(Some(&["task", "scope"]));
         let envelope = test_envelope(&tool)?;
         let attempt = test_attempt(&envelope)?;
         let store = OwnerProjectionStore::new(fence.clone());
-        let body =
-            project_state_projection(store, &fence, &envelope, &tool, &attempt).await?;
+        let body = project_state_projection(store, &fence, &envelope, &tool, &attempt).await?;
         assert!(
             check_state_result_receipt(&body).is_ok(),
             "the owner's own result carries its receipt"
@@ -1209,7 +1232,9 @@ fn named_parameters(entries: &[(&str, String)]) -> Result<NamedParameters, State
 /// `crate::DaemonKernelClient::submit_local_state_result_async` before the
 /// result leg touches the transport, so the Kernel's gate stays the authority
 /// and this one only ever refuses earlier.
-pub fn check_state_result_receipt(body: &HostRequestResultBody) -> Result<(), StateProjectionError> {
+pub fn check_state_result_receipt(
+    body: &HostRequestResultBody,
+) -> Result<(), StateProjectionError> {
     if body.lineage.is_none() {
         return Err(StateProjectionError::MissingOwnerReceipt);
     }
