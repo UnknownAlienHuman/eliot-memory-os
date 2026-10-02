@@ -2203,9 +2203,15 @@ pub fn assemble_candidate_result(
 /// [`translate_result`] (`validate_against`). A non-terminal envelope, an
 /// incomplete stream, or a linkage mismatch fails closed; success maps to
 /// candidate-only `Partial` exactly as [`translate_result`] defines, never
-/// Finish authority. The normalized pair feeds
-/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`, and
-/// the translated result feeds `AgentCoordinator::submit_result`.
+/// Finish authority.
+///
+/// The normalized pair and the translated result are shaped for
+/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event` and
+/// `AgentCoordinator::submit_result` intake. This crate's only coordinator
+/// dependency is the model-catalogue type (`ModelCatalogueSnapshot`,
+/// `ModelControlError`); it contains no `AgentCoordinator` call, so both
+/// intake edges are owned by the coordinator-facing caller and are not
+/// established here (issue #369 A4).
 #[derive(Debug)]
 pub struct CodexTurnResultDrain<'a> {
     /// Drained terminal wire notification (must be a notification, not a
@@ -2263,10 +2269,25 @@ pub struct CodexTurnResultDrain<'a> {
 
 /// Drains one completed Codex turn into its candidate result.
 ///
+/// MEASURED PRODUCTION ROOT: NONE (issue #369 A4). This function is the only
+/// caller of [`assemble_candidate_result`], which is the only caller of
+/// [`translate_result`], so the whole Codex conversion subtree
+/// (`translate_result` -> `assemble_candidate_result` -> this) is reachable
+/// only from tests. The crate *is* linked by a compiled binary
+/// (`eliot-agent-codex` -> `bins/eliot-native-worker`), but only for the
+/// `CODEX_ADAPTER_ID` resolution constant in `adapter_registry`, never for
+/// this conversion.
+///
 /// STITCH (#370 W23/A22): the future live caller drains one real completed
 /// turn observed from an admitted Codex session; BLOCKED-BY the
 /// native-worker provider-runtime driver (no production caller exists).
-/// Forbidden: a synthetic or test-only turn to manufacture a caller.
+///
+/// That driver also owns the admitted byte stream this crate cannot obtain
+/// for itself: P-03 `eliot_process::ProcessExecutor` exposes lifecycle
+/// receipts only and never yields the App Server JSONL line bytes a real
+/// completed turn arrives as, so a real turn must reach this function
+/// through a driver-owned transport. Forbidden: a synthetic or test-only
+/// turn to manufacture a caller.
 ///
 /// # Errors
 ///

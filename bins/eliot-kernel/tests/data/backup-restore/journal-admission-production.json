@@ -6,7 +6,7 @@
   "database_ref": "kernel-operational-ors",
   "installation_ref": "installation-960",
   "generation": 1,
-  "journal_identity_ref": "per-execution-stream-key-requires-a-live-restore-plan",
+  "journal_identity_ref": "kernel-restore-journal-v1",
   "admission_receipt_ref": "admission-receipt-960-production",
   "fixture_proof_only": false
 }
