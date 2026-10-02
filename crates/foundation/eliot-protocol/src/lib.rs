@@ -1447,6 +1447,14 @@ pub enum ModuleControlEffect {
     FatalRecorded,
     /// The module resumed `Quiesced` to `Active` on a correlated restart.
     Resumed,
+    /// One `Execute` request was admitted and its outcome recorded under the
+    /// request's validated idempotency key.
+    ///
+    /// The carried [`RequestId`] is the request identity the owner validated
+    /// when it first admitted the effect, not an echo of whichever retry
+    /// arrived later: a repeated `Execute` with the same idempotency identity
+    /// replays this exact recorded disposition and performs no second effect.
+    ExecuteRecorded(RequestId),
 }
 
 /// Recorded outcome of one effectful lifecycle control request.
@@ -1460,7 +1468,9 @@ pub enum ModuleControlEffect {
 /// a second event journal: no sequences, no cursors, no acknowledgement
 /// phases. `DrainStatus` reads are never recorded here because each read must
 /// observe the live denominator, and `Fatal` carries no request identity on
-/// its control frame so the `Failed` phase itself is the fence.
+/// its control frame so the `Failed` phase itself is the fence. `Execute` is
+/// recorded in this same map: it is the one and only replay mechanism for a
+/// lifecycle request's idempotency identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LifecycleControlReplay {
     /// Control message the recorded outcome belongs to.
@@ -1481,10 +1491,11 @@ struct LifecycleControlReplay {
 /// rejected with a typed [`ProtocolError`]; nothing is inferred from process
 /// state.
 ///
-/// The owner retains durable idempotency/outcomes for the effectful controls:
-/// the first outcome per idempotency key is recorded and replayed on retry,
-/// so a repeated `Quiesce` returns the earlier disposition and a key reused
-/// under a different message surfaces [`ProtocolError::ReplayConflict`].
+/// The owner retains durable idempotency/outcomes for the effectful controls
+/// and for `Execute`: the first outcome per idempotency key is recorded and
+/// replayed on retry, so a repeated `Quiesce` or `Execute` returns the earlier
+/// disposition and a key reused under a different message surfaces
+/// [`ProtocolError::ReplayConflict`].
 /// `Checkpoint` retains the published snapshot bytes verbatim (bounded by
 /// [`MAX_FRAME_BYTES`]); a fresh publication under a new key supersedes the
 /// retained checkpoint and moves correlation to the new key. `DrainStatus`
@@ -1525,9 +1536,9 @@ impl ModuleLifecycle {
     ///
     /// Only the [`ModuleLifecyclePhase::Active`] phase admits new `Execute`
     /// work: quiesced, terminated and failed lifecycles refuse admission. The
-    /// admission path consults this predicate before observing the frame
-    /// through the execute ledger; that call site lives in the transport loop
-    /// outside this crate (named STITCH).
+    /// admission path consults this predicate before applying the frame
+    /// through [`ModuleLifecycle::apply`]; that call site lives in the
+    /// transport loop outside this crate (named STITCH).
     #[must_use]
     pub const fn admits_execute(&self) -> bool {
         matches!(self.phase, ModuleLifecyclePhase::Active)
@@ -1597,14 +1608,14 @@ impl ModuleLifecycle {
     /// Applies one validated lifecycle control frame as an explicit transition.
     ///
     /// Effectful controls (`Quiesce`, `Checkpoint`, `RestoreCheckpoint`,
-    /// `Shutdown`, correlated `Start` resume) consult the owner-held
-    /// idempotency/outcome replay first: a retry carrying a recorded key and
-    /// message returns the earlier disposition without a second effect, and a
-    /// recorded key under a different message is refused as
-    /// [`ProtocolError::ReplayConflict`]. `Checkpoint` retains the
-    /// module-published snapshot bytes; `DrainStatus` always reports the
-    /// live denominator from its frame and is never replayed;
-    /// `RestoreCheckpoint` resumes to `Active`; `Fatal` fences on the
+    /// `Shutdown`, correlated `Start` resume) and the effectful `Execute`
+    /// request consult the owner-held idempotency/outcome replay first: a
+    /// retry carrying a recorded key and message returns the earlier
+    /// disposition without a second effect, and a recorded key under a
+    /// different message is refused as [`ProtocolError::ReplayConflict`].
+    /// `Checkpoint` retains the module-published snapshot bytes; `DrainStatus`
+    /// always reports the live denominator from its frame and is never
+    /// replayed; `RestoreCheckpoint` resumes to `Active`; `Fatal` fences on the
     /// terminal phase. The production caller is the IPC control dispatcher;
     /// transport-loop invocation stays outside this crate (named STITCH).
     pub fn apply(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
@@ -1617,6 +1628,7 @@ impl ModuleLifecycle {
             MessageType::Shutdown => self.apply_shutdown(frame),
             MessageType::Fatal => self.apply_fatal(frame),
             MessageType::Start => self.apply_resume(frame),
+            MessageType::Execute => self.apply_execute(frame),
             _ => Err(ProtocolError::InvalidField {
                 field: "message_type",
                 reason: "not a module lifecycle control message",
@@ -1760,6 +1772,47 @@ impl ModuleLifecycle {
         Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
     }
 
+    /// Admits one lifecycle `Execute` request and records its disposition.
+    ///
+    /// The frame must be a validated `Request` carrying an `Execute` message
+    /// and its validated [`RequestIdentity`]. The owner-held idempotency
+    /// replay is consulted first, exactly as for every other effectful
+    /// lifecycle request: a repeat of the same idempotency identity returns
+    /// the disposition already recorded in the owner's `control_effects` and
+    /// admits no second effect, and that recorded key presented under a
+    /// different message is refused as [`ProtocolError::ReplayConflict`]. A
+    /// first-seen `Execute` is admitted only from the
+    /// [`ModuleLifecyclePhase::Active`] phase; a quiesced, terminated or failed
+    /// lifecycle refuses new work. The recorded value is the request identity
+    /// this owner validated for the admitted effect.
+    fn apply_execute(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        let identity = Self::control_identity(frame)?;
+        if let Some(effect) = self.replay_control(frame, identity)? {
+            return Ok(effect);
+        }
+        if frame.kind != FrameKind::Request {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle Execute requires a Request frame carrying an Execute message",
+            });
+        }
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for lifecycle Execute requests",
+            })?;
+        if !self.admits_execute() {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "execute requires the active phase: new work is refused after quiesce, shutdown or fatal",
+            });
+        }
+        let effect = ModuleControlEffect::ExecuteRecorded(request_id);
+        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+    }
+
     fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         Self::control_identity(frame)?;
         let active_operations = match &frame.payload {
@@ -1859,81 +1912,6 @@ impl ModuleLifecycle {
 impl Default for ModuleLifecycle {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Idempotent disposition of one lifecycle `Execute` request (A2).
-///
-/// `New` carries the first-seen `request_id`; `Duplicate` carries the standing
-/// first-seen `request_id` so a retried `Execute` with the same idempotency
-/// identity observes the prior disposition instead of a second effect.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum LifecycleExecuteDisposition {
-    /// First receipt of this idempotency identity.
-    New(RequestId),
-    /// The same idempotency identity was already observed.
-    Duplicate(RequestId),
-}
-
-/// Explicit owner for lifecycle `Execute` idempotent disposition replay (A2).
-///
-/// Entries are keyed by the validated [`RequestIdentity::idempotency_key`];
-/// the first `request_id` is retained and replayed on every repeat, so a
-/// retry never produces a second effect. The ledger is owned by the lifecycle
-/// owner, never by a fenced session, and entries persist until an explicit
-/// `reap`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LifecycleExecuteLedger {
-    entries: BTreeMap<String, RequestId>,
-}
-
-impl LifecycleExecuteLedger {
-    /// Creates an empty execute ledger.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-        }
-    }
-
-    /// Observes one validated lifecycle `Execute` frame by idempotency identity.
-    pub fn observe(&mut self, frame: &Frame) -> Result<LifecycleExecuteDisposition, ProtocolError> {
-        frame.validate()?;
-        if !matches!(
-            (frame.kind, frame.message_type),
-            (FrameKind::Request, MessageType::Execute)
-        ) {
-            return Err(ProtocolError::InvalidField {
-                field: "kind/message_type",
-                reason: "lifecycle Execute dispatch requires a Request frame carrying an Execute message",
-            });
-        }
-        let identity = frame
-            .request_identity
-            .as_ref()
-            .ok_or(ProtocolError::InvalidField {
-                field: "request_identity",
-                reason: "required for lifecycle Execute requests",
-            })?;
-        identity.validate()?;
-        let request_id = frame
-            .request_id
-            .clone()
-            .ok_or(ProtocolError::InvalidField {
-                field: "request_id",
-                reason: "required for lifecycle Execute requests",
-            })?;
-        if let Some(prior) = self.entries.get(&identity.idempotency_key) {
-            return Ok(LifecycleExecuteDisposition::Duplicate(prior.clone()));
-        }
-        self.entries
-            .insert(identity.idempotency_key.clone(), request_id.clone());
-        Ok(LifecycleExecuteDisposition::New(request_id))
-    }
-
-    /// Removes one idempotency identity after its outcome is durably recorded.
-    pub fn reap(&mut self, idempotency_key: &str) {
-        self.entries.remove(idempotency_key);
     }
 }
 

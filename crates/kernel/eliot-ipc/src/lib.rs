@@ -547,26 +547,6 @@ pub fn dispatch_lifecycle_cancel(
     Ok(registry.cancel_stable(&identity.cancellation_id))
 }
 
-/// Observes one lifecycle `Execute` frame by idempotency identity (A2).
-///
-/// The frame is routed through the lifecycle-owned
-/// [`eliot_protocol::LifecycleExecuteLedger::observe`]: the first
-/// `request_id` per `idempotency_key` is retained and replayed, so a retried
-/// `Execute` with the same identity observes the prior disposition instead
-/// of a second effect. This dispatcher mints no identity and performs no
-/// effect itself.
-///
-/// # Errors
-///
-/// Returns the owner's typed protocol failure for invalid frames and for
-/// frames that are not lifecycle `Execute` requests.
-pub fn dispatch_lifecycle_execute(
-    frame: &Frame,
-    ledger: &mut eliot_protocol::LifecycleExecuteLedger,
-) -> Result<eliot_protocol::LifecycleExecuteDisposition, TransportError> {
-    ledger.observe(frame).map_err(TransportError::Protocol)
-}
-
 /// Records a deadline expiry for one lifecycle request frame (A3).
 ///
 /// The frame must be a validated `Request` carrying its `RequestIdentity`;
@@ -609,21 +589,24 @@ pub fn dispatch_lifecycle_expire(
 /// Applies one lifecycle control frame as an explicit transition on the
 /// module-lifecycle owner (W4: I7.4 `Quiesce`/`Checkpoint`/`RestoreCheckpoint`/
 /// `DrainStatus`/`Shutdown`/`Fatal` as explicit I7.2 control flows, plus the
-/// correlated `Start` resume tail).
+/// correlated `Start` resume tail and the effectful `Execute` request, A2).
 ///
 /// The frame is routed through [`eliot_protocol::ModuleLifecycle::apply`]:
-/// validation, phase gating, checkpoint retention, drain reporting and the
-/// restart-correlation check all live in that owner, and non-control messages
-/// are rejected with the typed protocol failure. This dispatcher never infers
-/// phase from process state and never touches any other owner.
+/// validation, phase gating, checkpoint retention, drain reporting, the
+/// restart-correlation check and the owner-held idempotency/outcome replay
+/// all live in that one owner, and non-lifecycle messages are rejected with
+/// the typed protocol failure. A repeated `Execute` with the same validated
+/// idempotency identity returns the disposition already recorded in that
+/// owner's `control_effects` and performs no second effect. This dispatcher
+/// never infers phase from process state and never touches any other owner.
 /// A post-restart frame carrying a fresh uncorrelated idempotency key is
 /// rejected by the owner as a protocol failure, not admitted as a new request.
 ///
 /// # Errors
 ///
 /// Returns the owner's typed protocol failure for invalid frames,
-/// non-control messages, illegal phase moves, missing checkpoints and
-/// uncorrelated restarts.
+/// non-lifecycle messages, illegal phase moves, missing checkpoints,
+/// uncorrelated restarts and idempotency identity conflicts.
 pub fn dispatch_lifecycle_control(
     frame: &Frame,
     lifecycle: &mut eliot_protocol::ModuleLifecycle,
