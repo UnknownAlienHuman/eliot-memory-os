@@ -18,17 +18,28 @@
 //! (source/diff guard) is the integrator's. Diagnostics are evidence only:
 //! they never change control flow, state, errors, receipts, order, status, or
 //! cleanup, and stdout framing stays exactly one-JSON-per-line.
+//!
+//! Executed audit cases in this file are driven through REAL production entry
+//! points, never through the diagnostic facade: a record asserted here is
+//! always one the OWNER passed to its own `#978` observe helper. The launch-side
+//! public seam is [`eliot_host::HostLaunchOptions`] — the exact
+//! `parse` / `parse_system_service` / `validate_service_main_argv` calls
+//! `src/main.rs` makes at the `run` and `run_as_scm_service` contours. The
+//! `host_job_launch` module is private (`src/lib.rs`), so the launch leaf's own
+//! `observe_launch_terminal` seam is NOT reachable from an integration-test
+//! crate; cases that would need it report that named ceiling instead of
+//! manufacturing the record they would assert on.
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
-    DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, HostRequestProjection, bound_detail,
-    bound_field, observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
-    sink_status,
+    DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, bound_detail, bound_field,
+    observe_entrypoint_with_detail, observe_terminal_error, sink_status,
 };
-use eliot_host::windows_event_log::{AdmittedEvent, event_log_sink_status, report_event};
+use eliot_host::windows_event_log::event_log_sink_status;
+use eliot_platform_windows::ELIOT_HOST_SERVICE_NAME;
 use serde_json::Value;
 
 /// Shared in-memory sink proving bounded formatter output without contending
@@ -64,19 +75,33 @@ fn manifest_source(relative: &str) -> String {
     std::fs::read_to_string(&path).expect("tracked source must be readable")
 }
 
-/// Runs `emit` under a scoped subscriber and returns the captured text.
-fn capture_emit(emit: impl FnOnce()) -> String {
+/// Runs `emit` under a scoped subscriber that admits only records at or above
+/// `level`, and returns the captured text.
+///
+/// This exists so a FAILING or FILTERED sink can be exercised against real
+/// production code instead of assumed: at [`tracing::Level::Error`] every
+/// `host.entrypoint_stage` record is dropped while the facade's single
+/// `host.terminal_error` record stays admissible, so an empty capture under
+/// this subscriber proves the owner emitted no terminal rather than proving
+/// the subscriber swallowed one.
+fn capture_emit_at_level(level: tracing::Level, emit: impl FnOnce()) -> String {
     let sink = CaptureSink::default();
     let writer_sink = sink.clone();
     let captured = {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
+            .with_max_level(level)
             .with_writer(move || writer_sink.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, emit);
         sink.bytes.lock().unwrap().clone()
     };
     String::from_utf8_lossy(&captured).into_owned()
+}
+
+/// Runs `emit` under a scoped subscriber and returns the captured text.
+fn capture_emit(emit: impl FnOnce()) -> String {
+    capture_emit_at_level(tracing::Level::INFO, emit)
 }
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
@@ -387,48 +412,97 @@ fn launch_11_sink_failure_leaves_operation_identical() {
     ] {
         assert!(source.contains("event_log_sink_status"));
     }
-    assert_eq!(
-        event_log_sink_status(),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
-    );
+    // The facade's Windows Event Log ARM is unavailable on every platform by
+    // construction. The live #984 port behind `event_log_sink_status` is a
+    // different seam and answers `Ok` exactly where it is implemented, so it
+    // is asserted against its own platform gate instead of against a hardcoded
+    // `Err` (which would be a false premise on this Windows host). `report_event`
+    // is deliberately never called: on this platform it performs a REAL OS
+    // Event Log insertion, which a proof must not trigger.
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
         Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
     );
-    assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
-    let record = eliot_host::windows_event_log::EventLogRecord::new(
-        AdmittedEvent::ServiceFailure,
-        "host-launch-failed",
+    assert_eq!(
+        event_log_sink_status().is_ok(),
+        cfg!(windows),
+        "the #984 live Event Log port answers Ok exactly where it is implemented"
+    );
+    // Same real argv and the same real production entry point, under two sinks:
+    // one that admits the owner's `INFO` phase records and one that drops them
+    // while still admitting a terminal record.
+    let mut admitted_outcome = None;
+    let admitted = capture_emit(|| {
+        admitted_outcome =
+            Some(eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()));
+    });
+    let mut filtered_outcome = None;
+    let filtered = capture_emit_at_level(tracing::Level::Error, || {
+        filtered_outcome =
+            Some(eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()));
+    });
+    // Non-emptiness PRECONDITION, asserted before every denial below: this
+    // capture really carries production output on this platform.
+    assert!(
+        admitted.contains("host.entrypoint_stage"),
+        "the INFO capture must carry production output: {admitted}"
+    );
+    let admitted_options = admitted_outcome
+        .expect("the parse must run under the INFO sink")
+        .expect("valid SystemService argv must admit");
+    let filtered_options = filtered_outcome
+        .expect("the parse must run under the ERROR-only sink")
+        .expect("valid SystemService argv must admit");
+    assert!(
+        filtered.is_empty(),
+        "the ERROR-only sink must drop the owner's INFO phase records: {filtered}"
+    );
+    // Result, typed values and call count are identical under both sinks.
+    assert_eq!(
+        admitted_options.config_descriptor_digest().as_str(),
+        filtered_options.config_descriptor_digest().as_str()
     );
     assert_eq!(
-        report_event(&record),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
+        admitted_options.config_descriptor_path(),
+        filtered_options.config_descriptor_path()
     );
-    let before =
-        eliot_host::HostLaunchOptions::parse(valid_launch_args()).expect("valid must admit");
-    let digest_before = before.config_descriptor_digest().as_str().to_owned();
-    let gen_before = before.transaction_plan_generation();
-    let _ = capture_emit(|| {
-        observe_entrypoint_with_detail(EntrypointStage::Startup, "host.launch requested");
-        observe_entrypoint_with_detail(EntrypointStage::Startup, "host.launch admitted");
-        observe_terminal_error("host-launch-failed");
-    });
-    assert_eq!(before.config_descriptor_digest().as_str(), digest_before);
-    assert_eq!(before.transaction_plan_generation(), gen_before);
-    let after =
-        eliot_host::HostLaunchOptions::parse(valid_launch_args()).expect("must still admit");
-    assert_eq!(after.config_descriptor_digest().as_str(), digest_before);
-    let ordered = capture_emit(|| {
-        observe_entrypoint_with_detail(EntrypointStage::Startup, "host.launch requested");
-        observe_entrypoint_with_detail(EntrypointStage::Startup, "host.launch admitted");
-    });
-    let first = ordered
-        .find("host.launch requested")
-        .expect("must contain first");
-    let second = ordered
-        .find("host.launch admitted")
-        .expect("must contain second");
-    assert!(first < second, "order must be preserved, got: {ordered}");
+    assert_eq!(
+        admitted_options.host_state_root(),
+        filtered_options.host_state_root()
+    );
+    assert_eq!(
+        admitted_options.transaction_plan_generation(),
+        filtered_options.transaction_plan_generation()
+    );
+    let admitted_nonce = admitted_options.registration_nonce().map(|n| n.as_str());
+    let filtered_nonce = filtered_options.registration_nonce().map(|n| n.as_str());
+    assert_eq!(admitted_nonce, filtered_nonce);
+    // The admission facts production actually emitted, and their observed order.
+    for frozen in [
+        "detail=\"host.launch-options parse requested\"",
+        "detail=\"host.launch-options parse admitted\"",
+        "detail=\"host.launch-options system-service admitted\"",
+    ] {
+        assert!(admitted.contains(frozen), "production must emit {frozen:?}, got: {admitted}");
+    }
+    let requested = admitted
+        .find("host.launch-options parse requested")
+        .expect("production must emit the parse request");
+    let parsed = admitted
+        .find("host.launch-options parse admitted")
+        .expect("production must emit the parse admission");
+    let admitted_service = admitted
+        .find("host.launch-options system-service admitted")
+        .expect("production must emit the system-service admission");
+    assert!(
+        requested < parsed && parsed < admitted_service,
+        "production must keep its own phase order under a failing sink, got: {admitted}"
+    );
+    assert_eq!(
+        count_occurrences(&admitted, "host.terminal_error"),
+        0,
+        "an admitted launch-config operation emits no terminal: {admitted}"
+    );
     let fixture = launch_fixture();
     assert_eq!(
         fixture["stdout_protocol_contamination"].as_bool(),
@@ -870,32 +944,48 @@ fn launch_13_deterministic_semantic_fields() {
             "deterministic vocabulary must pin {required:?}"
         );
     }
+    // The determinism claim is executed against a REAL production entry point
+    // (`HostLaunchOptions::parse_system_service`, the seam `main.rs` drives at
+    // the `SystemService` bootstrap), twice on the same real argv: the two
+    // captures must be byte-identical and must carry the owner's own frozen
+    // `stage`/`detail` fields. The previous form built both captures by calling
+    // the diagnostic facade with two manually identical test-supplied literals
+    // and compared only event counts and total output length, which cannot fail
+    // for any production reason.
     let first = capture_emit(|| {
-        observe_entrypoint_with_detail(
-            EntrypointStage::ScmDispatch,
-            "host.scm-launch probe requested",
-        );
-        observe_entrypoint_with_detail(
-            EntrypointStage::Startup,
-            "host.store-launch store-live observed",
+        assert!(
+            eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()).is_ok(),
+            "valid SystemService argv must admit"
         );
     });
     let second = capture_emit(|| {
-        observe_entrypoint_with_detail(
-            EntrypointStage::ScmDispatch,
-            "host.scm-launch probe requested",
-        );
-        observe_entrypoint_with_detail(
-            EntrypointStage::Startup,
-            "host.store-launch store-live observed",
+        assert!(
+            eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()).is_ok(),
+            "valid SystemService argv must admit"
         );
     });
-    assert_eq!(
-        count_occurrences(&first, "host.entrypoint_stage"),
-        count_occurrences(&second, "host.entrypoint_stage"),
-        "injected schedules must emit deterministically"
+    // Non-emptiness PRECONDITION, asserted before the equality below: both
+    // captures really carry production output on this platform.
+    assert!(
+        first.contains("host.entrypoint_stage"),
+        "first capture must carry production output: {first}"
     );
-    assert_eq!(first.len(), second.len(), "got: {first:?} vs {second:?}");
+    assert!(
+        second.contains("host.entrypoint_stage"),
+        "second capture must carry production output: {second}"
+    );
+    assert_eq!(
+        first, second,
+        "repeated execution of one production seam must emit deterministically"
+    );
+    for frozen in [
+        "stage=\"launch_config\"",
+        "detail=\"host.launch-options parse requested\"",
+        "detail=\"host.launch-options parse admitted\"",
+        "detail=\"host.launch-options system-service admitted\"",
+    ] {
+        assert!(first.contains(frozen), "production must emit {frozen:?}, got: {first}");
+    }
 }
 
 // WORK_UNIT_CASE: 978/14
@@ -949,214 +1039,142 @@ fn launch_14_source_guard_stays_diagnostics_only() {
     }
 }
 
-// Executed case for external audit 5909832545 defect 4: a rollback positive
-// (`host.phase-b rollback *`) is only ever projected when the owner's own
-// evidence proves the operation, and an unproven rollback disposition reaches
-// neither a positive record nor the OS Event Log. Driven through the real
-// `observe_host_request` -> `publish_projected_event_log_record` ->
-// `try_admit_admitted_event` path with real `HostRequestProjection` values, so
-// a projection that started forwarding unproven outcomes fails here.
+// Executed case for external audit 5910159678 defect 2 — the single-terminal
+// repair this file owns: the launch leaf is phase-only and the ENCLOSING
+// operation contour owns the one terminal for a failed launch. Driven through
+// the three REAL production launch-config entry points
+// (`HostLaunchOptions::parse`, `::parse_system_service` and
+// `::validate_service_main_argv`, the exact seams `src/main.rs` drives at the
+// `run` and `run_as_scm_service` contours), so every string asserted on below
+// is one the OWNER passed to its own `host_launch_options_observe` helper.
+//
+// NAMED CEILING for the leaf itself: the exact producer of the launch terminal,
+// `host_job_launch::observe_launch_terminal` (and `HostJobBranches::start_approved`
+// beside it), lives in `mod host_job_launch`, which `src/lib.rs:37` declares
+// private, so no integration-test crate can drive it. This case therefore
+// proves the reachable half of the obligation — the launch-config contour that
+// `main.rs` really runs emits its phase and NO terminal — and does not pretend
+// to have exercised the leaf's own terminal owner.
 #[test]
-fn launch_15_rollback_positive_requires_owner_evidence() {
-    let unknown = capture_emit(|| {
-        observe_host_request(
-            &HostRequestProjection::unknown(EntrypointStage::Startup)
-                .with_operation(AdmittedEvent::ServiceStart),
-        );
+fn launch_15_one_terminal_owner_and_distinct_launch_facts() {
+    // A REJECTED real argv through the real entry point. `args[3]` is the
+    // config-descriptor digest, so this is a genuine typed rejection.
+    let mut rejected = None;
+    let rejected_capture = capture_emit(|| {
+        let mut args = valid_launch_args();
+        args[3] = OsString::from("ZZ".repeat(32));
+        rejected = Some(eliot_host::HostLaunchOptions::parse(args));
     });
     assert!(
-        unknown.contains("host.request"),
-        "no projection record: {unknown}"
+        matches!(rejected, Some(Err(eliot_host::HostError::Platform(_)))),
+        "a malformed digest must stay a typed Platform rejection"
     );
-    // `tracing_subscriber::fmt` renders every string-valued field through
-    // `Debug` (`DefaultVisitor::record_str` delegates to `record_debug`), so a
-    // frozen name reaches the record QUOTED: production writes
-    // `evidence="unknown"`, never the bare `evidence=unknown`. Bool and integer
-    // fields keep `Debug`'s unquoted rendering, which is why the `*_missing`
-    // pins below read `reason_missing=true`.
+    // Non-emptiness PRECONDITION, asserted before EVERY denial below: this
+    // capture really carries production output on this platform. It cannot be
+    // delegated to `note_event_log_sink_status`, which returns early where the
+    // #984 Event Log port answers `Ok` — as it does on this Windows host — and
+    // so contributes nothing to a capture there.
     assert!(
-        unknown.contains("evidence=\"unknown\""),
-        "got: {unknown}"
+        rejected_capture.contains(HOST_DIAGNOSTICS_TARGET),
+        "the capture must carry production output: {rejected_capture}"
     );
-    assert!(unknown.contains("reason_missing=true"), "got: {unknown}");
+    for frozen in [
+        "event=\"host.entrypoint_stage\"",
+        "stage=\"launch_config\"",
+        "detail=\"host.launch-options parse requested\"",
+        "detail=\"host.launch-options parse typed rejection\"",
+    ] {
+        assert!(
+            rejected_capture.contains(frozen),
+            "production must emit {frozen:?}, got: {rejected_capture}"
+        );
+    }
+    // The failed operation has its single terminal emitter in the ENCLOSING
+    // contour, so this leaf records the rejection and no terminal at all.
     assert_eq!(
-        count_occurrences(&unknown, "host.event_log_admission"),
+        count_occurrences(&rejected_capture, "host.terminal_error"),
         0,
-        "an unproven rollback disposition must never reach the Event Log: {unknown}"
+        "the launch leaf must not emit a terminal of its own: {rejected_capture}"
     );
-    // The positive claim is a TYPED claim, so it is denied on the exact
-    // rendered discriminant: `HostRequestEvidence` is the only slot that can
-    // assert a completed operation, and `AdmittedEvent::is_admitted_by`
-    // (`windows_event_log.rs:140`) admits the Event Log only for
-    // `process_started`, `durable_committed` and `failed`. Denying those exact
-    // values denies the record claim and its sink record at once, and cannot be
-    // slipped past by a renamed or re-worded label the way a bare substring
-    // scan of the capture can.
-    for forbidden in [
+    // A launch request, an admission, an observed process and an authenticated
+    // readiness are four DIFFERENT facts: a rejection claims neither the
+    // admission nor any liveness or readiness claim.
+    assert!(
+        !rejected_capture.contains("detail=\"host.launch-options parse admitted\""),
+        "a rejected argv must not also claim admission: {rejected_capture}"
+    );
+    for foreign in [
         "process_started",
         "semantically_ready",
         "durable_committed",
-        "cancelled",
+        "readiness",
     ] {
         assert!(
-            !unknown.contains(&format!("evidence=\"{forbidden}\"")),
-            "unknown rollback disposition held owner evidence {forbidden:?}: {unknown}"
+            !rejected_capture.contains(foreign),
+            "the launch leaf claimed {foreign:?}: {rejected_capture}"
         );
     }
-    // The rollback positives this case forbids are the CURRENT frozen labels of
-    // the rollback owner's contour map (`RollbackContour::label` in
-    // `phase_b_materialization/rollback_backup.rs`): a prepared sidecar, a
-    // verified restoration, a verified uncommitted removal, and a completed
-    // sidecar cleanup. That owner is unreachable from an integration-test crate
-    // (`mod phase_b_materialization` is private, and `phase_b_restore_or_remove`
-    // / `phase_b_remove_rollback_backup` are `pub` only inside it), so the
-    // labels are bound here by source scan and the positive-claim invariant is
-    // proved on the records production actually emitted.
-    let rollback = manifest_source("src/phase_b_materialization/rollback_backup.rs");
-    let rollback_positives = [
-        "host.phase-b rollback backup prepared",
-        "host.phase-b rollback restored verified",
-        "host.phase-b rollback uncommitted removal verified",
-        "host.phase-b rollback backup cleanup completed",
-    ];
-    for positive in rollback_positives {
-        assert!(
-            rollback.contains(&format!("\"{positive}\"")),
-            "rollback owner must still name {positive:?}"
-        );
-        assert!(
-            !unknown.contains(positive),
-            "unknown rollback disposition claimed {positive:?}: {unknown}"
-        );
-    }
-    // The owner's unproven dispositions are what an unproven outcome may name,
-    // and they stay a distinct vocabulary: none of them carries a positive.
-    for unproven in [
-        "host.phase-b rollback backup unknown retained",
-        "host.phase-b rollback uncommitted removal absence unproven",
-        "host.phase-b rollback uncommitted removal absence unknown",
-        "host.phase-b rollback backup cleanup absence unproven",
-    ] {
-        assert!(
-            rollback.contains(&format!("\"{unproven}\"")),
-            "rollback owner must still name {unproven:?}"
-        );
-        for positive in rollback_positives {
+    assert_launch_15_no_terminal(
+        &capture_emit(|| {
             assert!(
-                !unproven.contains(positive),
-                "unproven disposition {unproven:?} must not carry the positive {positive:?}"
+                eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()).is_ok(),
+                "valid SystemService argv must admit"
             );
-        }
-    }
-    // Same projection with owner evidence does record: the absence above is a
-    // decision production made, not a dead or unreachable path.
-    let started = capture_emit(|| {
-        observe_host_request(
-            &HostRequestProjection::process_started(EntrypointStage::Startup, 4242)
-                .with_operation(AdmittedEvent::ServiceStart),
-        );
+        }),
+        "an admitted SystemService bootstrap",
+        &[
+            "detail=\"host.launch-options parse admitted\"",
+            "detail=\"host.launch-options system-service admitted\"",
+        ],
+        "typed rejection",
+    );
+    // The SCM callback contour is a THIRD distinct fact: the argv request the
+    // Windows service entry point receives is neither an observed process nor a
+    // readiness, and it never borrows the plain-parse or system-service
+    // admission record.
+    let mut callback = None;
+    let callback_capture = capture_emit(|| {
+        callback = Some(eliot_host::HostLaunchOptions::validate_service_main_argv([
+            OsString::from(ELIOT_HOST_SERVICE_NAME),
+        ]));
     });
-    assert!(
-        started.contains("evidence=\"process_started\""),
-        "got: {started}"
+    assert!(matches!(callback, Some(Ok(()))), "the canonical ServiceMain argv must be admitted");
+    assert_launch_15_no_terminal(
+        &callback_capture,
+        "the SCM service-main callback",
+        &["detail=\"host.launch-options service-main admitted\""],
+        "service-main typed rejection",
     );
-    assert!(started.contains("process=4242"), "got: {started}");
-    assert!(started.contains("process_missing=false"), "got: {started}");
-    assert!(
-        started.contains("host.event_log_admission"),
-        "proven start must be admitted: {started}"
-    );
-    assert!(
-        started.contains("operation=\"service_start\""),
-        "got: {started}"
-    );
-    // A verified durable effect (the disposition a rollback restoration may
-    // reach once its readback proved it) stays distinguishable from the
-    // unproven pair, and a proven no-effect stop admits nothing.
-    let committed = capture_emit(|| {
-        observe_host_request(
-            &HostRequestProjection::durable_committed(EntrypointStage::ShutdownDrain)
-                .with_operation(AdmittedEvent::ServiceStop),
-        );
-    });
-    assert!(
-        committed.contains("evidence=\"durable_committed\""),
-        "got: {committed}"
-    );
-    assert!(
-        committed.contains("operation=\"service_stop\""),
-        "got: {committed}"
-    );
-    let cancelled = capture_emit(|| {
-        observe_host_request(
-            &HostRequestProjection::cancelled(EntrypointStage::Startup)
-                .with_operation(AdmittedEvent::ServiceStop),
-        );
-    });
-    assert!(
-        cancelled.contains("evidence=\"cancelled\""),
-        "got: {cancelled}"
-    );
-    assert_eq!(
-        count_occurrences(&cancelled, "host.event_log_admission"),
-        0,
-        "a vacuous disposition must not state a completed operation: {cancelled}"
-    );
-    // A proven no-effect stop is not a committed stop, so the durable
-    // discriminant is denied here on its exact rendered value as well.
-    assert!(
-        !cancelled.contains("evidence=\"durable_committed\""),
-        "a vacuous disposition held owner evidence \"durable_committed\": {cancelled}"
-    );
-    // Failure before verification keeps its exact typed reason and still
-    // admits only the failure event, never a stop.
-    let failed = capture_emit(|| {
-        observe_host_request(
-            &HostRequestProjection::failed(
-                EntrypointStage::Startup,
-                &eliot_host::HostError::RecoveryRequired("unread-back".to_owned()),
-            )
-            .with_operation(AdmittedEvent::ServiceFailure),
-        );
-    });
-    assert!(failed.contains("evidence=\"failed\""), "got: {failed}");
-    assert!(
-        failed.contains("reason=\"recovery_required\""),
-        "got: {failed}"
-    );
-    assert!(failed.contains("reason_missing=false"), "got: {failed}");
-    assert!(
-        failed.contains("operation=\"service_failure\""),
-        "got: {failed}"
-    );
-    assert!(
-        !failed.contains("unread-back"),
-        "the error payload must not cross the record: {failed}"
-    );
-    assert!(
-        !failed.contains("host.terminal_error"),
-        "a failed projection is subordinate, never a second terminal: {failed}"
-    );
-    // Failure before verification is not owner evidence either, so it carries
-    // no rollback positive: the restoration / removal / cleanup claims stay
-    // unreachable from it exactly as they are from an unknown outcome. The
-    // typed denial is repeated here so the obligation does not rest on the
-    // long rollback labels alone.
-    for forbidden in [
-        "process_started",
-        "semantically_ready",
-        "durable_committed",
-        "cancelled",
+    for other in [
+        "detail=\"host.launch-options parse admitted\"",
+        "detail=\"host.launch-options system-service admitted\"",
     ] {
         assert!(
-            !failed.contains(&format!("evidence=\"{forbidden}\"")),
-            "failed rollback disposition held owner evidence {forbidden:?}: {failed}"
+            !callback_capture.contains(other),
+            "the SCM callback contour claimed {other:?}: {callback_capture}"
         );
     }
-    for positive in rollback_positives {
-        assert!(
-            !failed.contains(positive),
-            "failed rollback disposition claimed {positive:?}: {failed}"
-        );
+}
+
+/// Asserts that a REAL production capture names `positive`, never `negative`,
+/// and carries no terminal record of its own.
+///
+/// `capture` is asserted non-empty FIRST, so the terminal denial below cannot
+/// be satisfied by an empty capture — on this Windows host an empty capture is
+/// exactly what a dropped `INFO` phase produces and would make the denial
+/// vacuous.
+fn assert_launch_15_no_terminal(capture: &str, contour: &str, positive: &[&str], negative: &str) {
+    assert!(
+        capture.contains("host.entrypoint_stage"),
+        "{contour} must carry production output: {capture}"
+    );
+    for frozen in positive {
+        assert!(capture.contains(frozen), "{contour} must emit {frozen:?}: {capture}");
     }
+    assert!(!capture.contains(negative), "{contour} claimed {negative:?}: {capture}");
+    assert_eq!(
+        count_occurrences(&capture, "host.terminal_error"),
+        0,
+        "{contour} must leave its terminal to the enclosing operation guard: {capture}"
+    );
 }
