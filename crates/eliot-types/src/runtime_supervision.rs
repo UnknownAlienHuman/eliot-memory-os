@@ -380,21 +380,21 @@ pub struct OperationRuntimeCheckpoint {
     pub schema_version: String,
     #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
-    #[serde(deserialize_with = "deserialize_invocation_id")]
+    #[serde(default, deserialize_with = "deserialize_invocation_id")]
     pub invocation_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_optional_adapter_id")]
+    #[serde(default, deserialize_with = "deserialize_optional_adapter_id")]
     pub adapter_id: Option<String>,
     pub generation: u64,
     pub phase: OperationPhase,
     pub dispatch_state: ProviderDispatchState,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
-    #[serde(deserialize_with = "deserialize_optional_root_pid")]
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub root_process_start_ticks: Option<u64>,
-    #[serde(deserialize_with = "deserialize_root_executable_sha256")]
+    #[serde(default, deserialize_with = "deserialize_root_executable_sha256")]
     pub root_executable_sha256: Option<String>,
-    #[serde(deserialize_with = "deserialize_optional_job_object_name")]
+    #[serde(default, deserialize_with = "deserialize_optional_job_object_name")]
     pub job_object_name: Option<String>,
     pub active_process_count: u32,
     pub stdin_bytes: u64,
@@ -414,10 +414,10 @@ pub struct OperationRuntimeCheckpoint {
     pub absolute_deadline_at: OffsetDateTime,
     pub restart_count: u32,
     pub restart_window_started_at: Option<String>,
-    #[serde(deserialize_with = "deserialize_role_lease_id")]
+    #[serde(default, deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
-    #[serde(deserialize_with = "deserialize_runtime_contract_sha256")]
+    #[serde(default, deserialize_with = "deserialize_runtime_contract_sha256")]
     pub runtime_contract_sha256: Option<String>,
     pub last_error_class: Option<String>,
     pub last_evidence_refs: Vec<String>,
@@ -800,7 +800,7 @@ pub struct ProcessReapReceipt {
     pub generation: u64,
     #[serde(deserialize_with = "deserialize_job_object_name")]
     pub job_object_name: String,
-    #[serde(deserialize_with = "deserialize_optional_root_pid")]
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub process_count_before: u32,
     pub process_count_after: u32,
@@ -878,9 +878,9 @@ pub struct RuntimeCoreHealth {
     pub db_ready: bool,
     pub writer_ready: bool,
     pub read_service_ready: bool,
-    #[serde(deserialize_with = "deserialize_optional_service_generation")]
+    #[serde(default, deserialize_with = "deserialize_optional_service_generation")]
     pub service_generation: Option<String>,
-    #[serde(deserialize_with = "deserialize_executable_sha256")]
+    #[serde(default, deserialize_with = "deserialize_executable_sha256")]
     pub executable_sha256: Option<String>,
 }
 
@@ -919,7 +919,7 @@ pub struct RuntimeOperationDetail {
     pub phase: OperationPhase,
     pub last_progress_at: String,
     pub phase_deadline_at: String,
-    #[serde(deserialize_with = "deserialize_optional_root_pid")]
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub active_process_count: u32,
     pub stdin_state: String,
@@ -927,7 +927,7 @@ pub struct RuntimeOperationDetail {
     pub stderr_state: String,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
-    #[serde(deserialize_with = "deserialize_role_lease_id")]
+    #[serde(default, deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
 }
@@ -963,9 +963,9 @@ pub struct RuntimeAuthorityIntegrity {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIntegrityHealth {
     pub clean: bool,
-    #[serde(deserialize_with = "deserialize_expected_governor_sha256")]
+    #[serde(default, deserialize_with = "deserialize_expected_governor_sha256")]
     pub expected_governor_sha256: Option<String>,
-    #[serde(deserialize_with = "deserialize_observed_governor_sha256")]
+    #[serde(default, deserialize_with = "deserialize_observed_governor_sha256")]
     pub observed_governor_sha256: Option<String>,
     pub locked_active_binary: Option<String>,
     pub process_orphans: u32,
@@ -1074,6 +1074,19 @@ mod tests {
         assert!(decoded.proves_complete_reap());
     }
 
+    fn identity_field(identity: &str) -> &'static str {
+        match identity {
+            r#""invocation_id":"""# => "invocation_id",
+            r#""adapter_id":"""# => "adapter_id",
+            r#""root_executable_sha256":"""# => "root_executable_sha256",
+            r#""job_object_name":"""# => "job_object_name",
+            r#""role_lease_id":"""# => "role_lease_id",
+            r#""runtime_contract_sha256":"""# => "runtime_contract_sha256",
+            r#""root_pid":0"# => "root_pid",
+            other => panic!("unmapped identity fixture {other}"),
+        }
+    }
+
     #[test]
     fn optional_protected_checkpoint_identities_refuse_spelled_out_absences() {
         const CHECKPOINT_PREFIX: &str = concat!(
@@ -1096,14 +1109,22 @@ mod tests {
         ] {
             let bytes = checkpoint(identity);
             let decoded: Result<OperationRuntimeCheckpoint, _> = serde_json::from_str(&bytes);
-            assert!(
-                decoded.is_err(),
+            let refusal = decoded.expect_err(&format!(
                 "{identity} is a spelled-out absence and must not decode"
+            ));
+            assert!(
+                refusal.to_string().contains(identity_field(identity)),
+                "{identity} must be refused for its own reason, not by an unrelated \
+                 failure anywhere in the record: {refusal}"
             );
         }
         let absent: Result<OperationRuntimeCheckpoint, _> =
             serde_json::from_str(&checkpoint(r#""adapter_id":null"#));
-        assert!(absent.is_ok(), "a genuine absence must stay decodable");
+        assert!(
+            absent.is_ok(),
+            "a genuine absence must stay decodable: {:?}",
+            absent.err()
+        );
     }
 
     fn empty_captured(root_pid: u32) -> DescendantsAtRootExit {
