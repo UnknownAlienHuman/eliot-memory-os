@@ -244,18 +244,28 @@ fn frame_bytes() -> TestResult<Vec<u8>> {
     )?)
 }
 
-fn coverage_plan<'a>(
-    fingerprint: &'a RunFingerprint,
-    allowed_manifest_digest: &'a str,
-) -> CoverageManifestPlan<'a> {
-    CoverageManifestPlan {
-        fingerprint,
-        allowed_manifest_digest,
-        expected_event_sources_and_event_classes: vec!["acp:execution-unit".to_owned()],
-        observable_actions: vec!["session-update".to_owned()],
-        unobservable_actions: vec!["host-filesystem-access".to_owned()],
-        missing_source_reasons: vec!["host-access-observation-not-exposed".to_owned()],
-        coverage_by_material_action_and_effect_route: vec![MaterialActionCoverage {
+/// The declared coverage content the run may not mint itself.
+///
+/// [`CoverageManifestPlan`] borrows every collection and the denominator origin
+/// rather than owning them, so the declared values are owned here and the plan
+/// borrows them for exactly as long as the test holds this fixture.
+struct CoveragePlanFixture {
+    expected_event_sources_and_event_classes: [String; 1],
+    observable_actions: [String; 1],
+    unobservable_actions: [String; 1],
+    missing_source_reasons: [String; 1],
+    coverage_by_material_action_and_effect_route: [MaterialActionCoverage; 1],
+    denominator_origin_and_sampling_policy: DenominatorOrigin,
+    invalidation_dependencies: [String; 1],
+}
+
+fn coverage_plan() -> CoveragePlanFixture {
+    CoveragePlanFixture {
+        expected_event_sources_and_event_classes: ["acp:execution-unit".to_owned()],
+        observable_actions: ["session-update".to_owned()],
+        unobservable_actions: ["host-filesystem-access".to_owned()],
+        missing_source_reasons: ["host-access-observation-not-exposed".to_owned()],
+        coverage_by_material_action_and_effect_route: [MaterialActionCoverage {
             action_or_effect_route: "acp:execution-unit".to_owned(),
             covered: true,
             detail: "one retained committed execution-unit record".to_owned(),
@@ -264,8 +274,29 @@ fn coverage_plan<'a>(
             origin: "durable-host-event-journal".to_owned(),
             sampling_policy: "every-committed-record".to_owned(),
         },
-        completeness: CoverageCompleteness::Partial,
-        invalidation_dependencies: vec!["host-event-journal-reset".to_owned()],
+        invalidation_dependencies: ["host-event-journal-reset".to_owned()],
+    }
+}
+
+impl CoveragePlanFixture {
+    fn plan<'a>(
+        &'a self,
+        fingerprint: &'a RunFingerprint,
+        allowed_manifest_digest: &'a str,
+    ) -> CoverageManifestPlan<'a> {
+        CoverageManifestPlan {
+            fingerprint,
+            allowed_manifest_digest,
+            expected_event_sources_and_event_classes: &self.expected_event_sources_and_event_classes,
+            observable_actions: &self.observable_actions,
+            unobservable_actions: &self.unobservable_actions,
+            missing_source_reasons: &self.missing_source_reasons,
+            coverage_by_material_action_and_effect_route:
+                &self.coverage_by_material_action_and_effect_route,
+            denominator_origin_and_sampling_policy: &self.denominator_origin_and_sampling_policy,
+            completeness: CoverageCompleteness::Partial,
+            invalidation_dependencies: &self.invalidation_dependencies,
+        }
     }
 }
 
@@ -312,13 +343,14 @@ fn run_produces_and_delivers_execution_unit_events_with_owner_route_evidence() -
     }];
 
     let mut journal = DurableHostEventJournal::new();
+    let coverage = coverage_plan();
     let run = CoverageManifestRun {
         stream_ids: &[STREAM],
         manifest_digest: allowed_manifest_digest,
         manifest_revision: "rev-2645",
         declared_tool_names: &[],
         forbidden_tool_names: &[],
-        plan: coverage_plan(&fingerprint, allowed_manifest_digest),
+        plan: coverage.plan(&fingerprint, allowed_manifest_digest),
     };
 
     let outcome = run_ingest_for_fingerprint(&mut journal, &run, &events, |_| true)?;
@@ -428,13 +460,14 @@ fn run_refuses_foreign_observation_boundary_before_any_mutation() -> TestResult 
     }];
 
     let mut journal = DurableHostEventJournal::new();
+    let coverage = coverage_plan();
     let run = CoverageManifestRun {
         stream_ids: &[STREAM],
         manifest_digest: allowed_manifest_digest,
         manifest_revision: "rev-2645",
         declared_tool_names: &[],
         forbidden_tool_names: &[],
-        plan: coverage_plan(&fingerprint, allowed_manifest_digest),
+        plan: coverage.plan(&fingerprint, allowed_manifest_digest),
     };
 
     let refused = run_ingest_for_fingerprint(&mut journal, &run, &events, |_| true)
