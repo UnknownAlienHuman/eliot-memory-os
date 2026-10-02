@@ -6,12 +6,13 @@ pub(super) use readiness_append::{
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
 use eliot_host_state::{
-    ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
-    EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
-    HostKernelStoreLineage, HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION,
-    JournalBackend, JournalError, JournalManifest, KernelJobBinding,
-    KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps, PriorKernelDisposition,
-    PriorKernelSource, ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
+    ActivationState, AppendDisposition, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord,
+    DrainState, EliotActivationRecord, EpochTransition, FailureRecoveryDirective,
+    HostInstallationEpoch, HostKernelStoreLineage, HostState, HostStateJournalService,
+    HostStateRecord, JOURNAL_VERSION, JournalBackend, JournalError, JournalManifest,
+    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
+    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
+    WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -33,12 +34,18 @@ use eliot_runtime_contracts::{
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never records,
 // receipts, digests, or arbitrary error text — so bounding limits size, not
-// sensitivity (I15.4). Requested append, durable observed append, and
-// unknown outcome stay distinct (I14.21): possible loss is never promoted
-// into a receipt. These primitives own no terminal: a single terminal per
-// failed journal operation is enforced by the outermost owner boundary in
-// `lib.rs` (#891) or Host composition (#893), while these phases correlate
-// by stage order only. Sink outcome never alters result/order/cleanup.
+// sensitivity (I15.4). Requested append, a NEW durable commit, an EXACT
+// COMMITTED REPLAY/readback, committed reconciliation, known noncommit and a
+// still-unknown outcome stay distinct (I14.20 `RECONCILING` cannot create a new
+// effect; I14.21 assigns different recovery to known noncommit and unknown
+// outcome; case 11): possible loss is never promoted into a receipt, and a
+// committed replay is never reported as another append. A readback that fails
+// after committed reconciliation keeps "commit known, readback failed" while
+// the original typed error still propagates. These primitives own no terminal:
+// a single terminal per failed journal operation is enforced by the outermost
+// owner boundary in `lib.rs` (#891) or Host composition (#893), while these
+// phases correlate by stage order only. Sink outcome never alters
+// result/order/cleanup.
 fn host_journal_observe(detail: &str) {
     let _ = crate::windows_event_log::event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
@@ -491,21 +498,58 @@ pub(super) fn degraded_activation(
 /// design; `append_readiness_observation` enforces the approved contour), but
 /// the durable-outcome handling does not fork. Each caller performs its own
 /// retry append so its by-value record stays consumed (moved) into the retry
-/// instead of only cloned inside a closure.
+/// instead of only cloned inside a closure. All three owner verdicts are
+/// observed distinctly (I14.21); the retry/fail-closed policy below is
+/// unchanged from before and stays the semantic owner's to change.
 fn reconcile_unknown_outcome<B: JournalBackend>(
     journal: &HostStateJournalService<B>,
     transaction_id: &PlatformHandle,
 ) -> Result<bool, HostError> {
     match journal.reconcile(transaction_id)? {
+        // The exact original transaction committed. The caller's re-entry into
+        // the idempotent append owner then only verifies that commit through
+        // its replay receipt; it creates no new effect.
         ReconcileOutcome::Committed => {
             host_journal_observe("host.journal reconcile committed observed");
             Ok(true)
         }
-        ReconcileOutcome::NotCommitted | ReconcileOutcome::StillUnknown => {
+        // I14.21 assigns a known rollback/noncommit a different recovery path
+        // from an unknown outcome, so the two owner verdicts must stay distinct
+        // in the diagnostic history. This caller keeps its existing fail-closed
+        // policy (both refuse with the same typed `OutcomeUnknown` error the
+        // owner produced); only the observed record differs. Changing that
+        // caller policy is the semantic owner's decision, not a diagnostic one.
+        ReconcileOutcome::NotCommitted => {
+            host_journal_observe("host.journal reconcile not committed observed");
+            Err(HostError::Journal(JournalError::OutcomeUnknown {
+                transaction_id: transaction_id.clone(),
+            }))
+        }
+        ReconcileOutcome::StillUnknown => {
             host_journal_observe("host.journal reconcile unknown observed");
             Err(HostError::Journal(JournalError::OutcomeUnknown {
                 transaction_id: transaction_id.clone(),
             }))
+        }
+    }
+}
+
+/// Names the owner-issued disposition of one committed append receipt without
+/// creating, repeating or re-interpreting an effect.
+///
+/// I14.20 (`RECONCILING` cannot create a new effect) and case 11 require the
+/// two owner dispositions to stay distinct: [`AppendDisposition::Applied`] is
+/// this call's NEW durable commit, while [`AppendDisposition::Replayed`] is
+/// the exact readback of an already committed operation, not another append.
+/// The receipt is the owner's own verdict; this branch only observes which one
+/// the owner returned.
+fn observe_append_outcome(receipt: &AppendReceipt) {
+    match receipt.disposition() {
+        AppendDisposition::Applied => {
+            host_journal_observe("host.journal append durable observed");
+        }
+        AppendDisposition::Replayed => {
+            host_journal_observe("host.journal append committed replay observed");
         }
     }
 }
@@ -517,13 +561,28 @@ pub(super) fn append_reconciled<B: JournalBackend>(
     host_journal_observe("host.journal append requested");
     match journal.append(record.clone()) {
         Ok(receipt) => {
-            host_journal_observe("host.journal append durable observed");
+            observe_append_outcome(&receipt);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             host_journal_observe("host.journal append outcome unknown observed");
             if reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal.append(record).map_err(HostError::Journal)
+                // Reconciliation proved the exact original transaction committed,
+                // so re-entering the idempotent append owner only VERIFIES that
+                // commit through its replay receipt; it creates no new effect.
+                // A failed readback keeps "commit known, readback failed" in the
+                // diagnostic history while the owner's own error propagates
+                // unchanged to this caller.
+                match journal.append(record) {
+                    Ok(receipt) => {
+                        observe_append_outcome(&receipt);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        host_journal_observe("host.journal commit known readback failed observed");
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
