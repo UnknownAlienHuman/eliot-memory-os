@@ -602,6 +602,83 @@ mod tests {
         super::parse_manifest(&replace_once(MANIFEST_TEXT, from, to))
     }
 
+    /// The last real learning-closure ref and owner row, as written on disk.
+    const LAST_REF: &str = "  \"governor.daemon.learning-closure\",\n";
+    const LAST_ROW: &str = "  { cell = \"governor.daemon.learning-closure\", state = \"learning-closure\", owner = \"eliot_governor::LearningClosureService\" },\n";
+
+    /// Add one tenth cell to BOTH real files, naming the same owner in each.
+    ///
+    /// The ref goes into `functional_cell_refs` and the owner row into
+    /// `functional_cell_state_owners`, so the addition stays internally
+    /// consistent; the contract gains one matching projection row.
+    fn add_declared_cell(cell: &str, state: &str, owner: &str) -> (String, String) {
+        let manifest = replace_once(
+            MANIFEST_TEXT,
+            LAST_REF,
+            &format!("{LAST_REF}  \"{cell}\",\n"),
+        );
+        let manifest = replace_once(
+            &manifest,
+            LAST_ROW,
+            &format!("{LAST_ROW}{}", owner_row(cell, state, owner)),
+        );
+        let contract = replace_once(
+            CONTRACT_TEXT,
+            "# END GENERATED declared_functional_cell",
+            &format!(
+                "[[declared_functional_cell]]\ncell = \"{cell}\"\ndeclared_by = \
+                 \"bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs\"\n\
+                 mutable_state_owner = \"{owner}\"\n# END GENERATED declared_functional_cell"
+            ),
+        );
+        (manifest, contract)
+    }
+
+    /// The real guard's stage order over one mutated pair: parse both texts,
+    /// then run the two production comparison stages unchanged.
+    ///
+    /// `enforce_declared_cells` itself takes no arguments (it reads its own
+    /// baked bytes), so its two stages are invoked exactly as the guard
+    /// invokes them, in the guard's order, to reach the later stage.
+    fn compiled_table_drift_over(
+        manifest_text: &str,
+        contract_text: &str,
+    ) -> Result<(), super::CellRegistryError> {
+        let manifest = super::parse_manifest(manifest_text)?;
+        let contract = parse_contract(contract_text)?;
+        enforce_manifest_contract_agreement(&manifest, &contract)?;
+        enforce_compiled_table(&manifest)
+    }
+
+    #[test]
+    fn a_cell_the_compiled_registry_lacks_is_compiled_table_drift() {
+        // Arm: one tenth cell is added to BOTH real files with the same owner,
+        // so every earlier stage passes -- refs and owner rows still agree,
+        // owners are still distinct, and manifest and contract still name the
+        // same cells with the same owners. The compiled `DECLARED_CELLS` table
+        // still carries only eight rows, which is the exact
+        // "declaration moved ahead of the compiled registry" defect: only the
+        // compiled-table stage can refuse it, and it must name the cell.
+        let (manifest, contract) = add_declared_cell(
+            "governor.daemon.operator-replay-extra",
+            "operator-replay-extra",
+            "eliotd::controlboard_adapters::ExtraOperatorReplay",
+        );
+
+        let Err(error) = compiled_table_drift_over(&manifest, &contract) else {
+            panic!("a declared cell with no compiled registry row must not pass");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::CompiledTableDrift {
+                cell: "governor.daemon.operator-replay-extra".to_owned(),
+                compiled_owner: "<missing>".to_owned(),
+                manifest_owner: "eliotd::controlboard_adapters::ExtraOperatorReplay".to_owned(),
+            },
+            "the typed refusal must name the cell the compiled registry lacks"
+        );
+    }
+
     #[test]
     fn one_owner_claiming_two_cells_is_duplicate_owner() {
         // Arm (I2.23 second-owner defect): the real
