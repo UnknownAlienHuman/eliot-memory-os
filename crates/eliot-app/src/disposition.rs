@@ -1953,3 +1953,57 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
     crate::cell_declaration_registry::cell_declaration_guard()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Disposition, INVENTORY_REVISION, current_consumer_inventory, expiry_condition_guard,
+        first_iso_date_digits, iso_date_text,
+    };
+
+    /// Digits of the first `YYYY-MM-DD` token in `text`, decoded to integers.
+    fn iso_digits(text: &str) -> [u32; 8] {
+        let digits = first_iso_date_digits(text)
+            .unwrap_or_else(|| panic!("expiry text carries no YYYY-MM-DD token: {text}"));
+        digits.map(u32::from)
+    }
+
+    #[test]
+    fn expiry_condition_guard_accepts_the_shipped_inventory_and_never_invents_a_deadline() {
+        // Production entry point under test.
+        assert_eq!(
+            expiry_condition_guard(),
+            Ok(()),
+            "the shipped inventory must pass the expiry/removal-condition guard at the entry gate"
+        );
+
+        let inventory = current_consumer_inventory();
+        let fixtures = inventory
+            .iter()
+            .filter(|entry| entry.disposition == Disposition::TemporaryFixture)
+            .collect::<Vec<_>>();
+        assert!(
+            !fixtures.is_empty(),
+            "the guard would be blind with no temporary fixture in the inventory"
+        );
+
+        let revision = iso_digits(INVENTORY_REVISION);
+        for entry in &fixtures {
+            let expiry = entry.expiry.to_ascii_lowercase();
+            assert!(
+                expiry.contains("remove"),
+                "temporary fixture {} records no removal condition in {:?}",
+                entry.proof,
+                entry.expiry
+            );
+            let expiry_digits = first_iso_date_digits(entry.expiry)
+                .unwrap_or_else(|| panic!("{} carries no YYYY-MM-DD token", entry.proof));
+            assert!(
+                expiry_digits.map(u32::from) > revision,
+                "temporary fixture {} expired on {} against inventory revision {INVENTORY_REVISION}",
+                entry.proof,
+                iso_date_text(expiry_digits)
+            );
+        }
+    }
+}
