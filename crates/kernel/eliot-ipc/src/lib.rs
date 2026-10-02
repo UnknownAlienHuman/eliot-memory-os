@@ -3420,12 +3420,12 @@ mod tests {
         use eliot_contracts::{EpochId, EpochLineageId};
         use std::num::NonZeroU64;
         let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical test lineage-A");
+            .unwrap_or_else(|error| panic!("canonical test lineage-A: {error:?}"));
         EpochId::new(
             lineage,
-            NonZeroU64::new(sequence).expect("non-zero test sequence"),
+            NonZeroU64::new(sequence).unwrap_or_else(|| panic!("non-zero test sequence")),
         )
-        .expect("valid test epoch")
+        .unwrap_or_else(|error| panic!("valid test epoch: {error:?}"))
     }
 
     fn module_generation(epoch: u64) -> Result<ModuleGeneration, serde_json::Error> {

@@ -814,7 +814,11 @@ mod rollback_contour_tests {
 
         /// Retains a handle that does NOT share delete, so a real
         /// `remove_file` against it fails with a sharing violation.
-        fn hold_without_delete_sharing(&self, path: &Path) -> std::fs::File {
+        ///
+        /// Takes no `self`: the retained handle depends only on the exact path
+        /// it opens and the share mode below, never on fixture state, so a
+        /// receiver here would assert a binding the helper does not have.
+        fn hold_without_delete_sharing(path: &Path) -> std::fs::File {
             std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -829,7 +833,11 @@ mod rollback_contour_tests {
         /// genuinely proves absence. This helper exists to pin that platform
         /// fact, not to manufacture an unproven absence — a live handle alone
         /// can never make the sidecar still enumerated.
-        fn hold_with_delete_sharing(&self, path: &Path) -> std::fs::File {
+        ///
+        /// Takes no `self`, for the same reason as
+        /// `Fixture::hold_without_delete_sharing`: the handle depends only on
+        /// the exact path and the share mode below.
+        fn hold_with_delete_sharing(path: &Path) -> std::fs::File {
             std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -845,7 +853,7 @@ mod rollback_contour_tests {
         }
     }
 
-    /// WORK_UNIT_CASE: 980/14 — a prepared sidecar is stated as prepared, with
+    /// `WORK_UNIT_CASE: 980/14` — a prepared sidecar is stated as prepared, with
     /// the owner-held profile projected as a 1:1 typed label.
     #[test]
     fn backup_preparation_is_observed_as_prepared_only_after_the_exact_readback() {
@@ -886,7 +894,7 @@ mod rollback_contour_tests {
         assert!(sidecar.is_file(), "the retained sidecar must exist");
     }
 
-    /// WORK_UNIT_CASE: 980/15 — restoration is stated as requested and then as
+    /// `WORK_UNIT_CASE: 980/15` — restoration is stated as requested and then as
     /// verified, carrying the owner's own sidecar digest so two rollbacks of the
     /// same profile over different material are never byte-identical records.
     #[test]
@@ -943,7 +951,7 @@ mod rollback_contour_tests {
         );
     }
 
-    /// WORK_UNIT_CASE: 980/16 — with neither a sidecar nor a destination there
+    /// `WORK_UNIT_CASE: 980/16` — with neither a sidecar nor a destination there
     /// is nothing to restore and nothing uncommitted to remove. The state map
     /// states it with the explicit not-required disposition, so a silent no-op
     /// can never be confused with an unproven removal.
@@ -979,7 +987,7 @@ mod rollback_contour_tests {
         }
     }
 
-    /// WORK_UNIT_CASE: 980/17 — CRITICAL: `uncommitted removal verified` is
+    /// `WORK_UNIT_CASE: 980/17` — CRITICAL: `uncommitted removal verified` is
     /// UNREACHABLE when the delete does not succeed. A destination whose bytes
     /// are not the immutable template is genuinely removal-requested, the real
     /// delete then fails against a retained no-delete-sharing handle, and the
@@ -995,7 +1003,7 @@ mod rollback_contour_tests {
             .unwrap_or_else(|error| panic!("seed destination: {error}"));
         let template_digest = phase_b_bytes_digest(template)
             .unwrap_or_else(|error| panic!("template digest: {error}"));
-        let _blocking = fixture.hold_without_delete_sharing(&destination);
+        let _blocking = Fixture::hold_without_delete_sharing(&destination);
 
         let record = capture(|| {
             let outcome = phase_b_restore_or_remove(
@@ -1033,7 +1041,7 @@ mod rollback_contour_tests {
         );
     }
 
-    /// WORK_UNIT_CASE: 980/18 — a destination that still holds exactly the
+    /// `WORK_UNIT_CASE: 980/18` — a destination that still holds exactly the
     /// immutable template has no uncommitted material, so no removal is
     /// requested and the state is stated as not required. The template is
     /// retained on disk.
@@ -1079,7 +1087,7 @@ mod rollback_contour_tests {
         );
     }
 
-    /// WORK_UNIT_CASE: 980/19 — sidecar cleanup is stated as requested and then
+    /// `WORK_UNIT_CASE: 980/19` — sidecar cleanup is stated as requested and then
     /// completed, and the cleanup contour owns no profile so it renders the
     /// explicit missing-evidence disposition instead of a fabricated identity.
     #[test]
@@ -1119,7 +1127,7 @@ mod rollback_contour_tests {
         assert!(!sidecar.exists(), "the retained sidecar must be gone");
     }
 
-    /// WORK_UNIT_CASE: 980/20 — CRITICAL: `backup cleanup completed` is gated on
+    /// `WORK_UNIT_CASE: 980/20` — CRITICAL: `backup cleanup completed` is gated on
     /// a `NotFound` classification and on nothing else, and on Windows that gate
     /// is exact even while a delete-sharing handle is still live.
     ///
@@ -1157,7 +1165,7 @@ mod rollback_contour_tests {
         .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
         let sidecar = phase_b_rollback_path(&destination, "Store config")
             .unwrap_or_else(|error| panic!("sidecar path: {error}"));
-        let _pending = fixture.hold_with_delete_sharing(&sidecar);
+        let _pending = Fixture::hold_with_delete_sharing(&sidecar);
         assert!(
             matches!(
                 rollback_path_presence(&sidecar),
@@ -1211,7 +1219,7 @@ mod rollback_contour_tests {
         );
     }
 
-    /// WORK_UNIT_CASE: 980/21 — a cleanup delete that cannot succeed is stated
+    /// `WORK_UNIT_CASE: 980/21` — a cleanup delete that cannot succeed is stated
     /// as failed, and the positive completion claim stays unreachable.
     #[test]
     fn cleanup_never_claims_completed_when_the_delete_fails() {
@@ -1230,7 +1238,7 @@ mod rollback_contour_tests {
         .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
         let sidecar = phase_b_rollback_path(&destination, "Store config")
             .unwrap_or_else(|error| panic!("sidecar path: {error}"));
-        let _blocking = fixture.hold_without_delete_sharing(&sidecar);
+        let _blocking = Fixture::hold_without_delete_sharing(&sidecar);
 
         let record = capture(|| {
             let outcome = phase_b_remove_rollback_backup(&destination, "Store config");
@@ -1250,7 +1258,7 @@ mod rollback_contour_tests {
         );
     }
 
-    /// WORK_UNIT_CASE: 980/22 — a destination with no derivable rollback path is
+    /// `WORK_UNIT_CASE: 980/22` — a destination with no derivable rollback path is
     /// rejected before any file effect, and the rejection is stated as a path
     /// failure rather than as a completion.
     #[test]
