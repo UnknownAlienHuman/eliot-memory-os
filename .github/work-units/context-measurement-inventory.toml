@@ -1,11 +1,11 @@
-inventory_digest = "790974ece88f51eced08d8c682543e4df12ae89d1550e4306dc292751ce530d5"
+inventory_digest = "5b626675b3263ea03359e046e31f7813e500d3ee116c31658f915393c6045ba6"
 proposed_splits = []
 
 [header]
 schema = "eliot.context-measurement-inventory.v2"
 rule_revision = "866.4"
 tool_version = "0.2.0"
-source_sha = "857670028f5272f2b3d926f95e34436f4a158c28adfaaad3ccc64bf184b490c2"
+source_sha = "5ccda11c9c0caf381bcaf763ed174f948d742b38bc3437e219a77bddae01dd7c"
 source_sha_kind = "sha256 over sorted <path>:<sha256> of the declared scan roots; the generated artifact is never one of its own inputs, so committing it does not stale the inventory"
 rule_digest = "14421b66e43380d1e4a362571bb561c0d7d871ab8ee012dd3245d0320bf8a70e"
 owner_digest = "0b937c796a591bc265b2512277d7aa397920eaa521a0fd7a2467aa053b2397cb"
@@ -13,7 +13,7 @@ owner_map_path = ".github/work-units/context-measurement-owner-map.toml"
 owner_map_status = "SUPPLIED"
 owner_map_digest = "1e598dc28c46b8556831edaf4962a7ba703aa30f72b4020eef13c2208454dee0"
 scan_denominator_files = 27
-scan_denominator_bytes = 1477755
+scan_denominator_bytes = 1479625
 candidate_count = 72
 classified_count = 72
 owned_count = 68
@@ -29,7 +29,7 @@ scan_roots = ["crates/eliot-app/src/commands/data_and_memory.rs", "crates/eliot-
 exclusions = ["exc/1|crates/eliot-app/src/cognitive_field_runner.rs:11659-11659|unrelated_byte_or_character_metric|83224db3c2de82a5|collection-length partition for execution chunking (executions/target_chunks); no byte/char/token/STU semantic|declared unrelated byte/character metric: 'executions.len().div_ceil(target_chunks)'; excluded with exact evidence, not a package skip", "exc/2|crates/eliot-app/src/host_runtime/event_and_authority.rs:2907-2907|unrelated_byte_or_character_metric|8a15cd14ee1d7efe|seconds-to-minutes ceiling for a TTL; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'input.ttl_seconds.div_ceil(60)'; excluded with exact evidence, not a package skip", "exc/3|crates/eliot-app/src/host_runtime/supervised_process.rs:1545-1545|unrelated_byte_or_character_metric|2fb187414f7c18f4|digest text length bound on a hash string; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'hash.chars().count() <= 128'; excluded with exact evidence, not a package skip", "exc/4|crates/eliot-app/src/host_runtime/supervised_process.rs:1576-1576|unrelated_byte_or_character_metric|1b53d5d338573ec6|log-detail truncation bound; no byte/char/token/STU semantic|declared unrelated byte/character metric: 'if detail.chars().count() > 512'; excluded with exact evidence, not a package skip", "exc/5|crates/eliot-engine/src/host.rs:188-188|unrelated_byte_or_character_metric|bd25287324ab7b71|nonblank markdown line count for a skill body; a documentation metric, never divided or relabelled as tokens|declared unrelated byte/character metric: 'let nonblank_lines = body.lines().filter(|line| !line.trim().is_empty()).count()'; excluded with exact evidence, not a package skip", "exc/6|crates/eliot-engine/src/host.rs:186-186|unrelated_byte_or_character_metric|2a73328ae0d67216|summed description character count reported only as listing_characters; never divided or relabelled as tokens|declared unrelated byte/character metric: 'descriptions += description_characters'; excluded with exact evidence, not a package skip"]
 classifications = ["exact-utf8-envelope", "normative-stu-estimate", "serializer-identity-bound", "route-identity-bound", "estimator-policy-unvalidated", "capacity-fit-analysis", "exact-observation", "stale-or-absent-observation", "transformed-observation", "test-only", "token_estimate_without_tokenizer", "character_count_mislabeled_as_tokens", "bare_measurement_field_or_conversion", "unrelated_byte_or_character_metric", "unresolved"]
 owner_allocations = ["#704:9", "#783:21", "#878:17", "#880:21", "unresolved:4"]
-consumer_worksets_digest = "4d2da1c01e8c4a846deb30ddad4a43c7838348b897f0618bfbc2175dbf04a797"
+consumer_worksets_digest = "bdb659c8121e182450e9ab7ddff4321eafa00bca1d9ff3f732ade4f753afb482"
 
 [[rows]]
 id = "c0001"
@@ -46,12 +46,12 @@ signal = "stu_for_bytes"
 span_start = 19
 span_end = 19
 span_bytes = 62
-source_sha256 = "6f2d14ba872c938f43fd2a644eff27a38267d12a6d19b9e663f8e34487ee0e88"
+source_sha256 = "c85329f4ffa44f62c28c6b7485af5bf4a7a29323e2d746a00b1fa4ab50106ff7"
 span_digest = "efc9b335bca94c3c6c97329fc398a20ae9a4817e856b019dac7bfe081d15ff9e"
 classification = "normative-stu-estimate"
 status = "owned"
 dispatch_blocked = false
-row_digest = "8b6ecc8513d25cd0e9f084bd5a4d904ba853e15e079d2149a7a8e03036f0b436"
+row_digest = "648b14d4c2ff1c487fb9c818f472ca5a7c9b833db2bfdbfe2c1dc5053e8e6de3"
 evidence = "normative STU signal 'stu_for_bytes': ceil(bytes/3) estimate, never proves fit; frozen owner map confirms exact-scope ownership for crates/smart/eliot-context-measurement/src/stu.rs"
 successor_scope = "bounded successor scope: consumer #704 owns case 704/1 (normative-stu-estimate); prove fit/error/receipt in the owning issue"
 invalidation = "row invalid when the source span digest, file sha, rule revision, owner map, or owner allocation changes; rerun sync"
@@ -1853,9 +1853,9 @@ source_scope_bytes = 338
 source_scope_stu = 113
 workset_bytes = 56980
 workset_stu = 18994
-scan_root_bytes = 43957
-scan_root_stu = 14653
-workset_stu_share_of_scan_root = "0.0077"
+scan_root_bytes = 45827
+scan_root_stu = 15276
+workset_stu_share_of_scan_root = "0.0074"
 share_basis = "source_scope_stu / scan_root_stu: the exact source plus read-only spans against the declared scan-root universe; a scan-root universe is never context"
 upper_review_band_stu = 65000
 band_disposition = "WITHIN_UPPER_REVIEW_BAND"
@@ -1863,7 +1863,7 @@ write_serialization_edges = ["single-writer: crates/smart/eliot-context-{measure
 dispatch_ready = true
 dispatch_block_reason = "none"
 unresolved_row_count = 0
-workset_digest = "8ddce34a5f644d937cc3bfdfa5e6a26d3dbffd76b968471f09f75c8f1df51c3f"
+workset_digest = "aadfc277d7184e4300fcd51d57c9ea40cc2d5c84e28f52d12ba6c574a182427d"
 
 [[consumer_worksets]]
 issue = "#783"
