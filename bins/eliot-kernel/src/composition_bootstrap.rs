@@ -2168,6 +2168,8 @@ impl KernelComposition {
             user_broker_registration_authority:
                 super::user_broker_registration_authority::UserBrokerRegistrationAuthority::default(
                 ),
+            operator_request_identities:
+                super::operator_request_identity::OperatorIdentityLedger::default(),
             wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),

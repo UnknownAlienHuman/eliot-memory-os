@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{
     CommandCatalogue, CommandPort, CommandPortError, CommandRequest, USER_AUTOMATION_ROUTE,
+    kernel_client::{CONTROLBOARD_STATUS_OPERATION, OPERATOR_LAUNCH_OPERATION},
     user_automation_route_payload,
 };
 use eliot_doctor::integration;
@@ -1443,6 +1444,10 @@ fn run_controlboard_status_windows() -> Result<i32> {
             return Ok(FRONT_DOOR_CLOSED_EXIT);
         }
     };
+    // Issue #4600: `transact_controlboard_status` obtains this read's identity
+    // from the Kernel admission owner first, so the public entry no longer
+    // reaches CONTROLBOARD_STATUS_NOT_ADMITTED before a byte is sent. The
+    // dashboard shares that same method and therefore the same admission.
     let served = match port.transact_controlboard_status() {
         Ok(served) => served,
         Err(KernelClientError::FrontDoorClosed(contract)) => {
@@ -1452,6 +1457,14 @@ fn run_controlboard_status_windows() -> Result<i32> {
         Err(KernelClientError::UnknownOutcome(detail)) => {
             write_json_error("CONTROLBOARD_STATUS_UNKNOWN", &detail);
             return Ok(UNKNOWN_OUTCOME_EXIT);
+        }
+        Err(KernelClientError::Rejected(detail)) => {
+            // The Kernel admission owner refused a status identity for this
+            // session, so nothing was read: a plain invalid-request
+            // disposition, never an unknown outcome and never a retry of the
+            // refused identity.
+            write_json_error("CONTROLBOARD_STATUS_IDENTITY_NOT_ADMITTED", &detail);
+            return Ok(INVALID_REQUEST_EXIT);
         }
         Err(KernelClientError::MissingRequestIdentity) => {
             write_json_error(
@@ -4605,10 +4618,59 @@ fn load_input(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("read input: {}", path.display()))
 }
 
+/// Reports a refused per-operation admission for `eliot ui` (issue #4600).
+///
+/// A closed front door, a rejected admission, and a grant that was never
+/// issued stay three different reports. None of them is an unknown outcome, and
+/// none of them is a launch: the identity is obtained before the launch request
+/// exists, so a refusal here means nothing was launched.
+#[cfg(windows)]
+fn report_operator_launch_admission_failure(
+    error: &eliot_cli::kernel_client::KernelClientError,
+) -> i32 {
+    use eliot_cli::kernel_client::KernelClientError;
+    match error {
+        KernelClientError::FrontDoorClosed(contract) => {
+            write_json_error("KERNEL_APPLICATION_PORT_CLOSED", contract);
+            FRONT_DOOR_CLOSED_EXIT
+        }
+        KernelClientError::Rejected(detail) => {
+            write_json_error("KERNEL_OPERATOR_LAUNCH_IDENTITY_NOT_ADMITTED", detail);
+            INVALID_REQUEST_EXIT
+        }
+        KernelClientError::MissingRequestIdentity => {
+            write_json_error(
+                "KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED",
+                "no admitted EBP request identity is bound for a broker-admitted operator launch; the identity must arrive through the admitted host request path",
+            );
+            INVALID_REQUEST_EXIT
+        }
+        KernelClientError::UnknownOutcome(detail) => {
+            write_json_error("KERNEL_OPERATOR_LAUNCH_UNKNOWN", detail);
+            UNKNOWN_OUTCOME_EXIT
+        }
+        KernelClientError::RestartRequired(detail) => {
+            write_json_error("KERNEL_OPERATOR_RESTART_REQUIRED", detail);
+            RESTART_REQUIRED_EXIT
+        }
+        other => {
+            write_json_error("KERNEL_OPERATOR_LAUNCH_REJECTED", &other.to_string());
+            FRONT_DOOR_CLOSED_EXIT
+        }
+    }
+}
+
 #[cfg(windows)]
 fn run_ui() -> Result<i32> {
     let mut client =
         AuthenticatedKernelPort::load().map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // Issue #4600: the launch identity is minted by the Kernel admission owner
+    // from the session it already authenticated, over the same protected
+    // installation declaration this client loaded. Without this the public
+    // entry reaches KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED before a byte is sent.
+    if let Err(error) = client.admit_operation_identity(OPERATOR_LAUNCH_OPERATION) {
+        return Ok(report_operator_launch_admission_failure(&error));
+    }
     match client.ensure_operator_launch() {
         Ok(receipt) => {
             println!("{}", serde_json::to_string(&receipt)?);
@@ -4631,6 +4693,12 @@ fn run_ui() -> Result<i32> {
             // operation identity; never resubmit a second launch.
             write_json_error("KERNEL_OPERATOR_LAUNCH_UNKNOWN", &detail);
             Ok(UNKNOWN_OUTCOME_EXIT)
+        }
+        Err(eliot_cli::kernel_client::KernelClientError::Rejected(detail)) => {
+            // The Kernel admission owner refused an identity for this launch, so
+            // this launch is not attempted at all.
+            write_json_error("KERNEL_OPERATOR_LAUNCH_IDENTITY_NOT_ADMITTED", &detail);
+            Ok(INVALID_REQUEST_EXIT)
         }
         Err(eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity) => {
             write_json_error(
@@ -5068,6 +5136,21 @@ impl AuthenticatedKernelPort {
             })
     }
 
+    /// Obtains a fresh, exact, operation-bound request identity for `operation`
+    /// from the Kernel admission owner (issue #4600).
+    ///
+    /// This composition root wires the join only. The principal, session,
+    /// generation, Authority Epoch, State Fence, role, capability set, clock
+    /// and deadline are all minted and compared inside the owner and the client
+    /// respectively; nothing here reads ambient environment, extends a deadline,
+    /// or bypasses the authenticated front door.
+    fn admit_operation_identity(
+        &mut self,
+        operation: &str,
+    ) -> std::result::Result<(), eliot_cli::kernel_client::KernelClientError> {
+        self.client.admit_operation_identity(operation)
+    }
+
     fn ensure_operator_launch(
         &mut self,
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
@@ -5083,13 +5166,16 @@ impl AuthenticatedKernelPort {
     /// Sends the exact `controlboard.status` operation through the
     /// authenticated EBP Execute seam and returns the served result payload.
     ///
-    /// The EBP request identity must already be bound on the client by an
-    /// admitted flow; this front door never mints principal, session, fence,
-    /// or idempotency identity. Without one the call fails closed with
-    /// `MissingRequestIdentity` before any byte is sent.
+    /// Issue #4600: the status identity is obtained from the Kernel admission
+    /// owner first, for this exact read. The JSON `eliot controlboard status`
+    /// command and the dashboard share this one method, so both obtain a fresh
+    /// owner-issued identity and neither reuses a launch identity. This front
+    /// door never mints principal, session, fence, role, capability, clock, or
+    /// idempotency identity; it wires the join and the owner does the rest.
     fn transact_controlboard_status(
         &mut self,
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
+        self.admit_operation_identity(CONTROLBOARD_STATUS_OPERATION)?;
         self.client.transact_json(
             controlboard_status::STATUS_OPERATION,
             controlboard_status::status_request_payload(),
