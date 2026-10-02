@@ -87,9 +87,11 @@ pub async fn record_arrived_causal_intervention_outcome(
     composition: &mut DaemonComposition,
     arrived: &ArrivedCausalInterventionOutcome,
     state_fence: &StateFence,
+    admitted: &super::improvement_intake_dispatch::GovernedImprovementAdmission,
 ) -> Result<(CausalCandidate, WriteReceipt), ImprovementDispatchError> {
     super::improvement_candidate_dispatch::commit_causal_intervention_outcome(
         composition,
+        admitted,
         &arrived.candidate,
         arrived.outcome.clone(),
         state_fence,

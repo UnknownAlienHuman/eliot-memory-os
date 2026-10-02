@@ -6288,8 +6288,15 @@ async fn run_improvement_intake(
     // checked against this build's identity, where an unresolved external effect
     // is named instead of dropped, and where the record the NEXT pass compares
     // against is settled.
-    route_and_reconcile_improvement_candidate(composition, &artifact, &policy, &fence, retained)
-        .await
+    route_and_reconcile_improvement_candidate(
+        composition,
+        &artifact,
+        &policy,
+        &fence,
+        retained,
+        &admitted,
+    )
+    .await
 }
 
 /// Routes the committed artifact through the Governor pipeline, then routes the
@@ -6341,6 +6348,7 @@ async fn route_and_reconcile_improvement_candidate(
     policy: &eliot_maintenance::ImprovementAdmissionPolicy,
     fence: &eliot_contracts::StateFence,
     retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
+    admitted: &eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
 ) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
         eliotd::improvement_candidate_dispatch::ImprovementRouteDispatch {
@@ -6362,14 +6370,22 @@ async fn route_and_reconcile_improvement_candidate(
     // outcome, and nothing on this path promotes, activates, installs,
     // completes, or issues authority.
     if let Ok(outcome) = &routed {
-        record_unknown_effect_obligation(composition, artifact, &outcome.effect, fence).await;
+        record_unknown_effect_obligation(composition, artifact, &outcome.effect, fence, &admitted)
+            .await;
         // The terminal decision itself, bound to the candidate identity and the
         // candidate revision it was made on. This is what makes "this candidate
         // was rejected" and "this candidate was admitted for one bounded canary
         // handoff" reviewable after this pass ends, rather than a fact that lived
         // only in the pass that observed it. A stale candidate revision is a typed
         // refusal that commits nothing.
-        record_improvement_terminal_decision(composition, artifact, &outcome.decision, fence).await;
+        record_improvement_terminal_decision(
+            composition,
+            artifact,
+            &outcome.decision,
+            fence,
+            &admitted,
+        )
+        .await;
     }
     report_improvement_candidate_route(&artifact.candidate.candidate_id, routed, retained)
 }
@@ -6698,6 +6714,7 @@ async fn record_unknown_effect_obligation(
     artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
     effect: &eliotd::improvement_candidate_route::ImprovementEffectState,
     fence: &eliot_contracts::StateFence,
+    admitted: &eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
 ) {
     if effect.obligation.is_none() {
         // No unresolved effect is named, so there is no debt to record. A record
@@ -6708,7 +6725,7 @@ async fn record_unknown_effect_obligation(
     let committed = {
         let mut guard = composition.lock().await;
         eliotd::improvement_candidate_dispatch::commit_unknown_effect_obligation(
-            &mut guard, artifact, effect, fence,
+            &mut guard, artifact, admitted, effect, fence,
         )
         .await
     };
@@ -6780,11 +6797,12 @@ async fn record_improvement_terminal_decision(
     artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
     decision: &eliot_maintenance::ImprovementTerminalDecision,
     fence: &eliot_contracts::StateFence,
+    admitted: &eliotd::improvement_intake_dispatch::GovernedImprovementAdmission,
 ) {
     let committed = {
         let mut guard = composition.lock().await;
         eliotd::improvement_candidate_dispatch::commit_improvement_terminal_decision(
-            &mut guard, artifact, decision, fence,
+            &mut guard, artifact, admitted, decision, fence,
         )
         .await
     };
