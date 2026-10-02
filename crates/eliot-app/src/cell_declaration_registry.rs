@@ -337,6 +337,26 @@ mod tests {
     }
 
     #[test]
+    fn a_projection_pointing_elsewhere_than_the_source_is_refused() {
+        // Arm (I2.23 forbids a second handwritten owner list): the real
+        // projected row for `governor.daemon.composition` keeps the right cell
+        // and the right owner, but its `declared_by` is repointed at the facade
+        // file instead of the canonical manifest source. Cell set and owners
+        // still agree, so only the provenance check can catch a projection
+        // that re-declares ownership locally.
+        let result = mirror_of_mutated_contract(
+            "declared_by = \"bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs\"\n",
+            "declared_by = \"crates/eliot-app/src/cell_declaration_registry.rs\"\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("baked cell contract row for cell governor.daemon.composition points at crates/eliot-app/src/cell_declaration_registry.rs instead of the canonical manifest source".to_owned()),
+            "a projection that declares its own source must be refused by name"
+        );
+    }
+
+    #[test]
     fn a_contract_row_for_an_undeclared_cell_is_refused() {
         // Arm: the real generated contract block projects a ninth cell the
         // real manifest never declares. Every manifest cell is still projected
