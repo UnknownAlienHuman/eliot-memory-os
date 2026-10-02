@@ -13,6 +13,11 @@
 //!   ([`ReadService`]) over the real
 //!   [`KernelContextReadClient`](super::KernelContextReadClient), and
 //!   extracts the `Current` admitted position from the durable readback.
+//!   The selection joins the readback to the exact request and requires a
+//!   unique current answer ([`select_current_position`]), not an
+//!   input-order `find`: a payload carrying another scope, a substituted
+//!   position inside it, or several current positions is a refusal, while a
+//!   store `null` readback stays the existing explicit absence.
 //!   Works today: capability and store handler both exist. Routing the
 //!   request through the read owner rather than the raw Store port is what
 //!   keeps this leg a consumer of the one read engine instead of a second
@@ -36,7 +41,9 @@
 //! The whole of this module is currently **unreached from a run of this
 //! daemon**, so the "Daemon-side production edge" sentence above describes the
 //! intended contour rather than an executed one. Measured on this tree by
-//! symbol, with no `#[cfg(test)]` anywhere in this file:
+//! symbol, counting only non-test code (this file now carries one
+//! `#[cfg(test)] mod current_position_join_tests`, which exercises
+//! [`select_current_position`] and adds no production call site):
 //!
 //! - `run_experience_quality_event_with_revision` and
 //!   `commit_experience_event_records` have **zero call sites**; every other
@@ -250,6 +257,75 @@ pub fn propose_memory_extinction_candidate(
     Ok(eliot_dreamer_memory_revision::propose(intake)?)
 }
 
+/// Joins one admitted position readback to the exact request that asked for
+/// it and refuses anything that is not uniquely selected.
+///
+/// The join uses the store's own binding fields, never a name this file
+/// supplies. `GetCurrentEpistemicPosition` is keyed by
+/// `position_key(candidate.scope, payload.position)` on both backends, so
+/// those two members are exactly what the request selected:
+///
+/// - `readback.candidate.scope` must be the requested scope. That is the
+///   scope half of the key the store looked the read up under, so a payload
+///   carrying a different one answers a different read.
+/// - every returned position's `admission.scope` and `admission.position`
+///   must be the requested scope and the requested position subject. The
+///   position half reaches the readback through `AdmittedReceipt::position`,
+///   which `EpistemicCommit::readback` fills from `payload.position`; note it
+///   is NOT `candidate.proposition`, which is a different field of a
+///   different type and is deliberately not compared here. One substituted
+///   position inside an otherwise-matching readback fails the whole read
+///   rather than being skipped.
+/// - exactly one of those positions may be `Currentness::Current`. Zero is
+///   the existing explicit absence; more than one is a conflict.
+///   Input-order selection is not a resolution: `EpistemicCommit::readback`
+///   mints one admitted view per claim, so an arbitrary pick among several
+///   current views would hand the assessment a claim the owner never singled
+///   out, with no field recording which one was chosen.
+///
+/// Positions are validated by their own `validate()` at the call site before
+/// this runs; this adds the request binding and the uniqueness rule, not a
+/// second position contract.
+fn select_current_position(
+    readback_scope: &str,
+    positions: &[CurrentEpistemicPosition],
+    scope: &ScopeId,
+    position_subject: &str,
+) -> Result<CurrentEpistemicPosition, ExperienceDriverError> {
+    let absent = || ExperienceDriverError::Position {
+        field: "positions",
+        reason: "no current admitted position in the readback",
+    };
+    if readback_scope != scope.as_str() {
+        return Err(ExperienceDriverError::Position {
+            field: "response.payload.candidate.scope",
+            reason: "readback candidate does not answer the requested scope",
+        });
+    }
+    let mut current: Option<CurrentEpistemicPosition> = None;
+    for position in positions {
+        if position.admission.scope != scope.as_str()
+            || position.admission.position.as_str() != position_subject
+        {
+            return Err(ExperienceDriverError::Position {
+                field: "positions",
+                reason: "admitted position does not answer the requested scope and position subject",
+            });
+        }
+        if position.currentness != Currentness::Current {
+            continue;
+        }
+        if current.is_some() {
+            return Err(ExperienceDriverError::Position {
+                field: "positions",
+                reason: "more than one current admitted position answers the request",
+            });
+        }
+        current = Some(position.clone());
+    }
+    current.ok_or_else(absent)
+}
+
 /// Read the TRUE admitted edge position through the Governor read owner.
 ///
 /// Issues `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, exact
@@ -336,11 +412,22 @@ pub async fn read_current_position(
             reason: "bridge did not answer the position read",
         });
     }
-    let readback: EpistemicPositionReadback = serde_json::from_value(response.payload.clone())
-        .map_err(|_| ExperienceDriverError::Position {
-            field: "response.payload",
-            reason: "position readback is not the versioned shape",
+    // An absent position is the store's own `null` readback, which is the
+    // explicit absence this entry already reported; it is decoded as such
+    // rather than as a malformed payload.
+    let readback: Option<EpistemicPositionReadback> =
+        serde_json::from_value(response.payload.clone()).map_err(|_| {
+            ExperienceDriverError::Position {
+                field: "response.payload",
+                reason: "position readback is not the versioned shape",
+            }
         })?;
+    let Some(readback) = readback else {
+        return Err(ExperienceDriverError::Position {
+            field: "positions",
+            reason: "no current admitted position in the readback",
+        });
+    };
     for position in &readback.positions {
         position
             .validate()
@@ -349,15 +436,12 @@ pub async fn read_current_position(
                 reason: "admitted position is invalid",
             })?;
     }
-    readback
-        .positions
-        .iter()
-        .find(|position| position.currentness == Currentness::Current)
-        .cloned()
-        .ok_or(ExperienceDriverError::Position {
-            field: "positions",
-            reason: "no current admitted position in the readback",
-        })
+    select_current_position(
+        &readback.candidate.scope,
+        &readback.positions,
+        &scope,
+        &position_subject,
+    )
 }
 
 /// Journal-leg driver inputs: projection context plus live binding.
@@ -1060,4 +1144,177 @@ pub async fn commit_experience_event_records(
         feedback_receipts,
         view_stale,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod current_position_join_tests {
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{
+        ArtifactId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, SourceId, StateFence,
+    };
+    use eliot_epistemic_contracts::{
+        AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
+        PositionId, PositionRevision,
+    };
+    use eliot_store_api::ScopeId;
+
+    use super::{ExperienceDriverError, select_current_position};
+
+    fn hex64() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    fn fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("fixture lineage"),
+                NonZeroU64::new(1).expect("nonzero sequence"),
+            )
+            .expect("fixture epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    /// One admitted view over the exact (scope, position, claim) triple the
+    /// join compares. Only the three compared members vary between cases, so
+    /// a failing case isolates the join and not a fixture drift.
+    fn admitted(
+        scope: &str,
+        position: &str,
+        claim: &str,
+        currentness: Currentness,
+    ) -> CurrentEpistemicPosition {
+        let supersession = match currentness {
+            Currentness::Current => std::collections::BTreeSet::new(),
+            Currentness::Superseded => {
+                std::collections::BTreeSet::from([ArtifactId::new("pos-2").expect("supersession")])
+            }
+        };
+        let admission = AdmittedReceipt::new(AdmittedReceiptParams {
+            receipt_id: ReceiptId::new(format!("rc-{claim}")).expect("receipt"),
+            payload_digest: hex64(),
+            owner: SourceId::new("source-epistemic").expect("source"),
+            revision: "rev-1".to_owned(),
+            scope: scope.to_owned(),
+            fence: fence(),
+            evidence_digest: hex64(),
+            coverage_digest: hex64(),
+            conflict_digest: hex64(),
+            proof_digest: hex64(),
+            position: PositionId::new(position).expect("position"),
+            position_revision: PositionRevision::new(1).expect("revision"),
+        })
+        .expect("admission");
+        CurrentEpistemicPosition::new(
+            admission,
+            currentness,
+            supersession,
+            ClaimId::new(claim).expect("claim"),
+        )
+        .expect("admitted view")
+    }
+
+    fn select(
+        readback_scope: &str,
+        positions: &[CurrentEpistemicPosition],
+    ) -> Result<CurrentEpistemicPosition, ExperienceDriverError> {
+        select_current_position(
+            readback_scope,
+            positions,
+            &ScopeId::new("scope-1").expect("scope"),
+            "position-1",
+        )
+    }
+
+    #[test]
+    fn the_single_current_position_answering_the_request_is_selected() {
+        let current = admitted("scope-1", "position-1", "claim-1", Currentness::Current);
+        let superseded = admitted(
+            "scope-1",
+            "position-1",
+            "claim-0",
+            Currentness::Superseded,
+        );
+        let selected = select("scope-1", &[superseded, current.clone()])
+            .expect("the one current position answers the request");
+        assert_eq!(selected, current);
+        assert_eq!(selected.currentness, Currentness::Current);
+    }
+
+    #[test]
+    fn a_readback_answering_another_subject_is_refused() {
+        let current = admitted("scope-1", "position-1", "claim-1", Currentness::Current);
+        // Same position, foreign scope: the store keyed the read by
+        // (scope, position), so a differing scope is a substituted readback.
+        let error = select("scope-other", &[current]).expect_err("must fail closed");
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "response.payload.candidate.scope",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_substituted_position_inside_a_matching_readback_is_refused() {
+        let current = admitted("scope-1", "position-1", "claim-1", Currentness::Current);
+        let foreign = admitted("scope-1", "position-2", "claim-2", Currentness::Superseded);
+        let error = select("scope-1", &[current, foreign])
+            .expect_err("a foreign position must fail the whole read");
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn two_current_positions_are_a_conflict_not_an_input_order_pick() {
+        // The store mints one view per claim, so a multi-claim candidate
+        // legitimately yields several Current positions. Neither may be
+        // selected by position in the vector.
+        let first = admitted("scope-1", "position-1", "claim-1", Currentness::Current);
+        let second = admitted("scope-1", "position-1", "claim-2", Currentness::Current);
+        let error = select("scope-1", &[first, second])
+            .expect_err("several current positions must fail closed");
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn no_current_position_is_the_existing_explicit_absence() {
+        let superseded = admitted(
+            "scope-1",
+            "position-1",
+            "claim-1",
+            Currentness::Superseded,
+        );
+        let error = select("scope-1", &[superseded]).expect_err("absence must fail closed");
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Position {
+                field: "positions",
+                reason: "no current admitted position in the readback",
+                ..
+            }
+        ));
+        let empty = select("scope-1", &[]).expect_err("empty readback is absence");
+        assert!(matches!(
+            empty,
+            ExperienceDriverError::Position {
+                reason: "no current admitted position in the readback",
+                ..
+            }
+        ));
+    }
 }
