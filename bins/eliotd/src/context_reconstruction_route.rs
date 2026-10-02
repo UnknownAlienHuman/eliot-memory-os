@@ -74,6 +74,32 @@
 //! declares the candidate result class with no semantic receipt, exactly as the
 //! campaign-packet body does for content this daemon compiled from owner reads.
 //! The degraded body is weaker still: it declares no result content at all.
+//!
+//! # The plan and the projection belong to the `eliot.query` contract
+//!
+//! This route does not decide what a `ContextReconstruction` request means and
+//! it does not shape what a reconstruction looks like on the wire. Those two
+//! decisions belong to the MCP surface that declares the `eliot.query`
+//! contract, and the production flight calls them
+//! ([`eliot_mcp::plan_context_reconstruction_query`] and
+//! [`eliot_mcp::project_context_reconstruction_projection`]):
+//!
+//! - the **plan** is taken once the validated [`ContextReconstructionRequest`]
+//!   exists, from the same scope, evidence subject, evidence bound and resolved
+//!   epistemic position the Governor owner will read from, so the plan and the
+//!   read cannot name different selectors. It is then re-checked against the
+//!   authenticated task and scope;
+//! - the **projection** owns the `context_reconstruction` section of the served
+//!   body. Its `content` is a `PortProjection` whose `kind` is
+//!   `ProjectionKind::Projection` and whose `proof_ceiling` is
+//!   `ScopedVerification` — the same ceiling the `eliot.query` contract already
+//!   declares for a read-only reconstruction.
+//!
+//! Because both are total over a valid plan and a content-admitted closure,
+//! there is no "missing projection" shape: a closure that cannot be projected
+//! is [`ReconstructionPrerequisite::ReconstructionRefused`], never a wrapper
+//! around an absent value and never a field filled with `None` in place of owner
+//! data.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -86,6 +112,10 @@ use eliot_governor::{ContextInputsError, ContextReconstructionRequest, SevenRole
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceBinding, CampaignSourceRole,
     LearningStateViewRecipe, OwnerId, SlotRequirement, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+};
+use eliot_mcp::{
+    ContextReconstructionQueryPlan, QueryInput, QueryIntent, QueryMode,
+    plan_context_reconstruction_query, project_context_reconstruction_projection,
 };
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody,
@@ -304,6 +334,30 @@ pub async fn serve_context_reconstruction(
         &recipe.recipe,
     )?;
 
+    // #2857: the admitted pair is planned by the `eliot.query` contract's own
+    // planner, not by this route. `plan_context_reconstruction_query` is the
+    // single place that decides which intents admit the reconstruction closure,
+    // which query selector is exact (`task:<exact-task-id>`), and that a bound
+    // is a positive decimal. Calling it here makes the production flight answer
+    // to the surface's declared plan rather than to a second, parallel reading
+    // of the same request that only this route applies.
+    //
+    // The task selector is written from the AUTHENTICATED envelope identity,
+    // not from the caller's `query` prose: the wire's `subject:` selector is
+    // this route's evidence subject, while the planner's `task:` form carries
+    // the task the trusted session binding already resolved. The planner then
+    // re-derives `task_id` from that exact form and every other selector from
+    // the arguments below, so a plan can only be produced when all of them are
+    // present, non-blank and control-free.
+    let plan = plan_reconstruction_query(&request, &scope, task_id)?;
+    if plan.task_id != task_id || plan.scope_id != scope.as_str() {
+        // The planner admitted a task or scope other than the authenticated
+        // one. Refused rather than served under a substituted identity.
+        return Err(ReconstructionPrerequisite::ReconstructionRefused(
+            "reconstruction plan does not bind the authenticated task and scope".to_owned(),
+        ));
+    }
+
     let ctx = reconstruction_context(envelope, &owner_session, &retained_fence)?;
     let seven = match reads.reconstruct_context_inputs(&ctx, &request).await {
         Ok(seven) => seven,
@@ -344,7 +398,50 @@ pub async fn serve_context_reconstruction(
     // reconstruction: every refusal travels as an explicit skip disposition in
     // the same replay-exact response body.
     let cue_activation = evaluate_cue_activation(&seven);
-    context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven, &cue_activation)
+    context_reconstruction_result_body(envelope, attempt, &plan, &seven, &cue_activation)
+}
+
+/// Plans the admitted reconstruction through the `eliot.query` contract's own
+/// planner, [`eliot_mcp::plan_context_reconstruction_query`].
+///
+/// The `QueryInput` handed to the planner carries the exact `task:` selector
+/// the T11.3 plan requires, built from the authenticated task identity, and
+/// the same `ContextReconstruction` intent mode this route admitted the pair
+/// under. Every remaining plan argument is taken from the validated
+/// [`ContextReconstructionRequest`] — the scope, the evidence subject, the
+/// resolved epistemic position and the store catalogue's own evidence bound —
+/// so the plan and the request the Governor owner reads from cannot drift.
+///
+/// The planner's `BridgeError` is projected onto this route's closed
+/// [`ReconstructionPrerequisite::ReconstructionRefused`]: every plan refusal is
+/// a refusal of this reconstruction, never a partially planned read.
+fn plan_reconstruction_query(
+    request: &ContextReconstructionRequest,
+    scope: &ScopeId,
+    task_id: &str,
+) -> Result<ContextReconstructionQueryPlan, ReconstructionPrerequisite> {
+    let input = QueryInput {
+        intent: QueryIntent {
+            mode: QueryMode::ContextReconstruction,
+        },
+        query: format!("task:{task_id}"),
+        exact_resource_uri: None,
+    };
+    // The bound is carried as the decimal string the planner parses, and it is
+    // the request's own bound, so the plan can never claim a larger evidence
+    // window than the request was built with.
+    let evidence_max_records = request.evidence_max_records.to_string();
+    plan_context_reconstruction_query(
+        &input,
+        scope.as_str(),
+        &request.evidence_subject,
+        &evidence_max_records,
+        &request.epistemic_position,
+    )
+    .map_err(|error| {
+        tracing::warn!(error = %error, "eliotd.context_reconstruction.plan");
+        ReconstructionPrerequisite::ReconstructionRefused(error.to_string())
+    })
 }
 
 /// Settles one claimed reconstruction pair whose read closure was DEGRADED.
@@ -954,11 +1051,23 @@ fn reconstruction_context(
 
 /// Projects the reconstructed closure into the host-request result body.
 ///
-/// The response carries the exact `SevenRoleInputs` value plus the identity it
-/// was reconstructed under. The lineage declares the candidate result class and
-/// no semantic receipt: a retained source envelope is not an admitted
-/// `ActiveUnderstandingView`, admitted Cue array, capability qualification or
-/// action authority.
+/// The `context_reconstruction` section is produced by the `eliot.query`
+/// contract's own projector,
+/// [`eliot_mcp::project_context_reconstruction_projection`], over the plan
+/// [`plan_reconstruction_query`] returned. This route therefore contributes
+/// only the settled closure itself and the daemon-owned cue-activation
+/// disposition beside it; it does not restate the plan's identity fields or
+/// choose a second content shape, so the served body is the projection the
+/// surface already declares.
+///
+/// The projection is never absent and never partially filled: the projector is
+/// total over a served plan, and the closure is serialized only after
+/// [`SevenRoleInputs::validate_content_admission`] proves no refused role
+/// retained its bytes. A closure that cannot be projected is a typed refusal.
+///
+/// The lineage declares the candidate result class and no semantic receipt: a
+/// retained source envelope is not an admitted `ActiveUnderstandingView`,
+/// admitted Cue array, capability qualification or action authority.
 ///
 /// The closure's own structural content invariant is proved here, before
 /// anything is serialized. A role whose disposition admits no source records
@@ -969,8 +1078,7 @@ fn reconstruction_context(
 fn context_reconstruction_result_body(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
-    scope: &ScopeId,
-    task_id: &str,
+    plan: &ContextReconstructionQueryPlan,
     seven: &SevenRoleInputs,
     cue_activation: &CueActivationDisposition,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
@@ -979,11 +1087,10 @@ fn context_reconstruction_result_body(
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
     let closure = serde_json::to_value(seven)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let projection = project_context_reconstruction_projection(plan, closure);
     let response = json!({
         "operation": CONTEXT_RECONSTRUCTION_MODE,
-        "task_id": task_id,
-        "scope_id": scope.as_str(),
-        "context_reconstruction": closure,
+        "context_reconstruction": projection.content,
         "cue_activation": cue_activation.response_value(),
     });
     let bytes = canonical_json_bytes(&response)
@@ -1148,6 +1255,78 @@ mod tests {
         })
     }
 
+    /// The plan the production route's planner returns for this envelope.
+    fn test_plan() -> ProofResult<ContextReconstructionQueryPlan> {
+        let input = QueryInput {
+            intent: QueryIntent {
+                mode: QueryMode::ContextReconstruction,
+            },
+            query: "task:task-a".to_owned(),
+            exact_resource_uri: None,
+        };
+        Ok(plan_context_reconstruction_query(
+            &input,
+            "scope-a",
+            "evidence-alpha",
+            "32",
+            "position-one",
+        )?)
+    }
+
+    /// #2857: the planner this route calls in production accepts the exact
+    /// `task:` selector and refuses free text, a control-bearing selector, and
+    /// any non-`ContextReconstruction` intent. The production flight can
+    /// therefore never reach the projector without an exact, authenticated
+    /// plan.
+    #[test]
+    fn the_planner_admits_only_the_exact_task_selector() -> ProofResult {
+        let plan = test_plan()?;
+        assert_eq!(plan.task_id, "task-a");
+        assert_eq!(plan.scope_id, "scope-a");
+        assert_eq!(plan.evidence_subject, "evidence-alpha");
+        assert_eq!(plan.evidence_max_records, "32");
+        assert_eq!(plan.position, "position-one");
+
+        let other_intent = QueryInput {
+            intent: QueryIntent {
+                mode: QueryMode::Verification,
+            },
+            query: "task:task-a".to_owned(),
+            exact_resource_uri: None,
+        };
+        assert!(
+            plan_context_reconstruction_query(
+                &other_intent,
+                "scope-a",
+                "evidence-alpha",
+                "32",
+                "position-one",
+            )
+            .is_err(),
+            "a non-reconstruction intent must never plan a reconstruction"
+        );
+
+        let free_text = QueryInput {
+            intent: QueryIntent {
+                mode: QueryMode::ContextReconstruction,
+            },
+            query: "subject:evidence-alpha".to_owned(),
+            exact_resource_uri: None,
+        };
+        assert!(
+            plan_context_reconstruction_query(
+                &free_text,
+                "scope-a",
+                "evidence-alpha",
+                "32",
+                "position-one",
+            )
+            .is_err(),
+            "an evidence selector is not an exact task selector"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_bound_role_payload_reaches_the_requester() -> ProofResult {
         let fence = test_fence()?;
@@ -1158,23 +1337,30 @@ mod tests {
             Some(json!({"version": 1, "scope_id": "scope-a", "task_id": "task-a", "records": []})),
             eliot_context_candidates::ProjectionState::KnownEmpty,
         )?;
-        let body = context_reconstruction_result_body(
-            &envelope,
-            &attempt,
-            &ScopeId::new("scope-a")?,
-            "task-a",
-            &seven,
-            &skip,
-        )?;
+        let body =
+            context_reconstruction_result_body(&envelope, &attempt, &test_plan()?, &seven, &skip)?;
         // The bound envelope still travels to the requester in full: the
-        // retention rule removes refused bytes, not admitted ones.
+        // retention rule removes refused bytes, not admitted ones. The
+        // `context_reconstruction` section is the MCP projector's own content,
+        // so the settled closure sits under its `context_reconstruction` key
+        // beside the plan's own `task_id`/`scope_id`.
         assert_eq!(
-            body.response["context_reconstruction"]["task_frame"]["payload"]["task_id"],
+            body.response["context_reconstruction"]["context_reconstruction"]["task_frame"]["payload"]
+                ["task_id"],
             json!("task-a")
         );
         assert_eq!(
-            body.response["context_reconstruction"]["task_frame"]["state"]["state"],
+            body.response["context_reconstruction"]["context_reconstruction"]["task_frame"]["state"]
+                ["state"],
             json!("KNOWN_EMPTY")
+        );
+        assert_eq!(
+            body.response["context_reconstruction"]["task_id"],
+            json!("task-a")
+        );
+        assert_eq!(
+            body.response["context_reconstruction"]["scope_id"],
+            json!("scope-a")
         );
         Ok(())
     }
@@ -1195,14 +1381,8 @@ mod tests {
                 reason: "role payload fails its contract: role selector mismatch".to_owned(),
             },
         )?;
-        let refused = context_reconstruction_result_body(
-            &envelope,
-            &attempt,
-            &ScopeId::new("scope-a")?,
-            "task-a",
-            &seven,
-            &skip,
-        );
+        let refused =
+            context_reconstruction_result_body(&envelope, &attempt, &test_plan()?, &seven, &skip);
         assert!(matches!(
             refused,
             Err(ReconstructionPrerequisite::ReconstructionRefused(_))
@@ -1212,20 +1392,15 @@ mod tests {
         // serves the requester with the refusal and nothing else.
         seven.task_frame.payload = None;
         seven.task_frame.revision_heads.clear();
-        let body = context_reconstruction_result_body(
-            &envelope,
-            &attempt,
-            &ScopeId::new("scope-a")?,
-            "task-a",
-            &seven,
-            &skip,
-        )?;
+        let body =
+            context_reconstruction_result_body(&envelope, &attempt, &test_plan()?, &seven, &skip)?;
         assert_eq!(
-            body.response["context_reconstruction"]["task_frame"]["payload"],
+            body.response["context_reconstruction"]["context_reconstruction"]["task_frame"]["payload"],
             Value::Null
         );
         assert_eq!(
-            body.response["context_reconstruction"]["task_frame"]["state"]["state"],
+            body.response["context_reconstruction"]["context_reconstruction"]["task_frame"]["state"]
+                ["state"],
             json!("UNAVAILABLE")
         );
         Ok(())

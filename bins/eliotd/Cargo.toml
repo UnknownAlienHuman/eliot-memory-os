@@ -101,6 +101,19 @@ eliot-ors.workspace = true
 eliot-learning-contracts.workspace = true
 eliot-learning-state-view.workspace = true
 eliot-maintenance.workspace = true
+# Issue #2857: the `ContextReconstruction` route plans its admitted
+# `eliot.query` request through the MCP surface's own planner
+# (`eliot_mcp::plan_context_reconstruction_query`) and returns its result
+# through that surface's own projector
+# (`eliot_mcp::project_context_reconstruction_projection`), so the daemon
+# serves the closure the `eliot.query` contract already declares instead of a
+# second body shape of its own. `scripts/audit-architecture-boundaries.py`
+# permits this edge: `eliot-mcp` is in neither `forbidden_exact` nor
+# `forbidden_prefix` of the `eliotd` runtime root (issue #18), and its
+# closure (eliot-contracts, eliot-kernel-core, eliot-protocol, eliot-receipts,
+# eliot-security-contracts, eliot-skill, eliot-source-assurance, schemars,
+# serde, serde_json, sha2, thiserror) adds no forbidden reach.
+eliot-mcp.workspace = true
 eliot-memory-quality = { path = "../../crates/smart/eliot-memory-quality", version = "0.1.0" }
 eliot-observability = { path = "../../crates/instrument/eliot-observability", version = "0.1.0" }
 # Issue #1836 (W1): the shared observability runtime this composition root
