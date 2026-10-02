@@ -1988,9 +1988,7 @@ mod host_lifecycle_boundary_table_tests {
     /// test that uses one exercises the real grant/unknown arms rather than a
     /// degraded stand-in that would change which arm runs.
     #[cfg(windows)]
-    fn complete_readiness_contour(
-        label: &str,
-    ) -> super::readiness_gate::ReadinessContourIdentity {
+    fn complete_readiness_contour(label: &str) -> super::readiness_gate::ReadinessContourIdentity {
         use super::readiness_gate::ReadinessContourIdentity;
         let handle = |suffix: &str| {
             PlatformHandle::new(format!("{label}-{suffix}")).expect("contour handle must be valid")
@@ -3849,7 +3847,7 @@ mod host_lifecycle_boundary_table_tests {
             Err(super::HostError::Stopped)
         });
         assert_eq!(
-            deferred.probes, possible_change.probes,
+            deferred.probes, 0,
             "a pending unknown must not re-probe as a retry"
         );
         assert_eq!(
