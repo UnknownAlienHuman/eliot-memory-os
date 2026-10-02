@@ -91,6 +91,7 @@ use eliot_store_api::{
 use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
+mod state_projection;
 
 /// Kernel-owned ChangeMonitor ledger (issue #1824, I10.21): hint ingest,
 /// content checksum/re-read confirmation, governed-tool records, and
@@ -4270,7 +4271,7 @@ impl KernelComposition {
     }
 
     /// Submits one daemon-produced `eliot.state` result for its waiting host
-    /// request (issue #2564).
+    /// request (issue #2564; owner-receipt binding #1739 W5).
     ///
     /// Identical contract to [`Self::submit_local_read_result`] and deliberately
     /// a SEPARATE entry: the bound carrier form differs, so a query result can
@@ -4278,6 +4279,15 @@ impl KernelComposition {
     /// transport, the persistence owner and the fencing machinery. The stored
     /// capability must be the state capability and the live attempt must be the
     /// STATE form's attempt record, or this refuses.
+    ///
+    /// Issue #1739 W5 closes this leg's answer end: the submitted body must
+    /// carry the projection owner's explicit result receipt
+    /// ([`state_projection::check_state_result_receipt`]) and may not claim the
+    /// canonical write-receipt class, and an exact replay serves the retained
+    /// outcome only with the same receipt
+    /// ([`state_projection::same_state_owner_receipt`]). A receiptless or
+    /// foreign-receipt state result therefore cannot persist, so the row can
+    /// never become a durable answer the bridge is forbidden to read back.
     pub(crate) fn submit_local_state_result(
         &self,
         session: &Session,
@@ -4347,10 +4357,16 @@ impl KernelComposition {
         }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
-        // canonical readback rather than a second completion.
+        // canonical readback rather than a second completion. Issue #1739 W5:
+        // the State row replays only with the same owner receipt its durable
+        // row retained, so a receiptless or foreign-receipt body over
+        // identical bytes declines this arm and faces the submission gate
+        // below, which fails closed instead of serving it as the completion.
         if stored.state == HostRequestState::ResultReceived
             && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
             && stored.result_response.as_ref() == Some(&body.response)
+            && (!matches!(queue, DaemonReadQueue::State)
+                || state_projection::same_state_owner_receipt(&stored, body))
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
@@ -4367,6 +4383,14 @@ impl KernelComposition {
         } else {
             body.validate_for_submission()
                 .map_err(|_| TransportError::SessionFenced)?;
+        }
+        // Issue #1739 W5: the State row is answered by a semantic owner
+        // flight, so its result carries the owner's receipt exactly as the
+        // query and observe rows do. Without this the Kernel would persist a
+        // durable state result that the bridge's retained-outcome gate can
+        // never serve, because a receiptless body names no owner.
+        if matches!(queue, DaemonReadQueue::State) {
+            state_projection::check_state_result_receipt(body)?;
         }
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
@@ -4888,17 +4912,23 @@ pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 /// owner yet, so no tool bytes are retained here.
 pub(crate) const COORDINATE_CAPABILITY: &str = "eliot.coordinate";
 
-/// Closed capability admitted to the state submit entry (issue #1739
-/// W5; projection-owner readback join still open).
+/// Closed capability admitted to the state row (issue #1739 W5).
 ///
-/// Digest-only `eliot.state` invocations ride the shared submit entry
-/// through [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel
-/// owns only the mechanical dispatch binding here — capability plus
-/// invocation kind, checked before any staging — never the projection
-/// verdict: the current authorized task/scope/attention/health projection
-/// stays the projection owner's to serve at the future live state
-/// claim/flight (I01-08 read path; I07-08 step 9). No tool bytes are
-/// retained here.
+/// The `eliot.state` row is served on the shared bounded local-read carrier
+/// under its own [`LocalReadPairKind::State`] form, NOT on the digest-only
+/// submit entry. It reaches the projection owner through
+/// [`KernelComposition::invoke_read_host_request`] →
+/// [`KernelComposition::route_and_retain_invoke_read_lane`] →
+/// [`check_local_state_admission`] → [`KernelComposition::retain_bounded_state_pair`],
+/// which content-compares the presented tool bytes against the admitted
+/// payload digest and derives the closed `include` selectors from them. That
+/// is strictly stronger than the digest-only submit binding it replaced: a
+/// submit-frame state envelope carried no bytes, so nothing could be
+/// retained, claimed, or answered, and its Accepted handle had no owner
+/// behind it. The Kernel owns no projection verdict here — the current
+/// authorized task/scope/attention/health projection is the projection
+/// owner's to serve at the state claim/flight (I01-08 read path; I07-08
+/// step 9).
 pub(crate) const STATE_CAPABILITY: &str = "eliot.state";
 
 /// Whether one requested capability is task-relative or effectful and
@@ -5102,32 +5132,6 @@ pub(crate) fn check_coordinate_submit_binding(
     Ok(())
 }
 
-/// Kernel-owned dispatch binding for one `eliot.state` submit (issue
-/// #1739 W5; projection-owner readback join still open).
-///
-/// `Invocation` kind the submit entry serves. A swapped capability or a
-/// non-invocation kind fails closed as `SessionFenced` before the caller
-/// stages anything. Pure: validation performs no IO by construction.
-///
-/// Digest-only state submits carry no tool bytes, so there is no payload
-/// digest to link here — the envelope digest already commits to the exact
-/// canonical request through admission, and the live session/fence/
-/// connection binding is enforced by the frame gateway plus the admission
-/// gates. The projection itself stays the projection owner's at the
-/// future live state claim/flight, never a Kernel verdict (I01-08
-/// read path).
-pub(crate) fn check_state_submit_binding(
-    envelope: &HostRequestEnvelope,
-) -> Result<(), TransportError> {
-    if envelope.identity.capability != STATE_CAPABILITY {
-        return Err(TransportError::SessionFenced);
-    }
-    if envelope.kind != HostRequestKind::Invocation {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
 fn observe_tool_requires_exact_task_binding(
     tool: &serde_json::Value,
 ) -> Result<bool, TransportError> {
@@ -5159,10 +5163,15 @@ impl KernelComposition {
     /// is revalidated before admission, while the fabric verdict stays the
     /// #1740 execution-fabric owner's at the future live coordinate
     /// claim/flight.
-    /// Digest-only `eliot.state` invocations take the same entry: the
-    /// Kernel-owned dispatch binding ([`check_state_submit_binding`])
-    /// is revalidated before admission, while the projection readback
-    /// stays the projection owner's at the future live state claim/flight.
+    ///
+    /// `eliot.state` does NOT take this entry (issue #1739 W5). It is served
+    /// on the bounded local-read carrier through
+    /// [`Self::invoke_read_host_request`], which content-compares the
+    /// presented tool bytes against the admitted payload digest, derives the
+    /// closed `include` selectors, and retains the State form under a fenced
+    /// attempt. A state envelope reaching this digest-only submit entry has
+    /// no retained bytes and therefore no claimable pair, so it is refused
+    /// rather than acknowledged with a handle nothing can ever answer.
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -5187,13 +5196,19 @@ impl KernelComposition {
         if !is_observe && envelope.identity.capability == COORDINATE_CAPABILITY {
             check_coordinate_submit_binding(envelope)?;
         }
-        // State projection dispatch (issue #1739 W5; the projection-owner
-        // readback join is still open): digest-only `eliot.state` submits
-        // ride this same entry. Revalidate the Kernel-owned dispatch
-        // binding before staging; the projection itself stays the
-        // projection owner's at the future live state claim/flight.
+        // The state row is NOT served here (issue #1739 W5). This entry is
+        // digest-only: a state envelope arriving on it retains no tool bytes,
+        // so no pair can be queued, claimed, or answered, and acknowledging
+        // it would issue an operation handle with no owner behind it — the
+        // exact "admission acknowledgement with nothing behind it" the
+        // retained-outcome rule forbids. The row's real carrier is
+        // `invoke_read_host_request` → `check_local_state_admission` →
+        // `retain_bounded_state_pair`. Refusing here is a typed
+        // `SessionFenced`, never a silent reclassification, and a state
+        // envelope WITH linked tool bytes on this entry is refused for the
+        // same reason: the submit entry never retains a state pair.
         if !is_observe && envelope.identity.capability == STATE_CAPABILITY {
-            check_state_submit_binding(envelope)?;
+            return Err(TransportError::SessionFenced);
         }
         let task_relative_tool = if is_observe {
             tool.map(|tool| check_observe_tool_linkage(envelope, tool))
