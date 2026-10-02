@@ -16,6 +16,7 @@ use crate::{
     StateFenceSnapshot,
 };
 use eliot_receipts::ReceiptIdentity;
+use eliot_store_api::{CausalWriteReceipt, ProposedAttemptRecord, RecoveryRecord, WriteReceipt};
 
 /// Immutable, digest-bound reference to one owner-defined admission claim.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -522,6 +523,190 @@ impl AdmissionReservationSnapshot {
     /// Store-issued receipt binding the exact persisted current row.
     pub const fn receipt(&self) -> &OperationalMutationReceipt {
         &self.receipt
+    }
+}
+
+/// Independent original-owner values retained by the caller that staged,
+/// canonically admitted and activated one selected-source attempt.
+///
+/// The proposal contains the exact Task/Session/WorkScope and selected-source
+/// operation/path/selector/source/config/action commitments. The reservation
+/// contains the exact WorkItem/ProposedAttempt/reservation/stage/activation
+/// identities, complete claims, epoch/fence and both distinct receipt ids.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionReservationOwnerExpectation {
+    /// Original Governor-owned proposal passed to canonical admission.
+    pub proposed_attempt_record: ProposedAttemptRecord,
+    /// Original owner readback row retained with that proposal.
+    pub proposed_attempt_recovery_record: RecoveryRecord,
+    /// Original canonical Store receipt retained by the caller.
+    pub canonical_write_receipt: WriteReceipt,
+    /// Original causal projection retained by the caller.
+    pub canonical_causal_write_receipt: CausalWriteReceipt,
+    /// Original ORS active row returned by the activation owner.
+    pub admission_reservation_record: AdmissionReservationRecord,
+    /// Original ORS activation mutation receipt returned by the owner.
+    pub admission_reservation_receipt: OperationalMutationReceipt,
+}
+
+/// Adopts one exact selected-source owner snapshot only after comparing its
+/// owner-issued ORS values to the original typed values retained by its caller.
+///
+/// This accepts only an existing `AdmissionReservationSnapshot`, whose private
+/// fields and lack of `Deserialize` preserve its original-ORS-owner provenance;
+/// it never accepts a generic record/receipt pair or a serialized/caller-built
+/// `ActiveAdmissionReservation`. It verifies the canonical proposal and exact
+/// recovery bytes, the original committed Store receipt and causal projection,
+/// the active ORS row and original mutation receipt, complete claims and all
+/// request/reservation identities. Only the existing launch-prerequisite
+/// verifier may issue the returned sealed active typestate.
+pub fn adopt_active_admission_reservation_from_owner_snapshot(
+    current: &AdmissionReservationSnapshot,
+    expected: &AdmissionReservationOwnerExpectation,
+    current_epoch: &EpochLineage,
+    current_fence: &StateFenceSnapshot,
+    now_ms: i64,
+) -> Result<ActiveAdmissionReservation, OrsError> {
+    let reservation = current.record();
+    let mutation_receipt = current.receipt();
+    if reservation != &expected.admission_reservation_record
+        || mutation_receipt != &expected.admission_reservation_receipt
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+
+    let proposed_attempt = &expected.proposed_attempt_record;
+    proposed_attempt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    let recovery_record = &expected.proposed_attempt_recovery_record;
+    recovery_record
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if recovery_record
+        != &proposed_attempt
+            .recovery_record()
+            .map_err(|error| OrsError::Contract(error.to_string()))?
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let recovered_payload = std::str::from_utf8(&recovery_record.payload)
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    let recovered_attempt: ProposedAttemptRecord = serde_json::from_str(recovered_payload)
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    recovered_attempt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if recovered_attempt != *proposed_attempt {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+
+    expected
+        .canonical_write_receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    expected
+        .canonical_causal_write_receipt
+        .validate()
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+    if expected.canonical_causal_write_receipt.receipt != expected.canonical_write_receipt {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+
+    reservation.validate()?;
+    if reservation.state != AdmissionReservationState::Active
+        || reservation.work_item_id.as_str() != proposed_attempt.work_item_id
+        || reservation.proposed_attempt_id.as_str() != proposed_attempt.proposed_attempt_id
+        || reservation.reservation_id.as_str() != proposed_attempt.reservation_id
+        || reservation.stage_operation_id.as_str() != proposed_attempt.reservation_stage_receipt_id
+        || reservation.operation_id.as_str().trim().is_empty()
+        || reservation.state_fence != *current_fence
+        || reservation.authority_epoch != *current_epoch
+        || proposed_attempt.state_fence != *current_fence
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let expected_claims: AdmissionReservationClaims =
+        serde_json::from_value(proposed_attempt.reservation_claims.clone())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    expected_claims.validate()?;
+    if reservation.claims != expected_claims {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let proposal_epoch: EpochLineage =
+        serde_json::from_value(proposed_attempt.authority_epoch.clone())
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    proposal_epoch.validate()?;
+    if proposal_epoch != *current_epoch {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let proposal_fence = StateFenceSnapshot::capture(
+        &proposed_attempt.state_fence,
+        proposed_attempt.state_fence.authority_epoch.sequence.get(),
+    )?;
+    if proposal_fence != *current_fence {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+
+    let committed = reservation
+        .canonical_admission
+        .as_ref()
+        .ok_or(OrsError::ReconciliationMismatch)?;
+    let canonical_receipt_identity = canonical_admission_receipt_from_owner_receipt(
+        &expected.canonical_write_receipt,
+        &committed.operation_id,
+    )?;
+    let expected_commit = canonical_admission_from_owner_commit(
+        &expected.canonical_write_receipt,
+        committed.operation_id.as_str(),
+        &committed.launch_outbox_operation_id,
+        &committed.launch_outbox_id,
+    )?;
+    if expected.canonical_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || expected.canonical_write_receipt.operation_id.as_str() != committed.operation_id.as_str()
+        || expected.canonical_write_receipt.state_fence != proposed_attempt.state_fence
+        || expected.canonical_write_receipt.outbox_refs.is_empty()
+        || canonical_receipt_identity != committed.admission_receipt
+        || expected_commit != *committed
+        || reservation.canonical_admission_receipt.as_ref() != Some(&canonical_receipt_identity)
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let activation_receipt_identity = reservation
+        .activation_receipt
+        .as_ref()
+        .ok_or(OrsError::InvalidTransition)?;
+    AdmissionReservationActivationEvidence {
+        canonical_admission_receipt: canonical_receipt_identity,
+        activation_receipt: activation_receipt_identity.clone(),
+    }
+    .validate()?;
+
+    if mutation_receipt.record_id() != &reservation.operation_id
+        || mutation_receipt.subject_id() != &reservation.reservation_id
+        || mutation_receipt.phase() != crate::OperationalPhase::Active
+    {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    current_epoch.validate()?;
+    current_fence.validate_against_lineage(current_epoch)?;
+    if now_ms <= 0 {
+        return Err(OrsError::InvalidField {
+            field: "admission_reservation_launch_prerequisite.now_ms",
+            reason: "must be greater than zero",
+        });
+    }
+
+    match verify_admission_reservation_launch_prerequisite(
+        Some(current),
+        &reservation.work_item_id,
+        &reservation.proposed_attempt_id,
+        current_epoch,
+        current_fence,
+        now_ms,
+    )? {
+        AdmissionReservationLaunchPrerequisite::Active(active) => Ok(active),
+        _ => Err(OrsError::ReconciliationMismatch),
     }
 }
 
