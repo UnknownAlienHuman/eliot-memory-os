@@ -1957,8 +1957,9 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Disposition, INVENTORY_REVISION, assert_inventory_entries_are_live, baked_surface,
-        current_consumer_inventory, expiry_condition_guard, first_iso_date_digits, iso_date_text,
+        CONSUMER_SURFACES, Disposition, INVENTORY_REVISION, assert_inventory_entries_are_live,
+        baked_surface, consumer_disposition_guard, current_consumer_inventory,
+        expiry_condition_guard, first_iso_date_digits, inventory_entries_for, iso_date_text,
     };
 
     /// Digits of the first `YYYY-MM-DD` token in `text`, decoded to integers.
@@ -2127,5 +2128,99 @@ mod tests {
                 surface.path
             );
         }
+    }
+
+    #[test]
+    fn consumer_disposition_guard_gives_every_baked_surface_exactly_one_agreeing_disposition() {
+        // Production guard under test, reached from
+        // `run_facade_disposition_guards` and from `main.rs::dispatch_command`.
+        assert_eq!(
+            consumer_disposition_guard(),
+            Ok(()),
+            "the shipped surface/inventory pairing must pass the disposition guard at the entry gate"
+        );
+
+        assert!(
+            !CONSUMER_SURFACES.is_empty(),
+            "no facade consumer surface is baked; the inventory guard is blind"
+        );
+
+        let mut declared: Vec<&str> = Vec::new();
+        for surface in CONSUMER_SURFACES {
+            // The live side of every comparison is read out of the real file.
+            assert!(
+                surface.body.contains(surface.live_reference),
+                "baked facade consumer surface {} no longer contains its recorded live reference {:?}",
+                surface.path,
+                surface.live_reference
+            );
+
+            // Exactly one disposition per retained path: the guard refuses a
+            // second row and refuses a surface with no row at all.
+            let recorded = inventory_entries_for(surface.path);
+            assert_eq!(
+                recorded.len(),
+                1,
+                "surface {} carries {} dispositions; exactly one is required",
+                surface.path,
+                recorded.len()
+            );
+            assert_eq!(
+                recorded[0].live_reference,
+                surface.live_reference,
+                "inventory entry for {} disagrees with the baked surface reference",
+                surface.path
+            );
+            declared.push(surface.path);
+        }
+
+        // The reverse direction: an inventory proof is rejected unless it is one
+        // of the declared baked surfaces, so the inventory cannot name a caller
+        // outside the detector and cannot fall behind the declared consumer set.
+        for entry in current_consumer_inventory() {
+            assert!(
+                declared.contains(&entry.proof),
+                "inventory proof {} is not one of the baked facade consumer surfaces",
+                entry.proof
+            );
+        }
+
+        // Every declared surface is covered exactly once, so the inventory
+        // cannot silently fall behind the declared consumer set.
+        let inventory = current_consumer_inventory();
+        let mut covered: Vec<&str> = inventory.iter().map(|entry| entry.proof).collect();
+        covered.sort_unstable();
+        let mut expected = declared.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            covered, expected,
+            "the declared surface set and the set of inventory proofs differ"
+        );
+
+        // Every covered path carries one explicit disposition, and the shipped
+        // inventory really does use the extraction and fixture dispositions, so
+        // the two-disposition claim in A8 is exercised rather than vacuous.
+        let extract_paths = inventory
+            .iter()
+            .filter(|entry| entry.disposition == Disposition::ExtractToCurrentOwner)
+            .count();
+        let fixture_paths = inventory
+            .iter()
+            .filter(|entry| entry.disposition == Disposition::TemporaryFixture)
+            .count();
+        let remove_paths = inventory
+            .iter()
+            .filter(|entry| entry.disposition == Disposition::Remove)
+            .count();
+        assert_eq!(
+            extract_paths + fixture_paths + remove_paths,
+            inventory.len(),
+            "every covered path carries exactly one disposition"
+        );
+        assert!(
+            extract_paths > 0 && fixture_paths > 0,
+            "the shipped inventory must carry both extract and fixture dispositions \
+             (extract={extract_paths}, fixture={fixture_paths})"
+        );
     }
 }
