@@ -6209,9 +6209,16 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
         let operation = request.operation;
         let refusal = |reason: &'static str| BackupDispatchRefusal::new(operation, reason);
         // Rehearsal completion resolves to no cutover admission, so it can
-        // never select the cutover owner operation. The assertion pins the
-        // excluded-rehearsal contract on the real routing path.
-        debug_assert!(!eliot_host_control_endpoint::rehearsal_resolves_cutover());
+        // never select the cutover owner operation. This is a real gate and not
+        // a `debug_assert!`: a release build removes a debug assertion, so the
+        // previous form carried this guarantee in no shipped build at all. It
+        // runs before any owner effect, so the refusal it returns is a
+        // pre-effect one and leaves nothing to reconcile.
+        if eliot_host_control_endpoint::rehearsal_resolves_cutover() {
+            return Err(refusal(
+                "rehearsal completion resolves to cutover authority",
+            ));
+        }
         // The type-checked routing is the decision: a table marker string is
         // never followed.
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {

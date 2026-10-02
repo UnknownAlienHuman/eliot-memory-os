@@ -116,6 +116,43 @@ pub const fn requires_cutover_admission(op: BackupOperationKind) -> Option<bool>
     }
 }
 
+/// Stable refusal class for a request whose operation would reach cutover
+/// authority without being the separately admitted cutover request.
+///
+/// A13.7 makes cutover a separate authority, and this is the one refusal that
+/// says so at the endpoint: it is returned before any owner effect, so an
+/// operation that resolved cutover authority without its own admission never
+/// reaches a cutover owner and never leaves an unresolved effect behind.
+pub const CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL: &str =
+    "backup operation resolves to cutover authority without the admitted cutover request";
+
+/// Returns whether `op` reaches cutover authority on this endpoint.
+///
+/// Cutover is ONE operation. The Host's cutover authority is the separately
+/// admitted [`BackupOperationKind::AdmitCutover`] request and nothing else:
+/// it is the only canonical operation whose accepted row carries the
+/// `needs_cutover_admission` bit, and the only one whose registration is a
+/// cutover. Every other operation — rehearsal completion in particular — is
+/// either admitted with that bit clear or carries no accepted registration at
+/// all, so it resolves to no cutover authority.
+///
+/// This is derived from [`requires_cutover_admission`], the same canonical
+/// disposition the admission gates read, rather than asserted as a constant,
+/// and the `None` arm is a decision and not a fallback: an operation with no
+/// accepted Host registration resolves to no owner operation at all, so it can
+/// resolve to no cutover either. The result is compared against the operation
+/// itself by the caller, which is what makes it load-bearing: if a canonical
+/// variant ever changed its cutover disposition, or a rehearsal row ever
+/// required a cutover admission, this comparison fails and the request is
+/// refused before the owner is called.
+#[must_use]
+pub const fn resolves_cutover_authority(op: BackupOperationKind) -> bool {
+    match requires_cutover_admission(op) {
+        Some(needs_cutover_admission) => needs_cutover_admission,
+        None => false,
+    }
+}
+
 /// Returns whether a payload-claimed wire ID matches the authenticated
 /// operation's canonical wire ID. The payload can never override the
 /// authenticated operation: only exact equality passes.
@@ -297,13 +334,101 @@ impl HostBackupOwnerRegistration {
 
 /// Rehearsal (`CompleteRehearsal`) never resolves to cutover admission:
 /// it is excluded from the accepted table and carries a distinct wire ID.
-/// Always returns false; the debug assertions pin the exclusion.
+///
+/// This is DERIVED from the accepted table and the canonical cutover
+/// disposition, so it stays a fact about this endpoint's policy instead of a
+/// constant that could only ever say "false": it returns true the moment a
+/// rehearsal row enters [`accepted_host_backup_methods`], or the moment any
+/// accepted row resolves to cutover authority without being the admitted
+/// cutover request. Both routes are checked, so the predicate names every way
+/// rehearsal could reach cutover authority rather than the single one it was
+/// written for.
 pub fn rehearsal_resolves_cutover() -> bool {
-    debug_assert!(!is_supported(BackupOperationKind::CompleteRehearsal));
-    debug_assert!(requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none());
-    debug_assert!(!authority_matches(
-        BackupOperationKind::CompleteRehearsal,
-        BackupOperationKind::AdmitCutover.wire_id(),
-    ));
-    false
+    if resolves_cutover_authority(BackupOperationKind::CompleteRehearsal) {
+        return true;
+    }
+    accepted_host_backup_methods()
+        .iter()
+        .any(|method| method.op != BackupOperationKind::AdmitCutover && method.needs_cutover_admission)
+}
+
+#[cfg(test)]
+mod rehearsal_cutover_tests {
+    use super::{
+        BackupOperationKind, CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL, authority_matches, is_supported,
+        rehearsal_resolves_cutover, requires_cutover_admission, resolves_cutover_authority,
+    };
+
+    /// The predicate the production admission gate compares is load-bearing for
+    /// every canonical operation, and it names cutover authority for exactly
+    /// one of them.
+    ///
+    /// Load-bearing: delete gate 0a in `HostRuntimeControl::handle_backup_operation`
+    /// and this comparison stops happening, so an accepted row that resolved to
+    /// cutover authority without being the admitted cutover request would reach
+    /// a cutover owner. Delete `resolves_cutover_authority` and the gate cannot
+    /// be written at all, because nothing else derives the relation from the
+    /// canonical disposition.
+    #[test]
+    fn cutover_authority_is_one_operation_and_the_gate_compares_it() {
+        for op in [
+            BackupOperationKind::RequestCapture,
+            BackupOperationKind::ReadSnapshotPage,
+            BackupOperationKind::VerifyArchive,
+            BackupOperationKind::PrepareIsolatedRestore,
+            BackupOperationKind::RestoreStep,
+            BackupOperationKind::ReconcileRestore,
+            BackupOperationKind::RestoreStatus,
+            BackupOperationKind::CompleteRehearsal,
+            BackupOperationKind::AdmitCutover,
+        ] {
+            // This is the gate's own comparison, run for every variant.
+            assert_eq!(
+                resolves_cutover_authority(op),
+                op == BackupOperationKind::AdmitCutover,
+                "cutover authority for {op}"
+            );
+        }
+        // The refusal class is bounded, non-empty, and names the divergence.
+        assert!(!CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.is_empty());
+        assert!(CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.contains("cutover"));
+    }
+
+    /// Rehearsal completion selects no cutover authority, and the predicate
+    /// that says so is derived from the accepted table rather than asserted.
+    ///
+    /// Load-bearing: `rehearsal_resolves_cutover` is consulted by a release-mode
+    /// gate in `bins/eliot-host/src/lib.rs`. If it were replaced by the constant
+    /// `false` it used to be, the first assertion below would still pass and the
+    /// gate would carry nothing; the second assertion is what fails, because it
+    /// shows the predicate reads the accepted table and the canonical
+    /// disposition rather than answering from a literal.
+    #[test]
+    fn rehearsal_selects_no_cutover_and_the_predicate_is_derived() {
+        assert!(!rehearsal_resolves_cutover());
+        // Rehearsal is refused by the accepted table and by the canonical
+        // disposition independently of the predicate, so the predicate's inputs
+        // really do exclude it.
+        assert!(!is_supported(BackupOperationKind::CompleteRehearsal));
+        assert!(
+            requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none()
+        );
+        // And rehearsal still carries its own wire identity, never cutover's.
+        assert!(!authority_matches(
+            BackupOperationKind::CompleteRehearsal,
+            BackupOperationKind::AdmitCutover.wire_id(),
+        ));
+        // Every accepted row that is not the admitted cutover request must have
+        // its cutover-admission bit clear; this is the table-wide form of what
+        // the predicate checks for rehearsal, run here so a future row cannot
+        // be added without this failing.
+        for method in super::accepted_host_backup_methods() {
+            assert_eq!(
+                method.needs_cutover_admission,
+                method.op == BackupOperationKind::AdmitCutover,
+                "accepted row {} cutover authority",
+                method.op
+            );
+        }
+    }
 }

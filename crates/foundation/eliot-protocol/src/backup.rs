@@ -219,6 +219,18 @@ pub enum BackupError {
     /// A canonical identity was reused with changed content.
     #[error("backup replay identity conflicts with changed content")]
     ReplayConflict,
+    /// A replayed request envelope was refused with a stable typed reason.
+    ///
+    /// Distinct from [`BackupError::ReplayConflict`], which is the single
+    /// legacy "changed content" answer. This variant carries the closed
+    /// [`BackupReplayRefusal`] class, so a caller can tell a byte-identical
+    /// repeat from an identity that names nothing, from evidence that is no
+    /// longer current, and from changed content under one stable identity.
+    #[error("backup replay refused: {reason}")]
+    ReplayRefused {
+        /// Stable typed refusal class.
+        reason: BackupReplayRefusal,
+    },
     /// The authenticated role lacks the requested capability.
     #[error("role does not have the requested backup capability")]
     CapabilityDenied,
@@ -1470,6 +1482,69 @@ impl BackupIsolatedRestorePrepare {
                 field: "backup_isolated_restore_prepare.request_digest",
                 reason: "request digest mismatch",
             });
+        }
+        Ok(())
+    }
+
+    /// Validates the preparation against the separately authenticated
+    /// destination authority, and refuses a destination override there.
+    ///
+    /// [`BackupIsolatedRestorePrepare::validate`] already compares the declared
+    /// `destination_installation` against the bound
+    /// [`BackupRequestIdentity::dest_installation`]. That comparison is
+    /// necessary and it is not sufficient as a *fence*: both of those values
+    /// travel in the SAME presented request, so a caller that presents a
+    /// self-consistent forged identity satisfies it, and the destination it
+    /// names is still a caller-selected one. This method is the fence. It is
+    /// also the reason the preparation carries no standing authority of its
+    /// own: the destination it may write into is the one a separately
+    /// authenticated owner names, and the request only has the right to
+    /// confirm it.
+    ///
+    /// The comparison is against `destination_authority` exactly as it was
+    /// supplied by the caller from its own authenticated source. No digest is
+    /// recomputed, the destination is never inferred from the request, and the
+    /// ORIGINAL recorded `authority_owner` is the expected value; this is the
+    /// same shape [`BackupCutoverAdmission::validate_against`] and
+    /// [`BackupCutoverReceipt::validate_against`] already use, so this is the
+    /// one fence scheme in the crate rather than a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupError::CapabilityDenied`] when the separately
+    /// authenticated role is not the preparation's own principal, does not
+    /// permit the preparation, or may not issue owner attestations at all;
+    /// [`BackupError::Mismatch`] on
+    /// `backup_isolated_restore_prepare.destination_installation` when the
+    /// declared destination overrides the owner-named one; and
+    /// [`BackupError::FenceMismatch`] when the owner binding is from a
+    /// different authority lineage than the request's own fence.
+    pub fn validate_against_destination(
+        &self,
+        authenticated_role: BackupRole,
+        destination_authority: &AuthorityBinding,
+    ) -> Result<(), BackupError> {
+        self.validate()?;
+        self.identity.check_authenticated_role(authenticated_role)?;
+        if !authenticated_role.permits(BackupOperationKind::PrepareIsolatedRestore) {
+            return Err(BackupError::CapabilityDenied);
+        }
+        if !authenticated_role.is_attesting_role() {
+            return Err(BackupError::CapabilityDenied);
+        }
+        // THE destination fence: the declared destination against the
+        // independently authenticated owner binding, not against the
+        // presented request's own identity.
+        if self.destination_installation != destination_authority.authority_owner {
+            return Err(BackupError::Mismatch {
+                field: "backup_isolated_restore_prepare.destination_installation",
+            });
+        }
+        if !destination_authority
+            .authority_epoch
+            .is_same_authority(&self.identity.fence.authority_epoch)
+        {
+            return Err(BackupError::FenceMismatch);
         }
         Ok(())
     }
@@ -2910,11 +2985,64 @@ pub enum BackupReplayDisposition {
     Duplicate,
 }
 
+/// Typed refusal class for one replayed backup request envelope.
+///
+/// The four replayed-envelope cases are a closed and distinct set, never one
+/// "rejected" answer, because each has a different next action: a
+/// byte-identical repeat must reconcile the operation it already ran rather
+/// than redo it, an identity with no canonical request hash names nothing to
+/// replay against, evidence observed past its bound deadline is no longer
+/// current, and changed content under one stable identity is an identity
+/// conflict that performs no transition. I5.27 keeps idempotency defined over
+/// canonical bytes, so the class is decided from the canonical content and
+/// never from a caller's spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackupReplayRefusal {
+    /// Byte-identical replay of an identity this ledger already accepted.
+    Duplicate,
+    /// The identity carries no canonical request hash to key a replay on.
+    Unknown,
+    /// The identity's bound deadline admits no currently observed evidence.
+    Stale,
+    /// Changed canonical content reused one stable canonical request hash.
+    Changed,
+}
+
+impl std::fmt::Display for BackupReplayRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl BackupReplayRefusal {
+    /// Returns the stable bounded reason text of this refusal class.
+    ///
+    /// The match is exhaustive over the closed set, so a new refusal class is
+    /// a compile error here until it has a reason a caller can read.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Duplicate => "DUPLICATE_REPLAY",
+            Self::Unknown => "UNKNOWN_REPLAY_IDENTITY",
+            Self::Stale => "STALE_REPLAY_EVIDENCE",
+            Self::Changed => "CHANGED_REPLAY_IDENTITY",
+        }
+    }
+}
+
 /// A pure replay identity ledger for backup request identities.
 ///
 /// Keyed by the stable `canonical_request_hash`; a byte-identical digest
 /// observes `Duplicate`, while changed content under the same identity
 /// returns `ReplayConflict` before any semantic handling.
+///
+/// [`BackupReplayLedger::observe`] is the disposition-returning form.
+/// [`BackupReplayLedger::observe_typed`] is the refusal-returning form the
+/// production ingress uses, and it is the one that carries a
+/// [`BackupReplayRefusal`] class for every replayed envelope. Both read the
+/// same entries, so the two are two dispositions of one ledger rather than two
+/// ledgers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackupReplayLedger {
     entries: BTreeMap<String, String>,
@@ -2946,6 +3074,84 @@ impl BackupReplayLedger {
         }
         self.entries
             .insert(identity.mutation.canonical_request_hash.clone(), digest);
+        Ok(BackupReplayDisposition::Accepted)
+    }
+
+    /// Refuses one replayed identity with its typed class, or accepts a first
+    /// observation of it.
+    ///
+    /// This is the production ingress form, and it exists because
+    /// [`BackupReplayLedger::observe`] cannot express the guarantee the ingress
+    /// owes: `observe` reports a byte-identical repeat as
+    /// `Ok(BackupReplayDisposition::Duplicate)`, which is a disposition and not
+    /// a refusal, so a caller cannot tell "you already ran this, reconcile it"
+    /// apart from "I did work for you". Here every replayed envelope is refused
+    /// and the refusal names which of the four closed cases it is:
+    ///
+    /// - [`BackupReplayRefusal::Unknown`] — the identity carries no canonical
+    ///   request hash, so nothing can key a replay decision on it. It is
+    ///   refused rather than admitted under an empty key, where every unknown
+    ///   request would collide with every other one.
+    /// - [`BackupReplayRefusal::Stale`] — the bound deadline is not greater
+    ///   than zero, so no evidence observed against this identity is current
+    ///   and the replay is refused instead of being treated as fresh.
+    /// - [`BackupReplayRefusal::Duplicate`] — a byte-identical repeat of an
+    ///   identity this ledger already accepted. Nothing is recorded and no
+    ///   transition happens: the caller reconciles the original operation.
+    /// - [`BackupReplayRefusal::Changed`] — changed canonical content under one
+    ///   stable canonical request hash. I5.27 makes this `IDENTITY_CONFLICT`
+    ///   with no transition, and the already-recorded entry is left in place
+    ///   rather than overwritten, so the ledger still holds the original.
+    ///
+    /// The unknown-field, stale-wire and changed-`identity_digest` clauses of
+    /// the same guarantee are refused by [`BackupRequestIdentity::validate`]
+    /// itself, which runs first and unchanged, with its own typed
+    /// [`BackupError::InvalidField`]. This method does not weaken or replace
+    /// it; it adds the two cases that are only decidable against a ledger and
+    /// it makes the other two distinguishable by class on this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupError::ReplayRefused`] carrying the closed
+    /// [`BackupReplayRefusal`] class, or whatever
+    /// [`BackupRequestIdentity::validate`] returns for the identity's own
+    /// contract.
+    pub fn observe_typed(
+        &mut self,
+        identity: &BackupRequestIdentity,
+    ) -> Result<BackupReplayDisposition, BackupError> {
+        // The two ledger-only cases are decided BEFORE the identity contract
+        // runs, so they carry the closed replay class rather than collapsing
+        // into `InvalidField` and losing which replayed case they were. Both
+        // are refused by `BackupRequestIdentity::validate` as well; deciding
+        // them here is a naming refinement, never a relaxation, because a
+        // request carrying either defect is still refused.
+        let hash = identity.mutation.canonical_request_hash.as_str();
+        if hash.trim().is_empty() {
+            return Err(BackupError::ReplayRefused {
+                reason: BackupReplayRefusal::Unknown,
+            });
+        }
+        if identity.deadline_unix_ms == 0 {
+            return Err(BackupError::ReplayRefused {
+                reason: BackupReplayRefusal::Stale,
+            });
+        }
+        identity.validate()?;
+        let bytes = canonical_json_bytes(identity)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        let digest = sha256_hex(&bytes);
+        if let Some(previous) = self.entries.get(hash) {
+            if previous == &digest {
+                return Err(BackupError::ReplayRefused {
+                    reason: BackupReplayRefusal::Duplicate,
+                });
+            }
+            return Err(BackupError::ReplayRefused {
+                reason: BackupReplayRefusal::Changed,
+            });
+        }
+        self.entries.insert(hash.to_owned(), digest);
         Ok(BackupReplayDisposition::Accepted)
     }
 

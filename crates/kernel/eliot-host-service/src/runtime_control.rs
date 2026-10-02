@@ -24,7 +24,7 @@ use eliot_kernel_service::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::backup::{
-    BackupArtifactHandle, BackupCutoverAdmission, BackupIsolatedRestorePrepare,
+    BackupArtifactHandle, BackupCutoverAdmission, BackupError, BackupIsolatedRestorePrepare,
     BackupOperationKind, BackupPhaseAttestation, BackupRequestIdentity, BackupRestoreReconcile,
     BackupRestoreStatus, BackupStage, attesting_roles, operation_for_phase,
 };
@@ -1825,6 +1825,47 @@ impl BackupOperationBody {
         }
     }
 
+    /// Returns the destination THIS BODY declares, read from the body and never
+    /// from the envelope that carries it.
+    ///
+    /// [`BackupOperationBody::PrepareIsolatedRestore`] is the one variant with a
+    /// destination field of its own, and it is the only operation whose body can
+    /// override the destination its own bound identity names. The other three
+    /// carry no destination field, so the destination they operate on is the one
+    /// their bound identity names; that value is read from the identity, never
+    /// invented here.
+    ///
+    /// This exists so the destination fence is a COMPARISON on the production
+    /// admission path instead of a value merely carried in a struct field. The
+    /// body is validated first, so an unvalidated body never reaches the
+    /// comparison and the returned destination is one the body's own canonical
+    /// contract already accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the body's own canonical validation error.
+    pub fn declared_destination(&self) -> Result<&str, BackupError> {
+        self.validate_destination_owner()?;
+        match self {
+            Self::PrepareIsolatedRestore(body) => Ok(body.destination_installation.as_str()),
+            Self::AdmitCutover(_) | Self::RestoreStatus(_) | Self::ReconcileRestore(_) => {
+                Ok(self.identity().dest_installation.as_str())
+            }
+        }
+    }
+
+    /// Validates only the body variant that declares its own destination.
+    fn validate_destination_owner(&self) -> Result<(), BackupError> {
+        match self {
+            Self::PrepareIsolatedRestore(body) => body.validate(),
+            // The remaining three carry no destination field, so there is no
+            // declared destination to validate beyond the identity every body
+            // shares; `validate_body_binding` still validates each of them
+            // through its own contract on the path that reaches them.
+            Self::AdmitCutover(_) | Self::RestoreStatus(_) | Self::ReconcileRestore(_) => Ok(()),
+        }
+    }
+
     /// Validates the body through its own canonical `#954` contract.
     pub fn validate(&self) -> Result<(), String> {
         let validated = match self {
@@ -2195,6 +2236,25 @@ impl BackupRuntimeControlRequest {
             || identity.dest_installation != self.destination.as_str()
         {
             return Err("backup installations do not match the carried operation body".to_owned());
+        }
+        // The destination FENCE, compared here rather than merely carried in a
+        // struct field. `BackupIsolatedRestorePrepare` is the one body that
+        // declares its own destination, and that declaration used to be checked
+        // only inside the body, against the bound identity that travels in the
+        // SAME document - which is self-consistency, not a fence against the
+        // destination this endpoint actually admitted. The body's own declared
+        // destination is now compared against the admitted envelope destination,
+        // so a prepared destination override cannot ride in on a body that is
+        // internally consistent about a different destination than the one this
+        // request was admitted for. The body validates itself first, so an
+        // unvalidated body never reaches this comparison.
+        if self.body.declared_destination().map_err(|error| error.to_string())?
+            != self.destination.as_str()
+        {
+            return Err(
+                "backup destination does not match the destination the operation body declares"
+                    .to_owned(),
+            );
         }
         if identity.principal.role != self.role
             || identity.principal.session_id != self.session_id.as_str()

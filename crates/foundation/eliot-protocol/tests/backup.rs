@@ -94,10 +94,10 @@ use eliot_protocol::backup::{
     BackupCaptureReceipt, BackupCaptureRequest, BackupClassWire, BackupCutoverAdmission,
     BackupCutoverReceipt, BackupDisposition, BackupError, BackupIsolatedRestorePrepare,
     BackupMutationBinding, BackupOperationKind, BackupPhaseAttestation, BackupRehearsalComplete,
-    BackupReplayDisposition, BackupReplayLedger, BackupRequestIdentity, BackupRestoreReconcile,
-    BackupRestoreStatus, BackupRestoreStep, BackupRole, BackupSnapshotPageRead, BackupStage,
-    Denominator, HostAuditRef, ack_phase_stage, attesting_roles, contract_identity,
-    operation_for_phase,
+    BackupReplayDisposition, BackupReplayLedger, BackupReplayRefusal, BackupRequestIdentity,
+    BackupRestoreReconcile, BackupRestoreStatus, BackupRestoreStep, BackupRole,
+    BackupSnapshotPageRead, BackupStage, Denominator, HostAuditRef, ack_phase_stage,
+    attesting_roles, contract_identity, operation_for_phase,
 };
 use eliot_protocol::{
     AckPhase, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
@@ -1651,6 +1651,180 @@ fn duplicate_unknown_stale_changed_replay_rejected() -> TestResult {
             "same identity with changed bytes returns REPLAY_CONFLICT and performs no transition"
         )
     );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 2984/W3k2
+/// The four replayed-envelope classes are refused by the canonical owner with
+/// four DISTINCT typed reasons, on the same entries `observe` reads.
+///
+/// Load-bearing: if `observe_typed` were removed, `backup_replay::observe` in
+/// `eliot-host-control-endpoint` would have nothing to call and every one of
+/// these four assertions below would have no subject - the production ingress
+/// gate could not name which replayed case it refused, and a duplicate would be
+/// indistinguishable from a first observation.
+#[test]
+fn production_replay_refusals_are_typed_and_distinct() -> TestResult {
+    let identity = base_identity(
+        BackupRole::InstallationAuthority,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "backup-req-typed-replay",
+    );
+    identity.validate()?;
+
+    // POSITIVE: a first observation is accepted and recorded.
+    let mut ledger = BackupReplayLedger::new();
+    assert_eq!(
+        ledger.observe_typed(&identity)?,
+        BackupReplayDisposition::Accepted
+    );
+    assert_eq!(ledger.len(), 1);
+
+    // REFUSAL 1 - DUPLICATE: a byte-identical repeat is a refusal carrying the
+    // duplicate class, not an `Ok(Duplicate)` disposition. If this returned
+    // `Ok`, the ingress would have told the caller it did work for a request
+    // that already ran.
+    assert!(matches!(
+        ledger.observe_typed(&identity),
+        Err(BackupError::ReplayRefused {
+            reason: BackupReplayRefusal::Duplicate
+        })
+    ));
+
+    // REFUSAL 2 - CHANGED: changed canonical content under one stable
+    // canonical request hash. The recorded ORIGINAL is kept, so the ledger
+    // still refuses the original as a duplicate afterwards; if the changed
+    // observation overwrote the entry, that final assertion would fail.
+    let mut changed = identity.clone();
+    changed.snapshot_digest = digest("snapshot-typed-replay-changed");
+    changed.identity_digest = changed.compute_digest()?;
+    changed.validate()?;
+    assert!(matches!(
+        ledger.observe_typed(&changed),
+        Err(BackupError::ReplayRefused {
+            reason: BackupReplayRefusal::Changed
+        })
+    ));
+    assert!(matches!(
+        ledger.observe_typed(&identity),
+        Err(BackupError::ReplayRefused {
+            reason: BackupReplayRefusal::Duplicate
+        })
+    ));
+
+    // REFUSAL 3 - UNKNOWN: an identity that names no canonical request hash
+    // cannot key a replay decision at all. Admitting it would file it under an
+    // empty key, where every nameless request would collide.
+    let mut unknown = base_identity(
+        BackupRole::InstallationAuthority,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "backup-req-typed-unknown",
+    );
+    unknown.mutation.canonical_request_hash = "   ".to_owned();
+    assert!(matches!(
+        ledger.observe_typed(&unknown),
+        Err(BackupError::ReplayRefused {
+            reason: BackupReplayRefusal::Unknown
+        })
+    ));
+
+    // REFUSAL 4 - STALE: an identity whose bound deadline admits no currently
+    // observed evidence is refused as stale rather than treated as fresh.
+    let mut stale = base_identity(
+        BackupRole::InstallationAuthority,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "backup-req-typed-stale",
+    );
+    stale.deadline_unix_ms = 0;
+    assert!(matches!(
+        ledger.observe_typed(&stale),
+        Err(BackupError::ReplayRefused {
+            reason: BackupReplayRefusal::Stale
+        })
+    ));
+
+    // The four classes are four distinct values with four distinct bounded
+    // reasons, so no two of them collapse into one refusal a caller could read
+    // the same way.
+    let classes = [
+        BackupReplayRefusal::Duplicate,
+        BackupReplayRefusal::Unknown,
+        BackupReplayRefusal::Stale,
+        BackupReplayRefusal::Changed,
+    ];
+    for (index, class) in classes.iter().enumerate() {
+        for other in classes.iter().skip(index + 1) {
+            assert_ne!(class, other);
+            assert_ne!(class.as_str(), other.as_str());
+        }
+    }
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 2984/W3k2
+/// The preparation's destination is fenced against the destination a
+/// SEPARATELY AUTHENTICATED owner names, not against the presented request's
+/// own identity.
+///
+/// Load-bearing: remove `validate_against_destination` and the only remaining
+/// destination check is `validate`'s internal comparison of the declared
+/// destination against the bound identity - two values from the SAME document,
+/// which a self-consistent forged request satisfies. The owner-named
+/// destination would then be no fence at all.
+#[test]
+fn production_destination_fence_compares_owner_named_destination() -> TestResult {
+    let identity = base_identity(
+        BackupRole::InstallationAuthority,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "backup-req-typed-fence",
+    );
+    identity.validate()?;
+    let prepare = BackupIsolatedRestorePrepare {
+        wire_id: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID.to_owned(),
+        wire_version: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
+        identity: identity.clone(),
+        operation: BackupOperationKind::PrepareIsolatedRestore,
+        destination_installation: identity.dest_installation.clone(),
+        max_restore_bytes: 4096,
+        request_digest: String::new(),
+    }
+    .with_computed_digest()?;
+    let owner = installation_authority(&identity.fence, &identity.dest_installation);
+
+    // POSITIVE: the declared destination IS the owner-named destination, from
+    // an attesting role the owner grants the preparation, so the fence admits.
+    prepare.validate_against_destination(BackupRole::InstallationAuthority, &owner)?;
+
+    // REFUSAL: the owner names a different destination, so the request's
+    // declared destination is an override. The refusal names the exact field
+    // the owner returns, not any mismatch.
+    let other_owner = installation_authority(&identity.fence, "dest-other-owner");
+    assert!(matches!(
+        prepare.validate_against_destination(BackupRole::InstallationAuthority, &other_owner),
+        Err(BackupError::Mismatch { field })
+            if field == "backup_isolated_restore_prepare.destination_installation"
+    ));
+
+    // REFUSAL: a role the owner does not grant the preparation cannot fence it,
+    // even when it presents the exact owner-named destination. Without this the
+    // fence would be satisfied by any authenticated principal of the request.
+    let ungranted = base_identity(
+        BackupRole::SpoolOwner,
+        BackupOperationKind::PrepareIsolatedRestore,
+        "backup-req-typed-fence-spool",
+    );
+    let spool_owner = installation_authority(&ungranted.fence, &ungranted.dest_installation);
+    let spool_prepare = BackupIsolatedRestorePrepare {
+        identity: ungranted.clone(),
+        destination_installation: ungranted.dest_installation.clone(),
+        request_digest: String::new(),
+        ..prepare.clone()
+    }
+    .with_computed_digest()?;
+    assert!(matches!(
+        spool_prepare.validate_against_destination(BackupRole::SpoolOwner, &spool_owner),
+        Err(BackupError::CapabilityDenied)
+    ));
     Ok(())
 }
 

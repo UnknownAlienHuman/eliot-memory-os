@@ -79,11 +79,11 @@ pub use backup::{
     BackupCutoverAdmission, BackupCutoverPayload, BackupCutoverReceipt, BackupDisposition,
     BackupError, BackupIsolatedRestorePrepare, BackupMutationBinding, BackupOperationKind,
     BackupPageRef, BackupPhaseAttestation, BackupRehearsalComplete, BackupReplayDisposition,
-    BackupReplayLedger, BackupRequestIdentity, BackupRestoreReconcile, BackupRestoreStatus,
-    BackupRestoreStep, BackupRole, BackupSnapshotPageRead, BackupStage, Denominator, HostAuditRef,
-    MAX_BACKUP_CONTENT_BYTES, MAX_BACKUP_OBSERVED_DISPOSITIONS, MAX_BACKUP_PAGE_MEMBERS,
-    MAX_BACKUP_PAYLOAD_BYTES, MAX_BACKUP_TEXT_BYTES, ack_phase_stage, attesting_roles,
-    operation_for_phase,
+    BackupReplayLedger, BackupReplayRefusal, BackupRequestIdentity, BackupRestoreReconcile,
+    BackupRestoreStatus, BackupRestoreStep, BackupRole, BackupSnapshotPageRead, BackupStage,
+    Denominator, HostAuditRef, MAX_BACKUP_CONTENT_BYTES, MAX_BACKUP_OBSERVED_DISPOSITIONS,
+    MAX_BACKUP_PAGE_MEMBERS, MAX_BACKUP_PAYLOAD_BYTES, MAX_BACKUP_TEXT_BYTES, ack_phase_stage,
+    attesting_roles, operation_for_phase,
 };
 pub use dreamer_job::{
     AdmissionRef, CancellationState, DURABLE_JOB_CANONICAL_ENCODING, DURABLE_JOB_CONTRACT_NAME,

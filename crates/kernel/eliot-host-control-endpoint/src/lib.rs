@@ -53,10 +53,13 @@ use tokio::sync::oneshot;
 pub mod backup;
 pub mod responsiveness_challenge;
 pub use backup::{
-    AcceptedOwnerMethod, BackupDispatchRefusal, BackupOperationKind, BackupRole, HostBackupOwner,
-    HostBackupOwnerRegistration, accepted_host_backup_methods, authority_matches, is_supported,
-    register_backup_methods, rehearsal_resolves_cutover, requires_cutover_admission,
+    AcceptedOwnerMethod, BackupDispatchRefusal, BackupOperationKind, BackupRole,
+    CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL, HostBackupOwner, HostBackupOwnerRegistration,
+    accepted_host_backup_methods, authority_matches, is_supported, register_backup_methods,
+    rehearsal_resolves_cutover, requires_cutover_admission, resolves_cutover_authority,
 };
+
+use eliot_protocol::backup::{BackupError, BackupReplayLedger};
 
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 const MAX_QUEUE_DEPTH: usize = 32;
@@ -313,6 +316,21 @@ pub struct HostRuntimeControl {
     user_automation_queue: HostUserAutomationExecutionQueue,
     user_automation_owner: Option<UserAutomationHostOwnerBinding>,
     backup_owner: Option<HostBackupOwnerRegistration>,
+    /// The canonical `#954` replay ledger for admitted backup control requests.
+    ///
+    /// It lives on the endpoint rather than inside one request because the
+    /// endpoint is the long-lived owner of the canonical pipe: `serve_one` is
+    /// driven in a loop by the Host composition for the life of the process, so
+    /// this ledger observes every admitted backup request across frames and a
+    /// replayed envelope is refused against the ORIGINAL accepted content.
+    ///
+    /// It is the protocol owner's ledger used as it stands
+    /// ([`BackupReplayLedger::observe_typed`]); this endpoint introduces no
+    /// second replay scheme and never recomputes a digest to decide one. It is
+    /// not durable storage: cross-restart reconciliation and durability stay
+    /// with the owner's journal, and this ledger refuses a replay inside one
+    /// endpoint lifetime.
+    backup_replay: Mutex<BackupReplayLedger>,
 }
 
 impl HostRuntimeControl {
@@ -342,6 +360,7 @@ impl HostRuntimeControl {
             user_automation_queue,
             user_automation_owner: None,
             backup_owner: None,
+            backup_replay: Mutex::new(BackupReplayLedger::new()),
         })
     }
 
@@ -362,6 +381,7 @@ impl HostRuntimeControl {
             user_automation_queue,
             user_automation_owner: Some(owner),
             backup_owner: None,
+            backup_replay: Mutex::new(BackupReplayLedger::new()),
         })
     }
 
@@ -598,6 +618,19 @@ impl HostRuntimeControl {
         //    is, and a connection the transport could not prove refuses
         //    before the closed table below is even consulted.
         peer.admit_request(request)?;
+        // 0a. Cutover authority is ONE operation. The canonical disposition
+        //     must agree with the operation itself that only the separately
+        //     admitted cutover request reaches cutover authority; a rehearsal
+        //     completion, or any other canonical operation, that ever resolved
+        //     there refuses here, in a normal build, before the closed table is
+        //     consulted and long before any owner effect. This is the release
+        //     caller for the rehearsal/cutover guarantee: the only previous
+        //     caller of that predicate was a `debug_assert!`, which a release
+        //     build removes, so nothing carried the guarantee there.
+        if backup::resolves_cutover_authority(operation) != (operation == BackupOperationKind::AdmitCutover)
+        {
+            return Err(refusal(operation, backup::CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL));
+        }
         // 1. Closed Host-accepted method table. Unsupported and absent
         //    methods fail before effects, never as a default success.
         if !backup::is_supported(operation) {
@@ -667,6 +700,52 @@ impl HostRuntimeControl {
                 operation,
                 "registered cutover admission diverges from the accepted Host backup table",
             ));
+        }
+        // 4a. Replayed envelope, refused by the canonical `#954` replay ledger
+        //     against the ORIGINAL content this endpoint already accepted.
+        //     Duplicate, unknown, stale and changed replay are four distinct
+        //     closed classes and each is refused with its own typed reason; the
+        //     class text is read from the owner, so this endpoint does not
+        //     become a second source for the reason vocabulary. The observation
+        //     happens after every gate above has passed and before the owner is
+        //     called, so this refusal is exact and pre-effect: nothing has
+        //     transitioned, and the caller reconciles the original operation
+        //     instead of starting a second one.
+        let mut ledger = match self.backup_replay.lock() {
+            Ok(ledger) => ledger,
+            Err(_) => {
+                return Err(refusal(
+                    operation,
+                    "backup replay ledger is unavailable",
+                ));
+            }
+        };
+        // The observation is taken under the lock and the guard is released
+        // before the owner is called, so no ledger guard is ever held across
+        // an owner call.
+        let observed = ledger.observe_typed(request.body.identity());
+        drop(ledger);
+        match observed {
+            Ok(_) => {}
+            Err(BackupError::ReplayRefused { reason }) => {
+                // The typed class is read from the owner through
+                // `BackupReplayRefusal::as_str`, never re-spelled here, so this
+                // endpoint cannot become a second source for the reason
+                // vocabulary and the wire-visible reason still says WHICH of
+                // duplicate / unknown / stale / changed refused the envelope.
+                return Err(refusal(operation, reason.as_str()));
+            }
+            Err(_) => {
+                // Every other cause is the request identity failing its own
+                // canonical contract, which gate 0 above already refuses. It
+                // is handled here rather than dropped, so an identity that
+                // stopped satisfying that contract refuses on this path too
+                // instead of reaching the owner.
+                return Err(refusal(
+                    operation,
+                    "backup replay envelope does not satisfy the canonical request identity",
+                ));
+            }
         }
         // 5. Route to the one registered owner operation. Its typed outcome
         //    is the only source of the answer's disposition: pending,
