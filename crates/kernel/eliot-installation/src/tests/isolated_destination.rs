@@ -1112,6 +1112,17 @@ fn a_cutover_committed_after_admission_creates_no_destination_directory() {
 #[cfg(windows)]
 #[test]
 fn a_current_source_generation_materialises_the_destination_on_disk() {
+    // A genuinely INDEPENDENT second read, as production performs between
+    // admission and materialisation. It carries the same values here, which is
+    // the point: this case exists to catch the guard OVER-refusing or INVERTING,
+    // which is the regression the deleted `approved_target_build ==
+    // active_generation` clause caused. An assertion of `Ok` cannot fail when a
+    // correct guard is removed, so all removal-sensitivity belongs to the cutover
+    // case and none is faked here.
+    let re_read = fixture();
+    // Both reads are taken here, ahead of the `fixture` binding below, because
+    // that binding shadows the free function of the same name for the rest of
+    // this scope.
     let fixture = fixture();
     let destination = installation_key("8");
     let area = live_isolated_area("current-generation");
@@ -1121,14 +1132,6 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
         "the fixture starts from an absent leaf, so the creation below is this operation's"
     );
     let admission = live_admission(&area, &destination, &fixture.active_generation);
-    // A genuinely INDEPENDENT second read, as production performs between
-    // admission and materialisation. It carries the same values here, which is
-    // the point: this case exists to catch the guard OVER-refusing or INVERTING,
-    // which is the regression the deleted `approved_target_build ==
-    // active_generation` clause caused. An assertion of `Ok` cannot fail when a
-    // correct guard is removed, so all removal-sensitivity belongs to the cutover
-    // case and none is faked here.
-    let re_read = fixture();
 
     let materialisation = must(materialise_prepared_isolated_destination(
         &admission,
@@ -1142,7 +1145,10 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
         "the publication created the destination root at {destination_root}"
     );
     assert!(
-        materialisation.destination_root_identity.volume_serial_number != 0
+        materialisation
+            .destination_root_identity
+            .volume_serial_number
+            != 0
             && materialisation.destination_root_identity.file_index != 0,
         "the creation receipt carries a real observed identity for the created object"
     );
