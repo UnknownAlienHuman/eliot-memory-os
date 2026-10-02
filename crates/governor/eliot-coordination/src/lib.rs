@@ -15,6 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod handoff_capture_caller;
 mod handoff_persistence;
 mod handoff_resume;
 mod integration_candidate;
@@ -22,12 +23,21 @@ mod peer_communication;
 mod swarm_plan_attachment;
 mod work_lease_issuance;
 
-pub use handoff_persistence::{
-    HandoffPersistenceError, capture_handoff_checkpoint, handoff_checkpoint_ref_text,
-    reconcile_handoff_capture,
+pub use handoff_capture_caller::{
+    HandoffCaptureCallerError, HandoffCaptureOutcome, HandoffCaptureRequest,
+    capture_at_controlled_boundary, controlled_boundary_census, resume_captured_handoff,
+    unregistered_controlled_boundaries,
 };
 
-pub use handoff_resume::resume_from_retained_handoff;
+pub use handoff_persistence::{
+    HandoffPersistenceError, capture_handoff_checkpoint, handoff_capture_binding_text,
+    read_back_capture, reconcile_handoff_capture, stored_capture_binding,
+};
+
+pub use handoff_resume::{
+    HandoffResumeAuthorityQuery, HandoffResumeError, HandoffResumeRequest,
+    read_resume_authority_observations, resume_from_retained_handoff, resume_retained_handoff,
+};
 
 pub use integration_candidate::{
     ArtifactProvenance, CandidateProvenance, CorrelatedCandidate, CorrelatedReview,
