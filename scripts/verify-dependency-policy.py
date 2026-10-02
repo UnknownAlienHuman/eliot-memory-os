@@ -5515,7 +5515,18 @@ def verify_release_hash_bindings(
 
 
 def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict | None:
-    """Join a locked identity to its direct-dependency inventory disposition."""
+    """Join a locked identity to its direct-dependency inventory disposition.
+
+    The SBOM may publish only a disposition the executed validator would
+    accept. :func:`check_inventory_disposition_evidence` rejects a declared
+    entry whose required string field is missing or present-but-blank via
+    :func:`_malformed_disposition_fields`, and a run carrying such a finding
+    is INCOMPLETE, not PASS. This join therefore applies the same helper and
+    refuses (returns ``None``) for an entry that is missing a required string
+    field or carries a malformed one, so the artifact never emits an
+    all-empty disposition the validator refused. The rules and the finding
+    vocabulary stay owned by the validator; nothing here re-implements them.
+    """
 
     if not isinstance(inventory, dict) or not isinstance(name, str):
         return None
@@ -5527,6 +5538,14 @@ def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict |
             continue
         if _normalize_ecosystem_package_name(ecosystem, declared) != wanted:
             continue
+        missing = [
+            field for field in _DIRECT_DISPOSITION_STRING_FIELDS if field not in entry
+        ]
+        malformed = _malformed_disposition_fields(entry, require_features=False)
+        if missing or malformed:
+            # An unvalidated disposition is reported as absent, never
+            # published as blank evidence under the run's PASS envelope.
+            return None
         return {
             "consumer": entry.get("consumer"),
             "owner": entry.get("owner"),

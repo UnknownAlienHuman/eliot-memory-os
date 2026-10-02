@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,13 @@ STATUS_INCOMPLETE = vdp.STATUS_INCOMPLETE
 STATUS_FINDINGS = vdp.STATUS_FINDINGS
 
 _POPULATED_FEATURES = ["derive"]
+
+
+def receipt_digest_of(receipt: dict) -> str:
+    """Recompute the canonical receipt digest an artifact envelope must carry."""
+
+    canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class TestVerifyDependencyPolicy(unittest.TestCase):
@@ -295,6 +303,309 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         }
         self.assertTrue(rust_roots)
         self.assertEqual(check_cargo_inventory(manifest_data, rust_roots), [])
+
+    # --- issue #1229: the SBOM artifact path must publish no disposition
+    #     the validator refuses ---
+    #
+    # `_inventory_disposition` and `build_sbom_artifact` re-read the raw
+    # config table rather than reusing the validator's verdict, so "the
+    # validator refuses" is not on its own proof that the artifact is safe.
+    # These cases drive the real artifact path over a real `build_receipt`
+    # and assert the published component disposition directly.
+
+    _RUST_DENOMINATOR = {
+        "status": "complete",
+        "rust": {
+            "direct_dependencies": ["serde"],
+            "locked_packages": [
+                {
+                    "name": "serde",
+                    "version": "1.0.228",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "checksum": "a" * 64,
+                    "dependencies": [],
+                }
+            ],
+        },
+    }
+
+    def _artifact_root(self) -> Path:
+        """A minimal, self-contained root whose policy inputs all exist.
+
+        `build_receipt` binds real input digests, a real source commit and the
+        configured Node surface from the root it is given, so the receipt
+        carries this case's status only when every input it reads is present
+        and bound.
+        """
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "config").mkdir()
+        (root / "scripts").mkdir()
+        (root / "integrations").mkdir()
+        (root / "Cargo.lock").write_text("# empty lock\n", encoding="utf-8")
+        (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        (root / "deny.toml").write_text('[licenses]\nallow = ["MIT"]\n', encoding="utf-8")
+        (root / "config" / "dependency-policy.toml").write_text(
+            "schema = 'eliot.dependency-policy.v1'\n", encoding="utf-8"
+        )
+        (root / "scripts" / "requirements-verification.txt").write_text(
+            "jsonschema==4.25.1 --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8"
+        )
+        (root / "scripts" / "verify-dependency-policy.py").write_text("# verifier\n", encoding="utf-8")
+        # The receipt binds a real source commit, so the fixture root is a real
+        # repository with one committed revision rather than an unprovenanced
+        # or uncommitted directory.
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@e.invalid",
+             "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return root
+
+    def _receipt_for(self, manifest_fixture: dict, findings: list) -> dict:
+        """Build the executed receipt the artifact path actually consumes.
+
+        The receipt is built over an isolated minimal root so that the only
+        findings in it are the ones this case supplies: `build_receipt` binds
+        real input digests, a real source commit and the configured Node surface
+        from the root it is given, so the repository root would otherwise
+        contribute findings unrelated to this case.
+        """
+
+        root = self._artifact_root()
+        contract = root / "integrations" / "plugin-bridge-contract.json"
+        contract.write_text(json.dumps({"surface": "integrations/surface.js"}) + "\n", encoding="utf-8")
+        (root / "integrations" / "surface.js").write_text("// no external imports\n", encoding="utf-8")
+
+        manifest_with_inputs = dict(manifest_fixture)
+        manifest_with_inputs["ecosystems"] = {
+            "rust": {
+                "manifest": "Cargo.toml",
+                "lockfile": "Cargo.lock",
+                "policy_file": "deny.toml",
+                "targets": ["x86_64-pc-windows-msvc"],
+                "features": ["--all-features"],
+            },
+            "node": {
+                "contract": "integrations/plugin-bridge-contract.json",
+                "package_root": "integrations",
+            },
+        }
+        manifest_with_inputs.setdefault("exceptions", [])
+        manifest_with_inputs.setdefault("external_executables", {})
+        manifest_with_inputs["scanner"] = {
+            "tool": "cargo-deny",
+            "version": "0.20.2",
+            "executable": "cargo-deny",
+            "sha256": "a" * 64,
+            "advisory_owner": "cargo-deny-advisories",
+            "checks": ["advisories", "bans", "licenses", "sources"],
+        }
+
+        return build_receipt(
+            root,
+            "offline-source",
+            derive_overall_status(vdp.STATUS_PASS, findings),
+            list(findings),
+            manifest_with_inputs,
+            {"bans": {"errors": 0}},
+            1,
+            ecosystem_denominator=dict(self._RUST_DENOMINATOR),
+        )
+
+    def _serde_component(self, sbom: dict) -> dict:
+        matches = [c for c in sbom["components"] if c.get("name") == "serde"]
+        self.assertEqual(len(matches), 1, sbom["components"])
+        return matches[0]
+
+    @staticmethod
+    def _is_empty_disposition(disposition: object) -> bool:
+        if not isinstance(disposition, dict):
+            return False
+        return all(
+            value in (None, "", [], {})
+            for key, value in disposition.items()
+            if key != "platform_scope"
+        )
+
+    def _assert_no_empty_disposition_under_pass(self, receipt: dict, manifest_fixture: dict) -> None:
+        """The security property: no admitted dependency publishes a blank disposition.
+
+        A blank disposition can only reach a downstream reader through an
+        artifact whose envelope says PASS, so this drives the same artifact path
+        with the ONLY difference that matters -- the executed verdict -- and
+        asserts the disposition is published verbatim when the gate passes.
+        """
+
+        passing = self._receipt_for(manifest_fixture, [])
+        self.assertEqual(passing["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(passing, manifest_fixture)
+        self.assertEqual(sbom["status"], STATUS_PASS)
+        offending = [
+            c
+            for c in sbom["components"]
+            if c.get("direct") and self._is_empty_disposition(c.get("disposition"))
+        ]
+        self.assertEqual(offending, [], "a PASSING gate must publish no empty disposition")
+
+    def test_sbom_never_publishes_an_empty_direct_disposition(self) -> None:
+        # An all-empty direct-dependency disposition is a DEP-003 finding, so
+        # the executed receipt is INCOMPLETE and the artifact can never present
+        # itself as the disclosure of an admitted dependency: a passing gate is
+        # the only thing that would let a blank disposition ship, and the
+        # validator refuses it first.
+        manifest_fixture = self._rust_disposition_fixture(self._empty_rust_disposition())
+        findings = check_cargo_inventory(manifest_fixture, {"serde"})
+        findings += check_inventory_disposition_evidence(manifest_fixture)
+        self.assertTrue(findings, "an all-empty disposition must not verify")
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        self.assertNotEqual(receipt["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        self.assertNotEqual(sbom["status"], STATUS_PASS)
+        # The artifact faithfully carries the executed verdict; it cannot launder
+        # the refused disposition into a PASS.
+        self.assertEqual(sbom["status"], receipt["status"])
+        self.assertEqual(sbom["receipt_digest"], receipt_digest_of(receipt))
+        # The refused blank values may still be visible, but only under a
+        # non-PASS envelope: an admitted dependency never carries one.
+        self._assert_no_empty_disposition_under_pass(receipt, manifest_fixture)
+
+    def test_sbom_disposition_is_populated_evidence_when_accepted(self) -> None:
+        # The positive control: the same artifact path on a populated
+        # disposition publishes the real evidence, so the refusal above is a
+        # property of the empty evidence and not of the artifact shape.
+        manifest_fixture = self._rust_disposition_fixture(self._populated_rust_disposition())
+        findings = check_cargo_inventory(manifest_fixture, {"serde"})
+        self.assertEqual(findings, [])
+
+        sbom = vdp.build_sbom_artifact(self._receipt_for(manifest_fixture, findings), manifest_fixture)
+        disposition = self._serde_component(sbom).get("disposition")
+        self.assertFalse(self._is_empty_disposition(disposition))
+        self.assertEqual(disposition["consumer"], "crates/foundation/eliot-evidence")
+        self.assertEqual(disposition["owner"], "crates/foundation/eliot-evidence")
+        self.assertEqual(disposition["features"], list(_POPULATED_FEATURES))
+
+    def test_sbom_never_publishes_an_empty_non_ecosystem_disposition(self) -> None:
+        # `check_cargo_inventory` only ever sees the Rust direct set, so the
+        # NuGet row reaches the SBOM through `check_inventory_disposition_evidence`.
+        manifest_fixture = {
+            "direct_dependencies": {
+                "Microsoft.WindowsAppSDK": {
+                    "ecosystem": "nuget",
+                    "version": "2.3.1",
+                    "consumer": "",
+                    "owner": "",
+                    "reason": "",
+                    "public_exposure": "",
+                    "removal_plan": "",
+                }
+            },
+            "exceptions": [],
+            "external_executables": {},
+        }
+        findings = check_inventory_disposition_evidence(manifest_fixture)
+        self.assertTrue(findings, "an all-empty non-Rust disposition must not verify")
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        self.assertNotEqual(receipt["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        self.assertNotEqual(sbom["status"], STATUS_PASS)
+        self.assertEqual(sbom["status"], receipt["status"])
+        self._assert_no_empty_disposition_under_pass(receipt, manifest_fixture)
+
+    def test_sbom_omits_a_disposition_the_validator_refused(self) -> None:
+        # `_inventory_disposition` reuses the validator's own rule
+        # (`_malformed_disposition_fields` plus the missing-required-field set
+        # that `check_inventory_disposition_evidence` rejects), so a refused
+        # disposition is reported as absent rather than published as blank
+        # evidence. The artifact never emits an all-empty disposition, whatever
+        # verdict the enclosing run carries.
+        manifest_fixture = self._rust_disposition_fixture(self._empty_rust_disposition())
+        findings = check_cargo_inventory(manifest_fixture, {"serde"})
+        findings += check_inventory_disposition_evidence(manifest_fixture)
+        self.assertTrue(findings, "an all-empty disposition must not verify")
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        disposition = self._serde_component(sbom).get("disposition")
+        self.assertIsNone(disposition, "a refused disposition must be omitted, not published blank")
+        # The direct-binding refusal is independent of the run's verdict: even a
+        # hand-built PASS receipt over the same empty entry cannot publish it.
+        passing_receipt = self._receipt_for(manifest_fixture, [])
+        self.assertEqual(passing_receipt["status"], STATUS_PASS)
+        passing_sbom = vdp.build_sbom_artifact(passing_receipt, manifest_fixture)
+        self.assertIsNone(self._serde_component(passing_sbom).get("disposition"))
+
+    def test_sbom_publishes_every_field_of_a_populated_disposition(self) -> None:
+        # The positive control: a fully populated entry is validated and then
+        # published with every field present, so the refusal above is a property
+        # of the empty evidence and not of the artifact shape.
+        manifest_fixture = self._rust_disposition_fixture(self._populated_rust_disposition())
+        self.assertEqual(check_cargo_inventory(manifest_fixture, {"serde"}), [])
+        self.assertEqual(check_inventory_disposition_evidence(manifest_fixture), [])
+
+        receipt = self._receipt_for(manifest_fixture, [])
+        self.assertEqual(receipt["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        disposition = self._serde_component(sbom).get("disposition")
+        self.assertIsInstance(disposition, dict)
+        self.assertEqual(disposition["consumer"], "crates/foundation/eliot-evidence")
+        self.assertEqual(disposition["owner"], "crates/foundation/eliot-evidence")
+        self.assertEqual(disposition["reason"], "serde derive for canonical evidence records")
+        self.assertEqual(disposition["features"], list(_POPULATED_FEATURES))
+        self.assertEqual(disposition["platform_scope"], "all_configured_targets")
+        self.assertEqual(disposition["public_exposure"], "none")
+        self.assertEqual(disposition["removal_plan"], "hand-rolled serialization")
+        self.assertFalse(self._is_empty_disposition(disposition))
+
+    def test_advisory_report_publishes_the_exception_binding_check(self) -> None:
+        # `check_exception_lock_drift` replaced a silent `continue` with a
+        # binding finding; the advisory report publishes exactly the DEP-010
+        # findings of the receipt that produced it, so the new check reaches
+        # the artifact instead of stopping inside the validator.
+        denominator = {"rust": {"locked_packages": [{"name": "serde", "version": "1.0.228"}]}}
+        entry = self._populated_exception()
+        entry["package"] = "  "
+        entry["version"] = ""
+        manifest_fixture = self._exception_fixture(entry)
+        findings = check_exceptions(
+            manifest_fixture, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)
+        )
+        findings += check_exception_lock_drift(manifest_fixture, denominator)
+        binding = [
+            f for f in findings if f.code == "DEP-010" and "cannot be bound" in f.detail
+        ]
+        self.assertTrue(binding, findings)
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
+        self.assertNotEqual(report["status"], STATUS_PASS)
+        published = {finding["detail"] for finding in report["exception_findings"]}
+        self.assertIn(binding[0].detail, published)
+
+    def test_advisory_report_refuses_an_all_empty_exception(self) -> None:
+        entry = self._populated_exception()
+        for field in self._EXCEPTION_BLANK_FIELDS:
+            entry[field] = ""
+        manifest_fixture = self._exception_fixture(entry)
+        findings = check_exceptions(
+            manifest_fixture, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)
+        )
+        self.assertTrue(findings, "an exception with no evidence must not verify")
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
+        self.assertNotEqual(report["status"], STATUS_PASS)
+        self.assertTrue(report["exception_findings"])
+        self.assertEqual(
+            report["exceptions_digest"], vdp._canonical_digest(manifest_fixture["exceptions"])
+        )
 
     # --- issue #1229 A6: advisory exception evidence ---
 
