@@ -2309,7 +2309,9 @@ fn descriptor_digest_raw(
 }
 
 #[cfg(windows)]
-fn descriptor_digest_for_handle(file: &std::fs::File) -> Result<String, WindowsAdapterError> {
+pub(crate) fn descriptor_digest_for_handle(
+    file: &std::fs::File,
+) -> Result<String, WindowsAdapterError> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};

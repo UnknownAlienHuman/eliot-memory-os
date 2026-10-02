@@ -120,6 +120,9 @@ struct CacheIdentityOverrides {
     parser_version: String,
     producer_id: String,
     producer_generation: u64,
+    root_identity: String,
+    root_acl_digest: String,
+    root_disposition: RootDisposition,
 }
 
 #[derive(Serialize)]
@@ -468,9 +471,17 @@ impl ScipProjectionCache {
                 .map_or(self.provenance.producer_generation, |identity| {
                     identity.producer_generation
                 }),
-            root_identity: self.provenance.root_identity.clone(),
-            root_acl_digest: self.provenance.root_acl_digest.clone(),
-            root_disposition: self.provenance.root_disposition,
+            root_identity: overrides.map_or_else(
+                || self.provenance.root_identity.clone(),
+                |identity| identity.root_identity.clone(),
+            ),
+            root_acl_digest: overrides.map_or_else(
+                || self.provenance.root_acl_digest.clone(),
+                |identity| identity.root_acl_digest.clone(),
+            ),
+            root_disposition: overrides.map_or(self.provenance.root_disposition, |identity| {
+                identity.root_disposition
+            }),
             schema_revision: eliot_build_test_graph::DERIVED_CACHE_SCHEMA_V1.to_owned(),
             content_digest: content_digest.to_owned(),
         }
@@ -607,11 +618,7 @@ fn invocation_cache_identity(
         return Err(BridgeError::UnsupportedOperation);
     }
 
-    let proof = invocation.source_artifact_proof.as_ref().ok_or_else(|| {
-        BridgeError::InconsistentBinding(
-            "bound SCIP cache requires the original live source-artifact proof".to_owned(),
-        )
-    })?;
+    let proof = require_source_artifact_proof(invocation.source_artifact_proof.as_ref())?;
     if !proof
         .snapshot
         .validates_workspace_root(std::path::Path::new(
@@ -653,6 +660,17 @@ fn invocation_cache_identity(
     let source = proof.projection();
     super::validate_source_artifact_identity(&proof.snapshot, &source.artifact_reference)?;
     let identity = &source.artifact_reference.identity;
+    let root_observation = invocation
+        .scip_output_owner
+        .as_ref()
+        .ok_or(BridgeError::ScipArtifactNotInvocationOwned)?
+        .observe_retained_root()
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    let root_disposition = match root_observation.disposition() {
+        eliot_platform_windows::RetainedRootDisposition::Direct => RootDisposition::Direct,
+    };
     let commitment = ScipInvocationCommitmentV1 {
         schema_version: 1,
         candidate: &invocation.source_candidate,
@@ -698,6 +716,19 @@ fn invocation_cache_identity(
         parser_version,
         producer_id: invocation.registry_identity.instrument.as_str().to_owned(),
         producer_generation: invocation.registry_identity.generation,
+        root_identity: root_observation.root_identity(),
+        root_acl_digest: root_observation.acl_digest().to_owned(),
+        root_disposition,
+    })
+}
+
+fn require_source_artifact_proof(
+    proof: Option<&super::LspSourceArtifactProof>,
+) -> Result<&super::LspSourceArtifactProof, BridgeError> {
+    proof.ok_or_else(|| {
+        BridgeError::InconsistentBinding(
+            "bound SCIP cache requires the original live source-artifact proof".to_owned(),
+        )
     })
 }
 
@@ -723,4 +754,112 @@ fn validate_provenance(provenance: &ScipIndexerProvenance) -> Result<(), BridgeE
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    fn digest(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
+
+    fn test_cache() -> ScipProjectionCache {
+        ScipProjectionCache::new(
+            DerivedCacheStore::new(eliot_build_test_graph::CacheLimits::default()),
+            TrustPolicy::default(),
+            ScipIndexerProvenance {
+                indexer_name: "fixture-indexer".to_owned(),
+                indexer_version: "fixture-version".to_owned(),
+                producer_id: "fixture-producer".to_owned(),
+                producer_generation: 1,
+                root_identity: "windows-directory:1:2".to_owned(),
+                root_acl_digest: digest('a'),
+                root_disposition: RootDisposition::Direct,
+            },
+        )
+        .expect("fixture cache provenance is well-shaped")
+    }
+
+    fn overrides() -> CacheIdentityOverrides {
+        CacheIdentityOverrides {
+            source_digest: digest('b'),
+            config_digest: digest('c'),
+            toolchain_version: "rust-analyzer-toolchain".to_owned(),
+            compiler_version: "sha256:original-executable".to_owned(),
+            parser_version: "scip-parser@7".to_owned(),
+            producer_id: "scip-instrument".to_owned(),
+            producer_generation: 7,
+            root_identity: "windows-directory:1:2".to_owned(),
+            root_acl_digest: digest('d'),
+            root_disposition: RootDisposition::Direct,
+        }
+    }
+
+    #[test]
+    fn bound_cache_identity_changes_for_source_config_executable_parser_and_root() {
+        let cache = test_cache();
+        let baseline_overrides = overrides();
+        let baseline = cache.identity(
+            &baseline_overrides.source_digest,
+            &digest('e'),
+            &digest('f'),
+            &digest('1'),
+            Some(&baseline_overrides),
+        );
+        let baseline_digest = baseline.digest().expect("identity validates");
+
+        let mut changed_source = baseline_overrides.clone();
+        changed_source.source_digest = digest('2');
+        let changed_source_identity = cache.identity(
+            &changed_source.source_digest,
+            &digest('e'),
+            &digest('f'),
+            &digest('1'),
+            Some(&changed_source),
+        );
+        assert_eq!(
+            baseline.generated_input_digest, changed_source_identity.generated_input_digest,
+            "same sidecar bytes retain the same generated-input identity"
+        );
+        assert_ne!(
+            baseline_digest,
+            changed_source_identity
+                .digest()
+                .expect("identity validates"),
+            "changed source content cannot reuse the same sidecar projection"
+        );
+
+        let mutations: [fn(&mut CacheIdentityOverrides); 4] = [
+            |identity| identity.config_digest = digest('3'),
+            |identity| identity.compiler_version = "changed-exe".to_owned(),
+            |identity| identity.parser_version = "changed-parser".to_owned(),
+            |identity| identity.root_acl_digest = digest('4'),
+        ];
+        for mutate in mutations {
+            let mut changed = baseline_overrides.clone();
+            mutate(&mut changed);
+            let identity = cache.identity(
+                &changed.source_digest,
+                &digest('e'),
+                &digest('f'),
+                &digest('1'),
+                Some(&changed),
+            );
+            assert_ne!(
+                baseline_digest,
+                identity.digest().expect("identity validates"),
+                "changed original invocation commitment must miss the cache"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_cache_refuses_to_run_without_owner_minted_source_proof() {
+        let error = require_source_artifact_proof(None)
+            .expect_err("missing owner proof must not enter a bound cache key");
+        assert!(matches!(error, BridgeError::InconsistentBinding(_)));
+    }
 }

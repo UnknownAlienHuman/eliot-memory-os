@@ -49,6 +49,53 @@ impl std::fmt::Display for DirectoryPublicationError {
 
 impl std::error::Error for DirectoryPublicationError {}
 
+/// Direct no-reparse disposition established by a retained directory owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedRootDisposition {
+    /// The root was observed through its original direct retained handle.
+    Direct,
+}
+
+/// Read-only measured identity and owner/DACL digest for one retained root.
+///
+/// This is observation evidence only. It does not admit a producer, change
+/// ACLs, or confer authority over the root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedRootObservation {
+    pub(super) file_identity: FileIdentity,
+    pub(super) acl_digest: String,
+    pub(super) disposition: RetainedRootDisposition,
+}
+
+impl RetainedRootObservation {
+    /// Stable identity text derived from the measured Windows file identity.
+    #[must_use]
+    pub fn root_identity(&self) -> String {
+        format!(
+            "windows-directory:{}:{}",
+            self.file_identity.volume_serial_number, self.file_identity.file_index
+        )
+    }
+
+    /// File identity measured through the retained original root handle.
+    #[must_use]
+    pub const fn file_identity(&self) -> FileIdentity {
+        self.file_identity
+    }
+
+    /// Lowercase SHA-256 of the observed owner and DACL security descriptor.
+    #[must_use]
+    pub fn acl_digest(&self) -> &str {
+        &self.acl_digest
+    }
+
+    /// No-reparse disposition proved by the retained owner contour.
+    #[must_use]
+    pub const fn disposition(&self) -> RetainedRootDisposition {
+        self.disposition
+    }
+}
+
 /// Exact identity receipt after a create-new directory move is read back.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

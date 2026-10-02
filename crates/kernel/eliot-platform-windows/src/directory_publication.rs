@@ -48,7 +48,8 @@ use crate::{
 mod directory_publication_models;
 pub use directory_publication_models::{
     DirectoryPublicationError, DirectoryPublicationOutcome, DirectoryPublicationReceipt,
-    DirectoryPublicationUnknown, DirectoryPublicationUnknownReceipt,
+    DirectoryPublicationUnknown, DirectoryPublicationUnknownReceipt, RetainedRootDisposition,
+    RetainedRootObservation,
 };
 
 /// Prepared process-owned create-new directory publication.
@@ -185,6 +186,69 @@ impl OwnedDirectoryPublication {
     #[must_use]
     pub const fn temporary_identity(&self) -> FileIdentity {
         self.initial_temporary_identity
+    }
+
+    /// Measures the exact retained destination-parent root without changing
+    /// its permissions or resolving it again through an unowned pathname.
+    /// The root identity and owner/DACL digest are re-read on the same held
+    /// handle around descriptor measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when the retained contour, root path, file
+    /// identity, or owner/DACL descriptor cannot be measured exactly.
+    pub fn observe_retained_root(
+        &self,
+    ) -> Result<RetainedRootObservation, DirectoryPublicationError> {
+        #[cfg(windows)]
+        {
+            verify_directory_publication_contour(&self.contour)?;
+            let (expected_path, expected_identity, root_handle) = self
+                .contour
+                .entries
+                .last()
+                .ok_or(DirectoryPublicationError::IdentityMismatch)?;
+            if !windows_paths_equal(expected_path, &self.canonical_parent)
+                || *expected_identity != self.parent_identity
+                || self.contour.parent_identity != self.parent_identity
+            {
+                return Err(DirectoryPublicationError::IdentityMismatch);
+            }
+
+            let observed_path = final_windows_path_from_handle(root_handle)
+                .map_err(|_| DirectoryPublicationError::IdentityMismatch)?;
+            let observed_identity = file_identity_from_handle(root_handle)
+                .map_err(|_| DirectoryPublicationError::IdentityMismatch)?;
+            if !windows_paths_equal(&observed_path, &self.canonical_parent)
+                || observed_identity != self.parent_identity
+            {
+                return Err(DirectoryPublicationError::IdentityMismatch);
+            }
+
+            let acl_digest = crate::platform_security::descriptor_digest_for_handle(root_handle)
+                .map_err(|_| DirectoryPublicationError::Io)?;
+
+            verify_directory_publication_contour(&self.contour)?;
+            let rechecked_path = final_windows_path_from_handle(root_handle)
+                .map_err(|_| DirectoryPublicationError::IdentityMismatch)?;
+            let rechecked_identity = file_identity_from_handle(root_handle)
+                .map_err(|_| DirectoryPublicationError::IdentityMismatch)?;
+            if !windows_paths_equal(&rechecked_path, &self.canonical_parent)
+                || rechecked_identity != self.parent_identity
+            {
+                return Err(DirectoryPublicationError::IdentityMismatch);
+            }
+
+            Ok(RetainedRootObservation {
+                file_identity: rechecked_identity,
+                acl_digest,
+                disposition: RetainedRootDisposition::Direct,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
     }
 
     /// Reuse the retained temporary-root handle for a trusted pre-commit
@@ -1234,5 +1298,96 @@ impl OwnedDirectoryPublication {
                 destination_identity,
             },
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod retained_root_observation_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    fn fixture_parent() -> PathBuf {
+        let workspace = std::env::current_dir()
+            .expect("test working directory is available")
+            .canonicalize()
+            .expect("test working directory canonicalizes");
+        let base = workspace.join("target").join("issue-1831-source-fixtures");
+        std::fs::create_dir_all(&base).expect("lane fixture base is created");
+        let base = base
+            .canonicalize()
+            .expect("lane fixture base canonicalizes");
+        assert!(
+            base.starts_with(&workspace),
+            "fixture remains in this lane workspace"
+        );
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let fixture = base.join(format!("retained-root-{}-{id}", std::process::id()));
+        std::fs::create_dir(&fixture).expect("unique lane fixture directory is created");
+        fixture
+    }
+
+    fn cleanup_fixture(owner: OwnedDirectoryPublication, fixture: &Path) {
+        let temporary = owner.temporary_path().to_path_buf();
+        assert_eq!(temporary.parent(), Some(fixture));
+        assert!(
+            temporary
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with(".bundle.tmp."))
+        );
+        drop(owner);
+        std::fs::remove_dir(&temporary).expect("empty owned temporary fixture is removed");
+        std::fs::remove_dir(fixture).expect("unique fixture directory is removed");
+    }
+
+    #[test]
+    fn retained_root_observation_reports_original_handle_identity_and_acl() {
+        let fixture = fixture_parent();
+        let destination = fixture.join("bundle");
+        let publication = OwnedDirectoryPublication::create(&destination)
+            .expect("original publication owner retains the fixture root");
+        let observation = publication
+            .observe_retained_root()
+            .expect("retained root identity and descriptor are measurable");
+        let identity = publication.parent_identity();
+
+        assert_eq!(observation.file_identity(), identity);
+        assert_eq!(
+            observation.root_identity(),
+            format!(
+                "windows-directory:{}:{}",
+                identity.volume_serial_number, identity.file_index
+            )
+        );
+        assert_eq!(observation.disposition(), RetainedRootDisposition::Direct);
+        assert_eq!(observation.acl_digest().len(), 64);
+        assert!(
+            observation
+                .acl_digest()
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        cleanup_fixture(publication, &fixture);
+    }
+
+    #[test]
+    fn retained_root_observation_refuses_a_changed_owner_identity() {
+        let fixture = fixture_parent();
+        let destination = fixture.join("bundle");
+        let mut publication = OwnedDirectoryPublication::create(&destination)
+            .expect("original publication owner retains the fixture root");
+        let expected_identity = publication.contour.parent_identity;
+        publication.contour.parent_identity.file_index ^= 1;
+
+        assert_eq!(
+            publication.observe_retained_root(),
+            Err(DirectoryPublicationError::IdentityMismatch)
+        );
+        publication.contour.parent_identity = expected_identity;
+        cleanup_fixture(publication, &fixture);
     }
 }
