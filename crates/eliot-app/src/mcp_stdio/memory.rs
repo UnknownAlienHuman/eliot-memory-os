@@ -786,13 +786,17 @@ pub(super) fn legacy_memory_token_units_wire(
     records
         .iter()
         .map(|record| {
+            // #783: the canonical owner measures exact serialized UTF-8 bytes,
+            // so the adapter hands it the very bytes it just serialized. The
+            // retired `chars / 4` input - a Unicode scalar count taken from a
+            // different payload than the bytes measured - is gone with its
+            // consumer: keeping it would preserve the retired estimator's
+            // residue beside a byte figure that never read it.
             let serialized = serde_json::to_string(&record.receipt_body)
                 .context("serialize canonical memory payload for the legacy wire form")?;
-            let unicode_scalar_values = u64::try_from(serialized.chars().count())
-                .context("legacy memory character count exceeds u64")?;
             legacy_memory_token_units_wire_value(
                 &format!("canonical:{}", record.record_id),
-                unicode_scalar_values,
+                serialized.as_bytes(),
             )
         })
         .collect()

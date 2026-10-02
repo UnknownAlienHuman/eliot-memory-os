@@ -1,10 +1,11 @@
 //! Explicit legacy wire forms for the #783 MCP measurement records.
 //!
 //! #783 removed the last local `/4` character estimator from the MCP
-//! measurement paths. Every figure published here is now measured by the
-//! canonical #704 owner [`super::canonical_serialized_measurement`], over the
-//! exact final serialized UTF-8 bytes the caller already holds, so these
-//! records carry canonical `STU = ceil(bytes / 3)` evidence exactly like the
+//! measurement paths: no MCP measurement path takes a character count, and
+//! every figure published here is measured by the canonical #704 owner
+//! [`super::canonical_serialized_measurement`] over the exact final
+//! serialized UTF-8 bytes the caller already holds, so these records carry
+//! canonical `STU = ceil(bytes / 3)` evidence exactly like the
 //! current wire forms. What this module still owns is the *shape* those
 //! historical records were published in: a form that predates the current
 //! measurement and is therefore kept separate, separately named and
@@ -33,10 +34,17 @@
 //! `token_units` do not become current actual tokens) holds at the type level
 //! rather than by convention.
 //!
-//! There is no `From<Legacy…>` into the current form and no shared field name
-//! between the two forms that could let a legacy number be read as a current
-//! one. A legacy record is a *description of a historical estimate*, never a
-//! current claim.
+//! There is no `From<Legacy…>` into the current form, and the two forms are
+//! told apart by *wire shape and discriminator*, not by field names. Note
+//! honestly that one field name IS deliberately shared:
+//! [`LegacyMemoryTokenUnitsMeasurement::record_ref`] and
+//! `MemoryDistillationCorpusItem::record_ref` carry the same value
+//! (`"canonical:<record_id>"`), so `record_ref` is the intentional join key a
+//! consumer uses to pair a legacy figure with the current corpus item for the
+//! same record. That shared key is a correlation handle, never a channel for
+//! the numbers: the legacy figure lives under `legacy_unit` / `legacy_status`
+//! and has no field a current decoder reads. A legacy record is a *description
+//! of a historical estimate*, never a current claim.
 //!
 //! # Closed, not permissive
 //!
@@ -174,9 +182,10 @@ pub(super) struct LegacyMemoryTokenUnitsMeasurement {
 /// measured by that owner and can never be reproduced by a local ratio.
 ///
 /// A byte-denominated record given only a character count would have to invent
-/// the missing bytes, so the call sites below all pass real serialized bytes:
-/// the per-tool description slice and the concatenated combined descriptions.
-/// Nothing here converts characters to bytes or to tokens, and a caller with no
+/// the missing bytes, so all three call sites pass real serialized bytes: the
+/// per-tool description slice, the concatenated combined descriptions, and the
+/// memory adapter's own `serde_json` serialization of the record body. Nothing
+/// here converts characters to bytes or to tokens, and a caller with no
 /// serialized bytes has no honest way to build this record at all - it reaches a
 /// typed error rather than a fabricated estimate.
 pub(super) fn legacy_tool_description_measurement(

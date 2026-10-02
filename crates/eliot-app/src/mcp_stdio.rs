@@ -2417,13 +2417,19 @@ impl CanonicalMeasurement {
 /// No `tokenizer` observation is reported, so the actual count stays unknown
 /// rather than becoming zero, one or a cheap value.
 ///
-/// The envelope digest is computed and checked inside `validate_envelope`,
-/// which refuses a digest that does not match the exact bytes. That binds
-/// serializer, schema, profile and content identity: any change to the
-/// serialized bytes yields a different digest and invalidates the derived
-/// estimate. Valid empty bytes measure zero; invalid, non-UTF-8 or oversized
-/// bytes are a typed failure that reaches the caller instead of degrading to a
-/// character, zero or one fallback.
+/// The envelope digest is computed from these very bytes and then re-checked
+/// by `validate_envelope` against the bytes and the declared length it is
+/// handed, so it is a *self-consistency* check on this call: a mismatch means
+/// the digest or the length was computed from something other than the bytes
+/// measured. On this path it therefore does NOT bind the serializer, the
+/// schema, the profile or a content identity - nothing downstream re-derives
+/// or compares that digest against an independent claim, so a different
+/// serializer or profile producing different bytes is not detected here. What
+/// it does enforce is real and local: the payload is UTF-8, within
+/// `MAX_MEASUREMENT_BYTES`, and its declared length matches the bytes the
+/// estimate is derived from. Valid empty bytes measure zero; invalid, non-UTF-8
+/// or oversized bytes are a typed failure that reaches the caller instead of
+/// degrading to a character, zero or one fallback.
 fn canonical_serialized_measurement(serialized: &[u8]) -> Result<CanonicalMeasurement> {
     let byte_len = u64::try_from(serialized.len()).context("serialized length exceeds u64")?;
     let digest = sha256_bytes(serialized);
