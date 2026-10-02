@@ -44,6 +44,7 @@ use eliotd::{
     ModelRegistryPort, PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements,
     SwarmControlPort, SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config,
     plan_candidate, prereq_ports,
+    semantic_revision_store::SEMANTIC_REVISION_DIR,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2114,6 +2115,19 @@ impl SwarmStateRoot {
         // instead of being refused as outside it.
         let root = eliot_platform_windows::canonical_windows_path(&root)
             .map_err(|error| format!("canonicalize state root {}: {error}", root.display()))?;
+        // The store owns `<state root>/<SEMANTIC_REVISION_DIR>/owner-revisions.json`
+        // and does not create that directory itself, while the protected runtime
+        // path lease resolves the absent leaf's parent to decide the contour.
+        // This fixture owns the root, so it supplies the shape the store expects
+        // and the lease has a real parent to resolve. `Drop` removes the whole
+        // tree, so the directory is torn down with the root.
+        let revision_dir = root.join(SEMANTIC_REVISION_DIR);
+        std::fs::create_dir_all(&revision_dir).map_err(|error| {
+            format!(
+                "revision directory {}: {error}",
+                revision_dir.display()
+            )
+        })?;
         let override_root = eliot_platform_windows::test_support::override_protected_root(&root);
         Ok(Self {
             root,
