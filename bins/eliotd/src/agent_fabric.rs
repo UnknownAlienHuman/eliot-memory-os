@@ -3283,9 +3283,12 @@ impl AgentFabric {
     /// a clean failure here.
     ///
     /// #1702 A1: a DIFFERENT revision presented under an execution identity
-    /// this fabric already holds is a semantic execution UPDATE, and this is
-    /// the production caller of [`AgentFabric::check_semantic_execution_update`].
-    /// An update is checked as an update before it can become current, so a
+    /// this fabric already holds is a semantic execution UPDATE, and this
+    /// method is the ONLY path in the workspace that accepts a coordinator
+    /// [`SwarmExecutionRevision`] and checks it as an update. The check is
+    /// real and reaches the contract owner: [`AgentFabric::check_semantic_execution_update`]
+    /// applies the old-wave disposition gate and delegates the
+    /// field-vs-frozen decision to the owner's `check_execution_update`, so a
     /// mechanical advance (the recorded state edge and the coverage handle
     /// moving, the wave and root unchanged) is admitted and committed while an
     /// attempt to change the work graph, objective, acceptance,
@@ -3297,8 +3300,41 @@ impl AgentFabric {
     /// revision by [`execution_update_proposal`] and every field-vs-frozen
     /// decision belongs to the contract owner.
     ///
-    /// The execution revision is published as current only after the canonical
-    /// Store transaction that durably persists it committed; see
+    /// That method currently has NO production caller, and the reason is a
+    /// missing producer rather than a missing check. No production code mints a
+    /// [`SwarmExecutionRevision`] (every construction of the record in the
+    /// workspace is a test fixture) and none mints a [`SwarmOwnerRevision`], so
+    /// no binary can present one here: the durable owner revision this method
+    /// requires comes from a
+    /// [`eliot_store_api::NamedMutationOperation::ApplySwarmOwnerRevisions`]
+    /// commit, and no binary executes that operation — its request builder has
+    /// no caller at all, in test and production alike.
+    /// `register_semantic_definition` and `bind_semantic_admission` are
+    /// unreachable for the same reason. The execution record is owned by the
+    /// AgentCoordinator and the durable owner-revision commit is named by no
+    /// crate at all: I10.15:110 fixes the
+    /// owner of `SwarmExecutionState` and I10.15:112 requires the separate
+    /// per-owner revisions, but neither assigns who EXECUTES that commit. The
+    /// gap is documented rather than worked around, so the guarantee is not
+    /// read as live: the refusal here is unreachable in production because the
+    /// producer is missing, not reachable through an authority anyone could
+    /// have made up.
+    ///
+    /// What would make it live, and is missing: a producer that mints the
+    /// [`SwarmExecutionRevision`], commits its [`SwarmOwnerRevision`] under
+    /// [`eliot_store_api::TransitionClass::TaskControl`] through the named
+    /// Store mutation above, and hands the committed [`WriteReceipt`] here.
+    /// Until that producer exists this method is exercised only by
+    /// `bins/eliotd/tests/agent_fabric_wiring.rs`, which builds the real
+    /// records and the real durable Store evidence it requires rather than
+    /// short-circuiting authority.
+    ///
+    /// The ordering is unchanged by any of that and is what makes the check
+    /// worth having: the update refusal precedes BOTH the in-memory currency
+    /// change and the durable publish, so a refused update leaves the
+    /// previously current revision exactly as it was, and an accepted one is
+    /// published as current only after the canonical Store transaction that
+    /// durably persists it committed; see
     /// [`AgentFabric::register_semantic_definition`] for the ordering this
     /// preserves.
     ///

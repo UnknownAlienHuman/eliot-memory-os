@@ -1929,17 +1929,28 @@ fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #1702 A1: the production caller of the contract refusal.
+// Issue #1702 A1: the acceptance path of the contract refusal, and the
+// reachability gap it sits behind.
 //
-// `AgentFabric::record_semantic_execution` is the one production path that
-// accepts a coordinator `SwarmExecutionRevision` and publishes it through the
-// canonical `SemanticRevisionStore::commit`. A second revision presented under
-// an execution identity the fabric already holds is an execution UPDATE, so
-// that path runs `AgentFabric::check_semantic_execution_update` — which applies
-// the old-wave disposition gate and then the contract owner's own
+// `AgentFabric::record_semantic_execution` is the ONE path that accepts a
+// coordinator `SwarmExecutionRevision` and publishes it through the canonical
+// `SemanticRevisionStore::commit`. A second revision presented under an
+// execution identity the fabric already holds is an execution UPDATE, so that
+// path runs `AgentFabric::check_semantic_execution_update` — which applies the
+// old-wave disposition gate and then the contract owner's own
 // `check_execution_update` — before the revision can become current. The
 // fixtures below build the real records and the real durable Store evidence
 // those methods require; no authority is short-circuited.
+//
+// That path has NO production caller today, and these cases do not make it
+// one. No production code mints a `SwarmExecutionRevision` or a
+// `SwarmOwnerRevision`, so no binary can present one: the durable owner revision
+// it requires is a `NamedMutationOperation::ApplySwarmOwnerRevisions` commit
+// and no binary executes that operation. The execution record is owned by the
+// AgentCoordinator; the durable owner-revision commit is named by no crate.
+// What these tests therefore prove is that the refusal is correct and
+// reachable-with-real-evidence WHEN a producer exists — they are not evidence
+// that production enforces it today.
 // ---------------------------------------------------------------------------
 
 const SWARM_TASK_CONTROLLER: &str = "task-controller-1702";
