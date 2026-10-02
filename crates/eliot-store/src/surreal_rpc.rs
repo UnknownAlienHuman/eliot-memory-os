@@ -29,13 +29,28 @@ struct RpcRequest<'a> {
     params: Value,
 }
 
+// Closed against unknown top-level members, so a response carrying a member this
+// client does not know is refused rather than silently dropped. Safe for every
+// method this client issues: SurrealDB's `DbResponse::into_value` emits only
+// `result`/`error`, plus `id` when the client sent one, plus `session` only when
+// the REQUEST carried a session - and this client's request type has exactly
+// `id`, `method` and `params`, so `session` can never reach this decoder. The
+// unprompted `session` only appears on the live-query notification path, and
+// this client never issues `live`. SurrealDB's RPC is JSON-RPC-shaped, not
+// JSON-RPC-2.0-enveloped, so there is no `jsonrpc` member to allow for.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcResponse {
     id: Option<Value>,
     result: Option<Value>,
     error: Option<RpcErrorBody>,
 }
 
+// Deliberately NOT closed. SurrealDB's real error object is
+// `{code, message, kind, details?, cause?}` and its own source says the details
+// are flattened to the top level; `kind` is ALWAYS emitted (only an empty
+// `details` is skipped). Closing this would refuse every genuine provider error
+// frame and turn each auth, query or credential failure into a decode failure.
 #[derive(Debug, Deserialize)]
 struct RpcErrorBody {
     code: i64,

@@ -2519,8 +2519,8 @@ mod tests {
         assert!(output.reap_receipt.proves_complete_reap());
         match &output.reap_receipt.descendants_at_root_exit {
             DescendantsAtRootExit::Failed(failed) => {
-                assert_eq!(failed.error_kind, DescendantsCaptureErrorKind::Ambiguous);
-                assert!(failed.detail.contains("bounded cleanup"));
+                assert_eq!(failed.error_kind(), DescendantsCaptureErrorKind::Ambiguous);
+                assert!(failed.detail().contains("bounded cleanup"));
             }
             DescendantsAtRootExit::Captured(captured) => {
                 panic!("delayed capture became authoritative: {captured:?}");
@@ -2561,16 +2561,16 @@ mod tests {
         match &output.reap_receipt.descendants_at_root_exit {
             eliot_types::DescendantsAtRootExit::Captured(captured) => {
                 let root_pid = output.reap_receipt.root_pid.expect("root pid");
-                assert_eq!(captured.root_pid, root_pid);
-                assert!(!captured.descendants.is_empty());
+                assert_eq!(captured.root_pid(), root_pid);
+                assert!(!captured.descendants().is_empty());
                 assert!(
                     captured
-                        .descendants
+                        .descendants()
                         .iter()
                         .all(|entry| entry.pid != root_pid)
                 );
-                assert!(captured.descendants.iter().all(|entry| entry.pid != 0));
-                for entry in &captured.descendants {
+                assert!(captured.descendants().iter().all(|entry| entry.pid != 0));
+                for entry in captured.descendants() {
                     assert!(!entry.image_path.is_empty());
                     assert!(entry.start_ticks != 0);
                     assert!(
@@ -2581,9 +2581,9 @@ mod tests {
                         assert_eq!(sha.len(), 64);
                     }
                 }
-                let mut sorted = captured.descendants.clone();
+                let mut sorted = captured.descendants().to_vec();
                 sorted.sort_by_key(|entry| entry.pid);
-                assert_eq!(sorted, captured.descendants);
+                assert_eq!(sorted, captured.descendants().to_vec());
             }
             eliot_types::DescendantsAtRootExit::Failed(failed) => {
                 panic!("expected captured descendants, got failed {failed:?}");
@@ -2611,9 +2611,9 @@ mod tests {
         assert_eq!(output.reap_receipt.process_count_after, 0);
         match &output.reap_receipt.descendants_at_root_exit {
             eliot_types::DescendantsAtRootExit::Captured(captured) => {
-                assert!(captured.descendants.is_empty());
+                assert!(captured.descendants().is_empty());
                 assert_eq!(
-                    captured.root_pid,
+                    captured.root_pid(),
                     output.reap_receipt.root_pid.expect("root pid")
                 );
             }

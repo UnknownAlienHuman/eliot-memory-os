@@ -144,7 +144,7 @@ fn validate_through_model(
             );
         }
     }
-    let model_inputs = resolve_model_inputs(admission, job).expect("e2e model must resolve");
+    let model_inputs = resolve_model_inputs(admission, job, &[]).expect("e2e model must resolve");
     assert!(
         !model_inputs.route.is_empty(),
         "admitted route must be named"
@@ -156,7 +156,7 @@ fn validate_through_model(
     let draft: StructuredModelDraft =
         run_admitted_model(model_inputs).expect("e2e model must prove");
     let request: GroundingRequest =
-        resolve_grounding_inputs(admission, job, draft).expect("e2e grounding must resolve");
+        resolve_grounding_inputs(admission, job, draft, &[]).expect("e2e grounding must resolve");
     let grounded: GroundedDreamDraft =
         ground_admitted_draft(request.clone()).expect("e2e grounding must prove");
     let _inputs = resolve_validation_inputs(admission, job).expect("e2e validation must map");
@@ -247,10 +247,10 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     binding
         .validate()
         .expect("screened binding must satisfy the real owner check");
-    let model_inputs = resolve_model_inputs(&admission, &job).expect("e2e model must resolve");
+    let model_inputs = resolve_model_inputs(&admission, &job, &[]).expect("e2e model must resolve");
     let draft = run_admitted_model(model_inputs).expect("e2e model must prove");
     let request =
-        resolve_grounding_inputs(&admission, &job, draft).expect("e2e grounding must resolve");
+        resolve_grounding_inputs(&admission, &job, draft, &[]).expect("e2e grounding must resolve");
     let grounded = ground_admitted_draft(request).expect("e2e grounding must prove");
     // The common A-05 owner directs Curation to its separate typed carrier:
     // a genuine semantic gate firing exactly as designed.
