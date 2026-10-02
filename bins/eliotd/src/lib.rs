@@ -1311,6 +1311,47 @@ impl DaemonComposition {
         Ok(receipt)
     }
 
+    /// Creates and commits the real Task, Session, Coordination and WorkScope
+    /// owner transition for one admitted activation, then reloads those four
+    /// owner images through the ordinary authenticated Kernel recovery port.
+    ///
+    /// Session and lease state are produced by their domain owners from the
+    /// supplied lifecycle commands; Task and WorkScope are taken from the
+    /// already admitted Governor owners. The Store mutation remains one
+    /// canonical `PreparedTransition` Apply with the original owner revisions
+    /// as CAS expectations. A refresh failure after the durable receipt marks
+    /// the dependent view stale while preserving the receipt.
+    pub async fn commit_agent_activation_owners(
+        &mut self,
+        identity: &RequestIdentity,
+        operation_id: OperationId,
+        command: eliot_governor::AgentActivationOwnerCommand,
+    ) -> Result<eliot_store_api::WriteReceipt, DaemonError> {
+        let envelope = self
+            .governor
+            .prepare_agent_activation_owner_envelope(identity, operation_id, command)?;
+        let receipt = self
+            .governor
+            .commit_canonical(identity, envelope)
+            .await?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        if let Err(mismatch) = self.require_revision_fence_match() {
+            self.view_stale = true;
+            let _ = crate::diagnostics::ErrorRecord::of(
+                crate::diagnostics::OwningComponent::DaemonRuntime,
+                "revision-fence",
+                &mismatch.to_string(),
+            )
+            .emit();
+        } else {
+            self.cached_revision_fence =
+                Some(Box::new(self.governor.kernel_snapshot().state_fence()));
+        }
+        Ok(receipt)
+    }
+
     /// Requires the cached revision fence to match the live Kernel fence
     /// exactly (issue #18 W6/A5).
     ///
