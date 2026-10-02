@@ -17,8 +17,8 @@ use eliot_agent_api::{
 };
 use eliot_agent_contracts::{
     ExecutionUpdateProposal, RevisionId, SemanticCeilings, SwarmAdmissionId, SwarmCoordinatorLease,
-    SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState, SwarmPlanAdmission,
-    SwarmPlanDefinition, SwarmPlanDefinitionLifecycle, TaskControllerLease,
+    SwarmDefinitionId, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
+    SwarmPlanAdmission, SwarmPlanDefinition, SwarmPlanDefinitionLifecycle, TaskControllerLease,
 };
 use eliot_agent_coordinator::{
     CandidateId, CoordinatorConfig, LearningRole, RecipeId, RecipeManifest, RoleProfileId,
@@ -1958,13 +1958,14 @@ fn swarm_ceilings() -> SemanticCeilings {
 
 /// A frozen Task-Controller definition whose `definition_digest` really binds
 /// its own frozen content, so the contract validator accepts it.
-fn frozen_swarm_definition(fence: &StateFence, suffix: &str) -> SwarmPlanDefinition {
+fn frozen_swarm_definition(fence: &StateFence, suffix: &str) -> TestResult<SwarmPlanDefinition> {
     let mut definition = SwarmPlanDefinition {
-        definition_id: format!("definition-1702-{suffix}"),
+        definition_id: SwarmDefinitionId::new(format!("definition-1702-{suffix}"))
+            .expect("definition id"),
         definition_revision: RevisionId::new("1").expect("definition revision"),
         lifecycle: SwarmPlanDefinitionLifecycle::Frozen,
         task_id: format!("task-1702-{suffix}"),
-        task_revision: RevisionId::new("1").expect("task revision"),
+        task_revision: "1".to_owned(),
         recipe_id: "recipe-1702".to_owned(),
         recipe_revision: RevisionId::new("1").expect("recipe revision"),
         controller: TaskControllerLease {
@@ -1984,7 +1985,7 @@ fn frozen_swarm_definition(fence: &StateFence, suffix: &str) -> SwarmPlanDefinit
     definition.definition_digest = definition
         .content_digest()
         .expect("definition content digest");
-    definition
+    Ok(definition)
 }
 
 fn admitted_swarm_admission(
@@ -2019,6 +2020,7 @@ fn durable_swarm_commit<T: serde::Serialize>(
     let value = serde_json::to_value(record).map_err(|error| format!("encode record: {error}"))?;
     let bytes = eliot_contracts::canonical_json_bytes(&value)?;
     let content_digest = sha256_hex(&bytes);
+    let canonical_request_hash = sha256_hex(bytes.as_slice());
     let owner_revision = SwarmOwnerRevision {
         owner_kind,
         authorization: SwarmOwnerAuthorization {
@@ -2044,7 +2046,7 @@ fn durable_swarm_commit<T: serde::Serialize>(
     let receipt = WriteReceipt {
         operation_id: OperationId::new(&format!("operation-1702-{owner_id}-{revision}"))?,
         idempotency_key: format!("idempotency-1702-{owner_id}-{revision}"),
-        canonical_request_hash: sha256_hex(bytes.as_slice()),
+        canonical_request_hash,
         transition_class: TransitionClass::TaskControl,
         status: WriteReceiptStatus::Committed,
         commit_id: Some(CommitId::new(&format!(
@@ -2132,7 +2134,7 @@ fn admitted_running_execution(
     suffix: &str,
     revision: u64,
 ) -> TestResult<SwarmExecutionRevision> {
-    let definition = frozen_swarm_definition(fence, suffix);
+    let definition = frozen_swarm_definition(fence, suffix)?;
     let admission = admitted_swarm_admission(&definition, fence);
     let execution = SwarmExecutionRevision::begin(
         &definition,
@@ -2643,7 +2645,7 @@ fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_type
     // stop conditions — presented as this execution's own revision, durably
     // committed under this coordinator's own owner stream. Nothing here is a
     // stand-in: the substituted digest really does bind that rewritten content.
-    let mut rewritten = frozen_swarm_definition(&fence, "rewritten");
+    let mut rewritten = frozen_swarm_definition(&fence, "rewritten")?;
     rewritten.work_graph_digest = sha256_hex(b"work-graph-rewritten-1702");
     rewritten.objective_ref = "objective-rewritten-1702".to_owned();
     rewritten.acceptance_refs = vec!["acceptance-rewritten-1702".to_owned()];
