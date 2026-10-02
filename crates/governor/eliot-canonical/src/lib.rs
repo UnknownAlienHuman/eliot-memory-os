@@ -38,6 +38,10 @@ pub use contract_rejection::{
 };
 pub mod epistemic_revision;
 pub mod write_envelope;
+pub use write_envelope::{
+    WriteIntent, WRITE_ENVELOPE_PROTOCOL_VERSION, VersionedWriteSubmission, WriteEnvelopeLedger,
+    validate_write_intent_id,
+};
 
 /// Stable identity of this Governor contract surface.
 pub const CONTRACT_NAME: &str = "eliot.governor.canonical";
@@ -818,20 +822,64 @@ impl<S: CanonicalStoreClient> CanonicalTransitionOwner<S> {
         envelope.prepare()
     }
 
+    /// Binds one submitted envelope into its versioned write submission.
+    ///
+    /// This is the production entry this crate's own module documentation
+    /// names: "Every canonical write enters through
+    /// [`VersionedWriteSubmission::bind`]". Before this method existed the only
+    /// canonical write path — [`Self::commit`] — called
+    /// [`CanonicalWriteEnvelope::prepare`] directly, so no canonical write was
+    /// ever bound: no `write_intent_id` was declared, no `protocol_version` was
+    /// checked, and `bind` itself had no production caller.
+    ///
+    /// `intent` is the submitter's declared [`WriteIntent`] — I5.5
+    /// `protocol_version` and `write_intent_id`. It is required and is never
+    /// derived here from the operation id or the idempotency key: a submitter
+    /// with no intent to declare has no envelope to bind, and no caller can
+    /// reach this method without one.
+    pub fn submit(
+        &self,
+        intent: &WriteIntent,
+        envelope: CanonicalWriteEnvelope,
+    ) -> Result<VersionedWriteSubmission, CanonicalError> {
+        // The owner's own non-writing validation runs first, so a malformed
+        // envelope is refused by the owner before a submission exists.
+        self.prepare(&envelope)?;
+        VersionedWriteSubmission::bind(
+            intent.protocol_version,
+            intent.write_intent_id.clone(),
+            envelope,
+            WriteResponseMode::WaitForCommit,
+        )
+    }
+
     /// Performs one governed canonical transaction.  The store receives only
     /// the prepared transition and explicit compare-and-swap expectations.
+    ///
+    /// `submission` is the bound write ([`Self::submit`]) and `intent` is the
+    /// write intent as it reaches this transport beside the prepared
+    /// transition. The two arrive from different hops — the submission was
+    /// bound at the submitter, the intent travels with the write — so the
+    /// intent is re-admitted against the binding here
+    /// ([`VersionedWriteSubmission::admit_wire_intent`]) and a substituted or
+    /// unsupported intent is refused before anything is prepared or sent. The
+    /// intent is never recomputed from the operation id, and a refusal never
+    /// falls back to the bound envelope's own value.
     pub async fn commit(
         &self,
-        envelope: CanonicalWriteEnvelope,
+        submission: &VersionedWriteSubmission,
+        intent: &WriteIntent,
     ) -> Result<WriteReceipt, CanonicalError> {
-        let transition = envelope.prepare()?;
+        submission.admit_wire_intent(intent)?;
+        let envelope = &submission.envelope;
+        let transition = self.prepare(envelope)?;
         Ok(self
             .store
             .apply_prepared(
                 &envelope.request,
                 transition,
-                envelope.expected_revision_heads,
-                envelope.expected_ordering_heads,
+                envelope.expected_revision_heads.clone(),
+                envelope.expected_ordering_heads.clone(),
             )
             .await?)
     }

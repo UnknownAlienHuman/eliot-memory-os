@@ -18,7 +18,7 @@
 //! interpretation, authority creation, retry, cache, defaulting, or fallback.
 
 use eliot_contracts::{OperationId, StateFence};
-use eliot_ors::{ReservationRecord, WriterReservationToken};
+use eliot_ors::{RecoveryOwner, ReservationRecord, WriterReservationToken};
 use eliot_store_api::{CanonicalStoreClient, ReservedWriteRequest, WriteReceipt};
 
 use super::KernelStoreGateway;
@@ -72,14 +72,23 @@ pub(super) async fn receipt(
 /// the same `OperationId` throughout and never adopts a peer identity. The
 /// shared #991 verifier binds receipt to request (operation, idempotency,
 /// hash, class, fence, scope/sequence coverage, reconciliation envelope);
-/// [`reconcile_receipt`] binds receipt to token; the ORS owner verifies
+/// [`reconcile_receipt`] binds receipt to token and to the caller's declared
+/// recovery owner; the ORS owner verifies
 /// through the composition-bound evidence provider and finalizes or releases
 /// all token scopes atomically. A forged, foreign, partial, or stale receipt
 /// fails here with the token state unchanged. Cancellation, timeout, or
 /// socket replacement cannot reach this path with a fabricated receipt: only
 /// exact evidence closes the token.
+///
+/// `recovery_owner` is the reconciling owner's OWN declared identity, passed in
+/// by the composition rather than read back from the token. Passing the token's
+/// own recorded owner here would make the owner check in [`reconcile_receipt`]
+/// and in ORS's `reconciliation_matches` compare the token against itself, so
+/// every reservation would look owned by whichever owner happened to reconcile
+/// it (issue #1925, audit 5856193606 item 3).
 pub(super) fn reconcile_reserved(
     gateway: &KernelStoreGateway,
+    recovery_owner: &RecoveryOwner,
     token: &WriterReservationToken,
     request: &ReservedWriteRequest,
     receipt: &WriteReceipt,
@@ -122,6 +131,7 @@ pub(super) fn reconcile_reserved(
             writer_epoch_for_fence_from_epoch(&live_epoch).map_err(|error| error.to_string())?;
         CompositionReservation::bind(commit_ors, writer_epoch).map_err(|error| error.to_string())?
     };
-    let reconciliation = reconcile_receipt(token, receipt).map_err(|error| error.to_string())?;
+    let reconciliation =
+        reconcile_receipt(recovery_owner, token, receipt).map_err(|error| error.to_string())?;
     finalize_reservation(&owner, &reconciliation).map_err(|error| error.to_string())
 }

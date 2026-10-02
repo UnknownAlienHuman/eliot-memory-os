@@ -964,6 +964,30 @@ const WASM_HOST_IMAGE_FILE_NAME: &str = "eliot-wasm-host.exe";
 /// never self-asserted by the child.
 const WASM_HOST_MODULE_ID: &str = "eliot-wasm-host";
 
+/// Recovery-owner identity this composition reconciles reserved writes under
+/// (issue #1925, I5.7, audit 5856193606 item 3).
+///
+/// This is the Kernel composition's OWN declared identity, in the same shape
+/// as the drain decision's `recovery_owner` (`bins/eliot-kernel/src/lib.rs`
+/// `DrainCommitDecision`). It is a claim about who is reconciling, never
+/// authority and never evidence about a payload: `RecoveryOwner` is
+/// "recovery owner identity preserved without granting it authority".
+///
+/// It is load-bearing rather than decorative. The startup pass forwards it into
+/// `eliot_kernel_service::admit_reserved_write_recovery_owner`, which requires
+/// each persisted token to record this same owner AND to carry the admitted
+/// write identity that binds its staged envelope to the operation being
+/// reconciled. A reservation owned by another owner, or a legacy row retaining
+/// no admitted write identity, is reported pending and never observed or closed
+/// here. The owner is also bound into the reconciliation report digest, so two
+/// owners' passes over the same rows are never digest-indistinguishable.
+///
+/// It is NOT the source of the value written into a reservation: the write side
+/// takes its owner as the `recovery_owner` argument of
+/// `eliot_kernel_service::gateway_seed`, and the composition is the single
+/// place both sides read it from.
+const RESERVED_WRITE_RECOVERY_OWNER: &str = "kernel-reserved-write-recovery";
+
 /// Closed owner-side WASM dispatch publication (`#1780` D4a, `#1955`).
 ///
 /// Carries the installation-observed host binding (path + digest, re-hashed
@@ -9365,8 +9389,22 @@ impl KernelComposition {
                 // is exhaustive and clean; an unresolved reservation, a retained
                 // problem, or a truncated scan keeps normal writes gated, and
                 // nothing is retried, decoded, or dropped to reach readiness.
+                let recovery_owner =
+                    match eliot_ors::RecoveryOwner::new(RESERVED_WRITE_RECOVERY_OWNER) {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            return Ok(Self::store_error_response_text(
+                                "store_recovery",
+                                &error.to_string(),
+                            ));
+                        }
+                    };
                 let staged = match gateway
-                    .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
+                    .reconcile_staged_writes(
+                        &recovery_owner,
+                        &recovery_fence,
+                        eliot_ors::MAX_RECOVERY_PAGE,
+                    )
                     .await
                 {
                     Ok(staged) => staged,
@@ -9777,11 +9815,28 @@ impl KernelComposition {
         // durably stage the complete opaque operation, and a live write that
         // could not stage must not report it. This is not a silent fallback for
         // `accept_after_stage`: there is no `accept_after_stage` request on this
-        // wire to fall back from. The startup recovery owner
-        // (`store_recovery_operation` -> `KernelStoreGateway::reconcile_staged_writes`)
-        // enumerates, revalidates by the envelope's recorded hash, and reconciles
-        // by operation identity into either the canonical receipt or a durable
-        // Recovery Problem whenever ORS does hold one.
+        // wire to fall back from.
+        //
+        // The startup recovery owner is `RESERVED_WRITE_RECOVERY_OWNER` above,
+        // reached through `store_recovery_operation` ->
+        // `KernelStoreGateway::reconcile_staged_writes` ->
+        // `reconcile_staged_writes_at_startup`. It enumerates, revalidates by
+        // the envelope's ORIGINAL recorded hash, and reconciles by the admitted
+        // write identity into either the canonical receipt or a durable
+        // Recovery Problem whenever ORS does hold one. It is OWNED rather than
+        // addressed by name: the pass refuses any token that records a different
+        // recovery owner or that retains no admitted write identity, so this
+        // owner cannot close another owner's reservation.
+        //
+        // What is still open on the WRITE side is unchanged and is NOT worked
+        // around here: `gateway_seed` still has no production caller, so no
+        // envelope is produced on this route, and the seeded envelope's
+        // `RecoveryWriteBinding` has no producer in the repository
+        // (`eliot_ors::RecoveryPayloadEnvelope::with_write_binding` has no
+        // caller, and `RecoveryPayloadEnvelope::encrypted` hardcodes
+        // `write_binding: None`). That binding is the missing prerequisite for
+        // reaching `ACCEPTED_PENDING`; it is not something this recovery owner
+        // can supply, and no value is invented for it here.
         match gateway
             .apply(
                 &operation.context,
@@ -12893,6 +12948,9 @@ fn staged_write_recovery_view(
     serde_json::json!({
         "scan_source": reservations.scan_source,
         "fence": reservations.fence,
+        // The owner the pass RAN under, so an operator reads which owner
+        // reconciled (or refused) each row rather than inferring it.
+        "recovery_owner": reservations.recovery_owner,
         "digest": reservations.digest,
         "scanned": reservations.scanned,
         "scan_limit": reservations.scan_limit,

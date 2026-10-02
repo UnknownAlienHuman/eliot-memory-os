@@ -1533,6 +1533,13 @@ impl KernelStoreGateway {
             &expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
+        // The recovery owner this write is reconciled under is the SEED's
+        // declared owner — the caller's own declaration, taken before ORS
+        // persisted anything — not a copy of the token's recorded field. That
+        // keeps `reconcile_receipt`'s owner comparison between two independent
+        // sources instead of the token against itself.
+        let recovery_owner = eliot_ors::RecoveryOwner::new(seed.recovery_owner.clone())
+            .map_err(|error| format!("reserved write recovery owner is invalid: {error}"))?;
         ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
         let operation_id = transition.identity.operation_id.as_str().to_owned();
         if let Err(error) = validate_current_proof_approval_support(&transition) {
@@ -1576,7 +1583,7 @@ impl KernelStoreGateway {
                         "reserved write committed for operation {operation_id} but the reservation cannot execute ({error}); reconcile by exact receipt once the writer epoch is current"
                     )
                 })?;
-                let reconciliation = reconcile_receipt(&sealed.token, &receipt)
+                let reconciliation = reconcile_receipt(&recovery_owner, &sealed.token, &receipt)
                     .map_err(|error| error.to_string())?;
                 finalize_reservation(&owner, &reconciliation).map_err(|error| error.to_string())?;
                 drop(lease);
@@ -1770,8 +1777,15 @@ impl KernelStoreGateway {
     /// `store_receipt_gateway::reconcile_reserved`. Synchronous: every check
     /// below is a bounded local validation or ORS write, never a network
     /// wait, so reconciliation never holds the gateway across I/O.
+    ///
+    /// `recovery_owner` is the reconciling owner's OWN declared identity
+    /// (issue #1925). The gateway never chooses it and never reads it back from
+    /// `token`: a self-read would make the owner equality check compare the
+    /// token against itself, and every reservation would look owned by
+    /// whichever owner happened to reconcile it.
     pub fn reconcile_reserved(
         &self,
+        recovery_owner: &eliot_ors::RecoveryOwner,
         token: &WriterReservationToken,
         request: &ReservedWriteRequest,
         receipt: &WriteReceipt,
@@ -1780,7 +1794,7 @@ impl KernelStoreGateway {
         // reconciliation finalizes ORS reservation scopes, so a
         // `shadow_no_authority` candidate refuses before the delegate runs.
         self.refuse_shadow_mutation()?;
-        store_receipt_gateway::reconcile_reserved(self, token, request, receipt)
+        store_receipt_gateway::reconcile_reserved(self, recovery_owner, token, request, receipt)
     }
 
     /// Projects one sealed reservation into a Kernel-visible reserved
@@ -1883,10 +1897,18 @@ impl KernelStoreGateway {
     /// another generation or authority never reaches ORS. A composition with no
     /// bound ORS refuses explicitly instead of reporting an empty clean scan.
     ///
+    /// `recovery_owner` is the composition's declared recovery-owner identity
+    /// for this pass (issue #1925, audit 5856193606 item 3). The gateway does
+    /// not choose it: it forwards the caller's declaration so the pass can
+    /// close only the reservations that owner actually owns. A record owned by
+    /// another owner, or retaining no admitted write identity, is reported
+    /// pending and left untouched.
+    ///
     /// `limit` is the whole-scan ceiling for the reservation scan and the
     /// retained-problem listing.
     pub async fn reconcile_staged_writes(
         &self,
+        recovery_owner: &eliot_ors::RecoveryOwner,
         fence: &StateFence,
         limit: u16,
     ) -> Result<StagedWriteRecovery, String> {
@@ -1901,7 +1923,11 @@ impl KernelStoreGateway {
         })?;
         let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
         crate::store_write_reservation::reconcile_staged_writes_at_startup(
-            &owner, fence, self, limit,
+            &owner,
+            recovery_owner,
+            fence,
+            self,
+            limit,
         )
         .await
         .map_err(|error| error.to_string())

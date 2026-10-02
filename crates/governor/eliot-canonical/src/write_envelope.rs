@@ -10,7 +10,14 @@
 //! `protocol_version`, globally unique `operation_id`, stable
 //! `write_intent_id`, `idempotency_key`, exact task/scope/ordering/fence
 //! metadata carried by [`CanonicalWriteEnvelope`](super::CanonicalWriteEnvelope),
-//! and an allowed agent response mode. The immutable request identity is
+//! and an allowed agent response mode. `protocol_version` and
+//! `write_intent_id` are the submitter's own declared identity terms (see
+//! [`WriteIntent`]); they travel beside the envelope rather than inside its
+//! canonical request hash, because that hash input must stay reconstructible by
+//! the store from the transported apply values alone. Neither value is derived
+//! from the operation id or the idempotency key, and a typed correction keeps
+//! the intent while its attempt receives a new operation id. The immutable
+//! request identity is
 //! hashed with the shared provider-neutral
 //! [`canonical_request_hash`](super::CanonicalWriteEnvelope::canonical_request_hash)
 //! so Governor, Kernel, and store agree byte-for-byte.
@@ -36,6 +43,7 @@
 use std::collections::BTreeMap;
 
 use eliot_contracts::OperationId;
+use serde::{Deserialize, Serialize};
 
 use super::{CanonicalError, CanonicalWriteEnvelope, WriteResponseMode};
 
@@ -109,12 +117,74 @@ pub struct VersionedWriteSubmission {
     pub response_mode: WriteResponseMode,
 }
 
+/// The submitter's stable write intent, carried as one unit (I5.5).
+///
+/// These are the submitter's declared envelope identity terms — I5.5
+/// `protocol_version` and `write_intent_id` — and this type is the closed
+/// carrier that keeps them together from admission through the apply wire. It
+/// holds the submitter's values verbatim: nothing here derives the intent from
+/// the operation id or the idempotency key, and there is no default, empty, or
+/// synthesized form. A submitter with no intent to declare has no submission to
+/// bind.
+///
+/// They travel beside the envelope rather than inside it because
+/// `CanonicalWriteEnvelope`'s canonical JSON is its canonical request hash
+/// input, and that hash must stay reconstructible by the store from the
+/// transported apply values alone (see
+/// [`CanonicalWriteEnvelope::canonical_request_hash`](super::CanonicalWriteEnvelope::canonical_request_hash)).
+/// Folding the intent into the hashed envelope would make the store's
+/// independent recompute impossible; omitting it from the wire entirely is what
+/// left the intent unbound at the apply boundary. This carrier is that
+/// third thing: the submitter's declared value, validated by the same owner
+/// checks at admission and again before the write is forwarded.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteIntent {
+    /// Envelope protocol version the submitter wrote this envelope against.
+    pub protocol_version: u32,
+    /// Stable user/agent intent across typed correction attempts.
+    pub write_intent_id: String,
+}
+
+impl WriteIntent {
+    /// Builds the intent carrier from the submitter's own two values.
+    pub const fn new(protocol_version: u32, write_intent_id: String) -> Self {
+        Self {
+            protocol_version,
+            write_intent_id,
+        }
+    }
+
+    /// Validates the declared intent exactly as admission validates it.
+    ///
+    /// This runs the same two owner checks — the supported envelope protocol
+    /// version and the non-blank, control-free intent id — so a value that
+    /// crossed the wire can never be a weaker one than the one admission
+    /// accepted.
+    pub fn validate(&self) -> Result<(), CanonicalError> {
+        if self.protocol_version != WRITE_ENVELOPE_PROTOCOL_VERSION {
+            return Err(CanonicalError::InvalidField {
+                field: "protocol_version",
+                reason: "unsupported write envelope version",
+            });
+        }
+        validate_write_intent_id(&self.write_intent_id)
+    }
+}
+
 impl VersionedWriteSubmission {
     /// Parses and validates a versioned submission before admission.
     ///
-    /// Requires `protocol_version == 1`, a non-blank `write_intent_id`, a
-    /// fully valid envelope (including a non-empty complete
-    /// `ordering_scopes` set via the prepared transition), and the
+    /// `protocol_version` and `write_intent_id` are the submitter's declared
+    /// values (see [`WriteIntent`]); they are carried beside the envelope
+    /// rather than folded into its canonical request hash, because the hash
+    /// input must stay exactly reconstructible by the store from the transported
+    /// apply values alone. Nothing here derives either value from the operation
+    /// id or the idempotency key, and there is no default or empty form.
+    ///
+    /// Admission therefore requires `protocol_version == 1`, a non-blank
+    /// `write_intent_id`, a fully valid envelope (including a non-empty
+    /// complete `ordering_scopes` set via the prepared transition), and the
     /// already-typed agent response mode. Computes the canonical request
     /// hash over the immutable request identity.
     pub fn bind(
@@ -123,13 +193,8 @@ impl VersionedWriteSubmission {
         envelope: CanonicalWriteEnvelope,
         response_mode: WriteResponseMode,
     ) -> Result<Self, CanonicalError> {
-        if protocol_version != WRITE_ENVELOPE_PROTOCOL_VERSION {
-            return Err(CanonicalError::InvalidField {
-                field: "protocol_version",
-                reason: "unsupported write envelope version",
-            });
-        }
-        validate_write_intent_id(&write_intent_id)?;
+        let intent = WriteIntent::new(protocol_version, write_intent_id);
+        intent.validate()?;
         envelope.validate()?;
         // Require the complete ordering-scope declaration before staging:
         // the prepared transition rejects an empty ordering set.
@@ -141,8 +206,8 @@ impl VersionedWriteSubmission {
         }
         let canonical_request_hash = envelope.canonical_request_hash()?;
         Ok(Self {
-            protocol_version,
-            write_intent_id,
+            protocol_version: intent.protocol_version,
+            write_intent_id: intent.write_intent_id,
             envelope,
             canonical_request_hash,
             response_mode,
@@ -157,6 +222,31 @@ impl VersionedWriteSubmission {
     /// Stable idempotency key shared across retries of one logical transition.
     pub fn idempotency_key(&self) -> &str {
         &self.envelope.idempotency_key
+    }
+
+    /// The submitter's declared write intent, as it travels the apply wire.
+    pub fn write_intent(&self) -> WriteIntent {
+        WriteIntent::new(self.protocol_version, self.write_intent_id.clone())
+    }
+
+    /// Refuses a submitted write whose intent is not this envelope's own.
+    ///
+    /// This is the exact admission a transport performs before forwarding a
+    /// prepared transition: the intent carried beside it must be the one the
+    /// bound envelope declared, and a request presenting another envelope's
+    /// intent — or an intent under an unsupported protocol version — is refused
+    /// instead of forwarded. Nothing is repaired, defaulted, or derived here.
+    pub fn admit_wire_intent(&self, intent: &WriteIntent) -> Result<(), CanonicalError> {
+        intent.validate()?;
+        if intent.protocol_version != self.protocol_version
+            || intent.write_intent_id != self.write_intent_id
+        {
+            return Err(CanonicalError::InvalidField {
+                field: "write_intent_id",
+                reason: "write intent does not match the bound write envelope",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -515,6 +605,113 @@ mod tests {
             Err(CanonicalError::IdentityConflict)
         ));
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// I5.5 `write_intent_id: stable user/agent intent across typed
+    /// correction attempts`, read with I6.8 (`docs/architecture/
+    /// I06-08-contract-rejection.md:45`): "The corrected request receives a new
+    /// operation ID, canonical request hash and normally a new idempotency
+    /// key". The intent is the identity term that survives that correction, so
+    /// this proves it travels from the envelope rather than being derived from
+    /// the per-attempt identity.
+    #[test]
+    fn typed_correction_keeps_the_declared_write_intent_and_renames_the_attempt() {
+        let fence = fence();
+        let first = submission(
+            &fence,
+            "op-1928-a",
+            "idem-1928-a",
+            WriteResponseMode::WaitForCommit,
+        );
+        // The typed correction: a new operation id, a new canonical request
+        // hash, and normally a new idempotency key...
+        let corrected = submission(
+            &fence,
+            "op-1928-b",
+            "idem-1928-b",
+            WriteResponseMode::WaitForCommit,
+        );
+        assert_ne!(
+            corrected.operation_id().as_str(),
+            first.operation_id().as_str()
+        );
+        assert_ne!(
+            corrected.idempotency_key(),
+            first.idempotency_key()
+        );
+        assert_ne!(
+            corrected.canonical_request_hash,
+            first.canonical_request_hash
+        );
+        // ...while the submitter's declared write intent is unchanged, and the
+        // intent carried on the wire is the envelope's own value.
+        assert_eq!(corrected.write_intent_id, first.write_intent_id);
+        assert_eq!(corrected.protocol_version, first.protocol_version);
+        assert_eq!(corrected.write_intent().write_intent_id, first.write_intent_id);
+        corrected
+            .admit_wire_intent(&corrected.write_intent())
+            .expect("the envelope's own intent is admitted");
+        // Both attempts are separate submissions under their own keys.
+        let mut ledger = WriteEnvelopeLedger::new();
+        let SubmitOutcome::AcceptedNew { operation_id } =
+            ledger.submit(&first).expect("first submit accepts")
+        else {
+            panic!("first submit must accept");
+        };
+        assert_eq!(operation_id.as_str(), "op-1928-a");
+        let SubmitOutcome::AcceptedNew { operation_id } =
+            ledger.submit(&corrected).expect("correction is admitted")
+        else {
+            panic!("the corrected attempt must be admitted under its own key");
+        };
+        assert_eq!(operation_id.as_str(), "op-1928-b");
+    }
+
+    /// The refusal side of the same rule: a request whose `write_intent_id`
+    /// does not match the envelope being bound is refused rather than admitted,
+    /// forwarded, or repaired.
+    #[test]
+    fn mismatched_write_intent_is_refused_and_never_repaired() {
+        let fence = fence();
+        let bound = submission(
+            &fence,
+            "op-1928-a",
+            "idem-1928",
+            WriteResponseMode::WaitForCommit,
+        );
+        // Another envelope's intent presented with this envelope's transition.
+        let foreign = WriteIntent::new(WRITE_ENVELOPE_PROTOCOL_VERSION, "intent-other".to_owned());
+        assert!(matches!(
+            bound.admit_wire_intent(&foreign),
+            Err(CanonicalError::InvalidField {
+                field: "write_intent_id",
+                ..
+            })
+        ));
+        // An intent under an unsupported protocol version is refused too, and
+        // the refusal never downgrades to the bound envelope's version.
+        let future = WriteIntent::new(WRITE_ENVELOPE_PROTOCOL_VERSION + 1, bound.write_intent_id.clone());
+        assert!(matches!(
+            bound.admit_wire_intent(&future),
+            Err(CanonicalError::InvalidField {
+                field: "protocol_version",
+                ..
+            })
+        ));
+        // A blank intent never binds: there is no default or synthesized
+        // fallback value.
+        assert!(matches!(
+            VersionedWriteSubmission::bind(
+                WRITE_ENVELOPE_PROTOCOL_VERSION,
+                "   ".to_owned(),
+                envelope(&fence, "op-1928-c", "idem-1928-c"),
+                WriteResponseMode::WaitForCommit,
+            ),
+            Err(CanonicalError::InvalidField {
+                field: "write_intent_id",
+                ..
+            })
+        ));
     }
 
     #[test]
