@@ -81,6 +81,8 @@ pub struct OwnerCompiledSurfaceInput<'a> {
     pub coverage: Option<&'a IntegrationCoverageProfile>,
     /// Current Governor-derived profile. Missing remains unknown.
     pub governance_profile: Option<&'a GovernanceProfile>,
+    /// Fresh caller clock at response consumption or explicit retrieval.
+    pub now: u64,
 }
 
 /// Private-field proof that one exact Governor readback is bound to the live
@@ -159,6 +161,16 @@ pub fn admit_owner_compiled_surface(
         .receipt
         .validate()
         .map_err(|error| BootstrapError::new("BOOTSTRAP_OWNER_RECEIPT_INVALID", error.to_string()))?;
+    if input.now == 0
+        || input.now > owner.lease.deadline
+        || input.now > owner.receipt.expiry_tick
+        || owner.lease.deadline != owner.receipt.expiry_tick
+    {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_EXPIRED",
+            "owner readiness lease or receipt is expired at response consumption",
+        ));
+    }
 
     if owner.record.claim.lease_ref != owner.lease.lease_ref
         || owner.record.claim.lease_deadline != owner.lease.deadline
@@ -211,6 +223,23 @@ pub fn admit_owner_compiled_surface(
 
     let surface = &owner.surface;
     let receipt = &owner.receipt;
+    let projected = receipt.surface(&owner.lease).map_err(|error| {
+        BootstrapError::new(
+            "BOOTSTRAP_OWNER_SURFACE_MISMATCH",
+            format!("receipt could not project its canonical readiness surface: {error}"),
+        )
+    })?;
+    let expected_readiness = match receipt.readiness {
+        eliot_workscope::ReadinessLifecycle::Unseen => "UNSEEN",
+        eliot_workscope::ReadinessLifecycle::Scanning => "SCANNING",
+        eliot_workscope::ReadinessLifecycle::NeedsScope => "NEEDS_SCOPE",
+        eliot_workscope::ReadinessLifecycle::NeedsTask => "NEEDS_TASK",
+        eliot_workscope::ReadinessLifecycle::NeedsSources => "NEEDS_SOURCES",
+        eliot_workscope::ReadinessLifecycle::ReadyReadOnly => "READY_READ_ONLY",
+        eliot_workscope::ReadinessLifecycle::ReadyMaterial => "READY_MATERIAL",
+        eliot_workscope::ReadinessLifecycle::Degraded => "DEGRADED",
+        eliot_workscope::ReadinessLifecycle::Conflicted => "CONFLICTED",
+    };
     if surface.receipt_ref != receipt.receipt_ref
         || surface.lease_ref != receipt.lease_ref
         || surface.principal_ref != receipt.principal_ref
@@ -219,6 +248,7 @@ pub fn admit_owner_compiled_surface(
         || surface.scope_descriptor_revision != receipt.scope_descriptor_revision
         || surface.instance != receipt.instance
         || surface.lineage != receipt.lineage
+        || surface.scope_resolution != receipt.scope_resolution
         || surface.task_binding != receipt.task_binding
         || surface.state_fence != receipt.state_fence
         || surface.governing_source_set_ref != receipt.governing_source_set_ref
@@ -232,8 +262,19 @@ pub fn admit_owner_compiled_surface(
         || surface.tokenizer_id != receipt.tokenizer_id
         || surface.tokenizer_version != receipt.tokenizer_version
         || surface.tokenizer_hash != receipt.tokenizer_hash
+        || surface.readiness != expected_readiness
+        || surface.smallest_missing_question != projected.smallest_missing_question
         || surface.lease_deadline != receipt.expiry_tick
         || surface.receipt_revision != receipt.receipt_revision
+        || surface.proof_readiness != receipt.proof_readiness
+        || surface.missing_inputs != receipt.missing_inputs
+        || surface.next_safe_action != receipt.next_safe_action
+        || surface.discovered_source_refs != receipt.discovered_source_refs
+        || surface.admitted_source_refs != receipt.admitted_source_refs
+        || surface.conflicting_source_refs != receipt.conflicting_source_refs
+        || surface.unavailable_source_refs != receipt.unavailable_source_refs
+        || surface.scan_receipt_ref != receipt.scan_receipt_ref
+        || surface.workspace_instance_ref != receipt.instance.instance_ref
         || surface.projection_source_ref != receipt.projection_source_ref
         || surface.projection_generation != receipt.projection_generation
     {

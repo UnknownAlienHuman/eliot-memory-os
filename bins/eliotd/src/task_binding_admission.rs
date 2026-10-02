@@ -246,12 +246,239 @@ use eliot_protocol::{
 use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
-    BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
-    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
-    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    AuthorityBasis, BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey,
+    DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate,
+    GoverningSourceCandidateEvidence, GoverningSourceRole, ManifestEvidence,
+    NewTaskIntake, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    PrecedenceDeclaration, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
+    TaskBindingState, TaskIntakeCandidate, TaskIntakeOrigin, issue_discovery_lease,
+    task_selection_required,
 };
+
+/// Caller declarations for a source candidate. These are claims only; the
+/// builder binds them to source facts obtained from the live source owner.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitSourceClaim {
+    pub source_ref: String,
+    pub digest: String,
+    pub role: GoverningSourceRole,
+    pub domains: Vec<eliot_security_contracts::ObservationDomainRef>,
+    pub claim: Option<AuthorityBasis>,
+}
+
+/// Explicit task intake fields. Proposer and session identity are always
+/// filled from the authenticated caller, never from this request.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitTaskIntakeRequest {
+    pub intake_ref: String,
+    pub route_ref: String,
+    pub goal: Option<String>,
+    pub acceptance_digest: Option<String>,
+    pub constraints: Vec<String>,
+    pub proposed_source_digests: Vec<String>,
+    pub decision_owner_ref: Option<String>,
+    pub task_controller_ref: Option<String>,
+    pub origin: TaskIntakeOrigin,
+}
+
+/// Explicit onboarding request carried by the authenticated state route.
+/// It contains declarations only, never owner proofs or a selected task.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitColdStartBootstrapRequest {
+    pub explicit_root: PathBuf,
+    pub scope_ref: String,
+    pub generation: u64,
+    pub sources: Vec<ExplicitSourceClaim>,
+    pub precedences: Vec<PrecedenceDeclaration>,
+    pub absence_reason_ref: Option<String>,
+    pub expires_at: u64,
+    pub task_intake: Option<ExplicitTaskIntakeRequest>,
+}
+
+/// Exact live owner inputs used to construct a source admission request
+/// before a full readiness claim exists. Candidate origin and assurance are
+/// preserved from owner reads; request claims can never replace them.
+pub struct ExplicitColdStartOwnerInput<'a> {
+    pub request: &'a ExplicitColdStartBootstrapRequest,
+    pub principal_ref: &'a str,
+    pub session_ref: &'a str,
+    /// Authenticated human owner identity, distinct from the application
+    /// principal when the route is service-mediated.
+    pub required_owner_ref: &'a str,
+    pub live_fence: &'a StateFence,
+    pub now: u64,
+    pub activation: Option<&'a eliot_governor::GovernorActivationSnapshot>,
+    pub acceptance_set: Option<&'a eliot_store_api::TaskContractAcceptanceSet>,
+    pub owner_candidates: &'a [GoverningSourceCandidate],
+    pub scope_ref: &'a str,
+    pub generation: u64,
+    pub expires_at: u64,
+}
+
+/// Parses the exact `arguments.bootstrap` JSON object. Unknown keys are
+/// rejected by the closed request types above.
+pub fn parse_explicit_cold_start_bootstrap(
+    value: &serde_json::Value,
+) -> Result<ExplicitColdStartBootstrapRequest, TaskBindingError> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        TaskBindingError::selection_required(format!(
+            "explicit cold-start bootstrap request is invalid: {error}"
+        ))
+    })
+}
+
+/// Builds owner-admission input from declared source claims and exact current
+/// owner readbacks. No claim field is treated as authenticated by parsing.
+pub fn build_explicit_source_admission_request(
+    input: &ExplicitColdStartOwnerInput<'_>,
+) -> Result<eliot_workscope::SourceAdmissionRequest, TaskBindingError> {
+    if input.now == 0
+        || input.expires_at < input.now
+        || input.request.expires_at != input.expires_at
+        || input.request.scope_ref != input.scope_ref
+        || input.request.generation != input.generation
+        || input.request.explicit_root.as_os_str().is_empty()
+        || !input.request.explicit_root.is_absolute()
+        || input.principal_ref.trim().is_empty()
+        || input.session_ref.trim().is_empty()
+        || input.required_owner_ref.trim().is_empty()
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "explicit source admission is not bound to a valid live scope, owner, or fence",
+        ));
+    }
+    input.live_fence.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!("live state fence is invalid: {error}"))
+    })?;
+
+    let mut candidates = Vec::with_capacity(input.request.sources.len());
+    for declared in &input.request.sources {
+        if let Some(AuthorityBasis::HumanOwner { owner_ref }) = &declared.claim {
+            if owner_ref != input.required_owner_ref {
+                return Err(TaskBindingError::scope_incompatible(
+                    "human source claim does not name the authenticated owner",
+                ));
+            }
+        }
+        let mut matches = input.owner_candidates.iter().filter(|candidate| {
+            candidate.source_ref == declared.source_ref
+                && candidate.digest == declared.digest
+                && candidate.role == declared.role
+                && candidate.domains == declared.domains
+                && candidate.applicable_scope_ref == input.scope_ref
+                && candidate.applicable_generation == input.generation
+        });
+        let mut candidate = matches.next().cloned().ok_or_else(|| {
+            TaskBindingError::scope_incompatible(
+                "declared source does not match a live source-owner candidate",
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(TaskBindingError::selection_required(
+                "declared source matches ambiguous owner candidates",
+            ));
+        }
+        candidate.claim = declared.claim.clone();
+        candidates.push(candidate);
+    }
+    for precedence in &input.request.precedences {
+        if let AuthorityBasis::HumanOwner { owner_ref } = &precedence.authority {
+            if owner_ref != input.required_owner_ref {
+                return Err(TaskBindingError::scope_incompatible(
+                    "human precedence claim does not name the authenticated owner",
+                ));
+            }
+        }
+    }
+    if candidates.len() != input.owner_candidates.len() {
+        return Err(TaskBindingError::scope_incompatible(
+            "live source-owner candidates must be explicitly named; implicit source selection is forbidden",
+        ));
+    }
+
+    let proven_current_bindings = match (input.activation, input.acceptance_set) {
+        (None, None) => Vec::new(),
+        (Some(activation), Some(acceptance_set)) => {
+            acceptance_set.validate().map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "live TaskContract acceptance-set owner read is invalid: {error}"
+                ))
+            })?;
+            if activation.state_fence != *input.live_fence
+                || acceptance_set.read_state_fence != *input.live_fence
+                || activation.principal_id != input.principal_ref
+                || activation.session_id != input.session_ref
+                || activation.task_id != acceptance_set.task_id
+                || activation.task_revision != acceptance_set.task_revision
+                || acceptance_set.acceptance_digest.trim().is_empty()
+            {
+                return Err(TaskBindingError::scope_incompatible(
+                    "live activation and TaskContract acceptance owner reads disagree",
+                ));
+            }
+            vec![TaskBindingState::CurrentTaskContract {
+                task_ref: activation.task_id.to_string(),
+                task_revision: activation.task_revision,
+                acceptance_digest: acceptance_set.acceptance_digest.clone(),
+                selection_source_ref: activation.plan_id.clone(),
+                evidence_ref: acceptance_set.acceptance_digest.clone(),
+            }]
+        }
+        _ => {
+            return Err(TaskBindingError::selection_required(
+                "live activation and TaskContract acceptance set must be read together",
+            ));
+        }
+    };
+
+    Ok(eliot_workscope::SourceAdmissionRequest {
+        scope_ref: input.scope_ref.to_owned(),
+        generation: input.generation,
+        candidates,
+        precedences: input.request.precedences.clone(),
+        required_owner_ref: input.principal_ref.to_owned(),
+        proven_current_bindings,
+        proven_contracts: Vec::new(),
+        absence_reason_ref: input.request.absence_reason_ref.clone(),
+        state_fence: input.live_fence.clone(),
+        expires_at: input.expires_at,
+    })
+}
+
+/// Constructs task intake from declared content while binding proposer
+/// principal/session to the authenticated state request.
+pub fn build_explicit_task_intake(
+    request: &ExplicitColdStartBootstrapRequest,
+    principal_ref: &str,
+    session_ref: &str,
+) -> Result<Option<TaskIntakeCandidate>, TaskBindingError> {
+    let Some(intake) = &request.task_intake else {
+        return Ok(None);
+    };
+    TaskIntakeCandidate::new(NewTaskIntake {
+        intake_ref: intake.intake_ref.clone(),
+        proposer_principal_ref: principal_ref.to_owned(),
+        proposer_session_ref: session_ref.to_owned(),
+        route_ref: intake.route_ref.clone(),
+        goal: intake.goal.clone(),
+        acceptance_digest: intake.acceptance_digest.clone(),
+        constraints: intake.constraints.clone(),
+        proposed_scope_ref: Some(request.scope_ref.clone()),
+        proposed_source_digests: intake.proposed_source_digests.clone(),
+        decision_owner_ref: intake.decision_owner_ref.clone(),
+        task_controller_ref: intake.task_controller_ref.clone(),
+        origin: intake.origin,
+    })
+    .map(Some)
+    .map_err(|error| {
+        TaskBindingError::selection_required(format!(
+            "explicit task intake is invalid: {error}"
+        ))
+    })
+}
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
 /// scanner inputs. The ticket binds the explicit selector to the admitted
@@ -1014,14 +1241,14 @@ pub struct TaskBindingError {
 }
 
 impl TaskBindingError {
-    fn selection_required(detail: impl Into<String>) -> Self {
+    pub(crate) fn selection_required(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SELECTION_REQUIRED,
             detail: detail.into(),
         }
     }
 
-    fn scope_incompatible(detail: impl Into<String>) -> Self {
+    pub(crate) fn scope_incompatible(detail: impl Into<String>) -> Self {
         Self {
             code: TASK_SCOPE_INCOMPATIBLE,
             detail: detail.into(),
@@ -2123,8 +2350,10 @@ pub struct OwnerBoundBootstrapInput<'a> {
 /// A non-READY terminal can only produce a bounded diagnostic/intake result.
 /// Current task evidence additionally requires the activation and live
 /// task-selection owner result at the same fence. Missing/ambiguous task
-/// selection, unknown profiles, and the presently unavailable boot-delta and
-/// budget-preview owners remain diagnostic and never gain Material authority.
+/// selection and unknown profiles remain diagnostic and never gain Material
+/// authority. The bridge's owner-compiled surface admission independently
+/// requires the exact owner boot delta and performs its bounded response
+/// preview before projecting Material.
 pub fn admit_owner_bound_bootstrap(
     input: &OwnerBoundBootstrapInput<'_>,
 ) -> Result<OwnerBoundBootstrap, TaskBindingError> {
@@ -2747,6 +2976,52 @@ pub fn carry_owner_bound_dispatch(
         envelope: envelope.clone(),
         binding,
     })
+}
+
+/// Rechecks a queued or possibly-effectful operation against fresh Governor
+/// owner outputs without changing the original operation identity.
+///
+/// The caller obtains one fresh owner readback and current task/profile values
+/// for the original full claim, then passes them in `current`. This repeats
+/// original ORS byte/digest validation and the live TaskContract selection
+/// join before comparing the complete `MaterialBootstrap`: full selection
+/// evidence, principal/session, receipt identity/revision, governance
+/// reference and revision, coverage fingerprint, projection source/generation,
+/// and fence. Same-profile-reference revision movement conflicts for rebind.
+/// The exact canonical payload and operation ID remain in `dispatch` for
+/// reconciliation if an effect may already have happened.
+pub fn revalidate_owner_bound_dispatch(
+    dispatch: &OwnerBoundDispatch,
+    current: &OwnerBoundBootstrapInput<'_>,
+) -> Result<(), TaskBindingError> {
+    if dispatch.binding.operation_id != current.operation_id
+        || dispatch.bootstrap.operation_id != dispatch.binding.operation_id
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "live owner read is not correlated to the original dispatch operation; preserve its identity and reconcile",
+        ));
+    }
+    if dispatch.envelope.operation_id.as_str() != dispatch.binding.operation_id {
+        return Err(TaskBindingError::scope_incompatible(
+            "retained payload operation identity changed after admission; preserve and reconcile the original request",
+        ));
+    }
+    if dispatch.bootstrap.attach != *current.attach {
+        return Err(TaskBindingError::scope_incompatible(
+            "live owner revalidation substituted the original full attach claim or lease; rebind under a new operation",
+        ));
+    }
+    let live = admit_owner_bound_bootstrap(current)?;
+    if live.owner_record != dispatch.bootstrap.owner_record
+        || live.attach != dispatch.bootstrap.attach
+        || live.operation_id != dispatch.binding.operation_id
+        || live.bootstrap != dispatch.bootstrap.bootstrap
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "live owner selection, receipt, profile revision/fingerprint, projection or fence differs from the admitted bootstrap; rebind under a new operation",
+        ));
+    }
+    Ok(())
 }
 
 fn compatibility_for(
