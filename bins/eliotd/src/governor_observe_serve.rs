@@ -466,16 +466,26 @@ fn observe_capture_submission(
         "{}:observe:observation:{}",
         envelope.identity.idempotency_key, provenance.payload_digest
     );
-    // The event clock is the admitted pair's own admitted-time reading, never
-    // a wall-clock sample taken while this call runs: the submission's canonical
-    // bytes feed the store's canonical request hash, so a sampled reading would
-    // make an exact replay of the same retained pair derive different bytes.
-    let clock = eliot_contracts::ClockReading {
-        valid_time_ms: i64::try_from(envelope.identity.deadline_unix_ms).ok(),
-        known_time_ms: i64::try_from(envelope.identity.deadline_unix_ms).ok(),
-        transaction_sequence: None,
-        monotonic_ns: None,
-    };
+    // The event carries NO time of its own. The submission's canonical bytes feed
+    // the store's canonical request hash, so any value derived per call - a
+    // wall-clock sample, or a field borrowed from the envelope that is not an
+    // observation time - makes an exact replay of the same retained pair derive
+    // different bytes and the replay is refused as a provider mismatch.
+    //
+    // `ClockReading::default()` is therefore not merely equivalent to what the
+    // sibling builders in this owner do (observation_reconciliation.rs:351,
+    // :1306, :1617); it IS what they do, and it is stable under replay precisely
+    // because it asserts nothing about when anything happened.
+    //
+    // An earlier version of this bound the clock to
+    // `envelope.identity.deadline_unix_ms`. That was worse than a sampled
+    // clock, not better: a deadline is the instant by which the call must
+    // COMPLETE, so stamping an observation with it would tell the Governor the
+    // record became known at the moment it expires, and it would be a
+    // caller-authored value doing it. `ObservationEventIdentity::clock` is
+    // documented "Host/Governor time readings" and `known_time_ms` "time at
+    // which the observation became known to ELIOT"; a deadline is neither.
+    let clock = eliot_contracts::ClockReading::default();
     let evidence = observe_capture_evidence(provenance);
     let record_id = format!("observe:{}", provenance.payload_digest);
     let event_id = format!("observe-event:{}", provenance.payload_digest);
@@ -677,12 +687,11 @@ fn observe_capture_identity(
         source_id: eliot_contracts::SourceId::new(crate::SERVICE_NAME)
             .map_err(|error| format!("daemon observe capture source id: {error}"))?,
         state_fence: envelope.state_fence.clone(),
-        clock: ClockReading {
-            valid_time_ms: i64::try_from(envelope.identity.deadline_unix_ms).ok(),
-            known_time_ms: i64::try_from(envelope.identity.deadline_unix_ms).ok(),
-            transaction_sequence: None,
-            monotonic_ns: None,
-        },
+        // Same reasoning as the event clock above, and for the same reason: a
+        // deadline is not an observation time, and binding one here would stamp
+        // caller-authored expiry instants into the request metadata the store
+        // hashes. `default()` carries no time, so it is replay-stable.
+        clock: ClockReading::default(),
     };
     metadata
         .validate()

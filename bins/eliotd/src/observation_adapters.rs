@@ -721,6 +721,47 @@ mod tests {
                     &expected_revision_heads,
                     &expected_ordering_heads,
                 )?;
+                // Compare-and-swap on the ordering heads, mirroring what BOTH real
+                // stores enforce (eliot-store-memory/src/lib.rs:6005-6008 and
+                // eliot-store-surreal-adapter/src/apply.rs:2334-2339):
+                //
+                //     Some(current) if current.sequence != item.expected_sequence => OrderingConflict
+                //     None if item.expected_sequence != 1 => OrderingConflict
+                //
+                // This lives here, beside the commit, because it needs the committed
+                // map and `check_test_bindings` is an associated function with no
+                // `self`. Without it the fake is blind at exactly the check the
+                // production path depends on: `capture_submission_envelope` hard-codes
+                // `expected_sequence: 1`, so every capture passes here, while a real
+                // store increments the head on each commit and would refuse the
+                // second one in the same scope. Checking only the fence would let a
+                // test pass over a defect that ships.
+                for head in &expected_ordering_heads {
+                    let observed = {
+                        let committed = self.committed.lock().expect("committed lock");
+                        committed.values().find_map(|(_, scope, receipt)| {
+                            (scope == head.scope.as_str()).then(|| {
+                                receipt
+                                    .ordering_sequences
+                                    .iter()
+                                    .find(|committed| committed.scope == head.scope)
+                                    .map_or(1_u64, |committed| committed.sequence)
+                            })
+                        })
+                    };
+                    let committed_sequence = observed.unwrap_or(1);
+                    let agrees = match observed {
+                        Some(_) => committed_sequence == head.expected_sequence,
+                        None => head.expected_sequence == 1,
+                    };
+                    if !agrees {
+                        return Err(KernelPortError::Contract(format!(
+                            "test gateway: ordering head {:?} expected sequence {} but the \
+                         committed head is at {committed_sequence}",
+                            head.scope, head.expected_sequence,
+                        )));
+                    }
+                }
                 let key = transition.identity.operation_id.as_str().to_owned();
                 let hash = transition.identity.canonical_request_hash.clone();
                 let mut committed = self.committed.lock().expect("committed lock");
@@ -1230,15 +1271,41 @@ mod tests {
         .expect("a no-task observation captures as a cold candidate");
         assert_eq!(cold.receipt.status, WriteReceiptStatus::Committed);
         assert!(!cold.task_bound, "no admitted task means a cold candidate");
-        let stored = handle
-            .committed
-            .lock()
-            .expect("committed lock")
-            .get(cold.receipt.operation_id.as_str())
-            .expect("the cold observation is retained under its own operation")
-            .2
-            .clone();
-        assert_eq!(stored, cold.receipt);
+        // Read the retained candidate back through the OWNER's own canonical receipt
+        // path rather than out of the fake port's map. Comparing the map entry
+        // against the value just returned from that same map proves only that the
+        // fake is internally consistent; `canonical_receipt_read` re-validates
+        // the store's own `ReceiptEnvelope`, so it proves the committed record is
+        // reachable by an ordinary read - the property this delivery exists to
+        // establish.
+        let read = canonical_receipt_read(&handle, &cold.receipt.operation_id);
+        assert!(
+            read.validate().is_ok(),
+            "an ordinary canonical read returns a valid store receipt envelope"
+        );
+        // Assert against the ENVELOPE's own core, which is what an ordinary read
+        // returns, and against the operation the capture actually committed. The
+        // previous form read the value straight back out of the fake port's own
+        // map and compared it with what that same map had just returned, which
+        // can only fail if the fake is internally inconsistent - it never proved
+        // the record was reachable by a real read.
+        assert_eq!(
+            read.core.operation.operation_id, cold.receipt.operation_id,
+            "the ordinary read returns the operation the owner committed"
+        );
+        assert_eq!(
+            read.core.operation.operation_kind, "store.apply.capture_candidate",
+            "the ordinary read returns the store's own capture-candidate operation kind"
+        );
+        assert_eq!(
+            read.core.task.is_none(),
+            true,
+            "the ordinary read agrees the committed cold candidate bound no task"
+        );
+        assert!(
+            cold.receipt.status == WriteReceiptStatus::Committed,
+            "the capture committed rather than staying pending"
+        );
 
         // The admission boundary this fix depends on, stated so it stays
         // falsifiable: the owner distinguishes "no task" from "task selection
