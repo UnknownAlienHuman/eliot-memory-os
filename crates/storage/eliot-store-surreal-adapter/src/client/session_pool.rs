@@ -520,14 +520,14 @@ impl SessionPool {
     }
 
     /// Executes one closed named operation on a checked-out session of `role`
-    /// with the response admitted under an ELIOT-owned byte ceiling.
+    /// with the response admitted under an ELIOT-owned byte bound.
     ///
     /// The bounded capture entry point (issue #951). Lane admission is the same
     /// A13.5 backpressure [`SessionPool::query`] applies — a saturated lane
     /// sheds with `ProviderUnavailable` and an admitted-but-cold lane warms one
     /// slot through the blocking checkout — so a bounded capture is refused or
     /// admitted exactly like every other named operation on the same lane; only
-    /// the response frame's byte budget differs.
+    /// the response frame's byte bound differs.
     pub async fn query_bounded(
         &self,
         role: SessionRole,
@@ -601,14 +601,16 @@ impl PooledSession {
     }
 
     /// Executes one closed named operation whose response is admitted under an
-    /// ELIOT-owned byte ceiling.
+    /// ELIOT-owned byte bound.
     ///
     /// The bounded capture path (issue #951). Lane admission, the session slot,
     /// the binding codec and the result shape are exactly the ones
-    /// [`PooledSession::query`] uses; the only difference is that the response
-    /// frame is charged against `ceiling` at the transport boundary before it
-    /// is converted to text or decoded, so an over-budget provider response
-    /// never becomes a `serde_json::Value` tree.
+    /// [`PooledSession::query`] uses; the only difference is that each frame the
+    /// response arrives in is charged against `ceiling` before it is copied or
+    /// decoded, so an over-budget provider response never becomes a
+    /// `serde_json::Value` tree. The pooled socket was itself constructed under
+    /// the ELIOT-issued transport bound, so an oversize frame is refused there
+    /// before this read sees it.
     pub async fn query_bounded(
         &self,
         operation: &'static str,
