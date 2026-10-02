@@ -42,17 +42,31 @@
 //! - G4: `architecture_implications` / `model_routes_and_cost` markers
 //!   preserved. The seam takes references and returns no rewritten copy, so
 //!   there is no field here that could drop or thin the owner residues.
-//! - G5: Governor-resolved material arrives as the typed owner carrier. The
-//!   sibling grounding stage supplies the [`GroundedDreamDraft`](eliot_dreamer_contracts::grounding::GroundedDreamDraft);
-//!   the caller builds the [`GroundingValidationInput`] from it (policy,
-//!   usage, preservation, observation, rival declarations) and passes it to
-//!   [`validate_admitted_draft`]. Resolution itself maps admitted classes
-//!   directly with no material gate: nothing is synthesized here, and the
-//!   owner decides acceptance on the supplied carrier.
+//! - G5: the A-14b -> A-05 carrier is owned by the grounding crate, not built
+//!   here. This stage supplies only the A-05 data the owner cannot know
+//!   ([`ValidationAttachment`]: policy, usage, preservation, observation time,
+//!   cancellation observation, optional rival declarations, derived in
+//!   [`admitted_material`](crate::admitted_material)) and calls the single
+//!   production owner entry
+//!   [`ground_and_bind_validation_carrier`] -> [`ground_for_validation`],
+//!   which grounds the draft through this crate's own production grounding and
+//!   constructs the [`GroundingValidationInput`] at the owner's one
+//!   construction site. A grounding refusal the owner collapsed back to one
+//!   static is mapped through the composition's own exhaustive refusal table
+//!   ([`handoff_denied`]) so no refusal class is lost in translation. This root
+//!   never constructs a carrier and never
+//!   restates the grounded leg's identity, scope, fence, or task joins. The
+//!   result is passed to [`validate_admitted_draft`]. Resolution itself maps
+//!   admitted classes directly with no material gate: nothing is synthesized
+//!   here, and the owner decides acceptance on the supplied carrier.
 
 use eliot_dreamer_candidate_validation::{
     DreamDraftValidationError, StructuredCandidateValidationOutcome,
     validate_grounding_candidate_at,
+};
+use eliot_dreamer_claim_grounding::{
+    GroundingRequest, GroundingValidationRequest, ValidationAttachment, ground_draft_with_controls,
+    ground_for_validation,
 };
 use eliot_dreamer_contracts::JobClass;
 use eliot_dreamer_contracts::validation::structured::{
@@ -169,6 +183,111 @@ pub(crate) fn validate_admitted_draft_with(
     }
 }
 
+/// Production entry for the A-14b -> A-05 handoff, once per admission.
+///
+/// `handoff_once` is `FnOnce`: the owner handoff consumes its request by value
+/// and cannot run twice for one admission through this seam. Production passes
+/// [`ground_for_validation`]; deterministic tests pass a counting wrapper
+/// around the real owner entry to prove the once-per-admission call shape.
+///
+/// Wiring and contract construction only, per `bins/AGENTS.md`: the grounded
+/// leg, the carrier construction, and the candidate-only refusal all belong to
+/// the owning crate, so this function supplies the two independently owned
+/// inputs and maps the owner's typed outcome. A refusal is never softened
+/// into a default, an empty carrier, or a success — see
+/// [`ground_and_bind_validation_carrier`].
+///
+/// The seam retains its own request so a refusal the owner collapsed can still
+/// be named precisely; see [`handoff_denied`]. The owner consumes its request
+/// by value, so the retention is a clone, and the grounding it performs is
+/// never run on the retained copy unless the handoff has already refused.
+pub(crate) fn ground_and_bind_validation_carrier_with(
+    grounding: GroundingRequest,
+    attachment: ValidationAttachment,
+    handoff_once: impl FnOnce(
+        GroundingValidationRequest,
+    ) -> Result<GroundingValidationInput, DreamDraftValidationError>,
+) -> Result<GroundingValidationInput, DreamerError> {
+    let retained = grounding.clone();
+    handoff_once(GroundingValidationRequest::new(grounding, attachment))
+        .map_err(|error| handoff_denied(&error, &retained))
+}
+
+/// The owner's grounding phase name, as passed to its own `summarize_contract`.
+const GROUNDING_PHASE: &str = "claim grounding";
+
+/// The single static the owner's `summarize_contract` reduces six refusal
+/// classes to.
+const COLLAPSED_CONTRACT_FIELD: &str = "contract";
+
+/// Maps the owner handoff's refusal, naming the precise grounding refusal the
+/// owner collapsed.
+///
+/// The owning crate reduces a `ContractViolation` through its own
+/// `summarize_contract` before this composition ever sees it, and that
+/// reduction maps `CrossStage`, `KindPayload`, `Registry`, `ScreenIneligible`,
+/// `Preservation`, and `ForbiddenCarry` onto the single static `"contract"`
+/// (`eliot_dreamer_contracts::validation::error::summarize_contract`). Six
+/// distinguishable refusals would therefore leave this root indistinguishable,
+/// which is strictly less than the owner decided, so this mapping recovers
+/// them: when — and only when — the refusal is exactly that collapsed
+/// grounding refusal, the same pure owner grounding is re-run over the request
+/// this seam already retains, through the composition's own grounding seam
+/// ([`ground_admitted_draft_with`](crate::grounding_stage::ground_admitted_draft_with)),
+/// so the precise bounded static its exhaustive
+/// [`grounding_denied`](crate::grounding_stage::grounding_denied) table assigns
+/// is what this root reports. No second table and no new error variant is
+/// introduced for that.
+///
+/// The recovery is fail-closed in both directions. It cannot mint a refusal the
+/// owner did not raise, because a re-run that succeeds keeps the owner's own
+/// field; and it cannot soften one, because the re-run is the owner's own pure
+/// grounding over the owner's own retained request. Every other refusal — the
+/// ceiling refusal, the carrier's own contract validation, an encoding or bound
+/// failure — keeps [`validation_denied`] unchanged.
+fn handoff_denied(error: &DreamDraftValidationError, retained: &GroundingRequest) -> DreamerError {
+    if let DreamDraftValidationError::InvalidContract { phase, field } = error
+        && *phase == GROUNDING_PHASE
+        && *field == COLLAPSED_CONTRACT_FIELD
+        && let Err(DreamerError::InvalidAdmission(precise)) =
+            crate::grounding_stage::ground_admitted_draft_with(
+                retained.clone(),
+                ground_draft_with_controls,
+            )
+    {
+        return DreamerError::InvalidAdmission(precise);
+    }
+    validation_denied(error)
+}
+
+/// Production entry: the real owner handoff, once per admission.
+///
+/// Wires [`ground_for_validation`] as the `FnOnce` body. That entry grounds the
+/// supplied A03 v2 context through the owner's own production grounding and
+/// then binds the A-05 carrier at the owner's single construction site, so the
+/// carrier this function returns was built by its owner rather than by this
+/// composition root.
+///
+/// The owner's authority ceiling is preserved on this path and cannot be
+/// bypassed through it. A grounded value whose own retained records claim an
+/// epistemic position above the candidate-only ceiling is refused by the owner
+/// before any carrier exists; the typed refusal is mapped fail-closed here
+/// through the same [`validation_denied`] the A-05 gate uses, so it keeps the
+/// request-rejected code and can never arrive as a fabricated default or an
+/// empty success. The root neither inspects nor repairs the grounded leg, so
+/// it has no way to launder a self-certified record into a validated carrier.
+///
+/// Refusal precision is preserved here too: a grounding refusal the owner
+/// collapsed to one static is mapped through the composition's exhaustive
+/// table by [`handoff_denied`], so the six classes the owner reduces stay six
+/// distinguishable refusals on this path.
+pub(crate) fn ground_and_bind_validation_carrier(
+    grounding: GroundingRequest,
+    attachment: ValidationAttachment,
+) -> Result<GroundingValidationInput, DreamerError> {
+    ground_and_bind_validation_carrier_with(grounding, attachment, ground_for_validation)
+}
+
 /// Production entry: the real A-05 owner validation, once per admission.
 ///
 /// Wires [`validate_grounding_candidate_at`] as the `FnOnce` body: the owner
@@ -187,6 +306,11 @@ pub(crate) fn validate_admitted_draft(
 /// never the Kernel-admission code: the admission itself was valid, the draft
 /// was not. Dynamic payloads (bounds, digests, details) are dropped in favor
 /// of the bounded static field names; nothing secret flows.
+///
+/// One mapping serves both owner calls on this path — the A-14b -> A-05 handoff
+/// and the A-05 gate itself — because both refuse with the same typed error and
+/// neither may be softened on its way out. Sharing it keeps a second, laxer
+/// refusal mapping from appearing beside the first.
 fn validation_denied(error: &DreamDraftValidationError) -> DreamerError {
     match error {
         DreamDraftValidationError::Bound { field, .. }
@@ -731,6 +855,94 @@ mod slice_6_validation_tests {
             cancellation_requested: false,
             rival_declarations: None,
         }
+    }
+
+    /// Builds a grounding request for the A-14b -> A-05 handoff proofs: the
+    /// same carried-only parts as [`carrier_job`], and the retained job's
+    /// `frozen_manifest_digest` is empty, so the real owner refuses at
+    /// `job.validate` before any claim work. Only carried, never trusted.
+    fn handoff_request() -> GroundingRequest {
+        let Ok(task_id) = TaskId::new("task-slice-6") else {
+            panic!("valid test task");
+        };
+        let job = carrier_job();
+        let bundle = carrier_bundle();
+        let manifest = carrier_manifest(task_id.clone());
+        let policy = carrier_grounding_policy();
+        let draft = carrier_draft(job.clone(), bundle.clone(), task_id);
+        GroundingRequest::new(job, bundle, manifest, draft, policy)
+    }
+
+    /// Builds the A-05 half the composition root supplies for one admission.
+    ///
+    /// Carried, never trusted: the owner refuses at grounding on
+    /// [`handoff_request`] before any of this reaches carrier construction, so
+    /// only the shape matters here. The two members the root does not hold are
+    /// recorded as absent rather than filled in, exactly as
+    /// [`validation_attachment_for`](crate::admitted_material::validation_attachment_for)
+    /// supplies them. The observation is a carried placeholder for the same
+    /// reason and is never read: production measures the attempt's elapsed wall
+    /// time through
+    /// [`observed_attempt_wall_ms`](crate::admitted_material::observed_attempt_wall_ms).
+    fn handoff_attachment() -> ValidationAttachment {
+        ValidationAttachment {
+            policy: ValidationPolicy::new("policy-slice-6", 1, 1024),
+            usage: BudgetUsage::default(),
+            preservation: PreservationReport {
+                verdicts: Vec::new(),
+            },
+            observation_time_ms: Some(0),
+            cancellation_requested: false,
+            rival_declarations: None,
+        }
+    }
+
+    /// The real A-14b -> A-05 owner handoff runs exactly once per admitted
+    /// admission: one counting wrapper around the production entry over a
+    /// digest-corrupted request, one call, one typed fail-closed refusal with
+    /// the request-rejected code. Grounding and carrier binding are the same
+    /// owner call, so a second call would be a second grounding.
+    #[test]
+    fn owner_handoff_runs_exactly_once_per_admission() {
+        let calls = AtomicU64::new(0);
+        let refused = ground_and_bind_validation_carrier_with(
+            handoff_request(),
+            handoff_attachment(),
+            |request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ground_for_validation(request)
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the owner handoff must run exactly once per admission"
+        );
+        let Err(error) = refused else {
+            panic!("a digest-corrupted request must refuse at the owner");
+        };
+        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+        assert!(
+            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+            "a handoff refusal must not borrow the Kernel-admission code, got {error:?}"
+        );
+    }
+
+    /// The production handoff entry wires the real owner and preserves its
+    /// refusal verbatim: a refused grounding never becomes a carrier, a
+    /// fabricated default, or an empty success, and the refusal keeps the
+    /// request-rejected code.
+    #[test]
+    fn production_handoff_entry_calls_the_real_owner_once() {
+        let refused = ground_and_bind_validation_carrier(handoff_request(), handoff_attachment());
+        let Err(error) = refused else {
+            panic!("a digest-corrupted request must refuse at the owner handoff");
+        };
+        assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+        assert!(
+            !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+            "a handoff refusal must not borrow the Kernel-admission code, got {error:?}"
+        );
     }
 
     /// The real A-05 owner validation runs exactly once per admitted

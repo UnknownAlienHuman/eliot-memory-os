@@ -168,10 +168,7 @@ pub(crate) fn evaluate_claim(
     };
     // Grounding is a candidate-only transformation. It may carry upstream
     // ceilings downward, but it cannot mint an observed fact or material effect.
-    record.assertability_ceiling = weaker(
-        record.assertability_ceiling,
-        PositionAssertability::HypothesisCandidate,
-    );
+    record.assertability_ceiling = weaker(record.assertability_ceiling, CANDIDATE_ONLY_CEILING);
     Ok(record)
 }
 
@@ -925,6 +922,28 @@ pub(crate) fn recompute_record_assertability(record: &mut ClaimGroundingRecord) 
     record.assertability_ceiling = weaker(base, record.assertability_ceiling);
 }
 
+/// The strongest epistemic position this cell may ever leave on a grounded
+/// record: a hypothesis held as a candidate, never a fact.
+///
+/// This is the one owner of that policy value in this crate. Grounding is a
+/// candidate-only transformation, and this cell's declared invariant is
+/// "grounding does not promote epistemic status", so every site that caps a
+/// record's `assertability_ceiling` reads this symbol instead of restating the
+/// literal:
+///
+/// - [`evaluate_claim`], the unconditional producer cap on every record;
+/// - `grounding::ground_draft_with_controls`, the curation-screen cap;
+/// - `grounding::aggregate_parent_record`, the aggregation finalize cap;
+/// - `validation_bridge::refuse_self_certified_grounding`, which refuses a
+///   retained record that claims a position above this ceiling.
+///
+/// Relaxing or tightening the ceiling is therefore one edit here, and it moves
+/// every producer and every refusal with it. The comparison itself belongs to
+/// [`weaker`], the crate's evidence-side ordering over
+/// [`PositionAssertability`].
+pub(crate) const CANDIDATE_ONLY_CEILING: PositionAssertability =
+    PositionAssertability::HypothesisCandidate;
+
 pub(crate) fn cap_record_assertability(
     record: &mut ClaimGroundingRecord,
     cap: PositionAssertability,
@@ -960,7 +979,23 @@ fn assertability(result: &EvaluatedClaim) -> PositionAssertability {
     result.caps.iter().copied().fold(base, weaker)
 }
 
-fn weaker(left: PositionAssertability, right: PositionAssertability) -> PositionAssertability {
+/// The crate's single ordering over [`PositionAssertability`]: returns the
+/// weaker of two positions.
+///
+/// This is the only rank table in this crate. It owns both the comparison the
+/// ceiling cap uses ([`cap_record_assertability`], and therefore
+/// [`CANDIDATE_ONLY_CEILING`] at all four producer and refusal sites) and the
+/// comparison `grounding::aggregate_parent_record` uses when it folds a
+/// parent's ceiling down to its weakest child, so a cap and a comparison cannot
+/// disagree about which position is weaker.
+///
+/// `grounding.rs` previously carried `weaker_assertability`, a byte-for-byte
+/// duplicate of the table below; that duplicate was deleted rather than kept in
+/// sync. `weaker_ordering_is_the_only_assertability_ordering` pins the ladder.
+pub(crate) fn weaker(
+    left: PositionAssertability,
+    right: PositionAssertability,
+) -> PositionAssertability {
     let rank = |value| match value {
         PositionAssertability::UnknownWithheldQuarantined => 0,
         PositionAssertability::PlanningOnly => 1,
@@ -974,5 +1009,161 @@ fn weaker(left: PositionAssertability, right: PositionAssertability) -> Position
         left
     } else {
         right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::{
+        CANDIDATE_ONLY_CEILING, EvaluatedClaim, assertability, cap_record_assertability, weaker,
+    };
+    use eliot_dreamer_contracts::grounding::canonical::{
+        EvidenceGrade, GradeAssignment, PositionAssertability, PropositionId, SupportResult,
+    };
+    use eliot_dreamer_contracts::grounding::{ClaimGroundingRecord, ClaimKind};
+
+    /// A `Supported` evaluated claim whose grade is known, with no extra caps.
+    fn supported_with_known_grade() -> EvaluatedClaim {
+        EvaluatedClaim {
+            disposition: SupportResult::Supported,
+            grade: Some(GradeAssignment::known(EvidenceGrade::Corroborated)),
+            ..EvaluatedClaim::default()
+        }
+    }
+
+    /// A `Supported` grounding record with a known grade, sitting above the
+    /// candidate-only ceiling exactly as `evaluate_claim` builds it before its
+    /// mandatory cap.
+    fn supported_record_above_the_ceiling() -> ClaimGroundingRecord {
+        let Ok(proposition) = PropositionId::new("proposition-1") else {
+            panic!("a short literal proposition id is always bounded");
+        };
+        ClaimGroundingRecord {
+            claim_id: "claim-1".to_owned(),
+            proposition,
+            proposition_digest: "proposition-digest".to_owned(),
+            kind: ClaimKind::Causal,
+            proposed_support: BTreeSet::new(),
+            accepted_support: BTreeSet::new(),
+            rejected_support: BTreeSet::new(),
+            unresolved_support: BTreeSet::new(),
+            proposed_counterevidence: BTreeSet::new(),
+            accepted_counterevidence: BTreeSet::new(),
+            rejected_counterevidence: BTreeSet::new(),
+            unresolved_counterevidence: BTreeSet::new(),
+            witnesses: Vec::new(),
+            component_outcomes: BTreeMap::new(),
+            disposition: SupportResult::Supported,
+            grade: Some(GradeAssignment::known(EvidenceGrade::Corroborated)),
+            grade_ceiling: EvidenceGrade::Corroborated,
+            assertability_ceiling: PositionAssertability::MaterialEffect,
+            coverage_denominator_ids: BTreeSet::new(),
+            dependence_groups: BTreeSet::new(),
+            unknowns: BTreeSet::new(),
+            precision_findings: BTreeSet::new(),
+            record_digest: String::new(),
+        }
+    }
+
+    /// The single ceiling is exactly the weakest position grounding leaves on a
+    /// `Supported` record with a known grade.
+    ///
+    /// Measured on the current code: [`assertability`] derives `MaterialEffect`
+    /// for that disposition/grade pair (rank 6 under [`weaker`]), and the
+    /// mandatory producer cap in `evaluate_claim` then reduces it to
+    /// `HypothesisCandidate` (rank 2), which is [`CANDIDATE_ONLY_CEILING`]. The
+    /// cap is therefore load-bearing, not redundant, and the constant equals
+    /// the weakest assertability this record class can carry.
+    ///
+    /// The constant is a ceiling, not a floor: an upstream cap may still weaken
+    /// a record below it (`grounding.rs` caps a parent by its weakest child,
+    /// and a non-`Supported` child carries `UnknownWithheldQuarantined`). This
+    /// test pins the ceiling the cap guarantees, not a claim that no weaker
+    /// value is reachable.
+    #[test]
+    fn candidate_only_ceiling_is_the_weakest_supported_known_grade_position() {
+        let base = assertability(&supported_with_known_grade());
+        assert_eq!(
+            base,
+            PositionAssertability::MaterialEffect,
+            "measured: a Supported record with a known grade derives MaterialEffect"
+        );
+        assert_eq!(
+            weaker(base, CANDIDATE_ONLY_CEILING),
+            CANDIDATE_ONLY_CEILING,
+            "measured: the mandatory producer cap reduces MaterialEffect to the ceiling"
+        );
+    }
+
+    /// The same ceiling, observed through the record-level cap that
+    /// `grounding.rs` and `validation_bridge.rs` both call. Both downstream sites
+    /// share this one constant, so a record produced above it is capped and a
+    /// record already at it is unchanged.
+    #[test]
+    fn candidate_only_ceiling_bounds_a_record_through_the_shared_cap() {
+        let mut record = supported_record_above_the_ceiling();
+        cap_record_assertability(&mut record, CANDIDATE_ONLY_CEILING);
+        assert_eq!(
+            record.assertability_ceiling, CANDIDATE_ONLY_CEILING,
+            "a record above the ceiling is capped down to it"
+        );
+        assert_eq!(
+            weaker(record.assertability_ceiling, CANDIDATE_ONLY_CEILING),
+            CANDIDATE_ONLY_CEILING,
+            "the ceiling is idempotent under the crate's own ordering"
+        );
+    }
+
+    /// The crate's one ordering, pinned on the full ladder rather than on one
+    /// pair, so that reintroducing a second rank table anywhere in this crate
+    /// fails here instead of silently disagreeing with [`weaker`].
+    ///
+    /// Measured on the deleted duplicate: `grounding.rs::weaker_assertability`
+    /// and this table agreed variant for variant, so no pair of variants
+    /// *discriminates between those two tables* and the ladder is what is worth
+    /// pinning. The two ranks most likely to drift are the interior ones the
+    /// naive "observation beats inference" reading gets wrong —
+    /// `ConflictQualificationRequired` (3) sits *below* both `QualifiedInference`
+    /// (4) and `ObservedFact` (5) — so the ladder is asserted on every adjacent
+    /// pair, which catches any single reordering, and the two extremes are
+    /// asserted explicitly because they are the endpoints any second table must
+    /// also agree on.
+    #[test]
+    fn weaker_ordering_is_the_only_assertability_ordering() {
+        let ladder = [
+            PositionAssertability::UnknownWithheldQuarantined,
+            PositionAssertability::PlanningOnly,
+            PositionAssertability::HypothesisCandidate,
+            PositionAssertability::ConflictQualificationRequired,
+            PositionAssertability::QualifiedInference,
+            PositionAssertability::ObservedFact,
+            PositionAssertability::MaterialEffect,
+        ];
+        for pair in ladder.windows(2) {
+            let weaker_rank = pair[0];
+            let stronger_rank = pair[1];
+            assert_eq!(
+                weaker(weaker_rank, stronger_rank),
+                weaker_rank,
+                "measured: the ladder is total and strictly increasing, so this pair has one weaker side"
+            );
+            assert_eq!(
+                weaker(stronger_rank, weaker_rank),
+                weaker_rank,
+                "measured: the ladder is independent of argument order"
+            );
+        }
+        assert_eq!(
+            weaker(ladder[0], ladder[ladder.len() - 1]),
+            ladder[0],
+            "measured: the extremes are the endpoints of the same ordering"
+        );
+        assert_eq!(
+            weaker(ladder[ladder.len() - 1], ladder[0]),
+            ladder[0],
+            "measured: the extremes are the endpoints of the same ordering"
+        );
     }
 }

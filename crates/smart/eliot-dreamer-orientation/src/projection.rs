@@ -121,13 +121,45 @@ pub struct OrientationInterpretation {
     pub invalidation_conditions: Vec<String>,
 }
 
+/// Closed I9.5 residue classes produced by this crate. The variant set is the
+/// enumeration of every measured construction site on this crate's production
+/// path - `build_semantics`, `make_packet`, and
+/// `preserves_rivals_counterevidence_and_temporal_status`, which is a
+/// production predicate called from `projection_preservation` and not a test
+/// helper; an implementation agent cannot invent a further residue
+/// class, and the deserializer refuses any spelling outside this set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationResidueKind {
+    /// Model-supplied counterevidence carried as a rival residue.
+    Counterevidence,
+    /// An admitted omission handle whose material is not available.
+    Unavailable,
+    /// A class outside this basic Orientation owner's boundary.
+    Unsupported,
+    /// A class the coverage denominator proves empty.
+    KnownEmpty,
+    /// Retained A03 usage with no admitted route or price provenance.
+    BudgetProvenanceUnavailable,
+}
+
 /// Explicit unsupported residue, never upgraded to an algorithmic relation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationResidue {
-    pub kind: String,
+    pub kind: OrientationResidueKind,
     pub text: String,
     pub source: String,
+}
+
+/// Closed I9.5 probe classes produced by this crate. An inert model
+/// recommendation is the only measured probe status; the deserializer refuses
+/// any spelling outside this set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InertProbeStatus {
+    /// A model recommendation carried without execution authority.
+    ModelRecommendationInert,
 }
 
 /// A model recommendation remains inert and cannot become a typed plan.
@@ -135,7 +167,7 @@ pub struct OrientationResidue {
 #[serde(deny_unknown_fields)]
 pub struct InertProbe {
     pub text: String,
-    pub status: String,
+    pub status: InertProbeStatus,
     pub result_space: Option<String>,
 }
 
@@ -417,7 +449,7 @@ fn build_semantics(
             .counterevidence
             .iter()
             .map(|text| OrientationResidue {
-                kind: "counterevidence".to_owned(),
+                kind: OrientationResidueKind::Counterevidence,
                 text: text.clone(),
                 source: "model_draft".to_owned(),
             })
@@ -427,7 +459,7 @@ fn build_semantics(
             .omissions
             .iter()
             .map(|o| OrientationResidue {
-                kind: "unavailable".to_owned(),
+                kind: OrientationResidueKind::Unavailable,
                 text: o.reason.clone(),
                 source: o.handle.clone(),
             })
@@ -438,7 +470,7 @@ fn build_semantics(
             .iter()
             .map(|text| InertProbe {
                 text: text.clone(),
-                status: "model_recommendation_inert".to_owned(),
+                status: InertProbeStatus::ModelRecommendationInert,
                 result_space: None,
             })
             .collect(),
@@ -1086,7 +1118,7 @@ fn make_packet(
     data: ProjectionData,
 ) -> Result<OrientationPacketCandidate, OrientationError> {
     let advanced = |kind: &str| OrientationResidue {
-        kind: "unsupported".to_owned(),
+        kind: OrientationResidueKind::Unsupported,
         text: format!("{kind} is outside the basic Orientation owner"),
         source: "orientation_contract".to_owned(),
     };
@@ -1097,7 +1129,7 @@ fn make_packet(
     });
     let architecture = if architecture_known {
         OrientationResidue {
-            kind: "known_empty".to_owned(),
+            kind: OrientationResidueKind::KnownEmpty,
             text: "no architecture implications admitted".to_owned(),
             source: "coverage_denominator".to_owned(),
         }
@@ -1155,7 +1187,7 @@ fn make_packet(
         recommended_probes_or_next_actions: data.probes,
         architecture_implications: architecture,
         model_routes_and_cost: OrientationResidue {
-            kind: "budget_provenance_unavailable".to_owned(),
+            kind: OrientationResidueKind::BudgetProvenanceUnavailable,
             text: format!(
                 "A03 usage retained: input_bytes={} output_bytes={} stu_used={}",
                 candidate.usage.input_bytes, candidate.usage.output_bytes, candidate.usage.stu_used
@@ -1427,7 +1459,7 @@ fn preserves_rivals_counterevidence_and_temporal_status(
         .counterevidence
         .iter()
         .map(|text| OrientationResidue {
-            kind: "counterevidence".to_owned(),
+            kind: OrientationResidueKind::Counterevidence,
             text: text.clone(),
             source: "model_draft".to_owned(),
         })
@@ -1519,9 +1551,9 @@ fn preserves_source_authority(
 }
 
 fn preserves_candidate_effect_ceiling(data: &ProjectionData) -> bool {
-    data.probes
-        .iter()
-        .all(|probe| probe.status == "model_recommendation_inert" && probe.result_space.is_none())
+    data.probes.iter().all(|probe| {
+        probe.status == InertProbeStatus::ModelRecommendationInert && probe.result_space.is_none()
+    })
 }
 
 fn preserves_dependency_closure(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {

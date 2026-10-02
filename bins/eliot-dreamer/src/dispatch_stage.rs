@@ -76,8 +76,8 @@ use eliot_dreamer_orientation::{
 };
 
 use crate::admitted_material::{
-    admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
-    v1_model_of, validation_policy_of,
+    admission_of, bundle_of, manifest_of, observed_attempt_wall_ms, orientation_frame_of,
+    preservation_of, usage_of, v1_grounded_of, v1_model_of, validation_policy_of,
 };
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
@@ -488,7 +488,14 @@ fn dispatch_orientation(
     let grounded = v1_grounded_of(&model)?;
     let usage = usage_of(&admitted.budget);
     let validation_policy = validation_policy_of(admitted.policy_ref.as_str())?;
-    let preservation = preservation_of()?;
+    let manifest = manifest_of(&bundle)?;
+    let preservation = preservation_of(&admitted, &bundle, &manifest, job)?;
+    // The v1 track's own A-05 observation, measured on the same monotonic
+    // clock as the route receipt above rather than supplied as a literal. The
+    // v1 owner compares it against the admitted job's `deadline_ms` in the same
+    // unit, so a literal here would make that gate unreachable exactly as it
+    // would on the structured track.
+    let observed = observed_attempt_wall_ms(route_started)?;
     let candidate = match validate_grounded_dream_draft_at(
         &admitted,
         &bundle,
@@ -497,7 +504,7 @@ fn dispatch_orientation(
         &validation_policy,
         &usage,
         &preservation,
-        Some(0),
+        Some(observed),
         false,
     ) {
         Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
@@ -1862,7 +1869,12 @@ mod slice_7_native_owner_tests {
             allowed_tools: Vec::new(),
             allowed_model_routes: vec!["route-test".to_owned()],
             budget_units: 1,
-            deadline_ms: 1,
+            // A realistic wall budget, not a nominal one: the A-05 owners
+            // compare the supplied observation against this value in the same
+            // unit, so a one-millisecond budget would refuse any real elapsed
+            // reading and the fixture below could not carry the measured
+            // observation production threads.
+            deadline_ms: 60_000,
             output_schema: "eliot.dreamer.v1".to_owned(),
             forbidden_effects: Vec::new(),
         }
@@ -1924,6 +1936,7 @@ mod slice_7_native_owner_tests {
         GroundingRequest,
         eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
     ) {
+        let attempt_started = Instant::now();
         let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
@@ -1937,16 +1950,29 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
-            Ok(grounded) => grounded,
-            Err(error) => panic!("fixture grounding must prove, got {error:?}"),
+        // Same wiring production runs: the root supplies the A-05 attachment
+        // and the owning crate grounds and constructs the carrier. The
+        // observation time is measured, not a literal, exactly as the admitted
+        // chain measures it.
+        let observed = match observed_attempt_wall_ms(attempt_started) {
+            Ok(observed) => observed,
+            Err(error) => panic!("fixture observation time must measure, got {error:?}"),
         };
-        let carrier =
-            match crate::admitted_material::validation_input_for(admission, job, grounded, Some(0))
-            {
-                Ok(carrier) => carrier,
-                Err(error) => panic!("fixture carrier must build, got {error:?}"),
-            };
+        let attachment = match crate::admitted_material::validation_attachment_for(
+            admission,
+            job,
+            Some(observed),
+        ) {
+            Ok(attachment) => attachment,
+            Err(error) => panic!("fixture A-05 attachment must derive, got {error:?}"),
+        };
+        let carrier = match crate::validation_stage::ground_and_bind_validation_carrier(
+            request.clone(),
+            attachment,
+        ) {
+            Ok(carrier) => carrier,
+            Err(error) => panic!("fixture carrier must build, got {error:?}"),
+        };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
             Ok(validated) => (request, validated),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),
@@ -2666,8 +2692,8 @@ mod slice_7_native_owner_tests {
 mod orientation_packet_mapping_tests {
     use super::*;
     use crate::admitted_material::{
-        admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
-        v1_model_of, validation_policy_of,
+        admission_of, bundle_of, manifest_of, observed_attempt_wall_ms, orientation_frame_of,
+        preservation_of, usage_of, v1_grounded_of, v1_model_of, validation_policy_of,
     };
     use eliot_dreamer_orientation::projection::build_projection;
     use std::num::NonZeroU64;
@@ -2726,7 +2752,11 @@ mod orientation_packet_mapping_tests {
             allowed_tools: Vec::new(),
             allowed_model_routes: vec!["route-test".to_owned()],
             budget_units: 1,
-            deadline_ms: 1,
+            // A realistic wall budget, for the same reason as the slice-7
+            // fixture: the v1 owner compares the supplied observation against
+            // this value, so a one-millisecond budget would refuse any real
+            // elapsed reading.
+            deadline_ms: 60_000,
             output_schema: "eliot.dreamer.v1".to_owned(),
             forbidden_effects: Vec::new(),
         }
@@ -2743,6 +2773,7 @@ mod orientation_packet_mapping_tests {
     );
 
     fn admitted_packet_material() -> PacketMaterial {
+        let attempt_started = Instant::now();
         let admission = admission();
         let job = job();
         let admitted = admission_of(&admission, &job).expect("admitted job must derive");
@@ -2753,7 +2784,20 @@ mod orientation_packet_mapping_tests {
         let usage = usage_of(&admitted.budget);
         let validation_policy =
             validation_policy_of(admitted.policy_ref.as_str()).expect("validation policy seals");
-        let preservation = preservation_of().expect("preservation report must build");
+        let manifest = match manifest_of(&bundle) {
+            Ok(manifest) => manifest,
+            Err(error) => panic!("frozen manifest must rebuild, got {error:?}"),
+        };
+        let preservation = match preservation_of(&admitted, &bundle, &manifest, &job) {
+            Ok(preservation) => preservation,
+            Err(error) => panic!("preservation report must build, got {error:?}"),
+        };
+        // Measured, exactly as the production v1 site measures it, rather than
+        // a literal that could never trip the deadline gate.
+        let observed = match observed_attempt_wall_ms(attempt_started) {
+            Ok(observed) => observed,
+            Err(error) => panic!("fixture observation time must measure, got {error:?}"),
+        };
         let candidate = match validate_grounded_dream_draft_at(
             &admitted,
             &bundle,
@@ -2762,7 +2806,7 @@ mod orientation_packet_mapping_tests {
             &validation_policy,
             &usage,
             &preservation,
-            Some(0),
+            Some(observed),
             false,
         ) {
             Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,

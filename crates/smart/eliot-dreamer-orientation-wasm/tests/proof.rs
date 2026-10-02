@@ -28,8 +28,9 @@ use eliot_dreamer_contracts::{
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
-    CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationError, OrientationPolicy, project_orientation,
+    CurrentEpistemicPositionHandle, InertProbeStatus, LocalOrientationFrame,
+    OrientationCoverageDenominator, OrientationDisposition, OrientationError, OrientationPolicy,
+    project_orientation,
 };
 use eliot_dreamer_orientation_wasm::{
     CallLedger, GUEST_ABI_VERSION, GUEST_TARGET, GuestError, GuestRequest, HANDLER_SUBTYPE,
@@ -658,7 +659,7 @@ fn rivals_conflicts_gaps_probes_clarification_preserved() {
     );
     assert_eq!(packet.recommended_probes_or_next_actions.len(), 1);
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
         assert_eq!(probe.text, candidate.model.recommended_probes[0]);
     }
     assert_eq!(
@@ -1003,7 +1004,7 @@ fn property_output_equals_native_without_proof_authority_effect() {
                 assert!(!json.contains(absent), "response must not raise {absent}");
             }
             for probe in &packet.recommended_probes_or_next_actions {
-                assert_eq!(probe.status, "model_recommendation_inert");
+                assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
             }
         }
     }

@@ -30,16 +30,24 @@
 //! result view, the refused-class gate, and the Slice-2 controller gate
 //! are proved on the same code production executes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ScreenBinding;
-use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
+use eliot_dreamer_contracts::candidate::PRESERVATION_DIMENSIONS;
+use eliot_dreamer_contracts::grounding::{
+    ClaimKind, MaterialClaim, PositionAssertability, PrecisionPayload, PropositionId,
+    StructuredModelDraft, proposition_content_digest,
+};
 use eliot_dreamer_curation::{NativeCurationPort, NativeCurationPortSet};
 
-use crate::admitted_material::{admission_of, validation_input_for};
+use crate::admitted_material::{
+    admission_of, bundle_of, manifest_of, observed_attempt_wall_ms, preservation_of, usage_of,
+    validation_attachment_for,
+};
 use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
 use crate::dispatch_stage::{
@@ -49,13 +57,15 @@ use crate::dispatch_stage::{
     },
     dispatch_admitted,
 };
-use crate::grounding_stage::{ground_admitted_draft, resolve_grounding_inputs};
+use crate::grounding_stage::resolve_grounding_inputs;
 use crate::kernel_port::{
     ClaimTransport, DREAMER_JOB_WIRE_ID, DispatchGrant, KernelPortError, ValidatedDreamerMaterial,
 };
 use crate::model_stage::{resolve_model_inputs, run_admitted_model};
 use crate::result_stage::{project_result_view, render_jsonl};
-use crate::validation_stage::{resolve_validation_inputs, validate_admitted_draft};
+use crate::validation_stage::{
+    ground_and_bind_validation_carrier, resolve_validation_inputs, validate_admitted_draft,
+};
 use crate::{
     AuthenticatedKernelJobPort, CurationCarrierSource, DreamJobInput, DreamResult, DreamerError,
     JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
@@ -127,6 +137,7 @@ fn validate_through_model(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
 ) -> (GroundingRequest, ValidatedGroundingCandidate) {
+    let attempt_started = Instant::now();
     verify_admitted_binding(admission, job).expect("e2e binding must verify");
     match resolve_screen_inputs(admission, job).expect("e2e screen must resolve") {
         ScreenDecision::PassThrough(_) => {}
@@ -152,12 +163,25 @@ fn validate_through_model(
         run_admitted_model(model_inputs).expect("e2e model must prove");
     let request: GroundingRequest =
         resolve_grounding_inputs(admission, job, draft).expect("e2e grounding must resolve");
-    let grounded: GroundedDreamDraft =
-        ground_admitted_draft(request.clone()).expect("e2e grounding must prove");
     let _inputs = resolve_validation_inputs(admission, job).expect("e2e validation must map");
+    // Exactly the production handoff: this harness supplies the A-05 attachment
+    // and the owning crate grounds the request and builds the carrier. The
+    // observation time is the attempt's measured elapsed wall time, the same
+    // measurement production threads, never a literal.
+    let observed = match observed_attempt_wall_ms(attempt_started) {
+        Ok(observed) => observed,
+        Err(error) => panic!("e2e observation time must measure, got {error:?}"),
+    };
+    let attachment = match validation_attachment_for(admission, job, Some(observed)) {
+        Ok(attachment) => attachment,
+        Err(error) => panic!("e2e A-05 attachment must derive, got {error:?}"),
+    };
     let carrier: GroundingValidationInput =
-        validation_input_for(admission, job, grounded, Some(0)).expect("e2e carrier must build");
-    // The grounding owner consumes its request by value, so the retained clone
+        match ground_and_bind_validation_carrier(request.clone(), attachment) {
+            Ok(carrier) => carrier,
+            Err(error) => panic!("e2e carrier must build through the owner handoff, got {error:?}"),
+        };
+    // The handoff owner consumes its request by value, so the retained clone
     // is the exact request this chain ran under — the same record production
     // hands `PipelineOrientationRecords::new`.
     let validated = validate_admitted_draft(&carrier).expect("e2e validation must accept");
@@ -218,6 +242,459 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
     assert_eq!(roundtrip, view);
 }
 
+/// Positive case for the A-14b -> A-05 handoff the composition root now runs.
+///
+/// One admitted Orientation job travels the production wiring: the root
+/// resolves the grounding request, supplies only the A-05 data it actually
+/// holds, and calls the owning crate's single handoff entry. The owner grounds
+/// the draft and constructs the carrier, so what arrives here is an owner-built
+/// value, and the real A-05 gate then accepts it. Three properties are asserted
+/// separately so the proof discriminates them:
+///
+/// * the grounded leg is the owner's, bound to the admitted canonical identity
+///   and the admitted frozen manifest digest, and every retained ledger record
+///   sits inside the candidate-only ceiling — this path cannot promote a
+///   grounded value past it;
+/// * the A-05 data is exactly what this root holds, derived from admitted
+///   material (policy sealed against the admitted `policy_ref`, usage from the
+///   admitted budget, the seven preservation verdicts each computed from the
+///   derived bundle and rebuilt manifest) plus the attempt's measured elapsed
+///   observation time — and the preservation provenance itself is asserted by
+///   showing the report changes with the admitted handle set, not by counting
+///   its verdicts;
+/// * what the root does **not** hold stays what it is: no rival declarations
+///   are fabricated, and the carrier's frozen cancellation field — which has no
+///   unobserved state — carries this root's asserted negative, never a
+///   fabricated observation.
+#[test]
+fn grounding_handoff_binds_the_owner_carrier_for_admitted_material() {
+    let admission = admitted_admission("job-e2e-handoff-ok");
+    let job = job_with_handles("job-e2e-handoff-ok", JobClass::Orientation);
+    let attempt_started = Instant::now();
+    let model_inputs = match resolve_model_inputs(&admission, &job) {
+        Ok(model_inputs) => model_inputs,
+        Err(error) => panic!("e2e model inputs must resolve, got {error:?}"),
+    };
+    let request = match resolve_grounding_inputs(&admission, &job, model_inputs.draft) {
+        Ok(request) => request,
+        Err(error) => panic!("e2e grounding request must resolve, got {error:?}"),
+    };
+    let observed = match observed_attempt_wall_ms(attempt_started) {
+        Ok(observed) => observed,
+        Err(error) => panic!("e2e observation time must measure, got {error:?}"),
+    };
+    let attachment = match validation_attachment_for(&admission, &job, Some(observed)) {
+        Ok(attachment) => attachment,
+        Err(error) => panic!("e2e A-05 attachment must derive, got {error:?}"),
+    };
+    let admitted = match admission_of(&admission, &job) {
+        Ok(admitted) => admitted,
+        Err(error) => panic!("e2e admission must derive, got {error:?}"),
+    };
+    let canonical = admitted.canonical_id();
+    let policy_ref = admitted.policy_ref.clone();
+    let carrier = match ground_and_bind_validation_carrier(request, attachment) {
+        Ok(carrier) => carrier,
+        Err(error) => {
+            panic!("admitted material must bind a carrier through the owner handoff, got {error:?}")
+        }
+    };
+
+    // The grounded leg is the owner's own value, over the admitted context.
+    assert_eq!(carrier.grounded.job_id, canonical);
+    assert_eq!(
+        carrier.grounded.manifest_digest, admitted.frozen_manifest_digest,
+        "the grounded leg must bind the admitted frozen manifest, not a rebuilt one"
+    );
+    assert_eq!(carrier.grounded.scope_id, SCOPE_E2E);
+    for record in carrier.grounded.ledger.records.values() {
+        assert!(
+            matches!(
+                &record.assertability_ceiling,
+                PositionAssertability::UnknownWithheldQuarantined
+                    | PositionAssertability::PlanningOnly
+                    | PositionAssertability::HypothesisCandidate
+            ),
+            "the owner must hold every retained record at or below the candidate-only \
+             ceiling, got {:?}",
+            record.assertability_ceiling
+        );
+    }
+
+    // The A-05 data is the admitted data this root actually holds.
+    assert_eq!(carrier.policy.policy_id, policy_ref);
+    assert_eq!(carrier.usage, usage_of(&admitted.budget));
+    // The observation time is the attempt's measured elapsed wall time, so it
+    // is a real reading in the unit the owner compares it against (this job's
+    // `deadline_ms`) rather than a literal that can never trip the gate.
+    assert_eq!(carrier.observation_time_ms, Some(observed));
+    let job_deadline_ms = match u64::try_from(job.deadline_ms) {
+        Ok(deadline) => deadline,
+        Err(error) => panic!("the admitted job deadline must fit the wire range, got {error:?}"),
+    };
+    assert!(
+        observed < job_deadline_ms,
+        "the measured observation must be comparable with the admitted job's own deadline, \
+         got {observed} against {job_deadline_ms}"
+    );
+
+    // The preservation report is derived from the admitted bundle, and this
+    // asserts that provenance rather than the shape of a constant: the report
+    // for this admitted job must differ from the report for a job with a
+    // different admitted handle set, and each of the seven verdicts must carry
+    // its own computed finding. A length assertion alone would hold for any
+    // single canned verdict repeated seven times.
+    assert_eq!(
+        carrier.preservation.verdicts.len(),
+        PRESERVATION_DIMENSIONS.len(),
+        "every owner preservation dimension must be present exactly once"
+    );
+    if let Err(error) = carrier.preservation.overall() {
+        panic!(
+            "the derived preservation verdicts must satisfy the owner's own judgement, got \
+             {error:?}"
+        );
+    }
+    let notes: BTreeSet<&str> = carrier
+        .preservation
+        .verdicts
+        .iter()
+        .map(|verdict| verdict.note.as_str())
+        .collect();
+    assert_eq!(
+        notes.len(),
+        PRESERVATION_DIMENSIONS.len(),
+        "each preservation dimension must report its own derived finding, not one shared note: \
+         {notes:?}"
+    );
+    let mut sparse_job = job_with_handles("job-e2e-handoff-sparse", JobClass::Orientation);
+    sparse_job.memory_handles.clear();
+    sparse_job.architecture_handles.clear();
+    let sparse_admission = admitted_admission("job-e2e-handoff-sparse");
+    let sparse_admitted = match admission_of(&sparse_admission, &sparse_job) {
+        Ok(admitted) => admitted,
+        Err(error) => panic!("sparse e2e admission must derive, got {error:?}"),
+    };
+    let sparse_bundle = match bundle_of(&sparse_admission, &sparse_job) {
+        Ok(bundle) => bundle,
+        Err(error) => panic!("sparse e2e bundle must derive, got {error:?}"),
+    };
+    let sparse_manifest = match manifest_of(&sparse_bundle) {
+        Ok(manifest) => manifest,
+        Err(error) => panic!("sparse e2e manifest must derive, got {error:?}"),
+    };
+    let sparse_report = match preservation_of(
+        &sparse_admitted,
+        &sparse_bundle,
+        &sparse_manifest,
+        &sparse_job,
+    ) {
+        Ok(report) => report,
+        Err(error) => panic!("sparse e2e preservation must derive, got {error:?}"),
+    };
+    assert_ne!(
+        carrier.preservation, sparse_report,
+        "the preservation report must be computed from the admitted bundle: a job with no \
+         omitted handle must not produce the same report as one that omits two"
+    );
+
+    // What this root does not hold stays what it is. Rival declarations are
+    // genuinely absent, and the carrier's frozen cancellation field admits no
+    // absent state at all: `false` is an asserted negative that A-05 consumes
+    // as "not cancelled", not a recorded absence of observation. The
+    // cancellation identity this root holds is not consulted to reach it.
+    assert!(
+        carrier.rival_declarations.is_none(),
+        "this root holds no rival declarations, so none may be fabricated"
+    );
+    assert!(
+        !carrier.cancellation_requested,
+        "the frozen field carries no unobserved state, so a false here is read downstream as \
+         not-cancelled; the root asserts that negative without consulting its cancellation \
+         identity"
+    );
+
+    // And the owner-built carrier is accepted by the real A-05 gate.
+    let validated = match validate_admitted_draft(&carrier) {
+        Ok(validated) => validated,
+        Err(error) => panic!("owner-built carrier must be accepted, got {error:?}"),
+    };
+    let output_digest = match validated.output_digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("the accepted candidate must digest, got {error:?}"),
+    };
+    assert!(
+        !output_digest.is_empty(),
+        "the accepted candidate must bind its output digest"
+    );
+}
+
+/// Refusal case for the same handoff: a claim that declares its own content
+/// binding never becomes a carrier.
+///
+/// [`self_certified_draft`] produces a draft whose claim declares its own
+/// `proposition_digest` — a well-formed digest the model asserts for its own
+/// typed payload instead of letting the owner compute it. Every other binding
+/// on that draft is genuinely owner-derived, so the self-declared content
+/// binding is the only defect and only the owner can detect it.
+///
+/// **What this proves, precisely.** The refusal is raised by
+/// [`MaterialClaim::validate`], which the owning crate's grounding runs over
+/// the draft's claims, so this is a *content-digest binding* refusal detected
+/// during grounding. It is **not** the owner crate's candidate-only ceiling
+/// refusal (`refuse_self_certified_grounding`, field
+/// `grounding.assertability_ceiling`): that check runs on the grounded value
+/// inside the owner's carrier construction, which this case never reaches.
+/// The ceiling is proved from the root by the positive assertion in
+/// `grounding_handoff_binds_the_owner_carrier_for_admitted_material` (every
+/// retained record arrives at or below the ceiling) rather than by a negative
+/// here, because the owner's own producer sites cap every record they emit and
+/// no `GroundedDreamDraft` this entry can produce can trip that refusal.
+///
+/// The composition path must therefore end in a typed refusal: no carrier, no
+/// default, no empty success, and never the Kernel-admission code.
+#[test]
+fn grounding_handoff_refuses_self_declared_claim_content_digest() {
+    let admission = admitted_admission("job-e2e-handoff-refused");
+    let job = job_with_handles("job-e2e-handoff-refused", JobClass::Orientation);
+    let attempt_started = Instant::now();
+    let draft = self_certified_draft(&admission, &job);
+    // Resolution carries governed material and does not judge the draft, so
+    // the request builds; the owner refusal happens at grounding, inside the
+    // handoff, where the self-declared binding is detected.
+    let request = match resolve_grounding_inputs(&admission, &job, draft) {
+        Ok(request) => request,
+        Err(error) => panic!(
+            "governed material must resolve regardless of the draft's own claims, got {error:?}"
+        ),
+    };
+    let observed = match observed_attempt_wall_ms(attempt_started) {
+        Ok(observed) => observed,
+        Err(error) => panic!("e2e observation time must measure, got {error:?}"),
+    };
+    let attachment = match validation_attachment_for(&admission, &job, Some(observed)) {
+        Ok(attachment) => attachment,
+        Err(error) => panic!("e2e A-05 attachment must derive, got {error:?}"),
+    };
+
+    let refused = ground_and_bind_validation_carrier(request, attachment);
+    let Err(error) = refused else {
+        panic!("a self-certified draft must never bind an A-05 carrier");
+    };
+    assert_eq!(
+        error.code(),
+        "DREAMER_REQUEST_REJECTED",
+        "a refused handoff is a request rejection, not a Kernel-admission failure"
+    );
+    assert!(
+        !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "the handoff refusal must not borrow the Kernel-admission code, got {error:?}"
+    );
+    assert!(
+        matches!(
+            error,
+            // The owner reduces its grounding refusal to the failing field and
+            // refuses before any carrier exists.
+            DreamerError::InvalidAdmission("proposition_digest")
+        ),
+        "the refusal must name the self-declared content binding the owner rejected, \
+         got {error:?}"
+    );
+}
+
+/// Second root-level refusal case, and the one that proves refusal *classes*
+/// stay distinguishable through this handoff.
+///
+/// [`kind_mismatched_draft`] produces a draft whose single claim declares a
+/// `kind` that disagrees with its own typed payload: an `IdentityEntity` payload
+/// filed as `Causal`. The claim's preimage digest and the draft's preimage
+/// digest are both genuinely owner-derived, so the kind/payload disagreement is
+/// the only defect.
+///
+/// The owning crate reduces a `ContractViolation` through its own
+/// `summarize_contract`, which maps `KindPayload` onto the single static
+/// `"contract"`. Without the composition's recovery mapping this root would
+/// report that indistinguishable static; with it, the refusal must name the
+/// `KindPayload` class. This is therefore the root-level proof that the
+/// production handoff did not lose a refusal class in translation, and it
+/// deliberately asserts the class static rather than the owner's collapsed
+/// one.
+#[test]
+fn grounding_handoff_keeps_the_kind_payload_refusal_distinguishable() {
+    let admission = admitted_admission("job-e2e-handoff-kind");
+    let job = job_with_handles("job-e2e-handoff-kind", JobClass::Orientation);
+    let attempt_started = Instant::now();
+    let draft = kind_mismatched_draft(&admission, &job);
+    let request = match resolve_grounding_inputs(&admission, &job, draft) {
+        Ok(request) => request,
+        Err(error) => panic!(
+            "governed material must resolve regardless of the draft's own claims, got {error:?}"
+        ),
+    };
+    let observed = match observed_attempt_wall_ms(attempt_started) {
+        Ok(observed) => observed,
+        Err(error) => panic!("e2e observation time must measure, got {error:?}"),
+    };
+    let attachment = match validation_attachment_for(&admission, &job, Some(observed)) {
+        Ok(attachment) => attachment,
+        Err(error) => panic!("e2e A-05 attachment must derive, got {error:?}"),
+    };
+
+    let refused = ground_and_bind_validation_carrier(request, attachment);
+    let Err(error) = refused else {
+        panic!("a kind/payload mismatch must never bind an A-05 carrier");
+    };
+    assert!(
+        matches!(
+            error,
+            DreamerError::InvalidAdmission("kind/payload mismatch")
+        ),
+        "the owner collapses KindPayload onto one static; this root must recover the class, \
+         got {error:?}"
+    );
+    assert!(
+        !matches!(error, DreamerError::InvalidAdmission("contract")),
+        "a collapsed owner static would prove the refusal class was lost in translation, \
+         got {error:?}"
+    );
+    assert_eq!(
+        error.code(),
+        "DREAMER_REQUEST_REJECTED",
+        "a refused handoff is a request rejection, not a Kernel-admission failure"
+    );
+}
+
+/// Builds a draft whose single material claim self-certifies its own
+/// proposition content binding.
+///
+/// The claim declares a well-formed lowercase hex `proposition_digest` that is
+/// **not** the digest its own typed payload hashes to, so the draft asserts its
+/// own content identity instead of letting the owner compute it. Everything
+/// else is genuinely derived by the real owner functions — the claim preimage
+/// digest, the draft preimage digest, and the retained job, bundle, route, and
+/// budget context — so the self-declared binding is the single defect. The
+/// assertion below proves the fixture really is self-certified rather than
+/// accidentally correct.
+fn self_certified_draft(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+) -> StructuredModelDraft {
+    let mut draft = match resolve_model_inputs(admission, job) {
+        Ok(model_inputs) => model_inputs.draft,
+        Err(error) => panic!("e2e model inputs must resolve, got {error:?}"),
+    };
+    let payload = PrecisionPayload::IdentityEntity {
+        entity: "dreamer-grounding-policy".to_owned(),
+        entity_type: "policy".to_owned(),
+        version: "r1".to_owned(),
+        scope: SCOPE_E2E.to_owned(),
+    };
+    let proposition = match PropositionId::new("proposition-e2e-self-certified") {
+        Ok(proposition) => proposition,
+        Err(error) => panic!("proposition identity must construct, got {error:?}"),
+    };
+    let declared = "0".repeat(64);
+    let content_digest = match proposition_content_digest(&ClaimKind::IdentityEntity, &payload) {
+        Ok(digest) => digest,
+        Err(error) => panic!("claim content digest must compute, got {error:?}"),
+    };
+    assert_ne!(
+        declared, content_digest,
+        "the fixture must be genuinely self-certified, not accidentally correct"
+    );
+    let mut claim = MaterialClaim {
+        claim_id: "claim-e2e-self-certified".to_owned(),
+        proposition,
+        proposition_digest: declared,
+        kind: ClaimKind::IdentityEntity,
+        payload,
+        subclaim_ids: BTreeSet::new(),
+        proposed_support: BTreeSet::new(),
+        proposed_counterevidence: BTreeSet::new(),
+        component_digests: BTreeMap::new(),
+        screen_target: None,
+        source_preimage_digest: String::new(),
+    };
+    claim.source_preimage_digest = match claim.computed_digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("claim preimage digest must compute, got {error:?}"),
+    };
+    draft.claims.push(claim);
+    draft.draft_digest = match draft.computed_digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("draft preimage digest must compute, got {error:?}"),
+    };
+    draft
+}
+
+/// Builds a draft whose single material claim files a typed payload under the
+/// wrong claim kind.
+///
+/// The payload is a genuine `IdentityEntity`, but the claim declares
+/// `ClaimKind::Causal`, and its `proposition_digest` is the owner-computed
+/// content digest **for the declared kind** — so the content binding is
+/// correct and the claim preimage digest is correct, and the only defect is the
+/// kind/payload disagreement the owner's `MaterialClaim::validate` detects. The
+/// assertions below prove the fixture is genuinely mismatched rather than
+/// accidentally valid.
+fn kind_mismatched_draft(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+) -> StructuredModelDraft {
+    let mut draft = match resolve_model_inputs(admission, job) {
+        Ok(model_inputs) => model_inputs.draft,
+        Err(error) => panic!("e2e model inputs must resolve, got {error:?}"),
+    };
+    let payload = PrecisionPayload::IdentityEntity {
+        entity: "dreamer-grounding-policy".to_owned(),
+        entity_type: "policy".to_owned(),
+        version: "r1".to_owned(),
+        scope: SCOPE_E2E.to_owned(),
+    };
+    let declared_kind = ClaimKind::Causal;
+    let proposition = match PropositionId::new("proposition-e2e-kind-mismatch") {
+        Ok(proposition) => proposition,
+        Err(error) => panic!("proposition identity must construct, got {error:?}"),
+    };
+    assert_eq!(
+        payload.kind(),
+        ClaimKind::IdentityEntity,
+        "the fixture payload must really be an identity-entity payload"
+    );
+    assert_ne!(
+        payload.kind(),
+        declared_kind,
+        "the fixture must be genuinely kind-mismatched, not accidentally correct"
+    );
+    let proposition_digest = match proposition_content_digest(&declared_kind, &payload) {
+        Ok(digest) => digest,
+        Err(error) => panic!("claim content digest must compute, got {error:?}"),
+    };
+    let mut claim = MaterialClaim {
+        claim_id: "claim-e2e-kind-mismatch".to_owned(),
+        proposition,
+        proposition_digest,
+        kind: declared_kind,
+        payload,
+        subclaim_ids: BTreeSet::new(),
+        proposed_support: BTreeSet::new(),
+        proposed_counterevidence: BTreeSet::new(),
+        component_digests: BTreeMap::new(),
+        screen_target: None,
+        source_preimage_digest: String::new(),
+    };
+    claim.source_preimage_digest = match claim.computed_digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("claim preimage digest must compute, got {error:?}"),
+    };
+    draft.claims.push(claim);
+    draft.draft_digest = match draft.computed_digest() {
+        Ok(digest) => digest,
+        Err(error) => panic!("draft preimage digest must compute, got {error:?}"),
+    };
+    draft
+}
+
 /// Curation routes to the A-31 sole fan-in without class refusal: the screen
 /// admits a non-empty eligible set, the v2 owner itself directs Curation to
 /// its separate carrier (`UnsupportedJobShape` semantic rejection, never a
@@ -246,11 +723,23 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     let draft = run_admitted_model(model_inputs).expect("e2e model must prove");
     let request =
         resolve_grounding_inputs(&admission, &job, draft).expect("e2e grounding must resolve");
-    let grounded = ground_admitted_draft(request).expect("e2e grounding must prove");
     // The common A-05 owner directs Curation to its separate typed carrier:
-    // a genuine semantic gate firing exactly as designed.
-    let carrier =
-        validation_input_for(&admission, &job, grounded, Some(0)).expect("e2e carrier must build");
+    // a genuine semantic gate firing exactly as designed. The carrier is built
+    // by the owning crate from the same admitted attachment production uses,
+    // including the attempt's measured observation time.
+    let attempt_started = Instant::now();
+    let observed = match observed_attempt_wall_ms(attempt_started) {
+        Ok(observed) => observed,
+        Err(error) => panic!("e2e observation time must measure, got {error:?}"),
+    };
+    let attachment = match validation_attachment_for(&admission, &job, Some(observed)) {
+        Ok(attachment) => attachment,
+        Err(error) => panic!("e2e A-05 attachment must derive, got {error:?}"),
+    };
+    let carrier = match ground_and_bind_validation_carrier(request, attachment) {
+        Ok(carrier) => carrier,
+        Err(error) => panic!("e2e carrier must build through the owner handoff, got {error:?}"),
+    };
     let rejected = validate_admitted_draft(&carrier);
     assert!(
         matches!(

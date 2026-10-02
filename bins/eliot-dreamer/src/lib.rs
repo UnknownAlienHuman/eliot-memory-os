@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
@@ -682,6 +682,14 @@ fn run_admitted_pipeline(
     curation_carrier: Option<dispatch_stage::CurationExecutionCarrier<'_>>,
     orientation_supply: Option<&production_orientation::OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
+    // The A-05 observation time is this attempt's own elapsed wall time, and
+    // it is measured from the moment the admitted chain for this attempt
+    // began. It is not a literal and not the Kernel's absolute
+    // `deadline_unix_ms`: the owner compares the observation against the
+    // admitted job's `deadline_ms` wall budget in the same unit, so a
+    // fabricated value here would either make that gate unreachable or make
+    // every admitted job read as already expired.
+    let attempt_started = Instant::now();
     let screen = curation_screen_stage::resolve_screen_inputs(admission, job)?;
     if job.job_class == JobClass::Curation {
         let binding = match screen {
@@ -708,16 +716,26 @@ fn run_admitted_pipeline(
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
-    // The grounding owner takes its request by value; the same admitted request
-    // is retained here so the Orientation carrier joins the exact one this
-    // stage ran under instead of rebuilding a lookalike.
-    let grounded = grounding_stage::ground_admitted_draft(grounding_request.clone())?;
     // Non-Curation classes pass the screen through with no binding to carry:
     // the resolve above already proved the pass-through.
     let screen_binding = None;
     let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
-    let validation_input =
-        admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
+    // A-14b -> A-05 handoff, one owner call. This root supplies only the A-05
+    // data it actually holds (policy, usage, the derived preservation
+    // verdicts, and the observation time measured above); the owner grounds
+    // the request and constructs the carrier at its single construction site,
+    // so no `GroundingValidationInput` is built here and the grounded leg's
+    // identity, scope, fence, and task joins are never restated by the
+    // composition. The owner consumes the request by value, so the exact
+    // admitted request is retained here for the Orientation carrier to join
+    // instead of rebuilding a lookalike.
+    let observation_time_ms = admitted_material::observed_attempt_wall_ms(attempt_started)?;
+    let validation_attachment =
+        admitted_material::validation_attachment_for(admission, job, Some(observation_time_ms))?;
+    let validation_input = validation_stage::ground_and_bind_validation_carrier(
+        grounding_request.clone(),
+        validation_attachment,
+    )?;
     // The structured A-05 gate runs exactly once here; the validated receipt
     // threads into dispatch, which proves its binding before any native
     // handler runs and never re-runs the owner validation.

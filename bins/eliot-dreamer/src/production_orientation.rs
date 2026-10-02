@@ -14,9 +14,9 @@
 //! |---|---|---|
 //! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
-//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
-//! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
-//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
+//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired in source; NOT REACHABLE IN PRODUCTION: both gates ahead of it refuse first (`controller::resolve_cycle_inputs`, controller.rs:78-82, and `bundle_stage::resolve_bundle_request`, bundle_stage.rs:31-35) |
+//! | Ground the admitted draft and bind the A-05 carrier | `validation_stage::ground_and_bind_validation_carrier` -> `eliot_dreamer_claim_grounding::ground_for_validation` (the owner's single construction site) | wired in source; NOT REACHABLE IN PRODUCTION: both gates ahead of it refuse first (`controller::resolve_cycle_inputs`, controller.rs:78-82, and `bundle_stage::resolve_bundle_request`, bundle_stage.rs:31-35), so the handoff executes only from this crate's own proofs |
+//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired in source; NOT REACHABLE IN PRODUCTION: it runs after the handoff, behind the same two refusing gates |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | NOT REACHABLE IN PRODUCTION: the producer has no production caller, and the supply seam itself sits behind two upstream gates that refuse unconditionally |
 //! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | NOT REACHABLE IN PRODUCTION: no owner publishes these records to this binary, and the seam that would read them is unreachable |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
@@ -30,6 +30,17 @@
 //! hypothesis pair enters beside them as explicit parameters, because
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
+//!
+//! Carrying the grounding request into the carrier as a record is not the same
+//! as grounding again, and the difference is deliberate. The A-14b -> A-05
+//! handoff grounds the admitted draft once, inside the one owner call, and this
+//! module joins that already-grounded result. The Orientation pulse does re-run
+//! the same pure grounding over the same retained request, but only to compute
+//! its own stage commitment digest (`pulse::run_grounding_stage`, called from
+//! `collect_ref_stages` below), and only when an owner channel is admitted —
+//! which the refusal below (`production_orientation.rs:434-443`) and the
+//! `Ok(None)` from the only production supply source
+//! (`orientation_supply_source.rs:151`) currently prevent.
 //!
 //! The last two owner-channel rows are measured, not aspirational, and the
 //! measurement is stronger than "the owner published nothing". Three separate
@@ -53,7 +64,12 @@
 //! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) both end in a
 //! bare `Err`. An `Ok(None)` from the owner channel is therefore not merely the
 //! current answer — on today's tree `resolve_supply` is never called at all on
-//! any production path. The crate's own
+//! any production path. The same two gates sit ahead of every other row the
+//! admitted chain executes, not just this one: the model-route pair, the
+//! grounding request, the A-14b -> A-05 handoff, and the A-05 gate all run
+//! inside `run_admitted_pipeline`, which `submit` reaches only past those
+//! refusals, and the composer and the publish are downstream of them again. The
+//! crate's own
 //! `submit_orientation_stops_at_controller_gate` proof
 //! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
 //! the controller gate. The blocked disposition published downstream is reached

@@ -194,10 +194,7 @@ pub fn ground_draft_with_controls(
                 "curation screen binding is absent or differs from the input screen".into(),
             );
             evidence::recompute_record_assertability(&mut record);
-            evidence::cap_record_assertability(
-                &mut record,
-                eliot_dreamer_contracts::grounding::canonical::PositionAssertability::HypothesisCandidate,
-            );
+            evidence::cap_record_assertability(&mut record, evidence::CANDIDATE_ONLY_CEILING);
         }
         aggregate_parent_record(
             &grounded.input,
@@ -617,7 +614,7 @@ fn aggregate_parent_record(
             child_assignments.push(grade.clone());
         }
         child_assertability = Some(match child_assertability {
-            Some(current) => weaker_assertability(current, child.assertability_ceiling),
+            Some(current) => evidence::weaker(current, child.assertability_ceiling),
             None => child.assertability_ceiling,
         });
         child_coverage.extend(child.coverage_denominator_ids.iter().cloned());
@@ -696,32 +693,8 @@ fn aggregate_parent_record(
             .insert("typed precision payload is incomplete for grounding".into());
     }
     evidence::recompute_record_assertability(record);
-    evidence::cap_record_assertability(
-        record,
-        eliot_dreamer_contracts::grounding::canonical::PositionAssertability::HypothesisCandidate,
-    );
+    evidence::cap_record_assertability(record, evidence::CANDIDATE_ONLY_CEILING);
     Ok(())
-}
-
-fn weaker_assertability(
-    left: eliot_dreamer_contracts::grounding::canonical::PositionAssertability,
-    right: eliot_dreamer_contracts::grounding::canonical::PositionAssertability,
-) -> eliot_dreamer_contracts::grounding::canonical::PositionAssertability {
-    use eliot_dreamer_contracts::grounding::canonical::PositionAssertability;
-    let rank = |value| match value {
-        PositionAssertability::UnknownWithheldQuarantined => 0,
-        PositionAssertability::PlanningOnly => 1,
-        PositionAssertability::HypothesisCandidate => 2,
-        PositionAssertability::ConflictQualificationRequired => 3,
-        PositionAssertability::QualifiedInference => 4,
-        PositionAssertability::ObservedFact => 5,
-        PositionAssertability::MaterialEffect => 6,
-    };
-    if rank(left) <= rank(right) {
-        left
-    } else {
-        right
-    }
 }
 
 fn postorder<'a>(
