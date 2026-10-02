@@ -95,7 +95,7 @@
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
 //! transaction as the pages. Counted at the time of writing: 75 distinct declared
-//! tables, 45 backing a dispositioned row family and 30 carrying an explicit
+//! tables, 46 backing a dispositioned row family and 29 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
 //! it; 43 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 45 table-backed tables and 29 source-bound exclusions.
+/// checking it: 46 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +969,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 46 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -3706,7 +3706,7 @@ fn snapshot_completeness(
 /// pre-existing and unchanged in kind by this issue; the two-transaction witness
 /// that existed before behaved identically. It is recorded here because a witness
 /// described without its scope is the same defect as a witness that cannot fire.
-/// The 28 tables the census excludes with a written nonrestorable/forensic reason
+/// The 29 tables the census excludes with a written nonrestorable/forensic reason
 /// are consequently outside BOTH the denominator and this witness. That is the
 /// correct result for a table with no import path, and it is now a DECIDED
 /// exclusion rather than the old A5 gap: an earlier version of this comment

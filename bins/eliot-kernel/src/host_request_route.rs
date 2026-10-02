@@ -7698,12 +7698,7 @@ impl KernelComposition {
         // A later reconcile replays to the same handoff and records the same
         // receipt, because the receipt is keyed by handoff identity and the
         // first one stands.
-        let receipt_outcome = Self::bridge_event_owner_receipt(
-            &outcome,
-            owner_namespace,
-            event,
-            BRIDGE_OWNER_RECEIPT_APPLIED,
-        )?;
+        let receipt_outcome = Self::bridge_event_owner_receipt(&outcome, owner_namespace, event)?;
         if let Err(error) = self
             .generation_gateway
             .ors
@@ -7721,8 +7716,8 @@ impl KernelComposition {
         Ok(bridge_event_forward_response(&outcome, true))
     }
 
-    /// Builds the receiving-owner receipt request for one determined bridge
-    /// event outcome (issue #2730).
+    /// Builds the receiving-owner receipt request for the one determined
+    /// bridge event outcome this route can produce (issue #2730).
     ///
     /// `outcome` is the ORS entry's own answer for this exact identity, so
     /// every leg is read back from the store's answer rather than rebuilt from
@@ -7737,11 +7732,18 @@ impl KernelComposition {
     /// operation's own request-stable identity, derived over the identity legs
     /// plus the disposition, so the retained receipt is attributable to the
     /// operation that took it.
+    ///
+    /// The disposition is not a parameter because this route has exactly one
+    /// outcome it can determine. `REJECTED` needs a determined conflict, which
+    /// this route answers to the caller before any handoff is durable to join
+    /// a receipt to, and `UNKNOWN` means an undetermined outcome, which this
+    /// route reports as a transport failure instead of recording. Both stay
+    /// members of the ORS receipt vocabulary so the store can still refuse a
+    /// receipt that claims one for an identity with no determined acceptance.
     fn bridge_event_owner_receipt(
         outcome: &serde_json::Value,
         owner_namespace: &str,
         event: &EventEnvelope,
-        disposition: &str,
     ) -> Result<serde_json::Value, TransportError> {
         let sequence = outcome
             .get("sequence")
@@ -7763,7 +7765,7 @@ impl KernelComposition {
             "event_id": event.event_id,
             "sequence": sequence,
             "envelope_sha256": envelope_sha256,
-            "disposition": disposition,
+            "disposition": BRIDGE_OWNER_RECEIPT_APPLIED,
         });
         let operation_bytes = eliot_contracts::canonical_json_bytes(&operation_material)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -7776,7 +7778,7 @@ impl KernelComposition {
                 "bridge-event-owner-receipt:{}",
                 eliot_contracts::sha256_hex(&operation_bytes)
             ),
-            "disposition": disposition,
+            "disposition": BRIDGE_OWNER_RECEIPT_APPLIED,
             "receipt_digest": receipt_digest,
         }))
     }
