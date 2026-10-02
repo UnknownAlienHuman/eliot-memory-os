@@ -15,13 +15,15 @@ use super::{
     BRIDGE_EVENT_HANDOFFS, BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS, BRIDGE_EVENT_PROJECTIONS,
     BRIDGE_EVENT_RECORDS, CAMPAIGN_SOURCE_PENDING, COLD_START_READINESS_BINDINGS,
     COLD_START_READINESS_HEADS, COLD_START_READINESS_RECORDS, CUTOVER_OWNERSHIP, DOCTOR_ATTEMPTS,
-    DOCTOR_EFFECTS, DurableInboxRecord, DurableOperationalRecord, EFFECT_OPERATION_LEASES,
-    EFFECT_REPLAY_RECONCILIATIONS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS, META,
-    NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT, PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY,
-    RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS, REPLAY_EVENTS, RESERVATIONS,
-    RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS, STORE_FAILURE_RETENTION,
-    STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT, SUPERVISION_LEASE_STAGED,
-    UNKNOWN_COMMIT_RECOVERY, decode, decode_named, read_store_object_identity, storage,
+    DOCTOR_EFFECTS, DurableInboxRecord, DurableOperationalRecord, EFFECT_DELIVERY_RECORDS,
+    EFFECT_OPERATION_LEASES, EFFECT_REPLAY_RECONCILIATIONS, EFFECT_REVOCATION_EVENTS,
+    GENERATION_LIFECYCLES, GOVERNOR_ADMISSION_RECEIPTS, HOST_REQUEST_LOGICAL_KEYS, HOST_REQUESTS,
+    KERNEL_RESTART_RECONCILIATIONS, META, NATIVE_WORKER_CLAIMS, OPERATIONAL_CURRENT,
+    PROCESS_START_REPLAY, PROCESS_STREAM_RECOVERY, RECOVERY_INBOX, RECOVERY_PROBLEMS, REPLAY_ACKS,
+    REPLAY_EVENTS, RESERVATIONS, RUNTIME_LEASE_CURRENT, RedbRecoveryStore, SCAN_DISCLOSURE_RECORDS,
+    STORE_FAILURE_RETENTION, STORE_REBIND_REPLAY, SUPERVISION_LEASE_CURRENT,
+    SUPERVISION_LEASE_STAGED, UNKNOWN_COMMIT_RECOVERY, decode, decode_named,
+    read_store_object_identity, storage,
 };
 use crate::model::{SupervisionLeaseSnapshot, SupervisionLeaseStageReceipt};
 use crate::{
@@ -102,6 +104,22 @@ pub struct StoreStopObligationCounts {
     pub authority_handoffs: u64,
     /// Generation cutovers that have not reached their committed state.
     pub cutover_ownership: u64,
+    /// Recorded manifest-side restart escalations, one per appended attempt.
+    ///
+    /// This family has no terminal disposition: a recorded refusal is preserved
+    /// escalation evidence, not a settled fact, so every attempt a generation
+    /// accumulated is retained until its owner removes the row. One recorded
+    /// escalation is therefore enough to keep a Store stop from being reported
+    /// as clean.
+    pub restart_reconciliations: u64,
+    /// Generation Registry rows whose recorded disposition is `Degraded` or
+    /// `Quarantined`.
+    ///
+    /// This is the count of AFFECTED GENERATIONS, one row per
+    /// `{module_id, generation}`. A recorded degradation is what blocks launch,
+    /// routes and new effect operation leases for its generation, so a Store
+    /// that holds one cannot report a clean stop while the row exists.
+    pub degraded_generations: u64,
 }
 
 impl StoreStopObligationCounts {
@@ -140,6 +158,8 @@ impl StoreStopObligationCounts {
             self.process_start_replays,
             self.authority_handoffs,
             self.cutover_ownership,
+            self.restart_reconciliations,
+            self.degraded_generations,
         ]
         .into_iter()
         .try_fold(0_u64, u64::checked_add)
@@ -184,6 +204,8 @@ impl StoreStopObligationCounts {
             && self.process_start_replays == 0
             && self.authority_handoffs == 0
             && self.cutover_ownership == 0
+            && self.restart_reconciliations == 0
+            && self.degraded_generations == 0
     }
 }
 
@@ -336,6 +358,24 @@ pub(super) fn census_in_read(
     observe_authority_handoffs(read, &mut builder)?;
 
     observe_cutover_ownership(read, &mut builder)?;
+
+    // #1884 (W1.1, W1.5, AUD5): the five families this delivery adds around the
+    // admitted manifest are read in this same snapshot, so a row under any of
+    // them that does not belong to its own decoded identity fails the census
+    // closed instead of being invisible to the revision. Two of them are not
+    // merely inventoried: a recorded manifest-side restart escalation and a
+    // recorded generation degradation are live obligations, and both are counted,
+    // so `total()` and `is_zero()` cannot report a clean Store stop while either
+    // exists.
+    observe_governor_admission_receipts(read, &mut builder)?;
+
+    observe_generation_lifecycles(read, &mut builder)?;
+
+    observe_effect_revocation_events(read, &mut builder)?;
+
+    observe_effect_delivery_records(read, &mut builder)?;
+
+    observe_kernel_restart_reconciliations(read, &mut builder)?;
 
     observe_doctor_attempts(read, &mut builder)?;
 
@@ -615,16 +655,76 @@ fn observe_effect_replay_reconciliations(
                 "durable effect reconciliation has no operation identity",
             )
         })?;
-        let expected_key = format!(
+        // #1884 W1.5: this family appends like the manifest-side restart family,
+        // so one operation identity owns a `{prefix}{attempt:020}` series and the
+        // first cause a denial was recorded under is never overwritten by a later
+        // one. The census assertion is not weakened by that: the typed owner
+        // identity is still re-derived from the DECODED item alone, and no key
+        // shape outside this one series' two forms is accepted.
+        //
+        // The pre-append shape is the same series' attempt 0 and is accepted as
+        // such: rows written before #1884 W1.5 are keyed
+        // `{module_id}::{generation:020}::{operation_id}` with no trailing `::`
+        // and no ordinal, and this family DOES have production writers on `main`
+        // (`authorize_effect_replay_for_operation` and
+        // `deny_effect_replay_without_lease`), so such rows exist on installed
+        // databases. Rejecting them would make the Store-stop census fail with an
+        // integrity error on a healthy installed store. The legacy key is
+        // recognised only as that exact typed identity — a key that merely starts
+        // with the module or operation component is still refused — so the
+        // assertion keeps binding the key to the DECODED item.
+        let series_prefix = format!(
             "{}::{:020}::{}",
             RedbRecoveryStore::encode_key_component(&item.module_id),
             item.generation.value(),
             RedbRecoveryStore::encode_key_component(operation_id.as_str()),
         );
-        if key.value() != expected_key {
+        let attempt = match key.value().strip_prefix(series_prefix.as_str()) {
+            // Pre-append row: the exact series key with no trailing `::` and no
+            // ordinal at all, i.e. attempt 0 of this same series. This is the ONE
+            // accepted key that carries no ordinal, and it is recognised here by
+            // its own shape rather than by the digit check below.
+            Some("") => None,
+            // Appended row: `::` then the decimal attempt ordinal.
+            //
+            // #1884 W4: an EMPTY ordinal is refused here. `{prefix}::` — a
+            // present identity, two delimiters and no ordinal — is a third key
+            // form this function's own documentation does not name, and it used
+            // to pass because `all(is_ascii_digit)` is vacuously true for the
+            // empty string, which is the same reason the legacy arm above has to
+            // be spelled out instead of falling through to that check.
+            //
+            // Rejecting it is free: the writer emits
+            // `format!("{prefix}{attempt:020}")`, `{:020}` on a `u64` is a
+            // MINIMUM width of 20 and `u64::MAX` is exactly 20 decimal digits,
+            // so the writer can never produce an empty ordinal and no row this
+            // family can legally hold is refused by this arm.
+            Some(rest) => match rest.strip_prefix("::") {
+                Some("") => {
+                    return Err(integrity(
+                        "store_stop_effect_reconciliation",
+                        "reconciliation key ends in an empty attempt ordinal",
+                    ));
+                }
+                Some(ordinal) => Some(ordinal),
+                None => {
+                    return Err(integrity(
+                        "store_stop_effect_reconciliation",
+                        "reconciliation key does not match its typed owner identity",
+                    ));
+                }
+            },
+            None => {
+                return Err(integrity(
+                    "store_stop_effect_reconciliation",
+                    "reconciliation key does not match its typed owner identity",
+                ));
+            }
+        };
+        if attempt.is_some_and(|ordinal| !ordinal.bytes().all(|byte| byte.is_ascii_digit())) {
             return Err(integrity(
                 "store_stop_effect_reconciliation",
-                "reconciliation key does not match its typed owner identity",
+                "reconciliation key does not end in a decimal attempt ordinal",
             ));
         }
         builder.observe("effect_replay_reconciliations", key.value(), value.value());
@@ -1012,6 +1112,218 @@ fn observe_cutover_ownership(
         if stored.record.state != eliot_runtime_contracts::GenerationCutoverState::Committed {
             builder.counts.cutover_ownership = increment(builder.counts.cutover_ownership)?;
         }
+    }
+    Ok(())
+}
+
+/// Reads the canonical Governor admission receipts (issue #1884; I1.9 line 35,
+/// W1.1, AUD1).
+///
+/// The row is keyed by the receipt's OWN canonical operation identity, exactly as
+/// the receipt records it — the writer states no `::` prefix and no ordinal, so
+/// nothing is escaped or rendered here — and the identity is re-derived from the
+/// DECODED receipt alone. A row filed under another operation's identity, or one
+/// whose decoded `operation_id` disagrees with its key, fails the census closed.
+fn observe_governor_admission_receipts(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let receipts = read
+        .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+        .map_err(storage)?;
+    for row in receipts.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let receipt: crate::admission_receipt::GovernorAdmissionReceipt = decode(value.value())?;
+        if key.value() != receipt.operation_id.as_str() {
+            return Err(integrity(
+                "governor_admission_receipt",
+                "admission receipt key does not match its canonical operation identity",
+            ));
+        }
+        builder.observe("governor_admission_receipts", key.value(), value.value());
+    }
+    Ok(())
+}
+
+/// Reads the Generation Registry lifecycle owner (issue #1884; I1.9 line 8,
+/// W1.5, AUD5).
+///
+/// The row is keyed `{module_id}::{generation:020}` with the escaped `module_id`
+/// component `encode_key_component` produces, so `::` is an unambiguous
+/// delimiter, and both the module and the generation are re-derived from the
+/// DECODED record alone. A row under a key that names another generation fails
+/// the census closed.
+///
+/// #1884 AUD5: a recorded degradation is a BLOCKING obligation here, not only an
+/// inventoried row. `GenerationLifecycleRecord::admits_launch`,
+/// `admits_new_effect_leases` and `blocks_routes` answer from exactly this
+/// disposition, so a Store that holds a `Degraded` or `Quarantined` generation
+/// while reporting a clean stop would report a stop the launch, route and lease
+/// gates are still refusing. The record's own `validate()` runs first — both
+/// lifecycle writers validate before they write — so the disposition this counts
+/// is the disposition that satisfies the record's disposition/cause invariant.
+fn observe_generation_lifecycles(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let lifecycles = read.open_table(GENERATION_LIFECYCLES).map_err(storage)?;
+    for row in lifecycles.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::generation_lifecycle::GenerationLifecycleRecord = decode(value.value())?;
+        let expected_key = format!(
+            "{}::{:020}",
+            RedbRecoveryStore::encode_key_component(record.module_id.as_str()),
+            record.generation.value()
+        );
+        if key.value() != expected_key {
+            return Err(integrity(
+                "generation_lifecycle",
+                "generation lifecycle key does not match its recorded module and generation",
+            ));
+        }
+        record.validate()?;
+        builder.observe("generation_lifecycles", key.value(), value.value());
+        // The RECORD's own predicate, not a second spelling of its disposition:
+        // `blocks_routes` is true exactly for `Degraded` and `Quarantined`, the
+        // two dispositions that withhold launch, routes and new effect operation
+        // leases. Reusing it is what keeps this count and the launch/route/lease
+        // gate from ever disagreeing about which generations are degraded.
+        if record.blocks_routes() {
+            builder.counts.degraded_generations = increment(builder.counts.degraded_generations)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads the observed revocation events of effect operation leases (issue #1884;
+/// I1.9 line 48, AUD5).
+///
+/// The row is keyed by the lease's OWN identity, exactly as the lease records
+/// it, and that identity is re-derived from the DECODED event alone. A row filed
+/// under another lease's identity fails the census closed.
+fn observe_effect_revocation_events(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let events = read.open_table(EFFECT_REVOCATION_EVENTS).map_err(storage)?;
+    for row in events.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let event: crate::effect_current_state::RevocationEventRecord = decode(value.value())?;
+        if key.value() != event.lease_id.as_str() {
+            return Err(integrity(
+                "effect_revocation_event",
+                "revocation event key does not match its lease identity",
+            ));
+        }
+        builder.observe("effect_revocation_events", key.value(), value.value());
+    }
+    Ok(())
+}
+
+/// Reads the observed delivery acknowledgements of effect operation leases
+/// (issue #1884; I1.9 line 48, AUD5).
+///
+/// The row is keyed by the lease's OWN identity, exactly as the lease records
+/// it, and that identity is re-derived from the DECODED record alone. A row
+/// filed under another lease's identity fails the census closed.
+fn observe_effect_delivery_records(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let records = read.open_table(EFFECT_DELIVERY_RECORDS).map_err(storage)?;
+    for row in records.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let record: crate::effect_current_state::EffectDeliveryRecord = decode(value.value())?;
+        if key.value() != record.lease_id.as_str() {
+            return Err(integrity(
+                "effect_delivery_record",
+                "delivery record key does not match its lease identity",
+            ));
+        }
+        builder.observe("effect_delivery_records", key.value(), value.value());
+    }
+    Ok(())
+}
+
+/// Reads the manifest-side restart escalations (issue #1884; I1.9, W1.5, AUD5).
+///
+/// #1884 AUD5: this family was absent from this census altogether, so
+/// `total()` and `is_zero()` could report a CLEAN STOP while a restart had been
+/// refused, the refusal was durably escalated, and the affected generation sat
+/// degraded in `GENERATION_LIFECYCLES`. It is opened, key-checked and counted
+/// here, so a recorded escalation is a live Store obligation.
+///
+/// The row is keyed `{module_id}::{generation:020}::{attempt:020}`, where
+/// `module_id` is the escaped component `encode_key_component` produces (it
+/// escapes only `%` and `:`, so `::` is an unambiguous delimiter) and
+/// `KernelReconciliationItem` has no attempt field — the ordinal lives in the key
+/// alone. Exactly TWO key forms are this series and both are accepted:
+///
+/// * the appended `{M}::{G:020}::{attempt:020}` rows, and
+/// * the exact pre-append key `{M}::{G:020}` with no trailing `::` and no
+///   ordinal, which is a STRICT PREFIX of the series prefix and therefore sorts
+///   before every one of its extensions in redb's byte-ordered key space, so it
+///   can only be reached by an exact `get()`.
+///
+/// The module and the generation are re-derived from the DECODED item alone,
+/// exactly as `observe_effect_replay_reconciliations` does for the sibling family
+/// that shares this record type, so a row filed under another generation's series
+/// fails the census closed as corruption instead of being counted as evidence
+/// about this one. An EMPTY ordinal (`{M}::{G:020}::`) is refused for the same
+/// reason the effect-replay series refuses it: `all(is_ascii_digit)` is vacuously
+/// true for the empty string, and the writer emits `{:020}` on a `u64` whose
+/// maximum is exactly twenty decimal digits, so no row this family can legally
+/// hold carries one.
+///
+/// Every recorded row is counted. This family has no terminal disposition and no
+/// receipt that could retire it, so a recorded refusal stays live Store work
+/// until its owner removes the row; that is what makes one escalation enough to
+/// keep the stop non-clean.
+fn observe_kernel_restart_reconciliations(
+    read: &redb::ReadTransaction,
+    builder: &mut CensusBuilder,
+) -> Result<(), crate::OrsError> {
+    let escalations = read
+        .open_table(KERNEL_RESTART_RECONCILIATIONS)
+        .map_err(storage)?;
+    for row in escalations.iter().map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        let item: KernelReconciliationItem = decode(value.value())?;
+        let series_identity = format!(
+            "{}::{:020}",
+            RedbRecoveryStore::encode_key_component(item.module_id.as_str()),
+            item.generation.value()
+        );
+        let series_prefix = format!("{series_identity}::");
+        let attempt = if key.value() == series_identity {
+            // The exact pre-append key of this same series, recognised by its own
+            // shape rather than by falling through to the digit check.
+            None
+        } else {
+            match key.value().strip_prefix(series_prefix.as_str()) {
+                Some("") => {
+                    return Err(integrity(
+                        "store_stop_restart_reconciliation",
+                        "restart reconciliation key ends in an empty attempt ordinal",
+                    ));
+                }
+                Some(ordinal) => Some(ordinal),
+                None => {
+                    return Err(integrity(
+                        "store_stop_restart_reconciliation",
+                        "restart reconciliation key does not match its recorded module and generation",
+                    ));
+                }
+            }
+        };
+        if attempt.is_some_and(|ordinal| !ordinal.bytes().all(|byte| byte.is_ascii_digit())) {
+            return Err(integrity(
+                "store_stop_restart_reconciliation",
+                "restart reconciliation key does not end in a decimal attempt ordinal",
+            ));
+        }
+        builder.observe("kernel_restart_reconciliations", key.value(), value.value());
+        builder.counts.restart_reconciliations = increment(builder.counts.restart_reconciliations)?;
     }
     Ok(())
 }
@@ -1541,5 +1853,225 @@ impl CensusBuilder {
         let value_digest = crate::model::sha256_hex(value.as_bytes());
         let next = format!("{}\n{family}\n{key_digest}\n{value_digest}", self.revision);
         self.revision = crate::model::sha256_hex(next.as_bytes());
+    }
+}
+
+/// Issue #1884 AUD5: a recorded manifest-side restart escalation, and a recorded
+/// generation degradation, are live Store obligations.
+///
+/// These are the proofs for the two families this census previously left
+/// uncounted: the whole `StoreStopObligationCounts` denominator could report
+/// `is_zero()` on a store that held a durable restart refusal and a generation
+/// the launch, route and lease gates were still refusing.
+///
+/// They drive the two OBSERVERS over one read transaction rather than
+/// `load_store_stop_obligation_census`, and that is a stated limit of the proof
+/// rather than a convenience: `census_in_read` opens every family and several of
+/// them are `CreatedOnFirstWrite` (`RUNTIME_LEASE_CURRENT`, `HOST_REQUESTS`,
+/// `CUTOVER_OWNERSHIP`, `STORE_FAILURE_RETENTION`, `SCAN_DISCLOSURE_RECORDS`,
+/// `BRIDGE_EVENT_PROJECTIONS`, the `COLD_START_READINESS_*` triple), so a store
+/// that has recorded nothing but a manifest refusal cannot be read by the whole
+/// census at all. That fail-closed property is pre-existing and is not changed
+/// here; what these proofs establish is exactly the two counts this change adds
+/// and the corruption refusal the new observer applies.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test fixtures use unwrap/expect; production lints remain -D warnings"
+)]
+mod tests {
+    use std::path::PathBuf;
+
+    use eliot_contracts::ResourceGeneration;
+
+    use super::*;
+    use crate::KernelReconciliationKind;
+    use crate::generation_lifecycle::{
+        GENERATION_LIFECYCLE_SCHEMA_VERSION, GenerationDisposition, GenerationLifecycleRecord,
+    };
+    use crate::store::persistence_codec::encode;
+    use crate::test_support::kernel_fixture_dir;
+
+    const INSTALLATION_ID: &str = "installation-ors-1884-census";
+    const MODULE_ID: &str = "module-ors-1884-census";
+    const GENERATION: u64 = 7;
+    const OBSERVED_AT_MS: i64 = 1_700_000_000_000;
+
+    fn resource_generation(value: u64) -> ResourceGeneration {
+        ResourceGeneration::new(value).expect("non-zero generation")
+    }
+
+    /// Opens one installed, otherwise empty ORS under a unique temp root.
+    ///
+    /// The installation identity is bound so the fixture is the same durable shape
+    /// a production store has, store-object identity row included. Nothing in these
+    /// proofs reads that row; the identical fixture shape is used by the
+    /// `export_snapshot` proof in `store/backup_snapshot.rs`, which does compare
+    /// against it.
+    fn installed_store(tag: &str) -> (PathBuf, RedbRecoveryStore) {
+        let dir = kernel_fixture_dir(tag).expect("unique fixture temp root");
+        let (store, _identity) =
+            RedbRecoveryStore::open_for_installation(dir.join("ors.redb"), INSTALLATION_ID)
+                .expect("installed store opens");
+        (dir, store)
+    }
+
+    /// The manifest-side restart escalation a missing manifest produces: the same
+    /// item shape the production refusal path persists, with no operation or
+    /// lease identity because a restart is not an effect replay.
+    fn restart_escalation(module_id: &str, generation: u64) -> KernelReconciliationItem {
+        KernelReconciliationItem {
+            kind: KernelReconciliationKind::ManifestAbsent,
+            module_id: module_id.to_owned(),
+            generation: resource_generation(generation),
+            bound_manifest_sha256: None,
+            recorded_manifest_sha256: None,
+            lease_id: None,
+            operation_id: None,
+            observed_at_ms: OBSERVED_AT_MS,
+        }
+    }
+
+    /// Places one raw row under an exact key, bypassing every owner writer.
+    ///
+    /// It exists for two reasons and no others: to present a row the owner CANNOT
+    /// write — a row whose recorded identity disagrees with its key, which is the
+    /// only way to reach the corruption refusal — and to place a lifecycle row on
+    /// its own, without the escalation the refusal writer would append beside it.
+    /// Every escalation a production refusal produces is written through the owner
+    /// writer instead.
+    fn insert_raw_row(
+        store: &RedbRecoveryStore,
+        table: redb::TableDefinition<&'static str, &'static str>,
+        key: &str,
+        payload: &str,
+    ) {
+        let write = store
+            .database
+            .begin_write()
+            .expect("write transaction opens");
+        {
+            let mut rows = write.open_table(table).expect("test table opens");
+            let _ = rows.insert(key, payload).expect("test row inserts");
+        }
+        write.commit().expect("test row commits");
+    }
+
+    /// POSITIVE: one recorded manifest-side restart escalation is not a clean
+    /// stop, and it is counted in the same denominator as every other family.
+    ///
+    /// The owner writer is used, so the escalation row AND the
+    /// `GENERATION_LIFECYCLES` degradation it records in the same transaction are
+    /// exactly what production writes: one recorded refusal and one affected
+    /// generation. Both observers run here, because `census_in_read` runs both and
+    /// the point is that neither of them can be absorbed into a clean stop.
+    #[test]
+    fn a_recorded_restart_escalation_is_not_a_clean_stop() {
+        let (dir, store) = installed_store("stop-census-1884-escalation");
+        store
+            .persist_kernel_restart_reconciliation(&restart_escalation(MODULE_ID, GENERATION))
+            .expect("the owner writer persists the escalation and the degradation");
+        let read = store.database.begin_read().expect("read transaction opens");
+        let mut builder = CensusBuilder::new();
+        observe_kernel_restart_reconciliations(&read, &mut builder)
+            .expect("the restart-escalation observer reads its own family");
+        observe_generation_lifecycles(&read, &mut builder)
+            .expect("the generation-lifecycle observer reads its own family");
+        assert_eq!(builder.counts.restart_reconciliations, 1);
+        assert_eq!(builder.counts.degraded_generations, 1);
+        assert!(
+            !builder.counts.is_zero(),
+            "a store holding a recorded restart refusal must not report a clean stop"
+        );
+        assert_eq!(builder.counts.total().expect("total is representable"), 2);
+        drop(read);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// POSITIVE: a recorded generation DEGRADATION blocks a clean stop on its
+    /// own, with no escalation row present.
+    ///
+    /// The lifecycle row is placed directly rather than through the refusal
+    /// writer, because that writer always appends an escalation row too and would
+    /// leave the two families indistinguishable. Only the recorded disposition is
+    /// under test, and `GenerationLifecycleRecord` is the record that owns it.
+    #[test]
+    fn a_degraded_generation_lifecycle_row_is_not_a_clean_stop() {
+        let (dir, store) = installed_store("stop-census-1884-degraded");
+        let record = GenerationLifecycleRecord {
+            schema_version: GENERATION_LIFECYCLE_SCHEMA_VERSION,
+            module_id: MODULE_ID.to_owned(),
+            generation: resource_generation(GENERATION),
+            disposition: GenerationDisposition::Degraded,
+            first_refusal_cause: Some(KernelReconciliationKind::ManifestAbsent),
+            recorded_at_ms: OBSERVED_AT_MS,
+        };
+        record
+            .validate()
+            .expect("the lifecycle fixture satisfies its own shape");
+        let key = format!("{MODULE_ID}::{GENERATION:020}");
+        insert_raw_row(
+            &store,
+            GENERATION_LIFECYCLES,
+            key.as_str(),
+            encode(&record).expect("the lifecycle row encodes").as_str(),
+        );
+        let read = store.database.begin_read().expect("read transaction opens");
+        let mut builder = CensusBuilder::new();
+        observe_generation_lifecycles(&read, &mut builder)
+            .expect("the generation-lifecycle observer reads its own family");
+        assert_eq!(builder.counts.degraded_generations, 1);
+        assert_eq!(
+            builder.counts.restart_reconciliations, 0,
+            "this store holds no escalation row, so the degradation is the only obligation"
+        );
+        assert!(
+            !builder.counts.is_zero(),
+            "a generation recorded degraded must not report a clean stop"
+        );
+        assert_eq!(builder.counts.total().expect("total is representable"), 1);
+        drop(read);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// REFUSAL: an escalation row whose recorded module/generation does not
+    /// match the series it is filed under is corruption, exactly as the sibling
+    /// effect-replay family and every other observer in this census treat a
+    /// misfiled row. The row is placed raw because no owner writer can produce
+    /// one.
+    #[test]
+    fn a_restart_escalation_row_filed_under_another_generation_is_refused() {
+        let (dir, store) = installed_store("stop-census-1884-misfiled");
+        let item = restart_escalation(MODULE_ID, GENERATION);
+        let misfiled_key = format!("{MODULE_ID}::{:020}::00000000000000000000", GENERATION + 1);
+        insert_raw_row(
+            &store,
+            KERNEL_RESTART_RECONCILIATIONS,
+            misfiled_key.as_str(),
+            encode(&item).expect("the escalation row encodes").as_str(),
+        );
+        let read = store.database.begin_read().expect("read transaction opens");
+        let mut builder = CensusBuilder::new();
+        let error = observe_kernel_restart_reconciliations(&read, &mut builder)
+            .expect_err("a misfiled escalation row must fail the census closed");
+        match error {
+            crate::OrsError::IntegrityProblem {
+                record_type,
+                reason,
+            } => {
+                assert_eq!(record_type, "store_stop_restart_reconciliation");
+                assert_eq!(
+                    reason,
+                    "restart reconciliation key does not match its recorded module and generation"
+                );
+            }
+            other => panic!("expected a typed integrity refusal, got {other:?}"),
+        }
+        drop(read);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

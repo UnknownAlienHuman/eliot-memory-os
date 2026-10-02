@@ -12,10 +12,12 @@
 //! `crates/storage/eliot-store-surreal-adapter/tests/epistemic_revision.rs::real_position_cas_exact_replay_and_receipt_readback`
 //! (re-run on this base as the real-Surreal proof) and against the reference
 //! handler by `crates/storage/eliot-store-memory/src/epistemic_tests.rs`.
-//! This file proves the daemon half with the same closed types: the 20-entry
-//! catalogue (11 reads + 8 mutations + genesis), the CEP `position` selector,
-//! the `ApplyEpistemicRevision` closed payload requirement (admitted) versus
-//! `RecordAuthorityRevocation` (still unactivated), the `IdentityConflict`
+//! This file proves the daemon half with the same closed types: the 48-entry
+//! catalogue (23 reads + 24 mutations + genesis), the CEP `position` selector,
+//! the `ApplyEpistemicRevision` closed payload requirement (admitted) and the
+//! issue-#686-activated `RecordAuthorityRevocation` (admitted as a mutation
+//! entry, so an incomplete payload now fails as a typed parameter error rather
+//! than as `UnknownOperation`), the `IdentityConflict`
 //! without-second-revision disposition, and the exact daemon wiring types
 //! (`KernelContextReadClient: CanonicalReadClient`,
 //! `DaemonComposition::epistemic_composition` borrowing canonical +
@@ -69,26 +71,54 @@ fn test_fence() -> TestResult<eliot_store_api::StateFence> {
 fn catalogue_activates_position_read_and_revision_write() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
     // Denominator bound to the producer declaration tables in
-    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 11
-    // activated reads + 8 activated mutations (the eighth mutation is
-    // `ApplyNotificationState` and the eleventh read is
-    // `GetNotificationState`, both admitted by #1780 with handler, schema,
-    // and consumer triple; the seventh mutation remains `ApplyErasure`,
-    // admitted by #1712/PR #1987; the store owner's own count tests in
+    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 23 activated
+    // reads (the `ACTIVATED_READS: [ActivatedReadDescriptor; 23]` declaration,
+    // currently at operation_catalogue.rs:334) + 24 activated mutations (the
+    // `ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24]` declaration,
+    // currently at operation_catalogue.rs:550) + the genesis bootstrap entry
+    // pushed by `generated_operation_manifests` = 48. The store owner's own
+    // count tests in
     // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
-    // already assert 20) + the genesis bootstrap entry. Exact equality: a
-    // silent add or drop must fail here, never pass on a bound.
-    assert_eq!(entries.len(), 20, "11 reads + 8 mutations + genesis");
+    // assert the same 48.
+    //
+    // Recorded drift, stated plainly so a silent "fix" cannot hide it: this
+    // denominator was ALREADY stale before issue #686 activated anything. The
+    // previous comment claimed "11 activated reads + 8 activated mutations +
+    // genesis" and asserted 20, but the declaration tables already held 23
+    // reads and 23 mutations on pristine `main` (base 8b06c460) — 47 entries.
+    // So 12 reads and 15 mutations of drift were pre-existing red debt that
+    // this file's assertion had been failing on since well before #686, and it
+    // is not caused by #686 either. #686 adds exactly ONE of them: the
+    // activated `RecordAuthorityRevocation` mutation row, taking mutations from
+    // 23 to 24 and the total from 47 to 48. Both drift sources are now named
+    // rather than absorbed into a new number.
+    //
+    // The declaration line numbers above were re-measured against the current
+    // content of `operation_catalogue.rs` on this branch. No superseded
+    // citation is being corrected here: the comment these numbers replaced
+    // cited no line numbers at all. The backticked
+    // `ACTIVATED_READS`/`ACTIVATED_MUTATIONS` constructs — not the bare line
+    // numbers — are the stable anchor; re-measure before trusting a number here.
+    //
+    // Exact equality, deliberately still equality and never a bound: a silent
+    // add or drop must fail here, never pass on a bound. Count alone is not
+    // enough to prove which row was added, so the membership assertions below
+    // pin the named operations this delivery depends on.
+    assert_eq!(entries.len(), 48, "23 reads + 24 mutations + genesis");
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     assert!(names.contains(&"GetCurrentEpistemicPosition"));
     assert!(names.contains(&"ApplyEpistemicRevision"));
     assert!(names.contains(&"UpdateTaskState"));
     assert!(names.contains(&"GetEvidencePack"));
-    // The admitted catalogue growth since the 18-entry bound is exactly the
-    // #1780 notification pair — bound here so a different silent add still
-    // fails on the count above.
+    // The #1780 notification pair and the issue-#686 revocation row are each
+    // pinned by name, so a future add-and-drop that keeps the total at 48 still
+    // fails here.
     assert!(names.contains(&"GetNotificationState"));
     assert!(names.contains(&"ApplyNotificationState"));
+    assert!(
+        names.contains(&"RecordAuthorityRevocation"),
+        "issue #686 activates this mutation row; the count above is not a substitute for naming it"
+    );
     let set_digest =
         operation_manifest_set_digest(&entries).map_err(|error| format!("digest: {error}"))?;
     let regenerated =
@@ -156,7 +186,7 @@ fn position_read_requires_its_closed_selector() -> TestResult {
 }
 
 #[test]
-fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult {
+fn revision_write_and_revocation_both_reach_the_closed_parameter_gate() -> TestResult {
     let entries = generated_operation_manifests().map_err(|error| format!("catalogue: {error}"))?;
     let set_digest =
         operation_manifest_set_digest(&entries).map_err(|error| format!("digest: {error}"))?;
@@ -212,6 +242,23 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
         "admitted revision without its closed payload fails as a typed parameter error, never UnknownOperation"
     );
 
+    // Issue #686: `RecordAuthorityRevocation` is no longer known-but-unsupported.
+    // It now has a catalogue row (its own `ActivatedMutationDescriptor` entry in
+    // `ACTIVATED_MUTATIONS` naming
+    // `NamedMutationOperation::RecordAuthorityRevocation`, the row at
+    // operation_catalogue.rs:748-762 with its issue-#686 rationale comment at
+    // operation_catalogue.rs:722-747, `RecoverySchema` class /
+    // `ReversibleMutation` ceiling) and a typed-validation arm (the match arm
+    // routing it to `validate_typed_mutation_parameters`, at
+    // operation_catalogue.rs:1069-1074), so this plan resolves to that
+    // mutation entry instead of failing closed with `UnknownOperation`. The
+    // remaining refusal is the closed seven-field payload: all seven declared
+    // parameters are `required` (`RECORD_AUTHORITY_REVOCATION_PARAMETERS`,
+    // operation_parameters.rs:568-604), and an empty map therefore fails as
+    // `InvalidField { field: "operation.parameter" }` — the same typed
+    // parameter gate the admitted `ApplyEpistemicRevision` arm above exercises.
+    // Asserting that exact error is what proves the row is resolved: it is
+    // neither `Ok` nor `UnknownOperation`.
     let mut revocation = empty_revision.clone();
     revocation.transition_class = eliot_store_api::TransitionClass::RecoverySchema;
     revocation.named_operations = vec![eliot_store_api::NamedMutationRequest {
@@ -220,13 +267,18 @@ fn revision_write_is_admitted_while_revocation_stays_unactivated() -> TestResult
     }];
     // Rebind after mutation: the catalogue check runs `validate()` first,
     // so stale digests would fail as a digest mismatch instead of reaching
-    // the still-unactivated-operation assertion below.
+    // the typed parameter assertion below.
     eliot_store_api::bind_issue18_digests(&mut revocation)
         .map_err(|error| format!("issue-18 digests: {error}"))?;
-    assert_eq!(
-        revocation.validate_against_catalogue(&entries),
-        Err(StoreError::UnknownOperation),
-        "still-unactivated revocation has no catalogue entry"
+    assert!(
+        matches!(
+            revocation.validate_against_catalogue(&entries),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ),
+        "the #686 row resolves to a mutation entry: only its missing payload is refused"
     );
     Ok(())
 }

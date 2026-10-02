@@ -94,11 +94,16 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
-//! source-bound nonrestorable/forensic exclusion with the reason written next to
-//! it; 43 dispositioned families, each bound to at least one table, so none is
-//! excused from having one. A table with no disposition is refused with
+//! transaction as the pages. Counted against the code in this tree: 82 distinct
+//! declared table names (`store.rs`, `store/restore_journal.rs`, `status.rs`),
+//! of which the census names 80 — 46 backing a dispositioned row family and 34
+//! carrying an explicit source-bound nonrestorable/forensic exclusion with the
+//! reason written next to it; 43 dispositioned families, each bound to at least
+//! one table, so none is excused from having one. Two declared names are still
+//! NOT censused (`BRIDGE_EVENT_COMPACTED_RANGES` and `RUNTIME_LEASE_CURRENT`,
+//! `store.rs:882` and `store.rs:257`), so this count is not "every declared table
+//! has an entry" and check 2 still refuses any store whose first write has
+//! materialised either of them. A table with no disposition is refused with
 //! [`OrsError::MigrationRequired`] on all three paths that run —
 //! [`export_page`], [`export_snapshot`] and [`import_page_quarantined`] — so it
 //! cannot be silently exported, imported or counted, and no table disappears
@@ -108,14 +113,19 @@
 //! constants; it is NOT derived from the `TableDefinition::new` declarations, and
 //! nothing in the crate enforces that the two agree. So the live comparison in
 //! check 2 is a real reader that refuses a table the file has and the list does
-//! not — but it only sees a table once some write has MATERIALISED it, and two
-//! of the tables in this count (`CreatedOnFirstWrite`, like the P-06 purge-ledger
-//! pair) exist in no file until their first write. A newly declared table can
-//! therefore still be omitted from the census and stay invisible until a
-//! production write creates it, at which point the fail-closed refusal above
+//! not — but it only sees a table once some write has MATERIALISED it, and every
+//! table absent from `initialize_ors_tables` is `CreatedOnFirstWrite` and exists
+//! in no file until the write that touches it. That is not a theoretical gap in
+//! this tree: the two declared names the census still does not name,
+//! `BRIDGE_EVENT_COMPACTED_RANGES` and `RUNTIME_LEASE_CURRENT`, are both opened
+//! for write only from their own first write paths (`store.rs:20212` and
+//! `store.rs:26781`), so an installation that has certified one compacted range
+//! or persisted one runtime lease has a file check 2 refuses. A newly declared
+//! table can therefore still be omitted from the census and stay invisible until
+//! a production write creates it, at which point the fail-closed refusal above
 //! fires. Making that impossible needs a `macro_rules!` declaration macro so a
 //! table cannot exist without a census entry; that is a separate architectural
-//! change and is deliberately not done here. Do not read "70 of 70" as a
+//! change and is deliberately not done here. Do not read the count above as a
 //! compiler-enforced invariant — it is a measurement, and a new table in
 //! `store.rs` is on its author.
 //!
@@ -914,10 +924,17 @@ struct DispositionedTable {
 /// [`check_row_family_census`] is the only place a literal name appears at all —
 /// and there it comes from redb, not from this file.
 ///
-/// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
-/// row family and 29 are explicit source-bound exclusions.
-/// `row_family_denominator` carries 43 families and every one of them is now bound
+/// Counted against the code in this tree: 82 distinct declared table names in
+/// `store.rs`, `store/restore_journal.rs` and `status.rs`, of which this census
+/// names 80 — 46 back a dispositioned row family and 34 are explicit source-bound
+/// exclusions. Issue #1884 added five of those exclusions with it: the Generation
+/// Registry admission-receipt, lifecycle, revocation-event and delivery-readback
+/// families, and the manifest-side restart-reconciliation family. The remaining
+/// two declared names are NOT censused and this function does not cover them:
+/// `BRIDGE_EVENT_COMPACTED_RANGES` (`store.rs:882`) and `RUNTIME_LEASE_CURRENT`
+/// (`store.rs:257`), neither of which `initialize_ors_tables` materialises, so
+/// neither is named here and neither is refused on a store that has not written
+/// it. `row_family_denominator` carries 43 families and every one of them is bound
 /// to a table by this census.
 ///
 /// That count is a MEASUREMENT, not an enforced invariant, and the difference
@@ -933,8 +950,8 @@ struct DispositionedTable {
 /// here, which is a separate architectural change and deliberately not attempted
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
-/// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// Split so no half can grow past the point where a reader stops checking it:
+/// 46 table-backed tables and 34 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +986,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 46 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -977,7 +994,7 @@ fn family_backed_tables() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The 22 tables backing the canonical operational and recovery row families.
+/// The 23 tables backing the canonical operational and recovery row families.
 fn canonical_family_tables() -> Vec<DispositionedTable> {
     vec![
         family(super::ENVELOPES, RowFamilyKind::Envelopes),
@@ -1050,7 +1067,7 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 17 tables backing the supervision, replay, doctor and retention families.
+/// The 20 tables backing the supervision, replay, doctor and retention families.
 ///
 /// A separate function from [`canonical_family_tables`] only because the whole
 /// census must stay inside one reviewable length; the split is at the
@@ -1142,7 +1159,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The 34 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1151,11 +1168,12 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     let mut tables = owner_state_exclusions();
     tables.extend(projection_family_exclusions());
     tables.extend(effect_replay_family_exclusions());
+    tables.extend(generation_registry_family_exclusions());
     tables.extend(purge_ledger_exclusions());
     tables
 }
 
-/// The six exclusions that are owner state: four re-established by the
+/// The seven exclusions that are owner state: five re-established by the
 /// receiving owner, two superseded or already-committed facts.
 fn owner_state_exclusions() -> Vec<DispositionedTable> {
     vec![
@@ -1413,7 +1431,9 @@ fn effect_replay_family_exclusions() -> Vec<DispositionedTable> {
             "an execution manifest is installation-bound generation authority naming the exact artifact, config and protocol hashes, start command, restart class and accepted Catalog revision a restart reads; recovery must not resurrect it",
         ),
         // A denied replay's durable escalation, keyed
-        // `{module_id}::{generation}::{operation_id}`. It records that a replay
+        // `{module_id}::{generation}::{operation_id}::{attempt}`, where the
+        // attempt ordinal preserves every differing refusal of one operation
+        // identity instead of erasing it. It records that a replay
         // was REFUSED. A restored row would report a refusal this installation
         // never received and suppress the destination's own adjudication of the
         // same operation identity.
@@ -1421,6 +1441,95 @@ fn effect_replay_family_exclusions() -> Vec<DispositionedTable> {
             super::EFFECT_REPLAY_RECONCILIATIONS,
             RowDisposition::ForensicOnly,
             "an effect-replay reconciliation row records that a replay was denied; a restored row reports a refusal this installation never received and would suppress the destination's own adjudication of that operation identity",
+        ),
+    ]
+}
+
+/// The five #1884 Generation Registry tables: the issuer evidence, the lifecycle
+/// owner, its durable refusal escalations and the two current-state readbacks a
+/// restart or an exact effect replay is gated on.
+///
+/// `ForensicOnly` for the same reason as every sibling in
+/// [`effect_replay_family_exclusions`]: none has a durable
+/// `import_*_suspended` path in this crate, so `Restorable` would advertise a
+/// re-import that does not exist, while all five are genuinely records about
+/// this installation's own admitted generations. Each carries its own row
+/// disposition because each would mean something different if it were restored.
+fn generation_registry_family_exclusions() -> Vec<DispositionedTable> {
+    vec![
+        // The canonical Governor Module Catalog admission receipt, keyed by the
+        // receipt's own canonical operation identity. It is the issuer evidence
+        // the manifest ingress reads BEFORE it will write a Generation Registry
+        // manifest row, so a restored receipt would let the destination admit a
+        // generation against an admission it never received.
+        excluded(
+            super::GOVERNOR_ADMISSION_RECEIPTS,
+            RowDisposition::ForensicOnly,
+            "a Governor admission receipt is this installation's issuer evidence that one Module Catalog admission was issued under one canonical operation identity; restoring it would let a manifest ingress verify its seal against an admission the destination never received",
+        ),
+        // The Generation Registry's own lifecycle owner, keyed
+        // `{module_id}::{generation:020}`. Absence is deliberately not
+        // `Undegraded`, so this row is the only thing that admits a launch, a
+        // route or a new effect operation lease; a restored disposition would
+        // answer for a refusal this installation never observed.
+        excluded(
+            super::GENERATION_LIFECYCLES,
+            RowDisposition::ForensicOnly,
+            "a generation lifecycle row is this installation's current record of whether one generation may be launched, routed or issued a new effect lease; restoring it would report a disposition observed for a manifest refusal this installation never received",
+        ),
+        // The durable escalation a refused restart appends beside that lifecycle
+        // disposition, in the same write transaction and ordered after it. It has
+        // TWO key forms and a census entry has to name both, because a reader that
+        // honoured only the first would silently read a generation whose only
+        // refusal was recorded before the append discipline as never refused:
+        //
+        //   * the appended series `{module_id}::{generation:020}::{attempt:020}`,
+        //     where `module_id` is the escaped component `encode_key_component`
+        //     produces (it escapes only `%` and `:`, so `::` is an unambiguous
+        //     delimiter), `generation` and `attempt` are zero-padded decimals, and
+        //     `attempt` is the next free ordinal under the series prefix
+        //     `{module_id}::{generation:020}::` — so a differently-caused second
+        //     refusal of one generation appends beside the first and never
+        //     replaces it; and
+        //   * the exact pre-append key `{module_id}::{generation:020}`, with no
+        //     trailing `::` and no ordinal. It is a STRICT PREFIX of that series
+        //     prefix, and in redb's byte-ordered key space a strict prefix sorts
+        //     before every one of its extensions, so a `range(series_prefix..)`
+        //     scan can never return it; it is probed with an exact `get()` instead,
+        //     and is only read and identity-checked — never rewritten, re-keyed or
+        //     deleted.
+        //
+        // The row is the same `KernelReconciliationItem` payload the
+        // `EFFECT_REPLAY_RECONCILIATIONS` sibling stores, but a restart is not an
+        // effect replay: these items name no operation identity and no lease, so
+        // this family is not that family's series and the two cannot be read as one
+        // another's attempt ordinals. A restart refusal is durable escalation
+        // evidence about a past event and is what the generation's recorded
+        // lifecycle disposition and recorded restart ceiling are both read
+        // against.
+        excluded(
+            super::KERNEL_RESTART_RECONCILIATIONS,
+            RowDisposition::ForensicOnly,
+            "a manifest-side restart reconciliation row records that a restart was refused for one generation, appended under a per-attempt series key so a later differently-caused refusal never erases an earlier one; a restored row reports a refusal this installation never received and would answer both the destination's own generation lifecycle and its recorded restart ceiling for a degradation it never observed",
+        ),
+        // The observed revocation event of one effect operation lease, keyed by
+        // the lease identity. It is the readback the effect replay gate
+        // consults instead of a literal, so a restored acknowledgement would be
+        // this installation's revocation observation gating an effect in the
+        // destination.
+        excluded(
+            super::EFFECT_REVOCATION_EVENTS,
+            RowDisposition::ForensicOnly,
+            "an observed revocation event records the revocation state this installation observed for one exact leased operation; a restored acknowledgement would stand in for a revocation the destination never observed",
+        ),
+        // The observed delivery acknowledgement of one effect operation lease,
+        // keyed by the lease identity, and the readback the effect replay gate
+        // consults for the current delivery state. A restored row would report
+        // an effect outcome this installation never observed.
+        excluded(
+            super::EFFECT_DELIVERY_RECORDS,
+            RowDisposition::ForensicOnly,
+            "an observed delivery acknowledgement records the delivery outcome this installation observed for one exact leased operation; a restored row would report an effect outcome the destination never observed",
         ),
     ]
 }
@@ -1521,7 +1630,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus an 80-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///
@@ -3695,15 +3804,20 @@ fn snapshot_completeness(
 /// pre-existing and unchanged in kind by this issue; the two-transaction witness
 /// that existed before behaved identically. It is recorded here because a witness
 /// described without its scope is the same defect as a witness that cannot fire.
-/// The 28 tables the census excludes with a written nonrestorable/forensic reason
+/// The 34 tables the census excludes with a written nonrestorable/forensic reason
 /// are consequently outside BOTH the denominator and this witness. That is the
 /// correct result for a table with no import path, and it is now a DECIDED
 /// exclusion rather than the old A5 gap: an earlier version of this comment
 /// described `RowFamilyKind` enumerating 41 families while roughly 20 physical
 /// tables had no disposition at all, which was true then and is no longer true.
-/// Every declared table now has a disposition, so a table can be outside the
-/// denominator only by a written decision recorded in
-/// [`dispositioned_tables`].
+/// A censused table can therefore be outside the denominator only by a written
+/// decision recorded in [`dispositioned_tables`]. A table that is declared but NOT
+/// censused is a different case and is not covered by that sentence:
+/// `BRIDGE_EVENT_COMPACTED_RANGES` and `RUNTIME_LEASE_CURRENT` are declared and
+/// are in neither list, so they are outside the denominator, outside this
+/// witness, and invisible to check 2 until some write materialises them in a
+/// file — at which point check 2 refuses the export rather than exporting around
+/// them.
 ///
 /// ASSUMPTION: the capture's wall-clock stamp comes from the store's own
 /// `current_unix_ms()` (a `SystemTime` read). I05-16 lists `created_at`,
@@ -4343,4 +4457,144 @@ pub(super) fn reconcile_lost_import_response(
             },
         };
     replayed
+}
+
+/// Issue #1884: a stored manifest-side restart escalation is expressible evidence,
+/// not corruption.
+///
+/// `KERNEL_RESTART_RECONCILIATIONS` is materialized empty on every open, so it is
+/// present in EVERY store's file from the first open. A census entry that failed
+/// to name it would therefore make check 2 of [`check_row_family_census`] refuse
+/// every export of every installation — and the table holding a row is exactly the
+/// case an operator must still be able to back up. This is the proof that
+/// [`export_snapshot`] succeeds on a store that holds a legitimate escalation.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test fixtures use unwrap/expect; production lints remain -D warnings"
+)]
+mod tests {
+    use std::path::PathBuf;
+
+    use eliot_contracts::ResourceGeneration;
+
+    use super::super::RedbRecoveryStore;
+    use super::*;
+    use crate::KernelReconciliationKind;
+    use crate::backup_snapshot::{OrsBackupFence, OrsBackupSourceIdentity};
+    use crate::test_support::kernel_fixture_dir;
+
+    const INSTALLATION_ID: &str = "installation-ors-1884-backup";
+    const MODULE_ID: &str = "module-ors-1884-backup";
+    const GENERATION: u64 = 3;
+    const OBSERVED_AT_MS: i64 = 1_700_000_000_000;
+
+    /// Opens one installed ORS under a unique temp root.
+    ///
+    /// The installation identity is bound because `check_export_fence` compares
+    /// the request's declared source identity against the DURABLE store-object
+    /// identity; an unbound database has none for the comparison to succeed on.
+    fn installed_store(tag: &str) -> (PathBuf, RedbRecoveryStore) {
+        let dir = kernel_fixture_dir(tag).expect("unique fixture temp root");
+        let (store, _identity) =
+            RedbRecoveryStore::open_for_installation(dir.join("ors.redb"), INSTALLATION_ID)
+                .expect("installed store opens");
+        (dir, store)
+    }
+
+    fn resource_generation(value: u64) -> ResourceGeneration {
+        ResourceGeneration::new(value).expect("non-zero generation")
+    }
+
+    /// The restart escalation a missing manifest produces. No manifest is admitted
+    /// in this store, so `record_refusal_in_generation_lifecycle` degrades the
+    /// generation rather than quarantining it: quarantine needs a recorded
+    /// manifest's own rule, and this store has none.
+    fn restart_escalation() -> crate::KernelReconciliationItem {
+        crate::KernelReconciliationItem {
+            kind: KernelReconciliationKind::ManifestAbsent,
+            module_id: MODULE_ID.to_owned(),
+            generation: resource_generation(GENERATION),
+            bound_manifest_sha256: None,
+            recorded_manifest_sha256: None,
+            lease_id: None,
+            operation_id: None,
+            observed_at_ms: OBSERVED_AT_MS,
+        }
+    }
+
+    /// The request a caller would really present, bound to the store's OWN
+    /// observed fence: `check_export_fence` compares the declared high-water and
+    /// the durable store-object identity instead of transcribing them, so a
+    /// fixture has to read both back rather than invent them.
+    fn observed_request(store: &RedbRecoveryStore) -> OrsBackupRequest {
+        let read = store.database.begin_read().expect("read transaction opens");
+        let observation = capture_store_fence(&read).expect("the owner fence is observed");
+        drop(read);
+        // The observed identity is REQUIRED here, never defaulted: a store whose
+        // own object identity records no installation cannot state a backup
+        // source, so the fixture asserts the fact rather than inventing one.
+        let installation_id = observation
+            .store_identity
+            .installation_id
+            .clone()
+            .expect("1884: the observed store identity names its installation");
+        let source = OrsBackupSourceIdentity::new(
+            installation_id,
+            observation.store_identity.ors_generation,
+            BACKUP_SNAPSHOT_SCHEMA_VERSION,
+        )
+        .expect("the observed identity is a valid backup source");
+        let fence = OrsBackupFence::new(
+            crate::model::sha256_hex(b"eliot.ors.backup-1884.test-fence"),
+            observation.high_water_order,
+            crate::store::current_unix_ms().expect("the store clock reads"),
+        )
+        .expect("the observed fence binds");
+        OrsBackupRequest::new(source, fence, 0, 8, MAX_BACKUP_BYTES, 4)
+            .expect("the observed request binds")
+    }
+
+    /// A stored manifest-side restart escalation does not make a snapshot
+    /// inexpressible.
+    ///
+    /// `KERNEL_RESTART_RECONCILIATIONS` is materialized empty on every open, so it
+    /// is present in every store's file from the first open. A census that failed
+    /// to name it would make check 2 of [`check_row_family_census`] refuse the
+    /// export with [`OrsError::MigrationRequired`] — and a row's existence is not
+    /// corruption, so the refusal must not depend on whether one is stored. The
+    /// row is written through the owner writer, so it is exactly the evidence a
+    /// production refusal produces, and the export is required to carry on.
+    ///
+    /// What it does NOT do is export the row: the family is a `ForensicOnly`
+    /// exclusion outside the denominator, so the escalation is preserved evidence
+    /// that confers no restore path, which is the disposition
+    /// [`generation_registry_family_exclusions`] records for it.
+    #[test]
+    fn export_snapshot_accepts_a_store_holding_a_restart_escalation() {
+        let (dir, store) = installed_store("backup-1884-escalation");
+        store
+            .persist_kernel_restart_reconciliation(&restart_escalation())
+            .expect("the owner writer persists the escalation");
+        {
+            // Named on its own so a census refusal is reported as a census refusal
+            // rather than as "the export failed for some reason".
+            let read = store.database.begin_read().expect("read transaction opens");
+            check_row_family_census(&read)
+                .expect("a stored escalation row must not refuse the row-family census");
+        }
+        let request = observed_request(&store);
+        let snapshot = export_snapshot(&store.database, &request)
+            .expect("a stored escalation must not make a snapshot inexpressible");
+        snapshot
+            .validate()
+            .expect("the exported snapshot satisfies its own contract");
+        assert!(
+            !snapshot.pages.is_empty(),
+            "an accepted export still has to carry the page it read"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
