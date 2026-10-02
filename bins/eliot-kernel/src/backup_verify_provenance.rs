@@ -369,29 +369,32 @@ impl BackupProvenanceError {
 /// `Verification` absent here is a shape refusal at the route's existing
 /// admission seam, not a `None` this type tolerates.
 ///
-/// # WHY THE INLINE ARM STILL EXISTS, AND WHY BYTES STAY BESIDE THE HANDLE
+/// # WHY THE INLINE ARM STILL EXISTS, AND WHY NO BYTES RIDE BESIDE THE HANDLE
 ///
 /// Acceptance requires that a self-consistent inline bundle WITHOUT retained
 /// publication or capture evidence stays a durably replayable structural
 /// candidate, and the operator surface still presents exactly that. So the
 /// payload is a CLOSED TWO-ARM UNION keyed on whether the protocol request is
 /// present: `{bundle_hex}` / `{bundle_hex, successor_of}` is the inline arm and
-/// never reaches this type, and `{bundle_hex, verification}` /
-/// `{bundle_hex, successor_of, verification}` is this one.
+/// never reaches this type, and `{verification}` / `{successor_of,
+/// verification}` is this one — EXACTLY this type's two members and nothing
+/// else, because this type is `deny_unknown_fields` and decodes from the whole
+/// payload object.
 ///
-/// The bytes stay beside the handle rather than being resolved through an owner,
-/// and that is the honest arrangement rather than a shortcut. `bundle_hex` is
-/// read at the route's EXISTING bounded-lowercase-hex seam with its existing
-/// bound, so nothing about the wire spelling changes; and a frame that presents
-/// bytes beside a handle gains nothing it did not already have, because the
-/// adapter requires the request's `handle.content_sha256` and
-/// `handle.byte_length` to BE exactly the presented archive and the pre-verdict
-/// gate then requires the OWNER to have issued that same handle together with
-/// the capture operation, the receipt and both authenticated roles. A request
-/// whose handle is for other content, other bytes, another archive identity,
-/// another class, another source, another owner contract or another authority
-/// fence refuses, and a request with no owner evidence behind it refuses too — so
-/// a handle can never be decorative and caller bytes can never stand in for one.
+/// That closedness is not cosmetic. `bundle_hex` used to be admitted on this arm
+/// alongside `verification`, which was the parallel shape item I2 exists to
+/// remove (a caller-supplied stand-in for bytes an owner-issued handle is meant
+/// to stand for) and which also made the arm unreachable: every protocol frame
+/// was refused by the wrapper's own `deny_unknown_fields` with
+/// `unknown field 'bundle_hex'`, before the request ever reached
+/// [`super::backup_verify_admission::check_admission_binding`], the owner-name
+/// refusal, or this file's gate. A handle can never be decorative here, and a
+/// caller can never stand bytes in for one: the handle's bytes are the retained
+/// owner's to resolve, and the adapter requires the request's
+/// `handle.content_sha256` and `handle.byte_length` to BE the resolved archive
+/// while the pre-verdict gate requires the OWNER to have issued that same handle
+/// together with the capture operation, the receipt and both authenticated
+/// roles.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BackupVerifyAdmittedRequest {

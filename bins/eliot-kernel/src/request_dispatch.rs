@@ -129,12 +129,17 @@
 //!   non-owner from the operation it wants to read. The verify payload is therefore
 //!   a CLOSED TWO-ARM UNION keyed on whether the EXISTING protocol
 //!   `BackupArchiveVerification` is present: `{bundle_hex}` /
-//!   `{bundle_hex, successor_of}` is the inline arm, and `{bundle_hex,
-//!   verification}` / `{bundle_hex, successor_of, verification}` is the protocol
+//!   `{bundle_hex, successor_of}` is the inline arm, and `{verification}` /
+//!   `{successor_of, verification}` is the protocol
 //!   arm, whose request is admitted verbatim through the one closed wrapper
 //!   `backup_verify_provenance::BackupVerifyAdmittedRequest` and mapped into the
 //!   accepted ORS identity by the exhaustive checked adapter
-//!   `backup_verify_provenance::bind_protocol_request`. The inline arm carries no
+//!   `backup_verify_provenance::bind_protocol_request`. The protocol arm carries
+//!   NO caller bytes: its retained handle names bytes that the retained-archive
+//!   owner resolves, so a `bundle_hex` beside it would be the caller-supplied
+//!   stand-in for an owner-issued handle that I2 removes (and, because the
+//!   wrapper is `deny_unknown_fields` over exactly the two members above, such a
+//!   key made every protocol frame undecodable). The inline arm carries no
 //!   protocol request and therefore can never reach a provenance-qualified verdict
 //!   (#2862 I2). The protocol arm is admitted in full — decoded through that
 //!   wrapper and validated by the protocol's own `BackupArchiveVerification::validate`
@@ -2664,20 +2669,44 @@ impl PriorVerification {
 ///   never reach a provenance-qualified verdict. It is what the operator surface
 ///   has always sent and it is what acceptance requires to stay a durably
 ///   replayable structural candidate;
-/// - the PROTOCOL arm carries `bundle_hex` AND the EXISTING
-///   `BackupArchiveVerification`, embedded verbatim by
-///   [`BackupVerifyAdmittedRequest`]. The protocol request is REQUIRED once its
-///   key appears — it is never admitted as an absent or defaulted member — and
-///   the bytes beside it are the bytes the request's handle must equal, checked
-///   by exact digest and length in `super::backup_verify_provenance`.
+/// - the PROTOCOL arm carries ONLY the EXISTING `BackupArchiveVerification`,
+///   embedded verbatim by [`BackupVerifyAdmittedRequest`]. The protocol request is
+///   REQUIRED once its key appears — it is never admitted as an absent or
+///   defaulted member — and it carries NO caller bytes: the bytes its retained
+///   handle names come from the retained-archive owner, and a `bundle_hex` beside
+///   it would be exactly the caller-supplied stand-in for an owner-issued handle
+///   that item I2 removes. `super::backup_verify_provenance` checks the resolved
+///   bytes against the handle by exact digest and length once an owner can
+///   resolve them.
 ///
 /// `successor_of` rides on either arm, so four key sets are admitted and nothing
 /// else. `require_exact_keys` refuses any other key, so an unknown member is a
-/// shape refusal rather than an ignored field.
+/// shape refusal rather than an ignored field — and on the protocol arm that
+/// closedness is load-bearing rather than merely tidy, because
+/// `BackupVerifyAdmittedRequest` decodes from the whole payload object and
+/// refuses a key it does not own.
 const VERIFY_INLINE_KEYS: &[&str] = &["bundle_hex"];
 const VERIFY_INLINE_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of"];
-const VERIFY_PROTOCOL_KEYS: &[&str] = &["bundle_hex", "verification"];
-const VERIFY_PROTOCOL_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of", "verification"];
+// #2862: the protocol arm's admitted key set is EXACTLY the two members its own
+// closed wrapper owns — `verification` and `successor_of` — and nothing else.
+//
+// `bundle_hex` was on this list before, and that was the parallel shape item I2
+// exists to remove, with a second-order consequence that made the whole arm
+// dead: `BackupVerifyAdmittedRequest` is `deny_unknown_fields` and owns exactly
+// `verification` and `successor_of`, so decoding the payload object into it
+// failed on `unknown field 'bundle_hex'` for EVERY protocol-arm frame. The arm
+// therefore never reached its own refusal, `answer_verify_protocol_arm` was
+// never called, `check_admission_binding` was never called, and
+// `bind_protocol_request` was never called — every measured "unreachable in
+// production" statement about this route traced back to this one key.
+//
+// A caller-presented `bundle_hex` beside an owner-issued handle is exactly the
+// substitution I2 forbids: it lets the caller supply the very bytes the handle
+// is meant to stand for. The bytes the retained handle names come from the
+// retained-archive owner, so this arm carries no bytes and the operator surface's
+// inline arm is untouched.
+const VERIFY_PROTOCOL_KEYS: &[&str] = &["verification"];
+const VERIFY_PROTOCOL_SUCCESSOR_KEYS: &[&str] = &["verification", "successor_of"];
 
 /// One admitted `backup.verify` request (issue #2862, item I2).
 ///
@@ -2713,7 +2742,7 @@ enum AdmittedVerifyBundle {
     /// The admitted protocol verification request; its handle is unresolved.
     Protocol {
         /// The EXISTING protocol request, embedded verbatim.
-        request: BackupVerifyAdmittedRequest,
+        request: Box<BackupVerifyAdmittedRequest>,
     },
 }
 
@@ -2903,6 +2932,60 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, VerifyAd
             reason,
         });
     }
+    // #2862: the PROTOCOL arm is decided FIRST and decoded without `bundle_hex`.
+    // `BackupVerifyAdmittedRequest` is `deny_unknown_fields` over exactly
+    // `verification` and `successor_of`, so the payload object can only be
+    // decoded into it when it carries those members and nothing else. Reading
+    // `bundle_hex` on this arm — as the previous key sets required — both made
+    // the arm a caller-bytes-beside-an-owner-handle shape (the parallel shape I2
+    // removes) and, because the decode is closed, refused every protocol frame
+    // with `unknown field 'bundle_hex'` before the arm reached any of its own
+    // decisions. The retained handle's bytes come from the retained-archive
+    // owner; the caller does not supply them here.
+    //
+    // The INLINE arm below is deliberately left in its original order — bytes
+    // first, succession pointer second — so the operator surface's arm keeps the
+    // exact refusal precedence it has always had.
+    if object.contains_key("verification") {
+        let successor = admit_verify_successor(object)?;
+        // A malformed protocol request is the CALLER's mistake and is refused as
+        // a shape failure naming the payload member — including a `null` for a
+        // required field and an unknown key nested inside the request, both of
+        // which `deny_unknown_fields` and the protocol's own `validate()` reject.
+        let request: BackupVerifyAdmittedRequest =
+            serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+                VerifyAdmissionRefusal::Shape {
+                    field: "backup.verification",
+                    reason: format!("is not an admitted archive-verification request: {error}"),
+                }
+            })?;
+        // The succession pointer the route admitted and the one the closed
+        // wrapper decoded are checked for agreement rather than assumed: the route
+        // reads the two digests through its own 64-hex shape check and the
+        // wrapper reads them through serde, so requiring the decoded value to BE
+        // the admitted one is what stops a frame from being admitted on one
+        // reading of its succession evidence and answered on another.
+        if request.successor_of != successor {
+            return Err(VerifyAdmissionRefusal::Shape {
+                field: "backup.successor_of",
+                reason: "does not match the admitted succession pointer".to_owned(),
+            });
+        }
+        request
+            .verification
+            .validate()
+            .map_err(|error| VerifyAdmissionRefusal::Shape {
+                field: "backup.verification",
+                reason: format!("is not a valid archive-verification request: {error}"),
+            })?;
+        // A WELL-FORMED protocol request is ADMITTED here and decided in
+        // `handle_backup_verify`: first against the admission receipt this boundary
+        // issues for it, then against the absent retained-archive owner. See this
+        // function's docs for why those two steps are not here.
+        return Ok(AdmittedVerifyBundle::Protocol {
+            request: Box::new(request),
+        });
+    }
     let bundle_hex = match get_str(object, "bundle_hex") {
         Ok(bundle_hex) => bundle_hex,
         Err(reason) => {
@@ -2927,36 +3010,10 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, VerifyAd
             reason: "bundle bytes must be non-empty".to_owned(),
         });
     }
-    let successor = admit_verify_successor(object)?;
-    if !object.contains_key("verification") {
-        return Ok(AdmittedVerifyBundle::Inline {
-            bundle_raw,
-            successor,
-        });
-    }
-    // A malformed protocol request is the CALLER's mistake and is refused as a
-    // shape failure naming the payload member — including a `null` for a
-    // required field and an unknown key nested inside the request, both of which
-    // `deny_unknown_fields` and the protocol's own `validate()` reject here.
-    let request: BackupVerifyAdmittedRequest =
-        serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
-            VerifyAdmissionRefusal::Shape {
-                field: "backup.verification",
-                reason: format!("is not an admitted archive-verification request: {error}"),
-            }
-        })?;
-    request
-        .verification
-        .validate()
-        .map_err(|error| VerifyAdmissionRefusal::Shape {
-            field: "backup.verification",
-            reason: format!("is not a valid archive-verification request: {error}"),
-        })?;
-    // A WELL-FORMED protocol request is ADMITTED here and decided in
-    // `handle_backup_verify`: first against the admission receipt this boundary
-    // issues for it, then against the absent retained-archive owner. See this
-    // function's docs for why those two steps are not here.
-    Ok(AdmittedVerifyBundle::Protocol { request })
+    Ok(AdmittedVerifyBundle::Inline {
+        bundle_raw,
+        successor: admit_verify_successor(object)?,
+    })
 }
 
 /// Answers the retained-archive arm of `backup.verify`, in the only two ways it
@@ -5216,4 +5273,296 @@ fn correlated_backup_reply(
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok(frame)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod verify_admission_tests {
+    //! Proofs for the CLOSED TWO-ARM `backup.verify` payload admission
+    //! (issue #2862, item I2).
+    //!
+    //! # THE DEFECT THESE EXIST FOR
+    //!
+    //! The protocol arm's admitted key set required `bundle_hex`, while the closed
+    //! wrapper it decodes into ([`super::BackupVerifyAdmittedRequest`]) is
+    //! `deny_unknown_fields` over exactly `verification` and `successor_of`. Every
+    //! protocol-arm frame was therefore refused by the wrapper's own closedness
+    //! with `unknown field 'bundle_hex'`, before the arm reached its admission
+    //! receipt check, its owner-name refusal, or the ORS request-identity adapter.
+    //! That is why every earlier report measured this arm as "unreachable in
+    //! production": it was, and the cause was one key on one list.
+    //!
+    //! # WHY EACH PROOF FAILS WITHOUT THE CHANGE
+    //!
+    //! - `protocol_arm_reaches_the_wrapper_decode` fails before the fix: the key set
+    //!   demanded a `bundle_hex` the wrapper cannot hold, so a correctly-shaped
+    //!   protocol payload was refused as a malformed ENVELOPE.
+    //! - `protocol_arm_refuses_caller_bytes_beside_the_handle` fails before the fix:
+    //!   the arm ADMITTED `bundle_hex` beside an owner-issued handle, which is the
+    //!   caller-supplied stand-in for owner-issued bytes that I2 removes.
+    //! - `the_two_arms_admit_disjoint_keys` fails before the fix: `bundle_hex` was on
+    //!   both arms' key sets, so the union was one shape with an optional member.
+    //! - `inline_arm_*` are the regression guards for the arm every production
+    //!   caller uses, and they pass both before and after by design.
+
+    use serde_json::{Value, json};
+
+    use super::{
+        AdmittedVerifyBundle, BACKUP_VERIFY_MISSING_OWNER, VERIFY_INLINE_KEYS,
+        VERIFY_INLINE_SUCCESSOR_KEYS, VERIFY_PROTOCOL_KEYS, VERIFY_PROTOCOL_SUCCESSOR_KEYS,
+        VerifyAdmissionRefusal, admit_verify_successor, admit_verify_bundle,
+    };
+
+    /// The smallest payload that reaches the closed wrapper's own decode: the
+    /// wire envelope without its required members, so the protocol owner's
+    /// `validate()` is what refuses it.
+    ///
+    /// Deliberately incomplete. These proofs measure that the ARM is reached and
+    /// that the refusal is the payload's own; they never claim a placeholder is an
+    /// admitted request. `refusal_field` reports which payload member a refusal
+    /// names, so the assertions read the typed refusal rather than a string.
+    fn incomplete_protocol_payload(with_successor: bool) -> Value {
+        let mut payload = json!({
+            "verification": {
+                "wire_id": "eliot.protocol.backup.archive-verification",
+                "wire_version": 1
+            }
+        });
+        if with_successor {
+            payload["successor_of"] = json!({
+                "predecessor_identity_digest": "aa".repeat(32),
+                "predecessor_namespace_digest": "bb".repeat(32),
+            });
+        }
+        payload
+    }
+
+    /// The stable field path a typed refusal names, read off the variant rather
+    /// than re-derived, so a proof cannot pass by matching a formatted sentence.
+    fn refusal_field(refusal: &VerifyAdmissionRefusal) -> &str {
+        match refusal {
+            VerifyAdmissionRefusal::Shape { field, .. } => field,
+            VerifyAdmissionRefusal::RetainedOwnerAbsent { reason, .. } => reason,
+        }
+    }
+
+    /// The bounded reason a typed refusal carries, for the assertions that are
+    /// about WHICH rule refused rather than which member it names.
+    fn refusal_reason(refusal: &VerifyAdmissionRefusal) -> &str {
+        match refusal {
+            VerifyAdmissionRefusal::Shape { reason, .. } => reason,
+            VerifyAdmissionRefusal::RetainedOwnerAbsent { reason, .. } => reason,
+        }
+    }
+
+    /// POSITIVE. A protocol payload shaped exactly like the closed wrapper is
+    /// ADMITTED onto the protocol arm and refused only by the protocol owner's own
+    /// validators, never as a malformed envelope.
+    ///
+    /// Fails before the fix with `required payload field 'bundle_hex' is missing`
+    /// on `backup.verify`.
+    #[test]
+    fn protocol_arm_reaches_the_wrapper_decode() {
+        let refusal = admit_verify_bundle(&incomplete_protocol_payload(false))
+            .expect_err("an incomplete request is refused, but by the protocol owner");
+        assert_eq!(
+            refusal_field(&refusal),
+            "backup.verification",
+            "the wrapper's own decode and validators must be what refuses, not the \
+             envelope admission; got {refusal_field(&refusal)}"
+        );
+    }
+
+    /// The two arms are decided by the SAME predicate and neither falls back to
+    /// the other: a payload carrying `verification` is never read as inline bytes,
+    /// and one without it is never read as a protocol request.
+    #[test]
+    fn the_arm_is_chosen_by_the_protocol_request_key() {
+        // Inline: no `verification`, so the bytes are the request.
+        assert!(matches!(
+            admit_verify_bundle(&json!({ "bundle_hex": "00ff" })),
+            Ok(AdmittedVerifyBundle::Inline { .. })
+        ));
+        // Protocol: `verification` present, so the bytes-bearing arm is not a legal
+        // reading — the refusal names the request, which proves the arm was chosen.
+        assert_eq!(
+            refusal_field(
+                &admit_verify_bundle(&incomplete_protocol_payload(false))
+                    .expect_err("the placeholder request is refused")
+            ),
+            "backup.verification"
+        );
+    }
+
+    /// REFUSAL. Caller-presented bytes beside an owner-issued handle are refused.
+    ///
+    /// This is the parallel shape item I2 removes: it lets a caller supply the very
+    /// bytes the handle is meant to stand for. Fails before the fix, where the
+    /// protocol arm's key set REQUIRED `bundle_hex` and so admitted this payload.
+    #[test]
+    fn protocol_arm_refuses_caller_bytes_beside_the_handle() {
+        let mut payload = incomplete_protocol_payload(false);
+        payload["bundle_hex"] = json!("00ff");
+        let refusal = admit_verify_bundle(&payload)
+            .expect_err("caller bytes beside an owner-issued handle must be refused");
+        assert_eq!(
+            refusal_field(&refusal),
+            "backup.verify",
+            "an unexpected member is an envelope failure, refused before any decode"
+        );
+    }
+
+    /// The protocol arm with its succession pointer is admitted on the same closed
+    /// terms, and the pointer the route shape-checked is the pointer the wrapper
+    /// carries.
+    ///
+    /// The route reads both digests through its own 64-hex shape check and the
+    /// wrapper reads them through serde; requiring the decoded pointer to BE the
+    /// admitted one is what makes those two readings one value rather than two.
+    #[test]
+    fn protocol_arm_admits_its_successor_pointer() {
+        let admitted = admit_verify_successor(
+            incomplete_protocol_payload(true)
+                .as_object()
+                .expect("the payload is an object"),
+        )
+        .expect("two well-formed 64-hex digests are admitted");
+        assert_eq!(
+            admitted,
+            Some(super::BackupVerifySuccessorPointer {
+                predecessor_identity_digest: "aa".repeat(32),
+                predecessor_namespace_digest: "bb".repeat(32),
+            }),
+            "the pointer the route admits must be the one it will answer from"
+        );
+    }
+
+    /// A malformed succession pointer is refused on EITHER arm, and it is the
+    /// CALLER's payload in both cases. `successor_of` rides on both arms, so
+    /// moving the protocol arm ahead of the byte read must not have moved its
+    /// shape check behind anything that would answer it differently.
+    #[test]
+    fn a_malformed_successor_pointer_is_refused_on_either_arm() {
+        let mut inline = json!({ "bundle_hex": "00ff" });
+        inline["successor_of"] = json!({
+            "predecessor_identity_digest": "not-a-digest",
+            "predecessor_namespace_digest": "bb".repeat(32)
+        });
+        let mut protocol = incomplete_protocol_payload(false);
+        protocol["successor_of"] = json!({
+            "predecessor_identity_digest": "not-a-digest",
+            "predecessor_namespace_digest": "bb".repeat(32)
+        });
+        for payload in [inline, protocol] {
+            let refusal = admit_verify_bundle(&payload)
+                .expect_err("a succession pointer that is not two 64-hex digests must be refused");
+            assert_eq!(
+                refusal_field(&refusal),
+                "backup.successor_of",
+                "the refusal must name the succession pointer on either arm"
+            );
+        }
+    }
+
+    /// REGRESSION GUARD. The INLINE arm is untouched: the operator surface sends
+    /// `{bundle_hex}` and nothing else, and it must still be admitted with its
+    /// bytes and with no protocol request.
+    #[test]
+    fn inline_arm_admits_its_bytes_and_no_request() {
+        match admit_verify_bundle(&json!({ "bundle_hex": "00ff" }))
+            .expect("the inline arm the operator surface sends is still admitted")
+        {
+            AdmittedVerifyBundle::Inline {
+                bundle_raw,
+                successor,
+            } => {
+                assert_eq!(bundle_raw, vec![0x00, 0xff]);
+                assert!(
+                    successor.is_none(),
+                    "no successor pointer was presented, so none may be admitted"
+                );
+            }
+            AdmittedVerifyBundle::Protocol { .. } => {
+                panic!("a payload with no `verification` must be the inline arm")
+            }
+        }
+    }
+
+    /// REGRESSION GUARD. The inline arm still requires its bytes, still refuses
+    /// empty ones, and still reads them at the existing bounded hex seam — the fix
+    /// removed a requirement from the PROTOCOL arm and must not have relaxed this
+    /// one.
+    #[test]
+    fn inline_arm_still_requires_non_empty_bytes() {
+        // (payload, the bounded reason that rule must produce)
+        for (payload, expected) in [
+            // absent bytes: the route's own required-member rule
+            (json!({}), "bundle_hex"),
+            // present but empty: the route's own non-empty rule
+            (json!({ "bundle_hex": "" }), "non-empty"),
+            // present but not lowercase hex: the existing bounded hex seam
+            (json!({ "bundle_hex": "zz" }), "even-length lowercase hex"),
+        ] {
+            let refusal =
+                admit_verify_bundle(&payload).expect_err("the inline arm's refusals stand");
+            assert_eq!(
+                refusal_field(&refusal),
+                "backup.bundle_hex",
+                "every inline-arm byte refusal names the byte member"
+            );
+            assert!(
+                refusal_reason(&refusal).contains(expected),
+                "expected {expected:?} in {:?}",
+                refusal_reason(&refusal)
+            );
+        }
+    }
+
+    /// The two arms' key sets are DISJOINT, which is what makes this a union of two
+    /// closed shapes rather than one shape with an optional member.
+    ///
+    /// Fails before the fix, where `bundle_hex` was on both arms' lists.
+    #[test]
+    fn the_two_arms_admit_disjoint_keys() {
+        for protocol_key in VERIFY_PROTOCOL_KEYS
+            .iter()
+            .chain(VERIFY_PROTOCOL_SUCCESSOR_KEYS)
+        {
+            assert!(
+                !VERIFY_INLINE_KEYS.contains(protocol_key)
+                    && !VERIFY_INLINE_SUCCESSOR_KEYS.contains(protocol_key),
+                "{protocol_key} is admitted on both arms, so this is one shape with an \
+                 optional member rather than two closed arms"
+            );
+        }
+        for inline_key in VERIFY_INLINE_KEYS.iter().chain(VERIFY_INLINE_SUCCESSOR_KEYS) {
+            assert!(
+                !VERIFY_PROTOCOL_KEYS.contains(inline_key)
+                    && !VERIFY_PROTOCOL_SUCCESSOR_KEYS.contains(inline_key),
+                "{inline_key} is admitted on both arms"
+            );
+        }
+        // And each arm's key set is exactly its own closed type's members: the
+        // wrapper owns `verification` and `successor_of` and nothing else.
+        assert_eq!(VERIFY_PROTOCOL_KEYS.len(), 1);
+        assert!(VERIFY_PROTOCOL_KEYS.contains(&"verification"));
+        assert_eq!(VERIFY_PROTOCOL_SUCCESSOR_KEYS.len(), 2);
+        assert!(VERIFY_PROTOCOL_SUCCESSOR_KEYS.contains(&"verification"));
+        assert!(VERIFY_PROTOCOL_SUCCESSOR_KEYS.contains(&"successor_of"));
+    }
+
+    /// A protocol request the PROTOCOL OWNER refuses is answered with the
+    /// request's own field, never through the missing-owner vocabulary: a caller's
+    /// payload fault must not be reported as an absent owner.
+    #[test]
+    fn a_protocol_request_the_owner_refuses_names_the_request_field() {
+        let refusal = admit_verify_bundle(&incomplete_protocol_payload(false))
+            .expect_err("an incomplete protocol request is the caller's payload");
+        assert_eq!(refusal_field(&refusal), "backup.verification");
+        assert!(
+            !matches!(refusal, VerifyAdmissionRefusal::RetainedOwnerAbsent { .. }),
+            "a payload fault must not be rendered through {}",
+            BACKUP_VERIFY_MISSING_OWNER
+        );
+    }
 }
