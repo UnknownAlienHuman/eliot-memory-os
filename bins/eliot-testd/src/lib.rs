@@ -2480,11 +2480,21 @@ async fn drive_validated_dispatch_material_inner(
         let current_token = store
             .resolve_blob_process_stream_token_head(&job.job_id, &durable_grant.capability_ref)?
             .ok_or(TestdError::InvalidBinding)?;
+        let current_token_index = durable_grant
+            .tokens
+            .iter()
+            .position(|token| token == &current_token)
+            .ok_or(TestdError::InvalidBinding)?;
+        // The same ordered, one-use sequence serves both stream sessions and
+        // immutable readback. Start at the durable owner-issued head and keep
+        // the rest of that grant available for each open/append/finalize/read;
+        // a single token cannot authorize the complete two-stream exchange.
+        let remaining_tokens = &durable_grant.tokens[current_token_index..];
         let client = blob_client.ok_or(TestdError::InvalidBinding)?;
         let calls = crate::kernel_client::KernelBlobStreamCallSequence::new(
             client,
             &durable_grant.capability_ref,
-            &[current_token],
+            remaining_tokens,
             &job.job_id,
             store.clone(),
             material.grant.expires_at,

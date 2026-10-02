@@ -1438,6 +1438,14 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
                 }
             }
         }
+    } else if eliot_testd_core::is_productive_testd_profile(&claimed.invocation.profile) {
+        // A productive process result is not a verifier result. If this
+        // composition did not bind the immutable-source owner port, there is
+        // no safe way to resolve its typed stream evidence or run the retained
+        // parser/evaluator. Keep the terminal durable, but non-certifying.
+        execution = ExecutionStatus::Unknown;
+        reason =
+            "productive process has no authenticated immutable-source readback port".to_owned();
     }
     let mut receipt =
         collector.verification_receipt_at(claimed, execution, started_at, finished_at);
