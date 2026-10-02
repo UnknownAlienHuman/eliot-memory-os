@@ -710,7 +710,7 @@ sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "d38509b1bfc588b53fc7cb732f99c237e9d90d04a90d23a11288f021ab4f3068"
+sha256 = "ed34a3fbd257e66c2f0eb0fb7bccce8931e6d9e9f309dce80c5fea67ce4d7731"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -761,9 +761,9 @@ detail = "One global subscriber (OnceLock); stderr writer preserves stdout frami
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 122
-end = 132
-digest = "e96f9150d22e0e5fc2a81c34338e51999a347223da3fef5c0792c2fde01b4e8d"
+start = 260
+end = 293
+digest = "323ad7bb79fecc6f4ff561dacfaeb15cd4e1e04b5b4c2b9a0e87e8749c765ce8"
 markers = ["install_host_diagnostics", "try_init", "stderr", "AlreadyOwned"]
 [[boundary.site]]
 start = 244
@@ -1520,9 +1520,9 @@ end = 353
 digest = "1d0c20593ee322c8d7ee94676f890a32569277b5f91546a72c722a7b30f4fe27"
 markers = ["observe_terminal_error"]
 [[boundary.site]]
-start = 726
-end = 726
-digest = "6ee5a56b9338b9b0d0dc4a00d83fb6c2ac2f263a6e4b7ae59b4f2e5b23e44350"
+start = 355
+end = 408
+digest = "518c2d701ff6e51d2100ca496062332feea594c9e3fd83ec0a55458562b5d960"
 markers = ["HostLaunchTerminalGuard::armed"]
 code = "host-launch-failed"
 [[boundary.caller]]
@@ -1896,9 +1896,9 @@ detail = "The installer entry cutover_generation keeps its dead-code allowance (
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 8799
-end = 8803
-digest = "2fb953539225ab870b0fc743c4737114a7e2e4a898cce6b99b23e73a68b25d36"
+start = 14189
+end = 14194
+digest = "21e9439e0bb105909f9d0d48c11cc69aefbf758aff1f89b42cb322d149980a3a"
 markers = ["dead_code", "fn cutover_generation"]
 [[boundary.test]]
 file = "bins/eliot-host/src/tests.rs"
@@ -2940,9 +2940,9 @@ end = 303
 digest = "50f542bdd09fb58c7c32f1d75e947bf3794e2c2719ee8c580440c55e25feb422"
 markers = ["observe_config_progress", "host.backup.config_phase"]
 [[boundary.site]]
-start = 200
-end = 211
-digest = "f084133779bd6edff1671bc23ab2a8ffbde4ba6f2843d95c47a617a4424a1c98"
+start = 321
+end = 333
+digest = "a7b826c8fe20131590f08b515964a32be4134eadce3d56730151a39390deded8"
 markers = ["observe_bind_progress", "host.backup.config_phase"]
 [[boundary.site]]
 start = 337
@@ -2969,9 +2969,9 @@ detail = "#983 merged: phase/refusal observations via facade-target tracing (hos
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 1469
-end = 1488
-digest = "d7841ca1799c4569ec615a1164094ad7a7fbf4b13d00efae71762a8963246918"
+start = 1543
+end = 1579
+digest = "a7b6bf8f0c23fd7b55c09c9b9c7e588e564e71aecf0759dfa4d754d04a549b07"
 markers = ["observe_cutover_progress", "host.backup.cutover_phase"]
 [[boundary.site]]
 start = 1583
