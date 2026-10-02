@@ -1471,9 +1471,7 @@ mod tests {
         Ok(ProcessRequest::new(intent, permit)?)
     }
 
-    fn declaration_fixture(
-        binding: &ProviderExecutionBinding,
-    ) -> ClaudeSidecarBridgeDeclaration {
+    fn declaration_fixture(binding: &ProviderExecutionBinding) -> ClaudeSidecarBridgeDeclaration {
         crate::bridge_contract::issue_claude_sidecar_declaration(
             &binding.route,
             &binding.state_fence,
@@ -1878,15 +1876,15 @@ mod tests {
     /// declaration from the attempt itself and therefore always agreed with it.
     #[test]
     fn prepare_refuses_owner_declaration_for_another_generation() -> TestResult {
+        let binding = binding_fixture()?;
+        let fence = binding.state_fence.clone();
+        let mut other_route = binding.route.clone();
+        other_route.model = "other-generation-model".into();
+
         // A declaration issued for a different route generation.
         let mut input = fresh_input()?;
-        let mut other_route = input.binding.route.clone();
-        other_route.model = "other-generation-model".into();
         input.declaration =
-            crate::bridge_contract::issue_claude_sidecar_declaration(
-                &other_route,
-                &input.binding.state_fence,
-            )?;
+            crate::bridge_contract::issue_claude_sidecar_declaration(&other_route, &fence)?;
         assert!(matches!(
             prepare(input),
             Err(ClaudeSidecarError::BindingMismatch(_))
