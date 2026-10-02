@@ -3413,6 +3413,359 @@ fn build_export_batch(
     ))
 }
 
+/// Issue #955 V2: real protected-runtime root-lease evidence for this spool.
+///
+/// What this module EXECUTES on the test machine, and what it does not, is
+/// stated here so no reader can mistake one for the other (I0.5
+/// `EvidenceExecutionStatus`, I2.20 `ModuleTestCapsule.proof_level_ceiling` and
+/// `known_uncovered_behavior`, A5.5 "conditions that make the result
+/// inapplicable").
+///
+/// EXECUTED here, really:
+///
+/// - [`ProtectedRuntimePathLease::open_or_create_absolute`] — the exact
+///   acquisition every production spool constructor performs — against the
+///   exact owner spool path [`watchdog_spool_path`] produces. The retained
+///   identity is a real OS volume-serial/file-index pair read from a real
+///   no-follow handle, so it cannot be produced by a substituted placeholder.
+/// - The production path-mismatch predicate (`path_lease.path() != path`) and
+///   `verify_path_identity` reopen-and-compare proof, plus
+///   `verify_stable_identity` on the retained handle.
+/// - `Database::open` on the leased path, i.e. the database is opened where the
+///   lease proves, not on a re-derived path.
+/// - Refusals: a foreign un-admitted root, a component-prefix sibling escape
+///   that a textual prefix check would have admitted, and a substituted
+///   non-regular spool leaf. All three are real OS-level refusals raised
+///   before the production `map_err(|_| SpoolError::InvalidProtectedRoot)`.
+///
+/// NOT EXECUTED here, and why:
+///
+/// - The three production constructors themselves
+///   ([`WatchdogSpool::open_runtime_binding`],
+///   [`WatchdogSpool::open_existing_runtime_binding`],
+///   [`WatchdogSpool::open_isolated_destination`]) cannot be invoked from any
+///   test. Each takes an admission value — [`WatchdogRuntimeBinding`] or
+///   [`AdmittedIsolatedDestination`] — whose only producer is
+///   `watchdog_admission::load_runtime_binding` / `admit_isolated_destination`,
+///   and that producer fails closed without a durable, installer-minted
+///   `ProvisionedSupervisionAuthority`. The crate's `RegistryFixture` mints no
+///   such authority, by design. So the constructor bodies are NOT run; their
+///   lease acquisition is exercised above and their retention of that lease is
+///   source-shape-guarded by the second case. A reviewer must not read this
+///   module as proof that the constructors are called at all.
+/// - The installer `BA+LS+SY` runtime-file ACL comparison is not exercised: the
+///   `test-support` contour of `eliot-platform-windows` returns before
+///   `verify_readonly_acl`. That bypass is the platform owner's own long-standing
+///   test seam, already relied on by this crate's other in-crate protected-root
+///   tests, and the production contour's descriptor minting additionally needs
+///   `SeRestorePrivilege`/SYSTEM, which no hermetic test can hold.
+/// - A reparse-point (symlink/junction) substituted spool leaf is not asserted
+///   here: creating one needs `SeCreateSymbolicLinkPrivilege` or Developer Mode,
+///   so on a machine without it the case would prove nothing. The no-follow
+///   reparse refusal itself is covered by the platform owner's own lease tests.
+#[cfg(all(test, windows))]
+mod protected_root_lease_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use eliot_platform_windows::{
+        ProtectedPathError, ProtectedRuntimePathLease, canonical_windows_path,
+        file_identity_for_path, test_support::override_protected_root,
+    };
+    use redb::Database;
+
+    use super::watchdog_spool_path;
+
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    /// Materializes one disposable protected root and returns it in the exact
+    /// canonical text form the production lease retains, so the production
+    /// `path_lease.path() != path` check is decided on the same bytes an
+    /// installer-approved manifest would carry.
+    fn admitted_root(tag: &str) -> PathBuf {
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let raw = std::env::temp_dir().join(format!(
+            "eliot-watchdog-955-lease-{tag}-{serial}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&raw);
+        std::fs::create_dir_all(&raw)
+            .unwrap_or_else(|error| panic!("955 V2 create lease root {}: {error}", raw.display()));
+        canonical_windows_path(&raw).unwrap_or_else(|error| {
+            panic!("955 V2 canonicalize lease root {}: {error}", raw.display())
+        })
+    }
+
+    /// Materializes one real Watchdog state root under the admitted protected
+    /// root and returns it in the canonical text form the production lease
+    /// retains.
+    fn admitted_state_root(root: &Path, tag: &str) -> PathBuf {
+        let state_root = root.join(tag);
+        std::fs::create_dir_all(&state_root).unwrap_or_else(|error| {
+            panic!("955 V2 create state root {}: {error}", state_root.display())
+        });
+        canonical_windows_path(&state_root).unwrap_or_else(|error| {
+            panic!(
+                "955 V2 canonicalize state root {}: {error}",
+                state_root.display()
+            )
+        })
+    }
+
+    /// Materializes a complete, real Watchdog state root that the admitted
+    /// protected root does NOT cover, so a lease attempt against it is refused
+    /// by containment rather than by a missing path.
+    fn foreign_state_root(tag: &str) -> (PathBuf, PathBuf) {
+        let raw = std::env::temp_dir().join(format!(
+            "eliot-watchdog-955-lease-foreign-{tag}-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&raw);
+        let state_root = raw.join("watchdog");
+        std::fs::create_dir_all(&state_root).unwrap_or_else(|error| {
+            panic!(
+                "955 V2 create foreign state root {}: {error}",
+                state_root.display()
+            )
+        });
+        (
+            raw,
+            canonical_windows_path(&state_root).unwrap_or_else(|error| {
+                panic!(
+                    "955 V2 canonicalize foreign state root {}: {error}",
+                    state_root.display()
+                )
+            }),
+        )
+    }
+
+    // WORK_UNIT_CASE: 955/V2
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one case carries the positive lease proof and three distinct refusals"
+    )]
+    fn owner_spool_lease_retains_real_identity_and_refuses_foreign_roots() {
+        // ONE admitted root governs the whole case. Every refusal below is
+        // therefore attributable to the admitted root and not to the absence of
+        // any override: a dropped override would silently fall back to the real
+        // ProgramData root and refuse everything for the wrong reason.
+        let root = admitted_root("owner");
+        let protected_root = override_protected_root(&root);
+        let owner_state_root = admitted_state_root(&root, "owner");
+        let spool_path = watchdog_spool_path(&owner_state_root);
+
+        // ---- POSITIVE: the acquisition the production constructors perform. ----
+        let path_lease = ProtectedRuntimePathLease::open_or_create_absolute(&spool_path)
+            .unwrap_or_else(|error| panic!("955 V2 owner spool lease refused: {error}"));
+
+        // The production path-mismatch predicate (`path_lease.path() != path`)
+        // must hold for an owner root, or the constructor fails closed.
+        assert_eq!(
+            path_lease.path(),
+            spool_path,
+            "lease must retain the exact production owner spool path"
+        );
+        assert!(
+            spool_path.is_file(),
+            "lease must have materialized a real file at {}",
+            spool_path.display()
+        );
+
+        // A real OS identity, not a placeholder: volume serial and file index
+        // are only obtainable from a real file handle.
+        let retained = path_lease.identity();
+        assert_ne!(
+            retained.volume_serial_number, 0,
+            "a real retained handle must report a real volume serial"
+        );
+        assert_ne!(
+            retained.file_index, 0,
+            "a real retained handle must report a real file index"
+        );
+
+        // Retained handle is stable without reopening by path.
+        path_lease
+            .verify_stable_identity()
+            .unwrap_or_else(|error| panic!("955 V2 retained handle unstable: {error}"));
+        // Independent reopen by path agrees: this is the production
+        // `verify_path_identity` proof.
+        path_lease
+            .verify_path_identity()
+            .unwrap_or_else(|error| panic!("955 V2 path identity diverged: {error}"));
+        // Out-of-band measurement of the same file agrees with the lease, so the
+        // lease retained the owner file and not some other file under the root.
+        let measured = file_identity_for_path(&spool_path)
+            .unwrap_or_else(|error| panic!("955 V2 independent identity read: {error}"));
+        assert_eq!(
+            measured, retained,
+            "lease identity must equal an independent measurement of the owner spool file"
+        );
+
+        // A second, independent lease over the same owner path is the same
+        // retained identity: nothing was swapped between the two acquisitions.
+        let reopened = ProtectedRuntimePathLease::open_existing_absolute(&spool_path)
+            .unwrap_or_else(|error| panic!("955 V2 owner spool reopen refused: {error}"));
+        assert_eq!(reopened.identity(), retained);
+        drop(reopened);
+
+        // The database is created on the LEASED path, which is what production
+        // binds. `open_or_create_absolute` leaves a zero-byte file, and redb
+        // refuses to open one, so this mirrors production exactly:
+        // `WatchdogSpool::open_runtime_binding` builds the `Database::create`
+        // handle and then calls `initialize_or_recover`. The point of the case
+        // is WHICH PATH is opened, not that a zero-byte placeholder is a
+        // database.
+        let database = Database::create(path_lease.path())
+            .unwrap_or_else(|error| panic!("955 V2 leased spool database create: {error}"));
+        drop(database);
+        let reopened_database = Database::open(path_lease.path())
+            .unwrap_or_else(|error| panic!("955 V2 leased spool database open: {error}"));
+        drop(reopened_database);
+        drop(path_lease);
+
+        // ---- REFUSAL 1: a foreign, un-admitted root. ----
+        let (foreign_root, foreign_state_root) = foreign_state_root("a");
+        let foreign_path = watchdog_spool_path(&foreign_state_root);
+        let refused = ProtectedRuntimePathLease::open_or_create_absolute(&foreign_path)
+            .expect_err("955 V2 a foreign un-admitted root must be refused");
+        assert_eq!(
+            refused,
+            ProtectedPathError::InvalidPath,
+            "a foreign root must be refused by containment, not by a missing file"
+        );
+        assert!(
+            !foreign_path.exists(),
+            "a refused foreign root must not be materialized"
+        );
+        let _ = std::fs::remove_dir_all(&foreign_root);
+
+        // ---- REFUSAL 2: a component-prefix sibling of the admitted root. The
+        // sibling's text is a strict textual extension of the admitted root's
+        // text, so a string-prefix containment check would have admitted it;
+        // component-wise containment must still refuse. ----
+        let sibling_root = PathBuf::from(format!("{}-sibling", root.display()));
+        let sibling_state_root = sibling_root.join("watchdog");
+        std::fs::create_dir_all(&sibling_state_root).unwrap_or_else(|error| {
+            panic!(
+                "955 V2 create sibling state root {}: {error}",
+                sibling_state_root.display()
+            )
+        });
+        let sibling_path = watchdog_spool_path(&sibling_state_root);
+        let sibling_text = sibling_path.to_string_lossy().into_owned();
+        let root_text = root.to_string_lossy().into_owned();
+        assert!(
+            sibling_text.starts_with(&root_text),
+            "the escape case must be a textual prefix match, or it proves nothing"
+        );
+        assert!(
+            !sibling_path.starts_with(&root),
+            "component-wise containment must already exclude the sibling"
+        );
+        let refused = ProtectedRuntimePathLease::open_or_create_absolute(&sibling_path)
+            .expect_err("955 V2 a component-prefix sibling must be refused");
+        assert_eq!(
+            refused,
+            ProtectedPathError::InvalidPath,
+            "a textual prefix match must never substitute for containment"
+        );
+        let _ = std::fs::remove_dir_all(&sibling_root);
+
+        // ---- REFUSAL 3: a substituted non-regular spool leaf INSIDE the
+        // admitted root. The real no-follow leaf check must refuse a directory
+        // occupying `watchdog.redb`. ----
+        let substituted_state_root = admitted_state_root(&root, "substituted");
+        let substituted_leaf = watchdog_spool_path(&substituted_state_root);
+        std::fs::create_dir_all(&substituted_leaf).unwrap_or_else(|error| {
+            panic!(
+                "955 V2 create substituted leaf {}: {error}",
+                substituted_leaf.display()
+            )
+        });
+        let refused = ProtectedRuntimePathLease::open_or_create_absolute(&substituted_leaf)
+            .expect_err("955 V2 a non-regular spool leaf must be refused");
+        assert_eq!(
+            refused,
+            ProtectedPathError::Io,
+            "a directory substituted for the spool file must fail the real leaf open"
+        );
+        drop(protected_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // WORK_UNIT_CASE: 955/V2
+    #[test]
+    fn production_spool_constructors_retain_a_lease_and_never_a_none_placeholder() {
+        // A SHAPE guard, not lease evidence: the positive case above executes
+        // the real lease; this case only refuses the substitution this module's
+        // own doc comment names as uncovered. It fails if any production
+        // constructor stops retaining its lease, because the only other way to
+        // satisfy the field's type is the `None` placeholder.
+        //
+        // The counts run over the production region only, split at this module's
+        // own doc marker. The marker text occurs twice in this file - once on
+        // this doc comment and once inside the constant below - and
+        // `split_once` takes the first, which is the doc comment, so the split
+        // lands before the module and the searched literals in the assertions
+        // below can never satisfy the counts they assert. Moving this module
+        // above its own doc comment would break that and must not be done.
+        const MODULE_MARKER: &str = "/// Issue #955 V2: real protected-runtime root-lease";
+        let (production, _this_module) = include_str!("watchdog_spool.rs")
+            .split_once(MODULE_MARKER)
+            .unwrap_or_else(|| {
+                panic!("the 955 V2 lease test module marker {MODULE_MARKER} is missing")
+            });
+        // This is the load-bearing split check: the case name is declared only
+        // inside this module, and this literal is likewise only inside it, so
+        // `production` can never satisfy it by accident.
+        assert!(
+            !production
+                .contains("owner_spool_lease_retains_real_identity_and_refuses_foreign_roots"),
+            "the split must land before the lease test module, not inside production"
+        );
+        assert!(
+            production.contains("pub(crate) _path_lease: Option<ProtectedRuntimePathLease>,"),
+            "the retained production lease field must stay a real lease slot"
+        );
+        assert_eq!(
+            production.matches("_path_lease: Some(path_lease)").count(),
+            3,
+            "every production spool constructor must retain the lease it acquired"
+        );
+        assert_eq!(
+            production.matches("_path_lease: None").count(),
+            0,
+            "no production spool constructor may substitute a None placeholder"
+        );
+        for constructor in [
+            "pub(crate) fn open_runtime_binding(",
+            "pub(crate) fn open_existing_runtime_binding(",
+            "pub(crate) fn open_isolated_destination(",
+        ] {
+            assert!(
+                production.contains(constructor),
+                "production spool constructor {constructor} is missing"
+            );
+        }
+        assert_eq!(
+            production
+                .matches("ProtectedRuntimePathLease::open_or_create_absolute")
+                .count(),
+            2,
+            "the creating constructors must still acquire through the runtime lease"
+        );
+        assert_eq!(
+            production
+                .matches("ProtectedRuntimePathLease::open_existing_absolute")
+                .count(),
+            1,
+            "the read-only constructor must still acquire through the runtime lease"
+        );
+    }
+}
+
 /// Builds the explicit empty batch for `acknowledged == high-water`.
 ///
 /// The empty shape carries no entries, zero counts, and
