@@ -2120,6 +2120,13 @@ impl McpDaemon {
         }))
     }
 
+    /// Raw authenticated MCP ingress (`#937`).
+    ///
+    /// This is a boundary owner, not a second scheme: it applies the one shared
+    /// `named_pipe_ipc::validated_mcp_request_document` gate and immediately
+    /// hands the resulting duplicate-free `Value` to the typed path, so no
+    /// caller can reach `handle_validated_line` from raw bytes it has not
+    /// already proved duplicate-free.
     pub(crate) async fn handle_line(
         &self,
         profile_name: &str,
@@ -2129,9 +2136,35 @@ impl McpDaemon {
         role_authority: Option<AuthenticatedRoleAuthority<'_>>,
         line: &str,
     ) -> Result<Option<String>> {
+        let request = named_pipe_ipc::validated_mcp_request_document(line)
+            .with_context(|| "parse authenticated named-pipe request")?;
+        self.handle_validated_line(
+            profile_name,
+            session_id,
+            bound_project_id,
+            bound_task_id,
+            role_authority,
+            request,
+        )
+        .await
+    }
+
+    /// Typed boundary for an already duplicate-free MCP request document.
+    ///
+    /// The caller has proved the complete raw document duplicate-free at the
+    /// raw ingress gate, so its `Value` may be routed, schema-validated and
+    /// `from_value`-typed unchanged; a `CompilePacketToolInput` visitor reading
+    /// this value can no longer be handed an already-collapsed duplicate.
+    pub(crate) async fn handle_validated_line(
+        &self,
+        profile_name: &str,
+        session_id: SessionId,
+        bound_project_id: Option<ProjectId>,
+        bound_task_id: Option<TaskId>,
+        role_authority: Option<AuthenticatedRoleAuthority<'_>>,
+        request: Value,
+    ) -> Result<Option<String>> {
         let profile = McpAccessProfile::parse(profile_name)?;
-        let request: Value =
-            serde_json::from_str(line).with_context(|| "parse authenticated named-pipe request")?;
         let refreshed_scope = self.authoritative_host_scope(
             profile_name,
             session_id,

@@ -7,7 +7,7 @@ use crate::runtime_instance::{
     atomic_write_json,
 };
 use anyhow::{Context, Result};
-use eliot_types::{ProjectId, SessionId, TaskId};
+use eliot_types::{ProjectId, SessionId, TaskId, strict_json_value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -56,6 +56,32 @@ pub(crate) struct RequestedSessionScope {
 pub(crate) fn pipe_name(config_path: &Path) -> String {
     RuntimeInstance::select(config_path, None)
         .map_or_else(|_| String::new(), |instance| instance.pipe_name())
+}
+
+/// The one bounded, recursive, duplicate-rejecting parse of a raw MCP request
+/// line (#937).
+///
+/// `serde_json::from_str` collapses a repeated object member to last-wins the
+/// instant raw bytes become a `serde_json::Value`, so a later `deny_unknown_fields`
+/// DTO, a custom duplicate-rejecting visitor, or a schema check can no longer
+/// tell a duplicate document from its last-wins equivalent. This gate therefore
+/// runs on the RAW line, before `id`, `method`, `params`, tool `name` or
+/// `arguments` is read, so every downstream consumer — routing, correlation,
+/// schema validation and typed `from_value` — sees the same duplicate-free
+/// document under one guarantee.
+///
+/// It is a thin reuse of the shared `eliot_types::strict_json_value`, bounded by
+/// the existing IPC frame ceiling. It is not a per-tool parser and it adds no
+/// second check: it is the only place raw MCP request bytes are decoded.
+///
+/// Raw-ingress owner (`#937` item 4): every contour that decodes a raw MCP
+/// request line before routing must call this. Today that is the named-pipe
+/// server loop (`serve_connection`), the ordinary stdio client
+/// (`run_stdio_client`), the cognitive-child stdio client
+/// (`run_cognitive_stdio_client`), and `McpDaemon::handle_line`, which is the
+/// typed boundary the routed document reaches.
+pub(crate) fn validated_mcp_request_document(line: &str) -> Result<Value> {
+    strict_json_value(line.as_bytes(), MAX_FRAME_BYTES).map_err(anyhow::Error::from)
 }
 
 #[cfg(windows)]
@@ -261,15 +287,19 @@ async fn serve_connection(
     let session_id = principal.session_id.to_string();
     write_authentication_result(&mut writer, true, Some(&session_id), None).await?;
     while let Some(line) = read_bounded_async_line(&mut reader).await? {
+        // Raw MCP ingress (#937): the complete line is proved duplicate-free
+        // before `id`, `method`, `params`, tool `name` or `arguments` is read.
+        let request = validated_mcp_request_document(&line)
+            .context("parse authenticated named-pipe MCP request line")?;
         let role_authority = retained_role_authority(&principal)?;
         if let Some(response) = daemon
-            .handle_line(
+            .handle_validated_line(
                 &principal.profile,
                 principal.session_id,
                 principal.bound_project_id,
                 principal.bound_task_id,
                 role_authority,
-                &line,
+                request,
             )
             .await?
         {
@@ -304,7 +334,10 @@ pub(crate) async fn run_stdio_client(
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line)
+        // Direct stdio contour (#937): this client inspects `id`/`method` for
+        // correlation before relaying, so it decodes raw bytes itself and must
+        // use the same single gate as the daemon-side ingress.
+        let request = validated_mcp_request_document(&line)
             .with_context(|| format!("parse MCP JSON-RPC line: {line}"))?;
         let expects_response = request.get("id").is_some();
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -674,7 +707,10 @@ pub(crate) async fn run_cognitive_stdio_client(capability_path: &Path) -> Result
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line).context("parse cognitive MCP request")?;
+        // Direct stdio contour (#937): same single gate as every other raw MCP
+        // request decode.
+        let request =
+            validated_mcp_request_document(&line).context("parse cognitive MCP request")?;
         let expects_response = request.get("id").is_some();
         let response = if let Ok(response) =
             relay_request(&mut connection, &request, expects_response).await
@@ -1428,11 +1464,73 @@ mod tests {
         IpcPrincipal, MAX_REPLAY_NONCES, ReplayWindow, allowed_ipc_profile, decode_bounded_line,
         handshake_requires_process_attestation, private_host_governor_method_allowed,
         retained_role_authority, sha256_file, valid_normal_scope_shape,
+        validated_mcp_request_document,
     };
     use anyhow::{Context as _, Result};
     use eliot_types::SessionId;
     use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    /// The audit's exact counterexample, as RAW BYTES. A pre-normalized
+    /// `serde_json::Value` would already have kept only `goal="second"` and
+    /// `max_tokens=50000`, which is precisely the defect this gate closes, so
+    /// the proof must stay on the byte stream.
+    const DUPLICATE_COMPILE_PACKET_LINE: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"eliot_compile_packet_l3","#,
+        r#""arguments":{"project_id":"project-a","task_id":"task-a","goal":"first","goal":"second","#,
+        r#""candidate_handles":[],"max_tokens":1800,"max_tokens":50000}}"#,
+    );
+
+    /// The same document with every member written once.
+    const SINGLE_KEY_COMPILE_PACKET_LINE: &str = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"eliot_compile_packet_l3","#,
+        r#""arguments":{"project_id":"00000000-0000-7000-8000-000000000001","task_id":"task-a","#,
+        r#""goal":"first","candidate_handles":[],"max_tokens":1800}}}"#,
+    );
+
+    #[test]
+    fn raw_mcp_ingress_refuses_a_duplicated_member_before_routing() {
+        // Precondition on the exact bytes: a plain parse really does collapse
+        // both duplicates, so this refusal cannot be vacuously true.
+        let collapsed = serde_json::from_str::<serde_json::Value>(DUPLICATE_COMPILE_PACKET_LINE)
+            .expect("counterexample must be well-formed JSON");
+        assert_eq!(
+            collapsed.pointer("/params/arguments/goal"),
+            Some(&serde_json::json!("second"))
+        );
+        assert_eq!(
+            collapsed.pointer("/params/arguments/max_tokens"),
+            Some(&serde_json::json!(50000))
+        );
+
+        let refusal = validated_mcp_request_document(DUPLICATE_COMPILE_PACKET_LINE)
+            .expect_err("a duplicated raw MCP member must be refused at ingress");
+        assert_eq!(
+            refusal
+                .downcast_ref::<eliot_types::StrictJsonError>()
+                .map(|error| error.kind),
+            Some(eliot_types::StrictJsonErrorKind::DuplicateKey)
+        );
+    }
+
+    #[test]
+    fn raw_mcp_ingress_accepts_a_single_key_document_for_the_typed_path() -> Result<()> {
+        let request = validated_mcp_request_document(SINGLE_KEY_COMPILE_PACKET_LINE)
+            .context("single-key document must pass the raw ingress gate")?;
+        assert_eq!(
+            request.pointer("/method"),
+            Some(&serde_json::json!("tools/call"))
+        );
+        let arguments = request
+            .pointer("/params/arguments")
+            .cloned()
+            .context("tools/call arguments must survive the gate")?;
+        let typed: eliot_types::CompilePacketToolInput = serde_json::from_value(arguments)
+            .context("the existing CompilePacketToolInput visitor must accept the gated document")?;
+        assert_eq!(typed.request.goal, "first");
+        assert_eq!(typed.request.max_tokens, 1800);
+        Ok(())
+    }
 
     #[test]
     fn claude_desktop_is_an_authenticated_ipc_profile() {
