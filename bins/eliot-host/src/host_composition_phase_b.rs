@@ -147,9 +147,14 @@ impl PhaseBAuthorityIdentity {
         }
     }
 
-    /// Binds the exact `(lineage, sequence)` Host epoch of the authority
-    /// record under observation. A historical/destination record binds its own
-    /// prior epoch; a live incoming descriptor binds its State Fence epoch.
+    /// Binds the exact `(lineage, sequence)` Host epoch the semantic owner has
+    /// PROVEN for the authority record under observation. Only an
+    /// owner-proven value may be bound: a historical/destination record binds
+    /// the prior epoch its retained marker proves, and a live incoming
+    /// descriptor binds the LIVE Host epoch only after its State Fence epoch
+    /// has been proven to be the same authority. An unverified claim from the
+    /// input being validated is never projected here; until the owner proves
+    /// one, the slot stays explicitly unavailable.
     pub(super) fn bind_host_epoch(&mut self, epoch: &EpochIdentity) {
         self.host_epoch = Some(phase_b_epoch_identity_label(epoch));
     }
