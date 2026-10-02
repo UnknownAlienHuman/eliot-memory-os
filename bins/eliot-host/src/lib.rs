@@ -7637,6 +7637,31 @@ impl HostComposition {
         // leaf's read-failure observation stays nonterminal beneath it.
         let mut host_terminal =
             HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL);
+        // F-LOG-HOST-2 (#893 D2/D3): the third admitted cutover port, and the
+        // same admitted payload identity the activation and retirement ports
+        // bind one screen apart. `request` is in hand before anything runs, and
+        // the disposition read's OWN subordinate records already render its
+        // `operation_id`/`installation`/`request_digest` through
+        // `CutoverPhaseCorrelation::for_readback(readback)`
+        // (`backup_cutover.rs:3081` for the recheck/owner_moved reads and
+        // `backup_cutover.rs:4563` for the final projection), so binding the
+        // same three handles here is the exact sibling vocabulary, not a new
+        // scheme.
+        //
+        // Why it matters here specifically: this port is its own operation with
+        // its own terminal (F-LOG-HOST-8 / #983 W4), so its
+        // `read_cutover_disposition(...)?` read failure AND the `Failed`
+        // disposition arm below both owe a terminal. Two concurrent disposition
+        // reads for two different cutovers currently end in two byte-identical
+        // frozen codes pairable only by record order; with this binding they
+        // share the `operation_id`/`installation`/`request_digest` their phase
+        // records already carry (I13.11).
+        //
+        // Pure projection of handles already held: nothing is probed, re-proved,
+        // hashed, synthesized or cached, no field of `CutoverRequest` beyond the
+        // operation identity is read, and the returned `Result`, its error values
+        // and the read's operation count are untouched.
+        host_terminal.bind_request_identity(cutover_request_terminal_correlation(request));
         // The status read model consumes only the six bindings a disposition
         // projection reads, so the admitted body's envelope, admission receipt,
         // archive digest/class, activation fence and recovery evidence are
