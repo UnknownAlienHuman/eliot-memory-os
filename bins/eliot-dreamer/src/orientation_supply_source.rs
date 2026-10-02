@@ -14,13 +14,28 @@
 //! `submit` is the only production caller of
 //! [`OrientationSupplySource::resolve_supply`], and it consults it for every
 //! admitted `JobClass::Orientation` job that clears the two admitted-stage
-//! gates ahead of it. Those gates are themselves owner channels
-//! ([`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource), wired
-//! at `connect()` alongside this one), so this seam is now reached on every
-//! Orientation run rather than being unreachable code — and the production
-//! channel publishes no member, so the typed blocked disposition below is what a
-//! live run actually produces. That is a property of the tree, measured here, so
-//! the next attempt measures it rather than assuming the seam is live.
+//! gates ahead of it.
+//!
+//! On the current tree no job does, so this seam is NOT reached from a
+//! production `submit`. An earlier record in this file claimed the opposite —
+//! that the gates are "themselves owner channels ... so this seam is now
+//! reached on every Orientation run rather than being unreachable code". That
+//! claim was false and is corrected here. Measured order in `submit`:
+//!
+//! | file | hop | production outcome |
+//! |---|---|---|
+//! | `lib.rs` | `dispatch_admission`, `check_claimed` | pass |
+//! | `lib.rs` | `resolve_controller_snapshot` | reports `Ok(None)` |
+//! | `controller.rs` | `resolve_cycle_inputs(..., None)` | **`Err` — the run stops here** |
+//! | `lib.rs` | `resolve_published_bundle_request` | not reached |
+//! | `bundle_stage.rs` | `resolve_bundle_request(..., None)` | not reached; would also `Err` |
+//! | `lib.rs` | `resolve_orientation_supply` | **this method — not reached** |
+//!
+//! What the gates being owner channels changed is addressability, not
+//! reachability: the typed blocked disposition below is published from a real
+//! `submit` on no path today. Both upstream records must be published by their
+//! owners before this channel is consulted at all; that is the first missing hop,
+//! and it is upstream of this file.
 //!
 //! # What this source reads
 //!

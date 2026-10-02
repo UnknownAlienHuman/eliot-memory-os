@@ -238,22 +238,25 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// in-binary producer of a `CyclePolicy`, a `PhasePolicyRule` or a
     /// `DreamJobRecipe` exists — see that module's documentation — so the
     /// production result is the same typed refusal the gates published before
-    /// this channel existed. What changed is that the gates are addressable:
-    /// `submit` now consults a real owner channel for both records, so the
-    /// downstream `resolve_orientation_supply` seam is reached on every admitted
-    /// non-Curation run instead of being unreachable code. The channel itself is
-    /// replaceable through
+    /// this channel existed. What changed is only that the gates are
+    /// ADDRESSABLE: `submit` consults a real owner channel for both records
+    /// instead of a hardcoded refusal. It does not follow that the gates now
+    /// pass, and they do not: `submit` still returns `Err` at
+    /// [`resolve_cycle_inputs`](crate::controller::resolve_cycle_inputs), so the
+    /// downstream `resolve_orientation_supply` seam is still unreached from
+    /// production. The channel itself is replaceable through
     /// [`AuthenticatedKernelJobPort::with_admitted_stage_source`].
     admitted_stage_source: Option<&'a dyn AdmittedStageMaterialSource>,
     /// Owner channel for the mandatory Orientation carrier. `Some` in
     /// production: `connect` wires
     /// [`KernelStagedOwnerRecordSource`](crate::orientation_supply_source::KernelStagedOwnerRecordSource),
     /// which reports the mandatory members the Kernel-staged owner record does
-    /// not publish. On the current tree that reports total absence. The seam is
-    /// reached from `submit` for every admitted `JobClass::Orientation` job
-    /// (past the two admitted-stage gates, which are themselves owner channels
-    /// now), and the carrier stays refused rather than synthesizing canonical
-    /// state. The channel itself is replaceable through
+    /// not publish. On the current tree that reports total absence. `submit`
+    /// would consult this seam for every admitted `JobClass::Orientation` job
+    /// that clears the two admitted-stage gates ahead of it, and the carrier
+    /// would stay refused rather than synthesizing canonical state — but no job
+    /// clears those gates today, so the seam is not reached in production. The
+    /// channel itself is replaceable through
     /// [`AuthenticatedKernelJobPort::with_orientation_source`].
     orientation_source: Option<&'a dyn OrientationSupplySource>,
 }

@@ -18,6 +18,14 @@
 //! through a `with_*_source` builder — and this module adds the two missing
 //! instances of exactly that shape rather than a new mechanism.
 //!
+//! What that buys is addressability, and the distinction is load-bearing: an
+//! earlier record here implied the gates stop refusing, so the downstream
+//! Orientation seam becomes reached. On the current tree they do NOT stop
+//! refusing — `submit` still returns `Err` at the controller gate because the
+//! channel below reports the absence it measures, so
+//! `resolve_orientation_supply` remains unreached from production. The two
+//! statements are both true and only the first one is new.
+//!
 //! # What a source may publish
 //!
 //! [`AdmittedStageMaterialSource`] publishes values the issuing owner already
@@ -58,6 +66,18 @@
 //! therefore be the fabricated policy the carrier refuses, so the production
 //! answer stays the honest refusal and the channel is the place a real owner
 //! record arrives.
+//!
+//! The first of those two records is also the first missing hop on the whole
+//! pulse-to-packet path, and it is upstream of the Orientation carrier: `submit`
+//! calls `controller::resolve_cycle_inputs` before it resolves this channel at
+//! all, so no Orientation job reaches the carrier while the controller snapshot
+//! is absent. `T12.md` records the cycle profile that would supply it — which
+//! owner, product, source, operation kind, effect class and proof ceiling each
+//! `PhasePolicyRule` names — as "OWNER DEFAULT (proposed)", i.e. proposed rather
+//! than adopted. Writing those bindings here would therefore be authoring an
+//! owner default in a composition root, which is exactly what the same document
+//! says a composition root may not do. The gap is named here rather than filled
+//! with a plausible-looking rule set.
 
 use eliot_dreamer_bundle::AssemblyRequest;
 use eliot_dreamer_cycle::{CyclePolicy, DreamerCycleState, ObservedOutcome};

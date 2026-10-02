@@ -10,6 +10,11 @@
 //!
 //! Production owner chain (frozen by this issue):
 //!
+//! The rows below describe the carrier's own owner chain, not the whole
+//! `submit` path. Two #806/A-04 gates sit AHEAD of this carrier and refuse on the
+//! current tree, so every row here is measured from the moment `dispatch`
+//! reaches it, not from process entry. See the measured order below.
+//!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
 //! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
@@ -56,16 +61,45 @@
 //! `bins/eliot-dreamer/Cargo.toml` declares no `eliot-governor` dependency — adding
 //! one would be a `bins/*` -> D3-D5 edge.
 //!
-//! **2. The seam itself is reached, and reaches the blocked disposition.**
-//! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
-//! calls [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort)
-//! for every admitted Orientation job, past the two admitted-stage gates. Those
-//! gates are owner channels in their own right
-//! ([`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource)), so the
-//! chain is live rather than unreachable code; the production instances simply
-//! publish nothing, so the run still stops at the first unpopulated channel. The
-//! blocked disposition published downstream is therefore reached from a real
-//! `submit`, not only from the unit-level pipeline proofs.
+//! **2. The seam is NOT reached in production: two admitted-stage gates refuse
+//! first.** An earlier record in this file claimed the opposite — that `submit`
+//! consults [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort)
+//! "past the two admitted-stage gates" and that the blocked disposition is
+//! therefore "reached from a real `submit`". That claim is false on the current
+//! tree, and it is corrected here rather than repeated. Measured order inside
+//! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit):
+//!
+//! | file | hop | production outcome |
+//! |---|---|---|
+//! | `lib.rs` | `dispatch_admission`, `check_claimed` | pass |
+//! | `lib.rs` | `resolve_controller_snapshot` | reports `Ok(None)` |
+//! | `controller.rs` | `resolve_cycle_inputs(..., None)` | **`Err` — the run stops here** |
+//! | `lib.rs` | `resolve_published_bundle_request` | not reached |
+//! | `bundle_stage.rs` | `resolve_bundle_request(..., None)` | not reached; would also `Err` |
+//! | `lib.rs` | `resolve_orientation_supply` | not reached |
+//! | `lib.rs` | `run_admitted_pipeline` | not reached |
+//!
+//! So the first missing hop on the pulse-to-packet path is the #806
+//! `ControllerSnapshot`, not this channel: `submit` returns a typed
+//! `InvalidAdmission` and the binary exits 78 before the Orientation carrier is
+//! ever consulted. The two admitted-stage gates are themselves owner channels
+//! ([`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource)), which
+//! makes them addressable rather than hardcoded — but addressable is not
+//! reachable, and this module's blocked disposition is currently reached only
+//! from the unit-level pipeline proofs, not from a production `submit`.
+//!
+//! Two further measured facts belong to the same boundary and are recorded here
+//! rather than left for the next reader to re-derive. First, `submit` binds the
+//! #806 transition result and the A-04 plan result to `_step` and `_plan`: no
+//! class reads either value, so both gates are pure prerequisites whose entire
+//! effect today is the refusal. Second, the two conditions get DIFFERENT
+//! dispositions for what is one class of condition — a missing owner record
+//! refuses hard at the gate (process-level `InvalidAdmission`, exit 78, no
+//! `JobView` payload), while a missing owner record on the channel below
+//! publishes this module's typed `Blocked` pulse naming every missing owner.
+//! Reconciling that is an owner decision about the #706 stage order, not a
+//! local edit: dropping or deferring either gate to reach the packet would
+//! remove a stated guarantee rather than satisfy one.
 //!
 //! **3. The record that does travel is an address, not the member.**
 //! The opaque owner record channel is real: `KernelComposition::execute_dreamer_request`
@@ -90,14 +124,18 @@
 //! defaulted, no lookalike value is synthesized, and no check is skipped to make
 //! a stage fire.
 //!
-//! What a future attempt must supply is therefore not one adapter but all three
-//! of: a production caller for the Governor producer plus a `bins/eliot-dreamer`
-//! edge to it, a Governor that publishes the #806 controller snapshot and the
-//! A-04 recipe over [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource),
-//! and a content-retrieval capability that turns the record's address into a
-//! typed member. Naming the missing dependency edges is the honest deliverable
-//! here; manufacturing a value to cross them would be the self-issued authority
-//! the carrier's own contract refuses.
+//! What a future attempt must supply is therefore not one adapter but four
+//! things, in the order the measured chain hits them. FIRST, and ahead of this
+//! channel entirely, a Governor that publishes the #806 controller snapshot and
+//! the A-04 recipe over
+//! [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource) — until
+//! that exists, `submit` refuses upstream of this carrier and none of the rows
+//! below is even consulted. Then: a production caller for the Governor producer
+//! plus a `bins/eliot-dreamer` edge to it; a content-retrieval capability that
+//! turns the record's address into a typed member; and a published member set
+//! for every remaining mandatory stage. Naming the missing dependency edges is
+//! the honest deliverable here; manufacturing a value to cross them would be the
+//! self-issued authority the carrier's own contract refuses.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
@@ -185,12 +223,34 @@ const DIGEST_UNAVAILABLE: &str = "digest unavailable";
 /// Missing-owner identity for the CC-004 projection owner and the stage owners.
 const OWNER_PROJECTIONS: &str = "governor canonical projection owner";
 
-/// Immutable route-measurement function supplied with the understanding record.
+/// Immutable route measurement supplied with the understanding record.
 ///
-/// A plain `fn` item keeps the carrier non-generic: the Governor channel
-/// supplies the measurement with the admitted set, and the composer invokes it
-/// at most once through the understanding owner entry.
-pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
+/// The shape is the one the measurement owner itself pins for an independent
+/// consumer: a reference to `dyn Fn(&[u8]) -> Result<SerializedContextMeasurement,
+/// ContextError>` over the exact canonical payload bytes
+/// (`crates/smart/eliot-context-measurement/tests/measurement.rs`,
+/// `independent_consumer_compiles_against_a15_result_and_entrypoint`), and the
+/// same bound the understanding owner entry
+/// [`assemble_active_view`](eliot_context_assembly::assemble_active_view)
+/// declares. The composer invokes it at most once, through that owner entry.
+///
+/// This was a bare `fn` pointer, and that made the member unsatisfiable by any
+/// owner: the only real measurement operation,
+/// `eliot_context_measurement::measure_exact_utf8`, is a two-argument entry that
+/// takes the caller's own `MeasurementParams` (measurement identity, context
+/// binding, route/model identity, capacity reserves and the caller's byte
+/// ceiling), and a `fn` item cannot capture them. A pointer with that shape
+/// could therefore only ever be a measurement that ignored the route it claims
+/// to measure — the fabricated lookalike this carrier refuses — so the member
+/// had zero honest implementations anywhere in the workspace.
+///
+/// A reference to a trait object restores the capability without a second
+/// scheme, a new identity type, a new dependency or a weakened check: the owning
+/// route supplies a closure over its own parameters, this binary only invokes
+/// it, the callback still runs exactly once over the exact canonical payload
+/// bytes, and the owner measurement still refuses a malformed, oversized or
+/// wrongly bound payload with its own typed [`ContextError`].
+pub type MeasureFn<'a> = &'a dyn Fn(&[u8]) -> Result<SerializedContextMeasurement, ContextError>;
 
 /// Versioned runtime-owned production carrier: everything one complete
 /// Orientation pulse must consume, with no optional mandatory member.
@@ -227,7 +287,7 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     /// Epistemic resolution request over admitted records.
     pub epistemic: &'a PositionRequest,
     /// Understanding stage inputs with the route measurement.
-    pub understanding: UnderstandingStage<'a, MeasureFn>,
+    pub understanding: UnderstandingStage<'a, MeasureFn<'a>>,
     /// Claim-grounding request this binary's own grounding stage admitted.
     pub grounding: &'a GroundingRequest,
     /// Rival-structuring stage inputs.
@@ -267,10 +327,34 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// the validated grounding candidate are deliberately absent: they are outputs
 /// of stages this binary already runs, so no owner channel can supply them.
 /// They travel as explicit [`ProductionOrientationInputs`] parameters instead.
+/// That is the "answer before the question" defect removed: no member of this
+/// struct is a value the same admitted call produces later in its own body.
 pub struct OrientationSupply<'a> {
     /// CC-004 canonical projection set emitted by the Governor's own producer.
     pub projections: &'a CanonicalProjectionSet,
     /// Governor-issued Current Epistemic Position handles for the packet.
+    ///
+    /// An empty slice is a legitimate published value and is what binds today:
+    /// the owner has admitted no epistemic position view for this scope, and the
+    /// projector accepts that. A NON-empty list does not currently bind, and the
+    /// reason is a second documented link, not a missing producer:
+    /// `CurrentEpistemicPositionHandle::validate_material` requires a bundle
+    /// material whose bytes and digest equal the canonical bytes of the handle's
+    /// position, while `admitted_material::bundle_of` plants the orientation
+    /// frame body on the frame-source material and `0` bytes plus a handle digest
+    /// on every other evidence material. So the only bundle material that could
+    /// carry a CEP view is the frame source, and the projector refuses that one
+    /// explicitly ("frame and CEP source handles must differ"). The owner fix is
+    /// in `bundle_of` plus its call site `dispatch_stage::dispatch_orientation`,
+    /// both outside this crate's carrier.
+    ///
+    /// The handle is NOT the resolver's output and must not be built from it:
+    /// `eliot_epistemic::resolve` returns the resolver's own
+    /// `position::CurrentEpistemicPosition` policy algebra, while this field
+    /// carries `eliot_epistemic_contracts::CurrentEpistemicPosition`, the
+    /// owner-admitted view over an `AdmittedReceipt`. The two are deliberately
+    /// different vocabularies, so a stage returning its resolved position would
+    /// not fill this member even if it returned one.
     pub cep_handles: &'a [CurrentEpistemicPositionHandle],
     /// Owner classification input (classification stage).
     pub classification_input: &'a ClassificationInput,
@@ -302,7 +386,7 @@ pub struct OrientationSupply<'a> {
     /// Caller-owned immutable assembly parameters (understanding stage).
     pub assembly_policy: &'a AssemblyPolicy,
     /// Route measurement invoked once over the canonical payload bytes.
-    pub measure: MeasureFn,
+    pub measure: MeasureFn<'a>,
     /// Admitted current position the rivals bind against.
     pub current_position: &'a AdmittedPosition,
     /// Rival-structuring policy.
