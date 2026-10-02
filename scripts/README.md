@@ -46,8 +46,11 @@ committed as repository authority.
 | `verify-branch-protection.py` | Read back live branch protection/rulesets and compare against the retained merge-enforcement rule (#3004) | Live enforcement readback evidence only; never configures protection |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
+| `audit-context-measurement-ownership.py` | Context measurement ownership validator | Static source ownership evidence only |
 | `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |
+| `gen_capability_cell_registry.py` | Capability cell registry generator | Generated registry evidence only |
 | `long_lived_collection_inventory.py` | Deterministic source-bound inventory of mutable collections in long-lived owners (#885) | Static source classification only |
+| `prepare-dependency-policy-inputs.py` | Dependency policy input preparer | Static dependency policy evidence only |
 | `serde_boundary_inventory.py` | Deterministic serialized-boundary inventory and finite repair allocations (#929, freezing the F-DENY denominator for #710) | Static source classification only |
 | `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
 | `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |

@@ -362,6 +362,16 @@ source = "scripts/verify-legacy-config-retirement.py"
 path = "docs/notes.md"
 reason = "The self-test fixture uses docs/notes.md as a temporary test path."
 
+[[repository_paths.allow_missing]]
+source = "scripts/tests/test_package_reader_closure.py"
+path = "docs/architecture/A.md"
+reason = "The unit-test fixture uses docs/architecture/A.md as a dummy test path."
+
+[[repository_paths.allow_missing]]
+source = "scripts/verify-github-workflows.py"
+path = "docs/note.md"
+reason = "The self-test fixture uses docs/note.md as a temporary test path."
+
 [documentation_pipeline]
 shards_front_door = "scripts/docs_shards.py"
 router_front_door = "scripts/docs_router.py"
