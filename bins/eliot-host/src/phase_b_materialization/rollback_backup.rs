@@ -255,9 +255,10 @@ pub(super) fn phase_b_write_rollback_backup(
         })? {
         PublicationOutcome::Published(_) => {}
         PublicationOutcome::Unknown(_) => {
-            let lease = phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
-                rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
-            })?;
+            let lease =
+                phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
+                    rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
+                })?;
             lease.verify().map_err(|error| {
                 rollback_backup_observe(RollbackContour::BackupVerifyFailed, Some(&profile));
                 HostError::RecoveryRequired(error)
@@ -305,9 +306,10 @@ pub fn phase_b_restore_or_remove(
     })?;
     if std::fs::symlink_metadata(&backup).is_ok() {
         rollback_backup_observe(RollbackContour::RestoreRequested, Some(&profile));
-        let backup_lease = phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
-            rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
-        })?;
+        let backup_lease =
+            phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
+                rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
+            })?;
         backup_lease.verify().map_err(|error| {
             rollback_backup_observe(RollbackContour::RestoreBackupVerifyFailed, Some(&profile));
             HostError::RecoveryRequired(error)
