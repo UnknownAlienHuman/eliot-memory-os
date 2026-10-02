@@ -5693,5 +5693,9 @@ mod tests;
 #[path = "tests/local_read_claim.rs"]
 mod local_read_claim_tests;
 
+#[cfg(test)]
+#[path = "tests/local_state_readback.rs"]
+mod local_state_readback_tests;
+
 // Store implementation E2E belongs to the Store/Host boundary. Kernel tests
 // exercise only the neutral descriptor and route/fence behavior.
