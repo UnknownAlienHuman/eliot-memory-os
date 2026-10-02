@@ -24,6 +24,15 @@ use eliot_runtime_contracts::{
     GenerationCutoverRecord as RuntimeGenerationCutoverRecord, GenerationCutoverState,
 };
 
+/// The service and protocol identities this module's rollback diagnostics read.
+///
+/// They are TEST-SCOPED deliberately: this module no longer spells these values
+/// when it rebuilds the front-door `config_snapshot`, because that object has
+/// one owner in `composition_bootstrap::front_door_config_snapshot` and this
+/// module calls it. A module-scope import with no non-test consumer left is an
+/// unused import in a plain lib build, and the Review gate runs clippy with
+/// `-D warnings`, so that is a build failure rather than a warning.
+#[cfg(test)]
 use crate::{PROTOCOL_VERSION, SERVICE_NAME};
 
 fn is_lower_sha256(value: &str) -> bool {
