@@ -15,6 +15,18 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
 
+// The closed versioned Context-cost adapter - the accepted schema, the refusal
+// rules and the checked STU accumulation - lives in
+// `context_cost_measurement.rs`. It is attached with an explicit `#[path]`
+// rather than a `lib.rs` entry, following this crate's own convention for a
+// `src/`-level file owned by one feature module (`#[path =
+// "context_contracts.rs"] mod context_contracts;` in `context.rs`), so the crate
+// module owner list and `lib.rs` are untouched.
+#[path = "context_cost_measurement.rs"]
+mod context_cost_measurement;
+
+use context_cost_measurement::{canonical_context_cost_from_payload, checked_context_cost_add};
+
 pub const MEMORY_DISTILLATION_RULESET_VERSION: &str = "eliot-c4-distillation-v1";
 const MEMORY_DISTILLATION_NORMALIZATION_TOKEN_LIMIT: usize = 12;
 
@@ -27,7 +39,7 @@ impl MemoryDistillationService {
         snapshot_revision: MemoryRevision,
         source_records: &[MemoryUtilitySourceRecord],
         complete: bool,
-    ) -> CanonicalMemoryUtilityLedger {
+    ) -> Result<CanonicalMemoryUtilityLedger, EngineError> {
         let mut entries = BTreeMap::<String, MemoryUtilityLedgerEntry>::new();
         for record in source_records {
             let targets = if record.target_refs.is_empty() {
@@ -52,7 +64,7 @@ impl MemoryDistillationService {
                     .maintenance_cost_units
                     .saturating_add(record.serialized_bytes.div_ceil(1024));
                 for signal in &signals {
-                    apply_utility_signal(entry, *signal, &record.payload);
+                    apply_utility_signal(entry, *signal, &record.payload)?;
                 }
                 if !record.evidence_ref.trim().is_empty() {
                     entry.evidence_refs.push(record.evidence_ref.clone());
@@ -64,13 +76,13 @@ impl MemoryDistillationService {
             entry.evidence_refs.sort();
             entry.evidence_refs.dedup();
         }
-        CanonicalMemoryUtilityLedger {
+        Ok(CanonicalMemoryUtilityLedger {
             project_id,
             snapshot_revision,
             complete,
             source_record_count: source_records.len(),
             entries,
-        }
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -545,7 +557,7 @@ fn apply_utility_signal(
     entry: &mut MemoryUtilityLedgerEntry,
     signal: MemoryUtilitySignalKind,
     payload: &Value,
-) {
+) -> Result<(), EngineError> {
     *entry.signal_counts.entry(signal).or_insert(0) += 1;
     match signal {
         MemoryUtilitySignalKind::InjectionReceipt
@@ -594,13 +606,27 @@ fn apply_utility_signal(
         }
         MemoryUtilitySignalKind::ContextTokenCost => {
             // Closed versioned adapter, not a field probe. Only a payload that
-            // declares the accepted current measurement revision and carries
-            // the canonical #704 unvalidated STU is admitted; the legacy bare
-            // `estimated_tokens` integer is no longer decoded. A malformed or
-            // unversioned payload contributes nothing rather than a minimum-one
-            // estimate, so unknown cost is never cheap.
+            // deserializes into the whole `eliot-context-cost/v1` contract -
+            // every required fragment present, no unknown fragment - is
+            // admitted; the legacy bare `estimated_tokens` integer is no longer
+            // decoded. A malformed or unversioned payload contributes nothing
+            // rather than a minimum-one estimate, so unknown cost is never
+            // cheap.
+            //
+            // Accumulation is checked, not saturating. `saturating_add` turned an
+            // unrepresentable total into `u64::MAX`, which
+            // `deterministic_item_finding` reads as `context_cost_tokens > 512`
+            // and turns into a `Demote` - so malformed accumulation became a
+            // lifecycle action instead of typed evidence. Overflow is now the
+            // same typed `ContextError::Overflow` refusal this file's byte path
+            // already returns, and it propagates out of
+            // `derive_utility_ledger` to the caller. An overflow that was never
+            // a real measurement therefore never reaches the entry at all, and
+            // the `> 512` threshold can only ever see a sum of admitted STU.
             if let Some(value) = canonical_context_cost_from_payload(payload) {
-                entry.context_cost_tokens = entry.context_cost_tokens.saturating_add(value);
+                entry.context_cost_tokens =
+                    checked_context_cost_add(entry.context_cost_tokens, value)
+                        .map_err(EngineError::ContextMeasurement)?;
             }
         }
         MemoryUtilitySignalKind::MaintenanceCost => {}
@@ -612,6 +638,7 @@ fn apply_utility_signal(
                 entry.missing_context_regret_count.saturating_add(1);
         }
     }
+    Ok(())
 }
 
 fn deterministic_item_finding(
@@ -937,39 +964,15 @@ fn payload_string(value: &Value, key: &str) -> Option<String> {
         })
 }
 
-/// Accepted revision of the semantic Context-cost measurement adapter.
-///
-/// A payload that does not declare exactly this revision is not measured. There
-/// is no trial decoding, serde default or alias that invents evidence.
-const CONTEXT_COST_ADAPTER_REVISION: &str = "eliot-context-cost/v1";
-
-/// Closed versioned adapter from a canonical #704 measurement payload to the
-/// unvalidated STU recorded in `MemoryUtilityLedgerEntry::context_cost_tokens`.
-///
-/// Admitted only when the payload declares the accepted revision, names the
-/// canonical serializer, reports the #704 `conservative_stu` status, and
-/// carries an `actual_tokens` field. Absent or mismatched evidence yields
-/// `None` (unknown), never zero, one, or a legacy bare estimate. A stale
-/// legacy `estimated_tokens` value is never decoded as current tokens.
-fn canonical_context_cost_from_payload(payload: &Value) -> Option<u64> {
-    let measure = payload.get("measurement")?;
-    if measure.get("adapter_revision")?.as_str()? != CONTEXT_COST_ADAPTER_REVISION {
-        return None;
-    }
-    if measure.get("serializer_id")?.as_str()? != "serde_json" {
-        return None;
-    }
-    if measure.get("measurement_status")?.as_str()? != "conservative_stu" {
-        return None;
-    }
-    // An actual-token claim requires its own exact route/model/tokenizer
-    // binding over these bytes. Without one it must be explicitly null, never
-    // a synthesized count.
-    if !measure.get("actual_tokens").is_some_and(Value::is_null) {
-        return None;
-    }
-    measure.get("stu_estimate")?.get("value")?.as_u64()
-}
+// The five `canonical_context_cost_from_payload` probes that used to live here
+// are gone. That helper, the accepted schema it enforces and the checked STU
+// accumulation are all in the `context_cost_measurement` module declared at the
+// top of this file: it deserializes the whole `measurement` object into
+// `ContextCostMeasurement` under `#[serde(deny_unknown_fields)]`, which is what
+// refuses an extra, mutated or unexpected fragment, since one deserialization
+// has to account for every key it is given. An absent or mismatched payload
+// yields `None` (unknown), never zero, one, or a legacy bare estimate, and a
+// stale legacy `estimated_tokens` value is never decoded as current tokens.
 
 /// Canonical #704 covering-ESTIMATE byte length for one measured corpus unit
 /// count.

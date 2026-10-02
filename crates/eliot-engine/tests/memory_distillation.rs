@@ -1,11 +1,12 @@
-use eliot_engine::{MEMORY_DISTILLATION_RULESET_VERSION, MemoryDistillationService};
+use eliot_context_contracts::ContextError;
+use eliot_engine::{EngineError, MEMORY_DISTILLATION_RULESET_VERSION, MemoryDistillationService};
 use eliot_types::{
     CanonicalMemoryUtilityLedger, ForgettingOperator, MemoryCompressionArtifact,
     MemoryDistillationAction, MemoryDistillationCorpusItem, MemoryDistillationFinding,
     MemoryDistillationInput, MemoryDistillationScheduleRequest, MemoryDistillationTrigger,
     MemoryLifecycleState, MemoryRevision, MemoryTier, MemoryUtilitySourceRecord, ProjectId,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn item(target_ref: impl Into<String>) -> MemoryDistillationCorpusItem {
     let target_ref = target_ref.into();
@@ -68,7 +69,8 @@ fn plan(
 }
 
 #[test]
-fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
+fn utility_ledger_uses_canonical_signals_and_ignores_writer_score()
+-> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let snapshot_revision = MemoryRevision::new(7);
     let ledger = MemoryDistillationService::derive_utility_ledger(
@@ -89,7 +91,7 @@ fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
             serialized_bytes: 1_500,
         }],
         true,
-    );
+    )?;
 
     assert_eq!(ledger.source_record_count, 1);
     assert!(ledger.complete);
@@ -100,6 +102,7 @@ fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
     assert_eq!(entry.false_activation_count, 0);
     assert_eq!(entry.maintenance_cost_units, 2);
     assert_eq!(entry.evidence_refs, ["receipt:1"]);
+    Ok(())
 }
 
 #[test]
@@ -446,5 +449,389 @@ fn exact_distillation_reduces_the_covering_active_estimate_without_losing_curren
             .count(),
         9
     );
+    Ok(())
+}
+
+/// A well-formed `eliot-context-cost/v1` measurement payload is admitted and its
+/// conservative STU is added to `context_cost_tokens`.
+///
+/// This is the positive limb of the closed-schema repair: the admitted unit is
+/// the #704 conservative Source Token Unit and the three marker spellings are
+/// the canonical ones, not ad-hoc strings - `serde_json` is the serializer id
+/// the seam admits, `CONSERVATIVE_STU` is how the owner's
+/// `eliot_context_contracts::MeasurementStatus` serializes
+/// `MeasurementStatus::ConservativeStu` (it is
+/// `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`,
+/// `crates/smart/eliot-context-contracts/src/measurement.rs:10-18`), and
+/// `actual_tokens` is explicitly `null` because an actual-token claim needs its
+/// own route/model/tokenizer binding over these bytes, which this seam has no
+/// way to produce. The `stu_estimate` member set is exactly the owner's
+/// `StuEstimate` (`value`, `empirical`,
+/// `crates/smart/eliot-context-contracts/src/measurement.rs:96`).
+///
+/// HONEST NOTE ON THE PRODUCER: no in-repo producer emits this object. The only
+/// in-repo memory measurement wire form is `measurement_wire` at
+/// `crates/eliot-app/src/mcp_stdio.rs:371-377`, which emits
+/// `{unit, status, actual_tokens: null}` and no `adapter_revision`,
+/// `serializer_id` or `stu_estimate`. So this fixture is the contract's own
+/// admissible form, not a transcription of something an existing producer
+/// writes today, and the admission asserted here is a property of the schema -
+/// not evidence that any production payload is measured. That gap predates this
+/// change (the five probes it replaces required the same three keys) and
+/// emitting the contract is an `eliot-app` owner change outside this work unit;
+/// see the corrected-evidence note in
+/// `crates/eliot-engine/src/context_cost_measurement.rs`.
+fn context_cost_record(stu: u64) -> MemoryUtilitySourceRecord {
+    MemoryUtilitySourceRecord {
+        record_ref: "context_packet:1".to_owned(),
+        record_kind: "context_packet".to_owned(),
+        target_refs: vec!["claim:measured".to_owned()],
+        evidence_ref: "receipt:context".to_owned(),
+        payload: json!({
+            "measurement": {
+                "adapter_revision": "eliot-context-cost/v1",
+                "serializer_id": "serde_json",
+                "measurement_status": "CONSERVATIVE_STU",
+                "actual_tokens": Value::Null,
+                "stu_estimate": {
+                    "value": stu,
+                    "empirical": false,
+                },
+            },
+        }),
+        memory_revision: None,
+        project_sequence: None,
+        serialized_bytes: 190,
+    }
+}
+
+#[test]
+fn closed_context_cost_adapter_admits_a_well_formed_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project_id = ProjectId::new_v7();
+    let snapshot_revision = MemoryRevision::new(9);
+    let ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &[
+            context_cost_record(64),
+            context_cost_record(24),
+            MemoryUtilitySourceRecord {
+                record_ref: "injection_receipt:1".to_owned(),
+                record_kind: "injection_receipt".to_owned(),
+                target_refs: vec!["claim:measured".to_owned()],
+                evidence_ref: "receipt:other".to_owned(),
+                payload: json!({}),
+                memory_revision: None,
+                project_sequence: None,
+                serialized_bytes: 1_500,
+            },
+        ],
+        true,
+    )?;
+
+    let entry = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.target_ref == "claim:measured")
+        .expect("the measured target must have a ledger entry");
+    // 64 + 24 = 88 admitted STU, in the STU unit the payload declared. The
+    // `context_packet` record kind also feeds `PacketInclusion`, so this also
+    // proves the rest of the signal handling still runs.
+    assert_eq!(entry.context_cost_tokens, 88);
+    // 190 bytes over two context-packet records plus 1_500 over the injection
+    // receipt, each rounded up to whole KiB and kept in its own storage unit.
+    assert_eq!(entry.maintenance_cost_units, 2);
+    assert_eq!(
+        entry.evidence_refs,
+        ["receipt:context", "receipt:other"],
+        "evidence refs stay sorted and deduplicated"
+    );
+    Ok(())
+}
+
+/// The closed-schema limb: a payload carrying an extra, mutated or unexpected
+/// fragment is refused instead of admitted on the strength of the few fragments
+/// the old probes looked for.
+///
+/// Every assertion is on a real `derive_utility_ledger` return value, so a
+/// source-text change cannot make this green. The mutated-`value` case is the
+/// audit's exact counterexample: a forged STU carried beside unrelated and
+/// mutated bytes used to be accepted.
+#[test]
+fn closed_context_cost_adapter_refuses_unknown_and_malformed_fragments()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project_id = ProjectId::new_v7();
+    let snapshot_revision = MemoryRevision::new(9);
+    // Five admitted STU on the same target: anything that leaks in from a
+    // refused payload has to move this number off 5.
+    let records = [
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:0".to_owned(),
+            record_kind: "injection_receipt".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:0".to_owned(),
+            payload: json!({}),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        context_cost_record(5),
+        // An unknown sibling fragment on the measurement object. The old
+        // `adapter_revision`/`serializer_id`/`measurement_status`/
+        // `actual_tokens`/`stu_estimate.value` probes never looked at this key,
+        // so this payload was admitted before and is refused now.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:unknown".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:unknown".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "CONSERVATIVE_STU",
+                    "actual_tokens": Value::Null,
+                    "stu_estimate": { "value": 9_000, "empirical": false },
+                    "total_bytes": 190,
+                    "content_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        // A forged STU carried beside an unreviewed sibling inside the estimate
+        // object itself. `stu_estimate.value` alone used to be read.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:stu_sibling".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:stu-sibling".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "CONSERVATIVE_STU",
+                    "actual_tokens": Value::Null,
+                    "stu_estimate": { "value": 9_000, "estimator_id": "forged" },
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        // A present, non-null `actual_tokens` claim with no route/model/tokenizer
+        // binding behind it.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:actual".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:actual".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "CONSERVATIVE_STU",
+                    "actual_tokens": 9_000,
+                    "stu_estimate": { "value": 9_000, "empirical": false },
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        // The legacy bare integer and the pre-existing lowercase status spelling.
+        // Neither is decoded as a current STU.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:legacy".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:legacy".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "conservative_stu",
+                    "actual_tokens": Value::Null,
+                    "stu_estimate": { "value": 9_000, "empirical": false },
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:bare".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:bare".to_owned(),
+            payload: json!({ "estimated_tokens": 9_000 }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+    ];
+    let ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &records,
+        true,
+    )?;
+
+    let entry = &ledger.entries[0];
+    assert_eq!(
+        entry.context_cost_tokens, 5,
+        "only the one well-formed payload may contribute; every refused fragment \
+         above must leave the total at the single admitted 5 STU"
+    );
+    Ok(())
+}
+
+/// A required measurement fragment that is missing is refused as unknown
+/// evidence, NOT admitted as zero.
+///
+/// `actual_tokens` is the sharpest case: the old probe required it to be
+/// present-and-null, so omission was already refused, and modelling it as
+/// `Option<Value>` would have silently re-admitted it. Omitting `value` from
+/// the STU object is refused for the same reason. Neither may read as a cheap
+/// zero.
+#[test]
+fn closed_context_cost_adapter_refuses_a_missing_required_fragment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project_id = ProjectId::new_v7();
+    let snapshot_revision = MemoryRevision::new(9);
+    let records = [
+        MemoryUtilitySourceRecord {
+            record_ref: "injection_receipt:0".to_owned(),
+            record_kind: "injection_receipt".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:0".to_owned(),
+            payload: json!({}),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        context_cost_record(5),
+        // `actual_tokens` omitted entirely rather than explicitly null.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:no_actual".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:no-actual".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "CONSERVATIVE_STU",
+                    "stu_estimate": { "value": 9_000, "empirical": false },
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        // The required `value` member missing from the STU object.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:no_value".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:no-value".to_owned(),
+            payload: json!({
+                "measurement": {
+                    "adapter_revision": "eliot-context-cost/v1",
+                    "serializer_id": "serde_json",
+                    "measurement_status": "CONSERVATIVE_STU",
+                    "actual_tokens": Value::Null,
+                    "stu_estimate": { "empirical": false },
+                },
+            }),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+        // The whole measurement object absent.
+        MemoryUtilitySourceRecord {
+            record_ref: "context_packet:no_measurement".to_owned(),
+            record_kind: "context_packet".to_owned(),
+            target_refs: vec!["claim:measured".to_owned()],
+            evidence_ref: "receipt:no-measurement".to_owned(),
+            payload: json!({}),
+            memory_revision: None,
+            project_sequence: None,
+            serialized_bytes: 0,
+        },
+    ];
+    let ledger = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &records,
+        true,
+    )?;
+
+    assert_eq!(
+        ledger.entries[0].context_cost_tokens, 5,
+        "a missing required fragment must stay unknown evidence, never a zero \
+         that would read as a cheap memory"
+    );
+    Ok(())
+}
+
+/// An addition that would overflow is a typed error, not `u64::MAX`.
+///
+/// The admitted STU is a real `u64` a payload can name, so `u64::MAX` plus one
+/// more measured unit is reachable through the ordinary public entry point. The
+/// old `saturating_add` returned `u64::MAX` here, which is exactly the figure
+/// `deterministic_item_finding` reads as `context_cost_tokens > 512` when it
+/// proposes `MemoryDistillationAction::Demote` - so an arithmetic overflow
+/// could become a lifecycle action. It is now the typed
+/// `EngineError::ContextMeasurement(ContextError::Overflow)` refusal that this
+/// file's byte path already returns, propagated out of `derive_utility_ledger`.
+#[test]
+fn context_cost_accumulation_overflow_is_a_typed_error_not_u64_max()
+-> Result<(), Box<dyn std::error::Error>> {
+    let project_id = ProjectId::new_v7();
+    let snapshot_revision = MemoryRevision::new(9);
+
+    // Exactly at the boundary: `u64::MAX` alone is representable and admitted.
+    let at_limit = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &[context_cost_record(u64::MAX)],
+        true,
+    )?;
+    assert_eq!(at_limit.entries[0].context_cost_tokens, u64::MAX);
+
+    // One more measured unit past the boundary is the typed refusal.
+    let overflowed = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &[
+            context_cost_record(u64::MAX),
+            context_cost_record(1),
+            context_cost_record(1),
+        ],
+        true,
+    );
+    let error = overflowed
+        .expect_err("an overflowing STU accumulation must be refused, not saturated");
+    assert_eq!(
+        error,
+        EngineError::ContextMeasurement(ContextError::Overflow),
+        "the refusal must be the typed measurement overflow, not a saturated value"
+    );
+
+    // The saturated figure this used to produce is the one the demotion
+    // threshold fires on. Pin that a refused ledger yields no plan at all, so
+    // the overflow cannot reach `deterministic_item_finding` as a cost.
+    let refused = MemoryDistillationService::derive_utility_ledger(
+        project_id,
+        snapshot_revision,
+        &[context_cost_record(u64::MAX), context_cost_record(1)],
+        true,
+    )
+    .err()
+    .expect("the second ledger must also refuse");
+    assert_eq!(refused, EngineError::ContextMeasurement(ContextError::Overflow));
     Ok(())
 }
