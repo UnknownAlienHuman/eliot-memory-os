@@ -5,8 +5,8 @@ use eliot_engine::{
 };
 use eliot_types::runtime_supervision::ReapCompleteness;
 use eliot_types::{
-    DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION, DescendantFileIdentity, DescendantProcessSnapshot,
-    DescendantsAtRootExit, DescendantsAtRootExitFailed, DescendantsCaptureErrorKind,
+    DescendantFileIdentity, DescendantProcessSnapshot, DescendantsAtRootExit,
+    DescendantsCaptureErrorKind, MAX_DESCENDANT_DETAIL_CHARS,
     OPERATION_RUNTIME_CHECKPOINT_SCHEMA_VERSION, OperationCancellationState, OperationPhase,
     OperationReconciliationState, OperationRuntimeCheckpoint, ProcessReapReceipt,
     ProviderDispatchState, ProviderTimeoutClass,
@@ -549,6 +549,9 @@ pub async fn recover_stale_job_objects(
                 empty,
             } => {
                 let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                // A refusal to record capture evidence is a real failure of this
+                // recovery pass, not an invitation to invent a capture record: it
+                // propagates as the typed error instead of a synthetic `Failed`.
                 let descendants_at_root_exit = DescendantsAtRootExit::failed(
                     checkpoint.root_pid,
                     None,
@@ -556,14 +559,9 @@ pub async fn recover_stale_job_objects(
                     DescendantsCaptureErrorKind::EnumerationFailed,
                     "startup recovery: no live root-exit descendant capture",
                 )
-                .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
-                    schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-                    root_pid: checkpoint.root_pid,
-                    root_exit_code: None,
-                    capture_elapsed_ms: elapsed_ms,
-                    error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-                    detail: "startup recovery".to_owned(),
-                }));
+                .map_err(|invariant| {
+                    anyhow!("startup recovery descendant capture evidence: {invariant}")
+                })?;
                 let receipt = ProcessReapReceipt {
                     operation_id: checkpoint.operation_id.clone(),
                     generation: checkpoint.generation,
@@ -618,14 +616,9 @@ pub async fn recover_stale_job_objects(
                     DescendantsCaptureErrorKind::EnumerationFailed,
                     "startup recovery: verified root without live descendant capture",
                 )
-                .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
-                    schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-                    root_pid: Some(root_pid),
-                    root_exit_code: None,
-                    capture_elapsed_ms: elapsed_ms,
-                    error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-                    detail: "startup recovery".to_owned(),
-                }));
+                .map_err(|invariant| {
+                    anyhow!("startup recovery verified-root descendant evidence: {invariant}")
+                })?;
                 let receipt = ProcessReapReceipt {
                     operation_id: checkpoint.operation_id.clone(),
                     generation: checkpoint.generation,
@@ -1142,8 +1135,7 @@ fn run_worker(
     let mut root_exit_seen_at = None;
     let mut root_descendant_grace_deadline = None;
     let mut root_wait_failure_detail = None;
-    let mut descendants_at_root_exit: Option<DescendantsAtRootExit> = None;
-    let mut descendant_capture_task: Option<WorkerThread<DescendantsAtRootExit>> = None;
+    let mut descendant_capture_task: Option<WorkerThread<Result<DescendantsAtRootExit>>> = None;
 
     loop {
         if root_exit_seen_at.is_none() {
@@ -1301,56 +1293,43 @@ fn run_worker(
         }
     }
     let exit_waiter_terminal = exit_code.is_some();
-    if descendants_at_root_exit.is_none() {
+    // The capture disposition is resolved exactly once, here. There is no
+    // second, later default: an evidence value that cannot be built is a real
+    // failure of this reap and propagates as the typed error instead of being
+    // replaced by a manufactured capture record.
+    let descendants_at_root_exit = {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let fallback = root_wait_failure_detail.as_deref().map_or_else(
-            || {
-                failed_descendant_capture(
-                    Some(root_pid),
-                    exit_code,
-                    elapsed_ms,
-                    DescendantsCaptureErrorKind::Ambiguous,
-                    if descendant_capture_task.is_some() {
-                        "descendant capture did not complete before bounded cleanup"
-                    } else {
-                        "root exit was not observed before bounded cleanup"
-                    },
-                )
-            },
-            |detail| {
-                failed_descendant_capture(
-                    Some(root_pid),
-                    exit_code,
-                    elapsed_ms,
-                    DescendantsCaptureErrorKind::EnumerationFailed,
-                    detail,
-                )
-            },
-        );
-        let snapshot = if descendant_capture_task.is_some() {
-            receive_worker_thread(descendant_capture_task.take(), cleanup_deadline, fallback).0
+        let fallback: Result<DescendantsAtRootExit> =
+            root_wait_failure_detail.as_deref().map_or_else(
+                || {
+                    failed_descendant_capture(
+                        Some(root_pid),
+                        exit_code,
+                        elapsed_ms,
+                        DescendantsCaptureErrorKind::Ambiguous,
+                        if descendant_capture_task.is_some() {
+                            "descendant capture did not complete before bounded cleanup"
+                        } else {
+                            "root exit was not observed before bounded cleanup"
+                        },
+                    )
+                },
+                |detail| {
+                    failed_descendant_capture(
+                        Some(root_pid),
+                        exit_code,
+                        elapsed_ms,
+                        DescendantsCaptureErrorKind::EnumerationFailed,
+                        detail,
+                    )
+                },
+            );
+        if descendant_capture_task.is_some() {
+            receive_worker_thread(descendant_capture_task.take(), cleanup_deadline, fallback).0?
         } else {
-            fallback
-        };
-        descendants_at_root_exit = Some(snapshot);
-    }
-    let descendants_at_root_exit = descendants_at_root_exit.unwrap_or_else(|| {
-        DescendantsAtRootExit::failed(
-            Some(root_pid),
-            exit_code,
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            DescendantsCaptureErrorKind::EnumerationFailed,
-            "descendant capture unavailable",
-        )
-        .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
-            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-            root_pid: Some(root_pid),
-            root_exit_code: exit_code,
-            capture_elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-            detail: "descendant capture unavailable".to_owned(),
-        }))
-    });
+            fallback?
+        }
+    };
     let observed_processes = child.observed_processes();
     max_process_count =
         max_process_count.max(u32::try_from(observed_processes.len()).unwrap_or(u32::MAX));
@@ -1477,7 +1456,7 @@ fn spawn_descendant_capture(
     root_exit_code: Option<i32>,
     capture_elapsed_ms: u64,
     delay: Duration,
-) -> WorkerThread<DescendantsAtRootExit> {
+) -> WorkerThread<Result<DescendantsAtRootExit>> {
     let (result_tx, result_rx) = std_mpsc::sync_channel(1);
     let thread = std::thread::spawn(move || {
         if !delay.is_zero() {
@@ -1514,38 +1493,44 @@ fn descendant_capture_delay(operation_id: &str) -> Duration {
     Duration::ZERO
 }
 
+/// Records the bounded detail of a failed descendant capture.
+///
+/// The detail is bounded here, before the constructor sees it, so the single
+/// existing validator in `DescendantsAtRootExit` decides the outcome. A
+/// refusal therefore stays a typed error and propagates to the caller; it is
+/// never replaced by a manufactured `Failed` capture record.
 fn failed_descendant_capture(
     root_pid: Option<u32>,
     root_exit_code: Option<i32>,
     capture_elapsed_ms: u64,
     error_kind: DescendantsCaptureErrorKind,
     detail: impl Into<String>,
-) -> DescendantsAtRootExit {
+) -> Result<DescendantsAtRootExit> {
     let detail = detail.into();
+    let detail = if detail.chars().count() > MAX_DESCENDANT_DETAIL_CHARS {
+        detail
+            .chars()
+            .take(MAX_DESCENDANT_DETAIL_CHARS)
+            .collect::<String>()
+    } else {
+        detail
+    };
     DescendantsAtRootExit::failed(
         root_pid,
         root_exit_code,
         capture_elapsed_ms,
         error_kind,
-        detail.clone(),
-    )
-    .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
-        schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-        root_pid,
-        root_exit_code,
-        capture_elapsed_ms,
-        error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
         detail,
-    }))
+    )
+    .map_err(|invariant| anyhow!("descendant capture evidence refused: {invariant}"))
 }
 
-#[allow(clippy::too_many_lines)]
 fn capture_descendants_at_root_exit(
     job: &RecoverableJobObject,
     root_pid: u32,
     root_exit_code: Option<i32>,
     capture_elapsed_ms: u64,
-) -> DescendantsAtRootExit {
+) -> Result<DescendantsAtRootExit> {
     match job.current_job_processes() {
         Ok(snapshots) => {
             let mut descendants = Vec::new();
@@ -1574,7 +1559,7 @@ fn capture_descendants_at_root_exit(
                 capture_elapsed_ms,
                 descendants,
             ) {
-                Ok(captured) => captured,
+                Ok(captured) => Ok(captured),
                 Err(detail) => {
                     let kind = if detail.contains("overflow") {
                         DescendantsCaptureErrorKind::Overflow
@@ -1587,28 +1572,16 @@ fn capture_descendants_at_root_exit(
                     } else {
                         DescendantsCaptureErrorKind::EnumerationFailed
                     };
-                    let truncated = if detail.chars().count() > 512 {
-                        detail.chars().take(512).collect::<String>()
-                    } else {
-                        detail
-                    };
-                    DescendantsAtRootExit::failed(
+                    // `descendants` that no validated capture can represent are
+                    // recorded as a bounded refusal by the one existing
+                    // constructor; a refusal there stays typed.
+                    failed_descendant_capture(
                         Some(root_pid),
                         root_exit_code,
                         capture_elapsed_ms,
                         kind,
-                        truncated.clone(),
+                        detail,
                     )
-                    .unwrap_or(DescendantsAtRootExit::Failed(
-                        DescendantsAtRootExitFailed {
-                            schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-                            root_pid: Some(root_pid),
-                            root_exit_code,
-                            capture_elapsed_ms,
-                            error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-                            detail: truncated,
-                        },
-                    ))
                 }
             }
         }
@@ -1624,27 +1597,13 @@ fn capture_descendants_at_root_exit(
                 }
                 _ => DescendantsCaptureErrorKind::EnumerationFailed,
             };
-            let detail = error.to_string();
-            let detail = if detail.chars().count() > 512 {
-                detail.chars().take(512).collect::<String>()
-            } else {
-                detail
-            };
-            DescendantsAtRootExit::failed(
+            failed_descendant_capture(
                 Some(root_pid),
                 root_exit_code,
                 capture_elapsed_ms,
                 kind,
-                detail.clone(),
+                error.to_string(),
             )
-            .unwrap_or(DescendantsAtRootExit::Failed(DescendantsAtRootExitFailed {
-                schema_version: DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION.to_owned(),
-                root_pid: Some(root_pid),
-                root_exit_code,
-                capture_elapsed_ms,
-                error_kind: DescendantsCaptureErrorKind::EnumerationFailed,
-                detail,
-            }))
         }
     }
 }
