@@ -267,22 +267,6 @@ where
     deserialize_optional_pid(deserializer, "root_pid")
 }
 
-fn deserialize_descendants_at_root_exit_schema_version<'de, D>(
-    deserializer: D,
-) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    if value == DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION {
-        Ok(value)
-    } else {
-        Err(unsupported_schema_version(
-            DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION,
-        ))
-    }
-}
-
 fn deserialize_runtime_integrity_report_schema_version<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -534,15 +518,18 @@ pub enum DescendantsCaptureErrorKind {
     InvalidPid,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+// `Deserialize` is deliberately absent on both variant structs. The durable
+// descendant evidence is trusted as the authoritative answer to "what was left
+// of the process tree at root exit", and every load-bearing invariant of a
+// captured record — a non-zero `root_pid`, a bounded, pid-sorted, duplicate-free
+// descendant list, and per-entry PID/path/hash bounds — lives in
+// `DescendantsAtRootExit::validate`. A derived per-field decoder would rebuild
+// the "decoded but invalid" state that `validate` exists to exclude, so the
+// bytes are read through the private wire mirror below and the public value is
+// only ever produced after a full `validate()`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitCaptured {
-    // `DescendantsAtRootExit::validate` re-checks this field, but that method is
-    // not run by `Deserialize`. A snapshot written by a capture build whose
-    // layout this build does not own would otherwise decode and then be read as
-    // an authoritative empty-or-populated descendant list, so the version is
-    // bound at the decoder and the refusal is typed.
-    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: u32,
     pub root_exit_code: Option<i32>,
@@ -550,13 +537,9 @@ pub struct DescendantsAtRootExitCaptured {
     pub descendants: Vec<DescendantProcessSnapshot>,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitFailed {
-    // Bound at the decoder for the same reason as the captured variant: a
-    // failure record is the one that decides whether a capture attempt carried
-    // any descendant evidence at all, so an unowned version must not decode.
-    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: Option<u32>,
     pub root_exit_code: Option<i32>,
@@ -565,11 +548,89 @@ pub struct DescendantsAtRootExitFailed {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DescendantsAtRootExit {
     Captured(DescendantsAtRootExitCaptured),
     Failed(DescendantsAtRootExitFailed),
+}
+
+/// Private wire mirror of `DescendantsAtRootExit`.
+///
+/// It exists only to own the derived byte read. It is never public, never
+/// returned, and never validated by a second rule set: `Deserialize` converts
+/// it into the public value and then runs the one existing validator,
+/// `DescendantsAtRootExit::validate`. The wire shape is identical to the
+/// derived one it replaces, so current valid bytes and canonical digests are
+/// unchanged.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DescendantsAtRootExitWire {
+    Captured(DescendantsAtRootExitCapturedWire),
+    Failed(DescendantsAtRootExitFailedWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendantsAtRootExitCapturedWire {
+    schema_version: String,
+    root_pid: u32,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    descendants: Vec<DescendantProcessSnapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendantsAtRootExitFailedWire {
+    schema_version: String,
+    root_pid: Option<u32>,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    error_kind: DescendantsCaptureErrorKind,
+    detail: String,
+}
+
+/// Bounded refusal for descendant evidence that decoded but is not a capture any
+/// build could have taken.
+///
+/// The message carries only the fixed invariant name returned by `validate`; no
+/// received identifier, path or hash is echoed onto an operator surface.
+fn invalid_descendant_evidence<E>(invariant: String) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("invalid descendant capture evidence: {invariant}"))
+}
+
+impl<'de> Deserialize<'de> for DescendantsAtRootExit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DescendantsAtRootExitWire::deserialize(deserializer)?;
+        let value = match wire {
+            DescendantsAtRootExitWire::Captured(captured) => {
+                Self::Captured(DescendantsAtRootExitCaptured {
+                    schema_version: captured.schema_version,
+                    root_pid: captured.root_pid,
+                    root_exit_code: captured.root_exit_code,
+                    capture_elapsed_ms: captured.capture_elapsed_ms,
+                    descendants: captured.descendants,
+                })
+            }
+            DescendantsAtRootExitWire::Failed(failed) => Self::Failed(DescendantsAtRootExitFailed {
+                schema_version: failed.schema_version,
+                root_pid: failed.root_pid,
+                root_exit_code: failed.root_exit_code,
+                capture_elapsed_ms: failed.capture_elapsed_ms,
+                error_kind: failed.error_kind,
+                detail: failed.detail,
+            }),
+        };
+        value.validate().map_err(invalid_descendant_evidence::<D::Error>)?;
+        Ok(value)
+    }
 }
 
 impl DescendantsAtRootExit {
@@ -750,14 +811,55 @@ pub struct ProcessReapReceipt {
 }
 
 impl ProcessReapReceipt {
+    /// Typed disposition of this receipt's cleanup proof.
+    ///
+    /// The bool projection cannot be trusted to keep the two failure classes
+    /// apart, and they are not the same claim: `Incomplete` means the receipt
+    /// itself observed process members, open pipes or unjoined tasks, while
+    /// `DescendantEvidenceUntrusted` means the process-level conditions hold but
+    /// the descendant capture is failed, absent, or not a capture this build can
+    /// validate. Only `Proven` is an authoritative cleanup predicate.
     #[must_use]
-    pub fn proves_complete_reap(&self) -> bool {
-        self.process_count_after == 0
+    pub fn reap_completeness(&self) -> ReapCompleteness {
+        let process_level_complete = self.process_count_after == 0
             && self.stdout_closed
             && self.stderr_closed
             && self.all_tasks_joined
-            && (self.forced_termination || self.terminal_error_codes.is_empty())
+            && (self.forced_termination || self.terminal_error_codes.is_empty());
+        if !process_level_complete {
+            return ReapCompleteness::Incomplete;
+        }
+        // Process observation is not a substitute for the descendant capture:
+        // a zero member count with a failed or unusable capture has not proven
+        // that the process tree is gone, so it fails closed here as well as at
+        // the decoder.
+        if self.descendants_at_root_exit.is_captured()
+            && self.descendants_at_root_exit.validate().is_ok()
+        {
+            ReapCompleteness::Proven
+        } else {
+            ReapCompleteness::DescendantEvidenceUntrusted
+        }
     }
+
+    #[must_use]
+    pub fn proves_complete_reap(&self) -> bool {
+        matches!(self.reap_completeness(), ReapCompleteness::Proven)
+    }
+}
+
+/// Disposition of a `ProcessReapReceipt` as cleanup evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReapCompleteness {
+    /// Every process-level condition holds and the descendant capture is a
+    /// validated capture of this receipt.
+    Proven,
+    /// The receipt itself observed remaining process members, open pipes,
+    /// unjoined tasks, or unfreed terminal error codes.
+    Incomplete,
+    /// The process-level conditions hold, but the descendant capture is failed,
+    /// absent, or not valid capture evidence, so the tree is not proven gone.
+    DescendantEvidenceUntrusted,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
