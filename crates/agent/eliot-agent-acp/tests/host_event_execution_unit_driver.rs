@@ -30,6 +30,8 @@
 //! `stage_allowed` call would additionally bypass the applicability gate, which
 //! only the execution-unit constructor reaches.
 
+#![allow(clippy::expect_used)]
+
 use eliot_agent_acp::{
     AcpFrameCodec, CoverageManifestPlan, CoverageManifestRun, DurableHostEventJournal,
     ExecutionUnitDisclosure, ExecutionUnitDriverEvent, ExecutionUnitFrame, ExecutionUnitRunError,
