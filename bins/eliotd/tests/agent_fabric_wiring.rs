@@ -2034,7 +2034,7 @@ fn durable_swarm_commit<T: serde::Serialize>(
         },
         owner_id: owner_id.to_owned(),
         revision,
-        expected_predecessor: revision.checked_sub(1),
+        expected_predecessor: revision.checked_sub(1).filter(|predecessor| *predecessor > 0),
         content_digest,
         record_json: String::from_utf8(bytes)
             .map_err(|error| format!("canonical record bytes are not utf-8: {error}"))?,
