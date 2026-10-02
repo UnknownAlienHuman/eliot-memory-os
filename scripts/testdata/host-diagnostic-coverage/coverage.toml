@@ -830,7 +830,7 @@ operation = "console protocol failed before durable shutdown (HOST-0 reference f
 phase = "console"
 scope = "wired"
 status = "proven"
-detail = "Process entry; sole observe_terminal_error in main.rs (count pinned ==1 by console test)."
+detail = "Process entry; NOT a sole observe_terminal_error. main.rs has exactly two emission sites, one per typed code: HOST_TERMINAL_CODE_CONSOLE_FAILED at main.rs:494 (this boundary's frozen site) and HOST_TERMINAL_CODE_DISPATCHER_FAILED at main.rs:1594 under #[cfg(windows)]. The third main.rs occurrence (main.rs:481) is a comment, not an emission. The invariant that holds is one emitter per typed code, not one emitter per file; the recorded count==1 claim was the false artifact, not main.rs."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
