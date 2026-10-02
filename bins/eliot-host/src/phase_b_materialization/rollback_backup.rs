@@ -225,9 +225,8 @@ pub(super) fn phase_b_write_rollback_backup(
     label: &str,
 ) -> Result<(), HostError> {
     rollback_backup_observe(RollbackContour::BackupRequested, Some(&profile));
-    let backup = phase_b_rollback_path(destination, label).map_err(|error| {
+    let backup = phase_b_rollback_path(destination, label).inspect_err(|_| {
         rollback_backup_observe(RollbackContour::BackupPathFailed, Some(&profile));
-        error
     })?;
     let parent = backup.parent().ok_or_else(|| {
         rollback_backup_observe(RollbackContour::BackupPathFailed, Some(&profile));
@@ -256,18 +255,15 @@ pub(super) fn phase_b_write_rollback_backup(
         })? {
         PublicationOutcome::Published(_) => {}
         PublicationOutcome::Unknown(_) => {
-            let lease =
-                phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
-                    rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
-                    error
-                })?;
+            let lease = phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
+                rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
+            })?;
             lease.verify().map_err(|error| {
                 rollback_backup_observe(RollbackContour::BackupVerifyFailed, Some(&profile));
                 HostError::RecoveryRequired(error)
             })?;
-            let bytes = phase_b_lease_bytes(&lease).map_err(|error| {
+            let bytes = phase_b_lease_bytes(&lease).inspect_err(|_| {
                 rollback_backup_observe(RollbackContour::BackupReadFailed, Some(&profile));
-                error
             })?;
             if bytes != previous {
                 rollback_backup_observe(RollbackContour::BackupUnknownRetained, Some(&profile));
@@ -277,17 +273,15 @@ pub(super) fn phase_b_write_rollback_backup(
             }
         }
     }
-    let lease = phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
+    let lease = phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
         rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
-        error
     })?;
     lease.verify().map_err(|error| {
         rollback_backup_observe(RollbackContour::BackupVerifyFailed, Some(&profile));
         HostError::RecoveryRequired(error)
     })?;
-    let bytes = phase_b_lease_bytes(&lease).map_err(|error| {
+    let bytes = phase_b_lease_bytes(&lease).inspect_err(|_| {
         rollback_backup_observe(RollbackContour::BackupReadFailed, Some(&profile));
-        error
     })?;
     if bytes != previous {
         rollback_backup_observe(RollbackContour::BackupUnknownRetained, Some(&profile));
@@ -306,28 +300,23 @@ pub fn phase_b_restore_or_remove(
     label: &str,
     preserve_template_digest: Option<&PlatformHandle>,
 ) -> Result<(), HostError> {
-    let backup = phase_b_rollback_path(destination, label).map_err(|error| {
+    let backup = phase_b_rollback_path(destination, label).inspect_err(|_| {
         rollback_backup_observe(RollbackContour::BackupPathFailed, Some(&profile));
-        error
     })?;
     if std::fs::symlink_metadata(&backup).is_ok() {
         rollback_backup_observe(RollbackContour::RestoreRequested, Some(&profile));
-        let backup_lease =
-            phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
-                rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
-                error
-            })?;
+        let backup_lease = phase_b_open_existing(profile, portable_root, &backup).inspect_err(|_| {
+            rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
+        })?;
         backup_lease.verify().map_err(|error| {
             rollback_backup_observe(RollbackContour::RestoreBackupVerifyFailed, Some(&profile));
             HostError::RecoveryRequired(error)
         })?;
-        let bytes = phase_b_lease_bytes(&backup_lease).map_err(|error| {
+        let bytes = phase_b_lease_bytes(&backup_lease).inspect_err(|_| {
             rollback_backup_observe(RollbackContour::RestoreBackupReadFailed, Some(&profile));
-            error
         })?;
-        let backup_digest = phase_b_bytes_digest(&bytes).map_err(|error| {
+        let backup_digest = phase_b_bytes_digest(&bytes).inspect_err(|_| {
             rollback_backup_observe(RollbackContour::RestoreBackupReadFailed, Some(&profile));
-            error
         })?;
         let current_digest = match phase_b_open_existing(profile, portable_root, destination) {
             Ok(lease) => {
@@ -338,19 +327,17 @@ pub fn phase_b_restore_or_remove(
                     );
                     HostError::RecoveryRequired(error)
                 })?;
-                let current = phase_b_lease_bytes(&lease).map_err(|error| {
+                let current = phase_b_lease_bytes(&lease).inspect_err(|_| {
                     rollback_backup_observe(
                         RollbackContour::RestoreDestinationReadFailed,
                         Some(&profile),
                     );
-                    error
                 })?;
-                Some(phase_b_bytes_digest(&current).map_err(|error| {
+                Some(phase_b_bytes_digest(&current).inspect_err(|_| {
                     rollback_backup_observe(
                         RollbackContour::RestoreDestinationReadFailed,
                         Some(&profile),
                     );
-                    error
                 })?)
             }
             Err(HostError::RecoveryRequired(reason)) if reason.contains("missing") => None,
@@ -375,9 +362,8 @@ pub fn phase_b_restore_or_remove(
                 &allowed,
                 &format!("{label} rollback restore"),
             )
-            .map_err(|error| {
+            .inspect_err(|_| {
                 rollback_backup_observe(RollbackContour::RestoreMaterializeFailed, Some(&profile));
-                error
             })?;
         }
         // Only reached after the retained bytes were proven or restored; an
@@ -387,65 +373,84 @@ pub fn phase_b_restore_or_remove(
         // No rollback sidecar exists: the uncommitted destination itself is
         // the rollback effect, so this contour observes the removal request,
         // the post-delete absence proof, and every failure disposition.
-        let lease =
-            phase_b_open_existing(profile, portable_root, destination).map_err(|error| {
-                rollback_backup_observe(
-                    RollbackContour::RemovalDestinationOpenFailed,
-                    Some(&profile),
-                );
-                error
-            })?;
-        lease.verify().map_err(|error| {
+        remove_uncommitted_destination(
+            profile,
+            portable_root,
+            destination,
+            label,
+            preserve_template_digest,
+        )?;
+    }
+    Ok(())
+}
+
+/// Rollback by removal of an uncommitted destination that has no sidecar.
+///
+/// Pure extraction of the removal contour of `phase_b_restore_or_remove`: the
+/// same open, verify, read, compare, delete, and absence-proof steps run in the
+/// same order, with the same contours emitted on the same branches and the same
+/// `Result` returned.
+fn remove_uncommitted_destination(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    destination: &Path,
+    label: &str,
+    preserve_template_digest: Option<&PlatformHandle>,
+) -> Result<(), HostError> {
+    let lease = phase_b_open_existing(profile, portable_root, destination).inspect_err(|_| {
+        rollback_backup_observe(
+            RollbackContour::RemovalDestinationOpenFailed,
+            Some(&profile),
+        );
+    })?;
+    lease.verify().map_err(|error| {
+        rollback_backup_observe(
+            RollbackContour::RemovalDestinationVerifyFailed,
+            Some(&profile),
+        );
+        HostError::RecoveryRequired(error)
+    })?;
+    let current = phase_b_lease_bytes(&lease).inspect_err(|_| {
+        rollback_backup_observe(
+            RollbackContour::RemovalDestinationReadFailed,
+            Some(&profile),
+        );
+    })?;
+    let current_digest = phase_b_bytes_digest(&current).inspect_err(|_| {
+        rollback_backup_observe(
+            RollbackContour::RemovalDestinationReadFailed,
+            Some(&profile),
+        );
+    })?;
+    if preserve_template_digest.is_none_or(|expected| expected != &current_digest) {
+        rollback_backup_observe(RollbackContour::UncommittedRemovalRequested, Some(&profile));
+        std::fs::remove_file(destination).map_err(|error| {
             rollback_backup_observe(
-                RollbackContour::RemovalDestinationVerifyFailed,
+                RollbackContour::UncommittedRemovalDeleteFailed,
                 Some(&profile),
             );
-            HostError::RecoveryRequired(error)
+            HostError::RecoveryRequired(format!(
+                "remove uncommitted Phase-B {label} destination: {error}"
+            ))
         })?;
-        let current = phase_b_lease_bytes(&lease).map_err(|error| {
+        if std::fs::symlink_metadata(destination).is_ok() {
             rollback_backup_observe(
-                RollbackContour::RemovalDestinationReadFailed,
+                RollbackContour::UncommittedRemovalAbsenceUnproven,
                 Some(&profile),
             );
-            error
-        })?;
-        let current_digest = phase_b_bytes_digest(&current).map_err(|error| {
-            rollback_backup_observe(
-                RollbackContour::RemovalDestinationReadFailed,
-                Some(&profile),
-            );
-            error
-        })?;
-        if preserve_template_digest.is_none_or(|expected| expected != &current_digest) {
-            rollback_backup_observe(RollbackContour::UncommittedRemovalRequested, Some(&profile));
-            std::fs::remove_file(destination).map_err(|error| {
-                rollback_backup_observe(
-                    RollbackContour::UncommittedRemovalDeleteFailed,
-                    Some(&profile),
-                );
-                HostError::RecoveryRequired(format!(
-                    "remove uncommitted Phase-B {label} destination: {error}"
-                ))
-            })?;
-            if std::fs::symlink_metadata(destination).is_ok() {
-                rollback_backup_observe(
-                    RollbackContour::UncommittedRemovalAbsenceUnproven,
-                    Some(&profile),
-                );
-                return Err(HostError::RecoveryRequired(format!(
-                    "uncommitted Phase-B {label} destination remains after rollback"
-                )));
-            }
-            rollback_backup_observe(RollbackContour::UncommittedRemovalVerified, Some(&profile));
-        } else {
-            // The destination is exactly the immutable template, so there is
-            // no uncommitted material to remove. Recorded explicitly so the
-            // silent no-op is distinguishable from an unproven removal.
-            rollback_backup_observe(
-                RollbackContour::UncommittedRemovalNotRequired,
-                Some(&profile),
-            );
+            return Err(HostError::RecoveryRequired(format!(
+                "uncommitted Phase-B {label} destination remains after rollback"
+            )));
         }
+        rollback_backup_observe(RollbackContour::UncommittedRemovalVerified, Some(&profile));
+    } else {
+        // The destination is exactly the immutable template, so there is
+        // no uncommitted material to remove. Recorded explicitly so the
+        // silent no-op is distinguishable from an unproven removal.
+        rollback_backup_observe(
+            RollbackContour::UncommittedRemovalNotRequired,
+            Some(&profile),
+        );
     }
     Ok(())
 }
@@ -454,9 +459,8 @@ pub fn phase_b_remove_rollback_backup(destination: &Path, label: &str) -> Result
     // This cleanup contour owns no installation profile, so its records render
     // the explicit `unavailable` missing-evidence disposition rather than a
     // fabricated identity.
-    let backup = phase_b_rollback_path(destination, label).map_err(|error| {
+    let backup = phase_b_rollback_path(destination, label).inspect_err(|_| {
         rollback_backup_observe(RollbackContour::CleanupPathFailed, None);
-        error
     })?;
     if std::fs::symlink_metadata(&backup).is_ok() {
         rollback_backup_observe(RollbackContour::CleanupRequested, None);
