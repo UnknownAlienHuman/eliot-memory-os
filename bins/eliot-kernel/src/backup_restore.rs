@@ -149,10 +149,11 @@ use serde::Serialize;
 use super::backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, OrsRestoreBinding, OrsRestoreJournal, OrsRestoreJournalOwner,
-    PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, RetainedPhaseMaterial,
-    StagedCleanupOutcome, StagedCleanupRefusal, backup_to_kernel, check_kernel_effect_fence,
-    ors_to_backup, require_production_admitted, sync_file, sync_parent_directory,
+    OWNER_RESTORE_RECEIPT_FILE, PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE,
+    RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts,
+    RetainedPhaseMaterial, StagedCleanupOutcome, StagedCleanupRefusal, backup_to_kernel,
+    check_kernel_effect_fence, ors_to_backup, require_production_admitted, sync_file,
+    sync_parent_directory,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -353,9 +354,11 @@ pub const MAX_STAGED_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
 /// members the archive carries: one phase receipt for each of the five fixed
 /// phases (prepare, purge, rebuild, verify, finalize), the staged purge
 /// ledger, the rebuild marker, the verify marker, the finalize evidence
-/// document, and the pinned destination admission when Host admission exists —
-/// plus headroom, so this is a bound on the owner's own fixed output set
-/// rather than a tripwire that a later owner-evidence file would trip.
+/// document, the owner-issued restore receipt
+/// ([`KernelRestoreTarget::persist_owner_receipt`]), and the pinned
+/// destination admission when Host admission exists — plus headroom, so this is
+/// a bound on the owner's own fixed output set rather than a tripwire that a
+/// later owner-evidence file would trip.
 pub const OWNER_STAGED_FILE_ALLOWANCE: usize = 16;
 /// `BackupError::LimitExceeded` field name for the member ceiling, so the
 /// refusal names the exact bound that stopped the restore.
@@ -3955,6 +3958,63 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
             self.check_destination_admission(intent, plan.target.target_id.as_str())?;
         }
         self.apply_phase(plan, bundle, intent)
+    }
+
+    /// Places the coordinator-minted owner receipt at this owner's stable member
+    /// path, `restore-evidence/owner-restore-receipt.json` under the isolated
+    /// root (issue #938).
+    ///
+    /// The coordinator mints the receipt and holds no path, so this owner is the
+    /// only party that can name the destination it was issued for. The bytes are
+    /// that receipt verbatim, canonically serialized: a consumer proves issuance
+    /// by reading exactly this path, binding the bytes by digest, decoding them
+    /// as a `RestoreReceipt` and calling its own `validate()`. Nothing here
+    /// re-mints, synthesises or touches a field — the owner places an identity it
+    /// was handed and refuses to write one this owner could not honor.
+    ///
+    /// `validate()` runs BEFORE any byte is staged, so a receipt the coordinator's
+    /// own validator would refuse is a typed failure here rather than a quiet
+    /// persisted artifact. The coordinator already validates it
+    /// (`eliot_backup::validate_applied_effect`); re-checking is the owner's own
+    /// side of the same guarantee, exactly as the file runner does, because this
+    /// is where the bytes actually land.
+    ///
+    /// The write is the existing [`Self::write_file`], so it is admitted against
+    /// [`StagedOutputBudget`] before it happens, staged through an
+    /// operation-owned temporary, flushed, and published by rename. That costs
+    /// exactly ONE staged member and the receipt's own length in staged bytes,
+    /// and both are inside the ceilings this target already needs:
+    /// `StagedOutputBudget::members` reserves [`OWNER_STAGED_FILE_ALLOWANCE`]
+    /// files for the fixed set this owner serializes for itself (including
+    /// headroom, so an owner-evidence file does not trip the bound), and
+    /// `StagedOutputBudget::bytes` grants every one of those member slots a
+    /// [`MAX_STAGED_RECEIPT_BYTES`] allowance for a file this owner serializes,
+    /// which is the exact size class of a `RestoreReceipt`. No ceiling is raised
+    /// and no budget check is bypassed to admit this member.
+    ///
+    /// The member is deliberately NOT registered in [`Self::phase_material`].
+    /// `FinalizeIsolatedRoot`'s phase receipt digests the finalize EVIDENCE
+    /// (`RESTORE_EVIDENCE_FILE`) and nothing else, and `check_attested_material`
+    /// compares a member's bytes against exactly that receipt digest; this
+    /// receipt carries a different identity with a different digest, so naming it
+    /// there would compare two unrelated documents and refuse every resumed
+    /// restore as [`BackupError::RestoreJournalMismatch`]. It is also written
+    /// AFTER that phase receipt is journaled — `validate_applied_effect` calls
+    /// this only once the applied effect has been read back — so making the
+    /// phase's no-effect observation depend on it would turn a crash between the
+    /// two into an unresolvable state instead of the re-mint-and-re-place this
+    /// method makes idempotent. Resume therefore stays consistent by leaving the
+    /// finalize phase's attested material exactly as it is: on a resume the
+    /// engine re-mints the same receipt from the same plan, bundle and applied
+    /// effect, re-places these same bytes, and the phase readback still proves
+    /// the evidence document it actually attests.
+    fn persist_owner_receipt(&mut self, receipt: &RestoreReceipt) -> Result<(), BackupError> {
+        receipt.validate()?;
+        let bytes = canonical_json_bytes(receipt)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(OWNER_RESTORE_RECEIPT_FILE, &bytes)?;
+        self.calls.push("persist-owner-receipt".to_owned());
+        Ok(())
     }
 
     fn reconcile_restore_effect(

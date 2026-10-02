@@ -160,6 +160,24 @@ pub const RESTORE_JOURNAL_PAYLOAD_AREA: &str = "restore-journal-payloads";
 pub const DESTINATION_ADMISSION_FILE: &str = "destination-admission.json";
 /// File name of the finalized restore evidence inside the isolated root.
 pub const RESTORE_EVIDENCE_FILE: &str = "evidence.json";
+/// Member path of the coordinator-minted owner restore receipt inside the
+/// isolated root: `restore-evidence/owner-restore-receipt.json`.
+///
+/// This is the one location where this owner places a `RestoreReceipt`
+/// (`KernelRestoreTarget::persist_owner_receipt`), and it is written only by
+/// that method. The bytes are the receipt the coordinator handed over, verbatim
+/// and canonically serialized, so a consumer proves issuance by reading exactly
+/// this path, binding the bytes by digest, decoding them as a
+/// `RestoreReceipt` and calling its own `validate()`.
+///
+/// It is NOT [`RESTORE_EVIDENCE_FILE`]: that member is this owner's own
+/// finalize report, and the phase receipt for `FinalizeIsolatedRoot` digests
+/// those bytes. This receipt carries a different identity, bound to a different
+/// digest, which is why it sits in its own grouping directory rather than beside
+/// the evidence and why `phase_material` names only the former for that phase.
+/// A resume therefore never compares this member against the finalize evidence
+/// digest — it does not attest those bytes, and no phase receipt describes them.
+pub const OWNER_RESTORE_RECEIPT_FILE: &str = "restore-evidence/owner-restore-receipt.json";
 /// Maximum destination label length (bounded identities, I14.3).
 pub const MAX_DESTINATION_LABEL_LEN: usize = 64;
 /// Upper bound on the sealed journal-payload bodies this adapter remembers in
