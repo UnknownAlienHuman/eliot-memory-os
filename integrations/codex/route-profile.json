@@ -142,7 +142,8 @@
     "the App Server adapter process is not implemented in this profile change",
     "current-account model and quota behavior are unprobed",
     "experimental collaboration methods are excluded from production admission",
-    "existing hook commands still use the legacy bridge and are not a substitute for App Server execution"
+    "existing hook commands still use the legacy bridge and are not a substitute for App Server execution",
+    "codex.mcp remains a legacy compatibility route served by the eliot-app facade (bin/eliot-governor.exe mcp stdio --profile codex_controller --instance default per plugin/eliot-governor/.mcp.json): bins/eliot-agent-bridge admits no codex_controller profile and requires a --client-declaration agent-bridge/client-declaration-v2.json file that does not exist in the repository, so no protocol-faithful current-owner cutover exists yet (#18 W11 codex slice). Removal when the eliot MCP server is served by bins/eliot-agent-bridge under #13. Coupled residue: integrations/agent-runtimes/host-bundle.manifest.json pins route_profile_sha256 for this file and must be repinned by the manifest owner; integrations/codex/marketplace.json and the Windows release script still stage the legacy plugin route (W12-owned)."
   ],
   "source_refs": [
     "https://developers.openai.com/codex/app-server",
