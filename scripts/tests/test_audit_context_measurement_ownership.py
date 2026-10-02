@@ -35,8 +35,14 @@ UNCHANGED, so the bytes measured are exactly the committed fixture bytes and a
 failing assertion cannot leak into the repository tree.
 
 Scope note: ``scripts/tests/test_787_consumer_dependency_proof.py`` (defect 4)
-and ``scripts/tests/test_787_candidate_enumeration_c7.py`` (defect 3) use NO
-``# WORK_UNIT_CASE:`` marker: that namespace belongs to this file alone.
+and ``scripts/tests/test_787_candidate_enumeration_c7.py`` (defect 3) are
+UNMARKED SUPPORTING matrices for the clauses this file's cases already own.
+They use NO ``# WORK_UNIT_CASE:`` marker of any kind: this file is the sole
+owner of the ``787/N`` namespace, because the issue's "Required test matrix"
+declares exactly one marker for each case 1..32 and names THIS file as its
+exclusive mutable test scope. The C7 suite's whole C7 clause is proved here at
+case 787/7; the C7 file's tests remain as unmarked supporting coverage that
+does not compete for the namespace.
 """
 
 from __future__ import annotations
@@ -673,6 +679,14 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         must still report ``UNACCOUNTED_CANDIDATE`` naming the path, a real
         span, and the #866 rule that fired. The stored rows list is EMPTY, so
         the universe demonstrably cannot have been seeded from stored rows.
+
+        Seven further sub-assertions (a)-(g) below complete the same clause --
+        multiline survival, a typed complete finding, a negative control, that
+        detection is the set difference rather than a constant alarm, that a
+        producer without the enumeration API fails closed instead of degrading,
+        that the enumeration is deterministic and order-free, and one PINNED
+        LIMITATION (the ``use ... as`` alias) that is asserted so it cannot be
+        mistaken for coverage.
         """
         with _tree() as tree:
             tree.copy_producer()
@@ -726,6 +740,237 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
             self.assertTrue(
                 unaccounted,
                 f"the added estimator must surface through evaluate(): {_codes(result)}",
+            )
+
+        # ------------------------------------------------------------------
+        # 7 (cont). The rest of the C7 clause. The cases below live in this one
+        # method because they are all the SAME issue case -- "extra estimator
+        # detected through #866's producer, not a second scanner" -- and the
+        # issue declares exactly one marker per case number. They were moved
+        # here from `scripts/tests/test_787_candidate_enumeration_c7.py`, which
+        # held an unmarked supporting matrix that CLAIMED 787/1..787/9 and
+        # therefore collided with this suite's real 1..32 denominator.
+        # ------------------------------------------------------------------
+        #
+        # (a) MULTILINE: the SAME expression split across lines is still found.
+        # The audit's helper fits on one line; rustfmt pushes the receiver, the
+        # `.len()` and the `div_ceil(4)` apart once the expression grows, so a
+        # locator that read one line would miss the receiver. The one-line
+        # fixture and the split fixture are the same expression, so the pair
+        # makes line-splitting observable rather than assumed.
+        with _tree() as tree:
+            tree.copy_producer()
+            multiline = tree.add_fixture("reject_audit_helper_multiline_split.rs")
+            split_line = sum(
+                1
+                for line in multiline.read_text(encoding="utf-8").splitlines()
+                if line.lstrip().startswith("fn estimate_tokens_split")
+            )
+            self.assertEqual(split_line, 1, "the split fixture must declare one helper")
+            producer = oracle.load_producer(tree.root)
+            enumerated = producer.enumerate_measurement_candidates(
+                tree.root, (_SEAM_REL,)
+            )
+            by_rule = {str(c["rule"]): int(c["span_start"]) for c in enumerated}
+            self.assertIn(
+                "ESTIMATOR_HELPER_RE",
+                by_rule,
+                "the split helper's declaration line must still enumerate: "
+                f"{sorted(by_rule)!r}",
+            )
+            self.assertIn(
+                "BYTE_RATIO",
+                by_rule,
+                "the ratio on its own line must still enumerate: "
+                f"{sorted(by_rule)!r}",
+            )
+            self.assertNotEqual(
+                by_rule["ESTIMATOR_HELPER_RE"],
+                by_rule["BYTE_RATIO"],
+                "the declaration and the ratio must be DISTINCT spans, otherwise the "
+                "split fixture is not actually split and proves nothing",
+            )
+            found = oracle._enumerated_unaccounted(tree.root, producer, [], [_SEAM_REL])
+            typed = [f for f in found if f["code"] == "UNACCOUNTED_CANDIDATE"]
+            self.assertEqual(
+                sorted(int(f["span_start"]) for f in typed),
+                sorted(by_rule.values()),
+                "both the declaration and the ratio line are unaccounted",
+            )
+
+        # (b) TYPED AND COMPLETE: the finding is constructed through the oracle's
+        # own frozen `Finding` type, so a missing field is rejected by the type
+        # rather than silently projected, and its locator prints the span and
+        # the firing #866 rule.
+        with _tree() as tree:
+            tree.copy_producer()
+            tree.add_fixture("reject_audit_helper_no_stored_row.rs")
+            producer = oracle.load_producer(tree.root)
+            found = oracle._enumerated_unaccounted(tree.root, producer, [], [_SEAM_REL])
+            typed = [f for f in found if f["code"] == "UNACCOUNTED_CANDIDATE"]
+            self.assertTrue(typed, f"the audit helper must be reported: {found!r}")
+            raw = typed[0]
+            for field in ("code", "path", "rule", "evidence"):
+                self.assertTrue(
+                    str(raw[field]).strip(), f"finding field {field!r} must be non-empty"
+                )
+            locator = oracle.Finding(
+                code=str(raw["code"]),
+                detail=str(raw["evidence"]),
+                path=str(raw["path"]),
+                span_start=int(raw["span_start"]),
+                span_end=int(raw["span_end"]),
+                rule=str(raw["rule"]),
+            ).locator()
+            self.assertIn("UNACCOUNTED_CANDIDATE", locator)
+            self.assertIn(_SEAM_REL, locator, "the locator must print the path")
+            self.assertIn(
+                f"rule={raw['rule']}",
+                locator,
+                "the locator must print the firing #866 rule",
+            )
+            self.assertIn(
+                f":{raw['span_start']}-{raw['span_end']}",
+                locator,
+                "the locator must print the span",
+            )
+
+        # (c) NEGATIVE CONTROL: a helper with no ratio and no estimator name is
+        # not a candidate. Without this, a trigger arm that matched every `fn`
+        # -- or every `len()` -- would satisfy (a) and (b) while measuring
+        # nothing.
+        with _tree() as tree:
+            tree.copy_producer()
+            tree.add_fixture("accept_benign_length_helper_no_candidate.rs")
+            producer = oracle.load_producer(tree.root)
+            self.assertEqual(
+                producer.enumerate_measurement_candidates(tree.root, (_SEAM_REL,)),
+                [],
+                "a plain len() helper carries no byte/char ratio and no estimator name",
+            )
+            self.assertEqual(
+                oracle._enumerated_unaccounted(tree.root, producer, [], [_SEAM_REL]),
+                [],
+                "a benign helper must never produce an unaccounted candidate",
+            )
+
+        # (d) ACCOUNTING, NOT A CONSTANT ALARM: the very same fixture that
+        # yields a finding with an EMPTY row set yields ZERO findings once a
+        # stored row is anchored at the enumerated span. Detection must be a
+        # function of the set difference, so the check can still pass a fully
+        # accounted tree -- which is what case 1 proves by reaching a clean
+        # result at all.
+        with _tree() as tree:
+            tree.copy_producer()
+            tree.add_fixture("reject_audit_helper_no_stored_row.rs")
+            producer = oracle.load_producer(tree.root)
+            self.assertEqual(
+                len(oracle._enumerated_unaccounted(tree.root, producer, [], [_SEAM_REL])),
+                1,
+                "the helper is unaccounted when no row exists",
+            )
+            enumerated = producer.enumerate_measurement_candidates(
+                tree.root, (_SEAM_REL,)
+            )
+            self.assertTrue(enumerated, "the helper must enumerate at least one site")
+            span = int(enumerated[0]["span_start"])
+            accounted = oracle._enumerated_unaccounted(
+                tree.root,
+                producer,
+                [{"path": _SEAM_REL, "span_start": span, "case_ref": "787/fixture"}],
+                [_SEAM_REL],
+            )
+            self.assertEqual(
+                accounted,
+                [],
+                "a stored row at the enumerated span accounts for the site, so the "
+                "finding is the set difference and not an unconditional alarm",
+            )
+
+        # (e) FAIL CLOSED, NO SECOND SCANNER: the enumeration API is a REQUIRED
+        # producer dependency, so a producer without it is a typed
+        # PRODUCER_ABSENT and the oracle can never silently fall back to the old
+        # stored-row-seeded universe. The stripping happens inside the throwaway
+        # tree; the repository's #866 module is never touched.
+        with _tree() as tree:
+            tree.copy_producer()
+            producer_script = tree.path(_PRODUCER_REL)
+            producer_script.write_bytes(
+                producer_script.read_bytes()
+                + b"\n\n# #787 case 7 probe: remove exactly the accepted enumeration API.\n"
+                b"del enumerate_measurement_candidates\n"
+            )
+            with self.assertRaises(oracle.OracleError) as caught:
+                oracle.load_producer(tree.root)
+            self.assertEqual(
+                caught.exception.code,
+                "PRODUCER_ABSENT",
+                "a producer without the enumeration API must fail closed, never "
+                f"degrade silently: {caught.exception.detail}",
+            )
+            self.assertIn(
+                "enumerate_measurement_candidates",
+                caught.exception.detail,
+                "the typed failure must name the missing API",
+            )
+            # The live producer is untouched and still exposes it.
+            live = oracle.load_producer(_REPO_ROOT)
+            self.assertTrue(
+                callable(getattr(live, "enumerate_measurement_candidates", None)),
+                "the accepted #866 producer must expose a callable enumeration API",
+            )
+
+        # (f) DETERMINISTIC AND ORDER-FREE: repeated enumeration is identical and
+        # reversing the requested scan-root order changes nothing, so the
+        # oracle's digest cannot depend on traversal order.
+        with _tree() as tree:
+            tree.copy_producer()
+            tree.add_fixture("reject_audit_helper_no_stored_row.rs")
+            producer = oracle.load_producer(tree.root)
+            first = producer.enumerate_measurement_candidates(tree.root, (_SEAM_REL,))
+            second = producer.enumerate_measurement_candidates(tree.root, (_SEAM_REL,))
+            self.assertEqual(first, second, "repeated enumeration must be identical")
+            keys = [(str(c["path"]), int(c["span_start"]), str(c["rule"])) for c in first]
+            self.assertEqual(
+                keys, sorted(keys), "candidates must be returned in the producer's sorted order"
+            )
+            self.assertEqual(
+                producer.enumerate_measurement_candidates(tree.root, list(reversed((_SEAM_REL,)))),
+                first,
+                "the enumeration must not depend on the requested traversal order",
+            )
+
+        # (g) PINNED LIMITATION: an estimator reached through a `use ... as`
+        # ALIAS under a different local name is INVISIBLE to the accepted rules.
+        #
+        # #866's trigger arms are fixed-shape regexes over estimator
+        # IDENTIFIERS (ESTIMATOR_HELPER_RE, ESTIMATOR_CALL_RE, CHAR_RATIO,
+        # BYTE_RATIO). `use crate::budgets::plan_units as tokens;` followed by
+        # `tokens(body)` matches none of them, so the site enumerates nothing
+        # and can produce no finding. This is asserted, not expected to pass:
+        # it records the exact boundary of what #866's accepted rules can
+        # reach, so the gap stays visible instead of being reported as
+        # coverage. Closing it needs a `use ... as` resolution arm inside #866,
+        # which this issue is forbidden to write -- reported as a
+        # ContractChallenge instead. It is a separate blind spot from case 11,
+        # which is about an ALIASED CONSTANT divisor behind a `pub fn`.
+        with _tree() as tree:
+            tree.copy_producer()
+            tree.add_fixture("reject_use_alias_differently_named_estimator.rs")
+            producer = oracle.load_producer(tree.root)
+            self.assertEqual(
+                producer.enumerate_measurement_candidates(tree.root, (_SEAM_REL,)),
+                [],
+                "REPORTED LIMITATION (#787 case 7): #866 has no use-alias "
+                "resolution grammar, so a `use ... as tokens` estimator is "
+                "invisible to the accepted rules",
+            )
+            self.assertEqual(
+                oracle._enumerated_unaccounted(tree.root, producer, [], [_SEAM_REL]),
+                [],
+                "REPORTED LIMITATION (#787 case 7): an aliased estimator is "
+                "invisible to the accepted rules, so no finding can be produced "
+                "for it; closing this needs a new `use ... as` arm inside #866",
             )
 
     # ------------------------------------------------------------------
@@ -1735,8 +1980,9 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         )
         self.assertIsNone(oracle._adapter_record("#783"))
 
-        # A row that is owned, non-unrelated and therefore falls through to the
-        # residual arm is NOT reported as a closed legacy adapter.
+        # A row that is owned, non-unrelated and NOT accompanied by any measured
+        # canonical-reach proof is NOT reported as a reconciled consumer. Audit
+        # defect 5: "do not treat 'owned' as proof of canonical migration".
         residual = {
             "owner": "#783",
             "status": "owned",
@@ -1745,8 +1991,22 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         }
         self.assertEqual(
             oracle._derive_baseline_disposition(residual),
+            "explicit-unresolved",
+            "with no measured dependency proof an owned row asserts no migration",
+        )
+        self.assertEqual(
+            oracle._derive_baseline_disposition(
+                residual,
+                {
+                    "#783": {
+                        "kind": "canonical-port-call",
+                        "port_symbol": oracle.CANONICAL_MEASUREMENT_PORT,
+                        "call_sites": ["crates/smart/eliot-context-assembly/src/lib.rs:1"],
+                    }
+                },
+            ),
             "canonical-owner-consumer",
-            "the residual arm is the honest label for a live owned row",
+            "the same row IS canonical once a measured canonical-reach proof exists",
         )
         self.assertNotEqual(
             oracle._derive_baseline_disposition(residual),

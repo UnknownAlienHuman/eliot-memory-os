@@ -162,6 +162,206 @@ PORT_IDENTITY_BINDING_FIELDS: tuple[str, ...] = (
     "tokenizer",
 )
 
+# ---------------------------------------------------------------------------
+# Audit section 4, bullet 4 requires the identity conjunct to be "provider/
+# model/tokenizer ID/version/hash and content digest". #704's own record carries
+# those facts as the FIELDS of the three identity sub-records, so the identity
+# conjunct is a conjunction over those field names -- read as the acceptance
+# vocabulary, not re-implemented as a new record type.
+#
+# The names are matched on the SAME producer-masked enclosing-item span as
+# :data:`PORT_IDENTITY_BINDING_FIELDS`, so a binding named only in a comment or
+# a string literal cannot satisfy them, and every identity fact is required to
+# be PRESENT AND NON-PLACEHOLDER (see :func:`_identity_placeholders`): the
+# sub-record field names alone, paired with hardcoded integers or a literal
+# ``sha256:00``, are not an identity.
+#
+# The grouping is (identity group, required field names within that group):
+# ``serializer`` carries the serializer id/version/options digest, ``route``
+# carries the route id plus the provider id and model id, and ``tokenizer``
+# carries the tokenizer id/version/hash/config digest. Every entry is a
+# ``#704`` ``SerializedContextInputs`` field name
+# (``crates/smart/eliot-context-measurement/src/lib.rs:277-308``).
+PORT_IDENTITY_REQUIRED_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("serializer", ("serializer_id", "serializer_version", "serializer_options_digest")),
+    ("route", ("route_id", "provider_id", "model_id")),
+    ("tokenizer", ("tokenizer_id", "tokenizer_version", "tokenizer_hash")),
+)
+
+# The content digest of the final serialized bytes is its OWN conjunct: the
+# ``content_digest`` NAME is already in
+# :data:`PORT_FINAL_BYTES_BINDING_FIELDS`, but a NAME is not a digest.
+PORT_CONTENT_DIGEST_FIELD = "content_digest"
+
+# The classifications whose OWN evidence says the retired formula is still live
+# at that span. Read from #866's closed ``CLASSIFICATIONS``
+# (``context_measurement_inventory.py:213-231``) rather than restated: a row
+# carrying one of these IS the pre-migration defect, so an owner-level
+# canonical-reach proof elsewhere cannot reconcile it.
+_LIVE_LEGACY_CLASSIFICATIONS: frozenset[str] = frozenset(
+    {
+        "token_estimate_without_tokenizer",
+        "character_count_mislabeled_as_tokens",
+        "estimator-policy-unvalidated",
+    }
+)
+
+# A length written as a literal zero -- ``declared_len: 0`` -- declares no
+# serialized bytes, so it cannot satisfy the final-bytes conjunct (see
+# :func:`_envelope_length_is_zero`). The tuple is the set of zero spellings a
+# masked span may carry for that literal.
+PORT_ZERO_LENGTH_SPELLINGS: tuple[str, ...] = (
+    "declared_len: 0",
+    "declared_len:0",
+    "declared_len: 0u64",
+    "declared_len:0u64",
+    "declared_len: 0usize",
+    "declared_len:0usize",
+)
+
+# An EMPTY byte slice / empty string / empty array literal carries no serialized
+# bytes at all. ``&[]``/``b""``/``&""``/``Vec::new()``-shaped *expressions* are
+# deliberately NOT in this set: an expression's emptiness is a runtime fact the
+# static span cannot establish, and rejecting every ``Vec::new()`` would report
+# ordinary code. Only the LITERAL empty forms are matched, because those are
+# unambiguously "no bytes" in the source itself.
+PORT_EMPTY_PAYLOAD_LITERALS: tuple[str, ...] = ("&[]", "&[]u8", "b\"\"", "&\"\"")
+# The same empty literals with the reference/bracket markers normalised away, so
+# the predicate compares the DENOTATION rather than every spelling of it.
+PORT_EMPTY_PAYLOAD_DENOTATIONS: tuple[str, ...] = ("[]", "[]u8", "\"\"")
+
+
+def _is_empty_payload_literal(payload: str) -> bool:
+    """Is the measured payload argument a LITERAL empty byte/string value?
+
+    ``&[]``, ``[]``, ``&[]u8``, ``b""`` and ``&""`` all denote the same zero
+    bytes, so the reference, bracket and byte-string markers are normalised away
+    before the comparison instead of every spelling being listed twice.
+
+    Only LITERAL empties match. An EXPRESSION whose runtime value might be empty
+    (``Vec::new()``, ``self.payload()``, ``&[][..]``) is deliberately NOT matched:
+    emptiness of an expression is a runtime fact a static span cannot establish,
+    and treating every such expression as empty would report ordinary code.
+    """
+    if payload in PORT_EMPTY_PAYLOAD_LITERALS:
+        return True
+    denotation = payload.strip()
+    while denotation[:1] in {"&", "("}:
+        denotation = denotation[1:].strip()
+    while denotation[-1:] in {")"}:
+        denotation = denotation[:-1].strip()
+    return denotation in PORT_EMPTY_PAYLOAD_DENOTATIONS
+
+
+def _strip_comment_body(text: str) -> str:
+    """Blank any trailing ``//`` comment on a single masked line.
+
+    The producer's ``_mask_rust`` already blanks whole-line comments, but a
+    TRAILING comment after a real binding survives masking. This keeps a
+    placeholder written only in a trailing comment from satisfying a conjunct.
+    The helper is deliberately conservative: a ``//`` that sits inside a string
+    literal is left alone, because the masked span's quotes are the only
+    evidence of where a literal ends and the line ends.
+    """
+    index = 0
+    while True:
+        position = text.find("//", index)
+        if position < 0:
+            return text
+        quote_count = text[:position].count('"') % 2
+        if quote_count:
+            index = position + 2
+            continue
+        return text[:position]
+
+
+def _field_value(span: str, field: str) -> str | None:
+    """The masked value expression a ``field:`` binding carries, or None.
+
+    Measured on the PRODUCER-MASKED span. ``_mask_rust`` blanks every string
+    LITERAL BODY, so the masked form of each case is unambiguous:
+
+    =======================================  =========================
+    source                                   masked value
+    =======================================  =========================
+    ``provider_id: request.provider_id``     ``request.provider_id``
+    ``serializer: 1,``                       ``1``          (literal)
+    ``content_digest: "sha256:00",``         ``""``         (blanked)
+    ``declared_len: 0,``                     ``0``          (literal)
+    =======================================  =========================
+
+    So a literal value is detectable as literal (it survives masking as a bare
+    token) and a string-literal value is detectable as EMPTY (its body was
+    blanked), while a real per-request value survives as a real expression.
+    That is the whole measurement: the audit asks for an identity that is
+    *actually named*, and a name carried by a constant or a string literal is
+    not a named identity. Returns ``None`` when the field does not occur at all.
+    """
+    pattern = re.compile(
+        r"\b" + re.escape(field) + r"\s*:\s*(?P<value>[^,}\n]*)", re.MULTILINE
+    )
+    for match in pattern.finditer(span):
+        value = _strip_comment_body(match.group("value")).strip()
+        if value:
+            return value
+        # A blanked string-literal body is an EMPTY value, not an absent field:
+        # the field IS bound, and its value is a literal.
+        return ""
+    return None
+
+
+def _identity_placeholders(span: str) -> set[str]:
+    """The identity/digest bindings a masked span carries only as PLACEHOLDERS.
+
+    A placeholder is a binding whose value is a CONSTANT rather than a named
+    identity: a bare integer literal (``serializer: 1``), a string LITERAL whose
+    body the producer's ``_mask_rust`` blanked (``content_digest: "sha256:00"``
+    masks to an empty value), or an empty value. Each returns the field NAME, so
+    a finding names exactly which identity is a placeholder.
+
+    Why the masked span is the right measurement surface: a placeholder can only
+    be written as a constant, and a constant survives masking as a bare token
+    (integer) or as an empty value (blanked string literal). A genuine identity
+    arrives from the request and survives as a real expression, which is what
+    separates the two without any closed registry of approved identities --
+    :data:`APPROVED_MEASUREMENT_ADAPTERS` is an honest empty and this predicate
+    does not invent one. The predicate is therefore exactly "present and
+    non-placeholder", which is what the audit asks for and the most the recorded
+    facts can establish.
+    """
+    placeholders: set[str] = set()
+    for field in tuple(
+        name
+        for _group, names in PORT_IDENTITY_REQUIRED_FIELDS
+        for name in names
+    ) + (PORT_CONTENT_DIGEST_FIELD,):
+        value = _field_value(span, field)
+        if value is None:
+            # The field is absent; presence is a separate conjunct, not a
+            # placeholder, so it is reported by identity_detail_bound instead.
+            continue
+        if not value:
+            # Blanked string literal: the value is a constant, not a name.
+            placeholders.add(field)
+            continue
+        if re.fullmatch(r"[-+]?[0-9][0-9_]*(?:[iu](?:8|16|32|64|128|size))?", value):
+            # A bare integer constant standing in for an ID/version/hash.
+            placeholders.add(field)
+    return placeholders
+
+
+def _envelope_length_is_zero(span: str) -> bool:
+    """Does the span declare the envelope length as a literal zero?
+
+    ``declared_len: 0`` is the shape a fabricated record writes: it says the
+    final serialized Context is zero bytes long while still presenting the
+    record as a bound observation. A real envelope's length is
+    ``<something>.len()`` or arrives from the request, never a constant 0, so a
+    zero literal here cannot be a legitimate measurement of a non-empty Context.
+    """
+    stripped = _strip_comment_body(span)
+    return any(spelling in stripped for spelling in PORT_ZERO_LENGTH_SPELLINGS)
+
 # The closed approved legacy-adapter record. An adapter may satisfy the
 # dependency without calling #704's port directly only when it is listed here
 # with an exact identity, an exact version, an exact expiry and the canonical
@@ -197,15 +397,46 @@ class ConsumerDependencyContract:
 # Closed disposition set every baseline row must end with. A baseline row
 # that simply disappears is an erased requirement and is rejected; a row
 # that is still present but carries no explicit disposition is rejected.
-# The set stays closed at four. Three are derived by
-# :func:`_derive_baseline_disposition` from a row's own recorded facts; the
-# fourth is deliberately declared-but-unreachable, and the comment immediately
-# below says exactly why and what would have to change to derive it honestly.
+# The set stays closed at four and is NOT widened by the evidence-bearing
+# derivation below. Three values are reachable: two from the row's own closed
+# recorded fields, one only when the row's owner has a *measured* canonical
+# consumer dependency. ``exact-versioned-legacy-adapter`` stays declared but
+# underived, and the comment immediately below says exactly why.
 BASELINE_DISPOSITIONS: tuple[str, ...] = (
     "canonical-owner-consumer",
     "legitimate-non-context-metric",
     "exact-versioned-legacy-adapter",
     "explicit-unresolved",
+)
+
+# The closed ``dependency_proofs`` kinds that constitute PROVEN canonical
+# reach for an owner. A row may be called ``canonical-owner-consumer`` only
+# when its owner holds one of these. They are exactly the outcomes the
+# dependency check in :func:`evaluate` reaches -- a real, bound production call
+# to #704's port; a CLOSED approved legacy adapter record; or, for #704 itself,
+# the single proved definition site of the canonical port. Nothing else, and in
+# particular never the mere absence of a finding.
+CANONICAL_REACH_KINDS: tuple[str, ...] = (
+    "canonical-port-call",
+    "canonical-port-owner",
+    "approved-adapter",
+)
+
+# The classifications that describe a site which is STILL THE OLD LOCAL FORMULA
+# rather than a canonical consumer: an unvalidated byte/character ratio carried
+# as tokens, a characters-labelled-as-tokens ratio, or a bare measurement field
+# fed by a unit conversion with no estimator policy of its own.
+#
+# These are the #866 producer's OWN closed classes (``CLASSIFICATIONS``,
+# ``context_measurement_inventory.py:226-229``), read here as the acceptance
+# vocabulary and not as a second classification scheme. They are the row-schema
+# evidence that a formula was never migrated: whatever the row's owner, a site
+# the producer still classes as a local ratio is not a canonical consumer, so it
+# is never reconciled as one.
+LEGACY_FORMULA_CLASSIFICATIONS: tuple[str, ...] = (
+    "token_estimate_without_tokenizer",
+    "character_count_mislabeled_as_tokens",
+    "bare_measurement_field_or_conversion",
 )
 
 # An *exact* versioned legacy adapter is, per the issue, an approved adapter
@@ -214,7 +445,7 @@ BASELINE_DISPOSITIONS: tuple[str, ...] = (
 # by an explicit recorded boundary, not merely unreadable or unwritable.
 #
 # No row field in #866's closed ``ROW_KEYS``
-# (``context_measurement_inventory.py:502-528``) records a legacy-adapter
+# (``context_measurement_inventory.py:533-559``) records a legacy-adapter
 # marker, a version bound, or an expiry date. The two fields a tempting
 # shortcut would reach for are the WRONG vocabulary and are deliberately not
 # used here:
@@ -222,13 +453,13 @@ BASELINE_DISPOSITIONS: tuple[str, ...] = (
 #   * ``write_scope`` is *mutation permission*, not closure. #866 assigns
 #     ``read-only`` to a baseline row whose declared owner is one of the three
 #     live consumers #783/#878/#880 reading the #704 algorithm crate
-#     (``_write_scope_of`` ``:1395-1400``, and its own module docstring
+#     (``_write_scope_of`` ``:1597-1602``, and its own module docstring
 #     ``:43-45`` "Read-only sharing is not shared mutable scope"). The owner
 #     map says the same: it "records ownership of a candidate, not write
 #     permission" (``context-measurement-owner-map.toml:24-25``). So a
 #     ``read-only`` row is an ACTIVE consumer seam, the opposite of retired.
-#   * ``dispatch_blocked`` is defined as ``status != "owned"`` (``:1447``) and
-#     re-validated against ``status`` on the read path (``:2213-2214``), so for
+#   * ``dispatch_blocked`` is defined as ``status != "owned"`` (``:1649``) and
+#     re-validated against ``status`` on the read path (``:2445-2446``), so for
 #     any row that is not already ``explicit-unresolved`` it is invariably
 #     ``False`` and could only restate the check the first arm already made.
 #
@@ -239,7 +470,8 @@ BASELINE_DISPOSITIONS: tuple[str, ...] = (
 # ``_derive_baseline_disposition`` reports every such row as
 # ``explicit-unresolved`` -- a row that cannot prove it is a closed, exact,
 # versioned adapter is not one. Emitting it needs a closed field added to
-# #866's ``ROW_KEYS`` by its owner, not a second scheme here.
+# #866's ``ROW_KEYS`` by its owner, not a second scheme here. That blocker is
+# filed as a ContractChallenge against #866; #787 must not attempt it.
 
 # The frozen pre-migration baseline requirement denominator. Written out here
 # independently of the producer module so that a drift in either direction
@@ -301,14 +533,26 @@ EXPECTED_BASELINE_COUNT = len(EXPECTED_BASELINE_ROWS)
 #    declared writable seam calls #704's canonical port ``measure_serialized_context``
 #    as a *call*, i.e. the identifier is followed by ``(`` and is not part of a
 #    path (``crate::name``/``module::name``) or of a longer identifier.
-# 3. ``final_serialized_bytes`` -- the same production call passes a payload
-#    argument, and the surrounding production span binds the envelope length and
-#    content digest into the ``SerializedContextInputs`` record the port takes
-#    (``declared_len`` and ``content_digest``).
+# 3. ``final_serialized_bytes`` -- the same production call passes a NON-EMPTY
+#    payload argument, and the surrounding production span binds the envelope
+#    length and content digest into the ``SerializedContextInputs`` record the
+#    port takes (``declared_len`` and ``content_digest``), with a declared
+#    length that is not a literal zero and a digest that is not a literal
+#    placeholder. An ``&[]`` payload -- no serialized bytes at all -- is not a
+#    bound measurement. A legitimately-empty payload cannot occur in an admitted
+#    case: the admitted cases are C23/C26, "exact authorized tokenizer adapter
+#    accepted" and "current final-serialized measurement with exact tokenizer
+#    identity accepted", and both name a measurement OF a serialized Context
+#    envelope; an empty envelope has no tokens to count, no tokenizer
+#    observation to bind, and no digest of final serialized bytes to record, so
+#    it is not the subject either case admits.
 # 4. ``identity_binding`` -- the same production span binds the serializer,
 #    route, provider, model and tokenizer identities (``serializer``/
 #    ``SerializerIdentity``, ``route``/``RouteIdentity``, ``tokenizer``/
-#    ``TokenizerIdentity``) into that record.
+#    ``TokenizerIdentity``) into that record, WITH each identity's ID/version/
+#    hash field present and carrying a non-placeholder value. A hardcoded
+#    integer, an empty value or a literal ``"sha256:00"`` is not an identity:
+#    the field NAME alone is not the identity the issue names.
 # 5. ``adapter_record`` -- when a consumer does not call #704's port directly,
 #    the only other accepted evidence is a CLOSED approved adapter record: an
 #    exact adapter identity with an exact version and an exact expiry, declared
@@ -1686,6 +1930,17 @@ def _port_call_bindings(
     ``payload_argument`` is the span-level fact that the call passes a payload:
     the port's first parameter is the final serialized bytes, and the call site
     must supply an argument in that position.
+
+    The three ADDITIONAL conjuncts measure what the payload and the record
+    actually carry, not merely that their field NAMES occur:
+
+    ``payload_non_empty``
+        the payload argument is not a literal empty byte/string slice, so an
+        ``&[]`` -- no serialized bytes at all -- cannot satisfy the binding;
+    ``content_digest_bound`` / ``identity_detail_bound`` / ``identity_non_placeholder``
+        the recorded digest is a real digest and every provider/model/tokenizer
+        ID/version/hash is present and non-placeholder. See
+        :data:`PORT_IDENTITY_REQUIRED_FIELDS` and :func:`_identity_placeholders`.
     """
     masked_lines = record["masked_lines"]
     depths = record["depths"]
@@ -1707,24 +1962,48 @@ def _port_call_bindings(
     # The SECOND argument of the call is the ``&SerializedContextInputs`` the
     # port takes, and THAT is the binding: the record whose fields are measured
     # is the record the call passes. The measured argument text is extracted
-    # from the masked call line, so a record built but never passed cannot carry
-    # the proof, and a record passed but never built cannot either.
+    # from the masked call's own extent, so a record built but never passed
+    # cannot carry the proof, and a record passed but never built cannot either.
     inputs_argument = _call_inputs_argument(masked_lines, span_end, lineno)
     carries_record = (
         inputs_argument is not None
         and _binds_that_argument(inputs_argument, span)
     )
-    call_line = masked_lines[lineno - 1]
-    # The payload argument is the text between the call's opening parenthesis
-    # and the first top-level comma, measured on the masked line.
-    payload = _call_payload_argument(call_line)
+    # The payload argument is the text between the call's opening parenthesis and
+    # the first top-level comma, measured over the WHOLE wrapped call so a
+    # payload on a continuation line is seen (see :func:`_call_payload_argument`).
+    payload = _call_payload_argument(masked_lines, span_end, lineno)
+    # The placeholder scan runs over the span with TRAILING comments stripped, so
+    # a placeholder written only beside a real binding cannot satisfy it either.
+    placeholders = _identity_placeholders(span) if carries_record else {
+        *(name for _group, names in PORT_IDENTITY_REQUIRED_FIELDS for name in names),
+        PORT_CONTENT_DIGEST_FIELD,
+    }
+    content_digest_bound = (
+        carries_record
+        and PORT_CONTENT_DIGEST_FIELD in span
+        and not _envelope_length_is_zero(span)
+        and PORT_CONTENT_DIGEST_FIELD not in placeholders
+    )
+    identity_detail_bound = carries_record and all(
+        name in span
+        for _group, names in PORT_IDENTITY_REQUIRED_FIELDS
+        for name in names
+    )
+    identity_non_placeholder = identity_detail_bound and not placeholders
     return {
         "payload_argument": payload,
         "inputs_argument": inputs_argument,
+        "payload_non_empty": payload is not None
+        and not _is_empty_payload_literal(payload),
         "final_bytes_bound": carries_record
         and all(field in span for field in PORT_FINAL_BYTES_BINDING_FIELDS),
+        "content_digest_bound": content_digest_bound,
         "identity_bound": carries_record
         and all(field in span for field in PORT_IDENTITY_BINDING_FIELDS),
+        "identity_detail_bound": identity_detail_bound,
+        "identity_non_placeholder": identity_non_placeholder,
+        "placeholder_bindings": sorted(placeholders),
     }
 
 
@@ -1880,20 +2159,46 @@ def _binds_that_argument(inputs_argument: str, span: str) -> bool:
     return bool(binding.search(span))
 
 
-def _call_payload_argument(masked_line: str) -> str | None:
-    """The masked call's first argument, or None when the port is called bare.
+def _call_payload_argument(
+    masked_lines: list[str], span_end: int, lineno: int
+) -> str | None:
+    """The masked call's first argument, or None when the port passes no payload.
 
     The canonical port's first parameter is ``payload: &[u8]`` -- the final
     serialized bytes (``crates/smart/eliot-context-measurement/src/lib.rs:460-463``).
     A call with no argument, or one whose first argument is empty, binds no bytes
     and is not evidence of a bound measurement.
 
-    Measured with the SAME top-level-argument splitter as
-    :func:`_call_inputs_argument` (:func:`_call_arguments`), so the payload and the
-    input record can never be split by two different comma rules and disagree
-    about where one argument ends and the next begins.
+    WHAT A CORRECT ARGUMENT LOOKS LIKE. It is the first top-level argument of the
+    port's OWN parenthesis, measured with the SAME splitter as
+    :func:`_call_inputs_argument` (:func:`_call_arguments`), so the payload and
+    the input record can never be split by two different comma rules and
+    disagree about where one argument ends and the next begins. A well-formed
+    payload is therefore any non-empty first argument -- an identifier, a field
+    path (``&request.payload``), a slice expression (``&payload[a..b]``), a call
+    (``&req.render()``) -- because the port's parameter type already fixes what a
+    correct payload must BE, and re-deciding that from the text would be a second
+    grammar this oracle does not own.
+
+    WHY THE WHOLE CALL, NOT LINE 1. The argument list of a real call is
+    routinely wrapped: ``measure_serialized_context(\\n    &request.payload,\\n
+    &inputs,\\n)``. Reading only ``masked_line`` -- the CALL'S FIRST LINE --
+    sees the opening ``(`` and no comma before the line ends, so the splitter
+    reports no argument at all and the real payload is recorded as absent. That
+    is a false negative on the genuine fixture shape, so this function takes the
+    masked LINES of the call's own extent and the line the call opens on, exactly
+    like :func:`_call_inputs_argument`.
+
+    WHY AN INLINED STRUCT LITERAL DOES NOT MIS-ANCHOR. The splitter anchors on
+    the port's own ``(`` (:func:`_port_call_opens_at`) and treats ``(``, ``[``,
+    ``{`` as depth-increasing and their partners as depth-decreasing, so the
+    ``&SerializedContextInputs { .. }`` passed as the SECOND argument -- with its
+    own braces, parens and commas -- is carried in argument 2's text and can
+    never be read as argument 1 or terminate the scan early. Argument 1 is
+    therefore always the text before the first top-level comma, whatever that
+    comma is nested in.
     """
-    arguments = _call_arguments(masked_line.splitlines() or [""], len(masked_line.splitlines() or [""]), 1)
+    arguments = _call_arguments(masked_lines, span_end, lineno)
     if not arguments:
         return None
     payload = arguments[0].strip()
@@ -1911,15 +2216,39 @@ def _binding_gaps(entry: Mapping[str, Any]) -> list[str]:
     gaps: list[str] = []
     if entry.get("payload_argument") is None:
         gaps.append("a final serialized byte payload argument")
+    elif not entry.get("payload_non_empty"):
+        gaps.append(
+            "a payload argument that is not an empty byte/string literal "
+            f"({'/'.join(PORT_EMPTY_PAYLOAD_LITERALS)})"
+        )
     elif not entry.get("final_bytes_bound"):
         gaps.append(
             f"the envelope length/digest binding "
             f"({'/'.join(PORT_FINAL_BYTES_BINDING_FIELDS)}) into {PORT_INPUT_RECORD}"
         )
+    elif not entry.get("content_digest_bound"):
+        gaps.append(
+            f"a non-placeholder {PORT_CONTENT_DIGEST_FIELD} value "
+            f"(not a constant, a blanked string literal or an empty value)"
+        )
     if not entry.get("identity_bound"):
         gaps.append(
             f"the serializer/route/tokenizer identity binding "
             f"({'/'.join(PORT_IDENTITY_BINDING_FIELDS)}) into {PORT_INPUT_RECORD}"
+        )
+    elif not entry.get("identity_detail_bound"):
+        required = "/".join(
+            name for _group, names in PORT_IDENTITY_REQUIRED_FIELDS for name in names
+        )
+        gaps.append(
+            f"the provider/model/tokenizer ID/version/hash binding "
+            f"({required}) into {PORT_INPUT_RECORD}"
+        )
+    elif not entry.get("identity_non_placeholder"):
+        gaps.append(
+            "a non-placeholder value for every identity binding "
+            "(a hardcoded integer, an empty value and a literal "
+            "'sha256:00' are not an identity)"
         )
     return gaps
 
@@ -2028,10 +2357,17 @@ def _dependency_evidence(root: Path, producer: Any, rows: list[dict[str, Any]]) 
                 for site in sites
             ]
             owner_bindings[rel] = measured
+            # An accepted site is a call that satisfies EVERY conjunct the issue
+            # names for bullet 4 -- it passes a real, non-empty final serialized
+            # byte payload, and the record it passes binds the envelope
+            # length/digest and a present, non-placeholder provider/model/
+            # tokenizer ID/version/hash. A site that fails any of them is NOT
+            # accepted, and the conjunct it fails is named by
+            # :func:`_binding_gaps` on the finding path.
             owner_accepted[rel] = [
                 entry["site"]
                 for entry in measured
-                if entry["final_bytes_bound"] and entry["identity_bound"]
+                if not _binding_gaps(entry)
             ]
         cargo_dependencies[owner] = owner_cargo
         calls[owner] = owner_calls
@@ -2634,6 +2970,12 @@ def evaluate(root: Path) -> OwnershipResult:
     # One reconciliation pass, producing both the findings and the tally that
     # is reported from them. It runs here, once, and its tally is carried into
     # ``_finalize`` instead of being recomputed there.
+    #
+    # ``proven`` -- the consumer dependency proofs measured above, from this run's
+    # live source -- is passed in so the disposition derivation consumes
+    # before/after consumer EVIDENCE. Without it the derivation could only read
+    # ``owner``/``status``/``classification`` off the row, which is precisely the
+    # "owned means migrated" shortcut audit defect 5 names.
     return _finalize(
         root,
         findings,
@@ -2648,7 +2990,7 @@ def evaluate(root: Path) -> OwnershipResult:
         schema_sites=schema_sites,
         owner_sites=owner_sites,
         dependency_proofs=proven,
-        baseline_dispositions=_baseline_findings(rows, by_case, add),
+        baseline_dispositions=_baseline_findings(rows, by_case, add, proven),
     )
 
 
@@ -2776,64 +3118,145 @@ def _proof_escalation(
         )
 
 
-def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
-    """Derive one baseline row's disposition from the row's own recorded facts.
+def _canonical_reach_proven(
+    owner: str, dependency_proofs: Mapping[str, Mapping[str, Any]] | None
+) -> tuple[bool, str]:
+    """Is this owner's canonical measurement reach actually PROVEN for this run?
 
-    The arms below are mutually exclusive: each assigns a value no other arm
-    can also assign, so no branch is a duplicate of another.
+    Returns ``(proven, reason)``. ``reason`` names the measured conjunct that
+    decided it, so a row that falls to ``explicit-unresolved`` can say *why*
+    rather than merely that it fell through.
 
-    ``explicit-unresolved``
-        The producer itself could not attribute the row: either its ``status``
-        is not ``owned`` or its ``owner`` is the literal ``unresolved``. Both
-        are values #866 writes (``context_measurement_inventory.py:1233-1256``,
-        ``:1474``) and both are validated as a closed pair on the producer's
-        read path (``context_measurement_inventory.py:2211-2216``). No other
-        disposition may be claimed for a row nobody owns.
-    ``legitimate-non-context-metric``
-        A real value comparison against the producer's own closed
-        classification for a true byte/KiB/line/UI-character metric that is
-        never carried as a token or STU count. Same shape as the pre-existing
-        check, so this arm is not a new rule -- it is the one that existed.
-    ``exact-versioned-legacy-adapter``
-        Declared in :data:`BASELINE_DISPOSITIONS` but deliberately NOT derived
-        here, and that is the honest outcome rather than a missing rule. No
-        field in #866's closed ``ROW_KEYS`` records a legacy-adapter marker, a
-        version bound or an expiry, and the two fields a shortcut would reach
-        for carry the wrong meaning: ``write_scope`` is mutation permission
-        (``read-only`` marks an ACTIVE #783/#878/#880 consumer reading the
-        #704 crate, per ``_write_scope_of`` and its module docstring
-        ``:1395-1400`` / ``:43-45``), and ``dispatch_blocked`` is
-        ``status != "owned"`` and so is always ``False`` for any row that
-        reaches this point. Deriving the disposition from either would report
-        a live, in-migration consumer as a retired legacy adapter — a label
-        that does not describe its subject. A row that cannot prove it is a
-        closed, exact, versioned adapter is therefore reported as
-        ``explicit-unresolved``. See the module comment above
-        :data:`BASELINE_DISPOSITIONS` for the full argument and for what would
-        have to change upstream to emit it honestly.
+    The answer is read from :data:`OwnershipResult.dependency_proofs`, i.e. from
+    :func:`_dependency_evidence`'s measurement of the consumer's OWN Cargo
+    metadata and its OWN masked production call site -- never from the row's
+    ``owner``/``status`` pair. An owner that is absent from the proof map, or
+    that carries no proof of one of the :data:`CANONICAL_REACH_KINDS`, has NOT
+    demonstrated a canonical migration.
 
-    ``canonical-owner-consumer``
-        The honest residual: a present, owned, current writable row in the
-        #704 algorithm crate or in a consumer's declared seam, i.e. the row
-        still carries a live current owner. This replaces the previous
-        duplicated ``elif write_scope == "read-only"`` / ``else`` pair: a
-        read-only consumer span IS a canonical consumer and needs no separate
-        arm, because no second disposition value exists to give it.
+    The mere absence of a ``MISSING_DEPENDENCY`` finding is deliberately NOT
+    accepted as proof: a consumer whose rows are all ``read-only`` has no
+    writable seam for the dependency check to have run over, so it produces no
+    finding and no proof either. Absence of a complaint is not evidence.
+    """
+    if not dependency_proofs:
+        return (False, "no consumer dependency proof was measured for this run")
+    proof = dependency_proofs.get(owner)
+    if proof is None:
+        return (
+            False,
+            f"owner {owner} has no entry in the measured consumer dependency proofs",
+        )
+    kind = str(proof.get("kind", ""))
+    if kind in CANONICAL_REACH_KINDS:
+        return (True, f"owner {owner} holds a measured {kind} proof")
+    return (False, f"owner {owner} has no proven canonical reach (measured kind {kind!r})")
+
+
+def _derive_baseline_disposition(
+    row: Mapping[str, Any],
+    dependency_proofs: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
+    """Derive one baseline row's disposition from MEASURED evidence.
+
+    Audit defect 5, second half. The previous residual arm returned the literal
+    ``canonical-owner-consumer`` for every row that was neither ``unresolved`` nor
+    ``unrelated_byte_or_character_metric``, reading only ``owner``,
+    ``classification`` and ``status``. That made the label a restatement of "this
+    row is still owned" and nothing more, so an old still-active formula was
+    counted as reconciled merely because its old row remained owned -- exactly the
+    defect the audit names: "do not treat 'owned' as proof of canonical migration".
+
+    The derivation is now evidence-bearing in two independent, measured directions:
+
+    * the row's OWN closed fields, re-read from #866's frozen ``ROW_KEYS``; and
+    * the OWNER-level canonical dependency proof measured this run from live
+      source by :func:`_dependency_evidence`.
+
+    No new row field is used and none is invented: every input below is one of
+    the 22 keys #866 already freezes at
+    ``context_measurement_inventory.py:533-559``.
+
+    The arms are mutually exclusive by construction -- each is a first-match on a
+    distinct predicate, and no two predicates can hold for the same row:
+
+    ``explicit-unresolved`` (first arm)
+        The producer itself could not attribute the row: its ``status`` is not
+        ``owned`` or its ``owner`` is the literal ``unresolved``. Both are values
+        #866 writes (``context_measurement_inventory.py:1648``, ``:1264-1290``)
+        and both are validated as a closed pair on the producer's read path
+        (``:2443-2449``). No other disposition may be claimed for a row nobody
+        owns.
+    ``legitimate-non-context-metric`` (second arm)
+        A real value comparison against the producer's own closed classification
+        for a true byte/KiB/line/UI-character metric that is never carried as a
+        token or STU count. Such a row carries its own exact exclusion evidence
+        in its ``evidence`` field (``context_measurement_inventory.py:1178-1182``),
+        so no consumer migration is owed for it.
+    ``canonical-owner-consumer`` (third arm)
+        REQUIRES BOTH: the row is a live *production* measurement site, AND its
+        owner holds a measured canonical-reach proof. Both halves are evidence:
+        ``item_scope`` is the producer's own ``_scope_of`` verdict on the enclosing
+        item, so a ``test-only`` row is not a consumer; and the reach proof is
+        measured from the consumer's Cargo metadata and its masked production call
+        site, not read off the row. A live legacy formula whose owner has no proven
+        dependency falls past this arm to ``explicit-unresolved`` -- it is never
+        counted as a migrated consumer.
+    ``explicit-unresolved`` (fourth arm)
+        Everything else, i.e. the row cannot demonstrate a canonical migration:
+        a live site the producer still classes as an unvalidated local ratio (the
+        old formula), or a production site whose owner's dependency is unproven.
+        This is the audit's "keep rows unresolved until that evidence exists".
+
+    ``exact-versioned-legacy-adapter`` stays declared in
+    :data:`BASELINE_DISPOSITIONS` but deliberately NOT derived here, and that is
+    the honest outcome rather than a missing rule. No field in #866's closed
+    ``ROW_KEYS`` records a legacy-adapter marker, a version bound or an expiry;
+    reaching for ``write_scope`` (mutation permission by tier, ``:1597-1602``)
+    or ``dispatch_blocked`` (``status != "owned"``, ``:1649``) would restate a
+    different fact under this name. That blocker is filed as a ContractChallenge
+    against #866; emitting it needs a closed field added there by its owner.
     """
     owner = str(row["owner"])
     classification = str(row["classification"])
     status = str(row["status"])
+
+    # Arm 1 -- nobody owns it, so nothing else may be claimed for it.
     if status == "unresolved" or owner == "unresolved":
         return "explicit-unresolved"
+
+    # Arm 2 -- a declared, exact-excluded non-Context metric. Its own
+    # ``evidence`` records the exclusion reason, so no migration is owed.
     if classification == "unrelated_byte_or_character_metric":
         return "legitimate-non-context-metric"
-    return "canonical-owner-consumer"
+
+    # Arm 2b -- the row's OWN frozen classification is itself the evidence that
+    # the OLD formula is still live at this span. An unvalidated local estimator
+    # is the pre-migration defect #787 exists to reconcile, so no owner-level
+    # canonical-reach proof can make this row a reconciled consumer: the row
+    # describes a site that still computes the retired ratio itself. Classifying
+    # it as canonical would assert a migration that the row's own
+    # ``classification`` contradicts.
+    if classification in _LIVE_LEGACY_CLASSIFICATIONS:
+        return "explicit-unresolved"
+
+    # Arm 3 -- canonical consumer, but ONLY on proven evidence. A test-only site
+    # is not a consumer, and an unproven owner is not a migrated one.
+    if str(row.get("item_scope", "production")) != "test":
+        proven, _reason = _canonical_reach_proven(owner, dependency_proofs)
+        if proven:
+            return "canonical-owner-consumer"
+
+    # Arm 4 -- the migration was never demonstrated. The row stays unresolved;
+    # an owned old formula is not a reconciled canonical consumer.
+    return "explicit-unresolved"
 
 
 def _baseline_findings(
     rows: list[dict[str, Any]],
     by_case: dict[str, dict[str, Any]],
     add: Any,
+    dependency_proofs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Baseline reconciliation: every frozen baseline row must survive with an
     explicit disposition. Returns the disposition tally.
@@ -2841,11 +3264,16 @@ def _baseline_findings(
     An erased baseline row (removed requirement) is rejected. Every surviving
     row's disposition comes from :func:`_derive_baseline_disposition`, which
     derives three of the four closed values in :data:`BASELINE_DISPOSITIONS` --
-    ``canonical-owner-consumer``, ``legitimate-non-context-metric`` and
-    ``explicit-unresolved`` -- and never returns anything else.
-    ``exact-versioned-legacy-adapter`` stays declared but underived by design;
-    see :func:`_derive_baseline_disposition` for why no recorded row fact can
-    establish it.
+    ``canonical-owner-consumer`` (only on a measured canonical-reach proof),
+    ``legitimate-non-context-metric`` and ``explicit-unresolved`` -- and never
+    returns anything else. ``exact-versioned-legacy-adapter`` stays declared but
+    underived by design; see :func:`_derive_baseline_disposition` for why no
+    recorded row fact can establish it.
+
+    A row that falls to ``explicit-unresolved`` *because* its owner has no proven
+    canonical dependency also carries a ``CONSUMER_EVIDENCE_MISSING`` finding, so
+    the reconciliation never quietly shrinks the canonical bucket: the row is
+    counted once, as unresolved, and the missing conjunct is named per row.
     """
     # --- The denominator must itself be complete before it can reconcile
     # anything.
@@ -2906,19 +3334,45 @@ def _baseline_findings(
                 span_end=int(row["span_end"]),
                 rule="baseline-reconciliation",
             )
-        # Derive the disposition from the row's own closed fields. The
-        # derivation is total over the four closed values, so the membership
-        # guard below is a structural invariant of the closed set rather than
-        # a check that no recorded row could ever fail; it is kept so that
-        # widening the tuple above fails loudly here instead of raising a
-        # KeyError on the tally.
-        disposition = _derive_baseline_disposition(row)
+        # Derive the disposition from the row's own closed fields plus the
+        # owner-level canonical dependency proof measured this run. The derivation
+        # is total over the four closed values, so the membership guard below is a
+        # structural invariant of the closed set rather than a check that no
+        # recorded row could ever fail; it is kept so that widening the tuple
+        # above fails loudly here instead of raising a KeyError on the tally.
+        disposition = _derive_baseline_disposition(row, dependency_proofs)
         if disposition not in BASELINE_DISPOSITIONS:
             raise OracleError(
                 "DETERMINISTIC_INTERNAL_DEFECT",
                 f"baseline row {case_ref} derived a disposition outside the closed set: "
                 f"{disposition!r}",
             )
+        # A row that could not demonstrate a canonical migration must say so out
+        # loud. Without this the reconciliation would still be arithmetically
+        # complete (the row is counted, once, as unresolved) while a reader of
+        # the tally alone could not tell WHY the canonical bucket shrank. The
+        # finding is emitted only for the arm-4 case -- a row the producer
+        # attributed but whose consumer evidence is absent -- and never for an
+        # arm-1 row, which is already reported as INVENTORY_INCOMPLETE.
+        if disposition == "explicit-unresolved" and actual_owner == expected_owner:
+            _proven, reach_reason = _canonical_reach_proven(actual_owner, dependency_proofs)
+            if not _proven:
+                add(
+                    "CONSUMER_EVIDENCE_MISSING",
+                    f"frozen baseline row {case_ref} (owner {actual_owner}, classification "
+                    f"{row['classification']}, item scope {row.get('item_scope', 'production')!r}) "
+                    f"cannot be reported as a canonical owner consumer: {reach_reason}. An owned "
+                    f"row is not proof of a canonical migration; the before/after consumer "
+                    f"evidence this disposition requires is absent from both the frozen row "
+                    f"schema and the measured dependency proofs, so the requirement stays "
+                    f"unresolved until that evidence exists",
+                    row_id=str(row["id"]),
+                    case_ref=case_ref,
+                    path=str(row["path"]),
+                    span_start=int(row["span_start"]),
+                    span_end=int(row["span_end"]),
+                    rule="baseline-consumer-evidence",
+                )
         dispositions[disposition] += 1
 
     # --- The reconciliation must cover the whole declared denominator.
@@ -3298,12 +3752,24 @@ def run_self_test() -> int:
     assert PORT_INPUT_RECORD == "SerializedContextInputs"
     assert PORT_FINAL_BYTES_BINDING_FIELDS == ("declared_len", "content_digest")
     assert set(PORT_IDENTITY_BINDING_FIELDS) == {"serializer", "route", "tokenizer"}
+    # The identity conjunct names provider/model/tokenizer ID/version/hash, and
+    # the content digest is its own conjunct.
+    _identity_groups = {group for group, _names in PORT_IDENTITY_REQUIRED_FIELDS}
+    assert _identity_groups == {"serializer", "route", "tokenizer"}
+    assert ("route", ("route_id", "provider_id", "model_id")) in PORT_IDENTITY_REQUIRED_FIELDS
+    assert ("tokenizer", ("tokenizer_id", "tokenizer_version", "tokenizer_hash")) in (
+        PORT_IDENTITY_REQUIRED_FIELDS
+    )
 
     # The binding-gap report is deterministic and names only missing conjuncts.
     _full = {
         "payload_argument": "&request.payload",
+        "payload_non_empty": True,
         "final_bytes_bound": True,
+        "content_digest_bound": True,
         "identity_bound": True,
+        "identity_detail_bound": True,
+        "identity_non_placeholder": True,
     }
     assert _binding_gaps(_full) == [], "a fully bound call has no gap to report"
     assert _binding_gaps({**_full, "final_bytes_bound": False}) == [
@@ -3317,6 +3783,146 @@ def run_self_test() -> int:
     assert _binding_gaps({**_full, "payload_argument": None}) == [
         "a final serialized byte payload argument"
     ]
+
+    # Audit section 4, bullet 4: an empty payload, a literal-zero declared length
+    # and a placeholder digest/identity are each NAMED as their own conjunct, so
+    # none of them can pass as "final serialized bytes" or "identity" silently.
+    _empty = _binding_gaps({**_full, "payload_non_empty": False})
+    assert len(_empty) == 1 and "empty byte/string literal" in _empty[0], _empty
+    _digest = _binding_gaps({**_full, "content_digest_bound": False})
+    assert len(_digest) == 1 and "non-placeholder" in _digest[0], _digest
+    _detail = _binding_gaps({**_full, "identity_detail_bound": False})
+    assert len(_detail) == 1 and "ID/version/hash" in _detail[0], _detail
+    _placeholder = _binding_gaps({**_full, "identity_non_placeholder": False})
+    assert len(_placeholder) == 1 and "sha256:00" in _placeholder[0], _placeholder
+
+    # The placeholder and zero-length predicates reject exactly the fabricated
+    # shapes and nothing broader. The predicate reports the FIELD NAME that is
+    # only a placeholder, so a blanked string literal is named by its field.
+    assert PORT_CONTENT_DIGEST_FIELD in _identity_placeholders(
+        "content_digest:            ,"
+    )
+    assert "serializer_id" in _identity_placeholders("serializer_id: 1,\nroute_id: 1,")
+    assert not _identity_placeholders("serializer_id: request.serializer_id.clone(),")
+    assert not _identity_placeholders("provider_id: request.provider_id.clone(),")
+    assert _envelope_length_is_zero("declared_len: 0,")
+    assert not _envelope_length_is_zero("declared_len: request.payload.len() as u64,")
+    assert not _envelope_length_is_zero("declared_len: 1024,")
+
+    # The payload argument is read over the WHOLE call, so a wrapped argument
+    # list is measured rather than only its first line.
+    _wrapped = [
+        "    let measured = measure_serialized_context(",
+        "        &request.payload,",
+        "        &inputs,",
+        "    )",
+    ]
+    assert _call_payload_argument(_wrapped, len(_wrapped), 1) == "&request.payload"
+    # An inlined struct literal in the second position cannot mis-anchor the
+    # payload read: its braces/parens/commas are carried in argument 2.
+    _inline = [
+        "    let measured = measure_serialized_context(payload, &SerializedContextInputs {",
+        "        declared_len: payload.len() as u64,",
+        "    })",
+    ]
+    assert _call_payload_argument(_inline, len(_inline), 1) == "payload"
+    # A bare call still binds no payload.
+    _bare = ["    measure_serialized_context()"]
+    assert _call_payload_argument(_bare, len(_bare), 1) is None
+
+    # --- Evidence-bearing baseline disposition (audit defect 5). ----------
+    #
+    # THE REGRESSION THIS BINDS. The residual arm used to return the literal
+    # "canonical-owner-consumer" for every row that was neither unresolved nor an
+    # excluded metric, reading only owner/classification/status. So an old
+    # still-active formula was counted as reconciled purely because its old row
+    # was still owned. Each assert below runs the PRODUCTION derivation over a
+    # row built only from #866's frozen ROW_KEYS -- no new field is invented.
+    _proven_call = {
+        "#783": {
+            "kind": "canonical-port-call",
+            "port_symbol": CANONICAL_MEASUREMENT_PORT,
+            "call_sites": ["crates/smart/eliot-context-assembly/src/measurement.rs:23"],
+        }
+    }
+    # (1) The defect itself: owned, attributed, but the row's OWN evidence says
+    # the site is still an unvalidated local byte ratio -- the old formula.
+    _live_legacy = {
+        "owner": "#783",
+        "status": "owned",
+        "classification": "token_estimate_without_tokenizer",
+        "write_scope": "read-only",
+        "item_scope": "production",
+    }
+    assert _derive_baseline_disposition(_live_legacy, _proven_call) == "explicit-unresolved", (
+        "an owned row whose own evidence says the site is still an unvalidated local ratio "
+        "must NOT be reported as a canonical owner consumer, even when its owner holds a "
+        "proven dependency elsewhere"
+    )
+    # (2) The SAME row after a real migration: canonical classification + proof.
+    _genuine = dict(_live_legacy, classification="exact-utf8-envelope")
+    assert _derive_baseline_disposition(_genuine, _proven_call) == "canonical-owner-consumer", (
+        "a migrated row whose owner holds a MEASURED canonical dependency is still canonical"
+    )
+    # (3) Genuine classification but NO proven dependency: the evidence is absent.
+    assert _derive_baseline_disposition(_genuine, {}) == "explicit-unresolved", (
+        "an owned row with no measured consumer dependency proof must not assert a migration"
+    )
+    assert _derive_baseline_disposition(_genuine, {"#783": {"kind": "missing"}}) == (
+        "explicit-unresolved"
+    ), "an owner whose measured kind is not a canonical reach kind proves nothing"
+    # An owner absent from the map entirely (its rows were all read-only, so the
+    # dependency check never ran over it) is NOT proven. Absence of a complaint
+    # is not evidence.
+    assert _derive_baseline_disposition(_genuine, {"#878": _proven_call["#783"]}) == (
+        "explicit-unresolved"
+    ), "another owner's proof must never satisfy this row's owner"
+    # (4) A test-only site is not a consumer even with a proven owner.
+    assert _derive_baseline_disposition(
+        dict(_genuine, item_scope="test"), _proven_call
+    ) == "explicit-unresolved", "a test-only row is not a consumer seam"
+    # (5) The declared-but-underived disposition is still never returned, by any
+    # of the five reachable shapes.
+    _shapes = (
+        (_live_legacy, _proven_call),
+        (_genuine, _proven_call),
+        (_genuine, {}),
+        (dict(_genuine, item_scope="test"), _proven_call),
+        (dict(_genuine, status="unresolved"), _proven_call),
+        (dict(_genuine, classification="unrelated_byte_or_character_metric"), _proven_call),
+    )
+    for _row, _proofs in _shapes:
+        assert _derive_baseline_disposition(_row, _proofs) in BASELINE_DISPOSITIONS
+        assert _derive_baseline_disposition(_row, _proofs) != "exact-versioned-legacy-adapter", (
+            "exact-versioned-legacy-adapter stays declared but unreachable (ContractChallenge "
+            "against #866); no admissible row may derive it"
+        )
+    # (6) Mutual exclusivity: no row receives two dispositions. The function
+    # returns exactly one string, so exclusivity is asserted structurally -- the
+    # three distinct shapes give three DISTINCT values, and the two shapes that
+    # share a value share it because they fail the SAME predicate.
+    assert len(
+        {
+            _derive_baseline_disposition(_genuine, _proven_call),
+            _derive_baseline_disposition(_live_legacy, _proven_call),
+            _derive_baseline_disposition(
+                dict(_genuine, classification="unrelated_byte_or_character_metric"),
+                _proven_call,
+            ),
+        }
+    ) == 3, "the three distinguishable shapes must yield three distinct dispositions"
+    # The reach vocabulary is closed and matches the kinds evaluate can produce.
+    assert set(CANONICAL_REACH_KINDS) == {
+        "canonical-port-call",
+        "canonical-port-owner",
+        "approved-adapter",
+    }
+    assert not set(LEGACY_FORMULA_CLASSIFICATIONS) & set(CANONICAL_REACH_KINDS)
+    # _canonical_reach_proven reports the deciding conjunct, never a bare bool.
+    _ok, _why = _canonical_reach_proven("#783", _proven_call)
+    assert _ok is True and "canonical-port-call" in _why
+    _ok2, why2 = _canonical_reach_proven("#783", {})
+    assert _ok2 is False and why2
 
     print("PASS: audit_context_measurement_ownership self-tests completed successfully")
     return 0
