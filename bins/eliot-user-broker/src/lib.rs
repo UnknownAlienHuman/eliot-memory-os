@@ -431,7 +431,7 @@ pub struct HumanStateAuthority {
 /// Rows are process-memory only, so a broker restart discards every binding
 /// and a restarted UI must acquire a fresh one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct OperatorSessionBinding {
+pub struct OperatorSessionBinding {
     endpoint: OperatorEndpoint,
     kernel_registration_digest: String,
     kernel_session_token: String,
@@ -442,6 +442,16 @@ struct OperatorSessionBinding {
     capabilities: Vec<String>,
     challenge_peer: Option<ProcessIdentity>,
     redeemed_peer: Option<ProcessIdentity>,
+    /// Windows SID the OS named-pipe server reported for the redeeming peer,
+    /// recorded from the live authenticated pipe at redemption. It is absent
+    /// until redemption, so a row that was never redeemed on an observed peer
+    /// can never name a principal for a state-changing request.
+    redeemed_windows_sid: Option<String>,
+    /// Interactive logon Session the OS named-pipe server reported for the
+    /// redeeming peer, recorded from that same live authenticated pipe. It is
+    /// the owner of the session half of every Human authority built for this
+    /// row, distinct from the launch declaration's declared session above.
+    redeemed_interactive_session_id: Option<String>,
     redeemed: bool,
     /// The broker-local registration epoch the *core* held its handoff ledger
     /// under when this row was inserted. It is recorded from the live
@@ -508,6 +518,62 @@ impl OperatorClientBinding {
 }
 
 impl HumanStateAuthority {
+    /// Builds the authenticated Human authority for one state-changing request
+    /// out of the owners that observed it, and out of nothing else.
+    ///
+    /// This is the only construction site of a [`HumanStateAuthority`], and it
+    /// is a broker one: the request line is never an input to it. Every field
+    /// is read back from the owner that proved it —
+    ///
+    /// * `principal` and `interactive_session_id` from the Windows SID and
+    ///   logon Session the OS named-pipe server reported for the redeeming
+    ///   peer on the live authenticated pipe
+    ///   ([`OperatorSessionBinding::redeemed_windows_sid`] and
+    ///   [`OperatorSessionBinding::redeemed_interactive_session_id`], recorded
+    ///   in [`BrokerComposition::redeem_operator_handoff`]);
+    /// * `role` and `capabilities` from the exact grant the broker admitted for
+    ///   that binding ([`OperatorSessionBinding::role`] /
+    ///   [`OperatorSessionBinding::capabilities`]), which is the same grant the
+    ///   Kernel minted its session token against;
+    /// * `kernel_session_token` from the value the Kernel issued for this
+    ///   binding ([`OperatorSessionBinding::kernel_session_token`], recorded
+    ///   from [`BrokerComposition::kernel_session_token_grant`]), never from
+    ///   the presented copy;
+    /// * `approval_hash` from the Approver's own claim, which is the one field
+    ///   no owner in this crate holds an independent value for. It is carried
+    ///   verbatim and no more: it is a claim, and
+    ///   `BrokerComposition::admit_human_state_change` still refuses it by
+    ///   name because this broker cannot derive the approved action digest.
+    ///
+    /// Nothing is defaulted, guessed or synthesized. A row that was never
+    /// redeemed against an OS-observed peer has no observed principal or
+    /// session to read, so it is refused here instead of being given a value.
+    pub fn from_redeemed_binding(
+        row: &OperatorSessionBinding,
+        approval_hash: &str,
+    ) -> Result<Self, CompositionError> {
+        let principal = row.redeemed_windows_sid.clone().ok_or_else(|| {
+            BrokerAdmissionRefusal::HumanPrincipalRequired.with_platform(
+                "redeemed binding retains no OS-observed Windows SID, so it can name no Human principal",
+            )
+        })?;
+        let interactive_session_id =
+            row.redeemed_interactive_session_id.clone().ok_or_else(|| {
+                BrokerAdmissionRefusal::OperatorBindingCrossSession
+                    .with_platform("redeemed binding retains no OS-observed logon Session")
+            })?;
+        let authority = Self {
+            principal,
+            interactive_session_id,
+            role: row.role.clone(),
+            capabilities: row.capabilities.clone(),
+            approval_hash: approval_hash.to_owned(),
+            kernel_session_token: row.kernel_session_token.clone(),
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
     fn validate(&self) -> Result<(), CompositionError> {
         if !is_bounded_text(&self.principal) {
             return Err(
@@ -2017,6 +2083,12 @@ impl BrokerComposition {
                 capabilities: endpoint.capabilities.clone(),
                 challenge_peer: None,
                 redeemed_peer: None,
+                // The OS-observed peer tuple exists only once a redeemed peer
+                // has actually been seen on a live authenticated pipe. An
+                // issued-but-unchallenged binding names none, so it cannot be
+                // matched by principal or session at a state change.
+                redeemed_windows_sid: None,
+                redeemed_interactive_session_id: None,
                 redeemed: false,
                 core_ledger_broker_epoch: live.user_broker_epoch,
                 core_ledger_interactive_session_id: live.interactive_session_id.clone(),
@@ -2201,6 +2273,19 @@ impl BrokerComposition {
     /// artifact. The endpoint's own role/capability set must equal the
     /// granted set exactly: a capability outside the grant is refused rather
     /// than narrowed.
+    /// Read back the retained binding row for one redeemed handoff nonce.
+    ///
+    /// This is the read half of the same owner that
+    /// [`BrokerComposition::redeem_operator_handoff`] writes, and it exists so a
+    /// state-changing arm can build its authority from the row this broker
+    /// actually redeemed instead of from the text a caller presented. It returns
+    /// `None` for a nonce this broker never issued or has already consumed,
+    /// which is what makes a restarted client unable to present a binding the
+    /// current process did not redeem for itself.
+    pub fn operator_session_binding(&self, handoff_nonce: &str) -> Option<&OperatorSessionBinding> {
+        self.operator_session_bindings.get(handoff_nonce)
+    }
+
     pub fn redeem_operator_handoff(
         &mut self,
         endpoint: &OperatorEndpoint,
@@ -2296,6 +2381,12 @@ impl BrokerComposition {
             .get_mut(&endpoint.handoff_nonce)
         {
             stored.redeemed_peer = Some(peer.process().clone());
+            // The principal and session a Human authority for this row will
+            // carry are the ones the OS reported for the connected peer on this
+            // pipe, recorded from the observation itself rather than from the
+            // caller's JSON or from the launch declaration's declared tuple.
+            stored.redeemed_windows_sid = Some(peer.sid().to_owned());
+            stored.redeemed_interactive_session_id = Some(peer.session_id().to_string());
             stored.redeemed = true;
         }
         self.operator_session_bindings.retain(|nonce, stored| {
@@ -2390,18 +2481,28 @@ impl BrokerComposition {
     /// then dispatched on the existing typed Kernel path, where approval
     /// semantics stay Kernel-canonicalized:
     ///
-    /// * the principal must be present and must be the Windows SID this
-    ///   broker session was admitted for (omitted or foreign principals are
-    ///   refused);
+    /// The authority is not taken from the request. `authority` is the
+    /// request's *claim* about who it acts as, and this gate builds the
+    /// authority it admits with
+    /// `HumanStateAuthority::from_redeemed_binding` out of the owners that
+    /// observed it — the OS-observed named-pipe peer that redeemed the binding
+    /// and the Kernel-issued session token of that binding — and admits the
+    /// claim only where it agrees with that construction. Fields with no owner
+    /// are refused rather than filled, so a row whose peer was never observed
+    /// cannot name a principal at all.
+    ///
+    /// * the claim must be present and must name the Windows SID this broker
+    ///   session was admitted for (omitted or foreign principals are refused);
     /// * the presented Kernel session token must be the current token of a
     ///   redeemed binding in this session, inside that token's own lease, and
     ///   the registration that binding was issued under must still be the live
     ///   one (missing, expired, or foreign tokens refused);
-    /// * the presented SID/Session must equal the bound tuple
+    /// * the presented SID/Session must equal the tuple the OS observed for the
+    ///   redeeming peer of that binding, and this broker's own admitted session
     ///   (cross-session requests refused);
-    /// * the presented role/capabilities must be covered by a redeemed
-    ///   Kernel-backed binding for that live session (capability expansion
-    ///   refused);
+    /// * the presented role/capabilities must equal the granted set of a
+    ///   redeemed Kernel-backed binding for that live session (capability
+    ///   expansion refused);
     /// * the presented approval hash must be one exact lowercase SHA-256 *and*
     ///   must be provably the digest of the action this broker performs. A hash
     ///   that is merely well-formed is refused: this broker holds no
@@ -2451,8 +2552,13 @@ impl BrokerComposition {
                 && row.kernel_registration_digest == live.registration_digest
                 && row.kernel_session_token == authority.kernel_session_token
                 && row.kernel_session_expires_at > now
-                && row.windows_sid == authority.principal
-                && row.interactive_session_id == authority.interactive_session_id
+                // Matched against the SID/session the OS reported for the
+                // redeeming peer on the live pipe, not against the launch
+                // declaration's declared tuple: the binding that grants
+                // authority is one this broker observed authenticate a peer.
+                && row.redeemed_windows_sid.as_deref() == Some(authority.principal.as_str())
+                && row.redeemed_interactive_session_id.as_deref()
+                    == Some(authority.interactive_session_id.as_str())
         });
         let Some(granted) = granted else {
             return Err(
@@ -2470,7 +2576,16 @@ impl BrokerComposition {
         };
         let artifact = self.operator_artifact()?;
         Self::observe_operator_client(redeemed_peer, &artifact)?;
-        if authority.role != granted.role || authority.capabilities != granted.capabilities {
+        // The authority this gate admits is BUILT by this broker from the
+        // owners above, not taken from the request. The request's own copy is
+        // admitted only by agreeing with that construction field for field: its
+        // principal, session and Kernel token were matched against the
+        // observed peer and the Kernel-issued grant to select this row in the
+        // first place, and its role and capability set must equal the grant
+        // exactly. A capability outside the grant is refused, never narrowed.
+        let admitted =
+            HumanStateAuthority::from_redeemed_binding(granted, &authority.approval_hash)?;
+        if authority.role != admitted.role || authority.capabilities != admitted.capabilities {
             return Err(
                 BrokerAdmissionRefusal::HumanCapabilityNotGranted.with_platform(
                     "state-changing request role and capability set must exactly match the redeemed binding",
@@ -2788,7 +2903,140 @@ pub fn snapshot_digest(path: &Path) -> Result<String, CompositionError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrokerDispatchAuthority, LocalProcessPort};
+    use super::{
+        BrokerAdmissionRefusal, BrokerDispatchAuthority, CompositionError, HumanStateAuthority,
+        LocalProcessPort, OperatorArtifact, OperatorEndpoint, OperatorSessionBinding,
+        ProcessIdentity,
+    };
+
+    /// The exact shape both the approval hash and the Kernel-issued session
+    /// token must have for the producer to admit them: 64 lowercase hex
+    /// characters (`is_exact_approval_hash` / `is_exact_session_token`).
+    const TEST_EXACT_SHA256_TEXT_LEN: usize = 64;
+
+    /// The identity a caller can declare in a launch handoff. It is recorded on
+    /// every row as the *declared* tuple and is never the principal producer's
+    /// input.
+    const DECLARED_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1104";
+
+    /// The identity the OS named-pipe server reports for the connected peer on
+    /// the live authenticated pipe, recorded only during a successful
+    /// [`super::BrokerComposition::redeem_operator_handoff`].
+    const OBSERVED_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-512";
+
+    const OBSERVED_SESSION: &str = "3";
+    const TEST_OPERATOR_ROLE: &str = "operator";
+    const TEST_OPERATOR_CAPABILITY: &str = "operator.launch";
+
+    /// One redeemed operator session binding shaped exactly as
+    /// [`super::BrokerComposition::redeem_operator_handoff`] leaves it after a
+    /// redemption on an OS-observed peer: the declared launch tuple, the
+    /// Kernel-issued grant, and the observed peer identity recorded from that
+    /// pipe.
+    fn redeemed_operator_row(
+        observed_sid: Option<String>,
+        observed_session: Option<String>,
+    ) -> OperatorSessionBinding {
+        OperatorSessionBinding {
+            endpoint: OperatorEndpoint {
+                pipe_name: r"\\.\pipe\eliot-operator".to_owned(),
+                broker_epoch: 7,
+                interactive_session_id: OBSERVED_SESSION.to_owned(),
+                handoff_nonce: "handoff-nonce".to_owned(),
+                role: TEST_OPERATOR_ROLE.to_owned(),
+                capabilities: vec![TEST_OPERATOR_CAPABILITY.to_owned()],
+            },
+            kernel_registration_digest: "registration-digest".to_owned(),
+            kernel_session_token: "b".repeat(TEST_EXACT_SHA256_TEXT_LEN),
+            kernel_session_expires_at: 1_000,
+            windows_sid: DECLARED_SID.to_owned(),
+            interactive_session_id: OBSERVED_SESSION.to_owned(),
+            role: TEST_OPERATOR_ROLE.to_owned(),
+            capabilities: vec![TEST_OPERATOR_CAPABILITY.to_owned()],
+            challenge_peer: Some(ProcessIdentity {
+                process_id: 4242,
+                start_time_100ns: 1_337,
+                image_path: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
+            }),
+            redeemed_peer: Some(ProcessIdentity {
+                process_id: 4242,
+                start_time_100ns: 1_337,
+                image_path: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
+            }),
+            redeemed_windows_sid: observed_sid,
+            redeemed_interactive_session_id: observed_session,
+            redeemed: true,
+            core_ledger_broker_epoch: 7,
+            core_ledger_interactive_session_id: OBSERVED_SESSION.to_owned(),
+            core_ledger_artifact: OperatorArtifact {
+                image_id: "operator-image".to_owned(),
+                executable: r"C:\Program Files\Eliot\Eliot.Operator.exe".to_owned(),
+                artifact_digest: "artifact-digest".to_owned(),
+            },
+        }
+    }
+
+    /// Positive proof for the principal producer (#1777): the produced
+    /// authority names the identity the OS reported for the connected pipe
+    /// peer, not the identity the launch declaration declares, and carries the
+    /// Kernel-issued grant of that same redeemed row for role, capability set
+    /// and session token. Nothing is defaulted and nothing is synthesized.
+    #[test]
+    fn human_state_authority_names_the_os_observed_peer_not_the_declared_tuple() {
+        let row = redeemed_operator_row(
+            Some(OBSERVED_SID.to_owned()),
+            Some(OBSERVED_SESSION.to_owned()),
+        );
+        let admitted = HumanStateAuthority::from_redeemed_binding(
+            &row,
+            &"a".repeat(TEST_EXACT_SHA256_TEXT_LEN),
+        );
+        let admitted = match admitted {
+            Ok(authority) => authority,
+            Err(error) => panic!("an OS-observed redeemed peer must produce a principal: {error}"),
+        };
+        assert_eq!(admitted.principal, OBSERVED_SID);
+        assert_ne!(admitted.principal, DECLARED_SID);
+        assert_eq!(admitted.interactive_session_id, OBSERVED_SESSION);
+        assert_eq!(admitted.role, TEST_OPERATOR_ROLE);
+        assert_eq!(
+            admitted.capabilities,
+            vec![TEST_OPERATOR_CAPABILITY.to_owned()]
+        );
+        assert_eq!(admitted.kernel_session_token, row.kernel_session_token);
+        assert_eq!(
+            admitted.approval_hash,
+            "a".repeat(TEST_EXACT_SHA256_TEXT_LEN)
+        );
+    }
+
+    /// Refusal proof, and the load-bearing property: a row that carries only a
+    /// caller-declarable identity names no principal at all. The declared
+    /// launch SID/session are populated, so a producer that read a claim rather
+    /// than an observation would happily emit them; this one refuses by name
+    /// because the OS never reported an identity for that row.
+    #[test]
+    fn human_state_authority_refuses_a_principal_that_was_never_observed() {
+        let row = redeemed_operator_row(None, None);
+        let refused = HumanStateAuthority::from_redeemed_binding(
+            &row,
+            &"a".repeat(TEST_EXACT_SHA256_TEXT_LEN),
+        );
+        match refused {
+            Ok(authority) => panic!(
+                "an unobserved binding must name no principal, got {:?}",
+                authority.principal
+            ),
+            Err(CompositionError::Admission { refusal, detail }) => {
+                assert_eq!(
+                    refusal,
+                    BrokerAdmissionRefusal::HumanPrincipalRequired,
+                    "an unobserved binding must refuse by name, got: {detail}"
+                );
+            }
+            Err(other) => panic!("expected a named principal refusal, got: {other}"),
+        }
+    }
 
     #[test]
     fn broker_dispatch_authority_constructs_ephemeral_key() {
