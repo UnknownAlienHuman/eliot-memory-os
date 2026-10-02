@@ -210,8 +210,8 @@ pub fn capture_handoff_checkpoint(
 ) -> Result<CheckpointReceipt, HandoffPersistenceError> {
     let operation_id = check_capture_binding(capture, &draft)?;
     register_capture_operation(registry, &operation_id, &capture.capture_id)?;
-    if let Some(receipt) = readback_committed_capture(owner, capture, &draft) {
-        return receipt;
+    if let Some(receipt) = readback_committed_capture(owner, capture, &draft)? {
+        return Ok(receipt);
     }
     let receipt = owner.checkpoint(draft)?;
     if !owner.events().contains(&receipt.event) {
@@ -231,30 +231,41 @@ pub fn capture_handoff_checkpoint(
 /// subject or binding differs from this draft is a different input under the
 /// same key and fails with the owner's idempotency conflict; no match means the
 /// first commit never landed and the caller proceeds to commit.
+///
+/// The return shape carries exactly that distinction: `Ok(None)` is "no prior
+/// commit of this operation is in the stream", and `Err` is a refusal that
+/// keeps its own typed owner error. A parse refusal is never read as "no prior
+/// commit": letting one pass for that would let a foreign record stored under
+/// this operation identity pass for this draft's capture.
 fn readback_committed_capture(
     owner: &CoordinationOwner,
     capture: &HandoffCapture,
     draft: &WorkCheckpoint,
-) -> Option<Result<CheckpointReceipt, HandoffPersistenceError>> {
-    let expected = HandoffCaptureBinding::from_text(&draft.checkpoint_ref).ok()?;
+) -> Result<Option<CheckpointReceipt>, HandoffPersistenceError> {
+    // `check_capture_binding` already proved the draft reference equals a real
+    // binding's canonical text, so this parse is the round trip of the text this
+    // caller is about to commit, not a new claim about the store.
+    let expected = HandoffCaptureBinding::from_text(&draft.checkpoint_ref)?;
     let stored = owner.events().iter().find(|event| {
         event.kind == CoordinationEventKind::Checkpointed
             && event.idempotency_key == draft.request_id
-    })?;
+    });
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
     if stored.subject_id != draft.work_item_id || stored.payload_digest != draft.checkpoint_ref {
-        return Some(Err(CoordinationError::IdempotencyConflict(
-            draft.request_id.clone(),
-        )
-        .into()));
+        return Err(CoordinationError::IdempotencyConflict(draft.request_id.clone()).into());
     }
+    // The compared binding is parsed back out of the stored event text, so the
+    // retry admits the record the store holds rather than a recomputed one.
     let binding = HandoffCaptureBinding::from_text(&stored.payload_digest)?;
     if binding != expected || binding.checkpoint_id != capture.capture_id {
-        return Some(Err(CoordinationError::IdempotencyConflict(
+        return Err(CoordinationError::IdempotencyConflict(
             draft.request_id.clone(),
         )
-        .into()));
+        .into());
     }
-    Some(Ok(CheckpointReceipt {
+    Ok(Some(CheckpointReceipt {
         checkpoint_id: draft.checkpoint_id.clone(),
         work_item_id: draft.work_item_id.clone(),
         event: stored.clone(),

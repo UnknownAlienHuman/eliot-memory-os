@@ -62,10 +62,10 @@
 
 use eliot_agent_contracts::{
     HandoffAttemptIdentity, HandoffAuthorityObservations, HandoffCausalLink, HandoffCaptureRegistry,
-    HandoffCheckpointId, HandoffProviderCompactionCapability, HandoffProviderGap,
-    HandoffRecoveryError, HandoffRecoveryInputs, HandoffRecoveryOutput, HandoffResumeEvidence,
-    HandoffResumeIntent, HandoffSourceGenerations, PublicReference, TaskControllerLease,
-    recover_handoff,
+    HandoffCheckpointError, HandoffCheckpointId, HandoffProviderCompactionCapability,
+    HandoffProviderGap, HandoffRecoveryError, HandoffRecoveryInputs, HandoffRecoveryOutput,
+    HandoffResumeEvidence, HandoffResumeIntent, HandoffSourceGenerations, PublicReference,
+    TaskControllerLease, recover_handoff,
 };
 use eliot_contracts::{EpochId, StateFence};
 use thiserror::Error;
@@ -77,14 +77,19 @@ use super::{
 /// Failure of the Governor resume-owner join.
 ///
 /// The owner-read refusal keeps the coordination owner's own typed error, the
-/// authority and evidence refusals keep the recovery owner's typed errors, and
-/// the durable-capture corroboration keeps the persistence owner's typed error.
-/// No failure is collapsed into a generic code.
+/// authority and evidence refusals keep the recovery owner's typed errors, the
+/// durable-capture corroboration keeps the persistence owner's typed error, and
+/// the retained-payload re-check keeps the checkpoint record owner's typed
+/// error. No failure is collapsed into a generic code.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum HandoffResumeError {
     /// A capture, registry, or permit rejection from the persistence join.
     #[error(transparent)]
     Persistence(#[from] HandoffPersistenceError),
+    /// A retained-payload or checkpoint-record rejection from the checkpoint
+    /// owner, e.g. the re-checked checkpoint-to-link binding.
+    #[error(transparent)]
+    Checkpoint(#[from] HandoffCheckpointError),
     /// An authority, evidence, dispatch, or binding rejection, already typed by
     /// the recovery owner.
     #[error(transparent)]
@@ -199,13 +204,20 @@ pub struct HandoffResumeRequest<'a> {
     pub authority: &'a HandoffResumeAuthorityQuery<'a>,
 }
 
-/// Resumes under the durable readback, the retained payload, and a live owner
-/// read, in that order.
+/// Resumes under the live owner read, the durable readback, and the retained
+/// payload, in that order.
 ///
 /// This is the Governor-side entrypoint a real resume caller reaches. It
 /// resolves the current authority observations from the coordination owner,
 /// feeds the recovery owners, and returns their output; every refusal along the
 /// way is typed and none of them issues an executable resumed session.
+///
+/// The authority read lives here and not one layer down: this join owns the
+/// live owner, and it resolves
+/// [`read_resume_authority_observations`] exactly once before it builds
+/// [`HandoffRecoveryInputs`]. Those observations then travel inside
+/// `inputs.observations` as an owner observation, which is the only channel the
+/// recovery owners read current authority from.
 pub fn resume_retained_handoff(
     owner: &CoordinationOwner,
     request: &HandoffResumeRequest<'_>,
@@ -224,7 +236,7 @@ pub fn resume_retained_handoff(
         recipe_ref: request.recipe_ref,
         resume_request: request.resume_request,
     };
-    resume_from_retained_handoff(owner, request.registry, request.authority, &inputs, intent)
+    resume_from_retained_handoff(owner, request.registry, &inputs, intent)
 }
 
 /// Resumes from one retained handoff checkpoint through the Governor owner.
@@ -234,6 +246,14 @@ pub fn resume_retained_handoff(
 /// owners in order over caller-resolved inputs. A reference-only resume, a
 /// binding mismatch, or a capture that does not read back fails closed: no
 /// executable resumed session is issued.
+///
+/// This join takes no authority query. The current authority observations are
+/// already resolved and carried in `inputs.observations`, and taking the query
+/// here as well would leave two ways to state current authority for one run: an
+/// observation the owner read, and a caller record that merely looks like one.
+/// Reading the owner twice would not fix that, it would only make two reads
+/// that can disagree. A caller that has not resolved the observations yet goes
+/// through [`resume_retained_handoff`], which is the layer that owns the read.
 pub fn resume_from_retained_handoff(
     owner: &CoordinationOwner,
     registry: &HandoffCaptureRegistry,
@@ -242,6 +262,10 @@ pub fn resume_from_retained_handoff(
 ) -> Result<HandoffRecoveryOutput, HandoffResumeError> {
     let retained = inputs.evidence.retained()?;
     retained.validate()?;
+    // Existence of the committed binding is the corroboration: the text is
+    // parsed out of the owner event stream by `stored_capture_binding`, so this
+    // proves the store holds this checkpoint rather than that a caller could
+    // recompute one. A checkpoint with no committed binding is refused here.
     stored_capture_binding(owner, &retained.checkpoint.checkpoint_id)?;
     registry.require_compaction_permit(&retained.checkpoint.checkpoint_id)?;
     Ok(recover_handoff(inputs, intent)?)
