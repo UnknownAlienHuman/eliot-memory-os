@@ -5,7 +5,9 @@
 // rejected as MISSING_DEPENDENCY.
 use eliot_context_measurement::{SerializedContextInputs, measure_serialized_context};
 
-#[allow(dead_code)]
+// Stays private and uncalled: that is the defect this fixture models. Nothing
+// compiles this file -- it is frozen bytes the Python oracle scans as text -- so no
+// dead-code lint ever fires here and no suppression attribute is warranted.
 fn never_called_measurement_probe(bytes: &[u8]) -> u64 {
     let inputs = SerializedContextInputs {
         measurement_id: "m-dead".to_owned(),
