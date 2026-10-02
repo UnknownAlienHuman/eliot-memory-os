@@ -520,77 +520,6 @@ impl RecoveryRecord {
     }
 }
 
-/// One real Governor owner record paired with its original durable-row CAS.
-///
-/// The Governor supplies both revisions: `expected_revision` is the original
-/// row head and `record.revision` is the already-issued next row revision.
-/// The Store validates their succession but never manufactures a revision.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentActivationOwnerFrame {
-    pub expected_revision: u64,
-    pub record: RecoveryRecord,
-}
-
-impl AgentActivationOwnerFrame {
-    /// Validates the owner record, exact fence, and owner-issued CAS successor.
-    pub fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
-        self.record.validate_for_fence(expected)?;
-        let next_revision = self.expected_revision.checked_add(1).ok_or(
-            StoreError::InvalidField {
-                field: "agent_activation_owner.expected_revision",
-                reason: "revision overflow",
-            },
-        )?;
-        if self.record.revision != next_revision {
-            return Err(StoreError::InvalidField {
-                field: "agent_activation_owner.record.revision",
-                reason: "does not advance the original owner revision by one",
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Exact four-owner recovery bundle used by one Governor agent activation.
-///
-/// These are the existing Task, Session, Coordination, and WorkScope owner
-/// rows. The store treats each owner payload as opaque bytes; it verifies the
-/// fixed record addresses, shared admitted fence, and original-revision CAS.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentActivationOwnerBundle {
-    pub task: AgentActivationOwnerFrame,
-    pub session: AgentActivationOwnerFrame,
-    pub coordination: AgentActivationOwnerFrame,
-    pub work_scope: AgentActivationOwnerFrame,
-}
-
-impl AgentActivationOwnerBundle {
-    /// Validates the complete fixed-key owner set under one admitted fence.
-    pub fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
-        let owners = [
-            (&self.task, "task"),
-            (&self.session, "session"),
-            (&self.coordination, "coordination"),
-            (&self.work_scope, "work_scope"),
-        ];
-        for (owner, key) in owners {
-            if owner.record.namespace != "owner"
-                || owner.record.key != key
-                || owner.record.schema != OWNER_SNAPSHOT_SCHEMA
-            {
-                return Err(StoreError::InvalidField {
-                    field: "agent_activation_owner.record",
-                    reason: "does not match its fixed Governor owner address and schema",
-                });
-            }
-            owner.validate_for_fence(expected)?;
-        }
-        validate_recovery_packet_size(&serde_json::json!({ "owner_records": self }))
-    }
-}
-
 /// Request for one same-fence recovery observation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4119,9 +4048,6 @@ pub enum NamedMutationOperation {
     /// existing `RecoverySchema` transition. The store treats the receipt as
     /// opaque bytes and only arbitrates the `owner/finish` revision.
     RecordFinishDecision,
-    /// Atomically persists the exact Task, Session, Coordination, and
-    /// WorkScope RecoveryRecord frames emitted by a real Governor activation.
-    ApplyAgentActivationOwners,
     /// Persists the Governor-produced canonical finish-evidence owner image
     /// through the same fenced `RecoverySchema` transition. The store treats
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
@@ -4284,7 +4210,6 @@ impl NamedMutationOperation {
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
-            | Self::ApplyAgentActivationOwners
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
             | Self::RecordAuthorityRevocation

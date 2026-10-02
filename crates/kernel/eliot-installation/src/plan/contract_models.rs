@@ -13,7 +13,6 @@
 
 use std::path::Path;
 
-use eliot_platform_windows::FileIdentity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -207,71 +206,6 @@ pub struct UserModeSupervisionAuthorityProvisionPlan {
     /// roots. The effect executor reopens these roots and retains their
     /// current-user no-follow identities before key access.
     pub profile_roots: InstallationRoots,
-}
-
-/// Immutable create-only key plan for the explicitly disposable `PortableDev`
-/// repository-local authority. The file lives below the descriptor-selected
-/// repository root and is never shared with `UserMode` or `SystemService`.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PortableDevSupervisionAuthorityProvisionPlan {
-    /// Installation transaction that owns this planned key write.
-    pub transaction_id: PlatformHandle,
-    /// Exact planned effect identity.
-    pub effect_id: PlatformHandle,
-    /// Installation identity pinned into the trust anchor.
-    pub installation_id: PlatformHandle,
-    /// Exact candidate generation that owns the key.
-    pub candidate_generation: PlatformHandle,
-    /// Authority lifecycle generation.
-    pub authority_generation: ResourceGeneration,
-    /// Stable lease identity selected in the immutable candidate descriptor.
-    pub supervision_lease_scope_id: PlatformHandle,
-    /// Exact Kernel signer identity.
-    pub signer_id: PlatformHandle,
-    /// Generation-specific public key identity.
-    pub key_id: PlatformHandle,
-    /// Descriptor-selected repository root retained by the PortableDev profile.
-    pub repository_root: PlatformHandle,
-    /// File-object identity of that root, observed before planning the write.
-    pub repository_root_identity: FileIdentity,
-    /// Canonical relative path below `.eliot-dev/state/supervision/`.
-    pub relative_path: PlatformHandle,
-}
-
-impl PortableDevSupervisionAuthorityProvisionPlan {
-    pub(super) fn validate(&self) -> Result<(), InstallationError> {
-        for (value, field) in [
-            (&self.transaction_id, "portable_dev_supervision.transaction_id"),
-            (&self.effect_id, "portable_dev_supervision.effect_id"),
-            (&self.installation_id, "portable_dev_supervision.installation_id"),
-            (&self.candidate_generation, "portable_dev_supervision.candidate_generation"),
-            (&self.supervision_lease_scope_id, "portable_dev_supervision.supervision_lease_scope_id"),
-            (&self.signer_id, "portable_dev_supervision.signer_id"),
-            (&self.key_id, "portable_dev_supervision.key_id"),
-            (&self.relative_path, "portable_dev_supervision.relative_path"),
-        ] {
-            handle(value, field)?;
-        }
-        approved_path(&self.repository_root, "portable_dev_supervision.repository_root")?;
-        if self.authority_generation.value() == 0
-            || self.repository_root_identity.volume_serial_number == 0
-            || self.repository_root_identity.file_index == 0
-            || self.signer_id.as_str() != "eliot-kernel"
-            || self.key_id.as_str()
-                != format!("eliot-supervision-key:v1:{}", self.candidate_generation)
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-        eliot_runtime_contracts::PortableDevSupervisionKeyReference::new(
-            self.relative_path.as_str().to_owned(),
-        )
-        .map_err(|error| InstallationError::InvalidField {
-            field: "portable_dev_supervision.relative_path".to_owned(),
-            reason: error.to_string(),
-        })?;
-        Ok(())
-    }
 }
 
 impl UserModeSupervisionAuthorityProvisionPlan {

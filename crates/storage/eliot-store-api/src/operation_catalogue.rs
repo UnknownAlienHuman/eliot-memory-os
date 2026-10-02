@@ -35,9 +35,6 @@
 //! plus the `RecordFinishDecision` mutation (issue #325: persists the
 //! Governor-owned opaque finish receipt through the existing `RecoverySchema`
 //! owner path),
-//! plus `ApplyAgentActivationOwners` (issue #1838: atomically persists the
-//! exact four Governor-issued Task, Session, Coordination, and WorkScope
-//! recovery rows under their original row revisions and common State Fence),
 //! plus the `ApplyEpistemicRevision` mutation (T11.2: persists
 //! `TransitionClass::Epistemic` with the `EffectClass::Candidate`
 //! ceiling and the owner-approved epistemic-revision payload),
@@ -501,7 +498,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -537,14 +534,6 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
-    },
-    ActivatedMutationDescriptor {
-        operation: NamedMutationOperation::ApplyAgentActivationOwners,
-        transition_classes: &[TransitionClass::RecoverySchema],
-        maximum_effect: EffectClass::ReversibleMutation,
-        // The closed owner bundle validates the complete parameter packet
-        // against the existing recovery packet bound, also advertised here.
-        max_input_bytes: READ_MAX_OUTPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordFinishEvidence,
@@ -984,14 +973,6 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplySwarmOwnerRevisions
             | NamedMutationOperation::ApplyInstrumentRegistryState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyAgentActivationOwners => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                let owners: crate::AgentActivationOwnerBundle = serde_json::from_value(
-                    command.parameters["owner_records"].clone(),
-                )
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                owners.validate_for_fence(&transition.state_fence)?;
             }
             NamedMutationOperation::ApplyNotificationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;

@@ -188,8 +188,6 @@ pub enum ParameterShape {
     /// record contract owns its task/revision binding and its obligation list,
     /// and the neutral acceptance-set validator proves the digest against it.
     TaskContractAcceptanceRecord,
-    /// Closed four-owner recovery bundle for Governor agent activation.
-    AgentActivationOwnerBundle,
 }
 
 impl ParameterShape {
@@ -211,7 +209,6 @@ impl ParameterShape {
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
-            Self::AgentActivationOwnerBundle => "eliot.governor.agent-activation-owners.v1",
         }
     }
 }
@@ -439,14 +436,6 @@ static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
         required: true,
     },
 ];
-/// The complete four-owner activation image and original row revisions are
-/// supplied by Governor as one typed, closed bundle.
-static APPLY_AGENT_ACTIVATION_OWNERS_PARAMETERS: [ParameterDeclaration; 1] =
-    [ParameterDeclaration {
-        name: "owner_records",
-        shape: ParameterShape::AgentActivationOwnerBundle,
-        required: true,
-    }];
 /// Owner-approved Governor finish-evidence persistence fields. The canonical
 /// owner image remains an opaque JSON document at this boundary; the store
 /// only arbitrates its fixed owner address and revision.
@@ -1389,7 +1378,6 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::ApplyProblemOwnerState => "ApplyProblemOwnerState",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
-        NamedMutationOperation::ApplyAgentActivationOwners => "ApplyAgentActivationOwners",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
@@ -1424,9 +1412,6 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"ApplyProblemOwnerState" => Some(NamedMutationOperation::ApplyProblemOwnerState),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
-        b"ApplyAgentActivationOwners" => {
-            Some(NamedMutationOperation::ApplyAgentActivationOwners)
-        }
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
@@ -1607,9 +1592,6 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
         NamedMutationOperation::ApplyProblemOwnerState => &APPLY_PROBLEM_OWNER_STATE_PARAMETERS,
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
-        NamedMutationOperation::ApplyAgentActivationOwners => {
-            &APPLY_AGENT_ACTIVATION_OWNERS_PARAMETERS
-        }
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
@@ -1728,7 +1710,6 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::InstrumentRegistrySnapshot
         | ParameterShape::ProblemOwnerState
         | ParameterShape::TaskContractAcceptanceRecord => true,
-        ParameterShape::AgentActivationOwnerBundle => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1918,11 +1899,6 @@ fn check_declared_shape(
             let record: crate::TaskContractAcceptanceRecord = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             record.validate()
-        }
-        ParameterShape::AgentActivationOwnerBundle => {
-            let owners: crate::AgentActivationOwnerBundle = serde_json::from_value(value.clone())
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-            owners.validate_for_fence(&owners.task.record.state_fence)
         }
     }
 }

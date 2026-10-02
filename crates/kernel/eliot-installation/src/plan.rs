@@ -18,8 +18,7 @@ mod contract_models;
 
 pub use contract_models::{
     InstallerAclPrincipal, InstallerServiceAccount, InstallerServiceRole, PackageArtifactDigest,
-    PlannedChange, PortableDevSupervisionAuthorityProvisionPlan, SupervisionAuthorityProvisionPlan,
-    UserModeSupervisionAuthorityProvisionPlan,
+    PlannedChange, SupervisionAuthorityProvisionPlan, UserModeSupervisionAuthorityProvisionPlan,
 };
 
 /// One immutable installer effect owned by the enclosing
@@ -120,15 +119,6 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable current-user provision plan.
         provision: Box<UserModeSupervisionAuthorityProvisionPlan>,
     },
-    /// Provision the disposable repository-local `PortableDev` signing key.
-    /// The durable coordinator retains the original public receipt before its
-    /// create-only file write, using the existing PortableDev key provider.
-    ProvisionPortableDevSupervisionAuthority {
-        /// Stable effect identity.
-        effect_id: PlatformHandle,
-        /// Secret-free immutable repository-local provision plan.
-        provision: Box<PortableDevSupervisionAuthorityProvisionPlan>,
-    },
     /// Publish the Host-owned Phase-B overlay and hand the exact pending
     /// activation to Host after the credential effect has been durably read
     /// back. This is a separate effect so materialization has its own
@@ -165,7 +155,6 @@ impl InstallerEffectPlan {
             | Self::StartService { effect_id, .. }
             | Self::ProvisionStoreCredential { effect_id, .. }
             | Self::ProvisionUserModeSupervisionAuthority { effect_id, .. }
-            | Self::ProvisionPortableDevSupervisionAuthority { effect_id, .. }
             | Self::MaterializePhaseB { effect_id, .. } => effect_id,
         }
     }
@@ -300,16 +289,6 @@ impl InstallerEffectPlan {
                 }
                 Ok(())
             }
-            Self::ProvisionPortableDevSupervisionAuthority {
-                effect_id,
-                provision,
-            } => {
-                provision.validate()?;
-                if provision.effect_id != *effect_id {
-                    return Err(InstallationError::IdentityConflict);
-                }
-                Ok(())
-            }
             Self::MaterializePhaseB {
                 candidate_manifest_digest,
                 static_template,
@@ -416,65 +395,8 @@ pub(super) fn validate_effect_profile(
                     .to_owned(),
             ))
         }
-        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. }
-            if profile == InstallationProfile::PortableDev =>
-        {
-            Ok(())
-        }
-        InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { .. } => {
-            Err(InstallationError::ProfileViolation(
-                "repository-local authority provisioning requires PortableDev profile".to_owned(),
-            ))
-        }
         InstallerEffectPlan::MaterializePhaseB { .. } => Err(InstallationError::ProfileViolation(
             "Phase-B materialization requires SystemService profile".to_owned(),
-        )),
-    }
-}
-
-pub(super) fn validate_portable_dev_authority_effect_bindings(
-    transaction_id: &PlatformHandle,
-    candidate: &CandidateManifest,
-    effects: &[InstallerEffectPlan],
-) -> Result<(), InstallationError> {
-    let mut matched = 0_usize;
-    for effect in effects {
-        let InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority {
-            effect_id,
-            provision,
-        } = effect
-        else {
-            continue;
-        };
-        matched += 1;
-        if candidate.runtime_launch.profile != InstallationProfile::PortableDev
-            || provision.transaction_id != *transaction_id
-            || provision.effect_id != *effect_id
-            || provision.installation_id != candidate.runtime_launch.installation_epoch.installation
-            || provision.candidate_generation != candidate.generation
-            || provision.authority_generation != candidate.runtime_launch.authority_generation
-            || provision.supervision_lease_scope_id.as_str()
-                != candidate.runtime_launch.supervision_lease_scope_id()
-            || candidate.runtime_launch.portable_root.as_ref()
-                != Some(&provision.repository_root)
-            || provision.repository_root.as_str()
-                != candidate.runtime_launch.runtime_state_roots.profile_anchor_root.as_str()
-        {
-            return Err(InstallationError::IdentityConflict);
-        }
-    }
-    match (candidate.runtime_launch.profile, matched) {
-        (InstallationProfile::PortableDev, 1) => Ok(()),
-        (InstallationProfile::PortableDev, 0) => Err(InstallationError::IncompleteObservation(
-            "PortableDev candidate is missing its repository-local authority effect".to_owned(),
-        )),
-        (InstallationProfile::PortableDev, _) => Err(InstallationError::Duplicate {
-            kind: "PortableDev supervision authority effect".to_owned(),
-            identity: transaction_id.as_str().to_owned(),
-        }),
-        (_, 0) => Ok(()),
-        (_, _) => Err(InstallationError::ProfileViolation(
-            "PortableDev authority effect is inconsistent with the candidate profile".to_owned(),
         )),
     }
 }
@@ -600,7 +522,6 @@ pub(super) fn validate_installer_effects(
     let mut phase_b_index = None;
     let mut package_index = None;
     let mut user_mode_authority_index = None;
-    let mut portable_dev_authority_index = None;
     for (index, effect) in effects.iter().enumerate() {
         effect.validate()?;
         if !effect_ids.insert(effect.effect_id().as_str()) {
@@ -834,25 +755,6 @@ pub(super) fn validate_installer_effects(
                     ));
                 }
             }
-            InstallerEffectPlan::ProvisionPortableDevSupervisionAuthority { provision, .. } => {
-                if profile != InstallationProfile::PortableDev {
-                    return Err(InstallationError::ProfileViolation(
-                        "repository-local authority provisioning is PortableDev-only".to_owned(),
-                    ));
-                }
-                if portable_dev_authority_index.replace(index).is_some() {
-                    return Err(InstallationError::Duplicate {
-                        kind: "PortableDev supervision authority effect".to_owned(),
-                        identity: provision.effect_id.as_str().to_owned(),
-                    });
-                }
-                if package_index.is_none_or(|package| index != package + 1) {
-                    return Err(InstallationError::IncompleteObservation(
-                        "PortableDev authority provisioning must immediately follow package publication"
-                            .to_owned(),
-                    ));
-                }
-            }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 if phase_b_index.replace(index).is_some() {
                     return Err(InstallationError::Duplicate {
@@ -1003,18 +905,6 @@ pub(super) fn validate_installer_effects(
     if profile != InstallationProfile::UserMode && user_mode_authority_index.is_some() {
         return Err(InstallationError::ProfileViolation(
             "current-user supervision authority effect is admitted only for UserMode".to_owned(),
-        ));
-    }
-    if profile == InstallationProfile::PortableDev && portable_dev_authority_index.is_none() {
-        return Err(InstallationError::IncompleteObservation(
-            "PortableDev transaction requires its repository-local supervision authority effect"
-                .to_owned(),
-        ));
-    }
-    if profile != InstallationProfile::PortableDev && portable_dev_authority_index.is_some() {
-        return Err(InstallationError::ProfileViolation(
-            "repository-local supervision authority effect is admitted only for PortableDev"
-                .to_owned(),
         ));
     }
     if profile == InstallationProfile::SystemService

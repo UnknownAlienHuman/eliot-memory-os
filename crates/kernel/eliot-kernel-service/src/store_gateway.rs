@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{
-    ArtifactId, EpochId, HostCorrelationDomain, HostCorrelationProjection, OperationId,
-    RequestMetadata, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
+    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
@@ -97,14 +97,13 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
-    verify_canonical_request_hash,
+    NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
+    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
+    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -912,37 +911,6 @@ impl std::fmt::Debug for KernelStoreGateway {
 /// above is enforced by the borrow rather than asserted in this doc.
 pub struct BorrowedCanonicalStoreClient<'a> {
     gateway: &'a KernelStoreGateway,
-}
-
-/// Immutable selected-route facts captured by the canonical Store gateway
-/// while one named read is executing through its active generation.
-///
-/// This is observation data only: route identity, endpoint, connection,
-/// generation, authority epoch and approved artifact/configuration all come
-/// from the gateway's active route and the authenticated EBP client's
-/// bootstrap requirement. It carries no semantic interpretation of the read
-/// payload and does not make a route current after the operation completes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NamedReadRouteEvidence {
-    /// Exact named Store operation selected for the read.
-    pub operation: NamedReadOperation,
-    /// Exact fence bound into that named Store request.
-    pub state_fence: StateFence,
-    /// Route identity from the active Kernel generation route and Store requirement.
-    pub route_identity: String,
-    /// Active Kernel-selected Store generation used for this call.
-    pub active_generation: u64,
-    /// Authority epoch pinned to that active generation route.
-    pub authority_epoch: EpochId,
-    /// Authenticated local Store endpoint identity from the EBP requirement.
-    pub endpoint: String,
-    /// EBP connection identity used by the retained authenticated client.
-    pub connection_id: String,
-    /// Store artifact identity approved and checked by the EBP handshake.
-    pub approved_artifact_hash: String,
-    /// Store configuration identity approved and checked by the EBP handshake.
-    pub approved_config_hash: String,
 }
 
 impl<'a> BorrowedCanonicalStoreClient<'a> {
@@ -2663,29 +2631,6 @@ impl KernelStoreGateway {
         .await
     }
 
-    /// Executes one named read and returns the exact route facts selected for
-    /// that same Store exchange.
-    ///
-    /// Route facts are captured inside the shared execution core after its
-    /// active-route check and before the Store send. The response and facts
-    /// therefore describe one execution; callers must not query the current
-    /// route after the read, when a cutover could have advanced it.
-    pub async fn execute_named_with_route_evidence(
-        &self,
-        request: NamedReadRequest,
-    ) -> Result<(NamedReadResponse, NamedReadRouteEvidence), NamedReadGatewayError> {
-        self.require_active_store_generation()
-            .map_err(NamedReadGatewayError::Store)?;
-        execute_named_via_with_route_evidence(
-            &self.flight,
-            &self.service,
-            &self.route,
-            &self.store,
-            request,
-        )
-        .await
-    }
-
     /// Reads and authenticates the current `UserAutomation` owner material through
     /// the active generation-routed Store contour. The `UserAutomation` adapter
     /// constructs and projects the closed named reads; this gateway remains the
@@ -4287,7 +4232,6 @@ impl KernelStoreGateway {
                 obligation.kind.capability_ref().to_owned(),
             )?,
             fence_digest,
-            admitted_state_fence: Some(sealed.context.state_fence.clone()),
             authority_epoch: sealed.context.state_fence.authority_epoch.clone(),
             generation: sealed.context.state_fence.resource_generation.value(),
             deadline_unix_ms: observed_unix_ms,
@@ -10385,23 +10329,6 @@ async fn execute_named_via_with_error<T>(
 where
     T: EbpStoreTransport + 'static,
 {
-    execute_named_via_with_route_evidence(flight, service, route, store, request)
-        .await
-        .map(|(response, _route_evidence)| response)
-}
-
-/// Shared named-read executor that captures the route facts from the exact
-/// generation and authenticated EBP client used for the Store exchange.
-async fn execute_named_via_with_route_evidence<T>(
-    flight: &GatewayFlight,
-    service: &Mutex<KernelService>,
-    route: &GenerationRoute,
-    store: &EbpCanonicalStoreClient<T>,
-    request: NamedReadRequest,
-) -> Result<(NamedReadResponse, NamedReadRouteEvidence), NamedReadGatewayError>
-where
-    T: EbpStoreTransport + 'static,
-{
     let _flight = flight
         .enter()
         .map_err(NamedReadGatewayError::GatewayRefusal)?;
@@ -10413,34 +10340,6 @@ where
     request.validate()?;
     validate_route(service, route, &request.state_fence)
         .map_err(NamedReadGatewayError::GatewayRefusal)?;
-    let requirement = store.requirement();
-    if route.route_scope().as_str() != requirement.route_identity.as_str()
-        || route.active_generation() != requirement.store_generation
-        || !route
-            .authority_epoch()
-            .is_same_authority(requirement.authority_epoch())
-        || request.state_fence.resource_generation != route.active_generation()
-        || !request
-            .state_fence
-            .authority_epoch
-            .is_same_authority(route.authority_epoch())
-    {
-        return Err(NamedReadGatewayError::GatewayRefusal(
-            "named-read selected route does not match its authenticated Store requirement"
-                .to_owned(),
-        ));
-    }
-    let route_evidence = NamedReadRouteEvidence {
-        operation: request.operation,
-        state_fence: request.state_fence.clone(),
-        route_identity: requirement.route_identity.as_str().to_owned(),
-        active_generation: route.active_generation().value(),
-        authority_epoch: route.authority_epoch().clone(),
-        endpoint: requirement.canonical_pipe_identity.as_str().to_owned(),
-        connection_id: requirement.connection_id.as_str().to_owned(),
-        approved_artifact_hash: requirement.approved_artifact_hash.as_str().to_owned(),
-        approved_config_hash: requirement.approved_config_hash.as_str().to_owned(),
-    };
     let response = store.execute_named(request.clone()).await?;
     if flight.is_fenced() {
         return Err(NamedReadGatewayError::GatewayRefusal(
@@ -10460,7 +10359,7 @@ where
             "Store named-read fence does not match request".to_owned(),
         ));
     }
-    Ok((response, route_evidence))
+    Ok(response)
 }
 
 /// Closed refusal set for one `Apply` through the Kernel gateway.

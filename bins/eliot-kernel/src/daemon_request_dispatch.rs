@@ -3351,23 +3351,7 @@ impl KernelComposition {
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
             }
-            "snapshot" => self.daemon_snapshot().map(|mut value| {
-                // Issue #1838 A1: the existing authenticated status request
-                // may ask for one persisted trace by its exact Kernel
-                // operation handle. Missing or malformed selectors never
-                // fall back to another operation's latest manifest.
-                if let Some(selector) = payload.get("trace_operation_id") {
-                    value["trace_replay"] = selector.as_str().map_or_else(
-                        || serde_json::json!({"status": "unknown"}),
-                        |operation_id| {
-                            self.daemon_trace_replay_projection(
-                                session,
-                                request_identity,
-                                operation_id,
-                            )
-                        },
-                    );
-                }
+            "snapshot" => self.daemon_snapshot().map(|value| {
                 serde_json::json!({
                     "status": "known",
                     "value": value,
@@ -10547,17 +10531,9 @@ impl KernelComposition {
             return Ok(Self::store_error_response_text("local_read", &error));
         }
         validate_store_session_fence(session, &read.state_fence)?;
-        // Preserve the exact accepted activation result already retained for
-        // this envelope's session. This is provenance only: the read route
-        // does not resolve or refresh semantic identity.
-        let activation_resolution_result = self
-            .retained_activation_resolution_for_host_request(&envelope)?
-            .map(|result| serde_json::to_value(result).map_err(|_| TransportError::SessionFenced))
-            .transpose()?;
         let gateway = self.retained_store_gateway()?;
-        let (response, route_evidence) = match gateway.execute_named_with_route_evidence(read).await
-        {
-            Ok(execution) => execution,
+        let response = match gateway.execute_named_with_error(read).await {
+            Ok(response) => response,
             Err(error) => {
                 // The Kernel-issued host-request handle is the admitted read's
                 // own identity, so the directive preserves THAT handle and the
@@ -10572,8 +10548,6 @@ impl KernelComposition {
         };
         if response.operation != NamedReadOperation::GetEvidencePack
             || response.state_fence != envelope.state_fence
-            || route_evidence.operation != NamedReadOperation::GetEvidencePack
-            || route_evidence.state_fence != envelope.state_fence
         {
             return Ok(Self::store_error_response_text(
                 "local_read",
@@ -10590,26 +10564,6 @@ impl KernelComposition {
             Some(&response),
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        let named_operation = serde_json::to_value(&route_evidence.operation)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let route_facts =
-            serde_json::to_value(&route_evidence).map_err(|_| TransportError::SessionFenced)?;
-        let actual_route_receipt =
-            super::native_worker_lifecycle_route::seal_route_receipt(serde_json::json!({
-                "kind": "local_read_actual_route",
-                "operation_id": operation_id,
-                "request_digest": envelope.envelope_sha256,
-                "result_digest": digest,
-                "invoked_operation": "local_read",
-                "named_operation": named_operation,
-                "state_fence": response.state_fence,
-                "route_facts": route_facts,
-            }))?;
-        let actual_route = actual_route_receipt
-            .get("receipt_digest")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .ok_or(TransportError::SessionFenced)?;
         let lineage = HostRequestResultLineage {
             output_artifact_ref: None,
             output_digest: digest.clone(),
@@ -10665,14 +10619,9 @@ impl KernelComposition {
                 wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
                 operation_id: operation_id.clone(),
                 invoked_operation: Some("local_read".to_owned()),
-                actual_route: Some(actual_route),
-                actual_route_receipt: Some(actual_route_receipt),
-                activation_resolution_result,
-                // These existing fields describe the actual adapter
-                // connection and stable executor artifact observed by the
-                // selected Store route; they are not semantic fingerprint aliases.
-                adapter_identity: Some(route_evidence.connection_id.clone()),
-                executor_identity: Some(route_evidence.approved_artifact_hash.clone()),
+                actual_route: Some(receipt.receipt_sha256.clone()),
+                adapter_identity: Some(session.connection_id.clone()),
+                executor_identity: None,
                 input_handle: Some(envelope.envelope_sha256.clone()),
                 output_handle: Some(digest),
                 side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
@@ -10681,11 +10630,7 @@ impl KernelComposition {
         submission
             .validate_local_read_submission()
             .map_err(|_| TransportError::SessionFenced)?;
-        let resulted = match self.submit_local_read_result_with_route_evidence(
-            session,
-            &submission,
-            &route_evidence,
-        )? {
+        let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
             host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
                 return Err(TransportError::SessionFenced);
@@ -12512,157 +12457,6 @@ mod tests {
                 validate_origin_control_operation(operation).is_err(),
                 "unsupported origin effect must fail closed before executor entry"
             );
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn authenticated_snapshot_refuses_unjoined_trace_replay() {
-        let root = std::env::temp_dir().join(format!(
-            "eliot-kernel-trace-replay-refusal-{}-{}",
-            std::process::id(),
-            unix_ms()
-        ));
-        std::fs::create_dir_all(&root).expect("test work root");
-        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
-        let policy = kernel
-            .front_door_policy
-            .lock()
-            .expect("front-door policy lock")
-            .clone();
-        let mut module_generation = policy.module_generation.clone();
-        module_generation.module_id =
-            eliot_contracts::ContractId::new(ACTIVE_DAEMON_CALLER).expect("daemon module id");
-        let session = Session {
-            connection_id: "authenticated-eliotd-trace-replay".to_owned(),
-            protocol_version: policy.protocol_range.maximum,
-            peer: PeerIdentity::authenticated_for_test(
-                eliot_ipc::ProcessBinding::from_observation(
-                    7,
-                    9,
-                    r"C:\eliot\eliotd.exe".to_owned(),
-                )
-                .expect("authenticated process binding"),
-                "S-1-5-18".to_owned(),
-                "0".to_owned(),
-            )
-            .expect("authenticated test peer"),
-            authority_epoch: module_generation.state_fence.authority_epoch.clone(),
-            module_generation,
-            launch_nonce: policy.launch_nonce.clone(),
-            capabilities: policy.allowed_capabilities.clone(),
-            privacy_classes: policy.allowed_privacy_classes.clone(),
-            effects: policy.allowed_effects.clone(),
-            session_epoch: 1,
-            state: eliot_ipc::SessionState::Open,
-        };
-        assert_eq!(
-            session.module_generation.module_id.as_str(),
-            ACTIVE_DAEMON_CALLER
-        );
-
-        let absent_operation_id = format!("hostreq:{}", "a".repeat(64));
-        let absent_request_id = RequestId::new("snapshot-trace-replay-absent").expect("request id");
-        let absent_identity = trace_replay_test_request_identity(
-            &absent_request_id,
-            &session.module_generation.state_fence,
-            "semantic-session-1",
-        );
-        let absent = kernel
-            .execute_daemon_request_with_identity(
-                &session,
-                absent_request_id,
-                absent_identity,
-                "snapshot",
-                serde_json::json!({"trace_operation_id": absent_operation_id}),
-            )
-            .await
-            .expect("unjoined trace selector is an explicit refusal");
-        let ProtocolPayload::Json(absent) = absent.payload else {
-            panic!("snapshot response is JSON");
-        };
-        assert_eq!(
-            absent["value"]["value"]["trace_replay"]["status"],
-            "unknown"
-        );
-
-        let malformed_request_id =
-            RequestId::new("snapshot-trace-replay-malformed").expect("request id");
-        let malformed_identity = trace_replay_test_request_identity(
-            &malformed_request_id,
-            &session.module_generation.state_fence,
-            "semantic-session-1",
-        );
-        let malformed = kernel
-            .execute_daemon_request_with_identity(
-                &session,
-                malformed_request_id,
-                malformed_identity,
-                "snapshot",
-                serde_json::json!({"trace_operation_id": "hostreq:not-a-digest"}),
-            )
-            .await
-            .expect("malformed selector is an explicit refusal");
-        let ProtocolPayload::Json(malformed) = malformed.payload else {
-            panic!("snapshot response is JSON");
-        };
-        assert_eq!(
-            malformed["value"]["value"]["trace_replay"]["status"],
-            "unknown"
-        );
-
-        let foreign_request_id =
-            RequestId::new("snapshot-trace-replay-foreign-session").expect("request id");
-        let foreign_identity = trace_replay_test_request_identity(
-            &foreign_request_id,
-            &session.module_generation.state_fence,
-            "foreign-session-1",
-        );
-        let foreign = kernel
-            .execute_daemon_request_with_identity(
-                &session,
-                foreign_request_id,
-                foreign_identity,
-                "snapshot",
-                serde_json::json!({"trace_operation_id": absent_operation_id}),
-            )
-            .await
-            .expect("foreign operation scope is an explicit refusal");
-        let ProtocolPayload::Json(foreign) = foreign.payload else {
-            panic!("snapshot response is JSON");
-        };
-        assert_eq!(
-            foreign["value"]["value"]["trace_replay"]["status"],
-            "unknown"
-        );
-
-        drop(kernel);
-        let _ = std::fs::remove_dir_all(root);
-    }
-    #[cfg(not(windows))]
-    fn trace_replay_test_request_identity(
-        request_id: &RequestId,
-        state_fence: &StateFence,
-        session_id: &str,
-    ) -> RequestIdentity {
-        RequestIdentity {
-            request: eliot_receipts::RequestBinding {
-                metadata: eliot_contracts::RequestMetadata {
-                    request_id: request_id.clone(),
-                    session_id: Some(
-                        eliot_contracts::SessionId::new(session_id).expect("session id"),
-                    ),
-                    task_id: Some(eliot_contracts::TaskId::new("task-1").expect("task id")),
-                    product_id: eliot_contracts::ProductId::new("product-1").expect("product id"),
-                    source_id: eliot_contracts::SourceId::new("source-1").expect("source id"),
-                    state_fence: state_fence.clone(),
-                    clock: eliot_contracts::ClockReading::default(),
-                },
-                state_fence: state_fence.clone(),
-            },
-            idempotency_key: format!("{}:idempotency", request_id.as_str()),
-            deadline_unix_ms: 1,
-            cancellation_id: format!("{}:cancel", request_id.as_str()),
         }
     }
 }

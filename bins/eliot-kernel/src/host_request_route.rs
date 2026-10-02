@@ -63,7 +63,6 @@ use eliot_contracts::{BridgeRecoverySelector, RequestId};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, KernelHostRequestBinder, KernelServiceState,
-    NamedReadRouteEvidence,
 };
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
@@ -86,8 +85,8 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
-    CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation,
-    RevisionHead, RevisionKey, ScopeId,
+    CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
+    ScopeId,
 };
 use std::collections::BTreeMap;
 
@@ -2571,99 +2570,6 @@ impl KernelComposition {
         self.activation_owner_projection_is_live(retained)
     }
 
-    /// Returns the exact semantic activation result that still owns one
-    /// admitted host request connection. This exposes the immutable result
-    /// already retained by Kernel admission; it does not resolve a principal
-    /// from the transport peer or accept a caller-authored replacement.
-    pub(crate) fn retained_activation_resolution_for_host_request(
-        &self,
-        envelope: &HostRequestEnvelope,
-    ) -> Result<Option<AgentActivationResolutionResult>, TransportError> {
-        let _transition = self.agent_bridge_transition_read()?;
-        let pending = self
-            .agent_activation_pending
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?;
-        self.retained_activation_resolution_for_host_request_in(envelope, &pending)
-    }
-
-    /// Internal form for an admission/submit path that already owns the
-    /// pending activation-result guard. The connection and result must still
-    /// be the original accepted terminal pair, and the exact resolved
-    /// session/task/scope plus activation epoch/generation must agree with the
-    /// retained binding and this envelope's current gate semantics.
-    fn retained_activation_resolution_for_host_request_in(
-        &self,
-        envelope: &HostRequestEnvelope,
-        pending: &super::AgentActivationPendingState,
-    ) -> Result<Option<AgentActivationResolutionResult>, TransportError> {
-        if envelope.kind == HostRequestKind::Activation {
-            return Ok(None);
-        }
-        let retained = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&envelope.connection_id)
-            .and_then(|state| state.activated_binding.clone())
-            .ok_or(TransportError::SessionFenced)?;
-        if retained.principal_id.trim().is_empty()
-            || !self.activation_result_still_retained(pending, &retained, &envelope.connection_id)
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        let result = pending
-            .results
-            .get(&retained.activation_ticket_id)
-            .map(|record| record.result.clone())
-            .ok_or(TransportError::SessionFenced)?;
-        result
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        let resolved = result
-            .resolved_binding()
-            .ok_or(TransportError::SessionFenced)?;
-        if resolved != &retained.resolved_binding
-            || resolved.principal_id != retained.principal_id
-            || resolved.session_id != retained.session_id
-            || resolved.task_id != retained.task_id
-            || resolved.work_scope_id != retained.work_scope_id
-            || resolved.task_revision != retained.task_revision.value().to_string()
-            || !result
-                .ticket_state_fence
-                .authority_epoch
-                .is_same_authority(&retained.authority_epoch)
-            || result.ticket_state_fence.resource_generation != retained.activation_generation
-            || !envelope
-                .state_fence
-                .authority_epoch
-                .is_same_authority(&retained.authority_epoch)
-            || envelope.state_fence.resource_generation != retained.activation_generation
-            || envelope
-                .identity
-                .session_id
-                .as_deref()
-                .is_some_and(|claimed| claimed != retained.session_id)
-            || envelope
-                .identity
-                .task_id
-                .as_deref()
-                .is_some_and(|claimed| claimed != retained.task_id)
-            || envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .is_some_and(|claimed| claimed != retained.work_scope_id)
-            || envelope
-                .state_fence
-                .task_revision
-                .is_some_and(|claimed| claimed != retained.task_revision)
-        {
-            return Err(TransportError::SessionFenced);
-        }
-        Ok(Some(result))
-    }
-
     /// The activation's exact P-07 owner revision and bundle digest must still
     /// be current at dispatch and at each queued claim.
     fn activation_owner_projection_is_live(
@@ -4360,25 +4266,7 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
-        self.submit_claimed_result(session, body, DaemonReadQueue::LocalRead, None)
-    }
-
-    /// Submits a synchronous Kernel local read with the exact selected-route
-    /// facts returned by the same named Store exchange. This remains the
-    /// shared completion gate; the additional typed owner facts prevent a
-    /// daemon or replay caller from first-persisting a self-sealed route claim.
-    pub(crate) fn submit_local_read_result_with_route_evidence(
-        &self,
-        session: &Session,
-        body: &HostRequestResultBody,
-        route_evidence: &NamedReadRouteEvidence,
-    ) -> Result<LocalReadSubmitDisposition, TransportError> {
-        self.submit_claimed_result(
-            session,
-            body,
-            DaemonReadQueue::LocalRead,
-            Some(route_evidence),
-        )
+        self.submit_claimed_result(session, body, DaemonReadQueue::LocalRead)
     }
 
     /// Submits one daemon-produced `eliot.state` result for its waiting host
@@ -4395,7 +4283,7 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
-        self.submit_claimed_result(session, body, DaemonReadQueue::State, None)
+        self.submit_claimed_result(session, body, DaemonReadQueue::State)
     }
 
     #[allow(
@@ -4407,7 +4295,6 @@ impl KernelComposition {
         session: &Session,
         body: &HostRequestResultBody,
         queue: DaemonReadQueue,
-        route_evidence: Option<&NamedReadRouteEvidence>,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
@@ -4465,12 +4352,6 @@ impl KernelComposition {
             && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
             && stored.result_response.as_ref() == Some(&body.response)
         {
-            let presented = retained_result_provenance(body)?;
-            if presented.effect_evidence != stored.result_evidence
-                || presented.result_lineage != stored.result_lineage
-            {
-                return Err(TransportError::IdentityConflict);
-            }
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         // Issue #1839: record the adapter-produced native presentation
@@ -4673,21 +4554,6 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
-        validate_local_read_actual_route_owner_binding(
-            body,
-            queued_envelope.as_ref(),
-            route_evidence,
-        )?;
-        if let Some(envelope) = queued_envelope.as_ref() {
-            validate_retained_host_request_envelope(&stored, envelope)?;
-            if capability == LOCAL_READ_QUERY_CAPABILITY {
-                let original_activation = self.retained_activation_resolution_for_host_request_in(
-                    envelope,
-                    &admission_owner,
-                )?;
-                validate_retained_activation_resolution(body, original_activation.as_ref())?;
-            }
-        }
         // I7.24 (#1945): the retained tool bytes for the same pair. The
         // queue owner holds the exact admitted envelope+tool per durable
         // operation id; the exposure lifecycle below re-establishes its
@@ -4813,14 +4679,8 @@ impl KernelComposition {
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
-        let manifest = TraceManifest::seal(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-            bound_record.as_ref(),
-        );
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
         observe_trace_seal(&manifest);
@@ -6287,14 +6147,16 @@ impl KernelComposition {
         ));
         // Issue #1839: the normalized cursor advance is independent of the
         // raw presentation above; only a sealed binding advances the cursor.
-        let bound_record = self.audit_observe(AuditEventDraft::result_kernel_bound(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-        ));
-        if let Some(bound) = bound_record.as_ref() {
+        if let Some(bound) = self
+            .audit_observe(AuditEventDraft::result_kernel_bound(
+                session,
+                body,
+                &persisted,
+                queued_envelope.as_ref(),
+                lane,
+            ))
+            .as_ref()
+        {
             self.audit_observe(AuditEventDraft::result_cursor_advanced(
                 session,
                 body,
@@ -6306,14 +6168,8 @@ impl KernelComposition {
         }
         // Issue #1838: seal the canonical replayable trace manifest for the
         // bound result through the single audit chain.
-        let manifest = TraceManifest::seal(
-            session,
-            body,
-            &persisted,
-            queued_envelope.as_ref(),
-            lane,
-            bound_record.as_ref(),
-        );
+        let manifest =
+            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
         observe_trace_seal(&manifest);
@@ -6599,10 +6455,6 @@ fn host_request_identity_binding_records(
         binding.operation_id = OperationIdentity::new(format!("{prefix}{value}"))
             .map_err(|_| TransportError::SessionFenced)?;
         binding.request_digest.clone_from(&binding_digest);
-        // This namespace row uses its own fixed digest, not the original
-        // envelope digest, so it cannot retain the original envelope bytes as
-        // though those bytes belonged to this synthetic identity.
-        binding.admitted_input_bytes = None;
         binding
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -6636,136 +6488,6 @@ struct RetainedResultProvenance {
     effect_evidence: Option<HostRequestEffectEvidence>,
     /// Result-side lineage claims and references, when the leg submitted any.
     result_lineage: Option<HostRequestRetainedLineage>,
-}
-
-/// Requires every first-persisted local-read route receipt to match the exact
-/// typed route observation returned by the Kernel gateway that performed the
-/// same named-read exchange. A receipt's self-digest alone proves only its
-/// bytes, so an external result submit cannot introduce a route claim.
-fn validate_local_read_actual_route_owner_binding(
-    body: &HostRequestResultBody,
-    envelope: Option<&HostRequestEnvelope>,
-    observed_route: Option<&NamedReadRouteEvidence>,
-) -> Result<(), TransportError> {
-    let evidence = body.evidence.as_ref();
-    let actual_route = evidence.and_then(|item| item.actual_route.as_deref());
-    let receipt = evidence.and_then(|item| item.actual_route_receipt.as_ref());
-    let Some(envelope) = envelope else {
-        // A terminal exact replay is handled before this gate and must match
-        // the original ORS evidence byte-for-byte. A first persist with no
-        // live admitted envelope cannot re-establish execution or semantic
-        // activation provenance, even if a caller supplies a valid
-        // self-digest. Only a genuinely absent observation stays admissible.
-        let presented_execution_claim = evidence.is_some_and(|item| {
-            item.invoked_operation.is_some()
-                || item.actual_route.is_some()
-                || item.actual_route_receipt.is_some()
-                || item.activation_resolution_result.is_some()
-                || item.adapter_identity.is_some()
-                || item.executor_identity.is_some()
-                || item.input_handle.is_some()
-                || item.output_handle.is_some()
-                || item.side_effects.is_some()
-        });
-        return if !presented_execution_claim && observed_route.is_none() {
-            Ok(())
-        } else {
-            Err(TransportError::SessionFenced)
-        };
-    };
-    match (actual_route, receipt, observed_route) {
-        (None, None, None) => Ok(()),
-        (Some(_), Some(receipt), Some(observed)) => {
-            if envelope.kind != HostRequestKind::Invocation
-                || envelope.identity.capability != LOCAL_READ_QUERY_CAPABILITY
-                || body.operation_id != host_request_operation_id(envelope)
-                || body.request_sha256 != envelope.envelope_sha256
-                || observed.operation != NamedReadOperation::GetEvidencePack
-                || observed.state_fence != envelope.state_fence
-            {
-                return Err(TransportError::SessionFenced);
-            }
-            let route_facts =
-                serde_json::to_value(observed).map_err(|_| TransportError::SessionFenced)?;
-            let named_operation = serde_json::to_value(observed.operation)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let state_fence = serde_json::to_value(&observed.state_fence)
-                .map_err(|_| TransportError::SessionFenced)?;
-            let expected =
-                super::native_worker_lifecycle_route::seal_route_receipt(serde_json::json!({
-                    "kind": "local_read_actual_route",
-                    "operation_id": &body.operation_id,
-                    "request_digest": &envelope.envelope_sha256,
-                    "result_digest": &body.result_digest,
-                    "invoked_operation": "local_read",
-                    "named_operation": named_operation,
-                    "state_fence": state_fence,
-                    "route_facts": route_facts,
-                }))?;
-            if receipt != &expected {
-                return Err(TransportError::SessionFenced);
-            }
-            Ok(())
-        }
-        // A route digest without its original body, a self-sealed body without
-        // the independent same-execution owner observation, or owner facts
-        // without the corresponding receipt is not a first-persist proof.
-        _ => Err(TransportError::SessionFenced),
-    }
-}
-
-/// Checks any retained original request bytes and StateFence against the
-/// exact admitted queue envelope. Missing legacy copies stay explicit; a
-/// present copy that disagrees cannot be hidden by the envelope's digest slot.
-fn validate_retained_host_request_envelope(
-    stored: &HostRequestRecord,
-    envelope: &HostRequestEnvelope,
-) -> Result<(), TransportError> {
-    if let Some(retained_bytes) = stored.admitted_input_bytes.as_deref() {
-        let expected = envelope
-            .canonical_unsigned_bytes()
-            .map_err(|_| TransportError::SessionFenced)?;
-        if retained_bytes != expected.as_slice() {
-            return Err(TransportError::SessionFenced);
-        }
-    }
-    if stored
-        .admitted_state_fence
-        .as_ref()
-        .is_some_and(|retained| retained != &envelope.state_fence)
-    {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
-}
-
-/// Joins the caller's typed activation carrier to the exact result retained by
-/// this Kernel connection. The protocol validator checks shape and self-digest;
-/// this owner comparison establishes semantic provenance.
-fn validate_retained_activation_resolution(
-    body: &HostRequestResultBody,
-    original: Option<&AgentActivationResolutionResult>,
-) -> Result<(), TransportError> {
-    let presented = body
-        .evidence
-        .as_ref()
-        .and_then(|evidence| evidence.activation_resolution_result.as_ref())
-        .map(|value| {
-            let result: AgentActivationResolutionResult =
-                serde_json::from_value(value.clone()).map_err(|_| TransportError::SessionFenced)?;
-            result
-                .validate()
-                .map_err(|_| TransportError::SessionFenced)?;
-            if result.resolved_binding().is_none() {
-                return Err(TransportError::SessionFenced);
-            }
-            Ok(result)
-        })
-        .transpose()?;
-    if presented.as_ref() != original {
-        return Err(TransportError::SessionFenced);
-    }
-    Ok(())
 }
 
 /// Reports whether one submitted observe body presents the same owner receipt
@@ -6803,42 +6525,25 @@ fn same_observe_owner_receipt(stored: &HostRequestRecord, body: &HostRequestResu
 fn retained_result_provenance(
     body: &HostRequestResultBody,
 ) -> Result<RetainedResultProvenance, TransportError> {
-    let operation_id =
-        OpaqueLabel::new(body.operation_id.clone()).map_err(|_| TransportError::SessionFenced)?;
-    let local_read_attempt = body
-        .attempt
+    let effect_evidence = body
+        .evidence
         .as_ref()
-        .map(serde_json::to_value)
+        .map(|evidence| {
+            OpaqueLabel::new(evidence.operation_id.clone()).map(|operation_id| {
+                HostRequestEffectEvidence {
+                    operation_id,
+                    input_handle: evidence.input_handle.clone(),
+                    output_handle: evidence.output_handle.clone(),
+                    side_effects: evidence.side_effects.clone(),
+                    actual_route: evidence.actual_route.clone(),
+                    invoked_operation: evidence.invoked_operation.clone(),
+                    adapter_identity: evidence.adapter_identity.clone(),
+                    executor_identity: evidence.executor_identity.clone(),
+                }
+            })
+        })
         .transpose()
         .map_err(|_| TransportError::SessionFenced)?;
-    let effect_evidence = match body.evidence.as_ref() {
-        Some(evidence) => Some(HostRequestEffectEvidence {
-            operation_id,
-            input_handle: evidence.input_handle.clone(),
-            output_handle: evidence.output_handle.clone(),
-            side_effects: evidence.side_effects.clone(),
-            actual_route: evidence.actual_route.clone(),
-            actual_route_receipt: evidence.actual_route_receipt.clone(),
-            invoked_operation: evidence.invoked_operation.clone(),
-            adapter_identity: evidence.adapter_identity.clone(),
-            executor_identity: evidence.executor_identity.clone(),
-            local_read_attempt,
-            activation_resolution_result: evidence.activation_resolution_result.clone(),
-        }),
-        None => local_read_attempt.map(|local_read_attempt| HostRequestEffectEvidence {
-            operation_id,
-            input_handle: None,
-            output_handle: None,
-            side_effects: None,
-            actual_route: None,
-            actual_route_receipt: None,
-            invoked_operation: None,
-            adapter_identity: None,
-            executor_identity: None,
-            local_read_attempt: Some(local_read_attempt),
-            activation_resolution_result: None,
-        }),
-    };
     let result_lineage = body
         .lineage
         .as_ref()
@@ -6893,187 +6598,6 @@ fn retained_result_provenance(
     })
 }
 
-#[cfg(test)]
-mod local_read_actual_route_owner_tests {
-    use super::*;
-    use eliot_contracts::StateFence;
-
-    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
-
-    fn fixture() -> (
-        HostRequestEnvelope,
-        NamedReadRouteEvidence,
-        HostRequestResultBody,
-    ) {
-        let lineage = eliot_contracts::EpochLineageId::new(TEST_LINEAGE).expect("lineage");
-        let epoch = eliot_contracts::EpochId::new(
-            lineage,
-            std::num::NonZeroU64::new(3).expect("nonzero epoch"),
-        )
-        .expect("epoch");
-        let state_fence = StateFence::new(
-            epoch.clone(),
-            eliot_contracts::ResourceGeneration::new(7).expect("generation"),
-        );
-        let envelope = HostRequestEnvelope {
-            wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
-            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
-            kind: HostRequestKind::Invocation,
-            connection_id: "connection-original".to_owned(),
-            identity: eliot_protocol::HostRequestIdentity {
-                request_id: RequestId::new("route-evidence-test").expect("request id"),
-                correlation_projection: None,
-                idempotency_key: "route-evidence-test:invoke".to_owned(),
-                cancellation_id: "route-evidence-test:cancel".to_owned(),
-                parent_operation_id: None,
-                deadline_unix_ms: 2_000_000,
-                capability: LOCAL_READ_QUERY_CAPABILITY.to_owned(),
-                session_id: Some("session-original".to_owned()),
-                task_id: None,
-                work_scope_id: None,
-                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
-                payload_sha256: "a".repeat(64),
-            },
-            state_fence: state_fence.clone(),
-            descriptor_sha256: "b".repeat(64),
-            peer_admission_receipt_sha256: "c".repeat(64),
-            activation_binding: None,
-            envelope_sha256: String::new(),
-        }
-        .with_computed_digest()
-        .expect("envelope digest");
-        let route = NamedReadRouteEvidence {
-            operation: NamedReadOperation::GetEvidencePack,
-            state_fence: state_fence.clone(),
-            route_identity: "store-route-7".to_owned(),
-            active_generation: 7,
-            authority_epoch: epoch,
-            endpoint: "pipe://store-test".to_owned(),
-            connection_id: "store-connection-7".to_owned(),
-            approved_artifact_hash: "d".repeat(64),
-            approved_config_hash: "e".repeat(64),
-        };
-        let response = serde_json::json!({"answer":"retained"});
-        let result_digest = eliot_contracts::sha256_hex(
-            &eliot_contracts::canonical_json_bytes(&response).expect("canonical response"),
-        );
-        let receipt =
-            super::super::native_worker_lifecycle_route::seal_route_receipt(serde_json::json!({
-                "kind": "local_read_actual_route",
-                "operation_id": host_request_operation_id(&envelope),
-                "request_digest": &envelope.envelope_sha256,
-                "result_digest": &result_digest,
-                "invoked_operation": "local_read",
-                "named_operation": serde_json::to_value(route.operation).expect("operation"),
-                "state_fence": serde_json::to_value(&route.state_fence).expect("fence"),
-                "route_facts": serde_json::to_value(&route).expect("route facts"),
-            }))
-            .expect("sealed route receipt");
-        let receipt_digest = receipt["receipt_digest"]
-            .as_str()
-            .expect("receipt digest")
-            .to_owned();
-        let operation_id = host_request_operation_id(&envelope);
-        let evidence = eliot_protocol::LocalReadExecutionEvidence {
-            wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
-            wire_version: eliot_protocol::LocalReadExecutionEvidence::CONTRACT_VERSION,
-            operation_id: operation_id.clone(),
-            invoked_operation: Some("local_read".to_owned()),
-            actual_route: Some(receipt_digest),
-            actual_route_receipt: Some(receipt),
-            activation_resolution_result: None,
-            adapter_identity: None,
-            executor_identity: None,
-            input_handle: Some(envelope.envelope_sha256.clone()),
-            output_handle: Some(result_digest.clone()),
-            side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
-        };
-        let body = HostRequestResultBody {
-            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
-            wire_version: HostRequestResultBody::CONTRACT_VERSION,
-            operation_id,
-            request_sha256: envelope.envelope_sha256.clone(),
-            result_digest,
-            response,
-            attempt: None,
-            lineage: None,
-            evidence: Some(evidence),
-        };
-        (envelope, route, body)
-    }
-
-    #[test]
-    fn self_sealed_route_facts_require_the_same_gateway_observation() {
-        let (envelope, route, body) = fixture();
-        assert!(body.validate().is_ok());
-        assert!(
-            validate_local_read_actual_route_owner_binding(&body, Some(&envelope), Some(&route),)
-                .is_ok()
-        );
-        assert!(
-            validate_local_read_actual_route_owner_binding(&body, Some(&envelope), None).is_err()
-        );
-        assert!(validate_local_read_actual_route_owner_binding(&body, None, None).is_err());
-        let mut activation_claim = body.clone();
-        if let Some(evidence) = activation_claim.evidence.as_mut() {
-            evidence.actual_route = None;
-            evidence.actual_route_receipt = None;
-            evidence.activation_resolution_result =
-                Some(serde_json::json!({"principal_id":"claimed"}));
-        }
-        assert!(
-            validate_local_read_actual_route_owner_binding(&activation_claim, None, None).is_err()
-        );
-        let mut no_proof = body.clone();
-        no_proof.evidence = None;
-        assert!(validate_local_read_actual_route_owner_binding(&no_proof, None, None).is_ok());
-
-        let mut stored = requested_host_request_record(&envelope).expect("retained row");
-        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_ok());
-        stored.admitted_input_bytes = Some(b"different original input".to_vec());
-        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_err());
-        stored.admitted_input_bytes = envelope.canonical_unsigned_bytes().ok();
-        let mut changed_fence = envelope.state_fence.clone();
-        changed_fence.resource_generation =
-            eliot_contracts::ResourceGeneration::new(8).expect("changed generation");
-        stored.admitted_state_fence = Some(changed_fence);
-        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_err());
-
-        let mut forged_route = route.clone();
-        forged_route.connection_id = "caller-forged-connection".to_owned();
-        let mut forged_body = body;
-        let receipt =
-            super::super::native_worker_lifecycle_route::seal_route_receipt(serde_json::json!({
-                "kind": "local_read_actual_route",
-                "operation_id": &forged_body.operation_id,
-                "request_digest": &forged_body.request_sha256,
-                "result_digest": &forged_body.result_digest,
-                "invoked_operation": "local_read",
-                "named_operation": serde_json::to_value(forged_route.operation).expect("operation"),
-                "state_fence": serde_json::to_value(&forged_route.state_fence).expect("fence"),
-                "route_facts": serde_json::to_value(&forged_route).expect("route facts"),
-            }))
-            .expect("self-sealed forged receipt");
-        let forged_digest = receipt["receipt_digest"]
-            .as_str()
-            .expect("forged digest")
-            .to_owned();
-        if let Some(evidence) = forged_body.evidence.as_mut() {
-            evidence.actual_route = Some(forged_digest);
-            evidence.actual_route_receipt = Some(receipt);
-        }
-        assert!(forged_body.validate().is_ok());
-        assert!(
-            validate_local_read_actual_route_owner_binding(
-                &forged_body,
-                Some(&envelope),
-                Some(&route),
-            )
-            .is_err()
-        );
-    }
-}
-
 /// Builds the `Requested` ORS record for one validated envelope.
 ///
 /// Every identity is preserved opaquely: Session, task, scope, capability,
@@ -7109,14 +6633,6 @@ pub(crate) fn requested_host_request_record(
         payload_digest: envelope.identity.payload_sha256.clone(),
         payload_schema_id: Some(label(&envelope.identity.payload_schema_id)?),
         payload_body: None,
-        // Keep the exact original unsigned envelope bytes beside the digest:
-        // this is the producer's input, with `envelope_sha256` cleared by the
-        // protocol owner, not a reconstruction from later session state.
-        admitted_input_bytes: Some(
-            envelope
-                .canonical_unsigned_bytes()
-                .map_err(|_| TransportError::SessionFenced)?,
-        ),
         connection_ref: label(&envelope.connection_id)?,
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
@@ -7124,7 +6640,6 @@ pub(crate) fn requested_host_request_record(
         capability_ref: label(&envelope.identity.capability)?,
         fence_digest: sha256_json(&envelope.state_fence)
             .map_err(|_| TransportError::SessionFenced)?,
-        admitted_state_fence: Some(envelope.state_fence.clone()),
         authority_epoch: envelope.state_fence.authority_epoch.clone(),
         generation: envelope.state_fence.resource_generation.value(),
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
@@ -9335,16 +8850,12 @@ fn watchdog_export_projection_record(
         // the durable record rather than from a queue copy.
         payload_schema_id: Some(label(eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID)?),
         payload_body: Some(body),
-        // This reconciliation row is built from a Watchdog record, not a
-        // HostRequestEnvelope; no original envelope bytes exist on this path.
-        admitted_input_bytes: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,
         scope_ref: None,
         capability_ref: label(WATCHDOG_EXPORT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
-        admitted_state_fence: Some(submitted_fence.clone()),
         authority_epoch: submitted_fence.authority_epoch.clone(),
         generation: payload.watchdog_generation,
         deadline_unix_ms: payload.expires_at_ms,
@@ -9584,15 +9095,12 @@ fn watchdog_intent_projection_record(
         // schema or payload bytes. Any future bind still proves the digest.
         payload_schema_id: None,
         payload_body: None,
-        // This reconciliation intent is digest-only and has no envelope.
-        admitted_input_bytes: None,
         connection_ref: label(&payload.sink_id)?,
         session_ref: None,
         task_ref: None,
         scope_ref: None,
         capability_ref: label(WATCHDOG_INTENT_CAPABILITY)?,
         fence_digest: sha256_json(&submitted_fence).map_err(|_| TransportError::SessionFenced)?,
-        admitted_state_fence: Some(submitted_fence.clone()),
         authority_epoch: submitted_fence.authority_epoch.clone(),
         generation: intent.lineage_generation,
         deadline_unix_ms: payload.expires_at_ms,

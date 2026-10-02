@@ -47,7 +47,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
-use eliot_ors::{HostRequestEffectEvidence, OperationIdentity};
+use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
@@ -386,93 +386,14 @@ where
 /// The exact halves one admitted `local_read` answer carries for a completed
 /// operation: the operation handle, the recorded result digest, the recorded
 /// bounded response, and the retained result lineage the owner bound to THAT
-/// result, plus the retained execution evidence produced by the Kernel read
-/// leg. Optional owner evidence remains absent when the durable row has none;
-/// eliotd does not claim a second execution of work that has already completed.
+/// result. The lineage is `None` only for a row that carries none, which stays
+/// an honest unknown (issue #1809 item 2).
 type AdmittedLocalReadHalves<'a> = (
     &'a str,
     &'a str,
     serde_json::Value,
     Option<HostRequestResultLineage>,
-    Option<LocalReadExecutionEvidence>,
-    Option<LocalReadAttempt>,
 );
-
-/// Converts only the Kernel's retained local-read observation into the wire
-/// evidence envelope. The caller-supplied daemon identity is deliberately not
-/// an input: this function describes the already-executed Kernel read and
-/// preserves every absent owner slot as absent.
-fn retained_local_read_execution_evidence(
-    value: Option<&serde_json::Value>,
-    operation_id: &str,
-    envelope_digest: &str,
-    result_digest: &str,
-) -> Result<(Option<LocalReadExecutionEvidence>, Option<LocalReadAttempt>), KernelPortError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok((None, None));
-    };
-    let retained: HostRequestEffectEvidence = serde_json::from_value(value.clone()).map_err(
-        |error| {
-            KernelPortError::Contract(format!(
-                "Kernel local read admission carries undecodable retained execution evidence: {error}"
-            ))
-        },
-    )?;
-    let retained_operation_id = retained.operation_id.as_str();
-    if retained_operation_id != operation_id
-        || retained
-            .input_handle
-            .as_deref()
-            .is_some_and(|handle| handle != envelope_digest)
-        || retained
-            .output_handle
-            .as_deref()
-            .is_some_and(|handle| handle != result_digest)
-    {
-        return Err(KernelPortError::Contract(
-            "Kernel local read admission carries execution evidence bound to another result"
-                .to_owned(),
-        ));
-    }
-    let attempt = retained
-        .local_read_attempt
-        .map(serde_json::from_value::<LocalReadAttempt>)
-        .transpose()
-        .map_err(|error| {
-            KernelPortError::Contract(format!(
-                "Kernel local read admission carries an undecodable retained attempt: {error}"
-            ))
-        })?;
-    if let Some(attempt) = &attempt {
-        attempt
-            .validate()
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-        if attempt.operation_id != operation_id {
-            return Err(KernelPortError::Contract(
-                "Kernel local read admission carries an attempt bound to another operation"
-                    .to_owned(),
-            ));
-        }
-    }
-    let evidence = LocalReadExecutionEvidence {
-        wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
-        wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
-        operation_id: retained_operation_id.to_owned(),
-        invoked_operation: retained.invoked_operation,
-        actual_route: retained.actual_route,
-        actual_route_receipt: retained.actual_route_receipt,
-        activation_resolution_result: retained.activation_resolution_result,
-        adapter_identity: retained.adapter_identity,
-        executor_identity: retained.executor_identity,
-        input_handle: retained.input_handle,
-        output_handle: retained.output_handle,
-        side_effects: retained.side_effects,
-    };
-    evidence
-        .validate()
-        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-    Ok((Some(evidence), attempt))
-}
 
 /// Typed outcome of one `local_read_result` submit (Implements #18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3128,11 +3049,8 @@ impl DaemonKernelClient {
     /// design) or fails its own digest binding; `NotAdmitted` / `Unknown` for
     /// transport outcomes via [`kernel_port_error`].
     ///
-    /// The rebuilt body carries the execution evidence from the Kernel's
-    /// already-completed read row (issue #1838). Since Kernel executes and
-    /// persists this named read before replying, eliotd forwards the retained
-    /// owner evidence verbatim and never reattributes that execution to the
-    /// forwarding daemon.
+    /// The rebuilt body carries the daemon-observed execution evidence
+    /// (issue #1838) built by [`Self::forward_local_read_evidence`].
     ///
     /// Production caller:
     /// [`forward_admitted_local_read`](super::forward_admitted_local_read),
@@ -3188,14 +3106,13 @@ impl DaemonKernelClient {
                 "Kernel local read answer is not an admission".to_owned(),
             ));
         }
-        let (operation_id, body_digest, body_response, body_lineage, body_evidence, body_attempt) =
+        let (operation_id, body_digest, body_response, body_lineage) =
             Self::admitted_local_read_halves(admitted, &pair.envelope)?;
         // Rebuilt, never decoded: the ORS record carries the digest-bound
         // response halves, while the operation handle, envelope binding, and
         // attempt capability are proven here from the admitted answer. The
-        // body carries the ORS-retained original attempt verbatim; a missing
-        // legacy attempt remains absent and cannot be replaced by the request
-        // presentation.
+        // body carries the presented attempt verbatim so submit completes
+        // under the generation the read ran under.
         let body = HostRequestResultBody {
             wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
             wire_version: HostRequestResultBody::CONTRACT_VERSION,
@@ -3203,7 +3120,7 @@ impl DaemonKernelClient {
             request_sha256: pair.envelope.envelope_sha256.clone(),
             result_digest: body_digest.to_owned(),
             response: body_response,
-            attempt: body_attempt,
+            attempt: Some(attempt),
             // The retained result lineage the owner bound to this exact result
             // travels with the rebuild (issue #1809 W2). It is decoded from the
             // OWNER'S OWN retained record and re-bound here by comparing its
@@ -3212,7 +3129,14 @@ impl DaemonKernelClient {
             // the owner's proof with a fresh checksum. A row that carries no
             // lineage keeps the honest `None` — unknown, never clean.
             lineage: body_lineage,
-            evidence: body_evidence,
+            evidence: Some(Self::forward_local_read_evidence(
+                admitted,
+                operation_id,
+                &self.connection_id,
+                &self.kernel_binding.daemon_artifact_sha256,
+                &pair.envelope.envelope_sha256,
+                body_digest,
+            )),
         };
         body.validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
@@ -3298,22 +3222,43 @@ that does not describe this result: {error}"
                 Some(lineage)
             }
         };
-        let (body_evidence, body_attempt) = retained_local_read_execution_evidence(
-            admitted
-                .get("record")
-                .and_then(|record| record.get("result_evidence")),
-            operation_id,
-            &envelope.envelope_sha256,
-            body_digest,
-        )?;
-        Ok((
-            operation_id,
-            body_digest,
-            body_response,
-            body_lineage,
-            body_evidence,
-            body_attempt,
-        ))
+        Ok((operation_id, body_digest, body_response, body_lineage))
+    }
+
+    /// Builds the daemon-observed execution evidence for one forwarded
+    /// local read (issue #1838).
+    ///
+    /// Reports the invoked `local_read` operation, the actual-route receipt
+    /// digest from the admission answer, the presenting connection and daemon
+    /// artifact identities, the immutable input/output handles, and the
+    /// observed side-effect declaration for the sealed trace manifest. A
+    /// missing admission receipt leaves the actual route honestly absent
+    /// instead of inventing one.
+    fn forward_local_read_evidence(
+        admitted: &serde_json::Map<String, serde_json::Value>,
+        operation_id: &str,
+        connection_id: &str,
+        daemon_artifact: &str,
+        envelope_digest: &str,
+        result_digest: &str,
+    ) -> LocalReadExecutionEvidence {
+        let actual_route = admitted
+            .get("receipt")
+            .and_then(|receipt| receipt.get("receipt_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        LocalReadExecutionEvidence {
+            wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
+            wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
+            operation_id: operation_id.to_owned(),
+            invoked_operation: Some("local_read".to_owned()),
+            actual_route,
+            adapter_identity: Some(connection_id.to_owned()),
+            executor_identity: Some(daemon_artifact.to_owned()),
+            input_handle: Some(envelope_digest.to_owned()),
+            output_handle: Some(result_digest.to_owned()),
+            side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
+        }
     }
 
     fn clone_for_future(&self) -> Arc<Self> {
@@ -3633,7 +3578,6 @@ impl DaemonKernelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_ors::OpaqueLabel;
     use std::num::NonZeroU64;
 
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
@@ -4019,167 +3963,6 @@ mod tests {
         assert!(
             matches!(malformed, Err(KernelPortError::Contract(_))),
             "a malformed pair must fail the local_read transport closed as Contract, got {malformed:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn local_read_forwards_kernel_retained_execution_evidence_without_reauthoring()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fence = test_fence(1)?;
-        let envelope = test_envelope("eliot.query", &fence, &"a".repeat(64))?;
-        let operation_id = host_request_operation_id(&envelope);
-        let input_handle = envelope.envelope_sha256.clone();
-        let output_handle = "c".repeat(64);
-        let attempt = test_attempt(&envelope, 1)?;
-        let route_facts = json!({
-            "operation": "GetEvidencePack",
-            "state_fence": &fence,
-            "route_identity": "store-route-test",
-            "active_generation": 1,
-            "authority_epoch": &envelope.state_fence.authority_epoch,
-            "endpoint": "pipe://eliot-store-test",
-            "connection_id": "eliot-store-connection-17",
-            "approved_artifact_hash": "d".repeat(64),
-            "approved_config_hash": "e".repeat(64),
-        });
-        let mut actual_route_receipt = json!({
-            "kind": "local_read_actual_route",
-            "operation_id": &operation_id,
-            "request_digest": &input_handle,
-            "result_digest": &output_handle,
-            "invoked_operation": "local_read",
-            "named_operation": "GetEvidencePack",
-            "state_fence": &envelope.state_fence,
-            "route_facts": route_facts,
-        });
-        let receipt_bytes = eliot_contracts::canonical_json_bytes(&actual_route_receipt)?;
-        let receipt_digest = eliot_contracts::sha256_hex(&receipt_bytes);
-        actual_route_receipt["receipt_digest"] = json!(receipt_digest);
-        let retained = HostRequestEffectEvidence {
-            operation_id: OpaqueLabel::new(operation_id.clone())?,
-            input_handle: Some(input_handle.clone()),
-            output_handle: Some(output_handle.clone()),
-            side_effects: Some("none".to_owned()),
-            actual_route: Some(receipt_digest.clone()),
-            actual_route_receipt: Some(actual_route_receipt.clone()),
-            invoked_operation: Some("local_read".to_owned()),
-            adapter_identity: Some("eliot-store-connection-17".to_owned()),
-            executor_identity: Some("d".repeat(64)),
-            local_read_attempt: Some(serde_json::to_value(&attempt)?),
-            activation_resolution_result: None,
-        };
-        let retained = serde_json::to_value(retained)?;
-        let mut wrong_adapter = retained.clone();
-        wrong_adapter["adapter_identity"] = json!("substituted-store-connection");
-        assert!(
-            retained_local_read_execution_evidence(
-                Some(&wrong_adapter),
-                &operation_id,
-                &input_handle,
-                &output_handle,
-            )
-            .is_err()
-        );
-        let mut wrong_executor = retained.clone();
-        wrong_executor["executor_identity"] = json!("substituted-store-artifact");
-        assert!(
-            retained_local_read_execution_evidence(
-                Some(&wrong_executor),
-                &operation_id,
-                &input_handle,
-                &output_handle,
-            )
-            .is_err()
-        );
-        let mut legacy_digest_only = retained.clone();
-        legacy_digest_only["actual_route_receipt"] = serde_json::Value::Null;
-        let (legacy_evidence, legacy_attempt) = retained_local_read_execution_evidence(
-            Some(&legacy_digest_only),
-            &operation_id,
-            &input_handle,
-            &output_handle,
-        )?;
-        let legacy_evidence = legacy_evidence.ok_or("legacy evidence carrier must be retained")?;
-        assert_eq!(
-            legacy_evidence.actual_route.as_deref(),
-            Some(receipt_digest.as_str())
-        );
-        assert!(legacy_evidence.actual_route_receipt.is_none());
-        assert_eq!(legacy_attempt, Some(attempt.clone()));
-
-        let (forwarded, forwarded_attempt) = retained_local_read_execution_evidence(
-            Some(&retained),
-            &operation_id,
-            &input_handle,
-            &output_handle,
-        )?;
-        let forwarded = forwarded.ok_or("the durable Kernel evidence must be forwarded")?;
-
-        assert_eq!(forwarded.operation_id, operation_id);
-        assert_eq!(
-            forwarded.actual_route.as_deref(),
-            Some(receipt_digest.as_str())
-        );
-        assert_eq!(
-            forwarded.actual_route_receipt.as_ref(),
-            Some(&actual_route_receipt)
-        );
-        assert_eq!(
-            forwarded.adapter_identity.as_deref(),
-            Some("eliot-store-connection-17")
-        );
-        assert_eq!(
-            forwarded.executor_identity.as_deref(),
-            Some("d".repeat(64).as_str())
-        );
-        assert_eq!(
-            forwarded.input_handle.as_deref(),
-            Some(input_handle.as_str())
-        );
-        assert_eq!(
-            forwarded.output_handle.as_deref(),
-            Some(output_handle.as_str())
-        );
-        assert_eq!(forwarded.side_effects.as_deref(), Some("none"));
-        assert_eq!(forwarded_attempt, Some(attempt));
-
-        assert!(
-            retained_local_read_execution_evidence(
-                Some(&retained),
-                &format!("hostreq:{}", "d".repeat(64)),
-                &input_handle,
-                &output_handle,
-            )
-            .is_err()
-        );
-        assert!(
-            retained_local_read_execution_evidence(
-                Some(&retained),
-                &operation_id,
-                &"e".repeat(64),
-                &output_handle,
-            )
-            .is_err()
-        );
-        assert!(
-            retained_local_read_execution_evidence(
-                Some(&retained),
-                &operation_id,
-                &input_handle,
-                &"f".repeat(64),
-            )
-            .is_err()
-        );
-        assert_eq!(
-            retained_local_read_execution_evidence(
-                None,
-                &operation_id,
-                &input_handle,
-                &output_handle,
-            )?,
-            (None, None),
-            "missing owner evidence must stay absent"
         );
         Ok(())
     }

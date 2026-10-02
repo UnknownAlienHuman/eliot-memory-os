@@ -7501,22 +7501,6 @@ pub struct HostRequestEffectEvidence {
     pub side_effects: Option<String>,
     /// Actual route taken, as observed by the executor.
     pub actual_route: Option<String>,
-    /// Exact original sealed local-read actual-route receipt, when retained.
-    /// Historical evidence may omit it; ORS never reconstructs one from the
-    /// digest-only `actual_route` handle.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actual_route_receipt: Option<Value>,
-    /// Exact original LocalReadAttempt capability from the submitted result
-    /// body. This remains separate from the ORS-owned send/claim attempt.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_read_attempt: Option<Value>,
-    /// Exact original resolved AgentActivationResolutionResult supplying the
-    /// authenticated semantic principal for this local-read owner.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_resolution_result: Option<Value>,
     /// Invoked local-port operation.
     pub invoked_operation: Option<String>,
     /// Presenting transport adapter instance.
@@ -7535,16 +7519,11 @@ impl HostRequestEffectEvidence {
     /// fresh checksum over the wrong subject.
     pub(crate) fn validate(
         &self,
-        owner: &HostRequestRecord,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        result_digest: &str,
     ) -> Result<(), OrsError> {
-        let result_digest = owner
-            .result_digest
-            .as_deref()
-            .ok_or(OrsError::InvalidField {
-                field: "host_request_result_evidence",
-                reason: "retained evidence must observe a retained result",
-            })?;
-        if self.operation_id != owner.operation_id {
+        if self.operation_id != *operation_id {
             return Err(OrsError::InvalidField {
                 field: "host_request_effect_evidence_operation_id",
                 reason: "retained evidence does not observe this operation",
@@ -7552,7 +7531,7 @@ impl HostRequestEffectEvidence {
         }
         if let Some(input_handle) = &self.input_handle {
             validate_digest(input_handle, "host_request_effect_evidence_input_handle")?;
-            if input_handle != &owner.request_digest {
+            if input_handle != request_digest {
                 return Err(OrsError::InvalidField {
                     field: "host_request_effect_evidence_input_handle",
                     reason: "retained input handle does not bind the admitted envelope digest",
@@ -7594,351 +7573,8 @@ impl HostRequestEffectEvidence {
                 validate_text(reference, field)?;
             }
         }
-        if let Some(receipt) = &self.actual_route_receipt {
-            validate_local_read_actual_route_receipt(
-                receipt,
-                self.actual_route.as_deref(),
-                self.invoked_operation.as_deref(),
-                owner,
-            )?;
-        }
-        if let Some(attempt) = &self.local_read_attempt {
-            validate_local_read_attempt(attempt, owner)?;
-        }
-        if let Some(result) = &self.activation_resolution_result {
-            validate_activation_resolution_result(result, owner)?;
-        }
         Ok(())
     }
-}
-
-/// Revalidates the exact sealed actual-route receipt against its original
-/// recorded digest and the owning operation. Route facts remain opaque to ORS;
-/// the route owner validates their meaning before sealing them.
-fn validate_local_read_actual_route_receipt(
-    receipt: &Value,
-    actual_route: Option<&str>,
-    invoked_operation: Option<&str>,
-    owner: &HostRequestRecord,
-) -> Result<(), OrsError> {
-    let invalid_receipt = |reason| OrsError::InvalidField {
-        field: "host_request_effect_evidence_actual_route_receipt",
-        reason,
-    };
-    let object = receipt
-        .as_object()
-        .ok_or_else(|| invalid_receipt("actual-route receipt must be a JSON object"))?;
-    let encoded = serde_json::to_vec(receipt)
-        .map_err(|_| invalid_receipt("actual-route receipt must serialize to bounded JSON"))?;
-    if encoded.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
-        return Err(invalid_receipt(
-            "actual-route receipt exceeds the bounded response ceiling",
-        ));
-    }
-    let receipt_digest = object
-        .get("receipt_digest")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_receipt("actual-route receipt must retain its original digest"))?;
-    validate_digest(receipt_digest, "host_request_effect_evidence_actual_route_receipt")?;
-    if actual_route != Some(receipt_digest) {
-        return Err(invalid_receipt(
-            "actual-route handle does not match the original receipt digest",
-        ));
-    }
-    if invoked_operation != Some("local_read") {
-        return Err(invalid_receipt(
-            "actual-route receipt does not match the observed local-read operation",
-        ));
-    }
-    let result_digest = owner.result_digest.as_deref().ok_or_else(|| {
-        invalid_receipt("actual-route receipt must bind a retained result digest")
-    })?;
-    for (field, expected) in [
-        ("kind", "local_read_actual_route"),
-        ("operation_id", owner.operation_id.as_str()),
-        ("request_digest", owner.request_digest.as_str()),
-        ("result_digest", result_digest),
-        ("invoked_operation", "local_read"),
-    ] {
-        if object.get(field).and_then(Value::as_str) != Some(expected) {
-            return Err(invalid_receipt(
-                "actual-route receipt identity does not match the retained operation",
-            ));
-        }
-    }
-    if !object
-        .get("named_operation")
-        .is_some_and(|named_operation| !named_operation.is_null())
-    {
-        return Err(invalid_receipt(
-            "actual-route receipt must retain the selected operation",
-        ));
-    }
-    let receipt_fence = object
-        .get("state_fence")
-        .cloned()
-        .ok_or_else(|| invalid_receipt("actual-route receipt must retain its response fence"))
-        .and_then(|value| {
-            serde_json::from_value::<StateFence>(value)
-                .map_err(|_| invalid_receipt("actual-route response fence is malformed"))
-        })?;
-    receipt_fence
-        .validate()
-        .map_err(|_| invalid_receipt("actual-route response fence is invalid"))?;
-    let receipt_fence_bytes = canonical_json_bytes(&receipt_fence)
-        .map_err(|error| OrsError::Encoding(error.to_string()))?;
-    if receipt_fence.authority_epoch != owner.authority_epoch
-        || receipt_fence.resource_generation.value() != owner.generation
-        || sha256_hex(&receipt_fence_bytes) != owner.fence_digest
-        || owner
-            .admitted_state_fence
-            .as_ref()
-            .is_some_and(|fence| fence != &receipt_fence)
-    {
-        return Err(invalid_receipt(
-            "actual-route response fence does not match the original admitted fence",
-        ));
-    }
-    if !object.get("route_facts").is_some_and(Value::is_object) {
-        return Err(invalid_receipt(
-            "actual-route receipt must retain its route facts",
-        ));
-    }
-    let mut unsigned = object.clone();
-    let _ = unsigned.remove("receipt_digest");
-    let canonical = canonical_json_bytes(&Value::Object(unsigned))
-        .map_err(|error| OrsError::Encoding(error.to_string()))?;
-    if sha256_hex(&canonical) != receipt_digest {
-        return Err(invalid_receipt(
-            "actual-route receipt does not match its original canonical digest",
-        ));
-    }
-    Ok(())
-}
-
-/// Validates the original LocalReadAttempt's owner bindings while leaving its
-/// closed protocol shape to the protocol owner. In particular, its monotonic
-/// fencing generation is not the ORS send-claim generation.
-fn validate_local_read_attempt(
-    attempt: &Value,
-    owner: &HostRequestRecord,
-) -> Result<(), OrsError> {
-    let invalid_attempt = |reason| OrsError::InvalidField {
-        field: "host_request_effect_evidence_local_read_attempt",
-        reason,
-    };
-    let object = attempt
-        .as_object()
-        .ok_or_else(|| invalid_attempt("local-read attempt must be a JSON object"))?;
-    let encoded = serde_json::to_vec(attempt)
-        .map_err(|_| invalid_attempt("local-read attempt must serialize to bounded JSON"))?;
-    if encoded.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
-        return Err(invalid_attempt(
-            "local-read attempt exceeds the bounded response ceiling",
-        ));
-    }
-    if object.get("operation_id").and_then(Value::as_str) != Some(owner.operation_id.as_str()) {
-        return Err(invalid_attempt(
-            "local-read attempt does not observe this operation",
-        ));
-    }
-    let session_id = object
-        .get("session_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_attempt("local-read attempt must retain its Session identity"))?;
-    let expected_session_id = owner
-        .session_ref
-        .as_ref()
-        .or(owner.scope_ref.as_ref())
-        .map_or_else(|| owner.connection_ref.as_str(), OpaqueLabel::as_str);
-    if session_id != expected_session_id {
-        return Err(invalid_attempt(
-            "local-read attempt Session does not match the retained owner",
-        ));
-    }
-    let scope_id = object
-        .get("scope_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_attempt("local-read attempt must retain its scope identity"))?;
-    let expected_scope_id = owner
-        .scope_ref
-        .as_ref()
-        .or(owner.session_ref.as_ref())
-        .map_or_else(|| owner.connection_ref.as_str(), OpaqueLabel::as_str);
-    if scope_id != expected_scope_id {
-        return Err(invalid_attempt(
-            "local-read attempt scope does not match the retained owner",
-        ));
-    }
-    let attempt_id = object
-        .get("attempt_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_attempt("local-read attempt must retain its attempt identity"))?;
-    validate_text(attempt_id, "host_request_effect_evidence_local_read_attempt_id")?;
-    if attempt_id == owner.operation_id.as_str() {
-        return Err(invalid_attempt(
-            "local-read attempt identity must differ from its operation",
-        ));
-    }
-    let fencing_generation = object
-        .get("fencing_generation")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid_attempt("local-read attempt must retain its fencing generation"))?;
-    if fencing_generation == 0 {
-        return Err(invalid_attempt(
-            "local-read attempt fencing generation must be positive",
-        ));
-    }
-    if object.get("facet_method").and_then(Value::as_str)
-        != Some(owner.capability_ref.as_str())
-        || object.get("expires_at_unix_ms").and_then(Value::as_u64)
-            != Some(owner.deadline_unix_ms)
-        || object.get("use_budget").and_then(Value::as_u64) != Some(1)
-    {
-        return Err(invalid_attempt(
-            "local-read attempt facet, expiry, or one-use budget does not match the owner",
-        ));
-    }
-    let attempt_epoch = object
-        .get("authority_epoch")
-        .cloned()
-        .ok_or_else(|| invalid_attempt("local-read attempt must retain its authority epoch"))
-        .and_then(|value| {
-            serde_json::from_value::<EpochId>(value)
-                .map_err(|_| invalid_attempt("local-read attempt authority epoch is malformed"))
-        })?;
-    eliot_contracts::epoch_identity_digest(&attempt_epoch)
-        .map_err(|_| invalid_attempt("local-read attempt authority epoch is invalid"))?;
-    if attempt_epoch != owner.authority_epoch
-        || owner
-            .admitted_state_fence
-            .as_ref()
-            .is_some_and(|fence| fence.authority_epoch != attempt_epoch)
-    {
-        return Err(invalid_attempt(
-            "local-read attempt authority epoch does not match the retained owner fence",
-        ));
-    }
-    Ok(())
-}
-
-/// Validates the original activation-result seal and binds any resolved
-/// semantic identities to this retained host-request row. The protocol owner
-/// checks the closed result and its ticket join; ORS only preserves the
-/// self-digest and row bindings it already owns.
-fn validate_activation_resolution_result(
-    result: &Value,
-    owner: &HostRequestRecord,
-) -> Result<(), OrsError> {
-    let invalid_result = |reason| OrsError::InvalidField {
-        field: "host_request_effect_evidence_activation_resolution_result",
-        reason,
-    };
-    let object = result
-        .as_object()
-        .ok_or_else(|| invalid_result("activation result must be a JSON object"))?;
-    let encoded = serde_json::to_vec(result)
-        .map_err(|_| invalid_result("activation result must serialize to bounded JSON"))?;
-    if encoded.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
-        return Err(invalid_result(
-            "activation result exceeds the bounded response ceiling",
-        ));
-    }
-    let result_digest = object
-        .get("result_sha256")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_result("activation result must retain its original digest"))?;
-    validate_digest(
-        result_digest,
-        "host_request_effect_evidence_activation_result_sha256",
-    )?;
-    let mut unsigned = object.clone();
-    // Match AgentActivationResolutionResult::canonical_unsigned_bytes: the
-    // digest slot remains present and is cleared to the empty string.
-    unsigned.insert("result_sha256".to_owned(), Value::String(String::new()));
-    let canonical = canonical_json_bytes(&Value::Object(unsigned))
-        .map_err(|error| OrsError::Encoding(error.to_string()))?;
-    if sha256_hex(&canonical) != result_digest {
-        return Err(invalid_result(
-            "activation result does not match its original canonical digest",
-        ));
-    }
-    let result_fence = object
-        .get("ticket_state_fence")
-        .cloned()
-        .ok_or_else(|| invalid_result("activation result must retain its original ticket fence"))
-        .and_then(|value| {
-            serde_json::from_value::<StateFence>(value)
-                .map_err(|_| invalid_result("activation result ticket fence is malformed"))
-        })?;
-    result_fence
-        .validate()
-        .map_err(|_| invalid_result("activation result ticket fence is invalid"))?;
-    if result_fence.authority_epoch != owner.authority_epoch
-        || result_fence.resource_generation.value() != owner.generation
-    {
-        return Err(invalid_result(
-            "activation result ticket fence does not match the retained owner",
-        ));
-    }
-    let disposition = object
-        .get("disposition")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_result("activation result must retain its disposition"))?;
-    if disposition.get("kind").and_then(Value::as_str) != Some("RESOLVED") {
-        return Err(invalid_result(
-            "only a resolved activation result supplies a semantic principal",
-        ));
-    }
-    let binding = disposition
-        .get("binding")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid_result("resolved activation result must retain its binding"))?;
-    let principal_id = binding
-        .get("principal_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_result("resolved binding must retain its principal"))?;
-    validate_text(
-        principal_id,
-        "host_request_effect_evidence_activation_principal_id",
-    )?;
-    for (field, expected) in [
-        (
-            "session_id",
-            owner.session_ref.as_ref().map(OpaqueLabel::as_str),
-        ),
-        (
-            "task_id",
-            owner.task_ref.as_ref().map(OpaqueLabel::as_str),
-        ),
-        (
-            "work_scope_id",
-            owner.scope_ref.as_ref().map(OpaqueLabel::as_str),
-        ),
-    ] {
-        if let Some(expected) = expected
-            && binding.get(field).and_then(Value::as_str) != Some(expected)
-        {
-            return Err(invalid_result(
-                "resolved activation binding does not match the retained owner identity",
-            ));
-        }
-    }
-    if let Some(task_revision) = owner
-        .admitted_state_fence
-        .as_ref()
-        .and_then(|fence| fence.task_revision)
-    {
-        let expected_task_revision = task_revision.value().to_string();
-        if binding.get("task_revision").and_then(Value::as_str)
-            != Some(expected_task_revision.as_str())
-        {
-            return Err(invalid_result(
-                "resolved activation task revision does not match the admitted owner fence",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Default for a retained result lineage that omits its influence state.
@@ -8302,13 +7938,6 @@ pub struct HostRequestRecord {
     pub cancellation_id: OpaqueLabel,
     pub parent_operation_id: Option<OpaqueLabel>,
     pub request_digest: String,
-    /// Exact canonical unsigned admission-envelope bytes covered by
-    /// `request_digest` when retained from the validated presenting envelope.
-    /// Historical rows may omit these bytes; that absence stays explicit and
-    /// is never filled from a retry or a reconstructed envelope.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admitted_input_bytes: Option<Vec<u8>>,
     pub payload_digest: String,
     /// Schema identity of the staged payload (issue #1739 W2).
     ///
@@ -8339,15 +7968,6 @@ pub struct HostRequestRecord {
     pub scope_ref: Option<OpaqueLabel>,
     pub capability_ref: OpaqueLabel,
     pub fence_digest: String,
-    /// Original admitted request fence snapshot when retained with the row.
-    ///
-    /// Historical rows may omit this field; absence leaves replay without the
-    /// original State Fence and must never be filled from a current Session.
-    /// When present, validation checks its canonical digest against the
-    /// original `fence_digest` without replacing that recorded identity.
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admitted_state_fence: Option<StateFence>,
     /// Lineage-aware authority epoch (Implements #64).
     ///
     /// Widened from the `u64` contour because `host_request_binding`
@@ -8442,24 +8062,13 @@ impl HostRequestRecord {
         format!("{}::{}", self.operation_id.as_str(), self.request_digest)
     }
 
-    /// Returns whether two valid records carry the same request binding.
+    /// Returns whether two records carry the exact same request binding.
     ///
     /// State, result, commit order, and the post-stage payload body are
-    /// excluded: they are ORS-owned progression, not caller binding. Present
-    /// admitted input bytes must agree exactly; historical absence remains
-    /// compatible only because the original envelope digest is compared and
-    /// never fills the stored row. The post-stage payload body stays implied
-    /// by the compared `payload_digest` because `validate` re-checks
-    /// body/digest equality on every read. Historical fence-snapshot absence
-    /// remains compatible only because the recorded fence digest, epoch, and
-    /// generation are still compared; it never fills the stored row's absent
-    /// snapshot.
+    /// excluded: they are ORS-owned progression, not caller binding. The body
+    /// stays implied by the compared `payload_digest` because `validate`
+    /// re-checks body/digest equality on every read.
     pub fn same_binding(&self, other: &Self) -> bool {
-        let self_is_valid = self.validate().is_ok();
-        let other_is_valid = other.validate().is_ok();
-        if !self_is_valid || !other_is_valid {
-            return false;
-        }
         self.operation_id == other.operation_id
             && self.kind == other.kind
             && self.request_id == other.request_id
@@ -8468,10 +8077,6 @@ impl HostRequestRecord {
             && self.cancellation_id == other.cancellation_id
             && self.parent_operation_id == other.parent_operation_id
             && self.request_digest == other.request_digest
-            && Self::same_admitted_input_bytes(
-                self.admitted_input_bytes.as_deref(),
-                other.admitted_input_bytes.as_deref(),
-            )
             && self.payload_digest == other.payload_digest
             && Self::same_payload_schema(
                 self.payload_schema_id.as_ref(),
@@ -8483,10 +8088,6 @@ impl HostRequestRecord {
             && self.scope_ref == other.scope_ref
             && self.capability_ref == other.capability_ref
             && self.fence_digest == other.fence_digest
-            && Self::same_admitted_state_fence(
-                self.admitted_state_fence.as_ref(),
-                other.admitted_state_fence.as_ref(),
-            )
             && self.authority_epoch == other.authority_epoch
             && self.generation == other.generation
             && self.deadline_unix_ms == other.deadline_unix_ms
@@ -8499,27 +8100,6 @@ impl HostRequestRecord {
     /// W2 binding existed, never a changed schema: only two present but
     /// different schemas disagree.
     fn same_payload_schema(left: Option<&OpaqueLabel>, right: Option<&OpaqueLabel>) -> bool {
-        match (left, right) {
-            (Some(left), Some(right)) => left == right,
-            _ => true,
-        }
-    }
-
-    /// A historical row may lack the retained original snapshot. Missing on
-    /// either comparison side is compatible only with the separately compared
-    /// recorded digest, epoch, and generation; callers keep the durable row as
-    /// the winner so this comparison never backfills or erases its snapshot.
-    fn same_admitted_state_fence(left: Option<&StateFence>, right: Option<&StateFence>) -> bool {
-        match (left, right) {
-            (Some(left), Some(right)) => left == right,
-            _ => true,
-        }
-    }
-
-    /// Historical rows may lack the original admitted bytes. Missing on
-    /// either side is compatible only because the envelope digest is compared
-    /// separately; owner joins preserve the durable row and never backfill it.
-    fn same_admitted_input_bytes(left: Option<&[u8]>, right: Option<&[u8]>) -> bool {
         match (left, right) {
             (Some(left), Some(right)) => left == right,
             _ => true,
@@ -8541,27 +8121,6 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
-        if let Some(fence) = &self.admitted_state_fence {
-            let canonical = canonical_json_bytes(fence)
-                .map_err(|error| OrsError::Encoding(error.to_string()))?;
-            if sha256_hex(&canonical) != self.fence_digest {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_admitted_state_fence",
-                    reason: "original admitted fence does not match the recorded fence digest",
-                });
-            }
-            if fence.authority_epoch != self.authority_epoch
-                || fence.resource_generation.value() != self.generation
-            {
-                return Err(OrsError::InvalidField {
-                    field: "host_request_admitted_state_fence",
-                    reason: "original admitted fence epoch or generation does not match the row",
-                });
-            }
-        }
-        if let Some(input_bytes) = &self.admitted_input_bytes {
-            validate_admitted_input_bytes(input_bytes, &self.request_digest)?;
-        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {
@@ -8613,14 +8172,6 @@ impl HostRequestRecord {
             ) => {
                 validate_digest(result, "host_request_result_digest")?;
                 validate_result_response(body)?;
-                let canonical = canonical_json_bytes(body)
-                    .map_err(|error| OrsError::Encoding(error.to_string()))?;
-                if sha256_hex(&canonical).as_str() != result.as_str() {
-                    return Err(OrsError::InvalidField {
-                        field: "host_request_result_response",
-                        reason: "result body does not match the recorded result digest",
-                    });
-                }
             }
             // Legacy digest-only row (produced by the digest-only advance
             // before the bounded body existed): loads for compatibility but
@@ -8644,7 +8195,14 @@ impl HostRequestRecord {
         // row carries no evidence at all: that absence stays readable and stays
         // unknown, and is never upgraded into a clean observation here.
         if let Some(evidence) = &self.result_evidence {
-            evidence.validate(self)?;
+            let result_digest = self
+                .result_digest
+                .as_deref()
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_result_evidence",
+                    reason: "retained evidence must observe a retained result",
+                })?;
+            evidence.validate(&self.operation_id, &self.request_digest, result_digest)?;
         }
         // Issue #1853 W2: retained lineage describes the result, so it is bound
         // to the same retained result. Same discipline as the effect evidence
@@ -9115,28 +8673,6 @@ pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
 /// Mirrors `eliot-protocol::HARD_STRUCTURED_RESPONSE_BYTES` like the result
 /// body: the staged tool bytes are bounded structured JSON.
 pub const MAX_HOST_REQUEST_PAYLOAD_BODY_BYTES: usize = 256 * 1024;
-
-/// Validates the exact original canonical unsigned host-request bytes against
-/// the owner row's originally recorded envelope digest. ORS deliberately does
-/// not decode or reconstruct the protocol envelope.
-pub(crate) fn validate_admitted_input_bytes(
-    input_bytes: &[u8],
-    request_digest: &str,
-) -> Result<(), OrsError> {
-    if input_bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES {
-        return Err(OrsError::InvalidField {
-            field: "host_request_admitted_input_bytes",
-            reason: "admitted input exceeds the bounded original-envelope ceiling",
-        });
-    }
-    if sha256_hex(input_bytes) != request_digest {
-        return Err(OrsError::InvalidField {
-            field: "host_request_admitted_input_bytes",
-            reason: "admitted input bytes do not match the recorded envelope digest",
-        });
-    }
-    Ok(())
-}
 
 /// Validates exact staged payload bytes against their admitted digest.
 ///

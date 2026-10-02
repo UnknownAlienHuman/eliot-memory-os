@@ -875,20 +875,15 @@ impl AuditLineage {
         if let Some(lease) = manifest.lease_attempt_id.as_deref() {
             Self::fill(&mut self.attempt_id, lease);
             Self::fill(&mut self.environment_lease, lease);
-        } else if let Some(attempt) = manifest.local_read_attempt.as_ref() {
-            // A local-read fencing capability is a distinct owner from an
-            // ORS send-claim attempt. Mirror it only when that ORS claim is
-            // absent, preserving the durable owner priority.
-            Self::fill(&mut self.attempt_id, &attempt.attempt_id);
-            Self::fill(&mut self.environment_lease, &attempt.attempt_id);
-        }
-        if let Some(principal) = manifest.principal.as_deref() {
-            Self::fill(&mut self.principal, principal);
         }
         if self.state_fence.is_none() {
             self.state_fence.clone_from(&manifest.state_fence);
         }
-        if let Some(adapter) = manifest.adapter_identity.as_deref() {
+        if let Some(adapter) = manifest
+            .adapter_identity
+            .as_deref()
+            .or(manifest.connection_id.as_deref())
+        {
             Self::fill(&mut self.adapter_instance, adapter);
         }
         if let Some(process) = manifest.executor_identity.as_deref() {
