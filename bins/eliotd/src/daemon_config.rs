@@ -17,7 +17,7 @@ use eliot_runtime_contracts::{
 };
 
 use super::canonical_config_precedence::{
-    PolicyDocument, ResolvedChain, resolve_effective_configuration,
+    ConfigLayer, PolicyDocument, ResolvedChain, resolve_effective_configuration,
 };
 use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES, SERVICE_NAME};
 
@@ -54,8 +54,14 @@ fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
 /// an unknown or duplicated layer, and a lower-layer expansion that no higher
 /// layer delegated all fail this function.
 fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
-    let mut retained: Vec<(&str, Vec<u8>)> = Vec::new();
-    for relative in [INSTALLATION_CONFIG_RELATIVE, SYSTEM_OWNER_POLICY_RELATIVE] {
+    let mut retained: Vec<(&str, ConfigLayer, Vec<u8>)> = Vec::new();
+    for (relative, expected_layer) in [
+        (
+            INSTALLATION_CONFIG_RELATIVE,
+            ConfigLayer::InstallationConfig,
+        ),
+        (SYSTEM_OWNER_POLICY_RELATIVE, ConfigLayer::SystemOwnerPolicy),
+    ] {
         let path = protected_program_data_path(relative)?;
         match path.try_exists() {
             Ok(false) => continue,
@@ -73,12 +79,17 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
                     .to_owned(),
             ));
         }
-        retained.push((relative, lease.read_bounded(MAX_CONFIG_BYTES)?));
+        retained.push((
+            relative,
+            expected_layer,
+            lease.read_bounded(MAX_CONFIG_BYTES)?,
+        ));
     }
     let documents: Vec<PolicyDocument<'_>> = retained
         .iter()
-        .map(|(file_name, bytes)| PolicyDocument {
+        .map(|(file_name, expected_layer, bytes)| PolicyDocument {
             file_name,
+            expected_layer: *expected_layer,
             bytes: bytes.as_slice(),
         })
         .collect();

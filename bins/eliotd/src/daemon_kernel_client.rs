@@ -286,6 +286,37 @@ impl ActivationSubmitError {
     }
 }
 
+/// Typed failure to reconcile one exact activation result identity (issue
+/// #1115). A failed reconciliation never permits a second semantic
+/// resolution: callers either retain the same unknown ticket/result identity
+/// or stop on a definitive protocol violation.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationReconcileError {
+    /// The exact reconciliation query did not pass local contract validation,
+    /// so no frame was sent.
+    NotAttempted {
+        ticket_id: String,
+        result_sha256: String,
+        detail: String,
+    },
+    /// The reconciliation exchange could not produce a trustworthy response.
+    /// The prior submission may still be accepted, so this exact identity must
+    /// remain unknown and must not be recomputed.
+    Unknown {
+        ticket_id: String,
+        result_sha256: String,
+        detail: String,
+    },
+    /// Kernel returned a malformed or differently bound acknowledgement. This
+    /// is a protocol failure, not evidence for changing the semantic result.
+    InvalidAcknowledgement {
+        ticket_id: String,
+        result_sha256: String,
+        detail: String,
+    },
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1567,27 +1598,48 @@ impl DaemonKernelClient {
     pub async fn reconcile_agent_activation_result(
         &self,
         query: &AgentActivationResultReconcile,
-    ) -> Result<AgentActivationResultAck, super::DaemonError> {
+    ) -> Result<AgentActivationResultAck, ActivationReconcileError> {
+        let ticket_id = query.ticket_id.clone();
+        let result_sha256 = query.result_sha256.clone();
         query
             .validate()
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            .map_err(|error| ActivationReconcileError::NotAttempted {
+                ticket_id: ticket_id.clone(),
+                result_sha256: result_sha256.clone(),
+                detail: error.to_string(),
+            })?;
         let value = self
             .transact_async(
                 "agent_activation_reconcile",
                 serde_json::json!({ "reconcile": query }),
             )
             .await
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let response: ActivationReconcileResponse = serde_json::from_value(value)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        response
-            .ack
-            .validate()
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+            .map_err(|error| ActivationReconcileError::Unknown {
+                ticket_id: ticket_id.clone(),
+                result_sha256: result_sha256.clone(),
+                detail: error.to_string(),
+            })?;
+        let response: ActivationReconcileResponse =
+            serde_json::from_value(value).map_err(|error| {
+                ActivationReconcileError::InvalidAcknowledgement {
+                    ticket_id: ticket_id.clone(),
+                    result_sha256: result_sha256.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+        response.ack.validate().map_err(|error| {
+            ActivationReconcileError::InvalidAcknowledgement {
+                ticket_id: ticket_id.clone(),
+                result_sha256: result_sha256.clone(),
+                detail: error.to_string(),
+            }
+        })?;
         if response.ack.replay_key() != (query.ticket_id.as_str(), query.result_sha256.as_str()) {
-            return Err(super::DaemonError::Kernel(
-                "Kernel reconcile response identity mismatch".to_owned(),
-            ));
+            return Err(ActivationReconcileError::InvalidAcknowledgement {
+                ticket_id,
+                result_sha256,
+                detail: "Kernel reconcile response identity mismatch".to_owned(),
+            });
         }
         Ok(response.ack)
     }

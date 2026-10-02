@@ -79,8 +79,8 @@ use eliotd::testd_terminal_completion::{
     query_testd_owner_terminal_evidence,
 };
 use eliotd::{
-    ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
-    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
+    ActivationClaim, ActivationReconcileError, ActivationSubmitError, AgentActivationResolver,
+    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
     PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
@@ -208,7 +208,8 @@ struct RetainedActivationIdentity {
 
 /// Typed terminal failure from the run loop so `run()` selects the shutdown
 /// disposition from the dispatch owner's typed decision, never from free
-/// text. `message` keeps the exact existing terminal record. Only a failure
+/// text. `message` carries terminal detail and, for an unknown result, its
+/// retained identity. Only a failure
 /// the dispatch path classified as retained/unknown
 /// (`ActivationDispatchError::Unknown`) carries `activation_unknown`, with
 /// the original ticket/result identity verbatim; every other loop failure —
@@ -229,7 +230,9 @@ impl RunLoopFailure {
 
     fn activation_unknown(ticket_id: String, result_sha256: String, detail: String) -> Self {
         Self {
-            message: detail,
+            message: format!(
+                "activation result remains unknown for ticket {ticket_id} result {result_sha256}: {detail}"
+            ),
             activation_unknown: Some(RetainedActivationIdentity {
                 ticket_id,
                 result_sha256,
@@ -2144,34 +2147,44 @@ fn settle_activation_completion(
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
                 .map_err(RunLoopFailure::hard)
         }
-        ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
-            Ok(()) => {
+        ActivationCompletion::Dispatch(dispatch_outcome) => {
+            if dispatch_outcome.is_ok() {
                 note_supervision_applied(
                     supervision_progress.as_mut(),
                     health_heartbeat_flight,
                     deferred_activity,
                     true,
                 );
-                *flight = ActivationFlight::Idle;
-                Ok(())
             }
-            // #1115: Kernel-owned deadline expiry retires this ticket without
-            // retry, but no result was accepted and no Apply progress exists.
-            Err(ActivationDispatchError::Expired) => {
-                *flight = ActivationFlight::Idle;
-                Ok(())
-            }
-            Err(ActivationDispatchError::Hard(error)) => Err(RunLoopFailure::hard(error)),
-            Err(ActivationDispatchError::Unknown {
-                ticket_id,
-                result_sha256,
-                detail,
-            }) => Err(RunLoopFailure::activation_unknown(
-                ticket_id,
-                result_sha256,
-                detail,
-            )),
-        },
+            settle_activation_dispatch_completion(flight, dispatch_outcome)
+        }
+    }
+}
+
+/// Settles one completed activation dispatch. Unknown outcomes retain the
+/// exact ticket/result identity and leave the run loop through its typed
+/// failure arm, so the next cadence tick cannot resolve the ticket again.
+/// Human diagnostic text is carried through but never selects the outcome.
+fn settle_activation_dispatch_completion(
+    flight: &mut ActivationFlight,
+    outcome: Result<(), ActivationDispatchError>,
+) -> Result<(), RunLoopFailure> {
+    *flight = ActivationFlight::Idle;
+    match outcome {
+        Ok(()) => Ok(()),
+        // #1115: Kernel-owned deadline expiry retires this ticket without
+        // retry, but no result was accepted and no Apply progress exists.
+        Err(ActivationDispatchError::Expired) => Ok(()),
+        Err(ActivationDispatchError::Hard(error)) => Err(RunLoopFailure::hard(error)),
+        Err(ActivationDispatchError::Unknown {
+            ticket_id,
+            result_sha256,
+            detail,
+        }) => Err(RunLoopFailure::activation_unknown(
+            ticket_id,
+            result_sha256,
+            detail,
+        )),
     }
 }
 
@@ -7386,10 +7399,7 @@ async fn dispatch_agent_activation_result(
                 .reconcile_agent_activation_result(&query)
                 .await
                 .map_err(|error| {
-                    ActivationDispatchError::Hard(format!(
-                        "Kernel activation result reconcile ticket {}: {error}; submit: {submit_detail}",
-                        ticket.ticket_id
-                    ))
+                    classify_reconcile_error(ticket, &result, &submit_detail, error)
                 })?;
             classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?;
             trigger_accepted_cold_start(
@@ -7870,6 +7880,63 @@ fn classify_reconcile_ack(
     }
 }
 
+/// Preserves the exact retained result identity when the reconciliation
+/// exchange itself is ambiguous. A refusal or malformed/foreign acknowledgement
+/// remains fail-closed; none of these transport diagnostics can select a retry
+/// or semantic result.
+fn classify_reconcile_error(
+    ticket: &AgentActivationResolutionTicket,
+    result: &AgentActivationResolutionResult,
+    submit_detail: &str,
+    error: ActivationReconcileError,
+) -> ActivationDispatchError {
+    let (reported_ticket_id, reported_result_sha256, detail, retention_unresolved, phase) =
+        match error {
+            ActivationReconcileError::NotAttempted {
+                ticket_id,
+                result_sha256,
+                detail,
+            } => (ticket_id, result_sha256, detail, true, "was not attempted"),
+            ActivationReconcileError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            } => (ticket_id, result_sha256, detail, true, "outcome is unknown"),
+            ActivationReconcileError::InvalidAcknowledgement {
+                ticket_id,
+                result_sha256,
+                detail,
+            } => (
+                ticket_id,
+                result_sha256,
+                detail,
+                false,
+                "returned an invalid acknowledgement",
+            ),
+        };
+
+    if reported_ticket_id != ticket.ticket_id || reported_result_sha256 != result.result_sha256 {
+        return ActivationDispatchError::Hard(format!(
+            "Kernel activation result reconcile ticket {} binding mismatch",
+            ticket.ticket_id
+        ));
+    }
+
+    let detail = format!(
+        "Kernel activation result reconcile ticket {} {phase}: {detail}; submit: {submit_detail}",
+        ticket.ticket_id
+    );
+    if retention_unresolved {
+        ActivationDispatchError::Unknown {
+            ticket_id: ticket.ticket_id.clone(),
+            result_sha256: result.result_sha256.clone(),
+            detail,
+        }
+    } else {
+        ActivationDispatchError::Hard(detail)
+    }
+}
+
 /// Observes the transient `NotReady` deferral without adding retry policy.
 /// The predecessor result remains immutable. Reconsideration is possible only
 /// through a fresh Kernel-issued successor ticket after the declared due time
@@ -8122,6 +8189,56 @@ mod tests {
     }
 
     #[test]
+    fn unknown_dispatch_settlement_preserves_identity_and_uses_typed_outcome() {
+        let ticket_id = "ticket-settlement".to_owned();
+        let result_sha256 = "d".repeat(64);
+        let retained = RetainedActivationIdentity {
+            ticket_id: ticket_id.clone(),
+            result_sha256: result_sha256.clone(),
+        };
+        let mut flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            retained: Some(retained.clone()),
+        });
+
+        let failure = settle_activation_dispatch_completion(
+            &mut flight,
+            Err(ActivationDispatchError::Unknown {
+                ticket_id: ticket_id.clone(),
+                result_sha256: result_sha256.clone(),
+                // Text intentionally claims acceptance; it cannot change the
+                // typed Unknown settlement or select a retry.
+                detail: "diagnostic says accepted and retry is safe".to_owned(),
+            }),
+        )
+        .expect_err("an unknown retained result must stop the run loop");
+
+        assert!(matches!(flight, ActivationFlight::Idle));
+        assert_eq!(failure.activation_unknown, Some(retained));
+        assert!(failure.message.contains(&ticket_id));
+        assert!(failure.message.contains(&result_sha256));
+        assert!(failure.message.contains("accepted"));
+
+        let mut hard_flight = ActivationFlight::InFlight(ActivationFlightState {
+            future: Box::pin(std::future::pending::<ActivationCompletion>()),
+            retained: Some(RetainedActivationIdentity {
+                ticket_id,
+                result_sha256,
+            }),
+        });
+        let hard = settle_activation_dispatch_completion(
+            &mut hard_flight,
+            Err(ActivationDispatchError::Hard(
+                "diagnostic says unknown retention and retry is safe".to_owned(),
+            )),
+        )
+        .expect_err("a hard dispatch failure must stop the run loop");
+
+        assert!(matches!(hard_flight, ActivationFlight::Idle));
+        assert!(hard.activation_unknown.is_none());
+    }
+
+    #[test]
     fn submit_failure_reconcile_unknown_reuses_original_identity() {
         use std::cell::Cell;
         use std::num::NonZeroU64;
@@ -8360,6 +8477,85 @@ mod tests {
             }
             other => panic!("expected typed Unknown, got {other:?}"),
         }
+
+        // A lost reconcile response preserves the same identity in typed
+        // shutdown settlement. Diagnostic detail cannot turn that ambiguity
+        // into an Accepted result or a semantic retry.
+        let lost_reconcile_response = ActivationReconcileError::Unknown {
+            ticket_id: query.ticket_id.clone(),
+            result_sha256: query.result_sha256.clone(),
+            detail: "response lost; text says accepted and retry is safe".to_owned(),
+        };
+        match classify_reconcile_error(
+            &ticket,
+            &result,
+            "submit acknowledgement lost",
+            lost_reconcile_response,
+        ) {
+            ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            } => {
+                assert_eq!(ticket_id, original_ticket);
+                assert_eq!(result_sha256, original_sha);
+                assert!(detail.contains("submit acknowledgement lost"));
+                assert!(detail.contains("accepted"));
+            }
+            other => panic!("expected typed Unknown after lost reconcile response, got {other:?}"),
+        }
+
+        let reconcile_not_attempted = ActivationReconcileError::NotAttempted {
+            ticket_id: query.ticket_id.clone(),
+            result_sha256: query.result_sha256.clone(),
+            detail: "local query validation did not send a frame".to_owned(),
+        };
+        assert!(matches!(
+            classify_reconcile_error(
+                &ticket,
+                &result,
+                "submit acknowledgement lost",
+                reconcile_not_attempted,
+            ),
+            ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                ..
+            } if ticket_id == original_ticket && result_sha256 == original_sha
+        ));
+
+        let invalid_reconcile_ack = ActivationReconcileError::InvalidAcknowledgement {
+            ticket_id: query.ticket_id.clone(),
+            result_sha256: query.result_sha256.clone(),
+            detail: "malformed acknowledgement claims accepted".to_owned(),
+        };
+        assert!(matches!(
+            classify_reconcile_error(
+                &ticket,
+                &result,
+                "submit acknowledgement lost",
+                invalid_reconcile_ack,
+            ),
+            ActivationDispatchError::Hard(detail) if detail.contains("invalid acknowledgement")
+        ));
+
+        // A supplied foreign acknowledgement is a refusal, even if its
+        // diagnostic claims the result was accepted. It cannot be adopted as
+        // this ticket's retained result.
+        let foreign_ack = ActivationReconcileError::InvalidAcknowledgement {
+            ticket_id: "foreign-ticket".to_owned(),
+            result_sha256: original_sha.clone(),
+            detail: "ack payload says accepted".to_owned(),
+        };
+        assert!(matches!(
+            classify_reconcile_error(
+                &ticket,
+                &result,
+                "submit acknowledgement lost",
+                foreign_ack,
+            ),
+            ActivationDispatchError::Hard(detail) if detail.contains("binding mismatch")
+        ));
 
         // A durable retained record surviving the reconnect answers with the
         // same stable positive acknowledgement. The daemon settles the
