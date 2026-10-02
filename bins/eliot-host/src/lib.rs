@@ -1620,6 +1620,36 @@ mod host_lifecycle_boundary_table_tests {
         haystack.matches(needle).count()
     }
 
+    /// Strips the subscriber's observational timestamp and level prefix from
+    /// each captured line, leaving only the semantic record content.
+    ///
+    /// Two runs of the same contour therefore compare equal exactly when the
+    /// records they produced are equal; the wall-clock reading the subscriber
+    /// stamps on each line stays observational and never semantic.
+    fn semantic_records(capture: &str) -> Vec<&str> {
+        capture
+            .lines()
+            .map(|line| {
+                line.split_once(" INFO ")
+                    .or_else(|| line.split_once(" ERROR "))
+                    .map_or(line, |(_, rest)| rest)
+            })
+            .collect()
+    }
+
+    /// The ordered boundary details the real observers rendered, as the
+    /// `observe_entrypoint_with_detail` facade records them.
+    fn detail_order(capture: &str) -> Vec<&str> {
+        capture
+            .lines()
+            .filter_map(|line| {
+                line.split_once("detail=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(detail, _)| detail)
+            })
+            .collect()
+    }
+
     /// Returns the one frozen table row a `BOUNDARY_*` identifier selects, so a
     /// case can assert the row's own `name`/`event`/`owner_state` instead of a
     /// hand-written copy of the vocabulary.
@@ -2921,6 +2951,1346 @@ mod host_lifecycle_boundary_table_tests {
         assert!(
             !emitted.contains("propagated:"),
             "propagated rows own no emission, got: {emitted}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/12
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 12 keeps the durable cancellation contour, the reducer refusals it forces, and the emitted vocabulary in one deterministic walk"
+    )]
+    fn case_12_requested_and_terminal_cancellation_are_distinct() {
+        // The frozen contract: cancellation requested, stop requested, stop
+        // terminal, drained, and stopped are five distinct rows.
+        let cancellation = row(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
+        let terminal = row(super::BOUNDARY_STOP_TERMINAL);
+        assert_eq!(cancellation.name, "stop.cancellation-requested");
+        assert_ne!(cancellation.event, terminal.event);
+        assert_eq!(
+            cancellation.owner_state, "running activation/SCM stop control",
+            "cancellation requested must record the owner fact that only a cancellation was asked for"
+        );
+
+        // The real owner: `cancelled_drain_awaits_revalidation` admits a
+        // cancelled drain only while the linearization point is unproven, so
+        // "cancellation requested" is a revalidation-pending state, never a
+        // committed or stopped one.
+        let host = test_host();
+        let activation_generation = super::root_epoch(super::fresh_lineage_id().unwrap());
+        let activation_id = super::fresh_identity("891-case-12-activation").unwrap();
+        let ingress = super::journal_append::test_activation_ingress();
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())
+            .expect("in-memory journal must open");
+        let starting = super::journal_append::initial_activation_record(
+            &host,
+            &activation_id,
+            &activation_generation,
+            ActivationState::Starting,
+            "891-case-12-starting",
+            &ingress,
+        )
+        .unwrap();
+        let control_ready = super::journal_append::transition_activation_record(
+            &starting,
+            ActivationState::ControlReady,
+            "891-case-12-control-ready",
+        )
+        .unwrap();
+        let active = super::journal_append::transition_activation_record(
+            &control_ready,
+            ActivationState::Active,
+            "891-case-12-active",
+        )
+        .unwrap();
+        for record in [starting, control_ready.clone(), active.clone()] {
+            super::journal_append::append_reconciled(
+                &journal,
+                HostStateRecord::Activation(record),
+            )
+            .unwrap();
+        }
+        let drain_generation = active.fence.activation_generation.clone();
+        for (label, state) in [
+            ("891-case-12-request", DrainState::Requested),
+            ("891-case-12-draining", DrainState::Draining),
+        ] {
+            super::journal_append::append_reconciled(
+                &journal,
+                HostStateRecord::Drain(DrainRecord {
+                    fence: active.fence.clone(),
+                    operation: super::operation(label).unwrap(),
+                    drain_generation: drain_generation.clone(),
+                    state,
+                    evidence_refs: vec![PlatformHandle::new(label).unwrap()],
+                    expected_predecessor: None,
+                }),
+            )
+            .unwrap();
+        }
+        let draining = super::journal_append::transition_activation_record(
+            &active,
+            ActivationState::Draining,
+            "891-case-12-draining",
+        )
+        .unwrap();
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Activation(draining.clone()),
+        )
+        .unwrap();
+        let commit = super::drain_commit_record_for_stop(
+            &journal.snapshot().unwrap(),
+            &draining,
+            &drain_generation,
+        )
+        .unwrap();
+
+        // The cancellation itself: `Draining -> Cancelled` is admitted, and it
+        // is a request, not an outcome.
+        let cancelled = DrainRecord {
+            fence: active.fence.clone(),
+            operation: super::operation("891-case-12-cancelled").unwrap(),
+            drain_generation: drain_generation.clone(),
+            state: DrainState::Cancelled,
+            evidence_refs: vec![PlatformHandle::new("891-case-12-observable-use").unwrap()],
+            expected_predecessor: None,
+        };
+        super::journal_append::append_reconciled(
+            &journal,
+            HostStateRecord::Drain(cancelled.clone()),
+        )
+        .unwrap();
+        let cancelled_snapshot = journal.snapshot().unwrap();
+        assert!(
+            super::HostComposition::cancelled_drain_awaits_revalidation(
+                &draining,
+                cancelled_snapshot.drain.as_ref(),
+                cancelled_snapshot.drain_commit.as_ref(),
+            ),
+            "a cancelled pre-commit drain must await revalidation, never read as stopped"
+        );
+        assert!(
+            !super::HostComposition::cancelled_drain_awaits_revalidation(
+                &draining,
+                cancelled_snapshot.drain.as_ref(),
+                Some(&commit),
+            ),
+            "once the drain commit linearizes, the cancellation is no longer a pending request"
+        );
+
+        // The reducer refuses both terminal continuations of a cancellation:
+        // the linearization point and the clean stopped marker are both
+        // unreachable from `Cancelled`.
+        assert!(
+            journal
+                .append(HostStateRecord::DrainCommit(commit.clone()))
+                .is_err(),
+            "a cancelled drain must never reach the durable linearization point"
+        );
+        assert!(
+            super::clean_marker_record(&cancelled_snapshot, &host, &activation_id, &activation_generation)
+                .is_err(),
+            "a cancelled drain must never produce the clean stopped marker"
+        );
+
+        // The facade seam: a proven-no-effect cancellation is not a completed
+        // stop, so the Event Log never receives one for it.
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+        assert!(
+            !AdmittedEvent::ServiceStop
+                .is_admitted_by(HostRequestEvidence::Cancelled),
+            "a cancelled request must never be recorded as a completed stop"
+        );
+        assert!(
+            AdmittedEvent::ServiceStop.is_admitted_by(HostRequestEvidence::DurableCommitted),
+            "only a committed durable effect admits a stop record"
+        );
+
+        // The emitted vocabulary follows the durable contour: the cancellation
+        // row is recorded, the terminal and stopped rows are not.
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
+        });
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_STOP_CANCELLATION_REQUESTED.event),
+            1,
+            "the cancellation request must be recorded exactly once"
+        );
+        assert!(
+            !emitted.contains(terminal.event),
+            "a cancellation request owns no terminal, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains(super::BOUNDARY_STOP_STOPPED.event)
+                && !emitted.contains(super::BOUNDARY_STOP_STOPPED_CLEAN_DRAINED.event),
+            "a cancellation request never reaches a stopped record, got: {emitted}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/13
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 13 keeps the durable pending intent, its typed unknown classifications, and the emitted vocabulary in one deterministic walk"
+    )]
+    fn case_13_timeout_and_possible_state_change_stay_unknown() {
+        // The frozen contract: a pending restart intent has its own row, and it
+        // is neither the readback replay nor the completion.
+        let pending = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
+        let replay = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY);
+        let requested = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
+        assert_eq!(pending.name, "kernel-restart-reconcile unknown pending");
+        assert_ne!(pending.event, replay.event);
+        assert_ne!(pending.event, requested.event);
+        assert_eq!(
+            pending.owner_state, "pending intent, timeout proves nothing",
+            "the pending row must record that a timeout proves no effect either way"
+        );
+
+        // The real owner: a persisted pending intent is durable evidence that
+        // the restart may still take effect, so the reconcile answer must stay
+        // Unknown and the pending record must never be adopted as a receipt.
+        let host = test_host();
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-891-case-13-{}",
+            super::fresh_identity("root").unwrap().as_str()
+        ));
+        std::fs::create_dir_all(&root).expect("case root must be creatable");
+        let request = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-13-restart").unwrap(),
+        )
+        .unwrap();
+        request.validate().unwrap();
+        super::persist_runtime_restart_pending(&root, &request, &host)
+            .expect("the pending intent must persist");
+        assert!(
+            super::has_runtime_restart_pending(&root, request.mutation_digest.as_str())
+                .expect("the pending record must be readable"),
+            "the exact pending mutation must read back as pending"
+        );
+        assert!(
+            !super::has_runtime_restart_pending(&root, "0".repeat(64).as_str())
+                .expect("an unrelated digest must still read"),
+            "a foreign mutation digest must never read this pending intent"
+        );
+        assert!(
+            super::load_durable_runtime_restarts(&root)
+                .expect("the restart store must load")
+                .is_empty(),
+            "a pending intent is never adopted as a restart receipt"
+        );
+        let unknown = super::HostRuntimeControlResponse::unknown_for(
+            &request,
+            super::runtime_control_unknown_ref("kernel-restart-pending", &request),
+        );
+        assert!(
+            matches!(
+                unknown,
+                super::HostRuntimeControlResponse::Unknown { .. }
+            ),
+            "a pending intent answers typed Unknown, never a completion"
+        );
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(&request, &unknown),
+            "the Unknown must answer the exact pending request"
+        );
+
+        // The real classifier: an outcome that may have taken effect is a typed
+        // Unknown kind, distinct from a refused probe, and never a success.
+        assert_eq!(
+            super::readiness_failure_kind(&super::HostError::RecoveryRequired(
+                "restart may have taken effect".to_owned()
+            )),
+            super::ReadinessFailureKind::DeliveryUnknown,
+            "a possible state change must classify as an unknown delivery"
+        );
+        assert_eq!(
+            super::readiness_failure_kind(&super::HostError::Journal(
+                super::JournalError::OutcomeUnknown {
+                    transaction_id: PlatformHandle::new("891-case-13-transaction").unwrap(),
+                }
+            )),
+            super::ReadinessFailureKind::JournalOutcomeUnknown,
+            "an unknown journal outcome must stay its own typed kind"
+        );
+        assert_eq!(
+            super::readiness_failure_kind(&super::HostError::ProcessContour(
+                "probe refused".to_owned()
+            )),
+            super::ReadinessFailureKind::ProbeRejected,
+            "a refused probe must stay distinct from an unknown outcome"
+        );
+        use super::readiness_gate::{HostReadinessGate, ReadinessCadence};
+        let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let mut probes = 0_u32;
+        let disposition = super::reconcile_authenticated_readiness(
+            &mut gate,
+            Err(super::HostError::RecoveryRequired(
+                "restart may have taken effect".to_owned(),
+            )),
+            std::time::Instant::now(),
+            || -> Result<super::readiness_gate::ReadinessContourIdentity, super::HostError> {
+                probes += 1;
+                Err(super::HostError::Stopped)
+            },
+        );
+        assert_eq!(probes, 0, "a possible state change must not re-probe as a retry");
+        assert_eq!(
+            disposition,
+            super::HostBranchDisposition::ReadinessDegraded,
+            "an unknown outcome degrades, never becomes healthy"
+        );
+        assert_eq!(
+            gate.last_failure(),
+            Some(super::ReadinessFailureKind::DeliveryUnknown),
+            "the gate must retain the typed unknown kind for the retry"
+        );
+
+        // The emitted vocabulary stays on the unknown side of the boundary.
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_scm(
+                super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED,
+            );
+            super::host_lifecycle_observe_scm(pending);
+            {
+                let _guard = super::HostTerminalGuard::armed(
+                    super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                );
+            }
+        });
+        assert_eq!(
+            occurrences(&emitted, pending.event),
+            1,
+            "the pending intent must be recorded exactly once"
+        );
+        assert_eq!(
+            occurrences(&emitted, "host.terminal_error"),
+            1,
+            "one failed reconcile operation emits exactly one terminal"
+        );
+        assert!(
+            !emitted.contains(super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event)
+                && !emitted.contains(super::BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event),
+            "a pending intent never records a completion or a readback replay, got: {emitted}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // WORK_UNIT_CASE: 891/14
+    #[cfg(windows)]
+    #[test]
+    fn case_14_one_terminal_per_operation_across_nested_propagation() {
+        // The frozen contract: every terminal row is its own distinct code, so
+        // one operation can never be counted twice under one code.
+        let terminals: Vec<&'static super::HostLifecycleBoundary> =
+            super::HOST_LIFECYCLE_BOUNDARY_TABLE
+                .iter()
+                .filter(|boundary| boundary.name.ends_with(".terminal"))
+                .collect();
+        assert!(
+            !terminals.is_empty(),
+            "the table must keep its terminal rows"
+        );
+        for (index, boundary) in terminals.iter().enumerate() {
+            for other in terminals.iter().skip(index + 1) {
+                assert_ne!(
+                    boundary.event, other.event,
+                    "terminal rows {} and {} must stay distinct codes",
+                    boundary.name, other.name
+                );
+            }
+        }
+
+        // The real owner: a receipt rebind is refused by the durable owner, and
+        // its own digest recomputation sits behind that refusal. Three
+        // fallible frames propagate through `?`; only the outermost guard owns
+        // a terminal.
+        let restart = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-14-restart").unwrap(),
+        )
+        .unwrap();
+        restart.validate().unwrap();
+        let mut receipt = super::HostKernelRestartReceipt {
+            mutation_digest: restart.mutation_digest.clone(),
+            request_digest: restart.request_digest.clone(),
+            old_kernel_generation: PlatformHandle::new("1".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("2".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("3".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("4".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("5".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("6".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        assert!(
+            super::rebind_runtime_restart_receipt(&receipt, &restart).is_err(),
+            "the durable owner must refuse a restart commit read back as a rollback"
+        );
+
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+            let mut guard =
+                super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+            let outcome: Result<(), super::HostError> = (|| {
+                super::host_lifecycle_observe_scm(
+                    super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED,
+                );
+                // Frame 1: the wire identity owner.
+                restart
+                    .validate()
+                    .map_err(|error| super::HostError::Platform(error.to_string()))?;
+                // Frame 2: the durable rebind owner.
+                let rebound = super::rebind_runtime_restart_receipt(&receipt, &restart)?;
+                // Frame 3: the receipt digest owner behind the rebind.
+                let _digest = rebound
+                    .computed_digest()
+                    .map_err(super::HostError::Platform)?;
+                Ok(())
+            })();
+            assert!(
+                matches!(outcome, Err(super::HostError::RecoveryRequired(_))),
+                "the nested propagation must end in the owner's typed refusal"
+            );
+            // The guard stays armed on the error return: one terminal, dropped
+            // when this closure ends.
+        });
+        assert_eq!(
+            occurrences(&emitted, "host.terminal_error"),
+            1,
+            "three nested fallible frames must still emit exactly one terminal"
+        );
+        assert!(
+            emitted.contains(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL.event),
+            "the single terminal must carry the outer operation's frozen code, got: {emitted}"
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED.event),
+            1,
+            "the inner phase observation stays non-terminal and correlates once"
+        );
+
+        // Two distinct failed operations each own their own terminal: the
+        // single-terminal rule is per operation, never a global suppression.
+        let two_operations = capture_records(|| {
+            {
+                let _guard =
+                    super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
+            }
+            {
+                let _guard =
+                    super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+            }
+        });
+        assert_eq!(
+            occurrences(&two_operations, "host.terminal_error"),
+            2,
+            "two failed operations must emit two terminals, not one"
+        );
+        assert!(
+            two_operations.contains(super::BOUNDARY_KERNEL_RESTART_TERMINAL.event)
+                && two_operations.contains(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL.event),
+            "each operation must carry its own frozen code, got: {two_operations}"
+        );
+
+        // A successful operation disarms its guard and emits no terminal.
+        let succeeded = capture_records(|| {
+            let mut guard =
+                super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
+            guard.disarm();
+            super::host_lifecycle_observe_scm(
+                super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION,
+            );
+        });
+        assert_eq!(
+            occurrences(&succeeded, "host.terminal_error"),
+            0,
+            "a successful operation emits no terminal"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/15
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 15 keeps the exact identity tuple, its cross-contamination refusals, and the rendered correlation in one deterministic walk"
+    )]
+    fn case_15_exact_installation_process_generation_operation_correlation() {
+        // The frozen contract: the lifecycle-context and reconcile rows are the
+        // correlation rows, and neither is a readiness or terminal row.
+        let context_requested = row(super::BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED);
+        let context_admitted = row(super::BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED);
+        assert_eq!(context_requested.name, "lifecycle-context.requested");
+        assert_eq!(context_admitted.name, "lifecycle-context.admitted");
+        assert_ne!(context_requested.event, context_admitted.event);
+        assert_ne!(context_requested.event, row(super::BOUNDARY_RECONCILE_REQUESTED).event);
+        assert_eq!(
+            context_admitted.owner_state, "RequestMetadata",
+            "the admitted row must record the owner's own metadata carrier"
+        );
+
+        // The real owner: `lifecycle_context` binds the exact installation
+        // lineage/sequence, the caller operation, and this process id into one
+        // request identity, and fences it on the host's own epoch.
+        let host = test_host();
+        let context = super::lifecycle_context(&host, "891-case-15-start-manifest")
+            .expect("the lifecycle context must be constructible");
+        let request_id = context.request_id.as_str();
+        assert!(
+            request_id.contains(host.epoch.current.lineage_id.as_str()),
+            "the correlation must carry the installation lineage, got: {request_id}"
+        );
+        assert!(
+            request_id.contains(&host.epoch.current.sequence.to_string()),
+            "the correlation must carry the installation epoch sequence, got: {request_id}"
+        );
+        assert!(
+            request_id.contains("891-case-15-start-manifest"),
+            "the correlation must carry the exact caller operation, got: {request_id}"
+        );
+        assert!(
+            request_id.contains(&std::process::id().to_string()),
+            "the correlation must carry this serving process, got: {request_id}"
+        );
+        assert!(
+            context
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&host.epoch.current),
+            "the correlation must be fenced on the host's exact epoch"
+        );
+        assert_eq!(
+            context.source_id.as_str(),
+            "eliot-host-service",
+            "the source identity is the owner's static value, never a caller payload"
+        );
+
+        // A different installation epoch never reuses this correlation.
+        let other = super::fresh_host_epoch(
+            PlatformHandle::new("891-case-15-other-installation").unwrap(),
+            None,
+        )
+        .unwrap();
+        let other_context =
+            super::lifecycle_context(&other, "891-case-15-start-manifest").unwrap();
+        assert_ne!(
+            other_context.request_id.as_str(),
+            request_id,
+            "two installation epochs must never share one lifecycle correlation"
+        );
+
+        // The real projection: the admitted launch options and this process id
+        // are the only identities the SCM dispatch record may carry.
+        let options = super::HostLaunchOptions {
+            config_descriptor_path: std::path::PathBuf::from("891-case-15-config.json"),
+            config_descriptor_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
+            installation: host.installation.clone(),
+            transaction_plan_generation: 7,
+            host_state_root: std::path::PathBuf::from("891-case-15-host-state"),
+            registration_nonce: Some(PlatformHandle::new("b".repeat(64)).unwrap()),
+        };
+        let emitted = capture_records(|| {
+            super::lifecycle_context(&host, "891-case-15-start-manifest").unwrap();
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::admitted(
+                    super::host_diagnostics::EntrypointStage::ScmDispatch,
+                    &options,
+                )
+                .with_process(std::process::id()),
+            );
+        });
+        assert_eq!(
+            occurrences(&emitted, context_requested.event),
+            1,
+            "the real context owner must record its requested row once"
+        );
+        assert_eq!(
+            occurrences(&emitted, context_admitted.event),
+            1,
+            "the real context owner must record its admitted row once"
+        );
+        assert!(
+            emitted.contains(&format!("installation={:?}", host.installation.as_str())),
+            "the record must carry the exact installation, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("generation=7"),
+            "the record must carry the exact admitted generation, got: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("process={}", std::process::id())),
+            "the record must carry the exact serving process, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("operation_missing=true"),
+            "an SCM dispatch has no fitting service operation and must say so, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("891-case-15-other-installation")
+                && !emitted.contains("generation=8"),
+            "a foreign installation or generation must never appear in this record, got: {emitted}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/16
+    #[cfg(windows)]
+    #[test]
+    fn case_16_typed_reason_and_recovery_codes_without_free_text_status() {
+        // The frozen contract: the terminal rows carry typed codes, so the
+        // machine status is a discriminant and never a rendered message.
+        let terminal = row(super::BOUNDARY_STOP_TERMINAL);
+        assert_eq!(terminal.event, "host-stop-failed");
+        assert!(
+            !terminal.event.contains(' '),
+            "a terminal code must stay a single typed token, got: {}",
+            terminal.event
+        );
+
+        // The real owner: the facade projects only the `HostError` discriminant
+        // as the reason code, so a payload-bearing error renders its kind and
+        // nothing of its text.
+        const CREDENTIAL_CANARY: &str = "891-case-16-credential-canary";
+        const DB_CANARY: &str = "891-case-16-db-canary";
+        let census = super::HostError::StoreCensusIo(std::io::Error::other(DB_CANARY));
+        let refused = super::HostError::ProcessContour(format!(
+            "store credential {CREDENTIAL_CANARY} refused"
+        ));
+        let unknown = super::HostError::RecoveryRequired("delivery outcome unknown".to_owned());
+        let emitted = capture_records(|| {
+            for error in [&census, &refused, &unknown] {
+                super::host_lifecycle_observe_identity(
+                    &super::host_diagnostics::HostRequestProjection::failed(
+                        super::host_diagnostics::EntrypointStage::Startup,
+                        error,
+                    ),
+                );
+            }
+            {
+                let _guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
+            }
+        });
+        assert!(
+            emitted.contains("reason=\"store_census_runtime\""),
+            "a Store census failure must render its typed reason kind, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("reason=\"process_contour\""),
+            "a refused contour must render its typed reason kind, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("reason=\"recovery_required\""),
+            "a recovery-required outcome must render its typed reason kind, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("reason_missing=false"),
+            "a reason in hand must be recorded as present, got: {emitted}"
+        );
+        assert!(
+            emitted.contains(&format!("code={:?}", terminal.event)),
+            "the terminal must carry the operation's typed code, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains(CREDENTIAL_CANARY) && !emitted.contains(DB_CANARY),
+            "no credential or Store-census payload may reach a rendered record, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("delivery outcome unknown"),
+            "an error message must never become the machine status, got: {emitted}"
+        );
+
+        // The same typed discipline on the recovery side: the readiness
+        // classifier answers with closed discriminants, and a missing reason
+        // stays explicitly missing rather than guessed.
+        assert_eq!(
+            super::readiness_failure_kind(&super::HostError::RecoveryRequired(
+                CREDENTIAL_CANARY.to_owned()
+            )),
+            super::ReadinessFailureKind::DeliveryUnknown,
+            "recovery-required must map to the typed unknown-delivery discriminant"
+        );
+        assert_eq!(
+            super::readiness_failure_kind(&super::HostError::Stopped),
+            super::ReadinessFailureKind::ProbeRejected,
+            "an already-stopped Host must map to the typed refused-probe discriminant"
+        );
+        let unattributed = capture_records(|| {
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::failed_without_reason(
+                    super::host_diagnostics::EntrypointStage::Startup,
+                ),
+            );
+        });
+        assert!(
+            unattributed.contains("reason_missing=true"),
+            "an unattributed failure must record its reason as missing, got: {unattributed}"
+        );
+        assert!(
+            unattributed.contains("reason=\"\""),
+            "a missing reason must stay empty, never a rendered message, got: {unattributed}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/17
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 17 keeps the fenced and unfenced launch constructors, their missing evidence, and the emitted vocabulary in one deterministic walk"
+    )]
+    fn case_17_missing_evidence_suppresses_a_false_success_event() {
+        // The frozen contract: the fenced rows exist precisely because the
+        // fenced startup contour has no launch evidence to report.
+        let fenced_requested = row(super::BOUNDARY_JOBS_FENCED_REQUESTED);
+        let fenced_admitted = row(super::BOUNDARY_JOBS_FENCED_ADMITTED);
+        assert_eq!(fenced_requested.name, "jobs-fenced.requested");
+        assert_ne!(
+            fenced_requested.event,
+            row(super::BOUNDARY_JOBS_REQUESTED).event,
+            "the fenced contour must never reuse the unfenced launch row"
+        );
+
+        // The real owner: the fenced constructor performs no current-process
+        // observation and adopts no child, and it still returns the same inert
+        // projection: missing evidence suppresses the positive launch claim,
+        // never the operation's own result.
+        let host = test_host();
+        let mut fenced_names = (String::new(), String::new());
+        let mut unfenced_binding_observed = false;
+        let fenced = capture_records(|| {
+            let fenced = super::HostJobBranches::new_fenced(&host)
+                .expect("the fenced job projection must be constructible");
+            assert!(
+                fenced.kernel_launch_binding.is_none(),
+                "the fenced contour must carry no current-process observation"
+            );
+            assert!(
+                fenced.kernel.is_none() && fenced.store.is_none(),
+                "the fenced contour must adopt no child"
+            );
+            assert!(
+                !fenced.has_recorded_contour(),
+                "the fenced contour records no contour"
+            );
+            fenced_names = (
+                fenced.kernel_name().to_owned(),
+                fenced.store_name().to_owned(),
+            );
+            let unfenced = super::HostJobBranches::new(&host)
+                .expect("the live job identities must be constructible");
+            assert!(
+                unfenced.kernel_launch_binding.is_some(),
+                "the live constructor is the only path that observes this process"
+            );
+            unfenced_binding_observed = true;
+            // The fence changes the evidence available to the observation, not
+            // the owner-scoped identities the two constructors hand back.
+            assert_eq!(fenced.kernel_name(), unfenced.kernel_name());
+            assert_eq!(fenced.store_name(), unfenced.store_name());
+        });
+        assert!(
+            unfenced_binding_observed && !fenced_names.0.is_empty(),
+            "both constructors must have produced their owner-scoped identities"
+        );
+        assert_eq!(
+            occurrences(&fenced, fenced_requested.event),
+            1,
+            "the fenced contour must record its requested row exactly once"
+        );
+        assert_eq!(
+            occurrences(&fenced, fenced_admitted.event),
+            1,
+            "the fenced contour must record its admitted row exactly once"
+        );
+        assert!(
+            !fenced.contains(super::BOUNDARY_JOBS_REQUESTED.event)
+                && !fenced.contains(super::BOUNDARY_JOBS_ADMITTED.event),
+            "the fenced contour must never emit the unfenced launch claim, got: {fenced}"
+        );
+        assert!(
+            !fenced.contains("process_started")
+                && !fenced.contains(super::BOUNDARY_READINESS_PROOF_READY.event),
+            "missing launch evidence must suppress every process/readiness success event, got: {fenced}"
+        );
+        assert!(
+            unfenced.contains(super::BOUNDARY_JOBS_REQUESTED.event)
+                && unfenced.contains(super::BOUNDARY_JOBS_ADMITTED.event),
+            "the live constructor still records its own launch rows, got: {unfenced}"
+        );
+
+        // The facade seam: an admitted-but-unproven request never becomes an
+        // Event Log start record, so a suppressed success event stays
+        // suppressed all the way to the typed sink gate.
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+        assert!(
+            !AdmittedEvent::ServiceStart.is_admitted_by(HostRequestEvidence::Admitted),
+            "an admitted request alone must never admit a start record"
+        );
+        assert!(
+            !AdmittedEvent::ServiceStart
+                .is_admitted_by(HostRequestEvidence::ProcessStarted),
+            "only an observed process start admits the start record"
+        );
+        let dropped = capture_records(|| {
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::admitted(
+                    super::host_diagnostics::EntrypointStage::Startup,
+                    &super::HostLaunchOptions {
+                        config_descriptor_path: std::path::PathBuf::from(
+                            "891-case-17-config.json",
+                        ),
+                        config_descriptor_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
+                        installation: host.installation.clone(),
+                        transaction_plan_generation: 3,
+                        host_state_root: std::path::PathBuf::from("891-case-17-host-state"),
+                        registration_nonce: None,
+                    },
+                ),
+            );
+        });
+        assert!(
+            dropped.contains("evidence=\"admitted\"") && !dropped.contains("evidence=\"process_started\""),
+            "the suppressed contour must render its admitted evidence only, got: {dropped}"
+        );
+        assert!(
+            !dropped.contains("host.event_log_admission"),
+            "an unproven start must never reach the Event Log admission seam, got: {dropped}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/18
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 18 keeps the healthy and failing sink runs, their byte comparison, and the unchanged owner result in one deterministic walk"
+    )]
+    fn case_18_sink_failure_leaves_result_order_status_and_cleanup_unchanged() {
+        /// Sink that records every byte it is handed and then fails the write:
+        /// the record was produced and ordered by production, and the sink
+        /// dropped it on the way out.
+        #[derive(Clone, Default)]
+        struct FaultyCapture {
+            seen: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Write for FaultyCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.seen
+                    .lock()
+                    .map_err(|_| std::io::Error::other("faulty capture poisoned"))?
+                    .extend_from_slice(buf);
+                Err(std::io::Error::other("injected sink failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The real owner under test: creating the Job identities returns a
+        // result and records two launch rows. Run the identical production
+        // sequence twice, once under the healthy sink and once under a sink
+        // that fails every write.
+        let host = test_host();
+        let mut healthy_result = String::new();
+        let healthy = capture_records(|| {
+            let branches = super::HostJobBranches::new(&host)
+                .expect("the live job identities must be constructible");
+            assert!(
+                branches.kernel.is_none() && branches.store.is_none(),
+                "creating identities adopts no child"
+            );
+            assert!(
+                !branches.has_recorded_contour(),
+                "creating identities records no contour"
+            );
+            healthy_result = branches.kernel_name().to_owned();
+        });
+
+        let faulty = FaultyCapture::default();
+        let writer = faulty.clone();
+        let mut failed_result = String::new();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let branches = super::HostJobBranches::new(&host)
+                    .expect("a failing sink must not change the owner's result");
+                assert!(
+                    branches.kernel.is_none() && branches.store.is_none(),
+                    "a failing sink must not change the owner's service status"
+                );
+                assert!(
+                    !branches.has_recorded_contour(),
+                    "a failing sink must not change the owner's cleanup state"
+                );
+                failed_result = branches.kernel_name().to_owned();
+            });
+        }
+        let failed = String::from_utf8_lossy(
+            &faulty
+                .seen
+                .lock()
+                .expect("faulty capture is poisoned only by a panicking writer")
+                .clone(),
+        )
+        .into_owned();
+
+        // Result: byte-identical, so a dropped record cannot replace or
+        // swallow the owner's own value.
+        assert_eq!(
+            healthy_result, failed_result,
+            "a failing sink must not change the owner's own result"
+        );
+        assert!(
+            !healthy_result.is_empty(),
+            "the owner must have produced its Job identity"
+        );
+
+        // Order and content: the failing sink was handed exactly the records
+        // the healthy sink received, in the same order. A drop loses the
+        // delivery, never a record or its position.
+        assert_eq!(
+            detail_order(&healthy),
+            detail_order(&failed),
+            "a failing sink must not change, drop, or reorder a single record"
+        );
+        assert!(
+            failed.contains(super::BOUNDARY_JOBS_REQUESTED.event)
+                && failed.contains(super::BOUNDARY_JOBS_ADMITTED.event),
+            "the failing sink was still handed both launch records, got: {failed}"
+        );
+        assert!(
+            occurrences(&failed, "host.terminal_error") == 0,
+            "a successful operation emits no terminal under any sink"
+        );
+
+        // A failed operation emits its one terminal under a failing sink too:
+        // the drop loses the record, never the emission decision.
+        let faulty = FaultyCapture::default();
+        let writer = faulty.clone();
+        {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let _guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
+            });
+        }
+        let dropped_terminal = String::from_utf8_lossy(
+            &faulty
+                .seen
+                .lock()
+                .expect("faulty capture is poisoned only by a panicking writer")
+                .clone(),
+        )
+        .into_owned();
+        assert!(
+            dropped_terminal.contains(super::BOUNDARY_STOP_TERMINAL.event),
+            "the failing sink was still handed the terminal record, got: {dropped_terminal}"
+        );
+
+        // The typed Event Log seam answers for itself and never becomes the
+        // owner's result: admission is a closed typed name and a drop may only
+        // raise the monotone count.
+        let admission = super::windows_event_log::try_admit_admitted_event(
+            super::windows_event_log::AdmittedEvent::ServiceStop,
+            "891-case-18-stop",
+        );
+        let repeat = super::windows_event_log::try_admit_admitted_event(
+            super::windows_event_log::AdmittedEvent::ServiceStop,
+            "891-case-18-stop",
+        );
+        assert!(
+            matches!(
+                admission.as_str(),
+                "admitted"
+                    | "admitted_truncated"
+                    | "queue_full"
+                    | "producer_busy"
+                    | "formatting_panic_contained"
+                    | "not_started"
+                    | "shutdown"
+                    | "worker_unavailable"
+            ),
+            "the sink must answer with a closed typed admission name, got: {}",
+            admission.as_str()
+        );
+        assert!(
+            repeat.dropped_total() >= admission.dropped_total(),
+            "a dropped record may only raise the monotone drop count"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/19
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 19 keeps the launch-environment projection, its reserved-key replacement, and the rendered canary audit in one deterministic walk"
+    )]
+    fn case_19_credential_env_and_db_canaries_are_absent() {
+        // The frozen contract: the launch rows carry owner identities only, so
+        // no environment or credential material has a vocabulary to reach.
+        assert_eq!(
+            row(super::BOUNDARY_JOBS_FENCED_ADMITTED).owner_state,
+            "HostInstallationEpoch/fenced identity",
+            "the admitted row must record an owner identity, never ambient state"
+        );
+
+        const ENV_CANARY: &str = "891-case-19-env-canary";
+        const CREDENTIAL_CANARY: &str = "891-case-19-credential-canary";
+        const DB_CANARY: &str = "891-case-19-db-canary";
+
+        // The real owner: the launch-environment projection scrubs every
+        // reserved key from the ambient environment and rebinds it to the
+        // owner's own admitted values, so a poisoned ambient key cannot reach
+        // the child at all.
+        let host = test_host();
+        let generation = PlatformHandle::new("891-case-19-generation").unwrap();
+        let config_digest = PlatformHandle::new("a".repeat(64)).unwrap();
+        let artifact = PlatformHandle::new("b".repeat(64)).unwrap();
+        let branches = super::HostJobBranches::new_fenced(&host)
+            .expect("the fenced job projection must be constructible");
+        let ambient: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![
+            (
+                std::ffi::OsString::from("ELIOT_HOST_INSTALLATION"),
+                std::ffi::OsString::from(CREDENTIAL_CANARY),
+            ),
+            (
+                std::ffi::OsString::from("ELIOT_ACTIVATION_NONCE"),
+                std::ffi::OsString::from(ENV_CANARY),
+            ),
+            (
+                std::ffi::OsString::from("ELIOT_APPROVED_GENERATION"),
+                std::ffi::OsString::from(ENV_CANARY),
+            ),
+            (
+                std::ffi::OsString::from("ELIOT_STORE_CREDENTIAL"),
+                std::ffi::OsString::from(CREDENTIAL_CANARY),
+            ),
+        ];
+        let environment = super::HostJobBranches::environment_from(
+            ambient,
+            &host,
+            &generation,
+            &config_digest,
+            &artifact,
+            std::path::Path::new("891-case-19-config.json"),
+            &branches.kernel_identity,
+            None,
+            None,
+        );
+        let value_of = |key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            value_of("ELIOT_HOST_INSTALLATION").as_deref(),
+            Some(host.installation.as_str()),
+            "the installation binding must come from the owner, never the ambient value"
+        );
+        assert_eq!(
+            value_of("ELIOT_APPROVED_GENERATION").as_deref(),
+            Some(generation.as_str()),
+            "the generation binding must come from the owner, never the ambient value"
+        );
+        for (key, canary) in [
+            ("ELIOT_HOST_INSTALLATION", CREDENTIAL_CANARY),
+            ("ELIOT_ACTIVATION_NONCE", ENV_CANARY),
+            ("ELIOT_APPROVED_GENERATION", ENV_CANARY),
+        ] {
+            assert!(
+                !value_of(key).is_some_and(|value| value.contains(canary)),
+                "reserved key {key} must never keep its ambient canary"
+            );
+        }
+
+        // The rendered-record audit: the real observations for this contour and
+        // a real Store-census failure carrying a DB canary render owner
+        // identities and typed reasons only.
+        let emitted = capture_records(|| {
+            super::lifecycle_context(&host, "891-case-19-start-manifest").unwrap();
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::failed(
+                    super::host_diagnostics::EntrypointStage::Startup,
+                    &super::HostError::StoreCensusIo(std::io::Error::other(DB_CANARY)),
+                )
+                .with_launch_options(&super::HostLaunchOptions {
+                    config_descriptor_path: std::path::PathBuf::from(
+                        "C:\\891-case-19-store\\credentials.json",
+                    ),
+                    config_descriptor_digest: config_digest.clone(),
+                    installation: host.installation.clone(),
+                    transaction_plan_generation: 11,
+                    host_state_root: std::path::PathBuf::from("C:\\891-case-19-host-state"),
+                    registration_nonce: Some(PlatformHandle::new("c".repeat(64)).unwrap()),
+                }),
+            );
+            super::host_lifecycle_observe_requested(super::BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED);
+        });
+        assert!(
+            emitted.contains(&format!("installation={:?}", host.installation.as_str()))
+                && emitted.contains("generation=11"),
+            "the record must carry the owner's own admitted identities, got: {emitted}"
+        );
+        assert!(
+            emitted.contains("reason=\"store_census_runtime\""),
+            "the Store failure must render its typed reason kind, got: {emitted}"
+        );
+        for canary in [ENV_CANARY, CREDENTIAL_CANARY, DB_CANARY] {
+            assert!(
+                !emitted.contains(canary),
+                "no environment, credential, or Store canary may reach a rendered record, got: {emitted}"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 891/20
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 20 keeps the SCM cause classification, its bounded detail, and the rendered SCM/user/source audit in one deterministic walk"
+    )]
+    fn case_20_scm_source_and_user_canaries_are_absent() {
+        // The frozen contract: the SCM rows carry the operation and its
+        // identities, never a registration payload or an account.
+        assert_eq!(
+            row(super::BOUNDARY_RUNTIME_CONTROL_REQUESTED).owner_state,
+            "owner lease activation capability",
+            "the SCM row must record an owner capability, never SCM payload data"
+        );
+
+        const SERVICE_CANARY: &str = "891-case-20-scm-canary-service";
+        const USER_CANARY: &str = "891-case-20-user-canary";
+        const COMMAND_CANARY: &str = "891-case-20-command-canary";
+
+        // The real owner: the SCM classifier answers with one of three closed
+        // typed causes and a bounded detail, whatever the inspection reports.
+        let image = std::env::current_exe().expect("test image must be resolvable");
+        let registration = super::ServiceRegistrationRequest::new(
+            super::ELIOT_HOST_SERVICE_NAME,
+            super::ELIOT_HOST_SERVICE_NAME,
+            &image,
+            super::ServiceStartMode::Automatic,
+            super::ServiceAccount::LocalService,
+        )
+        .expect("the canonical registration request must build");
+        let absent = super::classify_host_scm_inspection(
+            &registration,
+            &super::ServiceRegistrationRuntimeInspection::Absent,
+        )
+        .expect("an absent registration must classify");
+        let mismatched = super::classify_host_scm_inspection(
+            &registration,
+            &super::ServiceRegistrationRuntimeInspection::Mismatched,
+        )
+        .expect("a mismatched registration must classify");
+        assert_eq!(absent.cause(), "absent");
+        assert_eq!(mismatched.cause(), "mismatched");
+        assert_ne!(absent.cause(), mismatched.cause());
+        assert!(
+            !absent.cause().contains(' '),
+            "a machine SCM status must be a closed typed name, got: {}",
+            absent.cause()
+        );
+        let oversized = super::HostScmRegistrationCause::Mismatched {
+            inspection_debug: "x".repeat(4 * super::HOST_SCM_CAUSE_MAX_CHARS),
+        };
+        assert!(
+            oversized.detail().chars().count() <= super::HOST_SCM_CAUSE_MAX_CHARS,
+            "the SCM detail must stay inside its declared bound"
+        );
+
+        // The real SCM refusal owner: the owner-visible pending reference is
+        // built from the canonical operation and the request digests, while
+        // the rendered SCM records carry the frozen boundary vocabulary only.
+        let request = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new(USER_CANARY).unwrap(),
+        )
+        .unwrap();
+        request.validate().unwrap();
+        let pending_ref = super::runtime_control_unknown_ref("kernel-restart", &request);
+        let refusal =
+            super::HostRuntimeControlResponse::unknown_for(&request, pending_ref.clone());
+        assert!(
+            eliot_host_service::runtime_control::response_matches_request(&request, &refusal),
+            "the typed refusal must answer its own SCM request"
+        );
+        assert!(
+            pending_ref.as_str().contains("RestartKernel"),
+            "the owner's pending reference names the canonical operation, got: {pending_ref:?}"
+        );
+
+        let emitted = capture_records(|| {
+            super::host_lifecycle_observe_scm(super::BOUNDARY_RUNTIME_CONTROL_REQUESTED);
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::observed(
+                    super::host_diagnostics::EntrypointStage::ScmDispatch,
+                )
+                .with_process(std::process::id()),
+            );
+        });
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_RUNTIME_CONTROL_REQUESTED.event),
+            1,
+            "the SCM dispatch must record its requested row exactly once"
+        );
+        assert_eq!(
+            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_REQUESTED.event),
+            1,
+            "the restart dispatch must record its requested row exactly once"
+        );
+        assert!(
+            emitted.contains("request_missing=true") && emitted.contains("operation_missing=true"),
+            "the SCM dispatch has no console-request or service-operation value and must say so, got: {emitted}"
+        );
+        for canary in [SERVICE_CANARY, USER_CANARY, COMMAND_CANARY] {
+            assert!(
+                !emitted.contains(canary),
+                "no SCM payload, source, or user value may reach a rendered record, got: {emitted}"
+            );
+        }
+        assert!(
+            !emitted.contains("LocalService") && !emitted.contains("S-1-5-19"),
+            "the service account must never reach a rendered record, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("inspection"),
+            "no SCM inspection payload may reach a rendered record, got: {emitted}"
+        );
+    }
+
+    // WORK_UNIT_CASE: 891/21
+    #[cfg(windows)]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "case 21 keeps the injected schedule, the two captured runs, and the observational-timing separation in one deterministic walk"
+    )]
+    fn case_21_injected_schedule_gives_deterministic_semantic_records() {
+        // The frozen contract: the schedule rows are fixed, so two runs of the
+        // same injected schedule must render the same semantic records.
+        let schedule = [
+            super::BOUNDARY_JOBS_FENCED_REQUESTED,
+            super::BOUNDARY_JOBS_FENCED_ADMITTED,
+            super::BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED,
+            super::BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED,
+            super::BOUNDARY_STOP_REQUESTED,
+            super::BOUNDARY_DRAIN_REQUESTED,
+            super::BOUNDARY_STOP_STOPPED,
+        ];
+        let expected: Vec<&str> = schedule.iter().map(|row| row.event).collect();
+
+        // The injected schedule seam: a pure wait clamp over the caller's hint,
+        // with no clock, sleep, or deadline of its own.
+        assert_eq!(
+            super::watchdog_start_wait(0),
+            std::time::Duration::from_millis(25),
+            "the injected schedule clamps to its lower bound"
+        );
+        assert_eq!(
+            super::watchdog_start_wait(1_000),
+            std::time::Duration::from_millis(250),
+            "the injected schedule clamps to its upper bound"
+        );
+        assert_eq!(
+            super::watchdog_start_wait(u32::MAX),
+            super::watchdog_start_wait(1_000),
+            "the injected schedule is a pure function of the hint"
+        );
+        assert_eq!(super::WATCHDOG_START_TIMEOUT_MS, 30_000);
+
+        let run = || {
+            capture_records(|| {
+                let host = test_host();
+                super::HostJobBranches::new_fenced(&host)
+                    .expect("the fenced job projection must be constructible");
+                super::lifecycle_context(&host, "891-case-21-schedule")
+                    .expect("the lifecycle context must be constructible");
+                for boundary in [
+                    super::BOUNDARY_STOP_REQUESTED,
+                    super::BOUNDARY_DRAIN_REQUESTED,
+                    super::BOUNDARY_STOP_STOPPED,
+                ] {
+                    super::host_lifecycle_observe_drain(boundary);
+                }
+            })
+        };
+        let first = run();
+        let second = run();
+
+        assert!(
+            first.lines().count() > 1,
+            "the captured run must hold the rendered records, got: {first}"
+        );
+        assert!(
+            first
+                .lines()
+                .all(|line| line.contains(" INFO ") || line.contains(" ERROR ")),
+            "every rendered record must carry its level, so observational timing is separable, got: {first}"
+        );
+        assert_eq!(
+            semantic_records(&first),
+            semantic_records(&second),
+            "two runs of the same injected schedule must render identical semantic records"
+        );
+        assert_eq!(
+            detail_order(&first),
+            detail_order(&second),
+            "the injected schedule must render in the same order every run"
+        );
+        for boundary in [
+            super::BOUNDARY_JOBS_FENCED_REQUESTED,
+            super::BOUNDARY_JOBS_FENCED_ADMITTED,
+            super::BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED,
+            super::BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED,
+            super::BOUNDARY_STOP_REQUESTED,
+            super::BOUNDARY_DRAIN_REQUESTED,
+            super::BOUNDARY_STOP_STOPPED,
+        ] {
+            assert_eq!(
+                occurrences(&first, boundary.event),
+                1,
+                "each scheduled boundary must render exactly once, got: {first}"
+            );
+        }
+        let rendered_order = detail_order(&first);
+        let scheduled: Vec<&str> = rendered_order
+            .iter()
+            .copied()
+            .filter(|detail| expected.contains(detail))
+            .collect();
+        assert_eq!(
+            scheduled,
+            vec![
+                super::BOUNDARY_JOBS_FENCED_REQUESTED.event,
+                super::BOUNDARY_JOBS_FENCED_ADMITTED.event,
+                super::BOUNDARY_LIFECYCLE_CONTEXT_REQUESTED.event,
+                super::BOUNDARY_LIFECYCLE_CONTEXT_ADMITTED.event,
+                super::BOUNDARY_STOP_REQUESTED.event,
+                super::BOUNDARY_DRAIN_REQUESTED.event,
+                super::BOUNDARY_STOP_STOPPED.event,
+            ],
+            "the rendered semantic records must follow the injected schedule order, got: {rendered_order:?}"
+        );
+        assert!(
+            !first.contains("elapsed=") && !first.contains("duration=") && !first.contains("ts="),
+            "no wall-clock timing may enter the semantic records, got: {first}"
         );
     }
 }
