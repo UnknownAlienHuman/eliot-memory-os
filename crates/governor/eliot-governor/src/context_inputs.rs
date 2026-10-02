@@ -52,8 +52,22 @@
 //! scan are reported as `Unavailable`/`Unknown`/`Partial` — never as empty.
 //! Each role response is bound to the requested operation, scope, selector and
 //! payload version before it becomes a disposition, so a response answering a
-//! different task/problem/skill is never adopted just because its operation
-//! and fence match.
+//! different task/problem/skill/position is never adopted just because its
+//! operation and fence match. The four task-bound envelopes echo their
+//! selector as an envelope member ([`classify_role_envelope`]); the evidence
+//! pack echoes `subject` and `scope_id` ([`classify_evidence_payload`]); the
+//! position read is not a selector envelope, so it is bound against the identity
+//! it carries itself — its own `EPISTEMIC_REVISION_SCHEMA`, the scope its
+//! candidate and transition carry, and the position its transition and every
+//! admitted row name ([`bind_position_payload`]).
+//!
+//! Content discipline: that binding decides the disposition AND whether the
+//! response's records are admissible. Only a response whose version, scope,
+//! selector and page provenance were all proved against the request keeps its
+//! records ([`admits_source_records`]); a refused or undescribed response keeps
+//! no records, no read identity and no observed heads, so no caller and no
+//! serialization can adopt a foreign or contract-invalid envelope. The state
+//! word is never a label on bytes that are still travelling.
 //!
 //! Page-provenance discipline (#2857): one shared rule
 //! ([`classify_role_page`]) judges every role page's declared extent, so a
@@ -94,7 +108,8 @@ use eliot_read::{
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, ScopeRevisionView, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback,
+    ScopeId, ScopeRevisionView, WriteReceiptStatus,
+    epistemic_revision::{EPISTEMIC_REVISION_SCHEMA, EpistemicPositionReadback},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -157,6 +172,16 @@ pub enum ContextInputsError {
     /// outcome); this is a programming error, never a role disposition.
     #[error("context reconstruction role request was rejected: {0}")]
     RequestRejected(String),
+    /// A role in the reconstructed closure carries source content its own
+    /// disposition does not admit, so the closure cannot be exposed.
+    ///
+    /// This is the structural content invariant ([`admits_source_records`])
+    /// stated once for all seven slots. It is unreachable while every role is
+    /// built by [`RoleAcquisition::from_response`]; it exists so a future
+    /// classifier change is refused at the read boundary instead of silently
+    /// publishing records for a state that does not admit them.
+    #[error("context reconstruction role content is not admitted by its state: {0}")]
+    ContentNotAdmitted(String),
     /// The `GetAttentionAndProblems` page the attention role returned is not a
     /// decodable, ordered history of canonical Problem revisions, so no committed
     /// Problem can be read back from it.
@@ -300,11 +325,23 @@ impl ContextReconstructionRequest {
     }
 }
 
-/// One acquired role: its disposition, raw payload, and observed heads.
+/// One acquired role: its disposition, and the source records that disposition
+/// admits.
 ///
-/// Payloads stay opaque here; the candidate stage (T11.4) binds them to the
-/// seven typed input families. A `None` payload always pairs with a
-/// non-`Complete` disposition.
+/// The fields are never assembled independently of each other: every role is
+/// built by [`RoleAcquisition::from_response`], so one classification decides
+/// the disposition, the payload, the identity and the observed heads together.
+///
+/// * `Complete`, `KnownEmpty` and `Partial` admit the validated envelope: an
+///   exact version/scope/selector binding with a coherent page-provenance
+///   tuple, carried whole (`Partial` is the bounded real prefix its consumers
+///   read).
+/// * Every other state — a version/scope/selector/shape mismatch, undescribed
+///   or contradictory provenance, `Unknown`, `Unavailable`, `Stale`, `Blocked`,
+///   `Missing`, or any transport failure — admits nothing. A refused envelope
+///   describes another request's source snapshot, so carrying its bytes (or the
+///   identity that binds them) would adopt it at the public read boundary
+///   (I1.8's exact named-read capability). Its typed reason stays in `state`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAcquisition {
@@ -312,17 +349,106 @@ pub struct RoleAcquisition {
     pub operation: NamedReadOperation,
     /// Completeness state of this role (`inputs.rs:188-282` vocabulary).
     pub state: ProjectionState,
-    /// Opaque payload for a completed role; `None` otherwise.
+    /// Opaque payload of the validated envelope; present exactly when
+    /// [`admits_source_records`] holds for `state`, and `None` otherwise.
     pub payload: Option<Value>,
-    /// Revision heads observed with this role's read.
+    /// Revision heads observed with this role's read; empty exactly when
+    /// `payload` is `None`.
     pub revision_heads: Vec<RevisionHead>,
     /// Exact read identity this role is bound to (`#1144` retained-read
     /// binding): principal, scope, fence, consistency, declared and observed
     /// heads, order heads, source, projection schema, coverage and the exact
-    /// invalidation conditions. `None` exactly when the role is not `Complete`
-    /// or `KnownEmpty`, so a retained role can always be revalidated from its
-    /// own record instead of re-deriving freshness from the payload.
+    /// invalidation conditions. Present exactly when the role retains its
+    /// validated envelope, so a retained role can always be revalidated from
+    /// its own record instead of re-deriving freshness from the payload, and
+    /// an identity that binds a refused payload is never presented as the
+    /// identity of an accepted role.
     pub identity: Option<ReadIdentity>,
+}
+
+impl RoleAcquisition {
+    /// Builds one acquired role from a successful transport response whose
+    /// content this classification admits.
+    ///
+    /// This is the single construction site a successful role uses, so the
+    /// disposition and the retention of bytes cannot drift apart: a
+    /// non-content-bearing state stores no payload, no identity and no heads.
+    fn from_response(
+        operation: NamedReadOperation,
+        state: ProjectionState,
+        payload: Value,
+        revision_heads: Vec<RevisionHead>,
+        identity: ReadIdentity,
+    ) -> Self {
+        let (payload, revision_heads) = admitted_envelope(&state, payload, revision_heads);
+        let identity = admits_source_records(&state).then_some(identity);
+        Self {
+            operation,
+            state,
+            payload,
+            revision_heads,
+            identity,
+        }
+    }
+
+    /// Builds one acquired role for a failed read, which by definition retains
+    /// nothing: the read produced no envelope to bind.
+    fn from_failure(operation: NamedReadOperation, state: ProjectionState) -> Self {
+        Self {
+            operation,
+            state,
+            payload: None,
+            revision_heads: Vec::new(),
+            identity: None,
+        }
+    }
+}
+
+/// Retains one successful response's source records only when its
+/// classification admits them, and drops them otherwise.
+///
+/// This is the one retention rule every acquisition site shares, so the
+/// disposition and the stored bytes cannot disagree: a response the classifier
+/// refused contributes no payload and no observed heads to the role it becomes.
+/// Its typed reason stays in the role's [`ProjectionState`].
+fn admitted_envelope(
+    state: &ProjectionState,
+    payload: Value,
+    revision_heads: Vec<RevisionHead>,
+) -> (Option<Value>, Vec<RevisionHead>) {
+    if admits_source_records(state) {
+        (Some(payload), revision_heads)
+    } else {
+        (None, Vec::new())
+    }
+}
+
+/// Whether one classified role disposition admits the source records that
+/// travelled with it.
+///
+/// The rule is the exact binding this reconstruction asked for, read by
+/// [`classify_role_page`]:
+///
+/// - `Complete` — an authoritative completed lookup whose page describes every
+///   matched row;
+/// - `KnownEmpty` — the same completed lookup that authoritatively matched no
+///   row;
+/// - `Partial` — a coherent bounded page: the exact-selector prefix of the rows
+///   the source holds. It is real evidence, so it is retained whole and its
+///   consumers (`problem_read_site::read_committed_problem`) read it as a
+///   labelled prefix rather than dropping it.
+///
+/// Everything else is non-content-bearing: a version/scope/selector/shape
+/// mismatch or undescribed provenance (`Unavailable`, `Unknown`), a read that
+/// never observed this fence (`Stale`), a blocked or unsupplied one
+/// (`Blocked`, `Missing`), or a transport failure. None of those states may
+/// carry raw records, and none may be paired with the identity and observed
+/// heads of a rejected envelope.
+fn admits_source_records(state: &ProjectionState) -> bool {
+    matches!(
+        state,
+        ProjectionState::Complete | ProjectionState::KnownEmpty | ProjectionState::Partial { .. }
+    )
 }
 
 /// The reconstructed seven-role input closure.
@@ -384,15 +510,8 @@ impl SevenRoleInputs {
     /// Returns every role label with its disposition, in slot order.
     #[must_use]
     pub fn role_states(&self) -> [(&'static str, &ProjectionState); 7] {
-        [
-            (ROLE_TASK_FRAME, &self.task_frame.state),
-            (ROLE_ATTENTION_CONFLICT, &self.attention.state),
-            (ROLE_EPISTEMIC_POSITION, &self.epistemic.state),
-            (ROLE_CUE_ACTIVATION, &self.cue.state),
-            (ROLE_NEGATIVE_MEMORY, &self.negative_memory.state),
-            (ROLE_EVIDENCE_ASSURANCE, &self.evidence.state),
-            (ROLE_AFFORDANCES, &self.affordances.state),
-        ]
+        self.role_acquisitions()
+            .map(|(label, role)| (label, &role.state))
     }
 
     /// Returns the labels of roles whose source could not be read or
@@ -423,6 +542,49 @@ impl SevenRoleInputs {
     #[must_use]
     pub fn has_unsupported_distinct_from_empty(&self) -> bool {
         !self.unsupported_role_names().is_empty()
+    }
+
+    /// The structural content invariant of this closure.
+    ///
+    /// A disposition that does not admit source records must retain none of
+    /// them: no payload, no read identity, no observed heads. A content-bearing
+    /// disposition may legitimately retain nothing — a read the owner itself
+    /// refused reports `Partial` through [`classify_read_outcome`] while holding
+    /// no envelope at all, and an unsupported source reports `Missing` — so this
+    /// states the direction that admits no leak, rather than requiring content
+    /// that a failed read never had.
+    ///
+    /// This is the one place the rule covers all seven slots at once, so the
+    /// public read boundary proves it before serializing instead of trusting each
+    /// acquisition site or each future classifier change to remember it.
+    pub fn validate_content_admission(&self) -> Result<(), ContextInputsError> {
+        for (label, role) in self.role_acquisitions() {
+            if admits_source_records(&role.state) {
+                continue;
+            }
+            if role.payload.is_some() || role.identity.is_some() || !role.revision_heads.is_empty()
+            {
+                return Err(ContextInputsError::ContentNotAdmitted(format!(
+                    "{label} retains source content under {:?}",
+                    role.state
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every role acquisition with its label, in slot order.
+    #[must_use]
+    pub fn role_acquisitions(&self) -> [(&'static str, &RoleAcquisition); 7] {
+        [
+            (ROLE_TASK_FRAME, &self.task_frame),
+            (ROLE_ATTENTION_CONFLICT, &self.attention),
+            (ROLE_EPISTEMIC_POSITION, &self.epistemic),
+            (ROLE_CUE_ACTIVATION, &self.cue),
+            (ROLE_NEGATIVE_MEMORY, &self.negative_memory),
+            (ROLE_EVIDENCE_ASSURANCE, &self.evidence),
+            (ROLE_AFFORDANCES, &self.affordances),
+        ]
     }
 }
 
@@ -635,20 +797,17 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             )
             .await
         {
-            Ok(response) => Ok(RoleAcquisition {
+            Ok(response) => Ok(RoleAcquisition::from_response(
                 operation,
-                state: classify_role_envelope(&response.view.payload, &request.scope_id, binding),
-                payload: Some(response.view.payload),
-                revision_heads: response.view.revision_heads,
-                identity: Some(response.identity),
-            }),
-            Err(error) => Ok(RoleAcquisition {
+                classify_role_envelope(&response.view.payload, &request.scope_id, binding),
+                response.view.payload,
+                response.view.revision_heads,
+                response.identity,
+            )),
+            Err(error) => Ok(RoleAcquisition::from_failure(
                 operation,
-                state: classify_read_error(error)?,
-                payload: None,
-                revision_heads: Vec::new(),
-                identity: None,
-            }),
+                classify_read_error(error)?,
+            )),
         }
     }
 
@@ -687,9 +846,9 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             )
             .await
         {
-            Ok(response) => Ok(RoleAcquisition {
+            Ok(response) => Ok(RoleAcquisition::from_response(
                 operation,
-                state: classify_role_envelope(
+                classify_role_envelope(
                     &response.view.payload,
                     &request.scope_id,
                     SelectorBinding {
@@ -697,17 +856,14 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                         expected: Some(selector),
                     },
                 ),
-                payload: Some(response.view.payload),
-                revision_heads: response.view.revision_heads,
-                identity: Some(response.identity),
-            }),
-            Err(error) => Ok(RoleAcquisition {
+                response.view.payload,
+                response.view.revision_heads,
+                response.identity,
+            )),
+            Err(error) => Ok(RoleAcquisition::from_failure(
                 operation,
-                state: classify_read_error(error)?,
-                payload: None,
-                revision_heads: Vec::new(),
-                identity: None,
-            }),
+                classify_read_error(error)?,
+            )),
         }
     }
 
@@ -778,27 +934,24 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             Ok(response) => response,
             Err(error) => {
                 return Ok((
-                    RoleAcquisition {
-                        operation,
-                        state: classify_read_error(error)?,
-                        payload: None,
-                        revision_heads: Vec::new(),
-                        identity: None,
-                    },
+                    RoleAcquisition::from_failure(operation, classify_read_error(error)?),
                     None,
                 ));
             }
         };
-        let (state, readback) = decode_epistemic_payload(&response.view.payload);
-        let payload = Some(response.view.payload);
+        let (state, readback) = decode_epistemic_payload(
+            &response.view.payload,
+            &request.scope_id,
+            &request.epistemic_position,
+        );
         Ok((
-            RoleAcquisition {
-                operation: response.view.operation,
+            RoleAcquisition::from_response(
+                response.view.operation,
                 state,
-                payload,
-                revision_heads: response.view.revision_heads,
-                identity: Some(response.identity),
-            },
+                response.view.payload,
+                response.view.revision_heads,
+                response.identity,
+            ),
             readback,
         ))
     }
@@ -844,13 +997,10 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
         {
             Ok(response) => response,
             Err(error) => {
-                return Ok(RoleAcquisition {
+                return Ok(RoleAcquisition::from_failure(
                     operation,
-                    state: classify_read_error(error)?,
-                    payload: None,
-                    revision_heads: Vec::new(),
-                    identity: None,
-                });
+                    classify_read_error(error)?,
+                ));
             }
         };
         let state = classify_evidence_payload(
@@ -858,13 +1008,13 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             &request.scope_id,
             &request.evidence_subject,
         );
-        Ok(RoleAcquisition {
-            operation: response.view.operation,
+        Ok(RoleAcquisition::from_response(
+            response.view.operation,
             state,
-            payload: Some(response.view.payload),
-            revision_heads: response.view.revision_heads,
-            identity: Some(response.identity),
-        })
+            response.view.payload,
+            response.view.revision_heads,
+            response.identity,
+        ))
     }
 }
 
@@ -1281,16 +1431,36 @@ fn classify_role_envelope(
     }
 }
 
-/// Decodes the current-position payload into the T11.2 readback shape.
+/// Decodes the current-position payload into the T11.2 readback shape, bound to
+/// the exact `position` selector and scope this reconstruction asked for.
 ///
-/// `None` from a successful read is an authoritative empty positions view.
-/// A non-committed or undecodable payload is `Unavailable`, never empty and
-/// never promoted: only an external receipt proves an admitted position.
+/// A `null` payload is the source's own authoritative empty positions view: the
+/// Store keys the lookup by `position_key(scope, position)`, so it already
+/// answers THIS selector and there is no echoed identity left to compare.
+///
+/// Every other payload is bound by [`bind_position_payload`] before it is
+/// interpreted, because a readback for another position is as foreign as a
+/// readback with another `task_id`. A payload that fails the binding, does not
+/// decode, or carries no committed receipt is `Unavailable` with no readback
+/// exposed — never empty, never promoted: only an external receipt proves an
+/// admitted position.
 fn decode_epistemic_payload(
     payload: &Value,
+    scope: &ScopeId,
+    position: &str,
 ) -> (ProjectionState, Option<EpistemicPositionReadback>) {
-    let readback: Option<EpistemicPositionReadback> = match serde_json::from_value(payload.clone())
-    {
+    if payload.is_null() {
+        return (ProjectionState::KnownEmpty, None);
+    }
+    if let Some(reason) = bind_position_payload(payload, scope, position) {
+        return (
+            ProjectionState::Unavailable {
+                reason: bounded_reason("position readback is not this request", reason),
+            },
+            None,
+        );
+    }
+    let readback: EpistemicPositionReadback = match serde_json::from_value(payload.clone()) {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -1301,16 +1471,59 @@ fn decode_epistemic_payload(
             );
         }
     };
-    match readback {
-        None => (ProjectionState::KnownEmpty, None),
-        Some(readback) if readback.receipt.status != WriteReceiptStatus::Committed => (
+    if readback.receipt.status != WriteReceiptStatus::Committed {
+        return (
             ProjectionState::Unavailable {
                 reason: "position readback carries no committed receipt".to_owned(),
             },
             None,
-        ),
-        Some(readback) => (ProjectionState::Complete, Some(readback)),
+        );
     }
+    (ProjectionState::Complete, Some(readback))
+}
+
+/// Returns why one current-position payload does not answer the requested
+/// `position` selector under `scope`, or `None` when it does.
+///
+/// The position read answers with the T11.2 readback rather than a selector
+/// envelope, so the echoed identity is read out of the same bytes the typed
+/// decode consumes: the declared readback `schema`, the scope its candidate and
+/// transition carry, the position its transition names, and the position every
+/// admitted row repeats on its own `AdmittedReceipt`. This is the same
+/// comparison [`classify_role_envelope`] makes on `version`/`scope_id`/
+/// `<selector>`, and it is a binding check rather than a second decode: every
+/// value is compared as recorded, and the typed decode with the contracts' own
+/// `validate()` still decides whether the page is usable at all.
+fn bind_position_payload(payload: &Value, scope: &ScopeId, position: &str) -> Option<&'static str> {
+    let echoes = |pointer: &str, expected: &str| {
+        payload.pointer(pointer).and_then(Value::as_str) == Some(expected)
+    };
+    if payload.get("schema").and_then(Value::as_str) != Some(EPISTEMIC_REVISION_SCHEMA) {
+        return Some("unsupported position readback schema");
+    }
+    if !echoes("/candidate/scope", scope.as_str())
+        || !echoes("/candidate/work_scope/scope_id", scope.as_str())
+        || !echoes("/transition/work_scope/scope_id", scope.as_str())
+    {
+        return Some("position scope mismatch");
+    }
+    if !echoes("/transition/position", position) || !echoes("/candidate/proposition", position) {
+        return Some("position selector mismatch");
+    }
+    let Some(admitted) = payload
+        .get("positions")
+        .and_then(Value::as_array)
+        .filter(|positions| !positions.is_empty())
+    else {
+        return Some("position readback served no admitted position");
+    };
+    if admitted
+        .iter()
+        .any(|view| view.pointer("/admission/position").and_then(Value::as_str) != Some(position))
+    {
+        return Some("an admitted position does not repeat the requested position");
+    }
+    None
 }
 
 /// Classifies an evidence-pack payload against its authoritative provenance.
@@ -1448,6 +1661,255 @@ mod reconstruction_tests {
             ProjectionState::Unavailable { .. }
         ));
         Ok(())
+    }
+
+    /// One well-formed task-state envelope for the exact requested selector.
+    fn bound_task_envelope(scope: &str, task_id: &str) -> Value {
+        serde_json::json!({
+            "version": ROLE_ENVELOPE_VERSION,
+            "scope_id": scope,
+            "task_id": task_id,
+            "records": [{"revision": 1}],
+            "provenance": {"matched_total": 1, "returned": 1, "truncated": false},
+        })
+    }
+
+    /// The identity a current-position readback echoes for one exact `position`
+    /// selector, at the shape the Store's position handler returns.
+    fn echoed_position(scope: &str, position: &str) -> Value {
+        serde_json::json!({
+            "schema": EPISTEMIC_REVISION_SCHEMA,
+            "positions": [{"admission": {"scope": scope, "position": position}}],
+            "candidate": {
+                "scope": scope,
+                "proposition": position,
+                "work_scope": {"scope_id": scope},
+            },
+            "transition": {
+                "position": position,
+                "work_scope": {"scope_id": scope},
+            },
+        })
+    }
+
+    #[test]
+    fn a_position_readback_is_bound_to_the_selector_and_scope_it_was_asked_for() -> ProofResult {
+        let scope = ScopeId::new("scope-a")?;
+        // Positive: the response's own schema, candidate/transition scope and
+        // transition position all name what this read asked for, so the binding
+        // admits it and the page reaches the typed decode — which is the only
+        // stage allowed to refuse it after that. The source's own empty answer
+        // for that same `position_key` stays an authoritative `KnownEmpty`.
+        let bound = echoed_position("scope-a", "position-a");
+        assert_eq!(bind_position_payload(&bound, &scope, "position-a"), None);
+        let (state, readback) = decode_epistemic_payload(&bound, &scope, "position-a");
+        assert!(matches!(
+            state,
+            ProjectionState::Unavailable { ref reason } if reason.contains("not a readback")
+        ));
+        assert!(readback.is_none());
+        let (empty, readback) = decode_epistemic_payload(&Value::Null, &scope, "position-a");
+        assert_eq!(empty, ProjectionState::KnownEmpty);
+        assert!(readback.is_none());
+
+        // Refusal: the same readback answering another position proves nothing
+        // about this request, so it is `Unavailable` on the binding itself and
+        // exposes no readback.
+        let foreign = echoed_position("scope-a", "position-b");
+        assert_eq!(
+            bind_position_payload(&foreign, &scope, "position-a"),
+            Some("position selector mismatch")
+        );
+        let (state, readback) = decode_epistemic_payload(&foreign, &scope, "position-a");
+        assert!(matches!(
+            state,
+            ProjectionState::Unavailable { ref reason } if reason.contains("not this request")
+        ));
+        assert!(readback.is_none());
+        Ok(())
+    }
+
+    /// The binding the `task_frame` slot was requested with.
+    fn task_binding<'a>(expected: Option<&'a str>) -> SelectorBinding<'a> {
+        SelectorBinding {
+            key: "task_id",
+            expected,
+        }
+    }
+
+    #[test]
+    fn bound_envelope_reaches_the_consumer_whole() -> ProofResult {
+        let scope = ScopeId::new("scope-a")?;
+        let heads = test_heads("scope-a")?.revision_heads;
+        // Positive: the exact version/scope/selector with coherent provenance is
+        // Complete, and every byte of it stays reachable to the consumers that
+        // read the role payload.
+        let payload = bound_task_envelope("scope-a", "task-a");
+        let state = classify_role_envelope(&payload, &scope, task_binding(Some("task-a")));
+        assert_eq!(state, ProjectionState::Complete);
+        let (retained, retained_heads) = admitted_envelope(&state, payload.clone(), heads.clone());
+        assert_eq!(retained.as_ref(), Some(&payload));
+        assert_eq!(retained_heads, heads);
+
+        // The bounded real prefix is retained whole too: `Partial` is a real
+        // exact-selector page, and `problem_read_site` reads it as a labelled
+        // prefix rather than losing it.
+        let truncated = serde_json::json!({
+            "version": ROLE_ENVELOPE_VERSION,
+            "scope_id": "scope-a",
+            "task_id": "task-a",
+            "records": [{"revision": 1}],
+            "provenance": {"matched_total": 4, "returned": 1, "truncated": true},
+        });
+        let bounded = classify_role_envelope(&truncated, &scope, task_binding(Some("task-a")));
+        assert!(matches!(bounded, ProjectionState::Partial { .. }));
+        let (retained, _) = admitted_envelope(&bounded, truncated, heads);
+        assert!(retained.is_some());
+
+        // An authoritative empty lookup keeps its validated envelope: it is a
+        // completed lookup that matched no row, not an absent read.
+        let empty = serde_json::json!({
+            "version": ROLE_ENVELOPE_VERSION,
+            "scope_id": "scope-a",
+            "task_id": "task-a",
+            "records": [],
+            "provenance": {"matched_total": 0, "returned": 0, "truncated": false},
+        });
+        let known_empty = classify_role_envelope(&empty, &scope, task_binding(Some("task-a")));
+        assert_eq!(known_empty, ProjectionState::KnownEmpty);
+        assert!(
+            admitted_envelope(&known_empty, empty, Vec::new())
+                .0
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refused_envelope_stores_no_records_and_never_serializes_them() -> ProofResult {
+        let scope = ScopeId::new("scope-a")?;
+        let heads = test_heads("scope-a")?.revision_heads;
+        // Every refusal below is a response that arrived under the expected
+        // operation and fence but does not answer THIS request. None of them may
+        // retain the records that travelled with it.
+        let refusals: [(&str, Value, ProjectionState); 5] = [
+            (
+                "foreign selector",
+                bound_task_envelope("scope-a", "task-b"),
+                ProjectionState::Unavailable {
+                    reason: "role payload fails its contract: role selector mismatch".to_owned(),
+                },
+            ),
+            (
+                "foreign scope",
+                bound_task_envelope("scope-b", "task-a"),
+                ProjectionState::Unavailable {
+                    reason: "role payload fails its contract: role scope mismatch".to_owned(),
+                },
+            ),
+            (
+                "unsupported version",
+                serde_json::json!({
+                    "version": ROLE_ENVELOPE_VERSION + 1,
+                    "scope_id": "scope-a",
+                    "task_id": "task-a",
+                    "records": [{"revision": 1}],
+                    "provenance": {"matched_total": 1, "returned": 1, "truncated": false},
+                }),
+                ProjectionState::Unavailable {
+                    reason: "role payload fails its contract: unsupported role payload version"
+                        .to_owned(),
+                },
+            ),
+            (
+                "missing records array",
+                serde_json::json!({
+                    "version": ROLE_ENVELOPE_VERSION,
+                    "scope_id": "scope-a",
+                    "task_id": "task-a",
+                    "provenance": {"matched_total": 0, "returned": 0, "truncated": false},
+                }),
+                ProjectionState::Unavailable {
+                    reason: "role payload fails its contract: role payload has no records array"
+                        .to_owned(),
+                },
+            ),
+            (
+                "undescribed provenance",
+                serde_json::json!({
+                    "version": ROLE_ENVELOPE_VERSION,
+                    "scope_id": "scope-a",
+                    "task_id": "task-a",
+                    "records": [{"revision": 1}],
+                }),
+                ProjectionState::Unknown {
+                    reason: "role provenance does not authoritatively describe the records"
+                        .to_owned(),
+                },
+            ),
+        ];
+        for (label, payload, expected) in refusals {
+            let state = classify_role_envelope(&payload, &scope, task_binding(Some("task-a")));
+            assert_eq!(state, expected, "{label} must classify as stated");
+            let (retained, retained_heads) = admitted_envelope(&state, payload, heads.clone());
+            assert!(retained.is_none(), "{label} must retain no payload");
+            assert!(
+                retained_heads.is_empty(),
+                "{label} must retain no observed heads"
+            );
+            assert!(
+                !admits_source_records(&state),
+                "{label} must admit no source records"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn content_admission_refuses_a_role_that_still_carries_refused_bytes() -> ProofResult {
+        // The structural invariant is checked on the closure, not only at each
+        // acquisition site: a role that kept a payload under a state admitting
+        // none is refused rather than serialized.
+        let mut inputs = role_inputs_with(
+            NamedReadOperation::GetTaskState,
+            ProjectionState::Unavailable {
+                reason: "role payload fails its contract: role selector mismatch".to_owned(),
+            },
+        )?;
+        inputs.task_frame.payload = Some(bound_task_envelope("scope-a", "task-b"));
+        assert!(matches!(
+            inputs.validate_content_admission(),
+            Err(ContextInputsError::ContentNotAdmitted(_))
+        ));
+        Ok(())
+    }
+
+    fn role_inputs_with(
+        operation: NamedReadOperation,
+        state: ProjectionState,
+    ) -> ProofResult<SevenRoleInputs> {
+        Ok(SevenRoleInputs {
+            scope_id: ScopeId::new("scope-a")?,
+            state_fence: test_fence()?,
+            clock: ClockReading::default(),
+            heads_before: test_heads("scope-a")?,
+            heads_after: test_heads("scope-a")?,
+            task_frame: RoleAcquisition {
+                operation,
+                state,
+                payload: None,
+                revision_heads: Vec::new(),
+                identity: None,
+            },
+            attention: unavailable_role(NamedReadOperation::GetAttentionAndProblems),
+            problem_readback: None,
+            epistemic: unavailable_role(NamedReadOperation::GetCurrentEpistemicPosition),
+            epistemic_readback: None,
+            cue: unavailable_role(NamedReadOperation::GetUnderstandingProjectionInputs),
+            negative_memory: unavailable_role(NamedReadOperation::GetUnderstandingProjectionInputs),
+            evidence: unavailable_role(NamedReadOperation::GetEvidencePack),
+            affordances: unavailable_role(NamedReadOperation::GetCapabilityEvidenceState),
+        })
     }
 
     #[test]
