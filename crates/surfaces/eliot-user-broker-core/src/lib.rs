@@ -5771,10 +5771,7 @@ impl OpenCodeSecretBoundary for OpenCodeRouteCredentials {
 
     fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, BrokerError> {
         self.live
-            .get(&(
-                handle.provider().to_owned(),
-                handle.key().to_owned(),
-            ))
+            .get(&(handle.provider().to_owned(), handle.key().to_owned()))
             .map(|credential| Box::<str>::from(credential.as_ref()))
             .ok_or(BrokerError::StaleLease)
     }
