@@ -2217,6 +2217,63 @@ mod tests {
     }
 
     #[test]
+    fn expiry_condition_guard_over_refuses_a_temporary_fixture_whose_removal_condition_is_undated()
+    {
+        // Refusal arm two: the `let Some(expiry_date) = ... else` branch, written
+        // at `expiry_condition_guard_over` in
+        // crates/eliot-app/src/disposition.rs:1611. This is the arm that SHOULD
+        // catch the six undated `ExtractToCurrentOwner` rows, and does not
+        // reach them; the test proves the arm itself is live by handing it the
+        // same kind of value as a fixture row.
+        let fixture = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove when the adapter is replaced by current ControlBoard reads under #18",
+        );
+
+        // The condition does say remove, so the guard has to get past arm one,
+        // and it carries no YYYY-MM-DD token, so it has to be refused here.
+        assert!(
+            fixture.expiry.to_ascii_lowercase().contains("remove"),
+            "this refusal case must reach the undated-date arm, which runs after the removal word is found"
+        );
+        assert_eq!(
+            first_iso_date_digits(fixture.expiry),
+            None,
+            "this refusal case must carry no YYYY-MM-DD removal date"
+        );
+
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&fixture)),
+            Err(ExpiryRefusal::UndatedRemovalCondition {
+                proof: REFUSAL_PROOF
+            }),
+            "a temporary fixture whose condition says remove but carries no date must be \
+             refused as UndatedRemovalCondition"
+        );
+
+        // A malformed date is refused by this arm too: the parser only accepts a
+        // full 10-character YYYY-MM-DD token with ASCII digits, so a near-miss
+        // is undated as far as the guard is concerned.
+        for malformed in [
+            "remove by 2026-13-31, when the plugin subtree is removed",
+            "remove by 26-12-31, when the plugin subtree is removed",
+            "remove by 2026/12/31, when the plugin subtree is removed",
+            "remove by 20261231, when the plugin subtree is removed",
+            "remove when the downstream owner under #13 is done (no date at all)",
+        ] {
+            let malformed_fixture = refused_fixture(Disposition::TemporaryFixture, malformed);
+            assert_eq!(
+                expiry_condition_guard_over(std::slice::from_ref(&malformed_fixture)),
+                Err(ExpiryRefusal::UndatedRemovalCondition {
+                    proof: REFUSAL_PROOF
+                }),
+                "malformed removal date {malformed:?} must be refused as \
+                 UndatedRemovalCondition"
+            );
+        }
+    }
+
+    #[test]
     fn assert_inventory_entries_are_live_backs_every_row_with_its_own_baked_proof() {
         // Production guard under test, reached from
         // `run_facade_disposition_guards`.
