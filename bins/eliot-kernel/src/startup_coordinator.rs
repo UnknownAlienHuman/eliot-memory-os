@@ -1200,30 +1200,113 @@ impl super::KernelComposition {
     /// authenticated daemon boundary (I7.16, #1935 AUD1).
     ///
     /// Designated producer: the `publish_governor_authority` daemon operation.
-    /// The owner revision, exact active fingerprint, and exact authorization
-    /// axes arrive in the owner's own vocabulary (no third profile is
-    /// introduced); the axes map to this crate's existing three-axis
-    /// [`GovernanceProfile`] and record under the existing strictly-advancing
-    /// revision rule, so a newer degraded projection revokes everything
-    /// issued under the old one.
+    /// The owner revision and exact active fingerprint arrive in the owner's
+    /// own vocabulary (no third profile is introduced), but the authorization
+    /// axes are NOT taken from the caller: the Kernel derives them from what
+    /// it itself proved for this publish, through the existing
+    /// [`governor_authorization_axes_to_profile`] ladder and the existing
+    /// strictly-advancing revision rule, so a newer degraded projection revokes
+    /// everything issued under the old one.
+    ///
+    /// `claimed_verified`/`claimed_enforcement`/`claimed_complete_coverage` are
+    /// the owner's published axes and are used only as a CEILING on what the
+    /// Kernel proved, never as the recorded verdict:
+    ///
+    /// - the published fingerprint must name the exact active contour the
+    ///   Kernel itself retains, or the publish refuses;
+    /// - the enforcement axis is derived from the Kernel's own retained
+    ///   independent-Watchdog observation for that contour under this exact
+    ///   fence, so claiming it without that proof refuses;
+    /// - a degraded publish (no verified observation) authorizes nothing and
+    ///   records the minimal profile; it may not also claim enforcement or
+    ///   complete-coverage authority.
+    ///
+    /// The recorded axes are therefore `claimed && kernel_proved`, never the
+    /// caller's word alone, so a proven case is distinguishable from an
+    /// unproven one.
     ///
     /// # Errors
     ///
-    /// Returns a platform error when the startup gate lock is poisoned, and
-    /// the fixed-shape reason when the revision does not strictly advance or
-    /// the fingerprint does not name the exact active fingerprint.
+    /// Returns a platform error when the startup gate lock is poisoned, when
+    /// the revision does not strictly advance or the fingerprint does not name
+    /// the exact active fingerprint, or when the owner's published axes claim
+    /// authority the Kernel has not proved for this exact contour under this
+    /// exact fence.
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the owner's three published axes are the I7.16 derivation inputs, compared against the Kernel's own proof as a ceiling"
+    )]
     pub(crate) fn record_governor_issued_coverage_projection(
         &self,
+        target: &eliot_contracts::StateFence,
         revision: u64,
         fingerprint: String,
-        verified: bool,
-        authorizes_enforcement: bool,
-        authorizes_complete_coverage_ops: bool,
+        claimed_verified: bool,
+        claimed_enforcement: bool,
+        claimed_complete_coverage: bool,
     ) -> Result<(), eliot_kernel_service::KernelServiceError> {
+        let refuse = |reason: &str| {
+            eliot_kernel_service::KernelServiceError::Platform(format!(
+                "governor authority publish refused: {reason}"
+            ))
+        };
+        target
+            .validate()
+            .map_err(|error| refuse(&format!("target State Fence is not well formed: {error}")))?;
+        // Bind the published fingerprint to the exact active contour the Kernel
+        // itself holds. Until this holds, "verified" names nothing Kernel-proven
+        // and a caller could publish an axis claim about any contour at all.
+        let candidate = {
+            let service = self.service.lock().map_err(|_| {
+                eliot_kernel_service::KernelServiceError::Platform(
+                    "service lock poisoned".to_owned(),
+                )
+            })?;
+            service
+                .candidate_binding()
+                .ok_or_else(|| refuse("no current candidate binding is retained"))?
+                .clone()
+        };
+        let candidate_digest = candidate
+            .compute_digest()
+            .map_err(|_| refuse("the current candidate contour has no computable digest"))?;
+        if fingerprint != candidate_digest {
+            return Err(refuse(&format!(
+                "the published fingerprint does not name the exact active contour '{}'",
+                candidate_digest
+            )));
+        }
+        // The supervision axis is proven here, not published: the same retained
+        // independent-Watchdog-observation check the Kernel runs before every
+        // Material/Critical effect must currently verify for this exact contour
+        // digest under this exact target fence. An absent, contradicted,
+        // contour-foreign, fence-foreign or expired observation proves nothing.
+        let supervised = self
+            .verify_watchdog_supervision_branch(&candidate, target)
+            .is_ok();
+        if !claimed_verified {
+            // A degraded publish (Governor-observed coverage loss or a route
+            // mismatch) names no verified observation and therefore authorizes
+            // nothing. That is the fail-closed direction the owner derives and
+            // the Kernel records unchanged as the minimal profile; it needs no
+            // Kernel proof because it claims no authority.
+            if claimed_enforcement || claimed_complete_coverage {
+                return Err(refuse(
+                    "a publish that is not verified production observation claims enforcement or complete-coverage authority",
+                ));
+            }
+        } else if claimed_enforcement && !supervised {
+            // Claiming enforcement authority requires the Kernel's own proof
+            // that the retained independent-Watchdog observation currently
+            // verifies for this exact contour under this exact fence.
+            return Err(refuse(
+                "the published axes claim enforcement authority the Kernel has not proved for this contour",
+            ));
+        }
         let profile = governor_authorization_axes_to_profile(
-            verified,
-            authorizes_enforcement,
-            authorizes_complete_coverage_ops,
+            claimed_verified && supervised,
+            claimed_enforcement && supervised,
+            claimed_complete_coverage,
         );
         let mut coordinator = self.startup_coordinator.lock().map_err(|_| {
             eliot_kernel_service::KernelServiceError::Platform(
@@ -1232,7 +1315,7 @@ impl super::KernelComposition {
         })?;
         coordinator
             .record_governor_derived_authority(revision, fingerprint, profile)
-            .map_err(eliot_kernel_service::KernelServiceError::Platform)
+            .map_err(|error| refuse(&error))
     }
 }
 
@@ -1406,5 +1489,35 @@ mod tests {
                 .is_err(),
             "ceiling must rise per Governance Profile only",
         );
+    }
+
+    // #1935 AUD1: the PUBLISH arm records `claimed && kernel_proved`, so a
+    // proven case is distinguishable from an unproven one. These cover the
+    // ladder the arm derives through, not the arm's I/O.
+    #[test]
+    fn governor_derivation_distinguishes_proven_from_unproven_axes() {
+        // The arm feeds the ladder `claimed && kernel_proved` for the two
+        // supervised axes and the claimed complete-coverage axis.
+        let supervised = true; // the Kernel's own supervision proof held
+        // Proven: the claim carries the Kernel proof, so the recorded profile
+        // rises to the ceiling the published axes justify.
+        let full = governor_authorization_axes_to_profile(supervised, supervised, true);
+        assert_eq!(full.ceiling(), AuthorityCeiling::Critical);
+        let material = governor_authorization_axes_to_profile(supervised, supervised, false);
+        assert_eq!(material.ceiling(), AuthorityCeiling::Material);
+        // Unproven: without the Kernel's supervision proof every authority axis
+        // is stripped, so a claimed-but-unproven enforcement claim can never
+        // yield material or critical authority.
+        let unsupervised = false;
+        let stripped = governor_authorization_axes_to_profile(unsupervised, unsupervised, true);
+        assert_eq!(stripped.ceiling(), AuthorityCeiling::LowImpact);
+        assert!(
+            !stripped.ceiling().allows_material(),
+            "an unproven enforcement claim must not admit Material authority",
+        );
+        // Degraded (unverified) observation authorizes nothing regardless of
+        // the other axes, matching the owner's coverage-loss derivation.
+        let degraded = governor_authorization_axes_to_profile(false, false, false);
+        assert_eq!(degraded, GovernanceProfile::minimal());
     }
 }

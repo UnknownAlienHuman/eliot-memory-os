@@ -4615,13 +4615,20 @@ impl KernelComposition {
                 }
                 // Issue #1935 AUD1: the live Governor-owned derivation
                 // projects its exact revision, exact active fingerprint, and
-                // exact authorization axes across this authenticated boundary.
-                // The axes map to the existing three-axis profile and record
-                // under the strictly-advancing revision rule, so a newer
-                // degraded projection revokes everything issued under the old
-                // one. Until the first publish records, every
-                // Material/Critical gate refuses closed.
+                // claimed authorization axes across this authenticated
+                // boundary. The Kernel does NOT record those booleans: it binds
+                // the published fingerprint to the exact active contour it
+                // holds, proves the supervision axis from its own retained
+                // independent-Watchdog observation for that contour under this
+                // exact session fence, and derives the profile from what it
+                // proved. An axis claimed beyond the proof refuses closed, and
+                // a weaker claim records a weaker profile, under the existing
+                // strictly-advancing revision rule — so a newer degraded
+                // projection revokes everything issued under the old one.
+                // Until the first publish records, every Material/Critical gate
+                // refuses closed.
                 self.record_governor_issued_coverage_projection(
+                    &session.module_generation.state_fence,
                     operation.revision,
                     operation.fingerprint,
                     operation.verified,
