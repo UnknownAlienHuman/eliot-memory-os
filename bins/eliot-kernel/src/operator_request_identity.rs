@@ -53,7 +53,7 @@ use eliot_contracts::{
     StateFence,
 };
 use eliot_receipts::RequestBinding;
-use elipt_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
+use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
 
 use super::{KernelComposition, KernelFrameAction, Session, TransportError, unix_ms};
 
