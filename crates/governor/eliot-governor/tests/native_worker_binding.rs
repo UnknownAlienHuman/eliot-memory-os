@@ -8,7 +8,7 @@ use std::sync::Arc;
 use eliot_authority::{EffectAuthorizer, GrantGraph};
 use eliot_contracts::{
     CapabilityCellId, ClockReading, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration,
-    StateFence, TaskId, canonical_json_bytes, sha256_hex,
+    StateFence, TaskId, canonical_json_bytes, native_worker_resource_facet_ref_v1, sha256_hex,
 };
 use eliot_coordination::CoordinationOwner;
 use eliot_finish::FinishDecisionReceipt;
@@ -42,6 +42,20 @@ fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
     )
     .expect("valid test epoch")
+}
+
+/// Returns the canonical ELIOT-owned native-worker facet ref by derivation.
+///
+/// `publish_native_worker_binding` requires the caller-supplied
+/// `facet_manifest_ref` to be byte-equal to the canonical ref it derives at
+/// publish time, and `NativeWorkerExecutableBinding::validate` requires the
+/// published field to equal the same value. The ref is
+/// `"{name}@{version}#{shape_sha256}"`, where the digest is computed from the
+/// facet source, so a fixture must derive it through the contract helper
+/// (`eliot_contracts::native_worker_resource_facet_ref_v1`) rather than
+/// duplicate the spelling — a placeholder can never match it.
+fn canonical_facet_ref() -> String {
+    native_worker_resource_facet_ref_v1().expect("canonical native-worker facet ref")
 }
 
 struct TestKernel {
@@ -528,7 +542,7 @@ fn publish_valid(composition: &GovernorComposition<TestKernel>) -> NativeWorkerE
             &"e".repeat(64),
             &"f".repeat(64),
             "cmd-1",
-            "facet-1",
+            &canonical_facet_ref(),
             CapabilityCellId::new("native-worker-core").expect("cell id"),
             vec!["intro-1".to_owned()],
             vec!["grant-1".to_owned()],
@@ -609,6 +623,12 @@ fn wrong_wire_version_fails() {
 #[test]
 fn stale_task_revision_fails_publish() {
     let composition = build_composition();
+    // The only difference from the valid fixture is the presented
+    // `task_revision`: the task owner record is at revision 1 while this
+    // publishes 999. Every other input is the derived canonical facet ref and
+    // otherwise identical, so the facet/catalog gate in
+    // `publish_native_worker_binding` passes and the refusal observed below can
+    // only come from the task-revision staleness check.
     let result = composition.publish_native_worker_binding(
         "claim-1",
         "reg-1",
@@ -633,7 +653,7 @@ fn stale_task_revision_fails_publish() {
         &"e".repeat(64),
         &"f".repeat(64),
         "cmd-1",
-        "facet-1",
+        &canonical_facet_ref(),
         CapabilityCellId::new("native-worker-core").expect("cell id"),
         vec!["intro-1".to_owned()],
         vec!["grant-1".to_owned()],
@@ -663,7 +683,26 @@ fn stale_task_revision_fails_publish() {
         &"b".repeat(64),
         "adm-1",
     );
-    assert!(matches!(result, Err(CompositionError::Recovery(_))));
+    // A bare `Err(CompositionError::Recovery(_))` wildcard would also be
+    // satisfied by the facet-ref refusal and by the catalog-revision, config
+    // snapshot, plan/scope and session/route refusals that guard this same
+    // entry point, so it did not actually prove task-revision staleness. The
+    // crate's typed vocabulary for this case is the `Recovery` payload raised
+    // by `check_native_binding_identity` when the presented `task_revision` is
+    // not the task owner's revision at the retained fence; the predicate below
+    // names that payload, so a facet-ref error can no longer pass here.
+    let refused = result.expect_err("stale task revision must be refused at publish");
+    assert_eq!(
+        refused,
+        CompositionError::Recovery(
+            "native binding task revision is stale or foreign".to_owned()
+        ),
+        "the refusal must name the stale task revision, not another publish guard"
+    );
+    // Proof that the facet/catalog gate is not what refuses this call: the same
+    // composition publishes the canonical facet ref at the live task revision,
+    // so the only failing leg above is the presented `task_revision`.
+    publish_valid(&composition);
 }
 
 #[test]

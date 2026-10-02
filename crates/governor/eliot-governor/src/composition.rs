@@ -14000,7 +14000,8 @@ mod tests {
                 &"e".repeat(64),
                 &"f".repeat(64),
                 "cmd-1",
-                "facet-1",
+                &eliot_contracts::native_worker_resource_facet_ref_v1()
+                    .expect("canonical native-worker facet ref"),
                 eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
                 vec!["intro-1".to_owned()],
                 vec!["grant-1".to_owned()],
