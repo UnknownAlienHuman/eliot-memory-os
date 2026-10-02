@@ -710,7 +710,7 @@ sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "ed34a3fbd257e66c2f0eb0fb7bccce8931e6d9e9f309dce80c5fea67ce4d7731"
+sha256 = "ddb983f2b00327cc0f6678195d8da8fdb20edc22c6048220f55c42f275b1216a"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -1486,8 +1486,8 @@ markers = ["StoreRecoveryTerminalGuard::armed"]
 code = "host-store-recovery-reconcile-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1561
-text = "RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),"
+line = 2607
+text = "host.handle_store_recovery_request(envelope.request())"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_durable_diagnostics.rs"
 case = "durable_01_six_file_denominator"
@@ -1790,8 +1790,8 @@ markers = ["BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL", "boundary_by_event"]
 code = "host-backup-cutover-retire-failed"
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5700
-text = "pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>("
+line = 9769
+text = "pub fn prepare_backup_destination("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
 line = 9821
@@ -1810,8 +1810,8 @@ line = 10334
 text = "pub fn backup_dispatch_target("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5942
-text = "pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>("
+line = 10367
+text = "pub fn backup_dispatch_prepare("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
 line = 10501
@@ -2625,8 +2625,8 @@ line = 726
 text = "if !write_response(&Response::Ready {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 549
-text = "if !write_response(&response) {"
+line = 819
+text = "if !write_response(&served_request.response) {"
 terminals = ["B-main-ref-terminal"]
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_console_diagnostics.rs"
@@ -2952,8 +2952,8 @@ markers = ["note_config_error", "host.backup.config_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_preparation.rs"
-line = 2356
-text = "bind_approved_build(&self.approved).map_err(projection_to_preparation)"
+line = 4338
+text = "bind_approved_build("
 
 [[boundary]]
 id = "B-prop-cutover"
@@ -2990,8 +2990,8 @@ line = 10590
 text = "let (committed, barrier) = execute_cutover("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6241
-text = "crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;"
+line = 10803
+text = "let outcome = crate::backup_cutover::read_cutover_disposition("
 
 [[boundary]]
 id = "B-prop-intro-readback"
@@ -3124,12 +3124,12 @@ digest = "2cd475b7deed17374b89589eb83a62069e50d747502e4dccfe4c65a4310bba13"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_WAKE_SATISFY_TERMINAL"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1203
-text = "idle_drain.note_observable_use(&mut host, trigger, &evidence);"
+line = 2392
+text = ".note_observable_use(host, *trigger, evidence)"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1760
-text = "match host.note_observable_use(trigger, evidence) {"
+line = 2885
+text = ".note_observable_use(trigger, evidence)"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
 line = 3055
