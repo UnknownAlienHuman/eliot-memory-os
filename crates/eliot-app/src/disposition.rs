@@ -1968,7 +1968,9 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
 
 #[cfg(test)]
 mod default_members_guard_tests {
-    use super::{WORKSPACE_MANIFEST, default_members_guard, default_members_section_refuses_facade};
+    use super::{
+        WORKSPACE_MANIFEST, default_members_guard, default_members_section_refuses_facade,
+    };
 
     /// Positive: the real baked-in root `Cargo.toml` satisfies the guard, and
     /// the real guard returns `Ok` on the current repository state.
