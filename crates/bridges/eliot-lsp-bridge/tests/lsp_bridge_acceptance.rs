@@ -1,14 +1,15 @@
-//! Acceptance proof for issue 1831: one-shot Rust semantic bridge.
+//! Deterministic bridge-level acceptance checks for issue 1831.
 //!
-//! The smallest proof named under acceptance:
-//! 1. a one-shot diagnostics request through the shared process layer returns
-//!    a normalized result carrying the exact analyzer executable identity,
-//!    configuration hash, candidate reference, freshness, and coverage;
-//! 2. a rename request returns an unapplied edit candidate and modifies no
-//!    files.
+//! These checks cover normalization and cache refusal using a scripted test
+//! executor; they do not claim a live analyzer launch or authenticated daemon
+//! queue proof. The live executable is
+//! `examples/live_acceptance.rs`; selected-source owner adoption is covered
+//! from the daemon's original caller composition.
 //!
-//! Documentation routing: route `sha256:cef8c2c1…`, read `sha256:770ab430…`,
-//! bundle `589015768a…` (29 required items read before mutation).
+//! Documentation routing: route `sha256:63ff31555e625ef8901dba3e1321c1f9af9e5ef43a9a71fa216486d794c86dd8`,
+//! read `sha256:33bb06ee7117e508fbbf976c7457b6174f7d2aac233c1815fe70d36be4391d73`,
+//! verified bundle `sha256:3cc9a469fc9937b73a7a10af7b1196bb0fd67a3d51815be202e893aacbfe3d3d`;
+//! 77 required items across 19 path families were read before mutation.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
