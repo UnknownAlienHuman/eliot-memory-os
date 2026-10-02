@@ -137,7 +137,7 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
 /// epistemic position, revision head, ordering head, or owner-row
 /// predecessor (notification, reactive, automation, experience, learning,
 /// finish/canonical/module-registry/capability-evidence owners, swarm,
-/// blackboard, mailbox, task-contract acceptance).
+/// blackboard, mailbox, task-contract acceptance, authority revocation).
 ///
 /// Each of these proves the admitted operation's semantic input moved under
 /// it. The apply loop never retries them as allocation contention and never
@@ -176,6 +176,10 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "experience_bank_conflict",
     "experience_feedback_conflict",
     "learning_record_conflict",
+    // #686 authority-revocation rows are create-only, exactly like every
+    // sibling owner leg: an existing row for the same closure identity is
+    // semantic/currentness drift for that leg, not allocation movement.
+    "authority_revocation_record_conflict",
 ];
 
 /// Reports whether a provider statement error carries the exact closed
@@ -975,6 +979,9 @@ fn build_apply_statements(
     // #1773 capability-evidence rows commit atomically beside the learning
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
+    // #686 durable authority-revocation rows commit atomically beside the
+    // other owner legs, ahead of the receipt create, in this same transaction.
+    append_authority_revocation_statements(&mut sql, &mut bindings, transition)?;
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
@@ -1450,6 +1457,33 @@ fn append_capability_evidence_owner_statements(
         "capability_evidence_record".to_owned(),
         Value::Object(record),
     );
+    Ok(())
+}
+
+/// Appends the durable authority-revocation record when the named operation is
+/// present in the transition (issue #686).
+///
+/// Same atomicity contract as every sibling owner leg: the revocation row and
+/// the canonical receipt commit in this one transaction, so a reader can never
+/// observe a durable revocation the receipt does not describe. The leg renders
+/// nothing for a transition that names no such operation, and it derives no
+/// revocation semantics of its own — the row is the authority owner's own
+/// record, carried verbatim.
+fn append_authority_revocation_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) =
+        super::surreal_authority_revocation::authority_revocation_statements(transition)?;
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "authority revocation binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -2552,6 +2586,21 @@ mod allocation_classification_tests {
     }
 
     #[test]
+    fn authority_revocation_record_conflict_is_a_semantic_conflict() {
+        // #686: the revocation leg is create-only, so an existing row for the
+        // same closure identity is the semantic/currentness conflict every
+        // sibling create-only leg already gets, not an unknown outcome.
+        assert_eq!(
+            classify_transaction_errors(
+                &[String::from("THROW 'authority_revocation_record_conflict'")],
+                "op-revocation",
+            ),
+            AdapterError::ProviderConflict,
+            "a recorded revocation conflict is deterministic, never retried"
+        );
+    }
+
+    #[test]
     fn unrecognized_errors_stay_unknown_never_conflict() {
         for error in [
             "connection reset during COMMIT".to_owned(),
@@ -2827,5 +2876,19 @@ mod allocation_classification_tests {
             Some(&json!(3)),
             "receipt binds the allocated commit sequence"
         );
+    }
+
+    #[test]
+    fn authority_revocation_leg_emits_nothing_without_its_operation() {
+        // The `transition` fixture names `CaptureObservation` only. The leg is
+        // inert for every other transition: an empty fragment appends no
+        // statement and no binding to the canonical transaction.
+        let transition = transition("op-no-revocation");
+        let mut sql = String::new();
+        let mut bindings = Map::new();
+        append_authority_revocation_statements(&mut sql, &mut bindings, &transition)
+            .expect("a transition naming no revocation operation is not an error");
+        assert!(sql.is_empty(), "no statement is contributed");
+        assert!(bindings.is_empty(), "no binding is contributed");
     }
 }

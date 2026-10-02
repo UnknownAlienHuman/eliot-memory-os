@@ -4058,9 +4058,26 @@ pub enum NamedMutationOperation {
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
     AppendAuditEvent,
-    /// Durable authority-revocation record (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters are already closed.
+    /// Durable authority-revocation record (issue #686).
+    ///
+    /// Activated: this variant has a row in
+    /// `operation_catalogue::ACTIVATED_MUTATIONS` and a proven per-backend
+    /// durable write handler
+    /// (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+    /// appended into the canonical atomic transaction by
+    /// `append_authority_revocation_statements`), so an admitted revocation
+    /// resolves to a mutation entry and reaches the canonical write path
+    /// instead of failing closed here with [`StoreError::UnknownOperation`].
+    /// The row records only the closure the authority owner already committed
+    /// and durably fenced, and grants no re-grant, restoration or support: a
+    /// revoked influence is never revived by writing this row.
+    ///
+    /// That proven WRITE leg is not a read-back claim. The paired named read
+    /// [`NamedReadOperation::GetAuthorityRevocationHistory`] is still
+    /// known-but-unsupported: it has no read row, no proven per-backend read
+    /// handler and no consumer triple, because the Kernel serves that read
+    /// from the retained P-07 ORS before the store bridge sees it. Recording a
+    /// revocation is therefore not reading it back from the store.
     RecordAuthorityRevocation,
     /// Named canonical erasure/disposition transaction (issue #1712).
     ///
