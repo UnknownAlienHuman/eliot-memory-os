@@ -15,5 +15,15 @@
       "enabled": true,
       "required": false
     }
+  },
+  "_eliot_legacy_compatibility": {
+    "status": "legacy_compatibility_route",
+    "owning_issue": "#18",
+    "work_slice": "W11 codex-consumer cutover",
+    "consumer": "Codex production MCP route (codex_controller stdio profile)",
+    "declared_current_owner": "bins/eliot-agent-bridge + crates/surfaces/* (per crates/eliot-app/AGENTS.md)",
+    "cutover_blocker": "bins/eliot-agent-bridge implements no codex_controller profile: its CLI contract (bins/eliot-agent-bridge/src/cli_contract.rs) admits only --profile SPINE_FUNCTIONAL|FULL_COMPOSITION with --transport stdio|loopback-http and a mandatory --client-declaration <absolute-path>/agent-bridge/client-declaration-v2.json; no such client-declaration file exists in the repository and the codex_controller MCP protocol lives only in the crates/eliot-app facade (src/mcp_stdio.rs). Renaming the executable without that protocol would violate the #18 P1 cutover rule, so the launch edge above is unchanged.",
+    "removal_condition": "remove when the eliot MCP server is served by bins/eliot-agent-bridge under #13 (mirrors the Codex plugin MCP server expiry in crates/eliot-app/src/disposition.rs)",
+    "production_manifest_residue": "integrations/codex/marketplace.json, scripts/build-eliot-windows-x64-release.ps1 and integrations/agent-runtimes/host-bundle.manifest.json still stage/advertise this legacy route; W12-owned."
   }
 }
