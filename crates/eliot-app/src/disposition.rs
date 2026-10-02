@@ -2008,4 +2008,15 @@ mod default_members_guard_tests {
             Err("root Cargo.toml default-members section is malformed".to_owned())
         );
     }
+
+    /// Refusal arm: the list opens but is never closed. Fails closed as
+    /// malformed rather than reading past the end of the section.
+    #[test]
+    fn refuses_when_default_members_list_never_closes() {
+        let manifest = "[workspace]\ndefault-members = [\"crates/eliot-app\"\n";
+        assert_eq!(
+            default_members_section_refuses_facade(manifest),
+            Err("root Cargo.toml default-members section is malformed".to_owned())
+        );
+    }
 }
