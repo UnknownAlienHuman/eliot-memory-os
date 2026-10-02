@@ -1846,11 +1846,40 @@ def _configured_repo_path(root: Path, raw_value: object, label: str, code: str) 
     return root / path, []
 
 
+# The documented NuGet contour of this repository, used only when no policy was
+# supplied so that an unconfigured caller still reaches the project, lock and
+# target-framework checks.  These are the exact paths carried by
+# `[ecosystems.nuget]` in `config/dependency-policy.toml`.
+_NUGET_DEFAULT_PROJECT = "apps/Eliot.Operator/Eliot.Operator.csproj"
+_NUGET_DEFAULT_LOCKFILE = "apps/Eliot.Operator/packages.lock.json"
+
+
+def _within_root(root: Path, path: Path) -> bool:
+    """Return whether a resolved path is the root itself or stays beneath it."""
+
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _collect_nuget_locked_packages(
     root: Path, nuget_policy: dict | None = None
 ) -> tuple[list[Finding], dict]:
     findings: list[Finding] = []
     policy = nuget_policy if isinstance(nuget_policy, dict) else {}
+    # An absent or malformed policy is an explicit incomplete input, never a
+    # silently accepted one.  Both configured paths are still resolved through
+    # the same typed-cause gate, so every configured defect keeps its own exact
+    # finding; a path that carries no usable configuration falls back to the
+    # repository's documented NuGet contour so the downstream project, lock and
+    # target-framework checks stay reachable and still report their own cause.
+    # This is the pattern the sibling Python collector already uses for its own
+    # manifest default (`_collect_python_locked_packages` takes
+    # `raw_lockfile="scripts/requirements-verification.txt"`), which keeps the
+    # documented `requirements-verification.txt` lock check reachable for the
+    # same no-argument caller.
     project_path, path_findings = _configured_repo_path(
         root, policy.get("project"), "[ecosystems.nuget].project", "DEP-007"
     )
@@ -1859,7 +1888,27 @@ def _collect_nuget_locked_packages(
         root, policy.get("lockfile"), "[ecosystems.nuget].lockfile", "DEP-007"
     )
     findings.extend(path_findings)
-    if project_path is None or lock_path is None:
+    for path, default, label, code in (
+        (project_path, _NUGET_DEFAULT_PROJECT, "[ecosystems.nuget].project", "project"),
+        (lock_path, _NUGET_DEFAULT_LOCKFILE, "[ecosystems.nuget].lockfile", "lockfile"),
+    ):
+        if path is not None:
+            continue
+        findings.append(
+            Finding(
+                "DEP-007",
+                "config/dependency-policy.toml",
+                1,
+                f"{label} is not configured for a direct caller; the documented NuGet "
+                f"contour '{default}' is checked instead and any missing, malformed or "
+                f"incomplete {code} there is reported as incomplete",
+            )
+        )
+    if project_path is None:
+        project_path = root / _NUGET_DEFAULT_PROJECT
+    if lock_path is None:
+        lock_path = root / _NUGET_DEFAULT_LOCKFILE
+    if not _within_root(root, project_path) or not _within_root(root, lock_path):
         return findings, {"status": "incomplete", "direct_packages": [], "locked_packages": []}
 
     relative_project = project_path.relative_to(root).as_posix()
