@@ -258,3 +258,34 @@ pub(crate) fn fixed_snapshot_statement(operation: &str) -> Result<&'static str, 
 pub(crate) const fn snapshot_capability() -> &'static str {
     BACKUP_IO_CAPABILITY_COHERENT_SNAPSHOT
 }
+
+/// Issues the ELIOT-owned provider-response bound for one admitted capture
+/// byte budget.
+///
+/// This is the registry's half of requirement 3 of the #951 audit repair, and it
+/// is here rather than in the transport because this module owns the fixed
+/// statement registry the protocol envelope is derived from: the request id, the
+/// per-statement `status`/`time` members and the pinned batch's statement count
+/// are all properties of the batches composed above, not of the WebSocket
+/// library.
+///
+/// The admitted budget is the capture's own `bounds.max_bytes`, already proved
+/// non-zero and no stronger than [`eliot_store_api::MAX_SNAPSHOT_BYTES`] by
+/// [`eliot_store_api::SnapshotBounds::validate`] before the capture opened. The
+/// transport bound is that budget plus the protocol envelope, so the effective
+/// bound is never weaker than the admitted `max_bytes` and a smaller admitted
+/// budget yields a proportionally tighter one.
+///
+/// The envelope itself is **not** owner-issued and is documented as a named
+/// limitation at `client::rpc_parse::SNAPSHOT_PROTOCOL_ENVELOPE_BYTES`, which
+/// also carries the executable derivation that proves it covers this registry's
+/// framing. Nothing here claims owner issuance for it.
+///
+/// A caller cannot reach this with a hand-picked bound: the parameter is the
+/// admitted request bound and the only arithmetic is
+/// [`ResponseCeiling::for_admitted_capture`](super::ResponseCeiling)'s.
+pub(crate) fn snapshot_response_ceiling(
+    admitted_max_bytes: u64,
+) -> Result<super::ResponseCeiling, AdapterError> {
+    super::rpc_parse::ResponseCeiling::for_admitted_capture(admitted_max_bytes)
+}

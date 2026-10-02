@@ -103,13 +103,22 @@
 //! of the structures this owner retains, derived from the existing named
 //! per-capture limits in `eliot_store_api::backup_io` plus
 //! [`PER_MEMBER_CHARGE_BYTES`]; they are not a heap measurement and no RSS claim
-//! is made from serialized size. The transport's only finite limit on the
-//! enumeration call is `query_timeout_ms` in *time*: it carries no response
-//! ceiling, and the whole provider response is already decoded into
-//! `serde_json::Value` before this module sees any of it. That decode is
-//! unbounded and nothing here bounds it. What is bounded is everything this
-//! module builds on top of the decoded rows — see [`read_enumeration`] and
-//! [`decoded_class_bytes`].
+//! is made from serialized size. The transport/frame/decode bytes are bounded
+//! separately and earlier, at the accepted client-set facade
+//! ([`capture_response_ceiling`], [`crate::client::snapshot_response_ceiling`]):
+//! the session socket is constructed with an ELIOT-issued frame and message
+//! bound derived from the owner-issued [`MAX_SNAPSHOT_BYTES`]
+//! (`client::session::response_bound_config`), so an oversize provider response
+//! is refused inside the transport while it is still a network frame and is never
+//! materialised; each frame a capture read is then handed is charged against the
+//! capture's own admitted `bounds.max_bytes` plus the fixed registry's protocol
+//! envelope before any `serde_json::Value` is constructed, and the statement-list
+//! decode stops at the statement that would exceed the admitted budget. An
+//! over-budget response is therefore refused as [`StoreError::PayloadTooLarge`]
+//! and recorded as [`InterruptionReason::ResponseTooLarge`], never as a provider
+//! that is gone and never as an empty denominator. What this owner additionally
+//! bounds is everything it builds on top of the decoded rows — see
+//! [`read_enumeration`] and [`decoded_class_bytes`].
 //!
 //! Reclamation does not depend on client traffic. Every installed capture
 //! registers a retirement deadline in the owner's expiry frontier
@@ -164,6 +173,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::SurrealStoreAdapter;
+use crate::client::ResponseCeiling;
 use crate::error::AdapterError;
 
 /// Closed named-operation label for binding one snapshot consistency point.
@@ -329,6 +339,7 @@ fn redact_snapshot_error(error: StoreError) -> StoreError {
 async fn run_pinned_snapshot_query(
     adapter: &SurrealStoreAdapter,
     operation: &'static str,
+    ceiling: ResponseCeiling,
 ) -> Result<crate::client::RpcResults, StoreError> {
     let statement = crate::client::fixed_snapshot_statement(operation)
         .map_err(AdapterError::into_store_error)?;
@@ -340,10 +351,64 @@ async fn run_pinned_snapshot_query(
     crate::apply::ensure_ready(adapter, transport)
         .await
         .map_err(AdapterError::into_store_error)?;
-    crate::client::query(transport, &adapter.config, operation, statement, Map::new())
-        .await
+    crate::client::query_bounded(
+        transport,
+        &adapter.config,
+        operation,
+        statement,
+        Map::new(),
+        ceiling,
+    )
+    .await
+    .map_err(AdapterError::into_store_error)
+    .map_err(redact_snapshot_error)
+}
+
+/// Issues the response bound this capture's provider reads run under, from the
+/// capture's own admitted byte budget.
+///
+/// The budget is the request's `bounds.max_bytes`, which
+/// [`SnapshotBeginRequest::validate`] has already proved non-zero and no
+/// stronger than [`MAX_SNAPSHOT_BYTES`]; the fixed registry adds the protocol
+/// envelope on top (see
+/// [`crate::client::snapshot_response_ceiling`]). The result is therefore never
+/// weaker than the admitted `max_bytes`, and a caller cannot select it. The
+/// envelope half is an engineering allowance rather than an owner-issued value
+/// and is recorded as a named limitation at
+/// `client::rpc_parse::SNAPSHOT_PROTOCOL_ENVELOPE_BYTES`.
+fn capture_response_ceiling(request: &SnapshotBeginRequest) -> Result<ResponseCeiling, StoreError> {
+    crate::client::snapshot_response_ceiling(request.bounds.max_bytes)
         .map_err(AdapterError::into_store_error)
-        .map_err(redact_snapshot_error)
+}
+
+/// Issues the response bound for the ECXF source capture.
+///
+/// An [`EcxfExportRequest`] carries no byte budget of its own, so the admitted
+/// aggregate is the named content ceiling this module already enforces on
+/// exactly these rows ([`MAX_SNAPSHOT_BYTES`], checked in
+/// [`capture_ecxf_source`]). Using that existing admitted value keeps the bound
+/// tied to a real owner-issued limit instead of an invented constant.
+fn ecxf_response_ceiling() -> Result<ResponseCeiling, StoreError> {
+    crate::client::snapshot_response_ceiling(MAX_SNAPSHOT_BYTES)
+        .map_err(AdapterError::into_store_error)
+}
+
+/// Re-proves the response bound a continuation's provider read runs under.
+///
+/// The retained [`SnapshotState::response_ceiling_bytes`] is the bound the
+/// capture was opened with. Every later provider read re-issues it from the same
+/// retained admitted budget and is refused when that derivation would be
+/// *weaker* than the retained one, so a page or close can never be served under
+/// a laxer response envelope than the capture it continues.
+fn require_capture_response_ceiling(state: &SnapshotState) -> Result<ResponseCeiling, StoreError> {
+    let ceiling = capture_response_ceiling(&state.begin)?;
+    if ceiling.max_bytes() < state.response_ceiling_bytes {
+        return Err(StoreError::InvalidField {
+            field: "snapshot.response_ceiling_bytes",
+            reason: "continuation would issue a provider read under a weaker response ceiling than this capture was opened with",
+        });
+    }
+    Ok(ceiling)
 }
 
 /// Domain separator for the owner-issued consistency point.
@@ -1093,6 +1158,20 @@ struct SnapshotState {
     /// worst-case reservation is settled into this field at publish, and it is
     /// released only when the payload is actually freed or the entry removed.
     charged_capture_bytes: u64,
+    /// The ELIOT-owned provider-response byte bound this capture's provider
+    /// reads run under, in bytes.
+    ///
+    /// Issued once at begin from the capture's own admitted `bounds.max_bytes`
+    /// plus the fixed registry's protocol envelope (see
+    /// [`capture_response_ceiling`]) and retained here, so every later page and
+    /// close read is re-proved against it by
+    /// [`require_capture_response_ceiling`]. This is the "snapshot profile" half
+    /// of audit requirement 3: the response bound that actually governed the
+    /// transport is a property of the retained capture, not an implicit global.
+    /// `SnapshotEndReceipt` is a frozen `eliot-store-api` type with no field for
+    /// it and is outside this leaf's mutable scope, so the bound is bound on the
+    /// retained record the receipt's accounting is derived from.
+    response_ceiling_bytes: u64,
 }
 
 /// The heavyweight member payload of a live capture.
@@ -1153,8 +1232,10 @@ const RETAINED_PAGE_BYTES: u64 = MAX_SNAPSHOT_PAGE_MEMBERS as u64 * PER_MEMBER_C
 ///
 /// Derived from the existing named content ceiling [`MAX_SNAPSHOT_BYTES`]: the
 /// decoded provider enumeration is refused as soon as its observed rows exceed
-/// it (see [`read_enumeration`]), so no admitted begin can transiently hold
-/// more than this.
+/// it (see [`read_enumeration`]), and the transport refuses the frame itself
+/// before decoding it once it exceeds the admitted response ceiling plus the
+/// fixed protocol envelope, so no admitted begin can transiently hold more than
+/// this.
 const RESERVED_ENUMERATION_BYTES: u64 = MAX_SNAPSHOT_BYTES;
 
 /// Bytes one retained terminal/tombstone record is charged.
@@ -1928,8 +2009,9 @@ fn is_retired(
 async fn observe_capture_point(
     adapter: &SurrealStoreAdapter,
     operation: &'static str,
+    ceiling: ResponseCeiling,
 ) -> Result<CapturePoint, StoreError> {
-    let mut response = run_pinned_snapshot_query(adapter, operation).await?;
+    let mut response = run_pinned_snapshot_query(adapter, operation, ceiling).await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -2138,9 +2220,11 @@ impl EnumerationEvidence {
 /// holding exactly the ceiling is complete and is served normally.
 async fn read_enumeration(
     adapter: &SurrealStoreAdapter,
+    ceiling: ResponseCeiling,
 ) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
     let mut response =
-        run_pinned_snapshot_query(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION).await?;
+        run_pinned_snapshot_query(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION, ceiling)
+            .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -2215,7 +2299,7 @@ pub async fn capture_ecxf_source(
     let generation = adapter.config.expected_schema_generation.as_str();
     verify_canonical_source_classes(generation)?;
 
-    let (point, class_rows) = read_enumeration(adapter).await?;
+    let (point, class_rows) = read_enumeration(adapter, ecxf_response_ceiling()?).await?;
     if point.schema_generation != generation {
         return Err(StoreError::Unavailable);
     }
@@ -2322,15 +2406,21 @@ fn canonical_source_rows(
 /// a bounded charge of the observed rows. A row that cannot be re-encoded is not
 /// measurable, so it is charged out rather than charged as free.
 ///
-/// Unbounded decode, named explicitly: the transport's only finite limits on this
-/// call are `query_timeout_ms` in *time* and nothing at all in *bytes*
-/// (`client/session.rs` carries no response-size ceiling), and
-/// `RpcResults::from_value` has already decoded the whole provider response into
-/// `serde_json::Value` before this module sees any of it. Nothing here bounds that
-/// decode, and the registry's counter does not either. What this bound does prove
-/// is narrower and real: every structure this module *builds on top of* the
-/// decoded rows — the member vector, the key index, the reference closure, the
-/// scope projection and the retained page copies — is refused before it is
+/// The transport bound that runs before this one, named explicitly: the accepted
+/// client-set facade issues an ELIOT-owned response byte bound from the capture's
+/// admitted `bounds.max_bytes` (see [`capture_response_ceiling`]), the session
+/// socket is constructed under an ELIOT-issued frame and message bound
+/// (`client::session::response_bound_config`), and each frame the bounded read is
+/// handed is charged against that bound before any `serde_json::Value` exists,
+/// with the statement-list decode stopping at the statement that would exceed
+/// the admitted budget. So by the time this function runs, the decoded
+/// observation it charges is already inside an owner-issued byte envelope. This
+/// bound is the second, independent line: it is the same
+/// [`MAX_SNAPSHOT_BYTES`] content ceiling applied per admitted class as the rows
+/// arrive, so it still refuses a response the transport envelope alone would
+/// have admitted, and every structure this module *builds on top of* the decoded
+/// rows — the member vector, the key index, the reference closure, the scope
+/// projection and the retained page copies — is refused before it is
 /// materialized.
 fn decoded_class_bytes(rows: &[Map<String, Value>]) -> u64 {
     rows.iter().fold(0_u64, |total, row| {
@@ -2518,7 +2608,7 @@ async fn enumerate_canonical_members(
     adapter: &SurrealStoreAdapter,
     request: &SnapshotBeginRequest,
 ) -> Result<Enumeration, StoreError> {
-    let (point, class_rows) = read_enumeration(adapter).await?;
+    let (point, class_rows) = read_enumeration(adapter, capture_response_ceiling(request)?).await?;
     let rows_by_key = observed_row_keys(&class_rows)?;
     let mut members = resolve_member_references(&class_rows, &rows_by_key)?;
     members.sort_by(|left, right| {
@@ -3246,6 +3336,16 @@ enum InterruptionReason {
     /// A read of the bound point failed, so the capture cannot say the point
     /// still holds.
     ProviderReadFailed,
+    /// A provider response exceeded the capture's admitted response byte bound,
+    /// so the read was refused before its content was decoded.
+    ///
+    /// This is a bounded refusal, not a transport blip: it is neither terminal
+    /// for serving (a smaller store still serves) nor a transient read that a
+    /// later exact reread may resolve away, because the refusal is a fact about
+    /// the size of what the source answered, not about custody of the answer.
+    /// Keeping it distinct is what stops an over-budget read from being cleared
+    /// into a `Complete` capture by the transient-read resolution.
+    ResponseTooLarge,
 }
 
 impl InterruptionReason {
@@ -3262,7 +3362,7 @@ impl InterruptionReason {
 
 /// Ceiling on one capture's merged reason ledger.
 ///
-/// The closed reason vocabulary is five entries, so this bound is never reached
+/// The closed reason vocabulary is six entries, so this bound is never reached
 /// by a real capture; it exists so the ledger is bounded storage by
 /// construction, and the earliest evidence is what survives when it is.
 const MAX_INTERRUPTION_REASONS: usize = 8;
@@ -3381,6 +3481,12 @@ struct CaptureCallClaim {
     claim_id: u64,
     /// The progress revision this claim was validated against.
     expected_revision: u64,
+    /// The response byte bound this call's provider read is admitted under.
+    ///
+    /// Re-proved from the retained capture at admission time by
+    /// [`require_capture_response_ceiling`] and carried here so the read cannot
+    /// pick its own bound between admission and the provider await.
+    response_ceiling: ResponseCeiling,
     /// Set once the matching transition was applied and the slot released.
     settled: bool,
 }
@@ -3502,6 +3608,7 @@ fn capture_claim_pending() -> StoreError {
 /// capture keeps its entry and its evidence.
 fn record_provider_read_failure(
     claim: &mut CaptureCallClaim,
+    refusal: &StoreError,
 ) -> Option<(SnapshotHandle, u64, u64)> {
     let Ok(mut states) = registry().lock() else {
         return None;
@@ -3518,7 +3625,7 @@ fn record_provider_read_failure(
         &mut states,
         &claim.digest,
         claim.incarnation,
-        InterruptionReason::ProviderReadFailed,
+        read_failure_reason(refusal),
     );
     let recovery_identity = if claim.kind == CaptureCallKind::End {
         states.get(&claim.digest).map(|state| {
@@ -3533,6 +3640,23 @@ fn record_provider_read_failure(
     };
     claim.settle(&mut states);
     recovery_identity
+}
+
+/// The interruption reason one returned provider-read failure records.
+///
+/// A bounded refusal is not a transport blip. `StoreError::PayloadTooLarge` on
+/// a capture read means the source answered with more bytes than this capture's
+/// admitted response ceiling allows, and no later exact reread of the bound
+/// point clears that: it is a fact about the size of what the provider returned,
+/// not about custody of the answer. Recording it as the resolvable transient
+/// reason would let a capture that was refused for being too large be closed
+/// `Complete` on a later reread, so it gets its own reason instead. Every other
+/// read failure observed nothing about the source and keeps the transient one.
+fn read_failure_reason(refusal: &StoreError) -> InterruptionReason {
+    match refusal {
+        StoreError::PayloadTooLarge => InterruptionReason::ResponseTooLarge,
+        _ => InterruptionReason::ProviderReadFailed,
+    }
 }
 
 /// The typed refusal for a handle that names no open capture.
@@ -4088,6 +4212,11 @@ pub(crate) async fn begin_snapshot(
     };
     handle.validate()?;
 
+    // The response byte bound this capture's provider reads run under, issued
+    // from the capture's own admitted `bounds.max_bytes`. It is computed before
+    // the publish so the retained entry and every later page/close read are
+    // bound to the same owner-issued value.
+    let response_ceiling_bytes = capture_response_ceiling(&request)?.max_bytes();
     // One more acquisition for the publish. The incarnation and the entry's
     // absence are both rechecked under it, so a successor that claimed this
     // logical request while this call enumerated is never overwritten; this call
@@ -4130,6 +4259,7 @@ pub(crate) async fn begin_snapshot(
             last_digest: snapshot_digest.clone(),
             opened_at_ms: started_at_ms,
             charged_capture_bytes: actual_capture_bytes,
+            response_ceiling_bytes,
         },
     );
     states.expiry.insert(ExpiryDeadline {
@@ -4499,6 +4629,7 @@ fn prepare_page(
         return Err(StoreError::PayloadTooLarge);
     }
     let expected_revision = state.progress_revision;
+    let response_ceiling = require_capture_response_ceiling(state)?;
     let claim_id = next_claim_id();
     // The in-flight call slot is an aggregate dimension, so the aggregate is
     // refused *before* this call's claim slot is installed. A refusal here
@@ -4520,6 +4651,7 @@ fn prepare_page(
         kind: CaptureCallKind::Page,
         claim_id,
         expected_revision,
+        response_ceiling,
         settled: false,
     }))
 }
@@ -4623,13 +4755,15 @@ pub(crate) async fn read_snapshot_page(
     // because a cancelled observation proves nothing about the source. Only a
     // provider failure that actually returns records an interruption, and it
     // records it under this claim before settling it.
-    let observed = match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION).await {
-        Ok(point) => point,
-        Err(error) => {
-            let _ = record_provider_read_failure(&mut claim);
-            return Err(error);
-        }
-    };
+    let observed =
+        match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION, claim.response_ceiling).await
+        {
+            Ok(point) => point,
+            Err(error) => {
+                let _ = record_provider_read_failure(&mut claim, &error);
+                return Err(error);
+            }
+        };
     finish_page(&mut claim, &observed, cursor)
 }
 
@@ -4760,6 +4894,7 @@ fn prepare_close(
     }
     let window_closed = capture_is_retired(state, now_ms);
     let expected_revision = state.progress_revision;
+    let response_ceiling = require_capture_response_ceiling(state)?;
     let claim_id = next_claim_id();
     // The same aggregate in-flight call slot the page path reserves, refused
     // before this close's claim slot exists. Recovery and control capacity is
@@ -4783,6 +4918,7 @@ fn prepare_close(
             kind: CaptureCallKind::End,
             claim_id,
             expected_revision,
+            response_ceiling,
             settled: false,
         },
         window_closed,
@@ -4830,7 +4966,7 @@ pub(crate) async fn end_snapshot(
         // re-read.
         None
     } else {
-        match observe_capture_point(adapter, SNAPSHOT_END_OPERATION).await {
+        match observe_capture_point(adapter, SNAPSHOT_END_OPERATION, claim.response_ceiling).await {
             Ok(point) => Some(point),
             Err(error) => {
                 // The close read failed, so no receipt can claim the point held
@@ -4838,8 +4974,16 @@ pub(crate) async fn end_snapshot(
                 // this claim, the caller may retry `end_snapshot` with the
                 // original owner-issued handle and exact served counts. A
                 // stable-point receipt is never fabricated from a failed read.
-                if let Some((handle, members_served, bytes_served)) =
-                    record_provider_read_failure(&mut claim)
+                let recovery = record_provider_read_failure(&mut claim, &error);
+                // A bounded refusal keeps its own typed outcome. It is a fact
+                // about the size of what the provider answered, not a close
+                // whose response was lost, so reporting it as
+                // `SnapshotClosePending` would replace an exact bound with a
+                // pending-close the caller cannot distinguish from a transport
+                // loss. The evidence and the released claim are the same
+                // either way.
+                if !matches!(error, StoreError::PayloadTooLarge)
+                    && let Some((handle, members_served, bytes_served)) = recovery
                 {
                     return Err(StoreError::SnapshotClosePending {
                         handle,

@@ -18,7 +18,11 @@
 //! error sites:
 //!   open/ensure_blob_parent/handle_put_failure -> is_storage_capacity gate
 //!   storage_exhausted() constructor -> StoreError::StorageExhausted
-//!   non-capacity failures -> StoreError::Io (unchanged legacy family)
+//!   cleanup_owned_temp() observation (every failed attempt, one execution)
+//!     -> StorageCleanup::{NotAttempted,Removed,Absent,Failed}
+//!   non-capacity failures -> StoreError::Io (unchanged legacy family),
+//!     except a failed owned staging cleanup, which additionally becomes
+//!     StoreError::StorageCleanupFailed retaining both causes
 //! callers:
 //!   in-crate: stage_canonical_memory -> put_bytes
 //!   external: eliot-app commands/execution.rs (open + startup probe put_bytes),

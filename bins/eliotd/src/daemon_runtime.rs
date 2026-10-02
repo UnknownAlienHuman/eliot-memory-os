@@ -4107,8 +4107,18 @@ async fn run_owner_feed_sync(
 /// complete — and only an owner-admitted row carries authority forward to the
 /// Governor second-phase-only resume entry.
 ///
+/// It is also that entry's production caller: every owner-admitted row is driven
+/// through `GovernorComposition::apply_pending_canonical_revocation` under the
+/// identities composed for it, with the durable second-phase link travelling
+/// over the authenticated front door to the Kernel that owns ORS. The resume
+/// never re-strikes the Kernel — the target is already fenced by its own owner,
+/// and the Kernel refuses a re-struck revoke with `NotAdmitted`.
+///
 /// Pending second phases are a real durable obligation, so they are reported
 /// with the exact remaining gap named rather than left implied by an absence.
+/// A refused resume is a real outcome too: the composition keeps the grant
+/// reading `Revoked` and keeps refusing to activate it, and the refusal is
+/// recorded on this stream's bounded failure guard rather than swallowed.
 async fn report_authority_revocation_ingress(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -4118,6 +4128,11 @@ async fn report_authority_revocation_ingress(
         let guard = composition.lock().await;
         eliotd::capture_authority_revocation_ingress_plan(&guard)
     };
+    let state_fence = plan.as_ref().ok().map(|plan| plan.state_fence().clone());
+    let revision = plan
+        .as_ref()
+        .ok()
+        .map(eliotd::AuthorityRevocationIngressPlan::revision);
     let report = match plan {
         Ok(plan) => eliotd::scan_authority_revocation_ingress(plan, kernel).await,
         Err(error) => Err(error),
@@ -4155,6 +4170,23 @@ async fn report_authority_revocation_ingress(
                     resume_blocked = pending.resume_blocked,
                 );
             }
+            // The second-phase-only resume is driven here, from the rows the
+            // maintenance-request owner re-admitted. It is a separate exchange
+            // from the diagnostic report above so a refused resume is bounded on
+            // its own terms while the rows themselves stay reported exactly as
+            // the durable state has it.
+            if let (Some(state_fence), Some(revision)) = (state_fence, revision) {
+                let admitted_rows = report.admitted_revocations();
+                drive_admitted_canonical_revocations(
+                    kernel,
+                    composition,
+                    &state_fence,
+                    revision,
+                    &admitted_rows,
+                    failure_guard,
+                )
+                .await;
+            }
         }
         Err(error) => {
             if failure_guard.should_emit() {
@@ -4164,6 +4196,109 @@ async fn report_authority_revocation_ingress(
                     &error.to_string(),
                 )
                 .emit();
+            }
+        }
+    }
+}
+
+/// Drives the Governor second-phase-only resume for every owner-admitted
+/// pending canonical revocation of one ingress pass.
+///
+/// `admitted` are exactly the rows the maintenance-request owner re-admitted; an
+/// owner-refused row is absent here and stays pending/recovery-required. Each
+/// resume runs under the admitted identities composed for it and under the live
+/// composition generation, holding the single composition borrow across the
+/// bounded resume exchange — the same discipline the governor-authority drive
+/// uses, so no second concurrent derivation instance exists and health,
+/// shutdown and the owner feed stay pollable around it.
+///
+/// The durable second-phase link travels over the authenticated front door
+/// through `DaemonKernelClient`'s `GrantClosureCanonicalLinkPort`
+/// implementation: the Kernel owns ORS in its own process, so this composition
+/// root holds no ORS handle and gains none.
+///
+/// Every outcome is either a completed second phase or a typed composition
+/// refusal. A refusal is reported on this stream's existing failure guard —
+/// bounded, and never failing the daemon — while the composition itself retains
+/// the stricter pending revocation, so a failed resume can never restore the
+/// revoked grant.
+async fn drive_admitted_canonical_revocations(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    state_fence: &eliot_contracts::StateFence,
+    revision: u64,
+    admitted: &[&eliotd::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation],
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    let resumes =
+        match eliotd::admit_canonical_revocation_resumes(state_fence, revision, admitted, kernel) {
+            Ok(resumes) => resumes,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "authority-revocation-resume-admission",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                return;
+            }
+        };
+    let durable_link: &dyn eliot_governor::GrantClosureCanonicalLinkPort = kernel.as_ref();
+    for resume in &resumes {
+        let grant_id = eliotd::diagnostics::sanitize_identity(resume.request().grant_id.as_str());
+        let outcome = {
+            let mut guard = composition.lock().await;
+            guard
+                .governor_mut()
+                .apply_pending_canonical_revocation(
+                    resume.request(),
+                    resume.committed_closure(),
+                    resume.canonical_operation_id(),
+                    resume.canonical_request_identity(),
+                    resume.operation(),
+                    durable_link,
+                )
+                .await
+        };
+        match outcome {
+            Ok(reconciliation) => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_second_phase_completed",
+                    grant_id = %grant_id,
+                    canonical_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        resume.canonical_operation_id().as_str()
+                    ),
+                    authority_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                        reconciliation.authority_receipt.revocation_id.as_str()
+                    ),
+                    canonical_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                        reconciliation
+                            .closure_projection
+                            .canonical_receipt()
+                            .receipt_id
+                            .as_str()
+                    ),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        reconciliation
+                            .closure_projection
+                            .closure()
+                            .operation_id
+                            .as_str()
+                    ),
+                );
+            }
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "authority-revocation-resume",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
             }
         }
     }
