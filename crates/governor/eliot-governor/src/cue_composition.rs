@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use eliot_context_candidates::ProjectionState;
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{RequestMetadata, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CueProjectionDenominator, CueSnapshotBuildCandidate,
     NormalizationProfile, SnapshotId, WorkScopeId,
@@ -756,7 +756,8 @@ mod cue_composition_tests {
                 return Err(eliot_store_api::StoreError::UnknownOperation);
             }
             // The same pre-dispatch catalogue gate the production adapters apply.
-            request.validate_against_catalogue(&eliot_store_api::generated_operation_manifests()?)?;
+            request
+                .validate_against_catalogue(&eliot_store_api::generated_operation_manifests()?)?;
             if request.state_fence != self.fence {
                 return Err(eliot_store_api::StoreError::FenceMismatch);
             }
@@ -764,12 +765,16 @@ mod cue_composition_tests {
                 operation: request.operation,
                 state_fence: self.fence.clone(),
                 revision_heads: vec![RevisionHead {
-                    key: RevisionKey::new(format!("scope:{}", request.scope_id.ok_or(
-                        eliot_store_api::StoreError::InvalidField {
-                            field: "scope_id",
-                            reason: "projection-inputs read requires scope_id",
-                        },
-                    )?.as_str()))?,
+                    key: RevisionKey::new(format!(
+                        "scope:{}",
+                        request
+                            .scope_id
+                            .ok_or(eliot_store_api::StoreError::InvalidField {
+                                field: "scope_id",
+                                reason: "projection-inputs read requires scope_id",
+                            },)?
+                            .as_str()
+                    ))?,
                     revision: 1,
                     state_fence: self.fence.clone(),
                 }],
@@ -866,7 +871,10 @@ mod cue_composition_tests {
                 dependency_revisions: BTreeMap::from([(RevisionKey::new(scope_key.clone())?, 1)]),
                 ordering: ReadOrderingBinding::without_order_dependency(),
                 parameters: NamedParameters::from_map(BTreeMap::from([
-                    ("selector".to_owned(), Value::String("selector-a".to_owned())),
+                    (
+                        "selector".to_owned(),
+                        Value::String("selector-a".to_owned()),
+                    ),
                     ("max_records".to_owned(), Value::String("8".to_owned())),
                 ]))?,
                 provenance_handles: Vec::new(),
@@ -890,10 +898,7 @@ mod cue_composition_tests {
         })
     }
 
-    fn scope_revision_head(
-        scope: &str,
-        fence: &StateFence,
-    ) -> ProofResult<RevisionHead> {
+    fn scope_revision_head(scope: &str, fence: &StateFence) -> ProofResult<RevisionHead> {
         Ok(RevisionHead {
             key: RevisionKey::new(format!("scope:{scope}"))?,
             revision: 1,
