@@ -875,7 +875,10 @@ pub enum HostEventsStartup {
 /// This is the composition decision itself, so it is `pub`: the package-local
 /// wiring/negative proof `bins/AGENTS.md` requires reaches the same resolver
 /// the shipped front door uses instead of a second implementation of it.
-#[must_use]
+///
+/// No `#[must_use]` here: the return type is `Result`, which already carries
+/// it, and a second bare attribute trips `clippy::double_must_use` without
+/// saying anything the signature does not.
 pub fn host_events_startup(
     store: &BridgeIntroductionStore,
 ) -> Result<HostEventsStartup, HostEventsServiceError> {
@@ -912,6 +915,33 @@ pub enum HostEventsServiceError {
     Runtime(#[source] std::io::Error),
 }
 
+/// Retires the introduction this process served, before its endpoint leaves
+/// this process (issue #2898, step 14).
+///
+/// Endpoint replacement, listener death, bridge restart and logout all reach
+/// this process the same way: the supervised serving loop stops. The
+/// introduction that served must therefore stop being usable **before** the
+/// loopback endpoint is released, because a released endpoint is precisely
+/// what a foreign or stale listener needs in order to inherit the route — the
+/// sentence "A foreign/stale listener cannot inherit the route" is an ordering
+/// claim, not a bind-concurrency claim.
+///
+/// The retirement uses only the store's own machinery and runs on the same
+/// [`BridgeIntroductionStore`] the serving loop read for every request: the
+/// served introduction's revocation id is retired and the current
+/// introduction is cleared. A composition that starts from a retired store
+/// resolves [`HostEventsStartup::Unintroduced`] and binds nothing, so the old
+/// endpoint answers no further request. There is no second store, no second
+/// revocation list and no second lifecycle here: this is the existing
+/// `revoke`/`clear` pair, ordered against the socket.
+pub fn retire_served_route(
+    store: &mut BridgeIntroductionStore,
+    served: &OpenCodeBridgeIntroduction,
+) {
+    store.revoke(&served.revocation_id);
+    store.clear();
+}
+
 /// Supervises `POST /v1/host-events` for the whole life of the bridge
 /// process (issue #2898, steps 1, 4, 5 and 14).
 ///
@@ -931,6 +961,12 @@ pub enum HostEventsServiceError {
 /// [`HostEventsShutdown`] is returned here as the real typed shutdown rather
 /// than discarded. An unintroduced composition returns
 /// [`HostEventsServiceError::Unintroduced`] without binding a port at all.
+///
+/// This function owns the serving store for the whole serving life, so the
+/// retirement of step 14 runs here and not in the caller: once the loop stops,
+/// [`retire_served_route`] retires the served introduction while `listener`
+/// still holds the bound socket, and only then does this function return and
+/// release the endpoint.
 pub fn serve_host_events<F>(
     runner: &mut BridgeRunner,
     store: BridgeIntroductionStore,
@@ -949,6 +985,12 @@ where
         } => (port, bound_generation),
         HostEventsStartup::Unintroduced => return Err(HostEventsServiceError::Unintroduced),
     };
+    // The introduction this process is about to serve under. It is captured
+    // before the store moves into the serving ports, because
+    // `retire_served_route` must name the exact introduction that served.
+    let served = store
+        .current_introduction()
+        .ok_or(HostEventsServiceError::Unintroduced)?;
     // `bind_loopback` both binds the socket and wraps it, re-proving the
     // loopback address and refusing a zero port. Wrapping it a second time via
     // `from_pre_bound` would bind a second socket and leave the first one
@@ -959,12 +1001,21 @@ where
         .build()
         .map_err(HostEventsServiceError::Runtime)?;
     let mut ports = assemble_ports(runner, store, current_profile, resolve_credential);
-    Ok(runtime.block_on(listener.serve_until(
+    let shutdown = runtime.block_on(listener.serve_until(
         &mut ports,
         bound_generation,
         stop,
         active_generation,
-    )))
+    ));
+    // Ordered against the socket on purpose: the served introduction is
+    // retired here, while `listener` is still bound and still exclusively
+    // owned by this process. `listener` is only released when this function
+    // returns, so no foreign or stale listener can hold this endpoint with a
+    // still-usable introduction, and no further request can be served by this
+    // process afterwards. `HostEventsShutdown::Rotated` reaches exactly this
+    // path too, so a rotated generation is retired by the same ordering.
+    retire_served_route(&mut ports.introductions, &served);
+    Ok(shutdown)
 }
 
 #[cfg(test)]

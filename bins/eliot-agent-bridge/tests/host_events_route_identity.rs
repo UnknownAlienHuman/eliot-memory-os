@@ -1,7 +1,7 @@
 //! Package-local wiring/negative proof for the supervised `POST /v1/host-events`
-//! composition root (issue #2898, items W4, A1, A2).
+//! composition root (issue #2898, items W4, A1, A2, W14).
 //!
-//! One positive case and one refusal case, both over the real
+//! One positive case and one refusal case per guarantee, all over the real
 //! [`HostEventsListener`] socket this composition owns, the real
 //! [`BridgeIntroductionStore`] the User Broker introduction is installed into,
 //! and the real broker credential table behind [`FnCredentialResolver`]. No
@@ -10,6 +10,11 @@
 //! exactly the installation-pinned `server_identity` of the introduction it
 //! owns, and the refusal arm proves that a listener which no longer owns the
 //! pinned endpoint discloses no identity proof at all.
+//!
+//! Step 14's ordering is proven against the store the serving loop actually
+//! read: [`serve_route`] hands that store back out of the serving thread, so
+//! [`retire_served_route`] is proven on the served introduction itself and not
+//! on a copy the proof kept.
 //!
 //! The admission port is the one collaborator this half does not own, so it is
 //! held here as an explicit guard: an identity probe must reach no admission,
@@ -28,14 +33,15 @@ use std::time::Duration;
 
 use eliot_agent_bridge::opencode_host_events::{
     BridgeIntroductionStore, FnCredentialResolver, GovernorActionGate, HostEventsStartup,
-    host_events_startup,
+    host_events_startup, retire_served_route,
 };
 use eliot_agent_opencode::{
     ActionGate, BootstrapIdentityFields, CredentialResolver, EffectDecisionRecord,
     HOST_EVENTS_CHALLENGE_HEADER, HOST_EVENTS_CHALLENGE_LENGTH, HOST_EVENTS_IDENTITY_VERSION,
     HOST_EVENTS_PATH, HostEventAdmission, HostEventAdmissionError, HostEventAdmissionFailure,
     HostEventAdmissionReceipt, HostEventGap, HostEventPorts, HostEventSubmission,
-    HostEventsListener, HostEventsShutdown, IntroductionStore, REASON_ROUTE_UNAVAILABLE,
+    HostEventsListener, HostEventsShutdown, IntroductionStore,
+    REASON_CAPABILITY_INTRODUCTION_REQUIRED, REASON_ROUTE_UNAVAILABLE,
     verify_bootstrap_identity_proof,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
@@ -270,7 +276,11 @@ struct ServingRoute {
     stop: tokio::sync::watch::Sender<bool>,
     generation: tokio::sync::watch::Sender<u64>,
     entered: Arc<AtomicBool>,
-    outcome: mpsc::Receiver<HostEventsShutdown>,
+    /// The typed shutdown plus the very store the serving loop read for every
+    /// request. The store comes back out of the serving thread because
+    /// step 14's retirement has to be proven on the store that served, not on
+    /// a copy the proof kept.
+    outcome: mpsc::Receiver<(HostEventsShutdown, BridgeIntroductionStore)>,
 }
 
 /// Adopts the pre-bound socket and serves the composition on the shape the
@@ -305,8 +315,8 @@ where
             generation_receiver,
         ));
         outcome_tx
-            .send(shutdown)
-            .expect("the proof receives the typed shutdown");
+            .send((shutdown, ports.introductions))
+            .expect("the proof receives the typed shutdown and the served store");
     });
     ServingRoute {
         stop,
@@ -423,10 +433,8 @@ fn a_correct_introduction_is_served_under_its_pinned_identity() {
     );
 
     route.stop.send(true).expect("signal the supervised stop");
-    assert_eq!(
-        route.outcome.recv().expect("typed shutdown"),
-        HostEventsShutdown::Stopped
-    );
+    let (shutdown, _served) = route.outcome.recv().expect("typed shutdown");
+    assert_eq!(shutdown, HostEventsShutdown::Stopped);
     assert!(
         !route.entered.load(Ordering::SeqCst),
         "an identity probe resolves no credential, admits no event and consults no gate"
@@ -480,13 +488,117 @@ fn a_rotated_introduction_is_refused_and_discloses_no_identity() {
     );
 
     route.stop.send(true).expect("signal the supervised stop");
-    assert_eq!(
-        route.outcome.recv().expect("typed shutdown"),
-        HostEventsShutdown::Stopped
-    );
+    let (shutdown, _served) = route.outcome.recv().expect("typed shutdown");
+    assert_eq!(shutdown, HostEventsShutdown::Stopped);
     assert!(
         !route.entered.load(Ordering::SeqCst),
         "a refused probe still admits nothing"
+    );
+}
+
+/// Positive case for step 14's ordering: the introduction this process served is
+/// retired on the very store the serving loop read, and the retired store
+/// admits no further composition — so the endpoint that just stopped serving
+/// carries no usable introduction when it leaves this process.
+///
+/// The retirement is the one [`retire_served_route`] performs; the production
+/// caller is [`serve_host_events`](eliot_agent_bridge::opencode_host_events::serve_host_events),
+/// which runs it while its listener is still bound.
+#[test]
+fn a_served_route_is_retired_before_its_endpoint_is_released() {
+    let (socket, port) = owner_socket();
+    let introduction =
+        minted_introduction(port, PINNED_SERVER_IDENTITY, "revocation-generation-11");
+    let mut ports = probe_ports(owner_resolver(route_credentials(&introduction)));
+    ports.introductions.install(introduction.clone());
+    ports.introductions.observe_session(session_facts());
+    assert_eq!(
+        host_events_startup(&ports.introductions).expect("an introduced store resolves"),
+        HostEventsStartup::Introduced {
+            port,
+            bound_generation: BRIDGE_GENERATION,
+        },
+        "the live route is admitted from the current introduction"
+    );
+
+    let route = serve_route(socket, ports, BRIDGE_GENERATION);
+    let (status, body) = identity_probe(port, &fresh_challenge('c'));
+    assert_eq!(
+        status, 200,
+        "the introduced route serves before the retirement, so the retirement is not vacuous"
+    );
+    assert_eq!(field(&body, "server_identity"), PINNED_SERVER_IDENTITY);
+
+    route.stop.send(true).expect("signal the supervised stop");
+    let (shutdown, mut served) = route.outcome.recv().expect("typed shutdown");
+    assert_eq!(shutdown, HostEventsShutdown::Stopped);
+
+    retire_served_route(&mut served, &introduction);
+    assert!(
+        served.is_revoked(&introduction.revocation_id),
+        "the served introduction is retired, so even a holder of its previous \
+         value fails the live revocation check"
+    );
+    assert!(
+        served.current_introduction().is_none(),
+        "no introduction survives the retirement"
+    );
+    assert_eq!(
+        host_events_startup(&served).expect("a retired store is not an error"),
+        HostEventsStartup::Unintroduced,
+        "the endpoint that stopped serving binds nothing again"
+    );
+    assert!(
+        !route.entered.load(Ordering::SeqCst),
+        "serving and retiring never admit an event"
+    );
+}
+
+/// Refusal case for step 14: after a restart or logout the composition owns no
+/// current introduction, so the exact endpoint it used to hold discloses no
+/// identity proof and admits nothing — even to a process that still holds the
+/// pinned loopback port and the retired store.
+#[test]
+fn a_restarted_or_logged_out_route_refuses_another_request() {
+    let (socket, port) = owner_socket();
+    let introduction =
+        minted_introduction(port, PINNED_SERVER_IDENTITY, "revocation-generation-11");
+    let mut store = BridgeIntroductionStore::new();
+    store.install(introduction.clone());
+    store.observe_session(session_facts());
+    retire_served_route(&mut store, &introduction);
+    assert_eq!(
+        host_events_startup(&store).expect("a retired store is not an error"),
+        HostEventsStartup::Unintroduced,
+        "restart and logout close the route before it can serve again"
+    );
+
+    // Even a listener that still holds the retired endpoint learns nothing:
+    // the ownership refusals apply before any proof exists.
+    let mut ports = probe_ports(owner_resolver(route_credentials(&introduction)));
+    ports.introductions = store;
+    let route = serve_route(socket, ports, BRIDGE_GENERATION);
+    let (status, body) = identity_probe(port, &fresh_challenge('d'));
+
+    assert_eq!(
+        status, 503,
+        "a route with no current introduction serves nothing"
+    );
+    assert_eq!(
+        field(&body, "reason_code"),
+        REASON_CAPABILITY_INTRODUCTION_REQUIRED
+    );
+    assert!(
+        body.get("identity_proof").is_none() && body.get("server_identity").is_none(),
+        "a retired route discloses neither a proof nor the pinned identity"
+    );
+
+    route.stop.send(true).expect("signal the supervised stop");
+    let (shutdown, _served) = route.outcome.recv().expect("typed shutdown");
+    assert_eq!(shutdown, HostEventsShutdown::Stopped);
+    assert!(
+        !route.entered.load(Ordering::SeqCst),
+        "a retired route admits nothing"
     );
 }
 
