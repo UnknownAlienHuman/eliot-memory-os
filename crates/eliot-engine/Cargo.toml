@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+# Issue #938: `RestoreService::rollback_isolated` proves owner issuance by
+# decoding the owner-placed artifact as `eliot_backup::RestoreReceipt` and
+# calling that owner's own `validate()`. Declared by explicit path because
+# `eliot-backup` is not a `[workspace.dependencies]` entry, matching
+# `crates/storage/eliot-blob/Cargo.toml`.
+eliot-backup = { path = "../storage/eliot-backup", version = "0.1.0" }
 eliot-bootstrap.workspace = true
 eliot-build-test-graph = { path = "../instrument/eliot-build-test-graph", version = "0.1.0" }
 eliot-contracts.workspace = true

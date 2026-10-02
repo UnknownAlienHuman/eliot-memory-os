@@ -1,6 +1,7 @@
 use crate::admission::WriteAdmissionService;
 use crate::error::EngineError;
 use crate::writer::WriterHandle;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_types::{
     AgentId, BackupChecksum, BackupManifest, BlobDeletionCandidate, BlobGcPlan, BlobGcReceipt,
     BlobGcStatus, BlobManifest, BlobManifestEntry, BlobReferenceSnapshot, BlobReport,
@@ -768,6 +769,79 @@ impl RestoreService {
             return Err(service_error(
                 "restore_rollback",
                 "restored-to-new-root restore receipt is not bound to its plan's exact action hash",
+            ));
+        }
+        // #938: a deserialized `eliot_types::RestoreReport` is not owner issuance.
+        // The only proof that the owner issued this restore is the artifact the
+        // owner itself placed in this isolated root: `eliot-backup`'s
+        // `restore-evidence/owner-restore-receipt.json` (the documented member
+        // `OWNER_RESTORE_RECEIPT_MEMBER` of `restore_runner.rs`), written only by
+        // `FileRestoreTarget::persist_owner_receipt` because only the owner knows
+        // which path names its own destination. It is read from this same
+        // `target` — the exact root about to be quarantined below — bound by the
+        // digest of its own canonical bytes, decoded as `eliot_backup::RestoreReceipt`
+        // and passed through the owner's own `validate()`. Nothing here has a
+        // default: an absent artifact, unreadable bytes, a decode failure, a
+        // failed owner validation, a non-canonical byte sequence or an artifact
+        // issued for a different plan each refuse the rollback outright.
+        let owner_receipt_artifact = target
+            .join("restore-evidence")
+            .join("owner-restore-receipt.json");
+        if !owner_receipt_artifact.is_file() {
+            return Err(service_error(
+                "restore_rollback",
+                "isolated restore root carries no owner-issued restore receipt",
+            ));
+        }
+        let owner_receipt_bytes = fs::read(&owner_receipt_artifact).map_err(|error| {
+            service_error(
+                "restore_rollback",
+                format!(
+                    "owner-issued restore receipt is unreadable at {}: {error}",
+                    owner_receipt_artifact.display()
+                ),
+            )
+        })?;
+        let owner_receipt: eliot_backup::RestoreReceipt =
+            serde_json::from_slice(&owner_receipt_bytes).map_err(|_| {
+                service_error(
+                    "restore_rollback",
+                    "owner-issued restore receipt is not an owner restore receipt",
+                )
+            })?;
+        owner_receipt.validate().map_err(|_| {
+            service_error(
+                "restore_rollback",
+                "owner-issued restore receipt fails the owner restore receipt validator",
+            )
+        })?;
+        // Digest binding: the owner persists exactly `canonical_json_bytes(receipt)`
+        // (`restore_runner.rs::persist_owner_receipt`), so the digest recomputed over
+        // the re-canonicalized receipt must equal the digest of the bytes on disk.
+        // A reformatted, re-encoded or hand-authored document fails here, and the
+        // digest is the owner's own scheme — `canonical_json_bytes` plus `sha256_hex`,
+        // the same pair `eliot_backup` hashes with — not a second one.
+        let owner_canonical_bytes = canonical_json_bytes(&owner_receipt).map_err(|error| {
+            service_error(
+                "restore_rollback",
+                format!("owner-issued restore receipt is not canonicalizable: {error}"),
+            )
+        })?;
+        if sha256_hex(&owner_canonical_bytes) != sha256_hex(&owner_receipt_bytes) {
+            return Err(service_error(
+                "restore_rollback",
+                "owner-issued restore receipt bytes are not the owner's canonical serialization",
+            ));
+        }
+        // Name binding: the owner derives its plan identity from the backup it
+        // restored (`format!("restore-plan-{backup_id}")` in `plan_isolated_restore`),
+        // so this artifact must be the receipt issued for the exact backup the
+        // retained report claims — an artifact minted for another restore does not
+        // authorize this one.
+        if owner_receipt.plan_id != format!("restore-plan-{}", restore_report.plan.backup_id) {
+            return Err(service_error(
+                "restore_rollback",
+                "owner-issued restore receipt names a different restore plan than the retained restore evidence",
             ));
         }
         let evidence_checksum = checksum_file(&evidence)?;
