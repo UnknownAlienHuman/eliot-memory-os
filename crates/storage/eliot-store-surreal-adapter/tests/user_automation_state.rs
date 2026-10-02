@@ -25,9 +25,9 @@
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
@@ -64,6 +64,33 @@ const SCOPE: &str = "user-automation";
 fn surreal_exe() -> PathBuf {
     std::env::var("ELIOT_TEST_SURREAL_EXE")
         .map_or_else(|_| PathBuf::from(TEST_SURREAL_EXE), PathBuf::from)
+}
+
+// The caller must provide an absolute parent before running these tests. The
+// harness claims and removes only its unique child beneath that parent.
+fn live_scratch_root() -> PathBuf {
+    let configured = PathBuf::from(
+        std::env::var_os("ELIOT_AUTOMATION_TEST_ROOT")
+            .expect("caller must provide ELIOT_AUTOMATION_TEST_ROOT"),
+    );
+    assert!(
+        configured.is_absolute(),
+        "ELIOT_AUTOMATION_TEST_ROOT must be an absolute path"
+    );
+    assert!(
+        configured
+            .components()
+            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir)),
+        "ELIOT_AUTOMATION_TEST_ROOT must not contain relative path components"
+    );
+    let resolved = configured
+        .canonicalize()
+        .expect("ELIOT_AUTOMATION_TEST_ROOT must already exist");
+    assert!(
+        resolved.is_absolute() && resolved.is_dir(),
+        "ELIOT_AUTOMATION_TEST_ROOT must resolve to an absolute directory"
+    );
+    configured
 }
 
 fn fence() -> StateFence {
@@ -227,7 +254,8 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new(SCOPE).expect("ordering")],
         transition_class: TransitionClass::UserAutomation,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
@@ -322,28 +350,104 @@ fn prepare_initial_root_user(exe: &Path, bind: &str, data: &Path, work: &Path, t
         .env("TMP", tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("preparation provider");
+    let stderr = child.stderr.take().expect("preparation provider stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut stderr, &mut bytes)
+            .expect("read preparation provider stderr");
+        bytes
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if std::net::TcpStream::connect(bind).is_ok() {
             break;
         }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stderr = stderr_reader
+                    .join()
+                    .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+                let stderr = String::from_utf8_lossy(&stderr);
+                panic!(
+                    "preparation provider exited before binding {bind} with {status}; stderr:\n{stderr}"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let kill = child.kill();
+                let exit = child.wait();
+                let stderr = stderr_reader
+                    .join()
+                    .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+                let stderr = String::from_utf8_lossy(&stderr);
+                panic!(
+                    "preparation provider status check failed before binding {bind}: {error}; kill={kill:?}; exit={exit:?}; stderr:\n{stderr}"
+                );
+            }
+        }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("preparation provider never bound {bind}");
+            let kill = child.kill();
+            let exit = child.wait();
+            let stderr = stderr_reader
+                .join()
+                .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+            let stderr = String::from_utf8_lossy(&stderr);
+            panic!(
+                "preparation provider never bound {bind}; kill={kill:?}; exit={exit:?}; stderr:\n{stderr}"
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     std::thread::sleep(Duration::from_secs(2));
-    child.kill().expect("stop preparation provider");
-    let _ = child.wait();
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let stderr = stderr_reader
+                .join()
+                .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+            let stderr = String::from_utf8_lossy(&stderr);
+            panic!(
+                "preparation provider exited after binding {bind} with {status}; stderr:\n{stderr}"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let kill = child.kill();
+            let exit = child.wait();
+            let stderr = stderr_reader
+                .join()
+                .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+            let stderr = String::from_utf8_lossy(&stderr);
+            panic!(
+                "preparation provider status check failed after binding {bind}: {error}; kill={kill:?}; exit={exit:?}; stderr:\n{stderr}"
+            );
+        }
+    }
+    let kill = child.kill();
+    let exit = child.wait();
+    let stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| b"preparation provider stderr reader panicked".to_vec());
+    let stderr = String::from_utf8_lossy(&stderr);
+    if let Err(error) = kill {
+        panic!(
+            "preparation provider stop failed at {bind}: {error}; exit={exit:?}; stderr:\n{stderr}"
+        );
+    }
+    let status = match exit {
+        Ok(status) => status,
+        Err(error) => {
+            panic!("preparation provider wait failed at {bind}: {error}; stderr:\n{stderr}")
+        }
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::net::TcpStream::connect(bind).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,
-            "preparation provider never released {bind}"
+            "preparation provider never released {bind}; exit={status}; stderr:\n{stderr}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -366,15 +470,25 @@ struct Harness {
 
 impl Harness {
     async fn fresh(test: &str) -> Self {
+        let scratch_root = live_scratch_root();
         let port = free_port();
-        let root = std::env::temp_dir().join(format!(
-            "eliot-automation-1779-{}-{port}-{test}",
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let root = scratch_root.join(format!(
+            "eliot-automation-2860-{}-{port}-{test}-{unique}",
             std::process::id()
         ));
-        let bin = root.join("bin");
-        let data = root.join("store").join("data");
-        let work = root.join("store").join("work");
-        let tmp = root.join("store").join("tmp");
+        std::fs::create_dir(&root).expect("claim unique test scratch child");
+        let mut harness = Self {
+            root,
+            adapter: None,
+        };
+        let bin = harness.root.join("bin");
+        let data = harness.root.join("store").join("data");
+        let work = harness.root.join("store").join("work");
+        let tmp = harness.root.join("store").join("tmp");
         for dir in [&bin, &data, &work, &tmp] {
             std::fs::create_dir_all(dir).expect("test dirs");
         }
@@ -387,9 +501,9 @@ impl Harness {
             exe.display(),
             digest,
             port,
-            root.display()
+            harness.root.display()
         );
-        let platform = WindowsPlatform::new(root.clone()).expect("platform");
+        let platform = WindowsPlatform::new(harness.root.clone()).expect("platform");
         let bind = format!("127.0.0.1:{port}");
         prepare_initial_root_user(&exe, &bind, &data, &work, &tmp);
         let lease = platform
@@ -405,10 +519,8 @@ impl Harness {
         {
             panic!("baseline migration: {error:?}");
         }
-        Self {
-            root,
-            adapter: Some(adapter),
-        }
+        harness.adapter = Some(adapter);
+        harness
     }
 
     fn adapter(&self) -> &SurrealStoreAdapter {
@@ -443,18 +555,811 @@ async fn read(
     automation_id: Option<&str>,
     include_retired: bool,
 ) -> Value {
+    read_page(adapter, query, automation_id, include_retired, 64, None)
+        .await
+        .expect("read executes")
+}
+
+async fn read_page(
+    adapter: &SurrealStoreAdapter,
+    query: &str,
+    automation_id: Option<&str>,
+    include_retired: bool,
+    max_records: u16,
+    cursor: Option<&str>,
+) -> Result<Value, StoreError> {
+    let mut request = eliot_store_api::automation_read_request(
+        query.to_owned(),
+        automation_id.map(str::to_owned),
+        include_retired,
+        max_records,
+        fence(),
+    )?;
+    if let Some(cursor) = cursor {
+        request.parameters.insert(
+            eliot_store_api::AUTOMATION_PARAM_CURSOR.to_owned(),
+            Value::String(cursor.to_owned()),
+        );
+    }
+    eliot_store_api::CanonicalStoreClient::execute_named(adapter, request)
+        .await
+        .map(|outcome| outcome.payload)
+}
+
+async fn read_page_with_fence(
+    adapter: &SurrealStoreAdapter,
+    query: &str,
+    automation_id: Option<&str>,
+    include_retired: bool,
+    max_records: u16,
+    state_fence: StateFence,
+) -> Result<Value, StoreError> {
     let request = eliot_store_api::automation_read_request(
         query.to_owned(),
         automation_id.map(str::to_owned),
         include_retired,
-        64,
-        fence(),
-    )
-    .expect("read builds");
+        max_records,
+        state_fence,
+    )?;
     eliot_store_api::CanonicalStoreClient::execute_named(adapter, request)
         .await
-        .expect("read executes")
-        .payload
+        .map(|outcome| outcome.payload)
+}
+
+fn page_cursor(payload: &Value) -> &str {
+    payload
+        .get("completeness")
+        .and_then(|completeness| completeness.get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR))
+        .and_then(Value::as_str)
+        .expect("truncated page has an owner cursor")
+}
+
+async fn store_revision(
+    adapter: &SurrealStoreAdapter,
+    automation_id: &str,
+    revision: &str,
+    previous_revision: Option<&str>,
+    tag: &str,
+) {
+    let mut candidate = valid_revision(
+        automation_id,
+        revision,
+        UserAutomationConfigurationState::Active,
+    );
+    let parameters = if let Some(previous_revision) = previous_revision {
+        candidate.supersedes = Some(previous_revision.to_owned());
+        candidate
+            .validate_supersedes(&valid_revision(
+                automation_id,
+                previous_revision,
+                UserAutomationConfigurationState::Active,
+            ))
+            .expect("fixture lineage is domain-valid");
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_edit_params(
+            automation_id.to_owned(),
+            previous_revision.to_owned(),
+            revision.to_owned(),
+            eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&candidate),
+        ))
+        .parameters
+    } else {
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_create_params(
+            automation_id.to_owned(),
+            revision.to_owned(),
+            eliot_store_api::AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&candidate),
+        ))
+        .parameters
+    };
+    apply(adapter, tag, parameters)
+        .await
+        .expect("revision commits");
+}
+
+async fn store_invocation(
+    adapter: &SurrealStoreAdapter,
+    automation_id: &str,
+    revision: &str,
+    occurrence_id: String,
+    invocation_json: String,
+    tag: &str,
+) {
+    let request =
+        eliot_store_api::automation_mutation_request(eliot_store_api::automation_run_now_params(
+            automation_id.to_owned(),
+            revision.to_owned(),
+            occurrence_id,
+            invocation_json,
+        ));
+    apply(adapter, tag, request.parameters)
+        .await
+        .expect("invocation commits");
+}
+
+async fn assert_page_replay(
+    adapter: &SurrealStoreAdapter,
+    query: &str,
+    automation_id: &str,
+    rows_field: &str,
+    identity_field: &str,
+    expected_ids: &[String],
+) {
+    assert_eq!(expected_ids.len(), 3);
+    let read_first = || read_page(adapter, query, Some(automation_id), false, 1, None);
+    let (first_a, first_b) = tokio::join!(read_first(), read_first());
+    let first = first_a.expect("first page reads");
+    assert_eq!(first, first_b.expect("replayed first page reads"));
+    assert_eq!(
+        first[rows_field][0][identity_field].as_str(),
+        Some(expected_ids[0].as_str())
+    );
+
+    let first_cursor = page_cursor(&first).to_owned();
+    let read_second = || {
+        read_page(
+            adapter,
+            query,
+            Some(automation_id),
+            false,
+            1,
+            Some(&first_cursor),
+        )
+    };
+    let (second_a, second_b) = tokio::join!(read_second(), read_second());
+    let second = second_a.expect("continued page reads");
+    assert_eq!(second, second_b.expect("replayed continued page reads"));
+    assert_eq!(
+        second[rows_field][0][identity_field].as_str(),
+        Some(expected_ids[1].as_str())
+    );
+
+    let first_after_child = read_page(adapter, query, Some(automation_id), false, 1, None)
+        .await
+        .expect("first page replays after its continuation is issued");
+    assert_eq!(first, first_after_child);
+
+    let last = read_page(
+        adapter,
+        query,
+        Some(automation_id),
+        false,
+        1,
+        Some(page_cursor(&second)),
+    )
+    .await
+    .expect("last page reads");
+    assert_eq!(
+        last[rows_field][0][identity_field].as_str(),
+        Some(expected_ids[2].as_str())
+    );
+    assert!(
+        last["completeness"]
+            .get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR)
+            .is_none()
+    );
+}
+
+fn assert_automation_page(
+    payload: &Value,
+    rows_field: &str,
+    identity_field: &str,
+    expected_ids: &[String],
+    expected_coverage: &str,
+    expect_cursor: bool,
+    label: &str,
+) -> (String, Option<String>) {
+    let rows = payload
+        .get(rows_field)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{label} rows array"));
+    assert!(rows.len() <= 64, "{label} exceeds max_records=64");
+    assert_eq!(rows.len(), expected_ids.len(), "{label} row count");
+    for (row, expected_id) in rows.iter().zip(expected_ids) {
+        assert_eq!(
+            row.get(identity_field).and_then(Value::as_str),
+            Some(expected_id.as_str()),
+            "{label} logical row identity"
+        );
+    }
+
+    let completeness = payload
+        .get("completeness")
+        .unwrap_or_else(|| panic!("{label} owner completeness"));
+    assert_eq!(
+        completeness.get("coverage").and_then(Value::as_str),
+        Some(expected_coverage),
+        "{label} owner coverage"
+    );
+    assert_eq!(
+        completeness.get("returned").and_then(Value::as_u64),
+        Some(rows.len() as u64),
+        "{label} completeness count matches returned rows"
+    );
+    assert_eq!(
+        payload.get("revision").and_then(Value::as_u64),
+        Some(rows.len() as u64),
+        "{label} projection revision matches returned rows"
+    );
+    let read_revision = completeness
+        .get("read_revision")
+        .and_then(Value::as_str)
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| panic!("{label} owner read revision"))
+        .to_owned();
+    let cursor = completeness
+        .get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR)
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    assert_eq!(cursor.is_some(), expect_cursor, "{label} cursor presence");
+    (read_revision, cursor)
+}
+
+fn automation_page_ids(payload: &Value, rows_field: &str, identity_field: &str) -> Vec<String> {
+    payload
+        .get(rows_field)
+        .and_then(Value::as_array)
+        .expect("page rows array")
+        .iter()
+        .map(|row| {
+            row.get(identity_field)
+                .and_then(Value::as_str)
+                .expect("page identity")
+                .to_owned()
+        })
+        .collect()
+}
+
+struct AutomationPageFixture {
+    row_count: usize,
+    automation_id: String,
+    revisions: Vec<String>,
+    invocations: Vec<(String, String)>,
+}
+
+async fn seed_automation_page_fixture(
+    adapter: &SurrealStoreAdapter,
+    corpus_id: &str,
+    row_count: usize,
+) -> AutomationPageFixture {
+    let automation_id = format!("auto-page-{corpus_id}");
+    let mut revisions = Vec::with_capacity(row_count);
+    let mut previous_revision = None;
+    for index in 0..row_count {
+        let revision = format!("r-{index:03}");
+        let tag = format!("{corpus_id}-revision-{index:03}");
+        store_revision(
+            adapter,
+            &automation_id,
+            &revision,
+            previous_revision.as_deref(),
+            &tag,
+        )
+        .await;
+        previous_revision = Some(revision.clone());
+        revisions.push(revision);
+    }
+
+    let latest_revision = revisions.last().expect("corpus has revisions").clone();
+    let mut invocations = (0..row_count)
+        .map(|index| {
+            invocation_for(
+                &automation_id,
+                &latest_revision,
+                &format!("{corpus_id}-nonce-{index:03}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    invocations.sort_by(|left, right| left.0.cmp(&right.0));
+    for (index, (occurrence_id, invocation_json)) in invocations.iter().enumerate() {
+        let tag = format!("{corpus_id}-invocation-{index:03}");
+        store_invocation(
+            adapter,
+            &automation_id,
+            &latest_revision,
+            occurrence_id.clone(),
+            invocation_json.clone(),
+            &tag,
+        )
+        .await;
+    }
+
+    AutomationPageFixture {
+        row_count,
+        automation_id,
+        revisions,
+        invocations,
+    }
+}
+
+async fn assert_automation_page_walk(
+    adapter: &SurrealStoreAdapter,
+    query: &str,
+    automation_id: &str,
+    rows_field: &str,
+    identity_field: &str,
+    expected_ids: &[String],
+    label: &str,
+) {
+    let mut offset = 0;
+    let mut cursor: Option<String> = None;
+    let mut root_read_revision: Option<String> = None;
+    let mut root_page: Option<Value> = None;
+    let mut observed_ids = Vec::with_capacity(expected_ids.len());
+    let mut page_index = 0;
+
+    loop {
+        let page_label = format!("{label} page {page_index}");
+        let page = read_page(
+            adapter,
+            query,
+            Some(automation_id),
+            false,
+            64,
+            cursor.as_deref(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{page_label}: {error:?}"));
+        let page_count = (expected_ids.len() - offset).min(64);
+        let expected_page_ids = &expected_ids[offset..offset + page_count];
+        let truncated = expected_ids.len() - offset > 64;
+        let expected_coverage = if truncated { "TRUNCATED" } else { "COMPLETE" };
+        let (read_revision, next_cursor) = assert_automation_page(
+            &page,
+            rows_field,
+            identity_field,
+            expected_page_ids,
+            expected_coverage,
+            truncated,
+            &page_label,
+        );
+        if let Some(root_read_revision) = root_read_revision.as_deref() {
+            assert_eq!(
+                read_revision, root_read_revision,
+                "{page_label} stays on the root read revision"
+            );
+        } else {
+            root_read_revision = Some(read_revision);
+        }
+        if page_index == 0 {
+            root_page = Some(page.clone());
+        }
+        observed_ids.extend(automation_page_ids(&page, rows_field, identity_field));
+
+        if let Some(cursor_value) = cursor.as_deref() {
+            let replay = read_page(
+                adapter,
+                query,
+                Some(automation_id),
+                false,
+                64,
+                Some(cursor_value),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{page_label} replay: {error:?}"));
+            assert_eq!(page, replay, "{page_label} continuation replay is exact");
+        }
+
+        offset += page_count;
+        page_index += 1;
+        cursor = next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let root_replay = read_page(adapter, query, Some(automation_id), false, 64, None)
+        .await
+        .unwrap_or_else(|error| panic!("{label} root replay: {error:?}"));
+    assert_eq!(
+        root_page.as_ref(),
+        Some(&root_replay),
+        "{label} root replay preserves its page and cursor identity"
+    );
+    assert_eq!(
+        observed_ids, expected_ids,
+        "{label} walk returns each row once"
+    );
+}
+
+fn assert_exact_automation_selector(
+    payload: &Value,
+    rows_field: &str,
+    identity_field: &str,
+    expected_id: &str,
+    label: &str,
+) {
+    let rows = payload
+        .get(rows_field)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{label} rows array"));
+    assert!(
+        rows.len() <= 1,
+        "{label} exact selector returned multiple rows"
+    );
+    assert_eq!(rows.len(), 1, "{label} exact selector row count");
+    assert_eq!(
+        rows[0].get(identity_field).and_then(Value::as_str),
+        Some(expected_id),
+        "{label} exact selector identity"
+    );
+    if let Some(completeness) = payload.get("completeness") {
+        assert!(
+            completeness
+                .get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR)
+                .and_then(Value::as_str)
+                .is_none(),
+            "{label} exact selector does not receive a continuation"
+        );
+        if completeness.get("returned").is_some() {
+            assert_eq!(
+                completeness.get("returned").and_then(Value::as_u64),
+                Some(1),
+                "{label} exact selector completeness count"
+            );
+        }
+        if completeness.get("coverage").is_some() {
+            assert_eq!(
+                completeness.get("coverage").and_then(Value::as_str),
+                Some("COMPLETE"),
+                "{label} exact selector coverage"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_provider_automation_history_and_invocation_page_matrix() {
+    let harness = Harness::fresh("page-cardinality-matrix").await;
+    let adapter = harness.adapter();
+
+    let mut first_page_fixtures = Vec::new();
+    for row_count in [63_usize, 64, 65, 66] {
+        first_page_fixtures.push(
+            seed_automation_page_fixture(adapter, &format!("first-{row_count}"), row_count).await,
+        );
+    }
+    let mut continuation_fixtures = Vec::new();
+    for remaining_count in [63_usize, 64, 65, 66] {
+        continuation_fixtures.push(
+            seed_automation_page_fixture(
+                adapter,
+                &format!("continuation-{remaining_count}"),
+                64 + remaining_count,
+            )
+            .await,
+        );
+    }
+
+    // Every corpus above is written through the same-fence canonical owner
+    // path before these reads. Other automation rows are real persisted rows,
+    // but cannot enter the selected automation's eligible denominator.
+    for fixture in &first_page_fixtures {
+        let invocation_ids = fixture
+            .invocations
+            .iter()
+            .map(|(occurrence_id, _)| occurrence_id.clone())
+            .collect::<Vec<_>>();
+        let row_count = fixture.row_count;
+        let foreign_rows_label = if row_count == 63 {
+            " with persisted foreign automation rows"
+        } else {
+            ""
+        };
+        assert_automation_page_walk(
+            adapter,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            &fixture.automation_id,
+            "revisions",
+            "revision",
+            &fixture.revisions,
+            &format!("history {row_count}{foreign_rows_label}"),
+        )
+        .await;
+        assert_automation_page_walk(
+            adapter,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            &fixture.automation_id,
+            "invocations",
+            "occurrence_id",
+            &invocation_ids,
+            &format!("invocations {row_count}{foreign_rows_label}"),
+        )
+        .await;
+
+        if row_count == 66 {
+            let requested_revision = &fixture.revisions[32];
+            let exact_history = eliot_store_api::automation_revision_read_request(
+                eliot_store_api::AUTOMATION_QUERY_HISTORY.to_owned(),
+                fixture.automation_id.clone(),
+                requested_revision.clone(),
+                false,
+                64,
+                fence(),
+            )
+            .expect("exact history request");
+            let exact_history =
+                eliot_store_api::CanonicalStoreClient::execute_named(adapter, exact_history)
+                    .await
+                    .expect("exact history reads")
+                    .payload;
+            assert_exact_automation_selector(
+                &exact_history,
+                "revisions",
+                "revision",
+                requested_revision,
+                "exact history",
+            );
+
+            let requested_occurrence = &fixture.invocations[32].0;
+            let exact_invocation = eliot_store_api::automation_invocation_read_request(
+                fixture.automation_id.clone(),
+                requested_occurrence.clone(),
+                fence(),
+            )
+            .expect("exact invocation request");
+            let exact_invocation =
+                eliot_store_api::CanonicalStoreClient::execute_named(adapter, exact_invocation)
+                    .await
+                    .expect("exact invocation reads")
+                    .payload;
+            assert_exact_automation_selector(
+                &exact_invocation,
+                "invocations",
+                "occurrence_id",
+                requested_occurrence,
+                "exact invocation",
+            );
+        }
+    }
+
+    for fixture in &continuation_fixtures {
+        let remaining_count = fixture.row_count - 64;
+        let invocation_ids = fixture
+            .invocations
+            .iter()
+            .map(|(occurrence_id, _)| occurrence_id.clone())
+            .collect::<Vec<_>>();
+        assert_automation_page_walk(
+            adapter,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            &fixture.automation_id,
+            "revisions",
+            "revision",
+            &fixture.revisions,
+            &format!("history continuation with {remaining_count} remaining rows"),
+        )
+        .await;
+        assert_automation_page_walk(
+            adapter,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            &fixture.automation_id,
+            "invocations",
+            "occurrence_id",
+            &invocation_ids,
+            &format!("invocation continuation with {remaining_count} remaining rows"),
+        )
+        .await;
+    }
+
+    let mut different_generation = fence();
+    different_generation.resource_generation =
+        ResourceGeneration::new(2).expect("typed alternate generation");
+    let persisted_owner = &first_page_fixtures[0].automation_id;
+    for query in [
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+    ] {
+        assert!(
+            matches!(
+                read_page_with_fence(
+                    adapter,
+                    query,
+                    Some(persisted_owner),
+                    false,
+                    64,
+                    different_generation.clone(),
+                )
+                .await,
+                Err(StoreError::FenceMismatch)
+            ),
+            "{query} refuses a different typed fence for the old-fence corpus"
+        );
+    }
+}
+
+#[tokio::test]
+async fn automation_history_and_invocation_pages_replay_same_cursors() {
+    let harness = Harness::fresh("automation-page-replay").await;
+    let adapter = harness.adapter();
+    let automation_id = "auto-page-replay";
+    store_revision(adapter, automation_id, "r-1", None, "page-create").await;
+    store_revision(adapter, automation_id, "r-2", Some("r-1"), "page-edit-2").await;
+    store_revision(adapter, automation_id, "r-3", Some("r-2"), "page-edit-3").await;
+
+    let mut invocations = [
+        invocation_for(automation_id, "r-3", "page-replay-a"),
+        invocation_for(automation_id, "r-3", "page-replay-b"),
+        invocation_for(automation_id, "r-3", "page-replay-c"),
+        invocation_for(automation_id, "r-3", "page-replay-d"),
+    ];
+    invocations.sort_by(|left, right| left.0.cmp(&right.0));
+    for (index, (occurrence_id, invocation_json)) in invocations.iter().skip(1).take(3).enumerate()
+    {
+        let tag = format!("page-run-{index}");
+        store_invocation(
+            adapter,
+            automation_id,
+            "r-3",
+            occurrence_id.clone(),
+            invocation_json.clone(),
+            &tag,
+        )
+        .await;
+    }
+    assert_page_replay(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        automation_id,
+        "revisions",
+        "revision",
+        &["r-1".to_owned(), "r-2".to_owned(), "r-3".to_owned()],
+    )
+    .await;
+    let invocation_ids = invocations
+        .iter()
+        .skip(1)
+        .take(3)
+        .map(|(occurrence_id, _)| occurrence_id.clone())
+        .collect::<Vec<_>>();
+    assert_page_replay(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        automation_id,
+        "invocations",
+        "occurrence_id",
+        &invocation_ids,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn automation_first_page_replay_refuses_changed_binding_tail_and_snapshot() {
+    let harness = Harness::fresh("automation-page-replay-refusal").await;
+    let adapter = harness.adapter();
+    let automation_id = "auto-page-refusal";
+    store_revision(adapter, automation_id, "r-1", None, "refusal-create").await;
+    store_revision(adapter, automation_id, "r-2", Some("r-1"), "refusal-edit-2").await;
+
+    let mut invocations = [
+        invocation_for(automation_id, "r-2", "refusal-low"),
+        invocation_for(automation_id, "r-2", "refusal-middle"),
+        invocation_for(automation_id, "r-2", "refusal-high"),
+    ];
+    invocations.sort_by(|left, right| left.0.cmp(&right.0));
+    for (index, (occurrence_id, invocation_json)) in invocations.iter().skip(1).enumerate() {
+        let tag = format!("refusal-run-{index}");
+        store_invocation(
+            adapter,
+            automation_id,
+            "r-2",
+            occurrence_id.clone(),
+            invocation_json.clone(),
+            &tag,
+        )
+        .await;
+    }
+
+    let history_first = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        Some(automation_id),
+        false,
+        1,
+        None,
+    )
+    .await
+    .expect("first history page reads");
+    let history_cursor = page_cursor(&history_first).to_owned();
+    let invocation_first = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        Some(automation_id),
+        false,
+        1,
+        None,
+    )
+    .await
+    .expect("first invocation page reads");
+    let invocation_cursor = page_cursor(&invocation_first).to_owned();
+
+    let changed_binding = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        Some(automation_id),
+        false,
+        2,
+        Some(&history_cursor),
+    )
+    .await;
+    assert!(matches!(
+        changed_binding,
+        Err(StoreError::AutomationContinuation(
+            eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown
+        ))
+    ));
+
+    store_invocation(
+        adapter,
+        automation_id,
+        "r-2",
+        invocations[0].0.clone(),
+        invocations[0].1.clone(),
+        "refusal-run-earlier",
+    )
+    .await;
+    let changed_snapshot_first = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        Some(automation_id),
+        false,
+        1,
+        None,
+    )
+    .await;
+    let changed_snapshot_first = changed_snapshot_first.expect("new snapshot first page reads");
+    assert_eq!(
+        changed_snapshot_first["invocations"][0]["occurrence_id"].as_str(),
+        Some(invocations[0].0.as_str())
+    );
+    let changed_snapshot_cursor = page_cursor(&changed_snapshot_first).to_owned();
+    assert_ne!(changed_snapshot_cursor, invocation_cursor);
+    let changed_snapshot_second = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        Some(automation_id),
+        false,
+        1,
+        Some(&changed_snapshot_cursor),
+    )
+    .await
+    .expect("new snapshot continuation reads after the new first-page tail");
+    assert_eq!(
+        changed_snapshot_second["invocations"][0]["occurrence_id"].as_str(),
+        Some(invocations[1].0.as_str())
+    );
+    let old_invocation_snapshot = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        Some(automation_id),
+        false,
+        1,
+        Some(&invocation_cursor),
+    )
+    .await;
+    assert!(matches!(
+        old_invocation_snapshot,
+        Err(StoreError::AutomationContinuation(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot
+        ))
+    ));
+
+    store_revision(adapter, automation_id, "r-3", Some("r-2"), "refusal-edit-3").await;
+    let changed_snapshot = read_page(
+        adapter,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        Some(automation_id),
+        false,
+        1,
+        Some(&history_cursor),
+    )
+    .await;
+    assert!(matches!(
+        changed_snapshot,
+        Err(StoreError::AutomationContinuation(
+            eliot_store_api::AutomationContinuationFailure::StaleSnapshot
+        ))
+    ));
 }
 
 fn check_domain_revision(payload_json: &str, automation_id: &str, revision: &str) {

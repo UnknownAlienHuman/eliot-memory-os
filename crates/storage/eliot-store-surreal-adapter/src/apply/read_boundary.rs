@@ -2554,6 +2554,24 @@ fn automation_page_needs_batch(eligible: usize, limit: usize, fetched: usize) ->
     eligible <= limit && fetched > limit
 }
 
+/// Adds same-fence rows from one raw batch, capped at the one-over probe.
+fn automation_extend_eligible_batch<T: Clone>(
+    eligible: &mut Vec<T>,
+    batch: &[T],
+    state_fence: &StateFence,
+    limit: usize,
+    row_fence: impl for<'a> Fn(&'a T) -> &'a StateFence,
+) {
+    let remaining = limit.saturating_add(1).saturating_sub(eligible.len());
+    eligible.extend(
+        batch
+            .iter()
+            .filter(|row| row_fence(row) == state_fence)
+            .take(remaining)
+            .cloned(),
+    );
+}
+
 /// Collects the eligible revision rows one page may inspect.
 ///
 /// Every batch is read at the bound plus one row and resumes strictly after the
@@ -2584,11 +2602,9 @@ async fn automation_eligible_revisions(
                 read_revisions_after(db, config, automation_id, after_revision, limit + 1).await?
             }
         };
-        for row in &batch {
-            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
-                eligible.push(row.clone());
-            }
-        }
+        automation_extend_eligible_batch(&mut eligible, &batch, state_fence, limit, |row| {
+            &row.state_fence
+        });
         if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
             return Ok(eligible);
         }
@@ -2627,11 +2643,9 @@ async fn automation_eligible_invocations(
                     .await?
             }
         };
-        for row in &batch {
-            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
-                eligible.push(row.clone());
-            }
-        }
+        automation_extend_eligible_batch(&mut eligible, &batch, state_fence, limit, |row| {
+            &row.state_fence
+        });
         if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
             return Ok(eligible);
         }
@@ -3762,6 +3776,187 @@ mod admitted_read_tests {
             .expect("canonical test lineage-A");
         let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
         eliot_store_api::StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    #[derive(Clone)]
+    struct ProbeRow {
+        id: String,
+        state_fence: StateFence,
+    }
+
+    fn probe_row(id: &str, state_fence: &StateFence) -> ProbeRow {
+        ProbeRow {
+            id: id.to_owned(),
+            state_fence: state_fence.clone(),
+        }
+    }
+
+    fn probe_rows(prefix: &str, count: usize, state_fence: &StateFence) -> Vec<ProbeRow> {
+        (1..=count)
+            .map(|number| probe_row(&format!("{prefix}-{number}"), state_fence))
+            .collect()
+    }
+
+    fn assert_probe_one_over_is_truncated(state_fence: &StateFence, limit: usize) {
+        let raw = probe_rows("one-over", limit + 1, state_fence);
+        let mut eligible = Vec::new();
+        automation_extend_eligible_batch(&mut eligible, &raw, state_fence, limit, |row| {
+            &row.state_fence
+        });
+        assert_eq!(eligible.len(), limit + 1);
+        assert!(!automation_page_needs_batch(
+            eligible.len(),
+            limit,
+            raw.len()
+        ));
+        assert_eq!(eligible[limit].id, "one-over-65");
+        let page = automation_page_slice(eligible, limit, |row| row.id.as_str());
+        assert_eq!(page.rows.len(), limit);
+        assert!(page.truncated);
+        assert_eq!(page.last_row_id.as_deref(), Some("one-over-64"));
+        let expected_ids = (1..=limit)
+            .map(|number| format!("one-over-{number}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+    }
+
+    #[test]
+    fn automation_page_probe_stops_after_eligible_quota() {
+        use std::cell::Cell;
+
+        let limit = 64;
+        let state_fence = test_fence();
+        let mut eligible = probe_rows("prior", limit, &state_fence);
+        let batch = probe_rows("batch", limit + 1, &state_fence);
+        let inspected = Cell::new(0);
+        automation_extend_eligible_batch(&mut eligible, &batch, &state_fence, limit, |row| {
+            inspected.set(inspected.get() + 1);
+            &row.state_fence
+        });
+        assert_eq!(inspected.get(), 1);
+        assert_eq!(eligible.len(), limit + 1);
+        assert_eq!(eligible.last().map(|row| row.id.as_str()), Some("batch-1"));
+
+        let already_full_inspections = Cell::new(0);
+        automation_extend_eligible_batch(&mut eligible, &batch, &state_fence, limit, |row| {
+            already_full_inspections.set(already_full_inspections.get() + 1);
+            &row.state_fence
+        });
+        assert_eq!(already_full_inspections.get(), 0);
+        assert_eq!(eligible.len(), limit + 1);
+    }
+
+    fn assert_dense_foreign_batches_require_more_rows(
+        state_fence: &StateFence,
+        foreign_fence: &StateFence,
+        limit: usize,
+    ) {
+        let mut eligible = Vec::new();
+        let first_raw = probe_rows("foreign-full", limit + 1, foreign_fence);
+        automation_extend_eligible_batch(&mut eligible, &first_raw, state_fence, limit, |row| {
+            &row.state_fence
+        });
+        assert!(eligible.is_empty());
+        assert!(automation_page_needs_batch(
+            eligible.len(),
+            limit,
+            first_raw.len()
+        ));
+        assert_eq!(
+            first_raw.last().map(|row| row.id.as_str()),
+            Some("foreign-full-65")
+        );
+
+        let second_raw = probe_rows("foreign-next", limit + 1, foreign_fence);
+        automation_extend_eligible_batch(&mut eligible, &second_raw, state_fence, limit, |row| {
+            &row.state_fence
+        });
+        assert!(eligible.is_empty());
+        assert!(automation_page_needs_batch(
+            eligible.len(),
+            limit,
+            second_raw.len()
+        ));
+        assert_eq!(
+            second_raw.last().map(|row| row.id.as_str()),
+            Some("foreign-next-65")
+        );
+    }
+
+    fn assert_foreign_tail_does_not_truncate_eligible_boundary(
+        state_fence: &StateFence,
+        foreign_fence: &StateFence,
+        limit: usize,
+    ) {
+        let mut eligible = Vec::new();
+        let mut exact_boundary = probe_rows("eligible", limit, state_fence);
+        exact_boundary.push(probe_row("foreign-tail", foreign_fence));
+        automation_extend_eligible_batch(
+            &mut eligible,
+            &exact_boundary,
+            state_fence,
+            limit,
+            |row| &row.state_fence,
+        );
+        assert_eq!(eligible.len(), limit);
+        assert!(automation_page_needs_batch(
+            eligible.len(),
+            limit,
+            exact_boundary.len()
+        ));
+        assert_eq!(
+            exact_boundary.last().map(|row| row.id.as_str()),
+            Some("foreign-tail")
+        );
+
+        let short_raw = [probe_row("foreign-exhausted", foreign_fence)];
+        automation_extend_eligible_batch(&mut eligible, &short_raw, state_fence, limit, |row| {
+            &row.state_fence
+        });
+        assert!(!automation_page_needs_batch(
+            eligible.len(),
+            limit,
+            short_raw.len()
+        ));
+        let complete = automation_page_slice(eligible, limit, |row| row.id.as_str());
+        assert_eq!(complete.rows.len(), limit);
+        assert!(!complete.truncated);
+        assert_eq!(complete.last_row_id.as_deref(), Some("eligible-64"));
+        let expected_complete_ids = (1..=limit)
+            .map(|number| format!("eligible-{number}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            complete
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            expected_complete_ids
+        );
+    }
+
+    #[test]
+    fn automation_page_probe_excludes_foreign_fence_rows() {
+        let limit = 64;
+        // Structural inputs prove only shared projection arithmetic, not persisted owner,
+        // cutover, or receipt state.
+        let state_fence = test_fence();
+        let mut foreign_fence = state_fence.clone();
+        foreign_fence.resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("distinct resource generation");
+        assert_dense_foreign_batches_require_more_rows(&state_fence, &foreign_fence, limit);
+        assert_foreign_tail_does_not_truncate_eligible_boundary(
+            &state_fence,
+            &foreign_fence,
+            limit,
+        );
+        assert_probe_one_over_is_truncated(&state_fence, limit);
     }
 
     fn read_request(
