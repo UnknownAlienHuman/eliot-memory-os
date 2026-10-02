@@ -2,7 +2,7 @@
   "contract": "F-LOG-HOST-1 host service lifecycle and SCM control diagnostics",
   "issue": 891,
   "target": "eliot_host::diagnostics",
-  "note": "Starter probes T-A (stop/drain distinct) and T-B (SCM receipt + Unknown) only, through the #889 facade. Case 1 is BOUND to the frozen HOST_LIFECYCLE_BOUNDARY_TABLE in src/lib.rs (see boundary_table); cases 2..22 stay DEFERRED in deferred_cases; whole-Host acceptance needs the final child-union coverage proof (#837/#852). Real Windows Event Log delivery smoke needs #984 and stays an honest residual: the seam is typed-Unavailable, never FFI, never faked.",
+  "note": "Probes T-A (stop/drain distinct) and T-B (SCM receipt + Unknown) drive the real #889 facade. The required 22-case matrix is LANDED, not deferred: every case 1..=22 carries a `// WORK_UNIT_CASE: 891/<n>` marker in src/lib.rs whose `fn case_<n>_` is a real `#[test]`, and case_matrix_denominator_is_exactly_1_to_22 pins that denominator in both directions (no missing marker, no marker without a live test, no doubled case), so deferred_cases is empty. Every non-#983 row of the frozen HOST_LIFECYCLE_BOUNDARY_TABLE in src/lib.rs (see boundary_table) names the landed case or the T-A/T-B probe that proves it, and boundary_rows_bind_a_landed_case fails if a row names a case that has no marker or no live test. Named remaining gaps: whole-Host acceptance still needs the final child-union coverage proof (#837/#852); real Windows Event Log delivery smoke needs #984 and stays an honest residual: the seam is typed-Unavailable, never FFI, never faked.",
   "stages": {
     "startup": "startup",
     "scm_dispatch": "scm_dispatch",
@@ -241,27 +241,5 @@
     "backup-cutover-retire.terminal"
   ]
 },
-  "deferred_cases": [
-    "2: service-start request versus result",
-    "3: startup-ready event only with actual readiness evidence",
-    "4: SCM receipt retains control/operation identity",
-    "5: unsupported control typed/non-success",
-    "6: stop request/pending/stopped distinct",
-    "7: activation requested/started/ready/failed distinct",
-    "8: drain request/progress/completion distinct",
-    "9: managed launch request is not readiness",
-    "10: process liveness is not semantic readiness",
-    "11: restart versus rollback distinct",
-    "12: requested versus terminal cancellation distinct",
-    "13: timeout/possible state change remains unknown",
-    "14: one terminal error per operation across nested propagation, not one per question mark",
-    "15: exact installation/process/generation/operation correlation",
-    "16: typed reason/recovery code, no free-text machine status",
-    "17: missing evidence suppresses a false success event without changing original semantic behavior",
-    "18: sink failure/drop leaves result/order/status/cleanup unchanged",
-    "19: credential/env/DB canaries absent",
-    "20: SCM/source/user canaries absent",
-    "21: injected schedule/capture gives deterministic semantic records, with observational timing separated",
-    "22: production-call-path/allowed-diff fixture proves no duplicate evaluation, lifecycle change, new visibility or unowned edit"
-  ]
+  "deferred_cases": []
 }

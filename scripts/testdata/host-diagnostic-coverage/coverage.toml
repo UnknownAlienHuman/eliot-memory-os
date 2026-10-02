@@ -1375,7 +1375,7 @@ phase = "lifecycle"
 scope = "none"
 status = "incomplete"
 reason = "missing_test_binding"
-detail = "Emitter present; no bound test."
+detail = "Emitter present; no recorded binding in this table. #891 landed case 15 (and 19/21) now call the real lifecycle_context projection and bind its lifecycle-context.requested/admitted rows; the three typed-identity failure arms that own host-lifecycle-context-failed are still not driven, so the boundary stays incomplete here."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
@@ -3209,7 +3209,7 @@ n = 9
 title = "exact operation/installation/process-start/generation/reason tied to owner"
 boundaries = ["B-lib-lifecycle-context", "B-main-scm-receipts"]
 decidable = "validator"
-note = "Identity projection emitter frozen (unbound); receipt codes frozen."
+note = "Identity projection emitter frozen (success path driven by the landed #891 case 15; its terminal arms unbound); receipt codes frozen."
 
 [[matrix]]
 n = 10
