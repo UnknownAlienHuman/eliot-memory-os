@@ -1912,7 +1912,7 @@ fn host_request_frame_for_envelope(
 ///
 /// The envelope remains the authenticated binding for the connection, session,
 /// fence, capability, idempotency key, and canonical payload digest. The
-/// `tool` member is carried only for the UserAutomation Kernel selector to
+/// `tool` member is carried only for the `UserAutomation` Kernel selector to
 /// decode and re-canonicalize before it constructs the authenticated service
 /// request. Reconciliation deliberately carries only the parent envelope and
 /// digest; it never resubmits this body under a new identity.
@@ -4235,9 +4235,8 @@ mod tests {
 
         let submit = host_request_user_automation_frame(&request, &envelope, &facts)
             .expect("UserAutomation submit frame must build");
-        let submit_payload = match &submit.payload {
-            ProtocolPayload::Json(payload) => payload,
-            _ => panic!("submit frame must carry JSON"),
+        let ProtocolPayload::Json(submit_payload) = &submit.payload else {
+            panic!("submit frame must carry JSON");
         };
         assert_eq!(
             submit_payload
@@ -4277,9 +4276,8 @@ mod tests {
             &facts,
         )
         .expect("UserAutomation reconciliation frame must build");
-        let reconcile_payload = match &reconcile_frame.payload {
-            ProtocolPayload::Json(payload) => payload,
-            _ => panic!("reconciliation frame must carry JSON"),
+        let ProtocolPayload::Json(reconcile_payload) = &reconcile_frame.payload else {
+            panic!("reconciliation frame must carry JSON");
         };
         assert_eq!(
             reconcile_payload
@@ -4662,9 +4660,11 @@ mod tests {
             payload
                 .pointer("/envelope/identity/payload_sha256")
                 .and_then(|digest| digest.as_str()),
-            Some(canonical_payload_digest(&request.tool)
-                .expect("payload digest must compute")
-                .as_str())
+            Some(
+                canonical_payload_digest(&request.tool)
+                    .expect("payload digest must compute")
+                    .as_str()
+            )
         );
     }
 
