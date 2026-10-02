@@ -49,10 +49,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use eliot_contracts::{
-    ClockReading, EpochId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId, StateFence,
+    ClockReading, EpochId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId,
+    StateFence,
 };
-use elipt_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
 use eliot_receipts::RequestBinding;
+use elipt_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
 
 use super::{KernelComposition, KernelFrameAction, Session, TransportError, unix_ms};
 
@@ -285,10 +286,7 @@ impl KernelComposition {
             .lock()
             .map_err(|_poisoned| TransportError::SessionFenced)?
             .is_some()
-            || !matches!(
-                self.service_state(),
-                Ok(super::KernelServiceState::Ready)
-            )
+            || !matches!(self.service_state(), Ok(super::KernelServiceState::Ready))
         {
             return Err(TransportError::SessionFenced);
         }
@@ -402,8 +400,8 @@ impl KernelComposition {
         let ProtocolPayload::Json(payload) = &frame.payload else {
             return Err(TransportError::SessionFenced);
         };
-        let request: OperatorRequestIdentityRequest =
-            serde_json::from_value(payload.clone()).map_err(|_error| TransportError::SessionFenced)?;
+        let request: OperatorRequestIdentityRequest = serde_json::from_value(payload.clone())
+            .map_err(|_error| TransportError::SessionFenced)?;
         let grant = self.issue_operator_request_identity(session, &request)?;
         let reply = super::status_frame(
             session,
@@ -466,13 +464,14 @@ fn mint_operator_request_identity(
     if role.trim().is_empty()
         || role.chars().any(char::is_control)
         || capabilities.is_empty()
-        || capabilities
-            .iter()
-            .any(|capability| capability.trim().is_empty() || capability.chars().any(char::is_control))
+        || capabilities.iter().any(|capability| {
+            capability.trim().is_empty() || capability.chars().any(char::is_control)
+        })
     {
         return Err(TransportError::SessionFenced);
     }
-    let observed_at = i64::try_from(issued_at_unix_ms).map_err(|_error| TransportError::SessionFenced)?;
+    let observed_at =
+        i64::try_from(issued_at_unix_ms).map_err(|_error| TransportError::SessionFenced)?;
     let identity = RequestIdentity {
         request: RequestBinding {
             metadata: eliot_contracts::RequestMetadata {
@@ -502,7 +501,9 @@ fn mint_operator_request_identity(
         deadline_unix_ms: expires_at_unix_ms,
         cancellation_id,
     };
-    identity.validate().map_err(|_error| TransportError::SessionFenced)?;
+    identity
+        .validate()
+        .map_err(|_error| TransportError::SessionFenced)?;
     Ok(identity)
 }
 
@@ -513,8 +514,8 @@ mod tests {
     use eliot_contracts::{AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_ipc::{PeerIdentity, ProcessBinding, SessionState};
     use eliot_kernel_service::{
-        HostKernelCandidateBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
-        KernelService, KernelServiceState,
+        HostKernelCandidateBinding, KernelActivationPermit, KernelControlCommand,
+        KernelReadyReceipt, KernelService, KernelServiceState,
     };
     use eliot_platform::PlatformHandle;
     use eliot_protocol::{EncodingProfile, ProtocolVersion};
@@ -541,7 +542,10 @@ mod tests {
     }
 
     fn candidate_binding() -> HostKernelCandidateBinding {
-        use eliot_kernel_service::{HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding, RestartBudget};
+        use eliot_kernel_service::{
+            HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostProcessBinding,
+            RestartBudget,
+        };
         HostKernelCandidateBinding {
             installation_id: handle("installation-4600"),
             host_epoch: AuthorityEpoch::new(1).expect("host epoch"),
@@ -623,9 +627,7 @@ mod tests {
         let mut service = KernelService::new([7; 32], 4, 8).expect("kernel service");
         let candidate = candidate_binding();
         service.reconcile(candidate.clone()).expect("reconcile");
-        service
-            .apply(KernelControlCommand::Shadow)
-            .expect("shadow");
+        service.apply(KernelControlCommand::Shadow).expect("shadow");
         service
             .apply(KernelControlCommand::PrepareHandoff)
             .expect("prepare handoff");
@@ -673,8 +675,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).expect("test work root");
-        let kernel =
-            KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
         let service = ready_service();
         *kernel.service.lock().expect("service lock") = service;
         assert_eq!(
@@ -751,7 +752,10 @@ mod tests {
             let (kernel, root) = ready_composition(operation);
             let session = admitted_session(&kernel, &format!("cli-{operation}"));
             let action = kernel
-                .dispatch_frame(&session, &issuance_request_frame(&session.connection_id, operation))
+                .dispatch_frame(
+                    &session,
+                    &issuance_request_frame(&session.connection_id, operation),
+                )
                 .expect("issuance request is admitted");
             let KernelFrameAction::Reply(reply) = action else {
                 panic!("{code}: issuance must answer with the owner grant frame");
@@ -776,11 +780,16 @@ mod tests {
                 .state_fence
                 .clone();
             assert_eq!(grant.state_fence, policy_fence, "{code}: live fence");
-            assert!(grant
-                .authority_epoch
-                .is_same_authority(&policy_fence.authority_epoch));
+            assert!(
+                grant
+                    .authority_epoch
+                    .is_same_authority(&policy_fence.authority_epoch)
+            );
             // And the identity is a real EBP frame value the client can carry.
-            grant.request_identity.validate().expect("identity validates");
+            grant
+                .request_identity
+                .validate()
+                .expect("identity validates");
             let wire = Frame {
                 protocol_version: ProtocolVersion::CURRENT,
                 encoding_profile: EncodingProfile::JsonV1,
@@ -824,12 +833,14 @@ mod tests {
             kernel.issue_operator_request_identity(&unproven, &request_for("operator.launch")),
             Err(TransportError::PeerIdentityUnavailable)
         ));
-        assert!(kernel
-            .operator_request_identities
-            .retained
-            .lock()
-            .expect("retained ledger")
-            .is_empty());
+        assert!(
+            kernel
+                .operator_request_identities
+                .retained
+                .lock()
+                .expect("retained ledger")
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -842,9 +853,15 @@ mod tests {
         let session = admitted_session(&kernel, "cli-wrong-session");
 
         let mut replaced = session.clone();
-        replaced.module_generation.state_fence.resource_generation =
-            ResourceGeneration::new(session.module_generation.state_fence.resource_generation.value() + 1)
-                .expect("next generation");
+        replaced.module_generation.state_fence.resource_generation = ResourceGeneration::new(
+            session
+                .module_generation
+                .state_fence
+                .resource_generation
+                .value()
+                + 1,
+        )
+        .expect("next generation");
         assert!(matches!(
             kernel.issue_operator_request_identity(&replaced, &request_for("operator.launch")),
             Err(TransportError::SessionFenced)
@@ -857,12 +874,14 @@ mod tests {
             kernel.dispatch_operator_request_identity(&foreign, &frame),
             Err(TransportError::SessionFenced)
         ));
-        assert!(kernel
-            .operator_request_identities
-            .retained
-            .lock()
-            .expect("retained ledger")
-            .is_empty());
+        assert!(
+            kernel
+                .operator_request_identities
+                .retained
+                .lock()
+                .expect("retained ledger")
+                .is_empty()
+        );
 
         // A request frame on this lane would have to present an identity, so it
         // can never be the issuance request and is refused as a contract error.
@@ -905,13 +924,11 @@ mod tests {
             "two operations never share a request id"
         );
         assert_ne!(
-            status.request_identity.idempotency_key,
-            launch.request_identity.idempotency_key,
+            status.request_identity.idempotency_key, launch.request_identity.idempotency_key,
             "two operations never share an idempotency key"
         );
         assert_ne!(
-            status.request_identity.cancellation_id,
-            launch.request_identity.cancellation_id,
+            status.request_identity.cancellation_id, launch.request_identity.cancellation_id,
             "two operations never share a cancellation id"
         );
         // The one-use handoff is the ledger itself: it retains one identity per
@@ -928,7 +945,11 @@ mod tests {
             launch.request_identity
         );
         assert_eq!(
-            retained[&(session.connection_id.clone(), "controlboard.status".to_owned())].identity,
+            retained[&(
+                session.connection_id.clone(),
+                "controlboard.status".to_owned()
+            )]
+                .identity,
             status.request_identity
         );
         let _ = std::fs::remove_dir_all(root);
