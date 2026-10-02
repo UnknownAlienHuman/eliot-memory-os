@@ -274,10 +274,12 @@ fn console_process_exit_code() -> i32 {
 // callsites use entrypoint observations with static nonsecret words only: no
 // argv/env/nonce/credentials, no raw request lines, no error text (I15.4,
 // I07.20). The single HOST-0 terminal record for the console path is
-// preserved verbatim and stays the only terminal emission in this file:
-// lib.rs owns child-failure terminals, so main correlates without re-emitting
-// (single-terminal rule); the SCM-dispatcher failure is likewise a stage
-// detail, keeping stderr/capsule/exit 1066 as its receipt.
+// preserved verbatim; lib.rs owns child-failure terminals, so main correlates
+// without re-emitting (single-terminal rule). The SCM-dispatcher process-entry
+// failure is the one terminal main itself owns, because no lib.rs operation
+// ever ran for it: `fail_scm_dispatcher` emits exactly one facade terminal
+// carrying the typed `HOST_TERMINAL_CODE_DISPATCHER_FAILED` code, and
+// stderr/capsule/exit 1066 remain that failure's unchanged receipt.
 //
 // B1  process bootstrap capture (`PROCESS_BOOTSTRAP.set`, Startup): cached
 //     only; a static outcome word, never launch material. The #889
@@ -286,7 +288,11 @@ fn console_process_exit_code() -> i32 {
 // B3  SCM dispatcher contour (windows-only, ScmDispatch): the `Ok(true)`
 //     service path stays unobserved (SCM owns the process); `Ok(false)`
 //     console fallback vs `Err` dispatcher failure stay distinct, and no
-//     fallback is added where none existed. No projection here.
+//     fallback is added where none existed. The `Err` arm emits the one
+//     terminal main owns (`fail_scm_dispatcher`, typed
+//     `HOST_TERMINAL_CODE_DISPATCHER_FAILED`) plus one bounded #889 request
+//     projection; the old bare `dispatcher_failed` stage detail is gone, so
+//     exactly one terminal names this failure.
 // B4  console terminal exit (HOST-0 reference): preserved verbatim, plus a
 //     typed #889 projection subordinate (INFO, not a second terminal).
 // B5  console launch parse (ConsoleLoop/LaunchConfig): the Error frame plus
@@ -318,7 +324,32 @@ fn console_process_exit_code() -> i32 {
 //     second stop terminal for the same request. The `Ok`/`Stopped` outcomes
 //     are distinguished with identical results; drain outcome observed only.
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
-// B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
+// B14 service-entry failures (`service_main`, main-only; these never cross
+//     `lib.rs`). Each is projected through the existing #889 facade at its real
+//     boundary by `observe_service_entry_failure`, so none is hidden. Every
+//     record names the operation (`AdmittedEvent::ServiceFailure`), the phase
+//     (`EntrypointStage::ScmDispatch`), the typed `HostStopCode` discriminant as
+//     the observation label, the typed `HostError` discriminant as the reason
+//     where one is in hand, and the launch identities only from options that
+//     already parsed. The six `fail_host_service` classes —
+//     `InvalidScmArgvOrBootstrap`, `InvalidRegistration`,
+//     `ReporterStartFailed`, `OpenHostFailed`, `ReporterProgressFailed`,
+//     `CredentialControlFailed`, `SpawnCredentialFailed`,
+//     `RuntimeControlFailed`, `SpawnRuntimeFailed` — are projected inside that
+//     one function, which every one of those arms already calls exactly once;
+//     `ScmRegisterNull` has no SCM handle and so calls the helper at its own
+//     site. No argv, Win32 code, bootstrap text, or error payload crosses.
+//     These are `INFO` subordinate records: the terminal for each failed
+//     operation stays with the owner that already emits it (lib.rs's
+//     `HostTerminalGuard` for `OpenHostFailed`/`CredentialControlFailed`/
+//     `RuntimeControlFailed`/stop, and the SCM status + capsule receipt for the
+//     boundary-only classes), so no failure gains a second terminal and none
+//     loses its receipt.
+// B15 start-failure capsule/stderr/SCM status and the process exit code: the
+//     receipt owners, unchanged. Every observation above is additive on the
+//     #889 facade only; stderr text, capsule content, `dwWin32ExitCode` 1066,
+//     `dwServiceSpecificExitCode`, and the console/dispatch exit code are byte
+//     and value identical to before.
 
 /// Reads the admitted profile supervisor switch from the process arguments,
 /// leaving every other launch argument untouched.
@@ -424,29 +455,7 @@ fn main() {
                 },
             );
         }
-        Err(error) => {
-            // F-LOG-HOST-7 B3 (issue #982): dispatcher failure as stage detail
-            // only, so the HOST-0 terminal record below stays singular per the
-            // #889 contract; stderr, capsule, and exit 1066 still own the
-            // terminal receipt with identical text and codes.
-            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
-                "dispatcher_failed",
-            );
-            let detail = format!(
-                "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
-            );
-            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
-            let cached = captured_bootstrap_snapshot();
-            persist_host_start_failure(
-                HostStopCode::DispatcherFailed,
-                "dispatcher",
-                &detail,
-                cached.as_ref(),
-            );
-            eliot_host::host_diagnostics::shutdown_event_log_reporting();
-            std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
-        }
+        Err(error) => fail_scm_dispatcher(error),
     }
     let console = run_console();
     // The console run fails when its primary outcome failed or when the
@@ -1556,6 +1565,97 @@ fn run_as_scm_service() -> Result<bool, u32> {
     }
 }
 
+/// Fails the process at the SCM-dispatcher process-entry boundary.
+///
+/// This is the one terminal failure `main` owns outright: no lib.rs operation
+/// ever ran for it, so no lib.rs boundary can own it. The #889 facade therefore
+/// carries exactly one terminal record, spelled with the typed
+/// `HOST_TERMINAL_CODE_DISPATCHER_FAILED` code that projects
+/// [`HostStopCode::DispatcherFailed`] (specific 12) without taking over its
+/// lifecycle meaning, plus one bounded #889 request projection naming the same
+/// failure. The bare `dispatcher_failed` stage detail this arm used to emit is
+/// replaced by that typed terminal, never joined by it, so this failed
+/// operation yields exactly one terminal and no second emitter.
+///
+/// Every preserved behavior is unchanged and in the same order: the same
+/// stderr text, the same capsule record, the same Event Log shutdown, and the
+/// same 1066 process exit. The Win32 code stays out of diagnostics; the reason
+/// slot is honestly missing because a Win32 code is not a typed `HostError`
+/// reason.
+#[cfg(windows)]
+fn fail_scm_dispatcher(error: u32) -> ! {
+    eliot_host::host_diagnostics::observe_terminal_error(
+        eliot_host::host_diagnostics::HOST_TERMINAL_CODE_DISPATCHER_FAILED,
+    );
+    let cached = captured_bootstrap_snapshot();
+    // #889 projection: the process never reached service supervision, so this
+    // is an admitted service failure with no typed reason to project.
+    let mut terminal = HostRequestProjection::failed_without_reason(
+        eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+    )
+    .with_operation(AdmittedEvent::ServiceFailure)
+    .with_terminal_exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+    if let Some(options) = cached.as_ref() {
+        terminal = terminal.with_launch_options(options);
+    }
+    observe_host_request(&terminal);
+    let detail = format!(
+        "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
+    );
+    let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+    persist_host_start_failure(
+        HostStopCode::DispatcherFailed,
+        "dispatcher",
+        &detail,
+        cached.as_ref(),
+    );
+    eliot_host::host_diagnostics::shutdown_event_log_reporting();
+    std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+}
+
+/// Bounded typed #889 projection for one main-owned SCM service-entry
+/// failure, emitted at the boundary that actually detected it.
+///
+/// These boundaries live in `service_main`, in this binary, and never cross
+/// `lib.rs`, so nothing downstream would ever project them: each is projected
+/// here instead. The record carries the admitted operation
+/// (`AdmittedEvent::ServiceFailure`), the phase (`EntrypointStage::ScmDispatch`),
+/// the typed [`HostStopCode`] discriminant as the stage label, and the
+/// installation/generation identities of launch options that already parsed.
+/// Slots with nothing in hand stay explicitly missing rather than guessed.
+///
+/// `error` is the typed [`HostError`] the owner produced where one exists;
+/// where the outcome collapsed it — the reporter thread's `io::Error`, the
+/// reporter progress flag — the reason stays explicitly missing instead of
+/// inventing one from a payload or an arbitrary `Debug` rendering. Nothing
+/// here reads argv, the Win32 code, or any error text (I15.4, I07.20).
+///
+/// This is an `INFO` subordinate record, never a second terminal: the single
+/// terminal per failed operation stays with the owner that already emits it —
+/// lib.rs's `HostTerminalGuard` for the composition failures, and the SCM
+/// status plus capsule receipt for the boundary-only classes.
+#[cfg(windows)]
+fn observe_service_entry_failure(
+    code: HostStopCode,
+    error: Option<&HostError>,
+    launch_options: Option<&HostLaunchOptions>,
+) {
+    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+        eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+        code.failure_class(),
+    );
+    let stage = eliot_host::host_diagnostics::EntrypointStage::ScmDispatch;
+    let mut projection = match error {
+        Some(error) => HostRequestProjection::failed(stage, error),
+        None => HostRequestProjection::failed_without_reason(stage),
+    }
+    .with_operation(AdmittedEvent::ServiceFailure);
+    if let Some(options) = launch_options {
+        projection = projection.with_launch_options(options);
+    }
+    observe_host_request(&projection);
+}
+
 #[cfg(windows)]
 struct HostStartPendingReporter {
     stop: Option<std::sync::mpsc::Sender<()>>,
@@ -1638,11 +1738,17 @@ fn fail_host_service(
     report: &mut eliot_platform_windows::scm_entry::ServiceStatusReport,
     code: HostStopCode,
     error_variant: &str,
+    error: Option<&HostError>,
     detail: &str,
     launch_options: Option<&HostLaunchOptions>,
 ) {
     use eliot_platform_windows::scm_entry::report_service_status;
     use windows_sys::Win32::System::Services::SERVICE_STOPPED;
+    // F-LOG-HOST-7 B14 (issue #982): every arm reaching this function is a
+    // main-owned service-entry failure that never crosses `lib.rs`, so this is
+    // the one site that projects all of them. `INFO` only — the single terminal
+    // for each failed operation stays with the owner that already emits it.
+    observe_service_entry_failure(code, error, launch_options);
     persist_host_start_failure(code, error_variant, detail, launch_options);
     report.current_state = SERVICE_STOPPED;
     report.win32_exit_code = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
@@ -1675,6 +1781,11 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             );
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let cached = captured_bootstrap_snapshot();
+            // F-LOG-HOST-7 B14 (issue #982): this boundary has no SCM handle,
+            // so it cannot go through `fail_host_service`; its typed #889
+            // projection is emitted here. No `HostError` is in hand (only a
+            // Win32 code) and none is invented, so the reason stays missing.
+            observe_service_entry_failure(HostStopCode::ScmRegisterNull, None, cached.as_ref());
             persist_host_start_failure(
                 HostStopCode::ScmRegisterNull,
                 "none",
@@ -1712,6 +1823,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::InvalidScmArgvOrBootstrap,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 cached.as_ref(),
             );
@@ -1726,6 +1838,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             &mut report,
             HostStopCode::InvalidRegistration,
             host_error_variant(&error),
+            Some(&error),
             &detail,
             Some(&launch_options),
         );
@@ -1741,6 +1854,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::ReporterStartFailed,
                 "io",
+                None,
                 &detail,
                 Some(&launch_options),
             );
@@ -1760,6 +1874,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::OpenHostFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1775,6 +1890,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             &mut report,
             HostStopCode::ReporterProgressFailed,
             "reporter",
+            None,
             detail,
             Some(&capsule_bootstrap),
         );
@@ -1791,6 +1907,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::CredentialControlFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1809,6 +1926,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::SpawnCredentialFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1826,6 +1944,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::RuntimeControlFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1844,6 +1963,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::SpawnRuntimeFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
