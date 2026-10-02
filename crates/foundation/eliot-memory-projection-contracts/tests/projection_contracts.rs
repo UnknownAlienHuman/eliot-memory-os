@@ -11,7 +11,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ArtifactId, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, SessionId, SourceId,
-    StateFence, TaskId,
+    StateFence, TaskId, TaskRevision,
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_projection_contracts::{
@@ -59,13 +59,32 @@ fn fence_other() -> StateFence {
     )
 }
 
-fn binding() -> MemoryScopeBinding {
+/// A fence on the same epoch and generation as [`fence`] that additionally
+/// carries a task revision.
+///
+/// `StateFence::is_compatible_with` treats an absent optional revision on
+/// either side as a match, so `fence()` and this fence are mutually
+/// compatible while comparing unequal. That makes them the one honest way to
+/// build a compatible-but-distinct fence pair in this fixture family;
+/// `fence_other` differs in epoch sequence and is therefore incompatible.
+fn fence_with_task_revision() -> StateFence {
+    StateFence {
+        task_revision: Some(TaskRevision::new(1).expect("fixture revision")),
+        ..fence()
+    }
+}
+
+fn binding_at(state_fence: StateFence) -> MemoryScopeBinding {
     MemoryScopeBinding {
         task_id: task(),
         scope_id: scope(),
         session_id: Some(session()),
-        state_fence: fence(),
+        state_fence,
     }
+}
+
+fn binding() -> MemoryScopeBinding {
+    binding_at(fence())
 }
 
 fn provenance() -> Provenance {
@@ -139,6 +158,55 @@ fn record_fence_mismatch_fails_closed() {
     assert!(matches!(
         error,
         eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch { .. }
+    ));
+}
+
+#[test]
+fn a_compatible_projection_fence_is_admitted_when_the_declared_binding_matches() {
+    // The positive half of the scope/fence rule, and the reason the rule stops
+    // where it does: a record projected at an older-but-compatible fence is a
+    // legitimate read observation and stays admissible. What must equal the
+    // batch is the binding the record DECLARES, not the fence it was read
+    // under. Tightening this into `record.state_fence ==
+    // batch.binding.state_fence` would reject every record read before the
+    // batch's own fence, which is the normal case the relaxation exists for.
+    let mut candidate = batch();
+    candidate.binding = binding_at(fence_with_task_revision());
+    for record in &mut candidate.records {
+        record.binding = candidate.binding.clone();
+        // Compatible with the batch fence, and unequal to it.
+        record.state_fence = fence();
+    }
+    candidate
+        .validate()
+        .expect("a compatible projection fence with an equal declared binding passes");
+}
+
+#[test]
+fn a_record_declaring_another_scope_fence_is_refused_even_when_compatible() {
+    // The wrong-scope record the batch previously admitted: task, scope and
+    // session all match, and the record's own projection fence is compatible
+    // with the batch fence, so both pre-existing checks pass. Only the
+    // declared binding fence differs, which means the record asserts it was
+    // projected under a different scope while reading as if it were this one.
+    // A digest computed over this batch would then cover a record from
+    // outside the scope it claims.
+    let mut candidate = batch();
+    candidate.binding = binding_at(fence_with_task_revision());
+    for record in &mut candidate.records {
+        // Declares the other scope; its own projection fence stays compatible,
+        // so only the declared binding gives the record away.
+        record.binding = binding_at(fence());
+    }
+    let error = candidate
+        .validate()
+        .expect_err("a record declaring another scope fence must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+            left: "record.binding.state_fence",
+            right: "batch.binding.state_fence",
+        }
     ));
 }
 

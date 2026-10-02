@@ -78,6 +78,20 @@ fn fence() -> StateFence {
     }
 }
 
+/// A fence compatible with [`fence`] but unequal to it.
+///
+/// This fixture family already binds `task_revision` on [`fence`], and
+/// `StateFence::is_compatible_with` treats an absent optional revision as a
+/// match. Dropping it therefore yields a fence that is compatible with, and
+/// compares unequal to, the batch fence — which is what separates "read at an
+/// older compatible fence" from "declares a different scope".
+fn fence_without_task_revision() -> StateFence {
+    StateFence {
+        task_revision: None,
+        ..fence()
+    }
+}
+
 fn binding() -> MemoryScopeBinding {
     MemoryScopeBinding {
         task_id: task(),
@@ -576,6 +590,57 @@ fn a_persisted_assessment_rechecks_its_own_recovery_partition() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_wrong_scope_record_is_refused_before_it_can_be_assessed() {
+    // The record declares a different scope fence than the batch while its own
+    // projection fence stays compatible. Assessing it would place a record
+    // from another scope into `items`, which is what every counter-metric and
+    // gravity/maintenance note in this assessment is derived from, so the
+    // refusal has to happen at the batch owner rather than become an ordinary
+    // exclusion.
+    let mut batch_value = batch(vec![record("mem-1")]);
+    batch_value.binding.state_fence = fence();
+    batch_value.records[0].binding.state_fence = fence_without_task_revision();
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    assert!(matches!(
+        assess_quality(&candidate),
+        Err(QualityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+                left: "record.binding.state_fence",
+                right: "batch.binding.state_fence",
+            }
+        ))
+    ));
+}
+
+#[test]
+fn a_compatible_projection_fence_is_assessed_normally() {
+    // The positive half of the same rule: an older-but-compatible projection
+    // fence with a matching declared binding is ordinary evidence, so the
+    // assessment completes over the exact denominator.
+    let mut batch_value = batch(vec![record("mem-1")]);
+    batch_value.binding.state_fence = fence();
+    batch_value.records[0].binding = batch_value.binding.clone();
+    batch_value.records[0].state_fence = fence_without_task_revision();
+    let applicable = set_for(&batch_value, &[], &[], None);
+    let candidate = QualityRequest {
+        batch: batch_value,
+        applicable,
+        projections: projections(vec![], vec![]),
+        receipts: vec![],
+    };
+    let assessment = assess_quality(&candidate).expect("quality assessment");
+    assessment.validate().expect("assessment validates");
+    assert_eq!(assessment.status, CoverageStatus::Complete);
+    assert_eq!(assessment.items.len(), 1);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ResourceGeneration, SessionId, SourceId, StateFence,
-    TaskId,
+    TaskId, TaskRevision,
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_applicability::{ApplicabilityRequest, evaluate_applicability};
@@ -50,6 +50,20 @@ fn fence() -> StateFence {
         .expect("fixture epoch"),
         ResourceGeneration::genesis(),
     )
+}
+
+/// A fence compatible with [`fence`] but unequal to it.
+///
+/// `StateFence::is_compatible_with` treats an absent optional revision as a
+/// match, so this pair is mutually compatible while comparing unequal. The
+/// declared-binding rule is about the scope a record CLAIMS, so the tests that
+/// exercise it need a fence pair that separates the two questions instead of
+/// failing the compatibility check first.
+fn fence_with_task_revision() -> StateFence {
+    StateFence {
+        task_revision: Some(TaskRevision::new(1).expect("fixture revision")),
+        ..fence()
+    }
 }
 
 fn binding() -> MemoryScopeBinding {
@@ -333,6 +347,42 @@ fn duplicate_and_overlapping_recovery_identities_are_refused() {
             eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
         ))
     ));
+}
+
+#[test]
+fn a_record_declaring_another_scope_fence_never_reaches_a_verdict() {
+    // The evaluator's own scope rule runs first and would name the record
+    // SCOPE_MISMATCH, so this proves the refusal happens earlier: at the batch
+    // owner that proves the denominator. A wrong-scope record inside an
+    // otherwise valid batch must never become an ordinary exclusion, because
+    // an exclusion still counts the record toward the assessed denominator
+    // while the record itself belongs to a different scope.
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.binding.state_fence = fence_with_task_revision();
+    candidate.batch.records[0].binding = binding();
+    let error = evaluate_applicability(&candidate)
+        .expect_err("a wrong-scope record must fail closed before evaluation");
+    assert!(matches!(
+        error,
+        eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+                left: "record.binding.state_fence",
+                right: "batch.binding.state_fence",
+            }
+        )
+    ));
+}
+
+#[test]
+fn a_compatible_projection_fence_still_evaluates() {
+    // The positive half: a record read under an older compatible fence with a
+    // matching declared binding is evaluated normally and stays applicable.
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.binding.state_fence = fence_with_task_revision();
+    candidate.batch.records[0].binding = candidate.batch.binding.clone();
+    candidate.batch.records[0].state_fence = fence();
+    let set = evaluate_applicability(&candidate).expect("compatible fence evaluates");
+    assert_eq!(set.applicable.len(), 1);
 }
 
 #[test]
