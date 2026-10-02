@@ -689,11 +689,12 @@ pub fn phase_b_remove_rollback_backup(destination: &Path, label: &str) -> Result
         })?;
         // F-LOG-HOST-5 (#980): `cleanup completed` is a positive removal
         // claim, so it is gated on the same post-delete absence proof the
-        // destination contour uses: a delete that reports success while the
-        // sidecar is still enumerated (or held open with delete sharing) is
-        // never logged as completed. A probe that does not prove absence
-        // records the explicit `absence unproven` disposition instead; the
-        // returned `Result`, the accepted set, and the delete call itself are
+        // destination contour uses: it is emitted only when the probe failed
+        // with `NotFound`, which is the classification that means the
+        // directory entry is gone. Any other outcome — an entry still
+        // enumerated, or a probe that could not determine presence — records
+        // the explicit `absence unproven` disposition instead. The returned
+        // `Result`, the accepted set, and the delete call itself are
         // unchanged.
         if rollback_path_presence(&backup) == RollbackPathPresence::Absent {
             rollback_backup_observe(RollbackContour::CleanupCompleted, None);
@@ -817,10 +818,13 @@ mod rollback_contour_tests {
                 .unwrap_or_else(|error| panic!("hold {}: {error}", path.display()))
         }
 
-        /// Retains a handle that DOES share delete: the delete succeeds and
-        /// marks the entry delete-pending, so it is still enumerated while
-        /// this handle lives. That is exactly the state the post-delete
-        /// absence proof exists to refuse.
+        /// Retains a handle that DOES share delete, so the real delete succeeds
+        /// while this handle is still live. Note what Windows then does: the
+        /// directory entry leaves the namespace at delete time, not at
+        /// last-handle-close, so the name is free and the post-delete probe
+        /// genuinely proves absence. This helper exists to pin that platform
+        /// fact, not to manufacture an unproven absence — a live handle alone
+        /// can never make the sidecar still enumerated.
         fn hold_with_delete_sharing(&self, path: &Path) -> std::fs::File {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -1111,13 +1115,29 @@ mod rollback_contour_tests {
         assert!(!sidecar.exists(), "the retained sidecar must be gone");
     }
 
-    /// WORK_UNIT_CASE: 980/20 — CRITICAL: `backup cleanup completed` is
-    /// UNREACHABLE when the post-delete absence proof does not succeed. A
-    /// delete-sharing handle makes the real delete succeed while the sidecar is
-    /// still enumerated, and the positive claim must be withheld in favour of
-    /// the explicit unproven-absence disposition.
+    /// WORK_UNIT_CASE: 980/20 — CRITICAL: `backup cleanup completed` is gated on
+    /// a `NotFound` classification and on nothing else, and on Windows that gate
+    /// is exact even while a delete-sharing handle is still live.
+    ///
+    /// The earlier revision of this case asserted that a successful
+    /// `remove_file` could leave the sidecar still enumerated. That premise is
+    /// false on this platform: `std::fs::remove_file` is `DeleteFileW`, and
+    /// Windows removes the directory entry from the namespace at delete time,
+    /// not at last-handle-close time. Measured on this NTFS volume, the
+    /// directory listing drops to zero entries and the same name is immediately
+    /// re-creatable while the delete-sharing handle is still open, and the
+    /// follow-up `symlink_metadata` (what `rollback_path_presence` calls) then
+    /// fails with `ERROR_FILE_NOT_FOUND`, so the completion claim here IS
+    /// absence-proven and is correctly emitted.
+    ///
+    /// So the property this case actually protects is the gate itself, proven
+    /// where it is deterministically observable: absence is read ONLY from a
+    /// `NotFound` probe, an undeterminable probe is `Unknown` (the arm the
+    /// contour states as `absence unproven` / `absence unknown`), and an entry
+    /// that is still there is `Present` (also `absence unproven`) — never
+    /// `Absent`.
     #[test]
-    fn cleanup_never_claims_completed_while_the_sidecar_is_still_enumerated() {
+    fn cleanup_completion_is_gated_on_a_not_found_absence_not_on_the_delete_returning_ok() {
         let fixture = Fixture::new();
         let destination = fixture.destination("store-config.json");
         let previous = b"{\"phase\":\"previous\"}";
@@ -1134,6 +1154,13 @@ mod rollback_contour_tests {
         let sidecar = phase_b_rollback_path(&destination, "Store config")
             .unwrap_or_else(|error| panic!("sidecar path: {error}"));
         let _pending = fixture.hold_with_delete_sharing(&sidecar);
+        assert!(
+            matches!(
+                rollback_path_presence(&sidecar),
+                RollbackPathPresence::Present
+            ),
+            "a sidecar that is still enumerated is Present, never Absent"
+        );
 
         let record = capture(|| {
             let outcome = phase_b_remove_rollback_backup(&destination, "Store config");
@@ -1147,12 +1174,36 @@ mod rollback_contour_tests {
             "cleanup must be requested: {record}"
         );
         assert!(
-            emitted(&record, RollbackContour::CleanupAbsenceUnproven),
-            "a still-enumerated sidecar must be observed as absence unproven: {record}"
+            emitted(&record, RollbackContour::CleanupCompleted),
+            "a sidecar whose entry the delete removed is absence-proven: {record}"
         );
         assert!(
-            !emitted(&record, RollbackContour::CleanupCompleted),
-            "an unproven absence must never be claimed as cleanup completed: {record}"
+            !emitted(&record, RollbackContour::CleanupAbsenceUnproven),
+            "a proven absence is never the unproven disposition: {record}"
+        );
+        assert!(
+            !sidecar.exists(),
+            "the delete must free the sidecar name even while a delete-sharing handle is live"
+        );
+        assert!(
+            matches!(
+                rollback_path_presence(&sidecar),
+                RollbackPathPresence::Absent
+            ),
+            "only a NotFound probe is read as absence"
+        );
+        // The other side of the gate: a probe that fails for ANY reason other
+        // than `NotFound` is undetermined. This is the exact classification the
+        // cleanup contour states as `absence unproven` and the destination
+        // contour as `absence unknown`, so a failing probe can never be read as
+        // a removal proof.
+        let undeterminable = fixture.portable.join("side\0car");
+        assert!(
+            matches!(
+                rollback_path_presence(&undeterminable),
+                RollbackPathPresence::Unknown
+            ),
+            "a probe that is not NotFound must never be classified as absence"
         );
     }
 
