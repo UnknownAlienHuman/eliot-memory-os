@@ -909,3 +909,240 @@ fn boundary_rows_bind_a_landed_case() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #893 audit comment 5917124913, blocking defect 1: a terminal failure must be
+// correlated to the operation whose subordinate phases carry the identities,
+// and a pre-subject failure must say so explicitly instead of relying on order.
+//
+// The seam driven below is the REAL production terminal owner
+// `scm_launch::validate_host_scm_bootstrap` (`src/scm_launch.rs`), reached
+// through its public export. It arms its own single `ScmLaunchTerminalGuard`
+// on entry and every failure after that point returns through the armed guard,
+// so what is asserted here is what production actually emitted through the
+// #889 facade - never a hand-built expected record.
+// ---------------------------------------------------------------------------
+
+/// The isolated temp root one `scm_launch` contour is launched against.
+///
+/// The path is deliberately never created: the driven contour refuses before
+/// it touches the filesystem, and the tests below assert exactly that, which
+/// is what keeps the capture free of any wall-clock, thread-order or ambient
+/// state dependence.
+fn scm_launch_root(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("eliot-host-893-{tag}"))
+}
+
+/// Real `HostLaunchOptions` for one SCM bootstrap contour.
+///
+/// Built with the canonical ten-pair argv and NO `--registration-nonce` pair,
+/// which is the exact pre-subject state production refuses: the launch options
+/// parse (the owner identity exists), but the SCM bootstrap has no registration
+/// nonce yet, so no operation subject exists at the terminal boundary.
+fn scm_launch_options(tag: &str) -> eliot_host::HostLaunchOptions {
+    let root = scm_launch_root(tag);
+    eliot_host::HostLaunchOptions::parse([
+        std::ffi::OsString::from("--config-descriptor"),
+        root.join("auth.json").into_os_string(),
+        std::ffi::OsString::from("--config-descriptor-sha256"),
+        std::ffi::OsString::from("a".repeat(64)),
+        std::ffi::OsString::from("--installation-id"),
+        std::ffi::OsString::from(format!("installation-{tag}")),
+        std::ffi::OsString::from("--tx-plan-generation"),
+        std::ffi::OsString::from("7"),
+        std::ffi::OsString::from("--host-state-root"),
+        root.into_os_string(),
+    ])
+    .expect("the canonical launch argv must admit")
+}
+
+/// #893 D1: a pre-subject terminal states that correlation is UNAVAILABLE.
+///
+/// Drives the real `validate_host_scm_bootstrap` owner to its failure and
+/// asserts the disposition production actually rendered: one terminal record,
+/// `correlation_available=false`, and all three owner-issued slots explicitly
+/// missing with empty values. The sibling phase record for the SAME operation
+/// carries the installation/generation/config identity the contour really held,
+/// which is what makes the terminal's explicit "unavailable" the honest
+/// disposition rather than a missing correlation this test could not supply.
+#[test]
+fn lifecycle_scm_pre_subject_failure_states_correlation_unavailable() {
+    let options = scm_launch_options("pre-subject");
+    let root = scm_launch_root("pre-subject");
+
+    // The owner identity is genuinely in hand before the terminal boundary:
+    // production itself renders it into the requested phase record.
+    let requested = format!(
+        "detail=\"host.scm-launch requested installation=installation-pre-subject \
+plan_generation=7 config_digest={}\"",
+        "a".repeat(64)
+    );
+
+    let emitted = capture_emit(|| {
+        let outcome = eliot_host::validate_host_scm_bootstrap(&options);
+        assert!(
+            outcome.is_err(),
+            "a nonce-free SystemService bootstrap must be refused by production, not admitted"
+        );
+    });
+
+    assert!(
+        emitted.contains(&requested),
+        "production must render the owner identity it holds, got: {emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&emitted, "host.terminal_error"),
+        1,
+        "one failed operation must emit exactly one terminal, got: {emitted}"
+    );
+    assert!(
+        emitted.contains("code=\"host-scm-launch-unknown\""),
+        "the terminal must carry production's own typed code, got: {emitted}"
+    );
+    // The disposition the audit demands: correlation is stated unavailable,
+    // never left to be inferred from record order (I13.11).
+    assert!(
+        emitted.contains("correlation_available=false"),
+        "a pre-subject terminal must state correlation is unavailable, got: {emitted}"
+    );
+    for missing in ["tx_missing=true", "effect_missing=true", "req_missing=true"] {
+        assert!(
+            emitted.contains(missing),
+            "every absent identity slot must be explicitly missing ({missing}), got: {emitted}"
+        );
+    }
+    // And the absent slots render empty: no derived, defaulted or borrowed
+    // value ever stands in for an identity the owner does not hold.
+    for empty in ["tx=\"\"", "effect=\"\"", "req=\"\""] {
+        assert!(
+            emitted.contains(empty),
+            "an absent identity slot must render empty ({empty}), got: {emitted}"
+        );
+    }
+    // Determinism: the refusal happened before any filesystem effect, so the
+    // isolated root this test names was never created and nothing outside the
+    // capture can influence it.
+    assert!(
+        !root.exists(),
+        "the driven failure must not touch the filesystem, but {} exists",
+        root.display()
+    );
+}
+
+/// #893 D1/case 22: exactly ONE terminal per failed operation, and none for an
+/// operation that owns no terminal.
+///
+/// Two independent failed `validate_host_scm_bootstrap` operations each return
+/// through their own armed `ScmLaunchTerminalGuard` through a `?` in the
+/// guarded body, so the terminal count must track the failed operation (two),
+/// never the process (one) and never the guard's internal `?` chain (more).
+/// A rejected `HostLaunchOptions::parse` operation owns no terminal at all and
+/// must therefore add none to the same accounting.
+#[test]
+fn lifecycle_each_failed_operation_emits_exactly_one_terminal() {
+    let first = scm_launch_options("op-a");
+    let second = scm_launch_options("op-b");
+
+    let emitted = capture_emit(|| {
+        assert!(eliot_host::validate_host_scm_bootstrap(&first).is_err());
+        assert!(eliot_host::validate_host_scm_bootstrap(&second).is_err());
+    });
+
+    assert_eq!(
+        count_occurrences(&emitted, "host.terminal_error"),
+        2,
+        "two failed operations must emit two terminals, not one and not more, got: {emitted}"
+    );
+    assert_eq!(
+        count_occurrences(&emitted, "correlation_available=false"),
+        2,
+        "both terminals must state their own unavailable disposition, got: {emitted}"
+    );
+    // Each failed operation also produced its own requested phase record, so
+    // the two terminals are two per-operation dispositions rather than one
+    // duplicated observation.
+    assert_eq!(
+        count_occurrences(&emitted, "detail=\"host.scm-launch requested"),
+        2,
+        "each failed operation must record its own requested phase, got: {emitted}"
+    );
+    // The two operations are distinct by the owner-issued identity production
+    // itself rendered, so the pair is joinable by field equality.
+    assert!(
+        emitted.contains("installation=installation-op-a")
+            && emitted.contains("installation=installation-op-b"),
+        "the two operations must carry distinct owner identities, got: {emitted}"
+    );
+
+    // An operation whose owner owns no terminal boundary contributes none.
+    let rejected = capture_emit(|| {
+        let outcome = eliot_host::HostLaunchOptions::parse([std::ffi::OsString::from(
+            "--config-descriptor",
+        )]);
+        assert!(outcome.is_err(), "a one-pair argv must be refused");
+    });
+    assert!(
+        rejected.contains("detail=\"host.launch-options parse typed rejection\""),
+        "production must render its own typed rejection, got: {rejected}"
+    );
+    assert_eq!(
+        count_occurrences(&rejected, "host.terminal_error"),
+        0,
+        "an operation with no terminal owner must emit no terminal, got: {rejected}"
+    );
+}
+
+/// #893 D1 item 4: a partial identity renders only what the owner holds.
+///
+/// Drives the real `HostTerminalCorrelation` projection production itself
+/// builds at every `bind_operation` site. `correlation_available` is the flag
+/// the terminal record renders, so the projection's own answer must never
+/// over-claim: a partial binding is not an available correlation, it is
+/// distinct from both the full and the fully-unavailable projection, and it is
+/// a value - two operations with different owner handles never collapse onto
+/// one correlation.
+#[test]
+fn lifecycle_terminal_correlation_never_over_claims_availability() {
+    use eliot_host::host_diagnostics::HostTerminalCorrelation;
+
+    assert!(
+        HostTerminalCorrelation::bound("tx", "effect", "req").is_available(),
+        "a fully bound correlation is the available one"
+    );
+    assert!(
+        !HostTerminalCorrelation::partially_bound(Some("tx"), None, None).is_available(),
+        "a partial binding must never claim full correlation availability"
+    );
+    assert!(
+        !HostTerminalCorrelation::unavailable().is_available(),
+        "the explicitly uncorrelated projection claims nothing"
+    );
+
+    // A partial binding is a distinct value from both neighbours: it is not the
+    // full correlation, and it is not the "nothing held" projection either.
+    let partial = HostTerminalCorrelation::partially_bound(Some("operation"), None, None);
+    assert_eq!(
+        partial,
+        HostTerminalCorrelation::partially_bound(Some("operation"), None, None),
+        "the same owner handles project the same immutable correlation"
+    );
+    assert_ne!(
+        partial,
+        HostTerminalCorrelation::unavailable(),
+        "holding one identity must not render as holding none"
+    );
+    assert_ne!(
+        partial,
+        HostTerminalCorrelation::bound("operation", "effect", "req"),
+        "a partial binding must not render as the full correlation"
+    );
+
+    // Content, not position: two operations with different owner-issued handles
+    // project to two different correlations, so a terminal carrying one can
+    // never be confused with a terminal carrying the other.
+    assert_ne!(
+        HostTerminalCorrelation::bound("tx-a", "effect-a", "req-a"),
+        HostTerminalCorrelation::bound("tx-b", "effect-b", "req-b"),
+        "distinct owner identities must project to distinct correlations"
+    );
+}

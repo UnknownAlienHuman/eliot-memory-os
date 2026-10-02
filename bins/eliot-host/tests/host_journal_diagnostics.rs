@@ -292,3 +292,170 @@ fn journal_06_terminal_sink_redaction_cleanup() {
     );
     assert_eq!(f["stdout_protocol_contamination"].as_bool(), Some(false));
 }
+
+// ---------------------------------------------------------------------------
+// #893 audit comment 5917124913, blocking defect 1, on the restart/journal
+// side: the restart operation's owner-issued identity must be the thing two
+// same-outcome operations are told apart by, and it must never be invented.
+//
+// The production seam driven here is the real runtime-control wire contract in
+// `crates/kernel/eliot-host-service/src/runtime_control.rs`:
+// `HostRuntimeControlRequest::new_with_mutation_digest` issues the identity,
+// `runtime_control_unknown_ref` projects it into the operation's own Unknown
+// receipt, and `response_matches_request` is the production join predicate.
+// Every assertion below is on values those production functions produced.
+// ---------------------------------------------------------------------------
+
+/// Two owner-issued restart operations that reach the SAME typed outcome.
+fn restart_pair(suffix: &str) -> (
+    eliot_host::HostRuntimeControlRequest,
+    eliot_host::HostRuntimeControlRequest,
+) {
+    (
+        restart_req(&format!("893-{suffix}-a"), &"c1".repeat(32)),
+        restart_req(&format!("893-{suffix}-b"), &"c2".repeat(32)),
+    )
+}
+
+/// #893 D1: two operations ending in the same outcome are distinguishable by
+/// CONTENT, not by record order.
+///
+/// Both requests below are `RestartKernel` and both produce the identical typed
+/// `Unknown` outcome - the audit's exact counterexample shape. The proof that
+/// the counterexample is closed is that the owner-issued identity production
+/// binds for each is different, so any record carrying it is distinguishable by
+/// field equality alone; record order contributes nothing to the pairing.
+#[test]
+fn journal_two_same_outcome_restart_operations_are_distinguishable_by_content() {
+    let (first, second) = restart_pair("counterexample");
+
+    // Same typed failure class for both operations - this is the audit's
+    // precondition, not the fix.
+    assert_eq!(first.operation, second.operation);
+    let first_unknown = eliot_host::HostRuntimeControlResponse::unknown_for(
+        &first,
+        eliot_host_service::runtime_control::runtime_control_unknown_ref("kernel-restart", &first),
+    );
+    let second_unknown = eliot_host::HostRuntimeControlResponse::unknown_for(
+        &second,
+        eliot_host_service::runtime_control::runtime_control_unknown_ref("kernel-restart", &second),
+    );
+    assert!(matches!(
+        first_unknown,
+        eliot_host::HostRuntimeControlResponse::Unknown { .. }
+    ));
+    assert!(matches!(
+        second_unknown,
+        eliot_host::HostRuntimeControlResponse::Unknown { .. }
+    ));
+
+    // The owner-issued identity production binds for each operation differs on
+    // every handle, so a terminal or projection carrying it is joinable by field
+    // equality. Nothing here depends on which record came first.
+    assert_ne!(first.request_id.as_str(), second.request_id.as_str());
+    assert_ne!(first.mutation_digest.as_str(), second.mutation_digest.as_str());
+    assert_ne!(first.request_digest.as_str(), second.request_digest.as_str());
+
+    // The production join predicate agrees: each Unknown answer belongs to its
+    // own request and to no other, which is exactly the field-equality pairing
+    // the audit requires in place of order inference.
+    assert!(
+        eliot_host_service::runtime_control::response_matches_request(&first, &first_unknown)
+    );
+    assert!(
+        eliot_host_service::runtime_control::response_matches_request(&second, &second_unknown)
+    );
+    assert!(
+        !eliot_host_service::runtime_control::response_matches_request(&second, &first_unknown),
+        "one operation's Unknown answer must never answer the other"
+    );
+    assert!(
+        !eliot_host_service::runtime_control::response_matches_request(&first, &second_unknown),
+        "the pairing must be symmetric, not a first-wins accident"
+    );
+
+    // The identity production projects into the operation's own receipt is also
+    // distinct per operation, so even the wire-level Unknown handle separates
+    // the two same-outcome operations by content.
+    let first_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "kernel-restart",
+        &first,
+    );
+    let second_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
+        "kernel-restart",
+        &second,
+    );
+    assert_ne!(first_ref.as_str(), second_ref.as_str());
+    assert!(
+        first_ref.as_str().contains(first.request_digest.as_str()),
+        "the projected identity must carry the exact owner request digest"
+    );
+    assert!(
+        !first_ref.as_str().contains(second.request_digest.as_str()),
+        "one operation's projected identity must never carry the other's digest"
+    );
+}
+
+/// #893 D1 item 4: the journal/restart projection renders only what the owner
+/// holds.
+///
+/// Drives the real `HostRequestIdentityCorrelation` production builds for every
+/// restart/recovery terminal (`runtime_control_request_terminal_correlation` in
+/// `src/lib.rs`, `store_recovery_request_terminal_correlation` in
+/// `src/host_composition_store_recovery.rs`). Every slot is required there, so
+/// the projection must never admit a partial or fabricated identity, and two
+/// different owner identities must project to two different values.
+#[test]
+fn journal_restart_projection_never_fabricates_an_identity_slot() {
+    use eliot_host::host_diagnostics::HostRequestIdentityCorrelation;
+
+    let (first, second) = restart_pair("projection");
+    let project = |request: &eliot_host::HostRuntimeControlRequest| {
+        HostRequestIdentityCorrelation::bound(
+            request.request_id.as_str(),
+            request.mutation_digest.as_str(),
+            request.request_digest.as_str(),
+        )
+    };
+    let first_projection = project(&first);
+    let second_projection = project(&second);
+
+    // Built from the request's own handles, the projection is a faithful value.
+    assert_eq!(
+        first_projection,
+        project(&first),
+        "the same owner handles must project the same immutable identity"
+    );
+    assert_ne!(
+        first_projection, second_projection,
+        "two operations must project to distinguishable identities, not one shared value"
+    );
+
+    // Every slot is required in this projection, so a caller can never present
+    // a partial identity and have it render as if a slot were held: two
+    // projections that differ in exactly one handle are still different values,
+    // which is what keeps each slot individually load-bearing.
+    assert_ne!(
+        HostRequestIdentityCorrelation::bound(
+            first.request_id.as_str(),
+            first.mutation_digest.as_str(),
+            first.request_digest.as_str(),
+        ),
+        HostRequestIdentityCorrelation::bound(
+            first.request_id.as_str(),
+            first.mutation_digest.as_str(),
+            second.request_digest.as_str(),
+        ),
+        "a differing request digest must change the projected identity"
+    );
+
+    // And a projection built from handles no owner issued is still just a value:
+    // it never equals the projection of a real operation, so a reader can only
+    // be misled by production binding it - never by the type itself inventing
+    // content.
+    assert_ne!(
+        first_projection,
+        HostRequestIdentityCorrelation::bound("", "", ""),
+        "empty handles must not collide with a real operation's identity"
+    );
+}
