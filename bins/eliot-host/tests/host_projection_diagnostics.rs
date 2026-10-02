@@ -238,8 +238,13 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         unknown.contains("host.request"),
         "no projection record: {unknown}"
     );
+    // `tracing_subscriber::fmt` renders every string-valued field through
+    // `Debug`, so a frozen name reaches the record QUOTED: production writes
+    // `evidence="unknown"`, never the bare `evidence=unknown`. Bool fields keep
+    // `Debug`'s unquoted rendering, which is why the missing-slot pins below
+    // read `reason_missing=true`.
     assert!(
-        unknown.contains("evidence=unknown"),
+        unknown.contains("evidence=\"unknown\""),
         "evidence must be unknown: {unknown}"
     );
     assert!(
@@ -268,6 +273,25 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             "unknown rollback disposition claimed {positive:?}: {unknown}"
         );
     }
+    // The positive claim is a TYPED claim, so it is denied on the exact
+    // rendered discriminant rather than on substrings of the whole capture:
+    // `HostRequestEvidence` is the only slot that can assert a completed
+    // operation, and `AdmittedEvent::is_admitted_by` (`windows_event_log.rs:
+    // 140`) admits the Event Log only for `process_started`,
+    // `durable_committed` and `failed`. Denying those exact values denies the
+    // record claim and its sink record at once, and a renamed or re-worded
+    // positive cannot slip past it the way a bare substring scan can.
+    for forbidden in [
+        "process_started",
+        "semantically_ready",
+        "durable_committed",
+        "cancelled",
+    ] {
+        assert!(
+            !unknown.contains(&format!("evidence=\"{forbidden}\"")),
+            "unknown rollback disposition held owner evidence {forbidden:?}: {unknown}"
+        );
+    }
     // The failed-before-verification sibling disposition: the typed reason is
     // kept, the payload is not, and no positive claim rides along with it.
     let unattributed = emit(|| {
@@ -276,7 +300,7 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         ));
     });
     assert!(
-        unattributed.contains("evidence=failed"),
+        unattributed.contains("evidence=\"failed\""),
         "got: {unattributed}"
     );
     assert!(
@@ -289,6 +313,19 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             "unattributed rollback disposition claimed {positive:?}: {unattributed}"
         );
     }
+    // The typed denial is repeated for the sibling disposition, so an
+    // unattributed failure cannot hold any owner evidence either.
+    for forbidden in [
+        "process_started",
+        "semantically_ready",
+        "durable_committed",
+        "cancelled",
+    ] {
+        assert!(
+            !unattributed.contains(&format!("evidence=\"{forbidden}\"")),
+            "unattributed rollback disposition held owner evidence {forbidden:?}: {unattributed}"
+        );
+    }
     // Dispositions that genuinely are proven stay reachable and distinct, so
     // the pair above is a real distinction and not a blanket denial.
     let committed = emit(|| {
@@ -297,13 +334,17 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         ));
     });
     assert!(
-        committed.contains("evidence=durable_committed"),
+        committed.contains("evidence=\"durable_committed\""),
         "got: {committed}"
     );
     // `observe_host_request` renders the frozen phase under the `phase` key;
     // `stage` is the `host.entrypoint_stage` key and is never projected here,
-    // so the pin follows the field production actually writes.
-    assert!(committed.contains("phase=shutdown_drain"), "got: {committed}");
+    // so the pin follows the field production actually writes - quoted, because
+    // the stage name is a string-valued field.
+    assert!(
+        committed.contains("phase=\"shutdown_drain\""),
+        "got: {committed}"
+    );
     assert!(
         !committed.contains("host.phase-b"),
         "a projection record carries no rollback contour detail: {committed}"

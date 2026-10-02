@@ -968,13 +968,41 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         unknown.contains("host.request"),
         "no projection record: {unknown}"
     );
-    assert!(unknown.contains("evidence=unknown"), "got: {unknown}");
+    // `tracing_subscriber::fmt` renders every string-valued field through
+    // `Debug` (`DefaultVisitor::record_str` delegates to `record_debug`), so a
+    // frozen name reaches the record QUOTED: production writes
+    // `evidence="unknown"`, never the bare `evidence=unknown`. Bool and integer
+    // fields keep `Debug`'s unquoted rendering, which is why the `*_missing`
+    // pins below read `reason_missing=true`.
+    assert!(
+        unknown.contains("evidence=\"unknown\""),
+        "got: {unknown}"
+    );
     assert!(unknown.contains("reason_missing=true"), "got: {unknown}");
     assert_eq!(
         count_occurrences(&unknown, "host.event_log_admission"),
         0,
         "an unproven rollback disposition must never reach the Event Log: {unknown}"
     );
+    // The positive claim is a TYPED claim, so it is denied on the exact
+    // rendered discriminant: `HostRequestEvidence` is the only slot that can
+    // assert a completed operation, and `AdmittedEvent::is_admitted_by`
+    // (`windows_event_log.rs:140`) admits the Event Log only for
+    // `process_started`, `durable_committed` and `failed`. Denying those exact
+    // values denies the record claim and its sink record at once, and cannot be
+    // slipped past by a renamed or re-worded label the way a bare substring
+    // scan of the capture can.
+    for forbidden in [
+        "process_started",
+        "semantically_ready",
+        "durable_committed",
+        "cancelled",
+    ] {
+        assert!(
+            !unknown.contains(&format!("evidence=\"{forbidden}\"")),
+            "unknown rollback disposition held owner evidence {forbidden:?}: {unknown}"
+        );
+    }
     // The rollback positives this case forbids are the CURRENT frozen labels of
     // the rollback owner's contour map (`RollbackContour::label` in
     // `phase_b_materialization/rollback_backup.rs`): a prepared sidecar, a
@@ -1029,7 +1057,7 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         );
     });
     assert!(
-        started.contains("evidence=process_started"),
+        started.contains("evidence=\"process_started\""),
         "got: {started}"
     );
     assert!(started.contains("process=4242"), "got: {started}");
@@ -1039,7 +1067,7 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         "proven start must be admitted: {started}"
     );
     assert!(
-        started.contains("operation=service_start"),
+        started.contains("operation=\"service_start\""),
         "got: {started}"
     );
     // A verified durable effect (the disposition a rollback restoration may
@@ -1052,11 +1080,11 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         );
     });
     assert!(
-        committed.contains("evidence=durable_committed"),
+        committed.contains("evidence=\"durable_committed\""),
         "got: {committed}"
     );
     assert!(
-        committed.contains("operation=service_stop"),
+        committed.contains("operation=\"service_stop\""),
         "got: {committed}"
     );
     let cancelled = capture_emit(|| {
@@ -1065,11 +1093,20 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
                 .with_operation(AdmittedEvent::ServiceStop),
         );
     });
-    assert!(cancelled.contains("evidence=cancelled"), "got: {cancelled}");
+    assert!(
+        cancelled.contains("evidence=\"cancelled\""),
+        "got: {cancelled}"
+    );
     assert_eq!(
         count_occurrences(&cancelled, "host.event_log_admission"),
         0,
         "a vacuous disposition must not state a completed operation: {cancelled}"
+    );
+    // A proven no-effect stop is not a committed stop, so the durable
+    // discriminant is denied here on its exact rendered value as well.
+    assert!(
+        !cancelled.contains("evidence=\"durable_committed\""),
+        "a vacuous disposition held owner evidence \"durable_committed\": {cancelled}"
     );
     // Failure before verification keeps its exact typed reason and still
     // admits only the failure event, never a stop.
@@ -1082,11 +1119,14 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
             .with_operation(AdmittedEvent::ServiceFailure),
         );
     });
-    assert!(failed.contains("evidence=failed"), "got: {failed}");
-    assert!(failed.contains("reason=recovery_required"), "got: {failed}");
+    assert!(failed.contains("evidence=\"failed\""), "got: {failed}");
+    assert!(
+        failed.contains("reason=\"recovery_required\""),
+        "got: {failed}"
+    );
     assert!(failed.contains("reason_missing=false"), "got: {failed}");
     assert!(
-        failed.contains("operation=service_failure"),
+        failed.contains("operation=\"service_failure\""),
         "got: {failed}"
     );
     assert!(
@@ -1099,7 +1139,20 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
     );
     // Failure before verification is not owner evidence either, so it carries
     // no rollback positive: the restoration / removal / cleanup claims stay
-    // unreachable from it exactly as they are from an unknown outcome.
+    // unreachable from it exactly as they are from an unknown outcome. The
+    // typed denial is repeated here so the obligation does not rest on the
+    // long rollback labels alone.
+    for forbidden in [
+        "process_started",
+        "semantically_ready",
+        "durable_committed",
+        "cancelled",
+    ] {
+        assert!(
+            !failed.contains(&format!("evidence=\"{forbidden}\"")),
+            "failed rollback disposition held owner evidence {forbidden:?}: {failed}"
+        );
+    }
     for positive in rollback_positives {
         assert!(
             !failed.contains(positive),
