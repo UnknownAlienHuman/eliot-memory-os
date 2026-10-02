@@ -974,9 +974,9 @@ fn context_reconstruction_result_body(
     seven: &SevenRoleInputs,
     cue_activation: &CueActivationDisposition,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
-    seven.validate_content_admission().map_err(|error| {
-        ReconstructionPrerequisite::ReconstructionRefused(error.to_string())
-    })?;
+    seven
+        .validate_content_admission()
+        .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
     let closure = serde_json::to_value(seven)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
     let response = json!({
@@ -1158,8 +1158,14 @@ mod tests {
             Some(json!({"version": 1, "scope_id": "scope-a", "task_id": "task-a", "records": []})),
             eliot_context_candidates::ProjectionState::KnownEmpty,
         )?;
-        let body =
-            context_reconstruction_result_body(&envelope, &attempt, &ScopeId::new("scope-a")?, "task-a", &seven, &skip)?;
+        let body = context_reconstruction_result_body(
+            &envelope,
+            &attempt,
+            &ScopeId::new("scope-a")?,
+            "task-a",
+            &seven,
+            &skip,
+        )?;
         // The bound envelope still travels to the requester in full: the
         // retention rule removes refused bytes, not admitted ones.
         assert_eq!(
@@ -1182,7 +1188,9 @@ mod tests {
         // A closure that still holds the foreign page it classified as
         // `Unavailable` is refused whole, before any byte of it is serialized.
         let mut seven = closure_with_task_frame(
-            Some(json!({"version": 1, "scope_id": "scope-a", "task_id": "task-b", "records": [{"revision": 1}]})),
+            Some(
+                json!({"version": 1, "scope_id": "scope-a", "task_id": "task-b", "records": [{"revision": 1}]}),
+            ),
             eliot_context_candidates::ProjectionState::Unavailable {
                 reason: "role payload fails its contract: role selector mismatch".to_owned(),
             },
