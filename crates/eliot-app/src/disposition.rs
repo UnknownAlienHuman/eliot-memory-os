@@ -2327,18 +2327,18 @@ mod tests {
              validates"
         );
 
-        // Consequence 2: the same defect in the other direction. Month 00 and a
-        // 32-day month sort BEFORE the revision month 09, so they are refused as
-        // EXPIRED rather than as malformed, naming a date the guard just invented
-        // from digits that were never a date.
+        // Consequence 2: the same defect, in the refusing direction. Groups that sort
+        // BEFORE the revision are refused as EXPIRED rather than as malformed,
+        // so the guard names back a date that does not exist as its reason for
+        // retiring the fixture.
         for (impossible, expired_on) in [
             (
                 "remove by 2026-00-31, when the plugin subtree is removed",
                 [2, 0, 2, 6, 0, 0, 3, 1],
             ),
             (
-                "remove by 2026-09-32, when the plugin subtree is removed",
-                [2, 0, 2, 6, 0, 9, 3, 2],
+                "remove by 2026-09-00, when the plugin subtree is removed",
+                [2, 0, 2, 6, 0, 9, 0, 0],
             ),
         ] {
             let fixture = refused_fixture(Disposition::TemporaryFixture, impossible);
@@ -2351,16 +2351,26 @@ mod tests {
                 "{impossible:?} parses to digits that sort before the revision, so it is \
                  refused as expired on a date that does not exist"
             );
-            assert_eq!(
-                iso_date_text(expired_on),
-                if expired_on[5] == 0 {
-                    "2026-00-31"
-                } else {
-                    "2026-09-32"
-                },
-                "the refusal names back the impossible date the guard read as digits"
-            );
         }
+
+        // Consequence 3: an impossible day that sorts AFTER the revision is
+        // accepted, so the same defect can also make an over-long retention
+        // window look valid. 2026-09-32 parses even though September has 30 days.
+        let impossible_later_day = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2026-09-32, when the plugin subtree is removed",
+        );
+        assert_eq!(
+            first_iso_date_digits(impossible_later_day.expiry),
+            Some([2, 0, 2, 6, 0, 9, 3, 2]),
+            "2026-09-32 parses: day 32 satisfies the digit check"
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&impossible_later_day)),
+            Ok(()),
+            "2026-09-32 sorts after the revision day 25 and is accepted as a future \
+             deadline, even though no September has a 32nd day"
+        );
     }
 
     #[test]
