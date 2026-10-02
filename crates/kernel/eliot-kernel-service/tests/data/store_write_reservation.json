@@ -35,7 +35,6 @@
   "payload_prefix": "payload-992-",
   "parent_receipt_prefix": "receipt-992-parent-",
   "canonical_request_hash_placeholder": "0000000000000000000000000000000000000000000000000000000000000000",
-  "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "operation_kind": "canonical-write",
   "observation_subject": "observation-992",
   "authority_id": "authority-992-store",

@@ -10684,6 +10684,19 @@ mod tests {
         };
 
         const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+        /// This receiving build's own admission contract-set support identity.
+        ///
+        /// `admit_prepared_transition` (store_gateway.rs) and
+        /// `PreparedTransition::validate` (eliot-store-api) both compare the
+        /// transition's recorded copy against this value, so a frozen
+        /// placeholder would refuse the fixture as `ManifestMismatch` before
+        /// any rule under test is reached.
+        fn contract_set_digest() -> String {
+            eliot_store_api::supported_admission_contract_set_digest()
+                .unwrap_or_else(|_| unreachable!())
+        }
+
         let epoch = EpochId::new(
             EpochLineageId::new(LINEAGE).unwrap_or_else(|_| unreachable!()),
             NonZeroU64::new(1).unwrap_or_else(|| unreachable!()),
@@ -10716,7 +10729,13 @@ mod tests {
             ],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // The admission contract-set digest is this build's OWN support
+            // identity, compared by both `admit_prepared_transition`
+            // (store_gateway.rs) and `PreparedTransition::validate`
+            // (eliot-store-api). Read from its owner, as the production
+            // builders do; a frozen placeholder would refuse this fixture as
+            // `ManifestMismatch` before the tamper cases below are reached.
+            admission_contract_set_digest: contract_set_digest(),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -11533,6 +11552,17 @@ mod live_surreal_evidence_pack_e2e {
         }
     }
 
+    /// This receiving build's own admission contract-set support identity.
+    ///
+    /// Distinct from the manifest-SET digest that authorizes a named operation:
+    /// `PreparedTransition::validate` compares the recorded copy against this
+    /// value, so a frozen placeholder (or the manifest-set value) refuses the
+    /// transition as `ManifestMismatch` before the live capture can commit.
+    fn live_contract_set_digest() -> String {
+        eliot_store_api::supported_admission_contract_set_digest()
+            .expect("build supports its own contract set")
+    }
+
     fn live_capture_transition(
         fence: &StateFence,
         scope: &ScopeId,
@@ -11555,7 +11585,14 @@ mod live_surreal_evidence_pack_e2e {
             ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: set_digest.as_str().to_owned(),
+            // Two DISTINCT build identities, each read from its own owner: the
+            // admission contract-set digest is the Store-API/write-admission/
+            // catalogue support identity (what `PreparedTransition::validate`
+            // and `admit_prepared_transition` compare), while the manifest-set
+            // digest authorizes the named operation. Using the manifest-set
+            // value for both would refuse this fixture as `ManifestMismatch`
+            // before the live capture could commit.
+            admission_contract_set_digest: live_contract_set_digest(),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`).

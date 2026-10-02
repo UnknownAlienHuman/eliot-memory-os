@@ -1144,7 +1144,7 @@ mod tests {
         NamedMutationRequest, OperationIdentity, OperationManifestDigest, ReservedScopeBinding,
         Resubmission, StoreFailure, StoreFailureIdentityContext, TransitionClass,
         WriteAdmissionParams, WriteAdmissionProjection, WriteReceiptStatus, WriterEpochBinding,
-        canonical_request_hash,
+        canonical_request_hash, supported_admission_contract_set_digest,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -1664,6 +1664,18 @@ mod tests {
         receipt
     }
 
+    /// Admission contract-set digest of THIS receiving build.
+    ///
+    /// It is the build's own support identity and `PreparedTransition::validate`
+    /// (crates/storage/eliot-store-api/src/lib.rs) compares the transition's
+    /// copy against it, so a frozen placeholder here refuses every fixture as
+    /// `StoreError::ManifestMismatch` before the hash-recompute rules under
+    /// test can run. Read from the owner, exactly as the production builders do
+    /// (`eliot-governor` `experience_commit.rs:321`).
+    fn build_admission_contract_set_digest() -> String {
+        supported_admission_contract_set_digest().expect("build supports its own contract set")
+    }
+
     /// Builds admission-valid apply parts bound to `fence`, with the
     /// transition's claimed digest computed from the exact values via the
     /// shared Slice A helper (the production Governor-admission shape).
@@ -1699,7 +1711,7 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest: build_admission_contract_set_digest(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
@@ -2351,7 +2363,7 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-991-k1").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest: build_admission_contract_set_digest(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
                 .expect("manifest digest"),
             // Issue-#18 digests are derived below via `bind_issue18_digests`,

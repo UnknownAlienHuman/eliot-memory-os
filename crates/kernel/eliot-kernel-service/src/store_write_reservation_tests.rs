@@ -54,7 +54,12 @@
 //!   end to end, proving the fixture (not code literals) is authoritative.
 //!
 //! Frozen domain inputs live in `data/store_write_reservation.json`; every
-//! literal below is asserted against that fixture, never re-declared.
+//! literal below is asserted against that fixture, never re-declared. The
+//! admission contract-set digest is deliberately NOT one of those frozen
+//! literals: it is the receiving build's own support identity, so the fixture
+//! reads it from `supported_admission_contract_set_digest()` and a frozen
+//! placeholder would refuse every transition here as `ManifestMismatch` before
+//! any reservation rule ran.
 //!
 //! The fake Store side speaks real EBP frames through the production exchange
 //! (pipe loopback in gateway cases); it manufactures responses bound to the
@@ -93,6 +98,7 @@ use eliot_store_api::{
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, Resubmission,
     RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError, TransitionClass,
     WriteReceipt, WriteReceiptStatus, canonical_request_hash,
+    supported_admission_contract_set_digest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -145,7 +151,6 @@ struct ReservationFixture {
     payload_prefix: String,
     parent_receipt_prefix: String,
     canonical_request_hash_placeholder: String,
-    admission_contract_set_digest: String,
     operation_kind: String,
     observation_subject: String,
     authority_id: String,
@@ -323,7 +328,19 @@ fn transition_for_with(
         &fixture.canonical_request_hash_placeholder,
         "pre-seal hash placeholder",
     );
-    assert_hex64(&fixture.admission_contract_set_digest, "admission digest");
+    // The admission contract-set digest is NOT a frozen domain literal: it is
+    // this receiving build's own support identity, and
+    // `PreparedTransition::validate` compares the transition's copy against
+    // `supported_admission_contract_set_digest()`
+    // (crates/storage/eliot-store-api/src/lib.rs). A fixture-supplied constant
+    // therefore fails admission as `StoreError::ManifestMismatch` inside
+    // `validate_admitted`, before any reservation rule is reached, so the suite
+    // would prove nothing. The value is read from its owner here, exactly as
+    // the production builders do (eliot-governor
+    // experience_commit.rs:321; eliot-kernel-service user_automation_store.rs).
+    let contract_set_digest = supported_admission_contract_set_digest()
+        .expect("this build supports its own contract set");
+    assert_hex64(&contract_set_digest, "build admission contract-set digest");
     let manifest = format!("{}{tag}", fixture.manifest_prefix);
     assert!(
         manifest.starts_with(&fixture.manifest_prefix),
@@ -364,7 +381,7 @@ fn transition_for_with(
             .collect(),
         transition_class,
         requested_effect_ceiling,
-        admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
+        admission_contract_set_digest: contract_set_digest,
         operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
@@ -3664,6 +3681,17 @@ fn foreign_recovery_owner() -> eliot_ors::RecoveryOwner {
         .expect("992 foreign recovery owner label")
 }
 
+/// A SECOND recovery owner in the fixture's own namespace, distinct from both
+/// the fixture owner and [`foreign_recovery_owner`].
+///
+/// It is a label, not an authority: a caller only earns it by actually staging
+/// a reservation whose `ReservationSeed` records it, which is exactly what the
+/// declared-owner proof does. No owner value is invented for an assertion.
+fn second_recovery_owner() -> eliot_ors::RecoveryOwner {
+    OpaqueLabel::new(format!("{}-second", fixture_992().recovery_owner))
+        .expect("992 second recovery owner label")
+}
+
 /// Startup-reconciliation proof harness (I1.11 step 6): a real named-pipe
 /// EBP connection to a scripted responder. The responder answers
 /// `ReservedWrite` ONLY via panic (the producer under test never sends;
@@ -4503,10 +4531,49 @@ fn reconcile_receipt_carries_the_declared_owner_and_ors_rejects_a_substituted_on
     // OWN recorded owner into the reconciliation, so ORS's
     // `reconciliation.recovery_owner != token.recovery_owner` check compared the
     // token against itself and every reservation looked owned. The declared
-    // owner is now the composition's own identity, so ORS compares two
-    // independent sources and the check is load-bearing.
+    // owner is now the caller's own identity, so ORS compares two independent
+    // sources and the check is load-bearing.
+    //
+    // Load-bearing, precisely: the token handed to `reconcile_receipt` carries
+    // the FIXTURE recovery owner, while the value the caller declares is a
+    // SECOND owner this composition legitimately owns (the seed owner of a
+    // second reservation it staged itself). If the function copied
+    // `token.recovery_owner` the reconciliation would carry the fixture owner
+    // and every assertion below would fail; if it carried a constant or
+    // synthesized owner, the same. Only the DECLARED value can appear.
     let (ors, _dir) = temp_ors("rro1", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
+    // A second recovery owner this composition GENUINELY owns: the composition
+    // itself stages a second reservation whose seed records this owner, so the
+    // declared value below is an owner the composition holds rather than one
+    // invented for the assertion. The seed's `recovery_owner` is the caller's
+    // own declared staging identity (`ReservationSeed`), so no value here is
+    // fabricated.
+    let declared = second_recovery_owner();
+    let context_b = context_for("rro1b");
+    let mut transition_b = transition_for("rro1b", &["scope-992-b"]);
+    let (revision_b, ordering_b) = heads_for("rro1b", &["scope-992-b"]);
+    seal(&context_b, &mut transition_b, &revision_b, &ordering_b);
+    let mut seed_b = seed_for(
+        "rro1b",
+        transition_b.identity.operation_id.as_str(),
+        &["scope-992-b"],
+    );
+    seed_b.recovery_owner = declared.as_str().to_owned();
+    let sealed_b = reserve_for_transition(
+        &owner,
+        &seed_b,
+        &context_b,
+        &transition_b,
+        &revision_b,
+        &ordering_b,
+    )
+    .expect("rro1 second owner's reservation binds");
+    assert_eq!(
+        sealed_b.token.recovery_owner, declared,
+        "the second owner is recorded by the reservation it genuinely staged"
+    );
+
     let (context, transition, revision, ordering, sealed) =
         reserve_one(&owner, "rro1a", &["scope-992-a"]);
     ensure_eligible(&owner, &sealed.token).expect("rro1 eligible");
@@ -4515,17 +4582,53 @@ fn reconcile_receipt_carries_the_declared_owner_and_ors_rejects_a_substituted_on
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("rro1 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let declared = fixture_recovery_owner();
-    let reconciliation =
-        reconcile_receipt(&declared, &sealed.token, &receipt).expect("rro1 evidence binds");
+
+    // The instrument is real: the declared owner is NOT the token's own field.
     assert_eq!(
-        reconciliation.recovery_owner, declared,
-        "the reconciliation carries the DECLARED owner, not a copy of the token's field"
+        sealed.token.recovery_owner.as_str(),
+        fixture_992().recovery_owner,
+        "the reservation records the fixture recovery owner"
     );
-    // A substituted owner is refused by ORS: the value was supplied
-    // independently of the persisted token, so the equality check can fail.
+    assert_ne!(
+        declared.as_str(),
+        sealed.token.recovery_owner.as_str(),
+        "the declared owner must differ from the token's own recorded owner, or \
+         the assertions below prove nothing"
+    );
+
+    // With the declared owner differing from the token's, the boundary REFUSES:
+    // `reconcile_receipt` checks the declared owner against the recorded one
+    // (store_write_reservation.rs) and never builds a reconciliation for a
+    // pass that does not own this reservation. This is the check whose absence
+    // let the token be compared against itself.
+    let refused = reconcile_receipt(&declared, &sealed.token, &receipt)
+        .expect_err("a declared owner that does not own this reservation is refused");
+    assert!(
+        matches!(refused, ReservationWriteError::Binding { .. }),
+        "declared-owner mismatch is a typed binding refusal, got {refused:?}"
+    );
+
+    // The load-bearing positive arm: the OWNING declared owner — the value the
+    // caller passes, which is what the reconciliation must carry — produces a
+    // reconciliation carrying exactly that declared value. A copy of the
+    // token's field would carry the fixture owner and fail this equality.
+    let owning = fixture_recovery_owner();
+    assert_eq!(
+        owning, sealed.token.recovery_owner,
+        "the owning declared owner equals the token's recorded owner"
+    );
+    let reconciliation =
+        reconcile_receipt(&owning, &sealed.token, &receipt).expect("rro1 evidence binds");
+    assert_eq!(
+        reconciliation.recovery_owner, owning,
+        "the reconciliation carries the DECLARED owner value"
+    );
+
+    // ORS then compares the reconciliation against its OWN persisted token, not
+    // against the reconciliation: substituting the owner on an accepted
+    // reconciliation is refused, which a self-comparison could never detect.
     let mut substituted = reconciliation.clone();
-    substituted.recovery_owner = foreign_recovery_owner();
+    substituted.recovery_owner = declared.clone();
     let error = finalize_reservation(&owner, &substituted)
         .expect_err("a substituted reconciliation owner must not close the token");
     assert!(
@@ -4535,6 +4638,19 @@ fn reconcile_receipt_carries_the_declared_owner_and_ors_rejects_a_substituted_on
         ),
         "ORS compares the reconciliation owner against the persisted token owner, got {error:?}"
     );
+    // Nothing was closed by the refused substitution.
+    assert!(
+        crate::recovery_page(&owner, 16)
+            .expect("rro1 recovery page")
+            .records
+            .iter()
+            .any(|record| {
+                record.token.operation_id.as_str() == sealed.token.operation_id.as_str()
+                    && matches!(record.state, ReservationState::Executing)
+            }),
+        "the substituted reconciliation left the reservation unresolved"
+    );
+
     // The owned reconciliation still closes the token exactly.
     let closed = finalize_reservation(&owner, &reconciliation).expect("rro1 exact receipt closes");
     assert_eq!(
@@ -4550,6 +4666,11 @@ fn reconcile_receipt_refuses_a_declared_owner_that_does_not_own_the_reservation(
     // Refusal case: a pass that runs under a different recovery owner must not
     // build a reconciliation for this reservation, and must not close it. The
     // token keeps its own recorded owner and its own state.
+    //
+    // Load-bearing against removing the declared-owner comparison at
+    // store_write_reservation.rs: with the comparison deleted, `reconcile_receipt`
+    // returns `Ok` here (the old code copied `token.recovery_owner`, so the
+    // foreign claim was silently overwritten) and `expect_err` fails.
     let (ors, _dir) = temp_ors("rro2", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
@@ -4561,6 +4682,11 @@ fn reconcile_receipt_refuses_a_declared_owner_that_does_not_own_the_reservation(
         .expect("rro2 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
     let foreign = foreign_recovery_owner();
+    assert_ne!(
+        foreign.as_str(),
+        sealed.token.recovery_owner.as_str(),
+        "the foreign instrument must not equal the recorded owner, or the refusal proves nothing"
+    );
     let error = reconcile_receipt(&foreign, &sealed.token, &receipt)
         .expect_err("a foreign owner's pass must not reconcile this reservation");
     assert!(

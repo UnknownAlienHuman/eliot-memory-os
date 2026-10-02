@@ -946,6 +946,16 @@ mod tests {
 
     const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+    /// This receiving build's own admission contract-set support identity.
+    ///
+    /// `PreparedTransition::validate` compares the recorded copy against it, so
+    /// a frozen placeholder here would be refused as `ManifestMismatch` and
+    /// would mask the hash-mismatch refusal this module probes.
+    fn gate_contract_set_digest() -> String {
+        eliot_store_api::supported_admission_contract_set_digest()
+            .expect("build supports its own contract set")
+    }
+
     fn fence() -> StateFence {
         let lineage = EpochLineageId::new(LINEAGE).expect("lineage");
         let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("nz")).expect("epoch");
@@ -978,7 +988,10 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // Read from its owner: a frozen placeholder here would be refused
+            // by `PreparedTransition::validate` as `ManifestMismatch` and would
+            // mask the hash-mismatch refusal this fixture exists to probe.
+            admission_contract_set_digest: gate_contract_set_digest(),
             operation_manifest_digest: OperationManifestDigest::new("manifest-gate")
                 .expect("manifest"),
             // Issue-#18 digests are derived, never defaulted; no semantic

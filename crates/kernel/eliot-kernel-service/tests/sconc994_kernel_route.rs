@@ -140,7 +140,13 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // Read from its owner: `PreparedTransition::validate` compares this
+        // field against the receiving build's own
+        // `supported_admission_contract_set_digest()`, so a frozen placeholder
+        // refuses every transition here as `ManifestMismatch` inside
+        // `validate_admitted` before any ORS or gateway rule under test runs.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("994-kr build supports its own contract set"),
         operation_manifest_digest: OperationManifestDigest::new(format!("manifest-994-kr-{tag}"))
             .expect("994-kr manifest digest"),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
