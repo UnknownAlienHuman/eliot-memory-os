@@ -54,8 +54,9 @@
 
 use eliot_contracts::StateFence;
 use eliot_ipc::Session;
-use eliot_ors::HostRequestRecord;
+use eliot_ors::{HostRequestRecord, OpaqueLabel};
 use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
+use eliot_store_api::CampaignLearningStateViewPublication;
 use serde::{Deserialize, Serialize};
 
 use crate::kernel_audit::{AuditEventKind, AuditRecord, authority_epoch_text};
@@ -87,12 +88,18 @@ const TRACE_EVIDENCE_REFERENCE_MAX_BYTES: usize = 1_024;
 ///   made under, when the read owner submitted one and that fence is the same
 ///   fence observed with the authority decision; else the policy revision the
 ///   authority decision's own fence carries.
-/// - `active_view_packet_manifest` and `verifier_result` have no field on the
-///   admitted envelope, the durable ORS row, or the submitted execution
-///   evidence, so nothing at this seal site observes them. They are therefore
-///   projected as absent and, being required classes, named in `missing_parts`
+/// - `active_view_packet_manifest` is the immutable generated view envelope ORS
+///   retained with the completion (`CampaignLearningStateViewPublication`), read
+///   back off the row that owns it and re-proved against that row's own task,
+///   scope and fence. It is the stored record's key, never a digest recomputed
+///   here.
+/// - `verifier_result` has no field on the admitted envelope, the durable ORS
+///   row, or the submitted execution evidence, and no owner produces an
+///   independent verifier result outside the completing actor's failure domain
+///   (A5.5), so nothing at this seal site observes it. It is therefore
+///   projected as absent and, being a required class, named in `missing_parts`
 ///   so the run classifies `DEGRADED_NO_PROOF`. Kernel never substitutes a
-///   lane label, a recomputed digest, or any other stand-in for them.
+///   lane label, a recomputed digest, or any other stand-in for it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraceEvidence {
     /// Authenticated producer principal/service reference, when retained.
@@ -142,9 +149,11 @@ impl TraceEvidence {
                     })
                 }),
             policy_snapshot_binding: retained_policy.map(|policy| policy.state_fence.clone()),
-            // No producer for either class exists at this seal site; see the
-            // type documentation. Absent stays absent.
-            active_view_packet_manifest: None,
+            // I16.12 "Active View/packet manifest": the immutable generated view
+            // envelope ORS retained in the same transaction as this completion.
+            active_view_packet_manifest: campaign_view_manifest(persisted),
+            // No owner produces an independent verifier/artifact result for
+            // this completion; see the type documentation. Absent stays absent.
             verifier_result: None,
         }
     }
@@ -174,6 +183,47 @@ fn valid_reference(value: Option<&str>) -> Option<String> {
 /// substitute cannot satisfy a required slot.
 fn carries_evidence_reference(value: Option<&str>) -> bool {
     valid_reference(value).is_some()
+}
+
+/// Reads the retained Active View/packet manifest reference off the durable row.
+///
+/// The owner is `eliot_store_api::CampaignLearningStateViewPublication`, which
+/// ORS stored in `ors_campaign_learning_state_views_v1` under `view_id` in the
+/// same write transaction that retained this row's result response
+/// (`RedbRecoveryStore::persist_host_request_result`). The value recorded here
+/// is that stored record's own key — never a digest recomputed at the seal site
+/// and never a handle the read owner supplied.
+///
+/// Bound by CONTENT, not by presence. `validate()` re-derives the view's
+/// `content_digest` from the canonical view bytes and proves the publication
+/// key matches the view's own identity and admitted binding, and the task,
+/// scope and fence must equal this row's own exactly as
+/// `validate_campaign_view_result` proved at the bind boundary. A view
+/// published for another packet, task, scope or fence leaves the slot ABSENT —
+/// and therefore named in `missing_parts` — rather than satisfying it. Only an
+/// `eliot.packet` completion may carry one; every other lane, including the
+/// query lane, still degrades honestly on this class.
+fn campaign_view_manifest(persisted: &HostRequestRecord) -> Option<String> {
+    if persisted.capability_ref.as_str() != "eliot.packet" {
+        return None;
+    }
+    let publication: CampaignLearningStateViewPublication = serde_json::from_value(
+        persisted
+            .result_response
+            .as_ref()?
+            .get("campaign_learning_state_view")?
+            .clone(),
+    )
+    .ok()?;
+    publication.validate().ok()?;
+    if persisted.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(publication.task_id.as_str())
+        || persisted.scope_ref.as_ref().map(OpaqueLabel::as_str)
+            != Some(publication.scope_id.as_str())
+        || crate::sha256_json(&publication.state_fence).ok()? != persisted.fence_digest
+    {
+        return None;
+    }
+    valid_reference(Some(publication.view_id.as_str()))
 }
 
 /// Required manifest slots, in stable enumeration order.
