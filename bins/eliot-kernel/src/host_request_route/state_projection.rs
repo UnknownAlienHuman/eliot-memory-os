@@ -147,7 +147,7 @@ mod state_read_wire_tests {
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
             kind: HostRequestKind::Invocation,
             connection_id: "conn-test-1".to_owned(),
-            identity: HostRequestIdentity {
+            identity: eliot_protocol::HostRequestIdentity {
                 request_id: RequestId::new(request_id).expect("valid request id"),
                 correlation_projection: None,
                 idempotency_key: format!("{request_id}:invoke"),

@@ -753,6 +753,7 @@ fn submit_curation_with_source_runs_a31_then_fails_closed_at_transport() {
         Box::new(ClosedTestTransport),
         Some(&empty_source),
         None,
+        None,
     )
     .expect("empty-handles test port must construct");
     let refused = <AuthenticatedKernelJobPort as KernelJobPort>::submit(

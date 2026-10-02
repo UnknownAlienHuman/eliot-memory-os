@@ -1013,7 +1013,7 @@ mod tests {
             census.len(),
             HandoffCaptureBoundary::CONTROLLED_BOUNDARIES.len()
         );
-        for row in census {
+        for row in &census {
             assert!(row.caller_symbol.contains("::"), "{row:?}");
             assert!(!row.caller_symbol.contains("STITCH"), "{row:?}");
         }
@@ -1166,7 +1166,7 @@ mod tests {
         let recipe_ref = reference("recipe", "recipe-1", "1", None);
         let incoming = intent();
         let state_fence = fence();
-        let authority = authority(40, &state_fence);
+        let admitted_authority = authority(40, &state_fence);
         let request = HandoffResumeRequest {
             capture_checkpoint_id: &captured.checkpoint_id,
             registry: &captured.registry,
@@ -1177,7 +1177,7 @@ mod tests {
             gap: None,
             recipe_ref: &recipe_ref,
             resume_request: &incoming,
-            authority: &authority,
+            authority: &admitted_authority,
         };
 
         // The right target attempt under the wrong handoff is a stale request.
