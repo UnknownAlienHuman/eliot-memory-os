@@ -61,7 +61,6 @@ import importlib.util
 import json
 import re
 import sys
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -141,6 +140,59 @@ CANONICAL_SCHEMA_TYPE = "SerializedContextMeasurement"
 CANONICAL_STU_PATH = "crates/smart/eliot-context-measurement/src/stu.rs"
 CANONICAL_STU_FORMULA = "stu_for_bytes"
 CANONICAL_MEASUREMENT_PORT = "measure_serialized_context"
+
+# The Cargo PACKAGE name of #704's algorithm crate. Cargo dependency facts are
+# named in the manifest's own kebab-case spelling; the Rust crate identifier is
+# the underscore spelling of the same name. Both come from this one constant so
+# the manifest lookup and the source lookup can never drift apart.
+MEASUREMENT_CRATE_PACKAGE = "eliot-context-measurement"
+MEASUREMENT_CRATE_RUST = "eliot_context_measurement"
+
+# The exact #704 input record the canonical port takes. The fields listed here
+# are the closed set whose presence in a production call's span is what binds the
+# call to the final serialized bytes and to the route/tokenizer identity. They
+# are #704's own ``SerializedContextInputs`` field names
+# (``crates/smart/eliot-context-measurement/src/lib.rs:277-308``), read here as
+# the acceptance vocabulary and not as a re-implementation of the record.
+PORT_INPUT_RECORD = "SerializedContextInputs"
+PORT_FINAL_BYTES_BINDING_FIELDS: tuple[str, ...] = ("declared_len", "content_digest")
+PORT_IDENTITY_BINDING_FIELDS: tuple[str, ...] = (
+    "serializer",
+    "route",
+    "tokenizer",
+)
+
+# The closed approved legacy-adapter record. An adapter may satisfy the
+# dependency without calling #704's port directly only when it is listed here
+# with an exact identity, an exact version, an exact expiry and the canonical
+# port it implements. Every field is required; a record missing one of them is
+# rejected, never treated as satisfied.
+@dataclass(frozen=True)
+class ApprovedAdapter:
+    identity: str
+    version: str
+    expires: str
+    implements_port: str
+
+    def closed(self) -> bool:
+        """An adapter record is closed only with all four exact fields."""
+        return all(
+            bool(part) for part in (self.identity, self.version, self.expires, self.implements_port)
+        )
+
+
+# The closed per-consumer dependency contract. Every field is measured, never
+# assumed: ``cargo_package`` is looked up in the consumer's own manifest, and
+# ``port_symbol`` is looked up as a production CALL. See the comment above
+# :data:`CONSUMER_DEPENDENCY_CONTRACTS` for the five conjuncts a consumer must
+# satisfy.
+@dataclass(frozen=True)
+class ConsumerDependencyContract:
+    owner: str
+    cargo_package: str
+    port_symbol: str
+    role: str = "consumer"
+
 
 # Closed disposition set every baseline row must end with. A baseline row
 # that simply disappears is an erased requirement and is rejected; a row
@@ -229,51 +281,84 @@ EXPECTED_BASELINE_ROWS: tuple[tuple[str, str], ...] = (
 EXPECTED_BASELINE_COUNT = len(EXPECTED_BASELINE_ROWS)
 
 # The three consumer migrations that must each leave exact evidence of the
-# canonical measurement dependency (or an exact approved adapter) in their
-# own source. #787 never chooses the migration; it only requires the
-# evidence. Each consumer is checked for a declared measurement dependency
-# marker in its declared seam files.
+# canonical measurement dependency in their own source. #787 never chooses the
+# migration; it only requires the evidence.
 #
-# This table is the *exact accepted adapter set*, one closed tuple per closed
-# consumer owner. It is deliberately exhaustive, not a sample: a migrated
-# consumer satisfies its dependency by naming one of the listed canonical crate
-# / port / adapter identifiers, and each listed identifier is itself an accepted
-# reference the oracle can name in a finding. Nothing outside these tuples is
-# accepted, and no marker set is widened at runtime -- an owner absent from this
-# table has NO accepted adapter and therefore can never satisfy the dependency
-# check (see :func:`_dependency_evidence` and the ``evaluate`` arm that iterates
-# exactly this table's keys). "Any one of these" is a closed disjunction over a
-# declared set, not a permissive trial decode: there is no fallback marker, no
-# substring-of-anything match beyond the exact literal, and no owner key added
-# without editing this closed table.
-CONSUMER_DEPENDENCY_MARKERS: dict[str, tuple[str, ...]] = {
-    # Exact accepted references a migrated consumer may name. The crate name
-    # (``eliot_context_measurement`` / ``eliot_context_contracts``) is the
-    # Cargo dependency itself; ``measure_serialized_context`` is #704's
-    # canonical port; ``measure_exact_utf8`` is #704's exact adapter entry
-    # point; ``eliot_context_contracts`` is #584's public contract type crate.
-    "#783": (
-        "eliot_context_measurement",
-        "eliot_context_contracts",
-        "measure_serialized_context",
-        "measure_exact_utf8",
-    ),
-    "#878": (
-        "eliot_context_measurement",
-        "eliot_context_contracts",
-        "measure_serialized_context",
-        "measure_exact_utf8",
-    ),
-    "#880": (
-        "eliot_context_measurement",
-        "eliot_context_contracts",
-        "measure_serialized_context",
-        "measure_exact_utf8",
-    ),
-    CANONICAL_MEASUREMENT_OWNER: (
-        "eliot_context_contracts",
-    ),
+# A dependency is *bound* evidence, not the existence or the shape of a name.
+# Every field below is compared against the measured content of this operation
+# -- the consumer's own Cargo metadata, its own masked production spans and its
+# own call site -- so a name that merely occurs somewhere in the file proves
+# nothing. The evidence is the conjunction of all five facts below; a consumer
+# that satisfies any subset has no dependency proof.
+#
+# 1. ``cargo_dependency`` -- the consumer's OWN Cargo manifest declares
+#    ``eliot-context-measurement`` under a normal/build/dev ``[dependencies]``
+#    table (directly or through ``.workspace = true`` / ``{ workspace = true }``).
+#    A renamed dependency still declares the real package via
+#    ``package = "eliot-context-measurement"``. Read from the manifest
+#    hierarchy, never from a Rust-source substring.
+# 2. ``port_call`` -- a production (non-test) masked line in the consumer's
+#    declared writable seam calls #704's canonical port ``measure_serialized_context``
+#    as a *call*, i.e. the identifier is followed by ``(`` and is not part of a
+#    path (``crate::name``/``module::name``) or of a longer identifier.
+# 3. ``final_serialized_bytes`` -- the same production call passes a payload
+#    argument, and the surrounding production span binds the envelope length and
+#    content digest into the ``SerializedContextInputs`` record the port takes
+#    (``declared_len`` and ``content_digest``).
+# 4. ``identity_binding`` -- the same production span binds the serializer,
+#    route, provider, model and tokenizer identities (``serializer``/
+#    ``SerializerIdentity``, ``route``/``RouteIdentity``, ``tokenizer``/
+#    ``TokenizerIdentity``) into that record.
+# 5. ``adapter_record`` -- when a consumer does not call #704's port directly,
+#    the only other accepted evidence is a CLOSED approved adapter record: an
+#    exact adapter identity with an exact version and an exact expiry, declared
+#    in :data:`APPROVED_MEASUREMENT_ADAPTERS` below. No such record exists on
+#    current main, so that arm is currently unreachable by design (defect 5 of
+#    the audit owns making case 25 reachable upstream, not this file); it is
+#    still evaluated so an adapter record can never be forged by naming a type.
+#
+# The closed accepted set is one entry per closed consumer owner. An owner
+# absent from :data:`CONSUMER_DEPENDENCY_CONTRACTS` has NO accepted dependency
+# and can never satisfy the check, and no owner key is ever added at runtime.
+#
+# ``eliot_context_contracts`` (#584, the public Context contract/schema crate)
+# is deliberately NOT an accepted measurement dependency. It owns the measurement
+# SCHEMA; depending on it names a type, not an algorithm. A schema-only import
+# with no call to #704's port is exactly the forging the audit names, so it is
+# excluded here and the check has no arm that would accept it.
+CONSUMER_DEPENDENCY_CONTRACTS: dict[str, "ConsumerDependencyContract"] = {
+    owner: ConsumerDependencyContract(
+        owner=owner,
+        cargo_package=MEASUREMENT_CRATE_PACKAGE,
+        port_symbol=CANONICAL_MEASUREMENT_PORT,
+    )
+    for owner in ("#783", "#878", "#880")
 }
+# #704 is the canonical measurement OWNER, not a consumer of it. Its requirement
+# is that it DEFINE :data:`CANONICAL_MEASUREMENT_PORT` exactly once, which the
+# ``canonical-owner`` arm of :func:`evaluate` already measures through
+# :func:`_measurement_owner_sites` and reports as ``MISSING_CANONICAL_OWNER`` /
+# ``GENERIC_ESTIMATOR_OWNER`` / ``DUPLICATE_OWNER``. Requiring #704 to declare a
+# Cargo dependency on the crate it *is* would be a false failure against the
+# algorithm owner, so its role is ``"owner"`` and it is evaluated by that
+# definition-site proof. It is present in the closed table rather than absent so
+# #704 still has a declared, closed role and can never be an owner with no
+# declared reach.
+CONSUMER_DEPENDENCY_CONTRACTS[CANONICAL_MEASUREMENT_OWNER] = ConsumerDependencyContract(
+    owner=CANONICAL_MEASUREMENT_OWNER,
+    cargo_package=MEASUREMENT_CRATE_PACKAGE,
+    port_symbol=CANONICAL_MEASUREMENT_PORT,
+    role="owner",
+)
+
+# The CLOSED approved legacy-adapter set: exact identity, exact version, exact
+# expiry, and the canonical port each adapter must implement. This is the only
+# way a consumer may satisfy the dependency WITHOUT calling #704's port in
+# production, and an entry that names no canonical port, no exact version or no
+# exact expiry is rejected by :func:`_adapter_record` rather than treated as
+# satisfied. The set is empty on current main because no approved adapter record
+# exists in any owned data file; that is an honest empty, not a widened accept.
+APPROVED_MEASUREMENT_ADAPTERS: dict[str, tuple["ApprovedAdapter", ...]] = {}
 
 
 class OracleError(RuntimeError):
@@ -383,6 +468,7 @@ class OwnershipResult:
     unaccounted_candidate_count: int
     canonical_measurement_owners: tuple[str, ...]
     canonical_schema_owners: tuple[str, ...]
+    dependency_proofs: dict[str, dict[str, Any]]
     producer_check_status: str
     finding_count: int
     findings: tuple[Finding, ...]
@@ -428,6 +514,10 @@ class OwnershipResult:
             "baseline_dispositions": dict(sorted(self.baseline_dispositions.items())),
             "canonical_measurement_owners": list(self.canonical_measurement_owners),
             "canonical_schema_owners": list(self.canonical_schema_owners),
+            "dependency_proofs": {
+                owner: dict(sorted(proof.items()))
+                for owner, proof in sorted(self.dependency_proofs.items())
+            },
             "findings": [f.as_dict() for f in self.findings],
             "result_digest": self.result_digest,
         }
@@ -480,6 +570,7 @@ def load_producer(root: Path) -> Any:
         "OWNER_MAP_PATH",
         "OWNED_TOML",
         "_parse_toml",
+        "_package_of",
         "_validate_artifact",
         "_load_files",
         "_scope_of",
@@ -1184,12 +1275,596 @@ def _measurement_owner_sites(
     return results
 
 
-def _dependency_evidence(root: Path, producer: Any, rows: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """For each consumer, collect the exact marker hits in its declared
-    writable seam source. Presence of an exact canonical/adapter marker is the
-    evidence that the consumer migrated to (or is bound to) the canonical
-    measurement instead of hand-rolling a local estimator."""
-    markers_by_owner: dict[str, list[str]] = {}
+# ---------------------------------------------------------------------------
+# Authoritative Cargo dependency facts.
+#
+# WHY THIS READER EXISTS HERE AND NOT ELSEWHERE. The audit requires the exact
+# Cargo dependency to be verified "from authoritative Cargo metadata, not a
+# Rust-source substring". The repository's other Cargo-metadata readers
+# (``scripts/verify-dependency-policy.py``, ``scripts/crate_reachability_inventory.py``,
+# ``scripts/migration_inventory_1860.py``, ``scripts/integration/ignored_test_inventory.py``)
+# all shell out to a Cargo resolver and parse its JSON. This oracle may not: its
+# own closed self-test bans the child-process surface module-wide (case 787/30,
+# "no network/write/measurement/admission/broad-skip implementation", which the
+# #866 producer's module docstring extends to "never spawns a child process"),
+# and the normal checking path is declared read-only, clock-free and network-free.
+# Reusing a resolver-spawning reader would import exactly the surface this
+# oracle's contract forbids.
+#
+# So the metadata is read with the producer's OWN read-only readers, reused
+# rather than restated: ``_parse_toml`` (``context_measurement_inventory.py``
+# ``:2062-2069``) parses the committed ``Cargo.toml`` and ``_package_of``
+# (``:779-805``) resolves the owning package by the same upward walk the
+# producer uses for every inventory row. Both are required read-only API in
+# :func:`load_producer`, so a producer that lost either fails closed as
+# ``PRODUCER_ABSENT`` instead of this oracle silently growing a second Cargo
+# grammar. What remains here is the *dependency-table* reader -- "does this
+# package declare this package as a dependency, and where" -- which reads only
+# declared ``[dependencies]`` tables, never Rust source.
+# ---------------------------------------------------------------------------
+
+# Cargo dependency tables. ``target.<cfg>.dependencies`` is flattened in: a
+# Windows-only dependency is a real dependency of a Windows consumer, and an
+# audit that ignored it would let a platform-gated measurement edge through
+# unproved.
+CARGO_DEPENDENCY_TABLES: tuple[str, ...] = (
+    "dependencies",
+    "dev-dependencies",
+    "build-dependencies",
+)
+
+
+def _read_cargo_manifest(producer: Any, root: Path, path: Path) -> dict[str, Any]:
+    """Parse one committed ``Cargo.toml`` with the PRODUCER's own TOML reader.
+
+    The decode/parse/table-check is the accepted #866 ``_parse_toml``
+    (``context_measurement_inventory.py:2062-2069``), reused as-is and translated
+    into this oracle's typed failure code. A second TOML grammar here would be a
+    second scheme for reading committed metadata: a manifest this oracle and the
+    producer could disagree about is exactly the disagreement a dependency proof
+    must not have.
+    """
+    resolved = path.resolve(strict=False)
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        raise OracleError(
+            "SOURCE_UNREADABLE",
+            f"Cargo manifest could not be read: {resolved.as_posix()}",
+        ) from exc
+    try:
+        return producer._parse_toml(raw, source=resolved.as_posix())
+    except producer.InventoryError as exc:
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"Cargo manifest is malformed: {resolved.as_posix()}: {exc.detail}",
+        ) from exc
+
+
+def _cargo_package_manifest(producer: Any, root: Path, rel: str) -> tuple[str, Path]:
+    """The nearest ``Cargo.toml`` at or above ``rel``, and its package name.
+
+    The upward walk is the accepted #866 ``_package_of``
+    (``context_measurement_inventory.py:779-805``) -- the same walk the producer
+    uses to attribute every inventory row to its Cargo package -- reused rather
+    than restated. Only the manifest's PATH is resolved here, because
+    ``_package_of`` returns the package NAME; the path is the same
+    ``<dir>/Cargo.toml`` the producer's walk stopped at. That manifest -- not a
+    Rust-source substring -- is the consumer's authoritative Cargo metadata.
+    """
+    package = producer._package_of(root, rel)
+    current = (root / rel).parent
+    while True:
+        manifest = current / "Cargo.toml"
+        if manifest.is_file() and not manifest.is_symlink():
+            document = _read_cargo_manifest(producer, root, manifest)
+            declared = document.get("package")
+            if isinstance(declared, dict) and isinstance(declared.get("name"), str):
+                if str(declared["name"]) == package:
+                    return (package, manifest)
+        if current == root:
+            break
+        parent = current.parent
+        try:
+            parent.relative_to(root)
+        except ValueError:
+            break
+        current = parent
+    raise OracleError(
+        "SOURCE_UNREADABLE",
+        f"no Cargo package manifest declares the crate owning {rel}; a consumer seam "
+        f"outside every Cargo package has no authoritative dependency metadata",
+    )
+
+
+def _cargo_dependency_declarations(
+    producer: Any, root: Path, manifest: Path
+) -> dict[str, list[tuple[str, str]]]:
+    """Every dependency declaration of one package, keyed by real package name.
+
+    Returns ``{declared_package_name: [(table, alias), ...]}``. The KEY is always
+    the real package name, so a renamed dependency is recorded under the package
+    it actually pulls. ``table`` is the declared table's path, e.g.
+    ``target.'cfg(windows)'.dependencies``, so a finding can name exactly where
+    the dependency was declared.
+    """
+    document = _read_cargo_manifest(producer, root, manifest)
+    declared: dict[str, list[tuple[str, str]]] = {}
+
+    def collect(table: Any, label: str) -> None:
+        if not isinstance(table, dict):
+            return
+        for alias, value in table.items():
+            if isinstance(value, str):
+                # ``foo = "1.0"`` style: the alias IS the package name.
+                package, _req = alias, value
+            elif isinstance(value, dict):
+                renamed = value.get("package")
+                package = renamed if isinstance(renamed, str) else alias
+            else:
+                continue
+            if isinstance(package, str) and package:
+                declared.setdefault(package, []).append((label, alias))
+
+    for name in CARGO_DEPENDENCY_TABLES:
+        collect(document.get(name), name)
+    targets = document.get("target")
+    if isinstance(targets, dict):
+        for triple, target_table in targets.items():
+            if not isinstance(triple, str) or not isinstance(target_table, dict):
+                continue
+            for name in CARGO_DEPENDENCY_TABLES:
+                collect(target_table.get(name), f"target.'{triple}'.{name}")
+    return declared
+
+
+def _cargo_dependency_facts(
+    producer: Any, root: Path, rels: Sequence[str], package: str
+) -> tuple[bool, str]:
+    """Does the package owning ``rels[0]`` declare ``package`` as a dependency?
+
+    Returns ``(declared, evidence)``. ``evidence`` names the exact declaring
+    table so a finding cites the manifest line the decision came from, not a
+    paraphrase.
+    """
+    _manifest_name, manifest = _cargo_package_manifest(producer, root, rels[0])
+    deltas = _cargo_dependency_declarations(producer, root, manifest)
+    sites = deltas.get(package, [])
+    if not sites:
+        return (
+            False,
+            f"{manifest.relative_to(root.resolve()).as_posix()} declares no dependency on "
+            f"{package!r} in any {', '.join(CARGO_DEPENDENCY_TABLES)} table",
+        )
+    table, alias = sorted(sites)[0]
+    return (True, f"{manifest.relative_to(root.resolve()).as_posix()} [{table}] declares {alias!r}")
+
+
+def _port_call_sites(
+    producer: Any, record: dict[str, Any], rel: str, port_symbol: str
+) -> list[dict[str, Any]]:
+    """Production call sites of ``port_symbol`` in one producer-masked record.
+
+    A site qualifies only when ALL of these hold, and each is load-bearing:
+
+    * the identifier occurs in a MASKED line, so a comment or a string literal
+      body is already blanked out by the producer's ``_mask_rust`` and can never
+      produce a site;
+    * it is followed by ``(`` -- a CALL, not an import, a type mention or a
+      re-export;
+    * it is not preceded by ``::`` and not part of a longer identifier, so
+      ``crate::measure_serialized_context``, ``mod::measure_serialized_context``
+      and ``measure_serialized_context_local`` are all rejected;
+    * the enclosing item scope measured by the producer's own ``_scope_of`` is
+      production, so a call inside ``#[cfg(test)]``/``#[test]``/``mod tests``
+      never produces a site;
+    * the ENCLOSING ITEM is REACHED by production code. A private ``fn`` no
+      production item calls is dead code: naming the port inside it binds
+      nothing. Reachability is measured on the item's own declaration line by
+      :func:`_reachable_item_starts`, not on the call line.
+
+    Returns one record per accepted site with its exact line and enclosing item.
+    ``span_start``/``span_end`` cover the CALL itself -- from the call line to
+    the line where its parenthesis nesting closes -- so a cited span always
+    covers the call it names and is never a zero-width line.
+    """
+    masked_lines = record["masked_lines"]
+    depths = record["depths"]
+    reachable = _reachable_item_starts(producer, record, rel)
+    item_re = producer.ITEM_RE
+    sites: list[dict[str, Any]] = []
+    needle = re.compile(
+        r"(?<![\w:])" + re.escape(port_symbol) + r"\s*\(",
+    )
+    for lineno, line in enumerate(masked_lines, start=1):
+        if not needle.search(line):
+            continue
+        item, scope = producer._scope_of(masked_lines, depths, lineno, rel)
+        if scope == "test":
+            continue
+        # The enclosing item's declaration line, measured with the producer's own
+        # item grammar: the last item declaration at or above the call whose
+        # extent reaches the call line.
+        enclosing = 0
+        for index in range(lineno - 1, -1, -1):
+            if item_re.match(masked_lines[index]) is not None:
+                if producer._item_extent(masked_lines, depths, index + 1) >= lineno:
+                    enclosing = index + 1
+                    break
+        if enclosing == 0 or enclosing not in reachable:
+            continue
+        # The site records the CALL's own extent, measured from the call line to
+        # the line where the call's parenthesis nesting closes -- the same
+        # top-level-argument splitter :func:`_call_arguments` walks. A site whose
+        # span were a single zero-width line (``span_start == span_end``) would
+        # name the call without covering any of it, so a finding could cite a
+        # span that proves nothing about the call. ``span_end`` is therefore at
+        # least ``span_start + 1`` whenever a call actually opens there, and it
+        # covers the whole call including a wrapped argument list.
+        call_end = _call_extent(masked_lines, lineno)
+        sites.append(
+            {
+                "path": rel,
+                "span_start": lineno,
+                "span_end": max(lineno + 1, call_end),
+                "item": item,
+                "item_start": enclosing,
+            }
+        )
+    return sites
+
+
+def _reachable_item_starts(producer: Any, record: dict[str, Any], rel: str) -> set[int]:
+    """1-based line numbers of items production code can actually reach.
+
+    Measured from the producer's own masked lines, with the producer's own
+    ``ITEM_RE`` grammar and its own ``_item_extent``:
+
+    * a ``pub`` item -- or a ``pub(...)``-anything item -- is reachable by
+      definition, because it is nameable from outside its module;
+    * any item whose own name is CALLED or PATHED somewhere outside its own
+      extent is reachable;
+    * ``main`` is reachable.
+
+    Anything else -- an unannotated private helper nothing calls -- is dead and
+    is excluded. This is deliberately conservative in the accepting direction
+    only for the two unambiguous classes: a public item and a called item. A
+    private helper called only by another dead helper stays dead, which is the
+    correct answer for "never called" and never hides a real production call,
+    because a real production call is itself a call site from a reachable item.
+    """
+    masked_lines = record["masked_lines"]
+    depths = record["depths"]
+    item_re = producer.ITEM_RE
+    declarations: list[tuple[int, str, bool]] = []
+    for index, line in enumerate(masked_lines):
+        match = item_re.match(line)
+        if match is None:
+            continue
+        declarations.append(
+            (index + 1, str(match.group("name")), bool(re.match(r"\s*pub(\s|\()", line)))
+        )
+    # A name is CALLED only where it occurs OUTSIDE its own declaration line.
+    # Counting the declaration itself would make every function its own caller
+    # and would turn the dead-code class into an unreachable one.
+    declaration_lines = {start for start, _name, _pub in declarations}
+    called: set[str] = set()
+    for name in {name for _start, name, _pub in declarations}:
+        pattern = re.compile(r"(?<![\w:])" + re.escape(name) + r"(?![\w])")
+        if any(
+            pattern.search(line)
+            for lineno, line in enumerate(masked_lines, start=1)
+            if lineno not in declaration_lines
+        ):
+            called.add(name)
+    reachable: set[int] = set()
+    for start, name, is_public in declarations:
+        if is_public or name in called or name == "main":
+            reachable.add(start)
+    del rel  # the reachability decision is per-file, not per-owner
+    return reachable
+
+
+def _port_call_bindings(
+    producer: Any, record: dict[str, Any], rel: str, site: dict[str, Any]
+) -> dict[str, object]:
+    """What the production call at ``site`` binds, measured over its item span.
+
+    The bindings are read from the PRODUCER-MASKED lines of the enclosing item
+    (located with the producer's own ``_item_extent``), so a binding named only
+    in a comment or a string literal cannot satisfy them.
+
+    ``payload_argument`` is the span-level fact that the call passes a payload:
+    the port's first parameter is the final serialized bytes, and the call site
+    must supply an argument in that position.
+    """
+    masked_lines = record["masked_lines"]
+    depths = record["depths"]
+    lineno = int(site["span_start"])
+    # The enclosing item's own span, measured from its declaration line with the
+    # producer's ``_item_extent`` -- NOT from the call line, because a
+    # ``SerializedContextInputs`` literal is normally built BEFORE the call that
+    # consumes it, and a binding that only looked below the call would miss every
+    # real call site.
+    item_start = int(site.get("item_start") or lineno)
+    span_end = producer._item_extent(masked_lines, depths, item_start)
+    span = "\n".join(masked_lines[item_start - 1 : span_end])
+    # The record is a struct literal whose fields legitimately span many lines,
+    # so the binding is searched over the whole enclosing item's MASKED span --
+    # never over one line, and never over a raw line. A field named only in a
+    # comment or a string literal is blanked out by the producer's ``_mask_rust``
+    # before this search runs, so it cannot satisfy a binding.
+    #
+    # The SECOND argument of the call is the ``&SerializedContextInputs`` the
+    # port takes, and THAT is the binding: the record whose fields are measured
+    # is the record the call passes. The measured argument text is extracted
+    # from the masked call line, so a record built but never passed cannot carry
+    # the proof, and a record passed but never built cannot either.
+    inputs_argument = _call_inputs_argument(masked_lines, span_end, lineno)
+    carries_record = (
+        inputs_argument is not None
+        and _binds_that_argument(inputs_argument, span)
+    )
+    call_line = masked_lines[lineno - 1]
+    # The payload argument is the text between the call's opening parenthesis
+    # and the first top-level comma, measured on the masked line.
+    payload = _call_payload_argument(call_line)
+    return {
+        "payload_argument": payload,
+        "inputs_argument": inputs_argument,
+        "final_bytes_bound": carries_record
+        and all(field in span for field in PORT_FINAL_BYTES_BINDING_FIELDS),
+        "identity_bound": carries_record
+        and all(field in span for field in PORT_IDENTITY_BINDING_FIELDS),
+    }
+
+
+def _call_inputs_argument(
+    masked_lines: list[str], span_end: int, lineno: int
+) -> str | None:
+    """The masked call's SECOND argument, or None when the span has no second one.
+
+    #704's port signature is ``measure_serialized_context(payload: &[u8],
+    inputs: &SerializedContextInputs)`` (``crates/smart/eliot-context-measurement/
+    src/lib.rs:460-463``), so the bound record is the second argument. It may wrap
+    across lines, so the argument text is measured from the call line down to the
+    point where the call's parenthesis nesting closes.
+
+    The call's arguments are SPLIT on the top-level commas -- the commas at the
+    call's own nesting depth, ignoring commas inside a nested ``(...)``/``{...}``/
+    ``[...]`` expression such as a nested call or struct literal -- and the
+    SECOND argument is returned. Returning the first (which is what a naive
+    "text before the first comma" read gives) would hand back the payload and
+    could never observe the record; returning a whole-argument string for arg 2
+    keeps the check bound to what the call actually passes.
+    """
+    arguments = _call_arguments(masked_lines, span_end, lineno)
+    if len(arguments) < 2:
+        return None
+    return arguments[1].strip() or None
+
+
+def _call_extent(masked_lines: list[str], lineno: int) -> int:
+    """The 1-based line where the call opening on ``lineno`` closes.
+
+    Returns ``lineno`` itself when the call's parenthesis nesting never closes
+    within the file (a genuinely unterminated call), so the caller always gets a
+    span that at least covers the call line rather than a zero-width span.
+    """
+    depth = 0
+    opened = False
+    for index in range(lineno - 1, len(masked_lines)):
+        for char in masked_lines[index]:
+            if char in "([":
+                depth += 1
+                opened = True
+            elif char in ")]":
+                depth -= 1
+                if opened and depth == 0:
+                    return index + 1
+    return lineno
+
+
+def _call_arguments(masked_lines: list[str], span_end: int, lineno: int) -> list[str]:
+    """The masked call's top-level arguments, in order, up to ``span_end``.
+
+    Scanning starts at the FIRST opening parenthesis at or after the canonical
+    port identifier on ``lineno`` and runs to the line where that parenthesis's
+    nesting closes. Anchoring on the port call rather than on the start of the
+    line matters: in ``wrap(x).measure_serialized_context(p, i)`` the leading
+    ``wrap(`` closes before the port's own ``(``, so scanning from the line start
+    would read ``wrap``'s arguments and measure the wrong call. A comma only
+    separates arguments at the call's own depth (``depth == 1``); a comma nested
+    inside a call/struct/bracket expression is carried in the argument text. A
+    trailing comma does not produce a final empty argument.
+    """
+    depth = 0
+    opened = False
+    current: list[str] = []
+    arguments: list[str] = []
+    index = lineno - 1
+    while index < min(span_end, len(masked_lines)):
+        line = masked_lines[index]
+        for position, char in enumerate(line):
+            if not opened:
+                # Locate the port's own call parenthesis. The anchor is the same
+                # exact-identifier condition :func:`_port_call_sites` uses to
+                # accept a site, so the splitter and the site finder can never
+                # disagree about which parenthesis is the call's.
+                if char == "(" and _port_call_opens_at(line, position):
+                    opened = True
+                    depth = 1
+                continue
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth -= 1
+                if depth == 0:
+                    arguments.append("".join(current))
+                    return [arg for arg in arguments if arg.strip()]
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            if depth >= 1:
+                if char == "," and depth == 1:
+                    arguments.append("".join(current))
+                    current = []
+                else:
+                    current.append(char)
+        index += 1
+    if opened:
+        arguments.append("".join(current))
+    return [arg for arg in arguments if arg.strip()]
+
+
+def _port_call_opens_at(line: str, position: int) -> bool:
+    """Does the ``(`` at ``position`` belong to the canonical port's own call?
+
+    True when the exact port identifier ends immediately before this
+    parenthesis, allowing intervening whitespace, and the identifier is neither
+    preceded by ``::`` nor part of a longer name -- the same condition
+    :func:`_port_call_sites` uses to accept a site, so the argument splitter and
+    the site finder can never disagree about which parenthesis is the call's.
+    """
+    prefix = line[:position]
+    match = re.search(
+        r"(?<![\w:])" + re.escape(CANONICAL_MEASUREMENT_PORT) + r"\s*$", prefix
+    )
+    return match is not None
+
+
+def _binds_that_argument(inputs_argument: str, span: str) -> bool:
+    """Is the call's second argument actually bound to a ``SerializedContextInputs``?
+
+    The argument is bound when EITHER
+
+    * it names :data:`PORT_INPUT_RECORD` directly -- an inline
+      ``&SerializedContextInputs { .. }`` literal at the call site; or
+    * it is a reference into a local binding whose own right-hand side is a
+      ``SerializedContextInputs`` literal -- the ordinary shape of a real
+      migrated consumer, which builds the record first and passes ``&inputs``.
+
+    The second form is what makes the proof BOUND rather than nominal: the
+    variable the call passes is followed to the record it was assigned from, in
+    the same masked enclosing-item span, so a call that passes an unrelated
+    ``&something_else``, or passes nothing, or passes a hand-rolled struct of
+    the same field names, satisfies neither arm. The span is producer-masked, so
+    a ``let x = SerializedContextInputs`` appearing only in a comment or a string
+    literal has been blanked out and cannot supply the binding.
+    """
+    normalized = inputs_argument.strip()
+    if re.search(r"\b" + re.escape(PORT_INPUT_RECORD) + r"\b", normalized):
+        return True
+    # ``&inputs`` / ``inputs`` / ``self.inputs`` -- take the trailing path
+    # segment, which is the local binding's name.
+    identifier = re.split(r"[.&\s]", normalized.lstrip("&"))[-1]
+    if not identifier or not identifier.isidentifier():
+        return False
+    # The local must be assigned a ``SerializedContextInputs`` literal in the
+    # same masked span. Match ``let <mut>? <name> ... = SerializedContextInputs``
+    # and require the record type on the right-hand side of that binding.
+    binding = re.compile(
+        r"\blet\s+(?:mut\s+)?" + re.escape(identifier) + r"\b[^=;]*=\s*"
+        + re.escape(PORT_INPUT_RECORD) + r"\b"
+    )
+    return bool(binding.search(span))
+
+
+def _call_payload_argument(masked_line: str) -> str | None:
+    """The masked call's first argument, or None when the port is called bare.
+
+    The canonical port's first parameter is ``payload: &[u8]`` -- the final
+    serialized bytes (``crates/smart/eliot-context-measurement/src/lib.rs:460-463``).
+    A call with no argument, or one whose first argument is empty, binds no bytes
+    and is not evidence of a bound measurement.
+
+    Measured with the SAME top-level-argument splitter as
+    :func:`_call_inputs_argument` (:func:`_call_arguments`), so the payload and the
+    input record can never be split by two different comma rules and disagree
+    about where one argument ends and the next begins.
+    """
+    arguments = _call_arguments(masked_line.splitlines() or [""], len(masked_line.splitlines() or [""]), 1)
+    if not arguments:
+        return None
+    payload = arguments[0].strip()
+    return payload or None
+
+
+def _binding_gaps(entry: Mapping[str, Any]) -> list[str]:
+    """Name the measured bindings a production port call does NOT make.
+
+    Returns the missing conjuncts in a fixed order so a finding is deterministic
+    and a fixture can be rejected for exactly one named reason rather than for
+    whatever happened to be checked first. An empty list means the call is fully
+    bound and may carry the proof.
+    """
+    gaps: list[str] = []
+    if entry.get("payload_argument") is None:
+        gaps.append("a final serialized byte payload argument")
+    elif not entry.get("final_bytes_bound"):
+        gaps.append(
+            f"the envelope length/digest binding "
+            f"({'/'.join(PORT_FINAL_BYTES_BINDING_FIELDS)}) into {PORT_INPUT_RECORD}"
+        )
+    if not entry.get("identity_bound"):
+        gaps.append(
+            f"the serializer/route/tokenizer identity binding "
+            f"({'/'.join(PORT_IDENTITY_BINDING_FIELDS)}) into {PORT_INPUT_RECORD}"
+        )
+    return gaps
+
+
+def _adapter_record(owner: str) -> dict[str, object] | None:
+    """The closed approved-adapter evidence for ``owner``, if any.
+
+    An adapter record counts only when it is CLOSED: an exact identity, an exact
+    version, an exact expiry and the canonical port it implements. A record
+    missing any of those is not evidence, so no adapter can be approved by naming
+    a type or by omitting its boundary.
+    """
+    records = APPROVED_MEASUREMENT_ADAPTERS.get(owner, ())
+    closed = [record for record in records if record.closed()]
+    if len(closed) != len(records):
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"an approved measurement adapter for {owner} is not a closed record "
+            f"(identity/version/expiry/port are all required)",
+        )
+    if not closed:
+        return None
+    return {
+        "identity": closed[0].identity,
+        "version": closed[0].version,
+        "expires": closed[0].expires,
+        "implements_port": closed[0].implements_port,
+    }
+
+
+def _dependency_evidence(root: Path, producer: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Measure each consumer's canonical measurement dependency.
+
+    Every field of the returned evidence is a measured fact about this
+    operation, not the presence or the shape of a name:
+
+    ``cargo_dependencies``
+        per ``path`` -> ``(declared, evidence)`` from that package's own
+        ``Cargo.toml`` dependency tables;
+    ``calls``
+        per ``path`` -> the production call sites of #704's canonical port, with
+        the item and line each was measured at;
+    ``bindings``
+        per ``path`` -> per call site, the measured final-serialized-bytes and
+        identity bindings;
+    ``accepted_sites``
+        per ``path`` -> only the call sites that bind BOTH the payload argument
+        and the envelope identities, i.e. the sites that may carry the proof.
+
+    A consumer is proven only if its Cargo metadata declares #704's crate AND at
+    least one accepted site exists. A comment, a string literal, a similarly
+    named local function, a schema-only import, a test-only call and dead code
+    each fail a specific conjunct and are named by the conjunct they fail.
+    """
     owner_paths: dict[str, set[str]] = {}
     for row in rows:
         if row["write_scope"] != "writable":
@@ -1198,9 +1873,9 @@ def _dependency_evidence(root: Path, producer: Any, rows: list[dict[str, Any]]) 
         if owner == "unresolved":
             continue
         owner_paths.setdefault(owner, set()).add(str(row["path"]))
-    all_paths = sorted({p for paths in owner_paths.values() for p in paths})
+    all_paths = sorted({path for paths in owner_paths.values() for path in paths})
     if not all_paths:
-        return markers_by_owner
+        return {"cargo_dependencies": {}, "calls": {}, "bindings": {}, "accepted_sites": {}}
     try:
         cache = producer._load_files(root, tuple(all_paths))
     except producer.InventoryError as exc:
@@ -1208,15 +1883,57 @@ def _dependency_evidence(root: Path, producer: Any, rows: list[dict[str, Any]]) 
             "SOURCE_UNREADABLE",
             f"a consumer seam could not be loaded for dependency evidence: {exc.code}: {exc.detail}",
         ) from exc
+
+    cargo_dependencies: dict[str, dict[str, Any]] = {}
+    calls: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    bindings: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    accepted_sites: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for owner, paths in owner_paths.items():
-        hits: list[str] = []
-        for rel in sorted(paths):
-            text = "\n".join(cache[rel]["lines"])
-            for marker in CONSUMER_DEPENDENCY_MARKERS.get(owner, ()):  # exact markers
-                if marker in text:
-                    hits.append(f"{rel}:{marker}")
-        markers_by_owner[owner] = sorted(set(hits))
-    return markers_by_owner
+        contract = CONSUMER_DEPENDENCY_CONTRACTS.get(owner)
+        ordered = sorted(paths)
+        owner_cargo: dict[str, Any] = {}
+        owner_calls: dict[str, list[dict[str, Any]]] = {}
+        owner_bindings: dict[str, list[dict[str, Any]]] = {}
+        owner_accepted: dict[str, list[dict[str, Any]]] = {}
+        for rel in ordered:
+            if contract is None or contract.role == "owner":
+                # No closed contract, or the owner of the algorithm crate: the
+                # owner's reach is proved by its single definition site (the
+                # ``canonical-owner`` arm), never by a self-dependency.
+                reason = (
+                    f"owner {owner} has no closed dependency contract"
+                    if contract is None
+                    else f"owner {owner} owns the canonical port; its reach is proved by its "
+                    f"definition site, not by a Cargo dependency on itself"
+                )
+                owner_cargo[rel] = (False, reason)
+                continue
+            declared, cargo_evidence = _cargo_dependency_facts(
+                producer, root, (rel,), contract.cargo_package
+            )
+            owner_cargo[rel] = (declared, cargo_evidence)
+            sites = _port_call_sites(producer, cache[rel], rel, contract.port_symbol)
+            owner_calls[rel] = sites
+            measured = [
+                {"site": site, **_port_call_bindings(producer, cache[rel], rel, site)}
+                for site in sites
+            ]
+            owner_bindings[rel] = measured
+            owner_accepted[rel] = [
+                entry["site"]
+                for entry in measured
+                if entry["final_bytes_bound"] and entry["identity_bound"]
+            ]
+        cargo_dependencies[owner] = owner_cargo
+        calls[owner] = owner_calls
+        bindings[owner] = owner_bindings
+        accepted_sites[owner] = owner_accepted
+    return {
+        "cargo_dependencies": cargo_dependencies,
+        "calls": calls,
+        "bindings": bindings,
+        "accepted_sites": accepted_sites,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1273,6 +1990,7 @@ def evaluate(root: Path) -> OwnershipResult:
             dependency={},
             schema_sites=[],
             owner_sites=[],
+            dependency_proofs={},
             # No rows were read, so no baseline row was reconciled. The tally is
             # an honest all-zero: the artifact is malformed, not a tree whose
             # baseline happens to be empty.
@@ -1588,63 +2306,144 @@ def evaluate(root: Path) -> OwnershipResult:
                 rule="canonical-schema",
             )
 
-    # --- Consumer dependency evidence (canonical use w/o dependency). -----
+    # --- Consumer dependency proof (canonical use w/o bound dependency). ---
     # Owner identity is the *string* owner form the inventory rows carry
     # ("#704"/"#783"/"#878"/"#880"), so the lookup and the evidence map -- both
     # keyed by that same string -- agree. A numeric issue id would silently miss
     # every owner and report a false dependency failure.
     #
-    # The iteration set is EXACTLY ``CONSUMER_DEPENDENCY_MARKERS``'s own keys, in
-    # its own (sorted) order. It is not a hard-coded restatement of the consumer
-    # list and not a superset of it: a closed owner that owns writable seam rows
-    # but has no accepted-adapter entry in that table is a finding in its own
-    # right, reported just below, rather than being quietly skipped here.
+    # The iteration set is EXACTLY ``CONSUMER_DEPENDENCY_CONTRACTS``'s own keys,
+    # in its own (sorted) order. It is not a hard-coded restatement of the
+    # consumer list and not a superset of it: a closed owner that owns writable
+    # seam rows but has no closed contract is a finding in its own right,
+    # reported below, rather than being quietly skipped here.
+    #
+    # A dependency is PROVEN only by the measured conjunction of its Cargo
+    # metadata declaration and at least one accepted production call site. Each
+    # missing conjunct is reported with the exact field that failed, so a
+    # comment, a string literal, a similarly named local function, a schema-only
+    # import, a test-only call and dead code each name themselves.
     dependency = _dependency_evidence(root, producer, rows)
-    for owner in sorted(CONSUMER_DEPENDENCY_MARKERS):
-        accepted = CONSUMER_DEPENDENCY_MARKERS[owner]
-        hits = dependency.get(owner, [])
-        if not hits:
-            add(
-                "MISSING_DEPENDENCY",
-                f"consumer {owner} has no exact canonical-measurement dependency or approved "
-                f"adapter marker in its declared seam source; a migrated consumer reaches "
-                f"measurement only through the {CANONICAL_MEASUREMENT_OWNER} port or an exact "
-                f"approved adapter, never a local ratio",
-                rule="dependency",
-            )
+    proven: dict[str, dict[str, Any]] = {}
+    for owner in sorted(CONSUMER_DEPENDENCY_CONTRACTS):
+        contract = CONSUMER_DEPENDENCY_CONTRACTS[owner]
+        if contract.role == "owner":
+            # #704 owns the algorithm crate. Its reach is measured by the
+            # single-definition-site proof above (``canonical-owner``), so the
+            # dependency conjuncts do not apply to it and a self-dependency is
+            # never demanded.
+            proven[owner] = {
+                "kind": "canonical-port-owner",
+                "port_symbol": contract.port_symbol,
+                "definition_proved_by": "canonical-owner",
+            }
             continue
-        # Every hit must be one of this owner's exact accepted adapters. The hit
-        # list is built by exact literal search over the owner's declared seam
-        # source (``_dependency_evidence``), so an unexpected hit can only mean
-        # the marker table and the evidence collector disagree -- which is a
-        # deterministic internal defect, reported rather than tolerated.
-        unexpected = sorted({hit.rsplit(":", 1)[-1] for hit in hits} - set(accepted))
-        if unexpected:
-            raise OracleError(
-                "DETERMINISTIC_INTERNAL_DEFECT",
-                f"consumer {owner} dependency evidence names {unexpected}, which is outside its "
-                f"exact accepted adapter set {list(accepted)}",
-            )
+        owner_cargo = dependency["cargo_dependencies"].get(owner, {})
+        owner_accepted = dependency["accepted_sites"].get(owner, {})
+        owner_bindings = dependency["bindings"].get(owner, {})
+        declared_any = any(bool(flag) for flag, _why in owner_cargo.values())
+        accepted_any = [site for sites in owner_accepted.values() for site in sites]
+        if not declared_any:
+            undeclared = sorted(rel for rel, (flag, _why) in owner_cargo.items() if not flag)
+            for rel in undeclared:
+                _why = dict(owner_cargo)[rel][1]
+                add(
+                    "MISSING_DEPENDENCY",
+                    f"consumer {owner} declares no Cargo dependency on "
+                    f"{contract.cargo_package!r} for {rel}: {_why}; the exact dependency must "
+                    f"come from authoritative Cargo metadata, not from a Rust-source name",
+                    path=rel,
+                    rule="dependency-cargo",
+                )
+            if not undeclared:
+                add(
+                    "MISSING_DEPENDENCY",
+                    f"consumer {owner} owns no writable seam path, so its Cargo metadata "
+                    f"cannot declare {contract.cargo_package!r} at all",
+                    rule="dependency-cargo",
+                )
+            continue
+        if not accepted_any:
+            # The dependency IS declared in Cargo metadata. The only other way
+            # to be accepted is a CLOSED approved adapter record: an exact
+            # identity, an exact version, an exact expiry and the canonical port
+            # it implements. A record that is absent, or present but not closed,
+            # is not evidence and is named as such.
+            adapter = _adapter_record(owner)
+            if adapter is not None:
+                proven[owner] = {
+                    "kind": "approved-adapter",
+                    "identity": adapter["identity"],
+                    "version": adapter["version"],
+                    "expires": adapter["expires"],
+                    "implements_port": adapter["implements_port"],
+                }
+                continue
+            # The dependency IS declared. What is missing is a bound production
+            # call; the finding names which measured field was absent, and names
+            # every candidate site that was rejected and why, so "dead code",
+            # "test-only" and "unbound final bytes" are distinguishable.
+            for rel in sorted(owner_bindings):
+                for entry in owner_bindings[rel]:
+                    site = entry["site"]
+                    missing = _binding_gaps(entry)
+                    if not missing:
+                        continue
+                    add(
+                        "MISSING_DEPENDENCY",
+                        f"consumer {owner} calls {contract.port_symbol} at "
+                        f"{rel}:{site['span_start']} inside `{site['item']}` but the call does "
+                        f"not bind {', '.join(missing)}; a measurement proof is bound to the "
+                        f"final serialized bytes and the route/tokenizer identity, not to the "
+                        f"existence of a call",
+                        path=rel,
+                        span_start=int(site["span_start"]),
+                        span_end=int(site["span_end"]),
+                        rule="dependency-binding",
+                    )
+            if not any(owner_bindings.values()):
+                add(
+                    "MISSING_DEPENDENCY",
+                    f"consumer {owner} declares {contract.cargo_package!r} but has no production "
+                    f"call to {contract.port_symbol!r} in its declared writable seam and no "
+                    f"closed approved adapter record; a comment, a string literal, a similarly "
+                    f"named local function, a schema-only import, a test-only call and dead code "
+                    f"are all not a measurement dependency",
+                    rule="dependency-call",
+                )
+            continue
+        # Proven by a real, bound production call. The accepted sites travel in
+        # the immutable result so the proof is auditable rather than an unstated
+        # pass; see :data:`OwnershipResult.dependency_proofs`.
+        proven[owner] = {
+            "kind": "canonical-port-call",
+            "cargo_dependency": sorted(
+                rel for rel, (flag, _why) in owner_cargo.items() if flag
+            ),
+            "port_symbol": contract.port_symbol,
+            "call_sites": [
+                f"{site['path']}:{site['span_start']}" for site in accepted_any
+            ],
+        }
 
-    # --- Every closed owner that owns writable seam rows must HAVE an exact
-    # accepted-adapter entry, or its dependency check above could never have
-    # run.
+    # --- Every closed owner that owns writable seam rows must HAVE a closed
+    # dependency contract, or its dependency check above could never have run.
     #
     # A consumer present in the inventory's own rows but absent from
-    # ``CONSUMER_DEPENDENCY_MARKERS`` has no declared accepted adapter at all. It
-    # is reported, never skipped: an owner with no accepted adapter set is an
+    # ``CONSUMER_DEPENDENCY_CONTRACTS`` has no declared accepted dependency at
+    # all. It is reported, never skipped: an owner with no closed contract is an
     # owner whose measurement reach is unconstrained.
     seam_owners = {
         str(row["owner"])
         for row in rows
         if row["write_scope"] == "writable" and str(row["owner"]) != "unresolved"
     }
-    for owner in sorted(seam_owners - set(CONSUMER_DEPENDENCY_MARKERS)):
+    for owner in sorted(seam_owners - set(CONSUMER_DEPENDENCY_CONTRACTS)):
         add(
             "MISSING_DEPENDENCY",
-            f"consumer {owner} owns writable seam rows but has no entry in the exact accepted "
-            f"adapter set, so no reference in its source could satisfy or fail the "
-            f"canonical-measurement dependency check",
+            f"consumer {owner} owns writable seam rows but has no entry in the exact closed "
+            f"dependency contract set, so no Cargo dependency and no call in its source could "
+            f"satisfy or fail the canonical-measurement dependency check",
             rule="dependency",
         )
 
@@ -1717,6 +2516,7 @@ def evaluate(root: Path) -> OwnershipResult:
         dependency=dependency,
         schema_sites=schema_sites,
         owner_sites=owner_sites,
+        dependency_proofs=proven,
         baseline_dispositions=_baseline_findings(rows, by_case, add),
     )
 
@@ -2036,10 +2836,11 @@ def _finalize(
     candidates: list[dict[str, Any]],
     check_status: str,
     unaccounted: list[dict[str, Any]],
-    dependency: dict[str, list[str]],
+    dependency: dict[str, Any],
     schema_sites: list[dict[str, Any]],
     owner_sites: list[dict[str, Any]],
     baseline_dispositions: dict[str, int],
+    dependency_proofs: dict[str, dict[str, Any]] | None = None,
 ) -> OwnershipResult:
     """Assemble the single immutable result, computing its digest over the
     full body (which excludes the digest itself)."""
@@ -2110,6 +2911,10 @@ def _finalize(
         unaccounted_candidate_count=len(unaccounted),
         canonical_measurement_owners=tuple(sorted({s["path"] for s in owner_sites})),
         canonical_schema_owners=tuple(sorted({s["path"] for s in schema_sites})),
+        dependency_proofs={
+            owner: dict(sorted(proof.items()))
+            for owner, proof in sorted((dependency_proofs or {}).items())
+        },
         producer_check_status=check_status,
         finding_count=len(ordered),
         findings=ordered,
@@ -2158,6 +2963,25 @@ def render_text(result: OwnershipResult) -> str:
     lines.append(f"  unaccounted          = {result.unaccounted_candidate_count}")
     lines.append(f"  measurement_owners   = {list(result.canonical_measurement_owners)}")
     lines.append(f"  schema_owners        = {list(result.canonical_schema_owners)}")
+    for owner in sorted(result.dependency_proofs):
+        proof = result.dependency_proofs[owner]
+        kind = str(proof.get("kind"))
+        if kind == "approved-adapter":
+            lines.append(
+                f"  dependency[{owner}]   = approved-adapter "
+                f"{proof.get('identity')}@{proof.get('version')} "
+                f"expires={proof.get('expires')} port={proof.get('implements_port')}"
+            )
+        elif kind == "canonical-port-owner":
+            lines.append(
+                f"  dependency[{owner}]   = canonical-port-owner "
+                f"{proof.get('port_symbol')} proved by {proof.get('definition_proved_by')}"
+            )
+        else:
+            lines.append(
+                f"  dependency[{owner}]   = {kind} "
+                f"{proof.get('port_symbol')} at {proof.get('call_sites')}"
+            )
     lines.append(f"  findings             = {result.finding_count}")
     for finding in result.findings:
         lines.append(f"    {finding.locator()}")
@@ -2270,6 +3094,14 @@ def run_self_test() -> int:
         unaccounted_candidate_count=2,
         canonical_measurement_owners=("crates/smart/eliot-context-measurement/src/stu.rs",),
         canonical_schema_owners=(CANONICAL_SCHEMA_PATH,),
+        dependency_proofs={
+            "#783": {
+                "kind": "canonical-port-call",
+                "cargo_dependency": ["crates/eliot-app/src/mcp_stdio.rs"],
+                "port_symbol": CANONICAL_MEASUREMENT_PORT,
+                "call_sites": ["crates/eliot-app/src/mcp_stdio.rs:10"],
+            }
+        },
         producer_check_status="blocked",
         finding_count=1,
         findings=(Finding("INVENTORY_STALE", "stale", case_ref="704/1", path="a.rs", rule="r"),),
@@ -2289,8 +3121,71 @@ def run_self_test() -> int:
     assert render_json(sealed) == render_json(sealed)
     assert render_text(sealed) == render_text(sealed)
 
-    # STU accounting is deterministic and mirrors the declared I2.16 rule.
+# STU accounting is deterministic and mirrors the declared I2.16 rule.
     assert _stu(0) == 0 and _stu(1) == 1 and _stu(3) == 1 and _stu(4) == 2
+
+    # --- Dependency-proof invariants (defect 4). --------------------------
+    #
+    # #584's schema crate is NEVER a measurement dependency: a consumer that
+    # only imports ``eliot_context_contracts`` names a type, not an algorithm.
+    # This is the closed structural fact the audit names, asserted here so a
+    # later edit that re-admits the schema crate fails loudly instead of
+    # restoring the forgeable marker disjunction.
+    assert MEASUREMENT_CRATE_PACKAGE == "eliot-context-measurement"
+    assert MEASUREMENT_CRATE_RUST == MEASUREMENT_CRATE_PACKAGE.replace("-", "_")
+    assert set(CONSUMER_DEPENDENCY_CONTRACTS) == {"#783", "#878", "#880", CANONICAL_MEASUREMENT_OWNER}
+    for _owner, _contract in CONSUMER_DEPENDENCY_CONTRACTS.items():
+        assert _contract.cargo_package == MEASUREMENT_CRATE_PACKAGE, (
+            "every consumer contract must name #704's own measurement crate in its Cargo "
+            "metadata; the #584 schema crate is not a measurement dependency"
+        )
+        assert _contract.port_symbol == CANONICAL_MEASUREMENT_PORT
+        assert _contract.role in ("consumer", "owner")
+    # Exactly one owner-role contract, and it is the canonical measurement owner:
+    # the algorithm owner is proved by its definition site, never by depending on
+    # the crate it is.
+    assert CONSUMER_DEPENDENCY_CONTRACTS[CANONICAL_MEASUREMENT_OWNER].role == "owner"
+    assert all(
+        _contract.role == "consumer"
+        for _owner, _contract in CONSUMER_DEPENDENCY_CONTRACTS.items()
+        if _owner != CANONICAL_MEASUREMENT_OWNER
+    ), "only the canonical measurement owner may hold the owner role"
+    # Every approved adapter record is closed, and an empty approved set is an
+    # honest empty rather than a widened accept.
+    for _owner, _records in APPROVED_MEASUREMENT_ADAPTERS.items():
+        assert all(record.closed() for record in _records), (
+            "an approved measurement adapter record must carry an exact identity, version, "
+            "expiry and canonical port"
+        )
+    # Every approved adapter must implement the canonical port; an adapter that
+    # implements something else is not measurement evidence.
+    for _records in APPROVED_MEASUREMENT_ADAPTERS.values():
+        for _record in _records:
+            assert _record.implements_port == CANONICAL_MEASUREMENT_PORT
+
+    # The binding vocabulary is closed and non-empty on both sides.
+    assert PORT_INPUT_RECORD == "SerializedContextInputs"
+    assert PORT_FINAL_BYTES_BINDING_FIELDS == ("declared_len", "content_digest")
+    assert set(PORT_IDENTITY_BINDING_FIELDS) == {"serializer", "route", "tokenizer"}
+
+    # The binding-gap report is deterministic and names only missing conjuncts.
+    _full = {
+        "payload_argument": "&request.payload",
+        "final_bytes_bound": True,
+        "identity_bound": True,
+    }
+    assert _binding_gaps(_full) == [], "a fully bound call has no gap to report"
+    assert _binding_gaps({**_full, "final_bytes_bound": False}) == [
+        f"the envelope length/digest binding ({'/'.join(PORT_FINAL_BYTES_BINDING_FIELDS)}) "
+        f"into {PORT_INPUT_RECORD}"
+    ]
+    assert _binding_gaps({**_full, "identity_bound": False}) == [
+        f"the serializer/route/tokenizer identity binding "
+        f"({'/'.join(PORT_IDENTITY_BINDING_FIELDS)}) into {PORT_INPUT_RECORD}"
+    ]
+    assert _binding_gaps({**_full, "payload_argument": None}) == [
+        "a final serialized byte payload argument"
+    ]
 
     print("PASS: audit_context_measurement_ownership self-tests completed successfully")
     return 0
@@ -2342,6 +3237,7 @@ def main(argv: list[str] | None = None) -> int:
             unaccounted_candidate_count=0,
             canonical_measurement_owners=(),
             canonical_schema_owners=(),
+            dependency_proofs={},
             producer_check_status="error",
             finding_count=1,
             findings=(Finding(exc.code, exc.detail, rule="evaluation"),),
