@@ -367,6 +367,38 @@ fn model_selection() -> Result<ModelSelection, CliError> {
         .map_err(|error| CliError::Model(sanitize_error(&error.to_string(), "")))
 }
 
+/// Reads the operator-supplied server credential and builds the `BasicAuth`
+/// every form shares.
+///
+/// The password is required and must be non-empty; the username defaults to
+/// `opencode` when the operator supplied none. The password is returned beside
+/// the auth value because every diagnostic path below redacts it.
+fn server_basic_auth() -> Result<(String, BasicAuth), CliError> {
+    let password = std::env::var("OPENCODE_SERVER_PASSWORD")
+        .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
+    if password.is_empty() {
+        return Err(CliError::Environment("OPENCODE_SERVER_PASSWORD"));
+    }
+    let username = match std::env::var("OPENCODE_SERVER_USERNAME") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "opencode".to_owned(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(CliError::InvalidArgument(
+                "OPENCODE_SERVER_USERNAME must be valid UTF-8",
+            ));
+        }
+    };
+    let auth = BasicAuth::new(username, SecretString::from(password.clone()))
+        .map_err(|error| CliError::Authentication(sanitize_error(&error.to_string(), &password)))?;
+    Ok((password, auth))
+}
+
+/// Parses the loopback endpoint every form targets.
+fn loopback_endpoint(raw: &str, password: &str) -> Result<LoopbackEndpoint, CliError> {
+    raw.parse::<LoopbackEndpoint>()
+        .map_err(|error| CliError::Endpoint(sanitize_error(&error.to_string(), password)))
+}
+
 /// `RGF-AGENT-ROUTES` route-selection gate (issue #1835), run before the
 /// underlying call and beside the bridge-contract gate.
 ///
@@ -412,26 +444,8 @@ fn gate_bridge_contract(route: &RouteFingerprint, password: &str) -> Result<(), 
 /// controlled task, the sixth probe (equal-stack fallback comparison) is
 /// measured from the pair; without it, the sixth probe stays `FAILED`.
 async fn run_pilot(args: PilotCliArgs) -> Result<(), CliError> {
-    let password = std::env::var("OPENCODE_SERVER_PASSWORD")
-        .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
-    if password.is_empty() {
-        return Err(CliError::Environment("OPENCODE_SERVER_PASSWORD"));
-    }
-    let username = match std::env::var("OPENCODE_SERVER_USERNAME") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "opencode".to_owned(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CliError::InvalidArgument(
-                "OPENCODE_SERVER_USERNAME must be valid UTF-8",
-            ));
-        }
-    };
-    let endpoint = args
-        .endpoint
-        .parse::<LoopbackEndpoint>()
-        .map_err(|error| CliError::Endpoint(sanitize_error(&error.to_string(), &password)))?;
-    let auth = BasicAuth::new(username, SecretString::from(password.clone()))
-        .map_err(|error| CliError::Authentication(sanitize_error(&error.to_string(), &password)))?;
+    let (password, auth) = server_basic_auth()?;
+    let endpoint = loopback_endpoint(&args.endpoint, &password)?;
     let prompt = read_prompt(&args.prompt_file)?;
     let model = model_selection()?;
     let request = ReadOnlyRunRequest::new(prompt, model)
@@ -465,46 +479,32 @@ async fn run_pilot(args: PilotCliArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
-    let password = std::env::var("OPENCODE_SERVER_PASSWORD")
-        .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
-    if password.is_empty() {
-        return Err(CliError::Environment("OPENCODE_SERVER_PASSWORD"));
-    }
-    let username = match std::env::var("OPENCODE_SERVER_USERNAME") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "opencode".to_owned(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CliError::InvalidArgument(
-                "OPENCODE_SERVER_USERNAME must be valid UTF-8",
-            ));
-        }
-    };
-    let endpoint = args
-        .endpoint
-        .parse::<LoopbackEndpoint>()
-        .map_err(|error| CliError::Endpoint(sanitize_error(&error.to_string(), &password)))?;
-    let auth = BasicAuth::new(username, SecretString::from(password.clone()))
-        .map_err(|error| CliError::Authentication(sanitize_error(&error.to_string(), &password)))?;
-    let prompt = read_prompt(&args.prompt_file)?;
-    let envelope = read_envelope(&args.envelope_file)?;
-    let model = model_selection()?;
-    let request = ReadOnlyRunRequest::new(prompt, model.clone())
-        .map_err(|error| CliError::Request(sanitize_error(&error.to_string(), &password)))?;
-    let mut policy = OpenCodeRunPolicy::new(args.directory)
-        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
+/// Reads the optional operator-supplied executable fingerprint for the
+/// admitted policy. `Ok(None)` means the variable is absent, so the policy is
+/// left exactly as constructed. A present-but-blank value and a non-unicode
+/// value are both refused with the same `Environment` variant: neither
+/// silently downgrades to an unverified executable.
+fn executable_fingerprint_from_environment() -> Result<Option<String>, CliError> {
     match std::env::var("ELIOT_OPENCODE_EXECUTABLE_FP") {
         Ok(fingerprint) => {
             if fingerprint.trim().is_empty() {
                 return Err(CliError::Environment("ELIOT_OPENCODE_EXECUTABLE_FP"));
             }
-            policy = policy.with_executable_fingerprint(fingerprint);
+            Ok(Some(fingerprint))
         }
-        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CliError::Environment("ELIOT_OPENCODE_EXECUTABLE_FP"));
+            Err(CliError::Environment("ELIOT_OPENCODE_EXECUTABLE_FP"))
         }
     }
+}
+
+/// Reads the optional operator-supplied environment allowlist for the
+/// admitted policy, using the same absence and refusal semantics as the
+/// executable fingerprint reader. Empty comma segments are dropped, and an
+/// allowlist that carries no surviving entry is refused rather than applied
+/// empty.
+fn environment_allowlist_from_environment() -> Result<Option<Vec<String>>, CliError> {
     match std::env::var("ELIOT_OPENCODE_ENV_ALLOWLIST") {
         Ok(allowlist) => {
             if allowlist.trim().is_empty() {
@@ -519,12 +519,30 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
             if entries.is_empty() {
                 return Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"));
             }
-            policy = policy.with_environment_allowlist(entries);
+            Ok(Some(entries))
         }
-        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"));
+            Err(CliError::Environment("ELIOT_OPENCODE_ENV_ALLOWLIST"))
         }
+    }
+}
+
+async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
+    let (password, auth) = server_basic_auth()?;
+    let endpoint = loopback_endpoint(&args.endpoint, &password)?;
+    let prompt = read_prompt(&args.prompt_file)?;
+    let envelope = read_envelope(&args.envelope_file)?;
+    let model = model_selection()?;
+    let request = ReadOnlyRunRequest::new(prompt, model.clone())
+        .map_err(|error| CliError::Request(sanitize_error(&error.to_string(), &password)))?;
+    let mut policy = OpenCodeRunPolicy::new(args.directory)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
+    if let Some(fingerprint) = executable_fingerprint_from_environment()? {
+        policy = policy.with_executable_fingerprint(fingerprint);
+    }
+    if let Some(entries) = environment_allowlist_from_environment()? {
+        policy = policy.with_environment_allowlist(entries);
     }
     let client = OpenCodeClient::new(endpoint, auth, policy)
         .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), &password)))?;
@@ -648,26 +666,8 @@ async fn run() -> Result<(), CliError> {
         return run_pilot(args).await;
     }
     let args = parse_args(&raw_args)?;
-    let password = std::env::var("OPENCODE_SERVER_PASSWORD")
-        .map_err(|_| CliError::Environment("OPENCODE_SERVER_PASSWORD"))?;
-    if password.is_empty() {
-        return Err(CliError::Environment("OPENCODE_SERVER_PASSWORD"));
-    }
-    let username = match std::env::var("OPENCODE_SERVER_USERNAME") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "opencode".to_owned(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(CliError::InvalidArgument(
-                "OPENCODE_SERVER_USERNAME must be valid UTF-8",
-            ));
-        }
-    };
-    let endpoint = args
-        .endpoint
-        .parse::<LoopbackEndpoint>()
-        .map_err(|error| CliError::Endpoint(sanitize_error(&error.to_string(), &password)))?;
-    let auth = BasicAuth::new(username, SecretString::from(password.clone()))
-        .map_err(|error| CliError::Authentication(sanitize_error(&error.to_string(), &password)))?;
+    let (password, auth) = server_basic_auth()?;
+    let endpoint = loopback_endpoint(&args.endpoint, &password)?;
     let prompt = read_prompt(&args.prompt_file)?;
     let model = model_selection()?;
     let request = ReadOnlyRunRequest::new(prompt, model)

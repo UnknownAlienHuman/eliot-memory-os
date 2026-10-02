@@ -11,7 +11,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ArtifactId, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, SessionId, SourceId,
-    StateFence, TaskId,
+    StateFence, TaskId, TaskRevision,
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_projection_contracts::{
@@ -59,13 +59,32 @@ fn fence_other() -> StateFence {
     )
 }
 
-fn binding() -> MemoryScopeBinding {
+/// A fence on the same epoch and generation as [`fence`] that additionally
+/// carries a task revision.
+///
+/// `StateFence::is_compatible_with` treats an absent optional revision on
+/// either side as a match, so `fence()` and this fence are mutually
+/// compatible while comparing unequal. That makes them the one honest way to
+/// build a compatible-but-distinct fence pair in this fixture family;
+/// `fence_other` differs in epoch sequence and is therefore incompatible.
+fn fence_with_task_revision() -> StateFence {
+    StateFence {
+        task_revision: Some(TaskRevision::new(1).expect("fixture revision")),
+        ..fence()
+    }
+}
+
+fn binding_at(state_fence: StateFence) -> MemoryScopeBinding {
     MemoryScopeBinding {
         task_id: task(),
         scope_id: scope(),
         session_id: Some(session()),
-        state_fence: fence(),
+        state_fence,
     }
+}
+
+fn binding() -> MemoryScopeBinding {
+    binding_at(fence())
 }
 
 fn provenance() -> Provenance {
@@ -143,6 +162,55 @@ fn record_fence_mismatch_fails_closed() {
 }
 
 #[test]
+fn a_compatible_projection_fence_is_admitted_when_the_declared_binding_matches() {
+    // The positive half of the scope/fence rule, and the reason the rule stops
+    // where it does: a record projected at an older-but-compatible fence is a
+    // legitimate read observation and stays admissible. What must equal the
+    // batch is the binding the record DECLARES, not the fence it was read
+    // under. Tightening this into `record.state_fence ==
+    // batch.binding.state_fence` would reject every record read before the
+    // batch's own fence, which is the normal case the relaxation exists for.
+    let mut candidate = batch();
+    candidate.binding = binding_at(fence_with_task_revision());
+    for record in &mut candidate.records {
+        record.binding = candidate.binding.clone();
+        // Compatible with the batch fence, and unequal to it.
+        record.state_fence = fence();
+    }
+    candidate
+        .validate()
+        .expect("a compatible projection fence with an equal declared binding passes");
+}
+
+#[test]
+fn a_record_declaring_another_scope_fence_is_refused_even_when_compatible() {
+    // The wrong-scope record the batch previously admitted: task, scope and
+    // session all match, and the record's own projection fence is compatible
+    // with the batch fence, so both pre-existing checks pass. Only the
+    // declared binding fence differs, which means the record asserts it was
+    // projected under a different scope while reading as if it were this one.
+    // A digest computed over this batch would then cover a record from
+    // outside the scope it claims.
+    let mut candidate = batch();
+    candidate.binding = binding_at(fence_with_task_revision());
+    for record in &mut candidate.records {
+        // Declares the other scope; its own projection fence stays compatible,
+        // so only the declared binding gives the record away.
+        record.binding = binding_at(fence());
+    }
+    let error = candidate
+        .validate()
+        .expect_err("a record declaring another scope fence must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+            left: "record.binding.state_fence",
+            right: "batch.binding.state_fence",
+        }
+    ));
+}
+
+#[test]
 fn record_scope_mismatch_fails_closed() {
     let mut candidate = batch();
     candidate.records[0].binding.task_id = TaskId::new("task-other").expect("fixture task");
@@ -184,9 +252,126 @@ fn unknown_denominator_stays_representable() {
     candidate.coverage.denominator = DenominatorState::Unknown {
         reason: "read side could not count".to_owned(),
     };
+    // The positive half of the unknown-denominator rule, and the reason the
+    // rule is a ceiling rather than a refusal: the state remains expressible.
+    // What it may not do is travel beside a closed revalidation claim, because
+    // that is the one combination that reads as a complete read nobody can
+    // prove is complete.
+    candidate.coverage.revalidation_required = true;
     candidate
         .validate()
         .expect("unknown denominator is explicit, not invalid");
+}
+
+#[test]
+fn an_unknown_denominator_may_not_close_revalidation() {
+    // The same batch as `unknown_denominator_stays_representable` with the
+    // revalidation flag dropped. Nothing is truncated and nothing is omitted,
+    // so the previous rule had no term to fire on, and the batch passed while
+    // asserting both that it could not count its observed population and that
+    // the consumer therefore had nothing to revalidate. That is the frozen
+    // `ProjectionCoverage` note read backwards: "Unknown stays representable
+    // but no consumer may read it as completeness." Substituting the returned
+    // record count for the missing denominator would be the same claim with a
+    // number attached, which is why the fix requires the ceiling instead.
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Unknown {
+        reason: "read side could not count".to_owned(),
+    };
+    let error = candidate
+        .validate()
+        .expect_err("an unprovable denominator cannot claim no revalidation");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch {
+            reason: "an unknown denominator requires revalidation",
+        }
+    ));
+}
+
+#[test]
+fn unaccounted_known_remainder_is_refused() {
+    // The control-flow counterexample: an empty batch that declares one
+    // observed record, projects none of it, omits none, defers none, and
+    // claims no truncation. Unclaimed completeness, refused at the owner.
+    let mut candidate = batch();
+    candidate.records.clear();
+    candidate.coverage = coverage_known(1);
+    let error = candidate
+        .validate()
+        .expect_err("an unaccounted known remainder must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn duplicate_omission_identities_are_refused() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 4 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions = vec![
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "fence-mismatch".to_owned(),
+        },
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "scope-mismatch".to_owned(),
+        },
+    ];
+    let error = candidate
+        .validate()
+        .expect_err("one observed record cannot be omitted twice");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate {
+            field: "coverage.omissions",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn projected_and_omitted_identities_cannot_overlap() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions = vec![CoverageOmission {
+        handle: aid("mem-1"),
+        reason: "fence-mismatch".to_owned(),
+    }];
+    let error = candidate
+        .validate()
+        .expect_err("one observed record cannot be both returned and lost");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate {
+            field: "coverage.omissions",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_truncated_batch_retains_its_exact_remainder() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.truncated = true;
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.frontier = vec!["mem-3".to_owned()];
+    candidate
+        .validate()
+        .expect("one deferred identity with truncation is exact");
+    // Claiming truncation while returning nothing deferred is unclaimed
+    // volume rather than a truncation.
+    let mut unbacked = candidate.clone();
+    unbacked.coverage.frontier.clear();
+    assert!(matches!(
+        unbacked.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
 }
 
 #[test]

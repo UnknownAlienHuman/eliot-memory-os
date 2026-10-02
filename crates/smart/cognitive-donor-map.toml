@@ -219,3 +219,97 @@ targets = ["A-05", "A-21", "A-22", "A-23", "A-24", "A-25", "A-26", "A-27", "A-28
 owner_issue_refs = [595]
 evidence = "current module manifest and A-31 contract boundary"
 uncertainty = "metadata records inherited validation only; it does not certify a new handler result"
+
+
+# ---------------------------------------------------------------------------
+# #261 r11 donor notes for the three families whose field contract was completed
+# at r11. These are NOT new donors and NOT new dispositions: no package is
+# donated, reused or retired by this work unit, and no package is recreated
+# because of an old planning entry.
+#
+# They are recorded because the C1 card requires that a reuse decision name one
+# current causal owner, and because the honest answer for one of the three
+# families is that no donor was needed at all: the owner crate already existed
+# and already declared the type. Reuse across an owner boundary was available in
+# each case and was declined, and saying so is the useful part.
+# ---------------------------------------------------------------------------
+[[contract_donor_note]]
+issue = 261
+family = "eliot-memory-projection-contracts-selection"
+donor_considered = "none required; the owner crate crates/foundation/eliot-memory-projection-contracts already declares all six selection types"
+current_causal_owner = "eliot-memory-projection-contracts"
+reuse_decision = "REUSE_EXISTING_OWNER_NO_NEW_DONOR"
+rejected_overgeneralization = "The Governor projection intake port ProjectionRequest is NOT this consumer request shape and must not be reused as one. That is the same distinction the freeze records for MemoryContextProjectionRequest, which stays NOT_FROZEN with no owner."
+uncertainty = "The contract has zero consumers, so no reuse has been exercised at a real seam. Adoption is the open question, not ownership."
+rust_change_needed = false
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-observation-contracts-failure"
+donor_considered = "the Governor observation owner at crates/governor/eliot-observation, which produces the journal records this shape projects"
+current_causal_owner = "eliot-observation-contracts for the projection schema; the Governor remains the owner of the records themselves"
+reuse_decision = "REUSE_BY_HANDLE_ONLY"
+rejected_overgeneralization = "The Governor journal records are cited BY HANDLE and never copied. Promoting a Governor-owned record into an owner-neutral projection was available and was declined: it would have imported the record across the owner boundary and made a pre-binding row readable as evidence. The same reasoning rejected the surface DTO at crates/surfaces/eliot-mcp/src/contract.rs, which has no denominator, fence, scope or omission semantics at all."
+uncertainty = "The Governor owner admits and rebuilds live; this projection only reads by handle. Record-level fence recovery stays a live-owner capability and is not available on this path."
+rust_change_needed = false
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-epistemic-contracts-contribution"
+donor_considered = "the Smart-side provider envelope at crates/smart/eliot-epistemic-context-provider, which wraps the owner contribution"
+current_causal_owner = "eliot-epistemic-contracts for the envelope; eliot-epistemic at crate-decisions order 2 for resolving the position the envelope carries"
+reuse_decision = "REUSE_EXISTING_OWNER_AND_KEEP_THE_ADAPTER_THIN"
+rejected_overgeneralization = "A parallel provider-specific contribution shape duplicating ProviderContribution under a new name was available and was declined. The context-provider row is a thin adapter that adds a provider id and nothing else; making it a second contract would create two contribution schemas for one admission event, which the rejected-rows table already forbids."
+uncertainty = "The adapter is registered as PROTOTYPE_PENDING_REGISTRATION in the freeze lane_prototype table and builds independently. It is not a W9 unblock and its registration is not claimed here."
+rust_change_needed = false
+
+# ---------------------------------------------------------------------------
+# #261 r12 donor notes for the four families that had NO field-contract row
+# before r12. These are NOT new donors and NOT new dispositions: no package is
+# donated, reused or retired by this work unit, and no package is recreated
+# because of an old planning entry.
+#
+# The useful part of each note is the rejected overgeneralization, because in
+# all four cases a reuse WAS available across an owner boundary and was
+# declined, and saying so is the part a later reader needs.
+# ---------------------------------------------------------------------------
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-observation-governor-classification"
+donor_considered = "none required; the owner crate crates/governor/eliot-observation already declares the whole admission family and its private classifier"
+current_causal_owner = "eliot-observation for admission, classification and the rebuildable journal; the foundation crates own the shape of the observation, coverage and evidence records it projects"
+reuse_decision = "REUSE_BY_IMPORT_NO_NEW_DONOR"
+rejected_overgeneralization = "The Governor bank and feedback admission lane in bank_admission.rs was available as a donor for the classification family and was declined: it is a separate admitted lane with its own owner functions and its own ledger semantics, and folding it into this contract would merge two admission paths the crate deliberately keeps apart. The reverse was equally declined -- promoting a Governor-owned journal record into an owner-neutral projection would import the record across the owner boundary and make a pre-binding row readable as evidence."
+uncertainty = "The cell's own manifest still records status = PROTOTYPE and workspace admission as forbidden pending implementation, package proof, edge proof, a current-main rebase and integration-owner review. Freezing its field contract does not change that package state and this row does not claim otherwise."
+rust_change_needed = false
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-dreamer-contracts-self-query-source"
+donor_considered = "the architecture and implementation brief projectors, crates/smart/eliot-dreamer-architecture-brief and crates/smart/eliot-dreamer-implementation-brief, which consume the same source closure"
+current_causal_owner = "eliot-dreamer-contracts for the source, anchor and denominator schemas; eliot-dreamer-self-query for the projector that consumes them"
+reuse_decision = "REUSE_EXISTING_OWNER_AND_KEEP_BRIEFS_DOWNSTREAM"
+rejected_overgeneralization = "Authority-separated outputs of one self-query job -- ArchitectureBrief and ImplementationBrief -- were available as a donor shape for a source-closure contract and were declined. They are OUTPUTS of the projector, not inputs to it, and reusing them in the other direction would invert the dependency and make the contract depend on its own consumer. A parallel brief-local copy of the anchor or denominator schema was equally available and declined: it would create a second owner for a shape the crate already owns once."
+uncertainty = "The projector builds independently and is not a W9 unblock; its registration is not claimed here. The crate's remaining job families are outside this contract and are named as out of scope rather than assumed."
+rust_change_needed = false
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-context-contracts-binding-view-omission"
+donor_considered = "the W8 context contributions and the memory-projection contracts, which this crate already depends on"
+current_causal_owner = "eliot-context-contracts for the binding, view and omission schemas; the Governor remains the owner of the negative-memory triggers the safety projection copies verbatim"
+reuse_decision = "REUSE_EXISTING_OWNER_AND_IMPORT_BY_HANDLE"
+rejected_overgeneralization = "A context-local omission record was available as a donor shape from the reactive path and was declined: the reactive types are a DIFFERENT path whose own pre-existing note says they must not be implemented by these packages, and importing a reactive omission shape into the canonical view would give the canonical completeness accounting two incompatible omission axes. The memory-projection denominator was likewise available and declined for the same reason the cue family declines a copy of it: it counts a different population, and reusing it here would make the view's omission claim a claim about someone else's records."
+uncertainty = "The view is assembled by projection only and never performs membership selection, so its selection-integrity proof depends on the admitted set it is validated AGAINST. A reader implementing the view needs AdmittedContextSet and ContextCandidateSet definitions even though r12 does not freeze their fields, and that dependency is named in the freeze coverage_accounting row."
+rust_change_needed = false
+
+[[contract_donor_note]]
+issue = 261
+family = "eliot-learning-contracts-binding-denominator"
+donor_considered = "the foundation System Experience and observation contracts this crate already depends on"
+current_causal_owner = "eliot-learning-contracts for the binding and denominator; the foundation crates own the identities the binding cites"
+reuse_decision = "REUSE_BY_IDENTITY_IMPORT_ONLY"
+rejected_overgeneralization = "A foundation-side denominator over the same population was available as a donor and was declined. The learning denominator counts SLOTS OR MEMBERS DECLARED BY THE RECIPE against those observed in one projection, and a foundation denominator counts a different population over a different fence; reusing it would make observed <= declared a comparison of two unrelated counts, which is arithmetically satisfiable while proving nothing. A shared cross-crate denominator type was equally available and declined as a second owner for a concept that is this crate's own."
+uncertainty = "The denominator is declared-versus-observed and carries NO omission list: the per-slot omission information lives in SlotDisposition, which r12 does not freeze. A reader implementing the state view needs SlotDisposition and SlotSpec, and that dependency is recorded rather than left implicit."
+rust_change_needed = false

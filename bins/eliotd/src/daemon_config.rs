@@ -27,6 +27,13 @@ const INSTALLATION_CONFIG_RELATIVE: &str = r"Eliot\config\installation.toml";
 /// I3.9 System Owner policy file, relative to the protected `ProgramData` root.
 const SYSTEM_OWNER_POLICY_RELATIVE: &str = r"Eliot\config\policy.toml";
 
+/// Human model-preference store file name (issue #485, audit 5872395796).
+///
+/// The single `redb` file the settings owner (`eliot-host-state`) publishes
+/// under the daemon protected state root. The file itself is minted by the
+/// first committed publication; only the name is configured here, never bytes.
+pub(crate) const MODEL_PREFERENCE_STORE_FILE_NAME: &str = "model-preferences.redb";
+
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()
         .map_err(|error| DaemonError::Kernel(format!("observe LocalService identity: {error}")))?;
@@ -345,6 +352,19 @@ impl DaemonConfig {
     #[must_use]
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Returns the absolute configured Human model-preference store path
+    /// (issue #485, audit 5872395796 step 2).
+    ///
+    /// Under the existing settings owner: the protected daemon state root this
+    /// boundary derived from the Host-approved launch config path. The path is
+    /// absolute whenever the state root is, and no second store, provider
+    /// state, or caller-supplied directory is involved: the daemon execution
+    /// intake hands exactly this path to the submit leg.
+    #[must_use]
+    pub fn model_preference_store_path(&self) -> PathBuf {
+        self.state_root.join(MODEL_PREFERENCE_STORE_FILE_NAME)
     }
 }
 

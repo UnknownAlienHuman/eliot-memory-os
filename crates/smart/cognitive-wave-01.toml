@@ -625,3 +625,177 @@ module_id = "smart.dreamer.curation"
 manifest = "crates/smart/eliot-dreamer-curation/module.toml"
 role = "screened_exact_one_handler_fan_in"
 kind = "curation_stage"
+
+
+# ---------------------------------------------------------------------------
+# #261 r11 W0 handoff notes for the three families whose field contract was
+# completed at r11. These are NOT new [[assignment]] rows and NOT new agents:
+# this wave assigns orders 1-31 and the three families below are NOT among them.
+# They belong to the foundation projection, foundation observation and
+# foundation epistemic seams, which are decided in their own waves.
+#
+# What r11 does here is make the W0 handoff legible: a reader of this wave can
+# see which existing crate owns each family, what the field contract now states,
+# and who the first consumer actually is. One of the three has NO consumer, and
+# that is recorded as an empty value with an owner rather than filled in.
+#
+# No write_scope is widened, no package_action changes, and no product pulse is
+# created. The proof ceiling of this wave is unchanged.
+# ---------------------------------------------------------------------------
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-memory-projection-contracts-selection"
+owning_crate = "eliot-memory-projection-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and the projection-contracts seam is foundation, assigned upstream"
+definition_revision = "eliot_contracts::ContractVersion 0.2.0, exact triple equality, under freeze rule VR-SELECTION-CONTRACT-VERSION"
+field_contract_state = "FROZEN_EXACT at 6 of 6 members as of freeze r11, every row carrying a resolving validator anchor and a typed error variant"
+input_rust_path = "eliot_memory_projection_contracts::MemoryProjectionBatch plus MemoryQueryIntent plus MemorySelectionPolicy"
+output_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+first_consumer = ""
+first_consumer_status = "NONE_EXISTS"
+error_unknown_behaviour = "Every rejection is a SelectionError or a wrapped MemoryProjectionError variant. An unreadable batch produces NO trace at all rather than a partial one, and an UNKNOWN batch denominator does not block selection because select() reads that denominator and never echoes it, since selection deliberately claims no completeness."
+later_positive_acceptance = "a selection over a batch whose records are all inside the allowlist and whose passing count is at or below the intent limit yields a trace whose coverage.considered equals the consumer's own batch.records length, whose selected plus not_selected equals considered, and which survives validate_against against the exact intent, policy and batch it was computed from"
+later_negative_acceptance = "a trace whose selected exceeds either the echoed policy ceiling or the intent limit is rejected as LimitOverPolicy or LimitExceeded rather than by silent truncation; a trace whose counts balance but whose entries do not replay against the batch is rejected as CoverageMismatch"
+owning_task_for_the_gap = "the cognitive-wave integrator named as integration_owner at crates/foundation/eliot-memory-projection-contracts/module.toml"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-observation-contracts-failure"
+owning_crate = "eliot-observation-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and the observation-contracts seam is foundation; the Governor owner cell eliot-observation at order 1 is a DIFFERENT seam and is not this contract crate"
+definition_revision = "eliot_contracts::ContractVersion 1.0.0, exact triple equality, plus each record's own frozen digest recomputed from every other field on each validate, under freeze rule VR-FAILURE-OBSERVATION-VERSION"
+field_contract_state = "FROZEN_EXACT at 4 of 4 members as of freeze r11, every row carrying a resolving validator anchor and a typed error variant"
+input_rust_path = "eliot_observation_contracts::FailureObservation plus MemoryRevisionEvidence"
+output_rust_path = "smart.dreamer.memory_revision::NegativeMemoryExtinctionCandidate, which is the consumer's own output and NOT a frozen input to this family"
+first_consumer = "eliot-dreamer-memory-revision"
+first_consumer_status = "MEASURED_EXISTS"
+error_unknown_behaviour = "Every rejection is an ObservationError variant. Unknown evidence is a VALUE and never an error path: an unreadable source is CoverageDisposition::Unavailable plus a named FailureOmission and an unadmitted source is the UNADMITTED_SOURCE omission class, neither of which is silently reported as an empty list. A Complete verdict requires the FULL POSTURE, namely disposition Complete AND an empty blind_intervals list."
+later_positive_acceptance = "an observation carrying a valid recomputed digest, a validated SourceRevisionHandle, refs within their bounds with no duplicates, and coverage with disposition Complete and an empty blind_intervals list satisfies coverage_complete and is accepted as a complete read"
+later_negative_acceptance = "an observation whose stored digest does not match the recomputed digest is rejected; a repeated ref handle is rejected as Duplicate rather than deduplicated; an observation whose coverage disposition is Complete but whose blind_intervals list is NON-EMPTY does NOT satisfy coverage_complete and is carried as a partial read"
+owning_task_for_the_gap = "none; the contract and its caller both exist. What remains unproven is runtime behaviour."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-epistemic-contracts-contribution"
+owning_crate = "eliot-epistemic-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31; the envelope owner is the foundation epistemic seam, which is distinct from the order-2 eliot-epistemic position RESOLVER cell that this wave does assign"
+definition_revision = "eliot_contracts::ContractVersion 1.2.0, exact triple equality, CONJUNCTIVE with the view_kind discriminator and a currentness of Current, under freeze rule VR-CONTRIBUTION-CONTRACT-VERSION"
+field_contract_state = "FROZEN_EXACT at 1 of 1 top-level member as of freeze r11; the nested owners CurrentEpistemicPosition, AdmittedKind and Currentness are dispositioned by their own pre-existing frozen_type rows and are referenced rather than duplicated"
+input_rust_path = "eliot_epistemic_contracts::CurrentEpistemicPosition, already validated and admitted by its owner"
+output_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+first_consumer = "eliot-epistemic-context-provider, and independently eliot-understanding-assessment"
+first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
+error_unknown_behaviour = "Every rejection is a ContractError variant. The whole envelope is the unit of failure: contribute() returns Result with no partial variant, so a caller can never be handed a partly-populated handoff. A superseded position is REFUSED outright rather than contributed with a weakened marker, and the epistemic distinctions the envelope does not carry, such as assumed, conflicted, stale or under investigation, stay visible on the CurrentEpistemicPosition and are not flattened by the handoff."
+later_positive_acceptance = "contribute over a validated Current position yields an envelope whose echoes all EQUAL the corresponding admission-envelope field, so a consumer holding the admission record can re-derive the envelope field by field and reach the same bytes; the understanding-assessment consumer accepts it as a citation and reads position_digest as the cite digest"
+later_negative_acceptance = "contribute over a position whose currentness is Superseded is refused with ImpossibleCombination and NO envelope is produced; a position whose own frozen digest does not recompute is refused BEFORE any envelope exists; passing the version check while carrying a wrong view_kind is still rejected"
+owning_task_for_the_gap = "none; the contract and two independent callers all exist. What remains unproven is runtime behaviour."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+# ---------------------------------------------------------------------------
+# #261 r12 W0 handoff notes for the four families that had NO field-contract row
+# before r12. These are NOT new [[assignment]] rows and NOT new agents. As at
+# r11 this wave assigns orders 1-31 and only one of these four families is in
+# it: eliot-observation is the order-1 Governor owner cell, while the
+# dreamer-contracts, context-contracts and learning-contracts seams are decided
+# in waves this file does not assign.
+#
+# What r12 adds here is the same thing r11 added: a reader of this wave can see
+# which existing crate owns each family, what the field contract now states,
+# and who the first consumer actually is. Every first_consumer below was located
+# by git grep on the r12 base commit.
+#
+# READ THE OWNERSHIP ASYMMETRY BEFORE THE TABLE. Each row records that the crate
+# pre-dates this issue and was NOT created by it. Two of the four families
+# additionally carry a MEASURED scope gap recorded in the freeze's
+# [[coverage_accounting]]: eliot-dreamer-contracts declares roughly 387 public
+# types and r12 freezes one job family of them, and eliot-learning-contracts
+# declares 80 and r12 freezes two shared types. Those rows are NOT a claim that
+# the rest of the crate is contracted.
+# ---------------------------------------------------------------------------
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-observation-governor-classification"
+owning_crate = "eliot-observation"
+in_this_wave = true
+in_this_wave_reason = "this wave assigns order 1 eliot-observation, the Governor observation owner cell, so this family IS in this wave; unlike the other three"
+definition_revision = "eliot_observation::CONTRACT_VERSION 1.0.0 under CONTRACT_NAME eliot.governor.observation, plus the content-addressed eliot_observation::contract_identity that folds eight of this crate's own schemas in. Exact triple equality plus the identity digest, under freeze rule VR-GOVERNOR-OBSERVATION-VERSION"
+field_contract_state = "FROZEN_EXACT at 11 of 11 frozen types as of freeze r12, every row carrying a resolving validator anchor and a typed GovernorObservationError variant. Before r12 this crate appeared ZERO times in the freeze."
+input_rust_path = "eliot_observation::ObservationSubmission plus TaskSelectionEvidence plus ObservationPlanBinding plus optionally ObservationRecordEnvelopeV2 and EvidenceEnvelope"
+output_rust_path = "eliot_observation::ObservationAdmissionResult, carrying ObservationAdmissionReceipt or ObservationAdmissionRejection, persisted as ObservationJournalEntry"
+first_consumer = "eliot-governor, and independently eliot-cue-binding"
+first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
+first_consumer_note = "Located by git grep: crates/governor/eliot-governor/src/observation_reconciliation.rs constructs ObservationSubmission at maintenance_result_submission and verification_submission and drives ObservationJournal::admit at admit_maintenance_result and admit_scratch_observation. The SECOND consumer is crates/smart/eliot-cue-binding/src/derive.rs, which reads ObservationAdmissionReceipt and branches on candidate_disposition == CandidateDisposition::TaskBound at line 692 to decide whether an observation may seed a cue binding. Recorded as two consumers rather than collapsed into one."
+error_unknown_behaviour = "Every rejection is a GovernorObservationError variant. Unknown is a VALUE rather than an absence: absent evidence is an explicit unknown and not an empty evidence set; a superseded task selection is refused with StaleTaskSelection rather than rebound to the current revision; a coherent-but-non-exact v2 family record is refused at submission with RecordFamilyNotAccepted; and a Replayed admission result may not be persisted as canonical journal input at all. A rejected observation is PRESERVED in safe_capture_fallback rather than discarded."
+later_positive_acceptance = "a submission whose plan fence equals its own fence and whose selection task_ref AND work_scope_ref both equal the record's own affected_scope values is admitted, yielding a receipt whose request_digest, record_id, candidate_disposition and evidence_digest each equal their independently recomputed values; resubmitting identical bytes under the same key yields Replayed with the original receipt unchanged"
+later_negative_acceptance = "the same key with DIFFERENT bytes yields a Conflict rejection rather than a second admission; a task-bound record with no selection is TaskSelectionRequired; a selection at a superseded revision is StaleTaskSelection and is not rebound; a plan or evidence envelope on another fence is FenceMismatch; Durability::Durable over an OperationalLog route is InsufficientDurability and a protected coverage_gap without Durability::Protected is likewise refused; an empty all_contract_errors list is Empty rather than an accepted rejection; a Replayed result offered as journal input is PersistedReplay"
+owning_task_for_the_gap = "none for the admission family itself; the crate, the closed validation and two real independent consumers all exist. What remains unproven is runtime behaviour, which stays NOT_EXECUTED. The private classifier has no wire form by design and the bank_admission lane is a separate owner path; both are named in the freeze coverage_accounting row rather than left silent."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-dreamer-contracts-self-query-source"
+owning_crate = "eliot-dreamer-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and does NOT assign order 3 eliot-dreamer-contracts; that cell is decided in the cognitive-micromodules assignment set named by its own module.toml agent_order"
+definition_revision = "the crate-private SCHEMA_VERSION 1 at crates/smart/eliot-dreamer-contracts/src/self_query/source.rs, exact equality per validate, no range and no negotiation; PLUS the NormativePairBinding edition identity, whose pair_key is RECOMPUTED over a versioned preimage rather than shape-checked"
+field_contract_state = "FROZEN_EXACT at 6 source-closure members plus 1 REFERENCED_NOT_FROZEN status enum as of freeze r12. THIS IS A PARTIAL SLICE: the crate declares roughly 387 public struct/enum declarations across about a dozen job families and r12 freezes ONE of them. The remaining families are named as out of scope in the freeze coverage_accounting row and are NOT counted anywhere."
+input_rust_path = "eliot_dreamer_contracts::self_query::ArchitectureSourceSnapshot plus NormativePairBinding plus Vec of ArchitectureAnchor plus ArchitectureDependencyDenominator"
+output_rust_path = "eliot_dreamer_contracts::self_query::AcceptedSourceProjection plus AcceptedSourceRef, the narrow-disclosure citation set that replaces the snapshot's bytes at the consumer edge"
+first_consumer = "eliot-dreamer-self-query, and independently eliot-understanding-assessment"
+first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
+first_consumer_note = "Located by git grep: crates/smart/eliot-dreamer-self-query/src/lib.rs takes AcceptedSourceProjection by reference at lines 171, 209 and 257. The second consumer is crates/smart/eliot-understanding-assessment/src/lib.rs, which names both types."
+error_unknown_behaviour = "Every failure is a SelfQueryContractError variant. Unknown is a NAMED STATUS: ArchitectureSourceStatus carries STALE and UNAVAILABLE as distinct members, so an old source and an unreadable one are never conflated and neither reads as current; a draft is citable as a draft and is never promoted; and only the Accepted member satisfies the accepted-source receipt obligation, which AcceptedSourceRef::validate requires outright. There is no nearest-version match anywhere in this family."
+later_positive_acceptance = "an anchor whose lineage triple matches its snapshot, whose byte range lands inside the snapshot bytes and whose text matches those bytes, satisfies validate_against when the snapshot is passed as an argument; a projection whose refs each carry status ACCEPTED with owner equal to pair.accepted_by and acceptance_receipt equal to pair.acceptance_receipt satisfies validate; a dependency denominator with unique members and complete=true satisfies validate and yields a recomputed digest"
+later_negative_acceptance = "a snapshot whose revision or digest differs from its pair is BindingMismatch rather than adopted as current; a well-shaped pair_key that does not recompute over the versioned preimage is DigestMismatch, not a re-derivation; an Accepted source with empty bytes or a missing or mismatched receipt is Missing or BindingMismatch; complete=true over an empty member list is Missing; a repeated dependency ref or member id is Duplicate rather than de-duplicated; an over-long source, excerpt, member list or source list is Bound naming the maximum, never truncated"
+owning_task_for_the_gap = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-dreamer-contracts/module.toml, for the roughly 380 declarations outside the source-closure family; nothing here is owed for the source closure itself"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-context-contracts-binding-view-omission"
+owning_crate = "eliot-context-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and does NOT assign order 15 eliot-context-contracts"
+definition_revision = "eliot-context-contracts declares NO crate-level CONTRACT_VERSION constant; its version binding is the per-projection schema_version 1 and the binding-and-fence equality rules of ContextBinding. The owner policy revision is bound by DecisionRevision::policy_sha256 and the compilation instance by recipe_digest, both compared for exact equality in validate_against"
+field_contract_state = "FROZEN_EXACT at 4 types plus 1 REFERENCED_NOT_FROZEN role enum as of freeze r12. THIS IS A PARTIAL SLICE: the crate declares 191 public declarations and r12 freezes the canonical binding, view and omission types; the reactive path is excluded by the crate's own pre-existing note. THE FAMILY ALSO CARRIES AN OPEN MEASURED DISAGREEMENT against its own summary list; see the row below and the freeze disagreement register."
+input_rust_path = "eliot_context_contracts::AdmittedContextSet plus QualityScorecard plus SerializedContextMeasurement plus ContextExecutionIdentity, all already validated by their own owners"
+output_rust_path = "eliot_context_contracts::ActiveUnderstandingView, an immutable assembled view consumed read-only, whose omission axis is carried separately as eliot_context_contracts::OmissionRecord"
+first_consumer = "eliotd, and independently eliot-context-assembly"
+first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
+first_consumer_note = "Located by git grep: crates/smart/eliot-context-assembly/src/assemble.rs drives assemble_active_view and re-derives ActiveUnderstandingView::canonical_output_digest independently at measurement.rs line 151. The second consumer is bins/eliotd/src/experience_runtime.rs, which imports ActiveUnderstandingView directly."
+error_unknown_behaviour = "Every failure is a ContextError variant. Unknown is a VALUE: an empty admitted or rendered list is an honest zero and not a completeness claim, and an omission that could not be measured records None through a custom deserializer rather than a zero. The omission reason set is CLOSED at ten members with no OTHER, and UNKNOWN_MEASUREMENT and MEASUREMENT_UNAVAILABLE are two DISTINCT members."
+later_positive_acceptance = "a view assembled from an admitted set whose bindings all agree, whose output_digest equals the value assemble recomputes, whose quality.output.admitted_digest equals the admitted set own canonical payload digest, whose omission handles equal the admitted set own displaced list, and whose recipe_digest and policy_sha256 equal the admitted economy receipt own values, satisfies validate_against"
+later_negative_acceptance = "a quality or measurement card on another binding is InvalidFence; a supplied output_digest disagreeing with the recomputed value is SelectionIntegrityMismatch; a view and an admitted set issued under DIFFERENT approved policy revisions are IdentityConflict even when both are individually well formed and share task, attempt, scope, decision and fence, which is the specific hole policy_sha256 closes; an omission carrying BOTH an expansion handle and a non_recoverable_reason is OmissionHandleInvalid and one carrying NEITHER is equally OmissionHandleInvalid"
+owning_task_for_the_gap = "the freeze owner named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml, for the DIS-CTX-VIEW-EXECUTION-POLICY summary-list drift; and the cognitive-wave integrator named as integration_owner at crates/smart/eliot-context-contracts/module.toml for the reactive-path types"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-learning-contracts-binding-denominator"
+owning_crate = "eliot-learning-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and does NOT assign order 32 eliot-learning-contracts, which its own module.toml places in cognitive-micromodules-wave-02"
+definition_revision = "eliot_learning_contracts::LEARNING_SCHEMA_VERSION 1, a PUBLIC u16 constant at crates/smart/eliot-learning-contracts/src/identity.rs, exact equality, no range and no negotiation. NOTE THE WIDTH: u16 here against the dreamer self-query family u32, so the two schema_version fields are NOT interchangeable."
+field_contract_state = "FROZEN_EXACT at 2 of 2 shared types as of freeze r12. THIS IS A PARTIAL SLICE: the crate declares 80 public types across attribution, delta, overlay, activation, promotion, experiment, closure, assessment and state view; r12 freezes the two types every durable candidate is bound by. THE FAMILY ALSO CARRIES A SEPARATE OPEN MEASURED DISAGREEMENT about a type r12 does NOT freeze; see the row below."
+input_rust_path = "eliot_learning_contracts::ContractBinding, which every durable candidate in this crate is bound by"
+output_rust_path = "eliot_learning_contracts::SourceDenominator, the declared-versus-observed pair carried on the projection rather than inferred from it"
+first_consumer = "eliot-learning-state-view"
+first_consumer_status = "MEASURED_EXISTS_SINGLE_CONSUMER"
+first_consumer_note = "Located by git grep: crates/smart/eliot-learning-state-view/src/lib.rs line 239 constructs SourceDenominator { declared, observed }, so it is the function that must satisfy the non-zero and not-exceeding rules. No other crate constructs this type, and that is recorded as a measured single consumer rather than padded into a second one."
+error_unknown_behaviour = "Every failure is a LearningContractError variant. Unknown is STRUCTURALLY DISTINGUISHED FROM ZERO: both denominator fields are plain integers with no serde default, so an absent key is a decode failure rather than an implicit zero, and a projection that observed nothing must state zero. A zero declared count is Missing, and an observed count above declared is the crate own IncompleteCoverage rather than a clamp. The wider error family also carries CandidateCeiling, NonIndependentAssessment, ProtectedSurfaceChanged and InvalidNoChange as typed refusals of the family own forbidden moves."
+later_positive_acceptance = "a binding carrying schema_version 1 with non-empty request, operation, product, task and scope text and a validating fence satisfies validate; a SourceDenominator with declared greater than zero and observed less than or equal to declared satisfies validate, including observed equal to zero as an honest partial projection"
+later_negative_acceptance = "a schema_version other than 1 is ScopeMismatch with no range accepted; empty request, operation, product, task or scope text is Missing rather than defaulted; a declared count of zero is Missing; an observed count ABOVE declared is IncompleteCoverage and is never clamped or silently reduced; an absent declared or observed key on the wire is a decode failure rather than an implicit zero, because an omitted observation and an observation of nothing are different facts"
+owning_task_for_the_gap = "the freeze owner named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml, for the DIS-LEA-ACTIVATION-SURFACE summary-list drift, which is a 15-recorded-against-32-actual gap and is therefore a PRIORITY repair; and the cognitive-wave integrator named as integration_owner at crates/smart/eliot-learning-contracts/module.toml for the six candidate families r12 does not freeze"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"

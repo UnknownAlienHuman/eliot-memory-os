@@ -3601,6 +3601,7 @@ dependencies = [
  "eliot-evaluation-contracts",
  "eliot-experience-provider",
  "eliot-governor",
+ "eliot-host-state",
  "eliot-improvement",
  "eliot-instrument-api",
  "eliot-integration-coverage",

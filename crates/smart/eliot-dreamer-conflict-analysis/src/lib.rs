@@ -226,7 +226,13 @@
 //! admission rather than assessed against nothing. Nothing here raises a
 //! ceiling: an unverifiable input keeps the unverified/unknown result.
 //!
-//! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
+//! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here,
+//! plus two unnumbered cases that enter [`analyze_conflict`] for the
+//! declared-but-absent member of that qualified one-position set and prove the
+//! analyzer's own two legs of it — `Partial` naming the absent member and its
+//! declared width under `allow_partial`, and `Abstention` for the same set when
+//! no partial path is admitted. They claim no case number because every number
+//! in 1..68 is already bound to exactly one numbered test
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts while a single position whose
 //! second member is declared but still open is, 673/5 duplicate and changed
@@ -3334,6 +3340,42 @@ fn validate_declared_absent_members(
     Ok(absent)
 }
 
+/// Renders the sorted handles of the declared-but-absent members, bounded.
+///
+/// Sorting makes the rendering order-independent, so the same set always names
+/// the same members in the same order however they were declared, and `redact`
+/// bounds the joined text to its own print ceiling, so a set declaring many
+/// absent members cannot push the note that carries these names past its byte
+/// bound.
+fn declared_absent_handles(conflict_set: &ConflictSet) -> String {
+    let mut handles: Vec<&str> = conflict_set
+        .missing_positions()
+        .iter()
+        .map(|missing| missing.owner.as_str())
+        .collect();
+    handles.sort_unstable();
+    redact(&handles.join(", "))
+}
+
+/// Renders the incompleteness note for a set that declares an absent member.
+///
+/// The member is NAMED, not only counted. A count says the denominator is
+/// wider than what was read here; the handle says whose position is missing,
+/// which is the only thing that lets the gap be reopened by its own owner.
+/// Reporting this set complete would be Algorithm 2's "a missing member
+/// disappearing from a complete claim", and a number alone would not stop a
+/// reader from mistaking one absent member for another.
+fn declared_absent_gap_note(conflict_set: &ConflictSet) -> String {
+    format!(
+        "incomplete coverage: {} of {} declared positions are declared but absent ({}), so the analyzed denominator is {} of {}",
+        conflict_set.missing_positions().len(),
+        conflict_set.positions.len() + conflict_set.missing_positions().len(),
+        declared_absent_handles(conflict_set),
+        conflict_set.positions.len(),
+        conflict_set.position_denominator(),
+    )
+}
+
 /// Returns the sorted source handles of every position in the set.
 fn position_source_handles(conflict_set: &ConflictSet) -> Vec<String> {
     let mut handles: Vec<String> = conflict_set
@@ -5386,10 +5428,11 @@ fn check_preservation(
         // width, because reporting only the carried count here would claim a
         // completeness this analysis does not have.
         format!(
-            "every expected position, objection, and source retained or explicitly unavailable ({} of {} declared positions; {} declared but absent)",
+            "every expected position, objection, and source retained or explicitly unavailable ({} of {} declared positions; {} declared but absent: {})",
             positions.len(),
             conflict_set.position_denominator(),
             conflict_set.missing_positions().len(),
+            declared_absent_handles(conflict_set),
         )
     };
     let faithfulness_passed = !positions.is_empty()
@@ -6125,13 +6168,7 @@ pub fn analyze_conflict(
             None
         }
     } else {
-        Some(format!(
-            "incomplete coverage: {} of {} declared positions are declared but absent, so the analyzed denominator is {} of {}",
-            conflict_set.missing_positions().len(),
-            conflict_set.positions.len() + conflict_set.missing_positions().len(),
-            conflict_set.positions.len(),
-            conflict_set.position_denominator(),
-        ))
+        Some(declared_absent_gap_note(conflict_set))
     };
     if let Some(note) = incompleteness {
         // With no partial path admitted, an incomplete analysis is withheld
@@ -6366,6 +6403,69 @@ mod tests {
     fn test_validity() -> ValidityBounds {
         ValidityBounds::new("scope-1", None, None, "v1", Precision("file".to_owned()))
             .expect("valid bounds")
+    }
+
+    /// Returns the qualified one-position set: one carried position plus a
+    /// declared-but-absent rival whose owner-issued outcome is still open.
+    ///
+    /// Every field is the real canonical field and the absent member is the
+    /// real `MissingConflictPosition` the contract produces, so this is the set
+    /// the contracts admit and nothing is fabricated to reach the analyzer.
+    fn test_qualified_missing_rival_set() -> ConflictSet {
+        let receipt = test_receipt();
+        ConflictSet::new_with_missing_positions(
+            ConflictSetParams {
+                conflict_id: "conflict-missing-rival".to_owned(),
+                kind: ConflictKind::Epistemic,
+                scope: "scope-1".to_owned(),
+                task_id: None,
+                positions: vec![test_position("source-a", "cache helps tail latency", false)],
+                evidence_refs: BTreeSet::new(),
+                owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                common_lineage: BTreeSet::new(),
+                resolved_parts: BTreeSet::new(),
+                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+                unresolved_owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                acceptability: ArgumentAcceptability::Contested,
+                defeated_refs: BTreeSet::new(),
+                probe: None,
+                decision_owner: SourceId::new("source-a").expect("valid source"),
+                affected_actions: vec!["decide-cache".to_owned()],
+                lifecycle: ConflictLifecycle::Open,
+                receipt_digest: receipt.bundle_digest.clone(),
+            },
+            vec![
+                MissingConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    MemberDisposition::Unavailable,
+                    "the rival's owner has not released its stance yet",
+                )
+                .expect("valid missing position"),
+            ],
+        )
+        .expect("a declared-but-absent open rival is a two-member denominator")
+    }
+
+    /// Returns the test supplements narrowed to the one carried position.
+    ///
+    /// The absent member carries no position, so a lineage attribution or an
+    /// objection naming it would describe a member this denominator does not
+    /// carry.
+    fn test_qualified_missing_rival_supplements() -> ConflictSupplements {
+        let mut supplements = test_supplements();
+        supplements
+            .lineage
+            .retain(|entry| entry.source_handle == "source-a");
+        supplements
+            .objections
+            .retain(|objection| objection.target_source == "source-a");
+        supplements
     }
 
     fn test_model_ref(id: &str) -> RivalModelRef {
@@ -6971,6 +7071,138 @@ mod tests {
             ),
             "a closed outcome is not a live rival and cannot admit a one-position set"
         );
+    }
+
+    /// The declared-absent-member leg `analyze_conflict` reports through its
+    /// incompleteness note and its coverage note: a qualified one-position set
+    /// yields a `Partial` candidate, the absent member is NAMED rather than only
+    /// counted, and the declared width is reported.
+    ///
+    /// This is a distinct case from `case_03`, which proves the two legs
+    /// required by test-matrix row 3 at the CONTRACT boundary (a one-position
+    /// set is refused without a qualifier and constructs with one) plus the
+    /// `AuthoritativeAbsence` refusal. What `case_03` never enters is the
+    /// analyzer itself for this shape, so nothing here would fail if the notes
+    /// counted the absent member without naming it, dropped it, or reported a
+    /// narrower denominator than the set declares.
+    #[test]
+    fn declared_absent_member_is_named_and_partial_under_allow_partial() {
+        let conflict = test_qualified_missing_rival_set();
+        let supplements = test_qualified_missing_rival_supplements();
+        // The expected width is written out here rather than read back off the
+        // set's own member lists, so a denominator that counted itself narrower
+        // fails here instead of agreeing with itself.
+        assert_eq!(
+            conflict.position_denominator(),
+            2,
+            "the carried position and the still-open absent member are both members"
+        );
+        let mut policy = test_policy();
+        policy.allow_partial = true;
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("declared-absent-member analysis: {err:?}"),
+        };
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Partial,
+            "an admitted but absent member keeps the analysis incomplete"
+        );
+        assert!(
+            candidate.note.contains("1 of 2 declared positions"),
+            "the incompleteness note reports the exact declared width: {}",
+            candidate.note
+        );
+        assert!(
+            candidate.note.contains("source-b"),
+            "the absent member is NAMED in the note, not only counted: {}",
+            candidate.note
+        );
+        let coverage = candidate
+            .preservation
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.dimension == PreservationDimension::Coverage)
+            .expect("the coverage verdict stays addressable");
+        assert!(
+            coverage.passed,
+            "an explicitly unavailable member is retained, not a coverage failure"
+        );
+        assert!(
+            coverage.note.contains("1 of 2 declared positions")
+                && coverage.note.contains("source-b"),
+            "the coverage note names the absent member and the declared width: {}",
+            coverage.note
+        );
+        // The one carried position survives verbatim and no fabricated
+        // `PositionAnalysis` stands in for the member the set never carried.
+        assert_eq!(candidate.positions.len(), 1);
+        assert_eq!(candidate.positions[0].source_handle, "source-a");
+        assert!(candidate.resolution_status.is_none());
+        candidate
+            .preservation
+            .overall()
+            .expect("every preservation dimension still holds with the gap named");
+    }
+
+    /// The refusal leg for the same set: with no partial path admitted the
+    /// analysis is `Abstention`, never promoted to `Complete`, and the named
+    /// gap and every carried member are still preserved on the withheld
+    /// candidate.
+    ///
+    /// It enters the same production `analyze_conflict` the positive case does
+    /// and changes only `allow_partial`, so the outcome is read from the gap in
+    /// the analysis rather than from the permission to emit it.
+    #[test]
+    fn declared_absent_member_is_abstained_when_partial_is_refused() {
+        let conflict = test_qualified_missing_rival_set();
+        let supplements = test_qualified_missing_rival_supplements();
+        let mut strict = test_policy();
+        strict.allow_partial = false;
+        let withheld = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &conflict,
+            &supplements,
+            &strict,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("declared-absent-member refusal analysis: {err:?}"),
+        };
+        assert_eq!(
+            withheld.outcome,
+            ConflictOutcome::Abstention,
+            "an incomplete analysis is withheld when no partial path is admitted"
+        );
+        assert!(
+            !matches!(
+                withheld.outcome,
+                ConflictOutcome::Complete | ConflictOutcome::Partial
+            ),
+            "a stricter emission policy never promotes the gap: {:?}",
+            withheld.outcome
+        );
+        assert!(
+            withheld.note.contains("1 of 2 declared positions")
+                && withheld.note.contains("source-b"),
+            "the withheld candidate still names the gap and its declared width: {}",
+            withheld.note
+        );
+        assert_eq!(withheld.positions.len(), 1);
+        assert_eq!(withheld.positions[0].source_handle, "source-a");
+        assert!(withheld.resolution_status.is_none());
+        withheld
+            .preservation
+            .overall()
+            .expect("withholding a candidate loses no preserved dimension");
     }
 
     // WORK_UNIT_CASE: 673/10
