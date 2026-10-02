@@ -78,7 +78,7 @@ struct RpcResponse {
 ///
 /// `Option<Value>` cannot carry that distinction: `serde_json` reports a JSON
 /// `null` through `Deserializer::deserialize_option` as `visit_none`, so a
-/// `"result": null` frame - the wire form of SurrealDB's `PublicValue::None` -
+/// `"result": null` frame - the wire form of `SurrealDB`'s `PublicValue::None` -
 /// decodes exactly like a frame carrying no `result` member at all.
 /// `#[serde(default)]` is therefore required on the field: an absent member is
 /// filled from `Default` (no member), while a present `null` reaches this
@@ -474,11 +474,10 @@ mod tests {
             outcome("ping", br#"{"id":"r-1","result":null}"#)?,
             Value::Null
         );
-        Ok(())
     }
 
     #[test]
-    fn a_frame_naming_no_outcome_member_is_refused() -> Result<(), StoreError> {
+    fn a_frame_naming_no_outcome_member_is_refused() {
         let frame = br#"{"id":"r-1"}"#;
         // Both the raw gate and the closed envelope admit these bytes, so the
         // missing `result` member is attributable as the whole cause: this is
@@ -490,7 +489,6 @@ mod tests {
             outcome("signin", frame),
             Err(StoreError::Decode(_))
         ));
-        Ok(())
     }
 
     #[test]
@@ -505,7 +503,6 @@ mod tests {
             outcome("query", twice),
             Err(StoreError::Decode(reason)) if reason == StrictJsonErrorKind::DuplicateKey.as_str()
         ));
-        Ok(())
     }
 
     #[test]
@@ -527,11 +524,10 @@ mod tests {
         // `session` member is attributable as the cause of the refusal.
         assert!(admitted(br#"{"id":"r-1","result":null}"#).is_ok());
         assert!(admitted(br#"{"id":"r-1","session":"s","result":null}"#).is_err());
-        Ok(())
     }
 
     #[test]
-    fn provider_error_frame_is_refused_not_read_as_a_null_success() -> Result<(), StoreError> {
+    fn provider_error_frame_is_refused_not_read_as_a_null_success() {
         let frame = br#"{"id":"r-1","error":{"code":-32000,"message":"boom","kind":"Query"}}"#;
         // The vendor error object is admitted by the closed envelope, and this
         // frame names no `result` member at all, so the refusal below is the
@@ -542,6 +538,5 @@ mod tests {
             outcome("query", frame),
             Err(StoreError::RpcError { .. })
         ));
-        Ok(())
     }
 }
