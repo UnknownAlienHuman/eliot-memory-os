@@ -1425,6 +1425,25 @@ pub struct ModuleDrainReport {
     pub active_operations: u64,
 }
 
+/// Disposition of one recorded lifecycle `Execute` request.
+///
+/// This is the same `New | Duplicate` split the lifecycle event dispatch
+/// contract uses: `New` is the first admission of an idempotency identity and
+/// `Duplicate` is a replay of one already recorded. Both variants carry the
+/// same [`RequestId`] — the identity the owner validated when it first
+/// admitted the effect — so a retry reports the standing record rather than an
+/// echo of whichever frame arrived later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ExecuteDisposition {
+    /// First admission of this idempotency identity: the owner validated the
+    /// carried request identity and performed the effect for the first time.
+    New(RequestId),
+    /// The same idempotency identity was already recorded: an idempotent
+    /// duplicate, not a second effect. The carried request identity is the one
+    /// recorded by the first admission, read back rather than recomputed.
+    Duplicate(RequestId),
+}
+
 /// Explicit outcome of applying one lifecycle control frame.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ModuleControlEffect {
@@ -1447,14 +1466,19 @@ pub enum ModuleControlEffect {
     FatalRecorded,
     /// The module resumed `Quiesced` to `Active` on a correlated restart.
     Resumed,
-    /// One `Execute` request was admitted and its outcome recorded under the
-    /// request's validated idempotency key.
+    /// One `Execute` request was recorded under the request's validated
+    /// idempotency key, together with the disposition of that recording.
     ///
-    /// The carried [`RequestId`] is the request identity the owner validated
-    /// when it first admitted the effect, not an echo of whichever retry
-    /// arrived later: a repeated `Execute` with the same idempotency identity
-    /// replays this exact recorded disposition and performs no second effect.
-    ExecuteRecorded(RequestId),
+    /// [`ExecuteDisposition::New`] means this frame performed the effect;
+    /// [`ExecuteDisposition::Duplicate`] means this frame was a retry that
+    /// performed none and returned the standing record. A caller that lost the
+    /// first response and resent the same frame therefore learns from this
+    /// value whether the effect ran once or was already done.
+    ///
+    /// Both variants carry the same [`RequestId`]: the request identity the
+    /// owner validated when it first admitted the effect, read back from the
+    /// record rather than recomputed from whichever retry arrived later.
+    ExecuteRecorded(ExecuteDisposition),
 }
 
 /// Recorded outcome of one effectful lifecycle control request.
@@ -1470,7 +1494,11 @@ pub enum ModuleControlEffect {
 /// observe the live denominator, and `Fatal` carries no request identity on
 /// its control frame so the `Failed` phase itself is the fence. `Execute` is
 /// recorded in this same map: it is the one and only replay mechanism for a
-/// lifecycle request's idempotency identity.
+/// lifecycle request's idempotency identity, and a replayed `Execute` returns
+/// the recorded request identity as [`ExecuteDisposition::Duplicate`] rather
+/// than the stored [`ExecuteDisposition::New`] verbatim, so the retrying
+/// caller learns that no second effect ran. The map is process-local: no
+/// snapshot or store readback restores it across a restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LifecycleControlReplay {
     /// Control message the recorded outcome belongs to.
@@ -1491,11 +1519,24 @@ struct LifecycleControlReplay {
 /// rejected with a typed [`ProtocolError`]; nothing is inferred from process
 /// state.
 ///
-/// The owner retains durable idempotency/outcomes for the effectful controls
-/// and for `Execute`: the first outcome per idempotency key is recorded and
-/// replayed on retry, so a repeated `Quiesce` or `Execute` returns the earlier
+/// The owner retains idempotency/outcomes for the effectful controls and for
+/// `Execute`: the first outcome per idempotency key is recorded and replayed
+/// on retry, so a repeated `Quiesce` or `Execute` returns the earlier
 /// disposition and a key reused under a different message surfaces
-/// [`ProtocolError::ReplayConflict`].
+/// [`ProtocolError::ReplayConflict`]. A repeated `Execute` reports that
+/// standing record as [`ExecuteDisposition::Duplicate`] over the recorded
+/// request identity, so the retrying caller can tell that no second effect
+/// ran.
+///
+/// That retention is process-local and bounded to this owner's memory: no
+/// snapshot, journal or store readback carries `control_effects`, and
+/// [`ModuleLifecycle::restore_retained`] restores only the phase and the
+/// retained checkpoint. A lifecycle rebuilt in a new process therefore starts
+/// with an empty record and admits an `Execute` under a previously used key as
+/// a first admission. Closing that gap requires a persistence owner for these
+/// records that does not exist yet; until it does, callers must not read
+/// cross-restart `Execute` idempotency as guaranteed.
+///
 /// `Checkpoint` retains the published snapshot bytes verbatim (bounded by
 /// [`MAX_FRAME_BYTES`]); a fresh publication under a new key supersedes the
 /// retained checkpoint and moves correlation to the new key. `DrainStatus`
@@ -1612,7 +1653,11 @@ impl ModuleLifecycle {
     /// request consult the owner-held idempotency/outcome replay first: a
     /// retry carrying a recorded key and message returns the earlier
     /// disposition without a second effect, and a recorded key under a
-    /// different message is refused as [`ProtocolError::ReplayConflict`].
+    /// different message is refused as [`ProtocolError::ReplayConflict`]. A
+    /// replayed `Execute` reports that record as
+    /// [`ExecuteDisposition::Duplicate`] over the recorded request identity,
+    /// so the caller can tell a first execution from a retry; every other
+    /// control replays its stored disposition verbatim.
     /// `Checkpoint` retains the module-published snapshot bytes; `DrainStatus`
     /// always reports the live denominator from its frame and is never
     /// replayed; `RestoreCheckpoint` resumes to `Active`; `Fatal` fences on the
@@ -1777,10 +1822,13 @@ impl ModuleLifecycle {
     /// The frame must be a validated `Request` carrying an `Execute` message
     /// and its validated [`RequestIdentity`]. The owner-held idempotency
     /// replay is consulted first, exactly as for every other effectful
-    /// lifecycle request: a repeat of the same idempotency identity returns
-    /// the disposition already recorded in the owner's `control_effects` and
-    /// admits no second effect, and that recorded key presented under a
-    /// different message is refused as [`ProtocolError::ReplayConflict`]. A
+    /// lifecycle request: a repeat of the same idempotency identity admits no
+    /// second effect and returns
+    /// [`ModuleControlEffect::ExecuteRecorded`] carrying
+    /// [`ExecuteDisposition::Duplicate`] over the request identity already
+    /// recorded in the owner's `control_effects`, while the first admission
+    /// returns [`ExecuteDisposition::New`]. That recorded key presented under
+    /// a different message is refused as [`ProtocolError::ReplayConflict`]. A
     /// first-seen `Execute` is admitted only from the
     /// [`ModuleLifecyclePhase::Active`] phase; a quiesced, terminated or failed
     /// lifecycle refuses new work. The recorded value is the request identity
@@ -1788,7 +1836,7 @@ impl ModuleLifecycle {
     fn apply_execute(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         let identity = Self::control_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
-            return Ok(effect);
+            return Ok(Self::as_replayed(effect));
         }
         if frame.kind != FrameKind::Request {
             return Err(ProtocolError::InvalidField {
@@ -1809,8 +1857,23 @@ impl ModuleLifecycle {
                 reason: "execute requires the active phase: new work is refused after quiesce, shutdown or fatal",
             });
         }
-        let effect = ModuleControlEffect::ExecuteRecorded(request_id);
+        let effect = ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(request_id));
         Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+    }
+
+    /// Marks a replayed recorded `Execute` as a duplicate.
+    ///
+    /// The recorded request identity is read back from the record exactly as it
+    /// was stored; only the disposition changes, so the caller learns that no
+    /// second effect ran. Any other recorded control effect is returned
+    /// unchanged: those controls replay their own disposition verbatim.
+    fn as_replayed(effect: ModuleControlEffect) -> ModuleControlEffect {
+        match effect {
+            ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(request_id)) => {
+                ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::Duplicate(request_id))
+            }
+            recorded => recorded,
+        }
     }
 
     fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
@@ -8159,5 +8222,22 @@ mod tests {
             event_replay_key("s", "e"),
             EventReplayKey::new("s", "e").canonical_key()
         );
+    }
+
+    #[test]
+    fn execute_replay_reports_duplicate_over_the_recorded_request_id()
+    -> Result<(), ProtocolError> {
+        let request_id = RequestId::new("request-1")?;
+        let mut lifecycle = ModuleLifecycle::new();
+        let execute = frame()?;
+        assert_eq!(
+            lifecycle.apply(&execute)?,
+            ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(request_id.clone()))
+        );
+        assert_eq!(
+            lifecycle.apply(&execute)?,
+            ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::Duplicate(request_id))
+        );
+        Ok(())
     }
 }
