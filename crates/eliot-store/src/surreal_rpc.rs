@@ -2,8 +2,10 @@ use crate::StoreError;
 use eliot_types::{SurrealServerConfig, strict_json_has_no_duplicate_members};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::Visitor;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -39,12 +41,13 @@ struct RpcRequest<'a> {
 // this client never issues `live`. SurrealDB's RPC is JSON-RPC-shaped, not
 // JSON-RPC-2.0-enveloped, so there is no `jsonrpc` member to allow for.
 //
-// Exactly one outcome member is required, and the `result` member is decoded as
-// `Option<Option<Value>>` rather than `Option<Value>` because serde maps an
-// explicit JSON `null` onto `None` for any `Option<T>` field: with a bare
-// `Option<Value>` an absent `result` and a present `"result": null` are the same
-// value here, and SurrealDB sends the second one for real. At the pinned
-// `v3.1.4` tag `surrealdb/core/src/rpc/response.rs` builds the response from
+// Exactly one outcome member is required, and the `result` member records its
+// own presence through [`RpcResultMember`] rather than through `Option<Value>`,
+// because serde maps an explicit JSON `null` onto `None` for any `Option<T>`
+// field: with a bare `Option<Value>` an absent `result` and a present
+// `"result": null` are the same value here, and SurrealDB sends the second one
+// for real. At the pinned `v3.1.4` tag
+// `surrealdb/core/src/rpc/response.rs` builds the response from
 // `pub result: Result<DbResult, TypesError>`, so `into_value` always emits
 // `result` or `error` and never neither; that tag's own
 // `surrealdb/core/src/rpc/protocol.rs` returns `DbResult::Other(PublicValue::None)`
@@ -55,13 +58,80 @@ struct RpcRequest<'a> {
 // 'result' or 'error' field", so upstream names the neither-case invalid and
 // this client refuses it in `rpc_result` instead of defaulting it to a null
 // success.
+//
+// The presence is carried by a private newtype rather than by a nested
+// `Option<Option<Value>>`: the nesting expresses the same three states but is
+// rejected outright by the workspace lint gate (`clippy::option_option`), and
+// suppressing that lint would leave an admitted construct the gate exists to
+// forbid. [`RpcResultMember`] is the same shape under a name that states the
+// distinction, so the construct is absent from this file rather than excused.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RpcResponse {
     id: Option<Value>,
-    #[serde(default, deserialize_with = "present_member")]
-    result: Option<Option<Value>>,
+    #[serde(default)]
+    result: RpcResultMember,
     error: Option<RpcErrorBody>,
+}
+
+/// The `result` member with its *presence* distinguished from its value.
+///
+/// `Option<Value>` cannot carry that distinction: `serde_json` reports a JSON
+/// `null` through `Deserializer::deserialize_option` as `visit_none`, so a
+/// `"result": null` frame - the wire form of SurrealDB's `PublicValue::None` -
+/// decodes exactly like a frame carrying no `result` member at all.
+/// `#[serde(default)]` is therefore required on the field: an absent member is
+/// filled from `Default` (no member), while a present `null` reaches this
+/// `Deserialize` impl and is recorded as a present member. Refusing the absent
+/// case in [`rpc_result`] depends on that separation; an `Option<Value>` field
+/// would refuse a legitimate null result as well.
+///
+/// The inner `Option<Value>` is the member's own value: `Some(Value::Null)` is a
+/// present member holding JSON `null`, and `None` is a present member holding no
+/// decodable value - which is the state `serde_json` never produces for a
+/// present member, and is therefore unreachable on the wire.
+#[derive(Debug, Default)]
+struct RpcResultMember(Option<Value>);
+
+impl RpcResultMember {
+    /// The member's value, or `None` only when the member was absent.
+    fn into_present(self) -> Option<Value> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RpcResultMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PresentMemberVisitor;
+
+        impl<'de> Visitor<'de> for PresentMemberVisitor {
+            type Value = RpcResultMember;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an RPC response result member")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RpcResultMember(Some(Value::Null)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(RpcResultMember(Some(Value::Null)))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Value::deserialize(deserializer).map(|value| RpcResultMember(Some(value)))
+            }
+        }
+
+        deserializer.deserialize_option(PresentMemberVisitor)
+    }
 }
 
 // The provider's real error object, verified against the pinned `v3.1.4` tag's
@@ -300,21 +370,6 @@ fn parse_response(text: &str) -> Result<RpcResponse, StoreError> {
     serde_json::from_str(text).map_err(|error| StoreError::Decode(error.to_string()))
 }
 
-/// Keeps a present-but-null member distinguishable from an absent one.
-///
-/// A derived `Option<T>` field calls `deserialize_option`, which serde's
-/// `Deserializer` answers with `visit_none` for an explicit `null`; so
-/// `result: Option<Value>` cannot tell `{}` from `{"result": null}`. This
-/// wrapper re-wraps the member's own `Option` decode, so absent stays `None`
-/// (the field `default`), an explicit `null` becomes `Some(None)` and any other
-/// value becomes `Some(Some(value))`.
-fn present_member<'de, D>(deserializer: D) -> Result<Option<Option<Value>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<Value>::deserialize(deserializer).map(Some)
-}
-
 /// Reduces one admitted RPC envelope to the outcome it actually reports.
 ///
 /// `method` is the method this client asked for, and it earns a refusal exactly
@@ -326,10 +381,10 @@ fn rpc_result(method: &str, response: RpcResponse) -> Result<Value, StoreError> 
         return Err(provider_error(method, error));
     }
 
-    match response.result {
-        Some(Some(result)) => Ok(result),
-        // A present `result` member holding SurrealDB's own "no payload" null.
-        Some(None) => Ok(Value::Null),
+    match response.result.into_present() {
+        // A present `result` member, including SurrealDB's own "no payload"
+        // null, which arrives here as `Value::Null` and stays a success.
+        Some(result) => Ok(result),
         // No outcome member at all. SurrealDB's `DbResponse::into_value` emits
         // `result` or `error` and never neither, so this frame is refused
         // instead of being answered with a default null success. The message
@@ -397,8 +452,8 @@ mod tests {
     /// already the collapsed projection of those bytes, so it cannot observe
     /// the lexical facts the duplicate-member tests exist to pin.
     fn admitted(frame: &[u8]) -> Result<RpcResponse, StoreError> {
-        let text = std::str::from_utf8(frame)
-            .map_err(|error| StoreError::Decode(error.to_string()))?;
+        let text =
+            std::str::from_utf8(frame).map_err(|error| StoreError::Decode(error.to_string()))?;
         parse_response(text)
     }
 
@@ -413,9 +468,12 @@ mod tests {
         // `invalidate`, `revoke` and `reset` all answer `PublicValue::None`,
         // which serialises as JSON `null`. `serde_json` reports that through
         // `visit_none`, so `{}` and `{"result": null}` are the same value for any
-        // derived `Option<Value>` field: the `present_member` wrapper is the only
-        // thing that keeps a genuine null result a success.
-        assert_eq!(outcome("ping", br#"{"id":"r-1","result":null}"#)?, Value::Null);
+        // derived `Option<Value>` field: `RpcResultMember` recording the presence
+        // itself is the only thing that keeps a genuine null result a success.
+        assert_eq!(
+            outcome("ping", br#"{"id":"r-1","result":null}"#)?,
+            Value::Null
+        );
         Ok(())
     }
 
@@ -428,7 +486,10 @@ mod tests {
         // most for `signin` and `use`, which discard the value, so a null
         // default here would read as a completed authentication.
         assert!(admitted(frame).is_ok());
-        assert!(matches!(outcome("signin", frame), Err(StoreError::Decode(_))));
+        assert!(matches!(
+            outcome("signin", frame),
+            Err(StoreError::Decode(_))
+        ));
         Ok(())
     }
 
@@ -477,7 +538,10 @@ mod tests {
         // provider's own refusal and never the absent-outcome refusal wearing a
         // null success.
         assert!(admitted(frame).is_ok());
-        assert!(matches!(outcome("query", frame), Err(StoreError::RpcError { .. })));
+        assert!(matches!(
+            outcome("query", frame),
+            Err(StoreError::RpcError { .. })
+        ));
         Ok(())
     }
 }
