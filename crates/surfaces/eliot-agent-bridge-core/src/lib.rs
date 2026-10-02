@@ -559,6 +559,35 @@ pub struct ActivationPortResult {
     cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
 }
 
+/// Authenticated application session result for session-level discovery when
+/// Governor has not selected a task. The Kernel still validates capability,
+/// deadline, request identity, current fence, and live revocation at every
+/// host-request use; this value alone grants no task or effect authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryPortResult {
+    principal_id: PrincipalId,
+    session_id: SessionId,
+    activation_generation: Generation,
+    state_fence: FencingToken,
+}
+
+impl DiscoveryPortResult {
+    pub fn authenticated(
+        principal_id: PrincipalId,
+        session_id: SessionId,
+        activation_generation: Generation,
+        state_fence: FencingToken,
+    ) -> Result<Self, BridgeError> {
+        validate_authority_binding(&session_id, activation_generation, &state_fence)?;
+        Ok(Self {
+            principal_id,
+            session_id,
+            activation_generation,
+            state_fence,
+        })
+    }
+}
+
 impl ActivationPortResult {
     #[allow(clippy::too_many_arguments)]
     pub fn authenticated(
@@ -832,6 +861,8 @@ impl fmt::Display for ActivationDenialReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActivationPortOutcome {
     Authenticated(ActivationPortResult),
+    /// Authenticated session with no selected task, limited to discovery.
+    AuthenticatedDiscovery(DiscoveryPortResult),
     /// I7.20 detailed denial carrying the disposition, the catalogue
     /// `reason_code`, and the directive triple plus the exact owner-issued
     /// denial detail. Fails closed via [`BridgeError::ActivationDenied`];
@@ -997,6 +1028,51 @@ pub struct AttachBinding {
     activation_generation: Generation,
     state_fence: FencingToken,
     task_binding: TaskBinding,
+}
+
+/// Read-only authenticated session binding for task-selection discovery.
+///
+/// It has no `TaskBinding`; consumers may use it only for the session-level
+/// `eliot.state` path whose capability, deadline, request digest, fence, and
+/// current revocation are checked by Kernel on each use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoveryAttachView {
+    principal_id: PrincipalId,
+    session_id: SessionId,
+    connection_id: ConnectionId,
+    activation_generation: Generation,
+    state_fence: FencingToken,
+}
+
+impl DiscoveryAttachView {
+    pub const fn principal_id(&self) -> &PrincipalId {
+        &self.principal_id
+    }
+
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub const fn connection_id(&self) -> &ConnectionId {
+        &self.connection_id
+    }
+
+    pub const fn activation_generation(&self) -> Generation {
+        self.activation_generation
+    }
+
+    pub const fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+}
+
+/// Attach result with the two authority levels kept explicit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttachOutcome {
+    /// Current authenticated semantic task binding.
+    TaskBound(AttachView),
+    /// Authenticated session-level discovery without selected task authority.
+    DiscoveryOnly(DiscoveryAttachView),
 }
 
 impl AttachBinding {
@@ -4252,6 +4328,7 @@ pub struct AgentBridgeCore {
     skill_lifecycle: Option<Box<dyn SkillLifecyclePort>>,
     cursor_policy: CursorPolicy,
     active: Option<ActiveAttach>,
+    active_discovery: Option<DiscoveryAttachView>,
     replay: ReplayLedger,
     acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
     pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
@@ -4284,6 +4361,7 @@ impl AgentBridgeCore {
             skill_lifecycle: None,
             cursor_policy,
             active: None,
+            active_discovery: None,
             replay: ReplayLedger::new(),
             acknowledged_phases: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
@@ -4302,6 +4380,20 @@ impl AgentBridgeCore {
     }
 
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
+        match self.attach_outcome(request)? {
+            AttachOutcome::TaskBound(view) => Ok(view),
+            AttachOutcome::DiscoveryOnly(_) => Err(BridgeError::InvalidTransition(
+                "task selection is required; only session-level state discovery is attached",
+            )),
+        }
+    }
+
+    /// Authenticates a bridge transport and retains either the existing
+    /// task-bound attach or the narrower no-task discovery session.
+    pub fn attach_outcome(
+        &mut self,
+        request: AttachRequest,
+    ) -> Result<AttachOutcome, BridgeError> {
         self.ensure_contracts()?;
         if !self.pending_deliveries.is_empty() {
             return Err(BridgeError::OutstandingDeliveryReconciliationRequired {
@@ -4314,6 +4406,43 @@ impl AgentBridgeCore {
         let activation = host.activate(&request)?;
         let grant = match activation {
             ActivationPortOutcome::Authenticated(result) => ActivationGrant::seal(result)?,
+            ActivationPortOutcome::AuthenticatedDiscovery(result) => {
+                validate_authority_binding(
+                    &result.session_id,
+                    result.activation_generation,
+                    &result.state_fence,
+                )?;
+                if let Some(current) = &self.active {
+                    if result.activation_generation <= current.binding.activation_generation {
+                        return Err(BridgeError::StaleAuthority);
+                    }
+                }
+                if let Some(current) = &self.active_discovery {
+                    if result.activation_generation < current.activation_generation
+                        || (result.activation_generation == current.activation_generation
+                            && (current.principal_id != result.principal_id
+                                || current.session_id != result.session_id
+                                || current.state_fence != result.state_fence
+                                || current.connection_id != request.connection_id))
+                    {
+                        return Err(BridgeError::StaleAuthority);
+                    }
+                    if result.activation_generation == current.activation_generation {
+                        return Ok(AttachOutcome::DiscoveryOnly(current.clone()));
+                    }
+                }
+                let view = DiscoveryAttachView {
+                    principal_id: result.principal_id,
+                    session_id: result.session_id,
+                    connection_id: request.connection_id,
+                    activation_generation: result.activation_generation,
+                    state_fence: result.state_fence,
+                };
+                self.active_discovery = Some(view.clone());
+                self.active = None;
+                self.reset_for_attach();
+                return Ok(AttachOutcome::DiscoveryOnly(view));
+            }
             ActivationPortOutcome::Denied(report) => {
                 return Err(BridgeError::ActivationDenied(report));
             }
@@ -4348,8 +4477,20 @@ impl AgentBridgeCore {
                         "transport replacement requires reconnect",
                     ));
                 }
-                return self.attach_view().ok_or(BridgeError::NotAttached);
+                return self
+                    .attach_view()
+                    .map(AttachOutcome::TaskBound)
+                    .ok_or(BridgeError::NotAttached);
             }
+        }
+        if let Some(current) = &self.active_discovery {
+            if grant.activation_generation < current.activation_generation
+                || !current.state_fence.matches(&grant.state_fence)
+                || current.session_id != grant.session_id
+            {
+                return Err(BridgeError::StaleAuthority);
+            }
+            self.active_discovery = None;
         }
         let active = ActiveAttach {
             binding: AttachBinding {
@@ -4366,6 +4507,13 @@ impl AgentBridgeCore {
             cold_start_question: grant.cold_start_question,
         };
         self.active = Some(active);
+        self.reset_for_attach();
+        self.attach_view()
+            .map(AttachOutcome::TaskBound)
+            .ok_or(BridgeError::NotAttached)
+    }
+
+    fn reset_for_attach(&mut self) {
         self.replay = ReplayLedger::new();
         self.acknowledged_phases.clear();
         self.acknowledged_out_of_order.clear();
@@ -4379,7 +4527,6 @@ impl AgentBridgeCore {
         self.stale_ui_disposition = None;
         self.error_event_refs.clear();
         self.resources.clear();
-        self.attach_view().ok_or(BridgeError::NotAttached)
     }
 
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
@@ -5111,6 +5258,13 @@ impl AgentBridgeCore {
                 .map(|_| ProofCeiling::CandidateOnly),
             cold_start_question: active.cold_start_question.clone(),
         })
+    }
+
+    /// Returns the authenticated taskless session binding used solely for
+    /// session-level discovery. Ordinary task-bound forwarding never consumes
+    /// this view.
+    pub fn discovery_attach_view(&self) -> Option<DiscoveryAttachView> {
+        self.active_discovery.clone()
     }
 
     /// Forwards only the session-scoped host observation admitted by the

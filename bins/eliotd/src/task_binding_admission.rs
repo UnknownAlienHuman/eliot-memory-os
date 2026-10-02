@@ -243,16 +243,23 @@ use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
 };
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{
+    CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, IndependenceLevel,
+    InstructionTaint, IntegrityStatus, PrivacyClass, QuarantineState, SourceAssurance,
+};
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     AuthorityBasis, BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey,
     DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate,
     GoverningSourceCandidateEvidence, GoverningSourceRole, ManifestEvidence,
-    NewTaskIntake, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    NewSourceCandidate, NewTaskIntake, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
     PrecedenceDeclaration, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
     TaskBindingState, TaskIntakeCandidate, TaskIntakeOrigin, issue_discovery_lease,
     task_selection_required,
+};
+
+use eliot_platform_windows::{
+    UserSelectedResourceKind, UserSelectedResourceLease, UserSelectedResourceMeasurement,
 };
 
 /// Caller declarations for a source candidate. These are claims only; the
@@ -325,7 +332,7 @@ pub struct ExplicitColdStartOwnerInput<'a> {
     pub expected_candidates: Option<&'a [GoverningSourceCandidateEvidence]>,
     /// Exact discovery lease that authorized the current source-content
     /// snapshot. A name-only scan is not source evidence.
-    pub discovery_lease: Option<&'a DiscoveryReadLease>,
+    pub discovery_lease: Option<&'a mut DiscoveryReadLease>,
     /// Current owner privacy policy for the scope.
     pub privacy: &'a PrivacyProfile,
     pub scope_ref: &'a str,
@@ -333,6 +340,252 @@ pub struct ExplicitColdStartOwnerInput<'a> {
     pub explicit_root_identity_ref: &'a str,
     pub generation: u64,
     pub expires_at: u64,
+}
+
+/// Maximum bytes read from one explicitly selected bootstrap source.
+/// This is the existing bounded source-material ceiling used by daemon
+/// orientation intake; request JSON cannot raise it.
+pub const MAX_EXPLICIT_SOURCE_SNAPSHOT_BYTES: u64 = 64 * 1024;
+
+/// One retained physical source selection associated with an exact name-only
+/// candidate. The lease was opened with `open_for_source_snapshot` against
+/// the authenticated explicit root; no pathname is reopened here.
+pub struct ExplicitSourceSnapshotLease<'a> {
+    pub source_ref: &'a str,
+    pub lease: &'a UserSelectedResourceLease,
+}
+
+/// Reads and admits explicit source content from retained same-handle leases,
+/// then runs the ordinary SourceAdmission owner-input builder over those
+/// independently measured candidates. `owner_root` is the current physical
+/// root measurement from the live WorkScope owner; request paths and scanner
+/// names cannot replace it. `owner_candidates` on `input` contributes only
+/// authenticated per-source domain/privacy metadata and exact discovery
+/// lineage, never the digest or integrity result.
+pub fn build_explicit_source_admission_request_from_snapshots(
+    input: &mut ExplicitColdStartOwnerInput<'_>,
+    selected_sources: &[ExplicitSourceSnapshotLease<'_>],
+    owner_root: &UserSelectedResourceMeasurement,
+) -> Result<eliot_workscope::SourceAdmissionRequest, TaskBindingError> {
+    if input.request.sources.is_empty() {
+        if !selected_sources.is_empty() {
+            return Err(TaskBindingError::scope_incompatible(
+                "source-free intake supplied selected file leases",
+            ));
+        }
+        return build_explicit_source_admission_request_inner(input, &[]);
+    }
+    if input.now == 0
+        || owner_root.object_kind != UserSelectedResourceKind::Directory
+        || owner_root.network
+        || owner_root.device
+        || !owner_root.reparse_free
+        || owner_root.measured_at_unix_ms.is_none()
+        || selected_sources.len() != input.request.sources.len()
+        || input.request.sources.len() > eliot_workscope::MAX_DISCOVERY_CONSUMPTION as usize
+        || owner_root.object_identity.file_index == 0
+        || owner_root.object_identity.volume_serial_number == 0
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "explicit source snapshots are not covered by a fresh bounded physical root read",
+        ));
+    }
+    if input.discovery_lease.is_none() {
+        return Err(TaskBindingError::scope_incompatible(
+            "explicit source snapshots have no live discovery lease",
+        ));
+    }
+    let declared_refs: std::collections::BTreeSet<_> = input
+        .request
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    let owner_refs: std::collections::BTreeSet<_> = input
+        .owner_candidates
+        .iter()
+        .map(|candidate| candidate.source_ref.as_str())
+        .collect();
+    if owner_refs.len() != input.owner_candidates.len() || owner_refs != declared_refs {
+        return Err(TaskBindingError::selection_required(
+            "live owner domain/privacy records must exactly cover every declared source once",
+        ));
+    }
+
+    let mut selected_by_ref = std::collections::BTreeMap::new();
+    for selected in selected_sources {
+        if selected.source_ref.trim().is_empty()
+            || selected_by_ref
+                .insert(selected.source_ref, selected.lease)
+                .is_some()
+        {
+            return Err(TaskBindingError::selection_required(
+                "explicit source leases contain an empty or duplicate source identity",
+            ));
+        }
+    }
+
+    let mut expanded = Vec::with_capacity(input.request.sources.len());
+    for declared in &input.request.sources {
+        let selected = selected_by_ref.get(declared.source_ref.as_str()).ok_or_else(|| {
+            TaskBindingError::selection_required(
+                "an explicitly declared source has no retained selected-file lease",
+            )
+        })?;
+        let mut templates = input
+            .owner_candidates
+            .iter()
+            .filter(|candidate| candidate.source_ref == declared.source_ref);
+        let template = templates.next().ok_or_else(|| {
+                TaskBindingError::selection_required(
+                    "an explicitly declared source has no live owner domain/privacy read",
+                )
+            })?;
+        if templates.next().is_some() {
+            return Err(TaskBindingError::selection_required(
+                "an explicitly declared source has ambiguous owner domain/privacy records",
+            ));
+        }
+        if template.role != declared.role
+            || template.applicable_scope_ref != input.scope_ref
+            || template.applicable_generation != input.generation
+            || template.domains != declared.domains
+            || template.assurance.source_ref != declared.source_ref
+            || template.domains.is_empty()
+            || template.assurance.state_fence != *input.live_fence
+            || !input
+                .privacy
+                .admitted_classes
+                .contains(&template.assurance.privacy_class)
+            || template.domains.iter().any(|domain| {
+                domain.state_fence != *input.live_fence
+                    || !input.privacy.admitted_classes.contains(&domain.privacy_class)
+            })
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "source declaration differs from live owner role, scope, fence, or privacy metadata",
+            ));
+        }
+        let (discovery_lease_ref, discovery_root_ref) = input
+            .discovery_lease
+            .as_deref()
+            .map(|lease| (lease.lease_ref.clone(), lease.candidate_root_ref.clone()))
+            .ok_or_else(|| {
+            TaskBindingError::scope_incompatible("live discovery lease disappeared")
+        })?;
+        if !matches!(
+            &template.origin,
+            eliot_workscope::SourceCandidateOrigin::DiscoveryLease { lease_ref }
+                if lease_ref == &discovery_lease_ref
+                    && discovery_root_ref == input.explicit_root_identity_ref
+        ) {
+            return Err(TaskBindingError::scope_incompatible(
+                "source owner metadata is not bound to the exact explicit root discovery lease",
+            ));
+        }
+
+        input
+            .discovery_lease
+            .as_deref()
+            .ok_or_else(|| {
+                TaskBindingError::scope_incompatible("live discovery lease disappeared")
+            })?
+            .authorize(DiscoveryRead::GoverningSourceCandidates, input.now)
+            .map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "source snapshot is outside its discovery lease: {error:?}"
+                ))
+            })?;
+        let snapshot_result = selected.read_bounded_snapshot(MAX_EXPLICIT_SOURCE_SNAPSHOT_BYTES);
+        input
+            .discovery_lease
+            .as_deref_mut()
+            .ok_or_else(|| {
+                TaskBindingError::scope_incompatible("live discovery lease disappeared")
+            })?
+            .charge(DiscoveryRead::GoverningSourceCandidates, input.now)
+            .map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "source snapshot did not consume its discovery lease: {error:?}"
+                ))
+            })?;
+        let (bytes, before, after) = snapshot_result.map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "selected source could not be read from its retained handle: {error}"
+                ))
+            })?;
+        if before.root_identity != owner_root.object_identity
+            || after.root_identity != owner_root.object_identity
+            || before.object_kind != UserSelectedResourceKind::File
+            || after.object_kind != UserSelectedResourceKind::File
+            || before.network
+            || after.network
+            || before.device
+            || after.device
+            || !before.reparse_free
+            || !after.reparse_free
+            || before.object_identity != after.object_identity
+            || before.ancestor_contour != after.ancestor_contour
+            || before.file_size_bytes != after.file_size_bytes
+            || before.last_write_filetime_100ns != after.last_write_filetime_100ns
+            || before.metadata_change_time_filetime_100ns
+                != after.metadata_change_time_filetime_100ns
+            || before.directory_generation != after.directory_generation
+            || before.file_size_bytes != Some(bytes.len() as u64)
+            || before.last_write_filetime_100ns.is_none()
+            || before.metadata_change_time_filetime_100ns.is_none()
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "selected source bytes do not match the exact stable live root/object measurement",
+            ));
+        }
+        let observed_digest = sha256_hex(&bytes);
+        if observed_digest != declared.digest {
+            return Err(TaskBindingError::scope_incompatible(
+                "selected source snapshot digest differs from the original source declaration",
+            ));
+        }
+
+        let assurance = SourceAssurance {
+            source_ref: declared.source_ref.clone(),
+            provenance_ref: template.assurance.provenance_ref.clone(),
+            integrity: IntegrityStatus::Verified,
+            freshness: FreshnessStatus::Current,
+            competence: CompetenceLevel::Unknown,
+            independence: IndependenceLevel::Unknown,
+            privacy_class: template.assurance.privacy_class,
+            instruction_taint: InstructionTaint::Untrusted,
+            allowed_epistemic_use: vec![EpistemicUse::AttributedInput, EpistemicUse::CandidateEvidence],
+            allowed_effects: vec![
+                EffectCeiling::ReadOnly,
+                EffectCeiling::CandidateOnly,
+                EffectCeiling::NoExternalEffect,
+            ],
+            required_verifier: None,
+            quarantine: QuarantineState::ReviewRequired,
+            state_fence: input.live_fence.clone(),
+        };
+        let candidate = GoverningSourceCandidate {
+                source_ref: declared.source_ref.clone(),
+                digest: observed_digest,
+                role: declared.role,
+                origin: eliot_workscope::SourceCandidateOrigin::DiscoveryLease {
+                    lease_ref: discovery_lease_ref,
+                },
+                applicable_scope_ref: input.scope_ref.to_owned(),
+                applicable_generation: input.generation,
+                assurance,
+                domains: template.domains.clone(),
+                claim: declared.claim.clone(),
+            };
+        candidate.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "retained source snapshot failed discovery candidate validation: {error}"
+            ))
+        })?;
+        expanded.push(candidate);
+    }
+    build_explicit_source_admission_request_inner(input, &expanded)
 }
 
 /// Parses the exact `arguments.bootstrap` JSON object. Unknown keys are
@@ -350,7 +603,19 @@ pub fn parse_explicit_cold_start_bootstrap(
 /// Builds owner-admission input from declared source claims and exact current
 /// owner readbacks. No claim field is treated as authenticated by parsing.
 pub fn build_explicit_source_admission_request(
-    input: &ExplicitColdStartOwnerInput<'_>,
+    input: &mut ExplicitColdStartOwnerInput<'_>,
+) -> Result<eliot_workscope::SourceAdmissionRequest, TaskBindingError> {
+    if !input.request.sources.is_empty() {
+        return Err(TaskBindingError::selection_required(
+            "explicit source content requires bounded same-handle snapshot admission",
+        ));
+    }
+    build_explicit_source_admission_request_inner(input, &[])
+}
+
+fn build_explicit_source_admission_request_inner(
+    input: &mut ExplicitColdStartOwnerInput<'_>,
+    expanded_owner_candidates: &[GoverningSourceCandidate],
 ) -> Result<eliot_workscope::SourceAdmissionRequest, TaskBindingError> {
     if input.now == 0
         || input.expires_at < input.now
@@ -418,20 +683,6 @@ pub fn build_explicit_source_admission_request(
     }
 
     let mut candidates = Vec::with_capacity(input.request.sources.len());
-    if !input.request.sources.is_empty() {
-        let lease = input.discovery_lease.ok_or_else(|| {
-            TaskBindingError::scope_incompatible(
-                "explicit source content has no live discovery-lease owner read",
-            )
-        })?;
-        lease
-            .authorize(DiscoveryRead::GoverningSourceCandidates, input.now)
-            .map_err(|error| {
-                TaskBindingError::scope_incompatible(format!(
-                    "explicit source content is outside its live discovery lease: {error:?}"
-                ))
-            })?;
-    }
     for declared in &input.request.sources {
         if let Some(AuthorityBasis::HumanOwner { owner_ref }) = &declared.claim {
             if owner_ref != input.required_owner_ref {
@@ -440,7 +691,7 @@ pub fn build_explicit_source_admission_request(
                 ));
             }
         }
-        let mut matches = input.owner_candidates.iter().filter(|candidate| {
+        let mut matches = expanded_owner_candidates.iter().filter(|candidate| {
             candidate.source_ref == declared.source_ref
                 && candidate.digest == declared.digest
                 && candidate.role == declared.role
@@ -463,7 +714,7 @@ pub fn build_explicit_source_admission_request(
                 "source owner candidate failed its original validation: {error}"
             ))
         })?;
-        let lease = input.discovery_lease.ok_or_else(|| {
+        let lease = input.discovery_lease.as_deref().ok_or_else(|| {
             TaskBindingError::scope_incompatible(
                 "explicit source content has no live discovery-lease owner read",
             )
@@ -514,12 +765,11 @@ pub fn build_explicit_source_admission_request(
             "explicit source declarations contain duplicate source identities",
         ));
     }
-    let owner_refs: std::collections::BTreeSet<_> = input
-        .owner_candidates
+    let owner_refs: std::collections::BTreeSet<_> = expanded_owner_candidates
         .iter()
         .map(|candidate| candidate.source_ref.as_str())
         .collect();
-    if owner_refs.len() != input.owner_candidates.len() || declared_refs != owner_refs {
+    if owner_refs.len() != expanded_owner_candidates.len() || declared_refs != owner_refs {
         return Err(TaskBindingError::scope_incompatible(
             "declared source identities must exactly cover unique live owner candidates",
         ));

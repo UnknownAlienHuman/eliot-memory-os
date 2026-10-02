@@ -3957,6 +3957,7 @@ impl KernelComposition {
                                 "envelope": read.envelope,
                                 "tool": read.tool,
                                 "attempt": read.attempt,
+                                "authenticated_owner_ref": read.authenticated_owner_ref,
                             } },
                             "recovery": null,
                         }),

@@ -127,6 +127,11 @@ pub enum UserSelectedResourceError {
     Io,
     /// The one-shot at-use remeasurement has already been attempted.
     AlreadyRemeasured,
+    /// The selected lease was opened for metadata-only observation rather
+    /// than a bounded source-byte snapshot.
+    SourceSnapshotLeaseRequired,
+    /// The selected regular file is larger than the caller's explicit byte bound.
+    SizeExceeded,
     /// The physical owner is available only on Windows.
     UnsupportedPlatform,
 }
@@ -141,6 +146,10 @@ impl std::fmt::Display for UserSelectedResourceError {
             Self::IdentityMismatch => "selected resource identity changed",
             Self::Io => "selected resource handle measurement failed",
             Self::AlreadyRemeasured => "selected resource at-use remeasurement was consumed",
+            Self::SourceSnapshotLeaseRequired => {
+                "selected file lease was not opened for a bounded source snapshot"
+            }
+            Self::SizeExceeded => "selected file exceeds the explicit read bound",
             Self::UnsupportedPlatform => "selected resource leases require Windows",
         })
     }
@@ -172,6 +181,8 @@ pub struct UserSelectedResourceLease {
     volume_root: PathBuf,
     #[cfg(windows)]
     remeasure_consumed: bool,
+    #[cfg(windows)]
+    source_snapshot_readable: bool,
 }
 
 impl std::fmt::Debug for UserSelectedResourceLease {
@@ -183,6 +194,7 @@ impl std::fmt::Debug for UserSelectedResourceLease {
                 .field("retained_directory_count", &self.directories.len())
                 .field("object_kind", &self.object_kind)
                 .field("remeasure_consumed", &self.remeasure_consumed)
+                .field("source_snapshot_readable", &self.source_snapshot_readable)
                 .finish_non_exhaustive()
         }
         #[cfg(not(windows))]
@@ -213,7 +225,27 @@ impl UserSelectedResourceLease {
     ) -> Result<(Self, UserSelectedResourceMeasurement), UserSelectedResourceError> {
         #[cfg(windows)]
         {
-            open_user_selected_resource(root, object)
+            open_user_selected_resource(root, object, false)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (root, object);
+            Err(UserSelectedResourceError::UnsupportedPlatform)
+        }
+    }
+
+    /// Opens an explicit source selection with the same no-follow retained
+    /// contour as [`Self::open`], but opens a selected regular file with
+    /// write/delete sharing denied so its bytes can be snapshotted later from
+    /// that exact retained handle. Directory and metadata-only callers should
+    /// continue using [`Self::open`].
+    pub fn open_for_source_snapshot(
+        root: &Path,
+        object: &Path,
+    ) -> Result<(Self, UserSelectedResourceMeasurement), UserSelectedResourceError> {
+        #[cfg(windows)]
+        {
+            open_user_selected_resource(root, object, true)
         }
         #[cfg(not(windows))]
         {
@@ -276,6 +308,9 @@ impl UserSelectedResourceLease {
         {
             if self.object_kind != UserSelectedResourceKind::File {
                 return Err(UserSelectedResourceError::InvalidPath);
+            }
+            if !self.source_snapshot_readable {
+                return Err(UserSelectedResourceError::SourceSnapshotLeaseRequired);
             }
             let before = measure_user_selected_resource(self)?;
             let expected_size = before
@@ -350,6 +385,7 @@ impl UserSelectedResourceLease {
 fn open_user_selected_resource(
     root: &Path,
     object: &Path,
+    source_snapshot_readable: bool,
 ) -> Result<(UserSelectedResourceLease, UserSelectedResourceMeasurement), UserSelectedResourceError>
 {
     let selected_root = normalize_user_selected_path(root)?;
@@ -388,9 +424,12 @@ fn open_user_selected_resource(
                 (UserSelectedResourceKind::Directory, None)
             }
             Err(ProtectedPathError::InvalidPath) => {
-                let (identity, handle) =
+                let (identity, handle) = if source_snapshot_readable {
                     open_user_selected_file_deny_write_delete(&selected_object.path)
-                        .map_err(map_selected_resource_path_error)?;
+                } else {
+                    crate::open_no_follow_file(&selected_object.path)
+                }
+                .map_err(map_selected_resource_path_error)?;
                 if identity.volume_serial_number != contour.volume_identity.volume_serial_number {
                     return Err(UserSelectedResourceError::IdentityMismatch);
                 }
@@ -421,6 +460,7 @@ fn open_user_selected_resource(
         object_kind,
         volume_root: contour.volume_root,
         remeasure_consumed: false,
+        source_snapshot_readable,
     };
     let measurement = measure_user_selected_resource(&lease)?;
     Ok((lease, measurement))
@@ -853,6 +893,78 @@ fn measure_user_selected_resource(
         reparse_free: true,
         measured_at_unix_ms,
     })
+}
+
+#[cfg(all(test, windows))]
+mod source_snapshot_tests {
+    use super::{UserSelectedResourceError, UserSelectedResourceKind, UserSelectedResourceLease};
+    use std::io::Write;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn explicit_source_snapshot_is_bounded_and_retained_handle_is_write_delete_exclusive() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eliot-user-selected-source-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("create private test directory");
+        let _cleanup = TestDirectory(root.clone());
+        let path = root.join("source.txt");
+        let expected = b"retained source bytes for issue 1746";
+        let limit = u64::try_from(expected.len()).expect("test source length fits u64");
+        std::fs::File::create(&path)
+            .expect("create source file")
+            .write_all(expected)
+            .expect("write source fixture");
+
+        let (metadata_lease, _) = UserSelectedResourceLease::open(&root, &path)
+            .expect("metadata-only lease preserves ordinary file selection");
+        assert_eq!(
+            metadata_lease.read_bounded_snapshot(1024).expect_err("metadata-only leases do not become source readers"),
+            UserSelectedResourceError::SourceSnapshotLeaseRequired,
+        );
+        drop(metadata_lease);
+
+        let (lease, opened) = UserSelectedResourceLease::open_for_source_snapshot(&root, &path)
+            .expect("explicit source lease denies concurrent mutation");
+        let (bytes, before, after) = lease
+            .read_bounded_snapshot(limit)
+            .expect("bounded bytes read from the retained handle");
+        assert_eq!(bytes.as_slice(), expected.as_slice());
+        assert_eq!(before.object_identity, opened.object_identity);
+        assert_eq!(before.object_kind, UserSelectedResourceKind::File);
+        assert_eq!(before.file_size_bytes, Some(limit));
+        assert_eq!(before.object_identity, after.object_identity);
+        assert_eq!(before.ancestor_contour, after.ancestor_contour);
+        assert_eq!(before.file_size_bytes, after.file_size_bytes);
+        assert_eq!(before.last_write_filetime_100ns, after.last_write_filetime_100ns);
+        assert_eq!(before.metadata_change_time_filetime_100ns, after.metadata_change_time_filetime_100ns);
+        assert_eq!(
+            lease.read_bounded_snapshot(limit - 1).expect_err("caller limit is enforced before reading"),
+            UserSelectedResourceError::SizeExceeded,
+        );
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&path).is_err(),
+            "the retained source handle denies new write access",
+        );
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "the retained source handle denies delete sharing",
+        );
+        drop(lease);
+        std::fs::remove_file(&path).expect("remove source after lease release");
+    }
 }
 
 impl std::fmt::Debug for UserOwnedRootReadLease {

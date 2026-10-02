@@ -2967,6 +2967,49 @@ impl AgentBridgeAuthenticatedBinding {
     }
 }
 
+/// Authenticated application session that has no selected task and is
+/// therefore limited to the session-level `eliot.state` discovery read.
+///
+/// The activation result carries no task, WorkScope, plan, or effect authority.
+/// Capability, expiry, and revocation are revalidated by Kernel against the
+/// exact host-request envelope at each use; these session facts only bind the
+/// discovery connection to the authenticated principal and current fence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentBridgeDiscoveryBinding {
+    /// Resolved semantic principal identity.
+    pub principal_id: String,
+    /// Resolved semantic Session identity.
+    pub session_id: String,
+    /// Resolver-issued activation generation.
+    pub activation_generation: ResourceGeneration,
+    /// Resolver-issued semantic fence.
+    pub state_fence: AgentBridgeActivationFence,
+}
+
+impl AgentBridgeDiscoveryBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        bounded_text(
+            &self.principal_id,
+            "agent_bridge_activation_response.discovery.principal_id",
+            512,
+        )?;
+        bounded_text(
+            &self.session_id,
+            "agent_bridge_activation_response.discovery.session_id",
+            512,
+        )?;
+        self.state_fence.validate()?;
+        if self.activation_generation != self.state_fence.generation {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.discovery.activation_generation",
+                reason: "must match the semantic state fence generation",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Typed reason why an admitted bridge transport cannot be activated.
 ///
 /// The six disposition codes project the exact daemon-owned
@@ -3028,6 +3071,12 @@ pub enum AgentBridgeActivationDisposition {
         /// Complete resolver-owned semantic binding.
         binding: Box<AgentBridgeAuthenticatedBinding>,
     },
+    /// Authenticated session-level discovery when semantic task selection is
+    /// unresolved. This result authorizes no task-bound operation.
+    AuthenticatedDiscovery {
+        /// Principal, Session, and current fence from the semantic owner.
+        binding: Box<AgentBridgeDiscoveryBinding>,
+    },
     /// Typed fail-closed outcome with no semantic binding.
     ///
     /// Carries the denial code plus the exact owner-issued denial detail:
@@ -3051,6 +3100,7 @@ impl AgentBridgeActivationDisposition {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Authenticated { binding } => binding.validate(),
+            Self::AuthenticatedDiscovery { binding } => binding.validate(),
             Self::Denied {
                 reason_code,
                 detail,
@@ -3296,6 +3346,12 @@ pub enum OpenAgentBridgeActivationDisposition {
         /// Complete owner-produced activation binding.
         binding: Box<AgentBridgeAuthenticatedBinding>,
     },
+    /// Authenticated session-level discovery when semantic task selection is
+    /// unresolved. This result authorizes no task-bound operation.
+    AuthenticatedDiscovery {
+        /// Principal, Session, and current fence from the semantic owner.
+        binding: Box<AgentBridgeDiscoveryBinding>,
+    },
     /// Existing known-denial wire form, kept byte-compatible with the closed
     /// transport code used by current Kernel producers.
     Denied {
@@ -3322,6 +3378,7 @@ impl OpenAgentBridgeActivationDisposition {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Authenticated { binding } => binding.validate(),
+            Self::AuthenticatedDiscovery { binding } => binding.validate(),
             Self::Denied {
                 reason_code,
                 detail,

@@ -23,7 +23,7 @@ use eliot_ors::{
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     PreparedTransition, RevisionHeadExpectation, ScopeId, ScopeRevisionView, StoreHealth,
-    WriteReceipt,
+    WriteReceipt, WriteReceiptStatus,
 };
 use eliot_workscope::{
     InstallationScanContour, OnboardingLease, OnboardingLeaseState, OnboardingReadinessReceipt,
@@ -33,6 +33,21 @@ use eliot_workscope::{
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 const INSTALLATION: &str = "install-1746";
+const OWNER_DEADLINE_WINDOW_MS: u64 = 3_600_000;
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_millis(),
+    )
+    .expect("Unix milliseconds fit in u64")
+}
+
+fn owner_deadline() -> u64 {
+    now_unix_ms() + OWNER_DEADLINE_WINDOW_MS
+}
 
 fn fence() -> StateFence {
     StateFence::new(
@@ -49,6 +64,8 @@ struct TestKernel {
     snapshot: KernelGenerationSnapshot,
     payloads: BTreeMap<RecoveryOwner, Vec<u8>>,
     acceptance: Mutex<Option<eliot_store_api::TaskContractAcceptanceSet>>,
+    task_bound_calls: Mutex<Vec<(eliot_contracts::OperationId, String, eliot_observation::TaskSelectionEvidence, eliot_observation::CurrentTaskSelection)>>,
+    task_bound_receipts: Mutex<Vec<WriteReceipt>>,
 }
 
 impl KernelGenerationSnapshotProvider for TestKernel {
@@ -66,7 +83,9 @@ impl KernelTransitionPort for TestKernel {
         Box::pin(async { Err(KernelPortError::NotAdmitted("readback fixture".to_owned())) })
     }
     fn receipt(&self, _operation_id: eliot_contracts::OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
-        Box::pin(async { Ok(None) })
+        let receipt = self.task_bound_receipts.lock().expect("receipt lock").iter()
+            .find(|receipt| receipt.operation_id == _operation_id).cloned();
+        Box::pin(async move { Ok(receipt) })
     }
     fn health(&self) -> KernelPortFuture<'_, StoreHealth> {
         Box::pin(async { Err(KernelPortError::NotAdmitted("readback fixture".to_owned())) })
@@ -80,6 +99,82 @@ impl KernelTransitionPort for TestKernel {
         let result = self.acceptance.lock().expect("acceptance lock").clone().filter(|set| {
             set.task_id == *task_id && set.task_revision == task_revision && set.read_state_fence == *state_fence
         }).ok_or_else(|| KernelPortError::NotAdmitted("test has no matching task contract acceptance set".to_owned()));
+        Box::pin(async move { result })
+    }
+
+    fn apply_prepared_with_task_selection<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
+        claim: &'a ColdStartReadinessClaim,
+        owner_readback: &'a eliot_governor::ColdStartOwnerReadback,
+        selection: &'a eliot_observation::TaskSelectionEvidence,
+        current: &'a eliot_observation::CurrentTaskSelection,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let result = (|| {
+            if owner_readback.record.claim != *claim
+                || selection.task_ref != current.task_ref
+                || selection.task_revision != current.task_revision
+                || selection.acceptance_digest != current.acceptance_digest
+                || selection.work_scope_ref != current.work_scope_ref
+                || transition.task_id.as_deref() != Some(selection.task_ref.as_str())
+                || transition.scope_id.as_str() != selection.work_scope_ref
+                || transition.state_fence != current.state_fence
+            {
+                return Err(KernelPortError::NotAdmitted(
+                    "test Kernel rejected a task-bound handoff mismatch".to_owned(),
+                ));
+            }
+            identity.validate().map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            transition.validate().map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let mut candidate = WriteReceipt {
+                operation_id: transition.identity.operation_id.clone(),
+                idempotency_key: transition.identity.idempotency_key.clone(),
+                canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+                transition_class: transition.transition_class,
+                status: WriteReceiptStatus::Committed,
+                commit_id: Some(eliot_store_api::CommitId::new(format!("commit-{}", transition.identity.operation_id)).map_err(|error| KernelPortError::Contract(error.to_string()))?),
+                state_fence: transition.state_fence.clone(),
+                ordering_sequences: Vec::new(),
+                revision_before_after: Vec::new(),
+                applied_command_ids: vec!["task-bound-effect-1746".to_owned()],
+                emitted_event_ids: Vec::new(),
+                projection_refs: Vec::new(),
+                outbox_refs: Vec::new(),
+                operation_manifest_digest: transition.operation_manifest_digest.clone(),
+                admission_digest: transition.admission_digest.clone(),
+                mutation_plan_digest: transition.mutation_plan_digest.clone(),
+                semantic_source_revisions: transition.semantic_source_revisions.clone(),
+                policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(&transition),
+                error_code: None,
+                resubmission: eliot_store_api::Resubmission::None,
+                committed_at: Some("test-owner-commit-1746".to_owned()),
+                envelope: None,
+            };
+            candidate.validate().map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let envelope = eliot_store_api::issue_store_receipt_envelope(
+                &identity.request.metadata,
+                &transition,
+                &candidate,
+                1,
+            ).map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            candidate.envelope = Some(envelope);
+            eliot_store_api::validate_store_receipt_envelope(
+                &identity.request.metadata,
+                &transition,
+                &candidate,
+            ).map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            self.task_bound_calls.lock().expect("effect lock").push((
+                transition.identity.operation_id.clone(),
+                claim.binding_digest.clone(),
+                selection.clone(),
+                current.clone(),
+            ));
+            self.task_bound_receipts.lock().expect("receipt lock").push(candidate.clone());
+            Ok(candidate)
+        })();
         Box::pin(async move { result })
     }
 }
@@ -141,6 +236,8 @@ fn kernel_with_current_task(snapshot: KernelGenerationSnapshot) -> TestKernel {
     use eliot_session::SessionLifecycleSnapshot;
     use eliot_task::{TaskLifecycleEvent, TaskLifecycleSnapshot, TaskRecord, TaskState};
     let state_fence = snapshot.state_fence();
+    let owner_now = now_unix_ms();
+    let owner_deadline = owner_now + OWNER_DEADLINE_WINDOW_MS;
     let mut payloads = BTreeMap::new();
     let mut task = TaskLifecycleSnapshot { next_sequence: 2, tasks: BTreeMap::new(), events: Vec::new(), professional_execution: BTreeMap::new() };
     let task_id = TaskId::new("task-1746").expect("task id");
@@ -161,11 +258,11 @@ fn kernel_with_current_task(snapshot: KernelGenerationSnapshot) -> TestKernel {
         request_id: "session-register-1746".to_owned(), event_id: "session-event-1746".to_owned(), session_id: session_id.clone(),
         agent_id: "agent-1746".to_owned(), model_route: "route-1746".to_owned(), harness: "harness-1746".to_owned(), role: "worker".to_owned(),
         project_scope: "scope-1746".to_owned(), task_scope: Some(task_id.as_str().to_owned()), capability_profile_id: "capability-1746".to_owned(),
-        parent_session_id: None, policy_snapshot_id: "policy-1".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: 1, expires_at: 100,
+        parent_session_id: None, policy_snapshot_id: "policy-1".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: owner_now, expires_at: owner_deadline,
     }).expect("session register");
     sessions.apply(session_id, SessionCommandContext {
         request_id: "session-activate-1746".to_owned(), event_id: "session-activate-event-1746".to_owned(), actor_ref: "agent-1746".to_owned(),
-        state_fence: state_fence.clone(), authority_epoch: state_fence.authority_epoch.clone(), observed_at: ClockReading::default(), now: 2,
+        state_fence: state_fence.clone(), authority_epoch: state_fence.authority_epoch.clone(), observed_at: ClockReading::default(), now: owner_now + 1,
     }, SessionCommand::Activate).expect("session activation");
     let session_snapshot: SessionLifecycleSnapshot = sessions.snapshot();
     payloads.insert(RecoveryOwner::Session, canonical_json_bytes(&session_snapshot).expect("session owner bytes"));
@@ -173,7 +270,7 @@ fn kernel_with_current_task(snapshot: KernelGenerationSnapshot) -> TestKernel {
     let mut coordination = CoordinationOwner::new();
     coordination.register_session(CoordinationRegisterSession {
         request_id: "coord-session-1746".to_owned(), session_id: "session-1746".to_owned(), principal_id: "principal-1746".to_owned(),
-        route_ref: "route-1746".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: 1, heartbeat_deadline: 100,
+        route_ref: "route-1746".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: owner_now, heartbeat_deadline: owner_deadline,
     }).expect("coordination session");
     coordination.register_work(WorkItem {
         work_item_id: "work-1746".to_owned(), task_id: "task-1746".to_owned(), state: WorkState::Ready, state_fence: state_fence.clone(),
@@ -181,7 +278,7 @@ fn kernel_with_current_task(snapshot: KernelGenerationSnapshot) -> TestKernel {
     }, "work-request-1746", "principal-1746", ClockReading::default()).expect("work item");
     coordination.acquire_work(WorkLeaseRequest {
         request_id: "work-lease-1746".to_owned(), lease_id: "lease-work-1746".to_owned(), work_item_id: "work-1746".to_owned(),
-        session_id: "session-1746".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: 2, lease_duration: 50,
+        session_id: "session-1746".to_owned(), authority_epoch: state_fence.authority_epoch.clone(), state_fence: state_fence.clone(), now: owner_now + 1, lease_duration: OWNER_DEADLINE_WINDOW_MS,
     }).expect("work lease");
     payloads.insert(RecoveryOwner::Coordination, canonical_json_bytes(&coordination).expect("coordination bytes"));
 
@@ -202,7 +299,13 @@ fn kernel_with_current_task(snapshot: KernelGenerationSnapshot) -> TestKernel {
         task_id: TaskId::new("task-1746").expect("task id"), task_revision: 1, acceptance_digest: "a".repeat(64),
         items: vec![eliot_store_api::TaskContractAcceptanceItem { item_id: "acceptance-1746".to_owned(), description: "dispatch remains bound to the current task".to_owned(), required_evidence: eliot_store_api::TaskContractAcceptanceEvidence::Observation }],
     };
-    TestKernel { snapshot, payloads, acceptance: Mutex::new(Some(acceptance)) }
+    TestKernel {
+        snapshot,
+        payloads,
+        acceptance: Mutex::new(Some(acceptance)),
+        task_bound_calls: Mutex::new(Vec::new()),
+        task_bound_receipts: Mutex::new(Vec::new()),
+    }
 }
 
 fn owner_payload(owner: RecoveryOwner, state_fence: &StateFence, protected: &str) -> Vec<u8> {
@@ -256,7 +359,7 @@ fn valid_record() -> ColdStartReadinessOrsRecord {
     use eliot_security_contracts::PrivacyClass;
     use eliot_workscope::{MemoryState, RepositoryLineageIdentity, WorkspaceInstanceIdentity};
     let state_fence = fence();
-    let lease = OnboardingLease { lease_ref: "lease-1746".to_owned(), lineage_candidate_ref: "lineage-1746".to_owned(), workspace_instance_candidate_ref: "instance-1746".to_owned(), privacy_class: PrivacyClass::Internal, governing_source_generation: 1, compiler_epoch: 1, state: OnboardingLeaseState::Ready, deadline: 100 };
+    let lease = OnboardingLease { lease_ref: "lease-1746".to_owned(), lineage_candidate_ref: "lineage-1746".to_owned(), workspace_instance_candidate_ref: "instance-1746".to_owned(), privacy_class: PrivacyClass::Internal, governing_source_generation: 1, compiler_epoch: 1, state: OnboardingLeaseState::Ready, deadline: owner_deadline() };
     let lease_bytes = String::from_utf8(canonical_json_bytes(&lease).expect("lease bytes")).expect("UTF-8");
     let key = ColdStartReadinessOwnerKey { installation_id: INSTALLATION.to_owned(), lineage_candidate_ref: lease.lineage_candidate_ref.clone(), workspace_instance_candidate_ref: lease.workspace_instance_candidate_ref.clone(), filesystem_identity_ref: "root-1746".to_owned(), vcs_identity_ref: Some("vcs-1746".to_owned()), privacy_boundary_ref: "boundary-1746".to_owned(), privacy_class: PrivacyClass::Internal, governing_source_set_ref: "sources-1746".to_owned(), governing_source_generation: 1, governing_source_digests: Vec::new(), dirty_summary_ref: None, state_fence: state_fence.clone() };
     let claim = ColdStartReadinessClaim::new(key, lease.lease_ref.clone(), lease.deadline, lease_bytes).expect("claim");
@@ -305,6 +408,191 @@ fn current_task_record() -> ColdStartReadinessOrsRecord {
     record
 }
 
+struct TaskEffectReadiness {
+    descriptor: eliot_workscope::WorkScopeDescriptor,
+    coverage: eliot_workscope::GoverningCoverage,
+    guard: eliot_workscope::ScopeBindingGuardReceipt,
+    sources: eliot_workscope::GoverningSourceSet,
+    privacy: eliot_workscope::PrivacyProfile,
+    observed: eliot_governor::ScopeBinding,
+}
+
+impl TaskEffectReadiness {
+    fn inputs<'a>(
+        &'a self,
+        receipt: &'a OnboardingReadinessReceipt,
+        lease: &'a OnboardingLease,
+        state_fence: &'a StateFence,
+        now: u64,
+    ) -> eliot_workscope::MaterialReadinessInputs<'a> {
+        eliot_workscope::MaterialReadinessInputs {
+            receipt,
+            descriptor: &self.descriptor,
+            coverage: &self.coverage,
+            guard_receipt: &self.guard,
+            lease,
+            fence: state_fence,
+            now,
+        }
+    }
+}
+
+fn task_effect_readiness(
+    receipt: &OnboardingReadinessReceipt,
+    state_fence: &StateFence,
+) -> TaskEffectReadiness {
+    use eliot_security_contracts::PrivacyClass;
+    use eliot_workscope::{
+        AuthorityBasis, GenerationEvidence, GoverningSource, GoverningSourceRole, GoverningSourceSet,
+        ResourceExecutionIdentity, ScopeBinding, ScopeBindingGuard, ScopeLifecycle,
+        ScopeResolutionState, SourceStatus, WorkScopeDescriptor,
+    };
+
+    assert_eq!(receipt.scope_resolution, ScopeResolutionState::Authenticated);
+    let privacy = eliot_workscope::PrivacyProfile {
+        admitted_classes: vec![PrivacyClass::Internal],
+    };
+    let sources = GoverningSourceSet::new(
+        receipt.scope.scope_ref.clone(),
+        receipt.governing_source_generation,
+        vec![GoverningSource {
+            source_ref: "source-1746".to_owned(),
+            role: GoverningSourceRole::Architecture,
+            assurance: serde_json::from_value(serde_json::json!({
+                "source_ref": "source-1746",
+                "provenance_ref": "artifact:1746",
+                "integrity": "VERIFIED",
+                "freshness": "CURRENT",
+                "competence": "DOMAIN_VERIFIED",
+                "independence": "INDEPENDENT",
+                "privacy_class": "INTERNAL",
+                "instruction_taint": "CLEARED",
+                "allowed_epistemic_use": ["OBSERVATION"],
+                "allowed_effects": ["READ_ONLY"],
+                "required_verifier": null,
+                "quarantine": "NONE",
+                "state_fence": state_fence
+            })).expect("fixture source assurance"),
+            applicable_generation: receipt.scope.generation,
+            status: SourceStatus::Admitted,
+            domains: Vec::new(),
+            digest: "a".repeat(64),
+            authority_basis: Some(AuthorityBasis::HumanOwner {
+                owner_ref: "owner-1746".to_owned(),
+            }),
+        }],
+        Vec::new(),
+    ).expect("current governing source set");
+    let observed = ScopeBinding {
+        scope: receipt.scope.clone(),
+        privacy_class: PrivacyClass::Internal,
+        governing_source_generation: receipt.governing_source_generation,
+    };
+    let guard = ScopeBindingGuard.check(&observed, &observed, &sources, &privacy);
+    let descriptor = WorkScopeDescriptor {
+        scope_ref: receipt.scope.scope_ref.clone(),
+        descriptor_revision: receipt.scope_descriptor_revision,
+        kind: receipt.scope.kind,
+        display_name: "session-scope-1746".to_owned(),
+        lineage: receipt.lineage.clone(),
+        instances: vec![receipt.instance.clone()],
+        owner_refs: vec!["owner-1746".to_owned()],
+        canonical_resource_refs: Vec::new(),
+        root_identities: vec![receipt.scope.root_identity.clone()],
+        external_resource_refs: Vec::new(),
+        truth_surface_refs: vec!["truth-1746".to_owned()],
+        verifier_refs: vec!["verifier-1746".to_owned()],
+        privacy: privacy.clone(),
+        authority_profile_ref: Some(receipt.governance_profile_ref.clone()),
+        execution_identity: ResourceExecutionIdentity::Service,
+        generation: GenerationEvidence {
+            branch_ref: None,
+            commit_ref: None,
+            dirty_summary_ref: None,
+            task_revision: None,
+            resource_generation: state_fence.resource_generation,
+        },
+        state_fence: state_fence.clone(),
+        available_capabilities: Vec::new(),
+        missing_capabilities: Vec::new(),
+        lifecycle: ScopeLifecycle::Active,
+    };
+    TaskEffectReadiness {
+        descriptor,
+        coverage: eliot_workscope::GoverningCoverage::AdmittedSources(sources.clone()),
+        guard,
+        sources,
+        privacy,
+        observed,
+    }
+}
+
+fn task_effect_identity_and_envelope(
+    state_fence: &StateFence,
+) -> (RequestIdentity, eliot_governor::CanonicalWriteEnvelope) {
+    use eliot_contracts::{ClockReading, ProductId, RequestId, SessionId, SourceId, TaskId};
+    use eliot_canonical::{SemanticCommand, SemanticCommandKind};
+    use eliot_governor::CanonicalWriteEnvelope;
+    use eliot_store_api::{
+        EffectClass, EventProjectionRelationIntents, OperationManifestDigest,
+        RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, TransitionClass,
+    };
+    use eliot_protocol::RequestBinding;
+
+    let operation_id = "op-1746-real-task-effect";
+    let idempotency_key = "idem-1746-real-task-effect";
+    let metadata = eliot_contracts::RequestMetadata {
+        request_id: RequestId::new("req-1746-real-task-effect").expect("request id"),
+        session_id: Some(SessionId::new("session-1746").expect("session id")),
+        task_id: Some(TaskId::new("task-1746").expect("task id")),
+        product_id: ProductId::new("test-product-1746").expect("product id"),
+        source_id: SourceId::new("acceptance-test-1746").expect("source id"),
+        state_fence: state_fence.clone(),
+        clock: ClockReading::default(),
+    };
+    let now = now_unix_ms();
+    let identity = RequestIdentity {
+        request: RequestBinding {
+            metadata: metadata.clone(),
+            state_fence: state_fence.clone(),
+        },
+        idempotency_key: idempotency_key.to_owned(),
+        deadline_unix_ms: now + 60_000,
+        cancellation_id: "cancel-1746-real-task-effect".to_owned(),
+    };
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: eliot_contracts::OperationId::new(operation_id).expect("operation id"),
+        request: metadata,
+        idempotency_key: idempotency_key.to_owned(),
+        scope_id: ScopeId::new("scope-1746").expect("scope id"),
+        task_id: Some("task-1746".to_owned()),
+        transition_class: TransitionClass::TaskControl,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contracts"),
+        operation_manifest_digest: OperationManifestDigest::new("manifest-1746")
+            .expect("operation manifest digest"),
+        semantic_commands: vec![SemanticCommand {
+            operation: SemanticCommandKind::UpdateTaskState,
+            parameters: BTreeMap::new(),
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+        expected_revision_heads: vec![RevisionHeadExpectation {
+            key: RevisionKey::new("task:task-1746").expect("task revision key"),
+            expected_revision: 1,
+            state_fence: state_fence.clone(),
+        }],
+        expected_ordering_heads: Vec::new(),
+    };
+    (identity, envelope)
+}
+
 fn persist_and_bind_readiness_record(
     composition: &mut GovernorComposition<TestKernel>,
     record: &ColdStartReadinessOrsRecord,
@@ -333,7 +621,13 @@ fn persist_and_bind_readiness_record(
 fn governor_composition_reads_the_full_bound_ors_readiness_record() {
     let observed = snapshot();
     let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
-    let kernel = Arc::new(TestKernel { snapshot: observed, payloads: BTreeMap::new(), acceptance: Mutex::new(None) });
+    let kernel = Arc::new(TestKernel {
+        snapshot: observed,
+        payloads: BTreeMap::new(),
+        acceptance: Mutex::new(None),
+        task_bound_calls: Mutex::new(Vec::new()),
+        task_bound_receipts: Mutex::new(Vec::new()),
+    });
     let mut composition = GovernorComposition::new(kernel, None, &expected, QueueLimits::default()).expect("Governor composition");
     let record = valid_record();
     let claim = record.claim.clone();
@@ -388,8 +682,9 @@ fn governor_rechecks_current_task_contract_acceptance_at_the_live_fence() {
     let record = current_task_record();
     let claim = record.claim.clone();
     let (owner, database_path) = persist_and_bind_readiness_record(&mut composition, &record);
+    let now = now_unix_ms();
     let raw_readback = composition
-        .cold_start_owner_readback_with_delta_for_claim(&claim, None, 10)
+        .cold_start_owner_readback_with_delta_for_claim(&claim, None, now)
         .expect("current task terminal comes from the exact bound ORS owner");
     assert_eq!(raw_readback.readback.record, record);
     assert!(matches!(
@@ -397,7 +692,7 @@ fn governor_rechecks_current_task_contract_acceptance_at_the_live_fence() {
         TaskBindingState::CurrentTaskContract { ref task_ref, task_revision: 1, ref acceptance_digest, .. }
             if task_ref == "task-1746" && acceptance_digest == &"a".repeat(64)
     ));
-    let activation = composition.read_unique_agent_activation(10).expect("actual Governor current activation from session, coordination, task, scope and canonical owners");
+    let activation = composition.read_unique_agent_activation(now).expect("actual Governor current activation from session, coordination, task, scope and canonical owners");
     assert_eq!(activation.task_id.as_str(), "task-1746");
 
     let selection = TaskSelectionEvidence {
@@ -405,7 +700,7 @@ fn governor_rechecks_current_task_contract_acceptance_at_the_live_fence() {
         work_scope_ref: "scope-1746".to_owned(), selection_source_ref: "selection-source-1746".to_owned(),
         evidence_ref: "selection-evidence-1746".to_owned(), contamination_flags: Vec::new(),
     };
-    let current = block_on(composition.recheck_task_selection_for_claim(10, &claim, &selection))
+    let current = block_on(composition.recheck_task_selection_for_claim(now, &claim, &selection))
         .expect("Governor reads current TaskContract acceptance set at its live fence");
     assert_eq!(current.task_ref, "task-1746");
     assert_eq!(current.acceptance_digest, "a".repeat(64));
@@ -414,8 +709,170 @@ fn governor_rechecks_current_task_contract_acceptance_at_the_live_fence() {
     let mut changed = kernel.acceptance.lock().expect("acceptance lock").clone().expect("owner set");
     changed.acceptance_digest = "b".repeat(64);
     *kernel.acceptance.lock().expect("acceptance lock") = Some(changed);
-    let moved = block_on(composition.recheck_task_selection_for_claim(10, &claim, &selection));
+    let moved = block_on(composition.recheck_task_selection_for_claim(now_unix_ms(), &claim, &selection));
     assert!(moved.is_err(), "a live TaskContract acceptance revision/digest change refuses the original selection instead of rebinding it");
+
+    drop(composition);
+    drop(owner);
+    std::fs::remove_file(database_path).expect("remove approved test store");
+}
+
+#[test]
+fn task_bound_canonical_effect_rechecks_original_owner_and_adopts_exact_receipt() {
+    use eliot_observation::{CurrentTaskSelection, TaskSelectionEvidence};
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+    impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    let observed = snapshot();
+    let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+    let kernel = Arc::new(kernel_with_current_task(observed));
+    let mut composition = GovernorComposition::new(kernel.clone(), None, &expected, QueueLimits::default()).expect("Governor composition");
+    let record = current_task_record();
+    let claim = record.claim.clone();
+    let (owner, database_path) = persist_and_bind_readiness_record(&mut composition, &record);
+    let now = now_unix_ms();
+    let owner_readback = composition
+        .cold_start_owner_readback_with_record_for_claim(&claim, now)
+        .expect("exact raw owner record, receipt, lease, and projection");
+    assert_eq!(owner_readback.record, record);
+    let selection = TaskSelectionEvidence {
+        task_ref: "task-1746".to_owned(),
+        task_revision: 1,
+        acceptance_digest: "a".repeat(64),
+        work_scope_ref: "scope-1746".to_owned(),
+        selection_source_ref: "selection-source-1746".to_owned(),
+        evidence_ref: "selection-evidence-1746".to_owned(),
+        contamination_flags: Vec::new(),
+    };
+    let current = block_on(composition.recheck_task_selection_for_claim(now, &claim, &selection))
+        .expect("actual Kernel TaskContract acceptance set at the current fence");
+    let activation = composition.read_unique_agent_activation(now).expect("actual session, coordination, task, WorkScope and canonical owner activation");
+    assert_eq!(activation.task_id.as_str(), selection.task_ref);
+    assert_eq!(current.acceptance_digest, selection.acceptance_digest);
+
+    let readiness = task_effect_readiness(&owner_readback.receipt, &owner_readback.record.claim.key.state_fence);
+    let (identity, envelope) = task_effect_identity_and_envelope(&owner_readback.record.claim.key.state_fence);
+    let original_operation_id = envelope.operation_id.clone();
+    macro_rules! readiness_inputs {
+        () => {
+            readiness.inputs(
+                &owner_readback.receipt,
+                &owner_readback.lease,
+                &owner_readback.record.claim.key.state_fence,
+                now_unix_ms(),
+            )
+        };
+    }
+
+    let mut missing_head = envelope.clone();
+    missing_head.expected_revision_heads.clear();
+    let no_head = block_on(composition.commit_canonical_with_readiness_for_task_bound(
+        &identity,
+        missing_head,
+        &readiness_inputs!(),
+        &readiness.observed,
+        &readiness.sources,
+        &readiness.privacy,
+        &claim,
+        &owner_readback,
+        &selection,
+        &current,
+    ));
+    assert!(no_head.is_err(), "missing task revision CAS head refuses before the Kernel effect");
+
+    let mut stale_head = envelope.clone();
+    stale_head.expected_revision_heads[0].expected_revision = 2;
+    let stale_head_result = block_on(composition.commit_canonical_with_readiness_for_task_bound(
+        &identity,
+        stale_head,
+        &readiness_inputs!(),
+        &readiness.observed,
+        &readiness.sources,
+        &readiness.privacy,
+        &claim,
+        &owner_readback,
+        &selection,
+        &current,
+    ));
+    assert!(stale_head_result.is_err(), "stale task revision CAS head refuses before the Kernel effect");
+
+    let self_consistent_stale = CurrentTaskSelection {
+        acceptance_digest: "b".repeat(64),
+        ..current.clone()
+    };
+    let stale_owner_projection = block_on(composition.commit_canonical_with_readiness_for_task_bound(
+        &identity,
+        envelope.clone(),
+        &readiness_inputs!(),
+        &readiness.observed,
+        &readiness.sources,
+        &readiness.privacy,
+        &claim,
+        &owner_readback,
+        &selection,
+        &self_consistent_stale,
+    ));
+    assert!(stale_owner_projection.is_err(), "a caller-supplied self-consistent-looking newer acceptance digest cannot replace the retained owner selection");
+    assert!(kernel.task_bound_calls.lock().expect("effect lock").is_empty());
+
+    let receipt = block_on(composition.commit_canonical_with_readiness_for_task_bound(
+        &identity,
+        envelope.clone(),
+        &readiness_inputs!(),
+        &readiness.observed,
+        &readiness.sources,
+        &readiness.privacy,
+        &claim,
+        &owner_readback,
+        &selection,
+        &current,
+    )).expect("matching owner selection and task revision head reach the actual Governor task-bound Kernel port");
+    assert_eq!(receipt.operation_id, original_operation_id);
+    assert_eq!(receipt.status, WriteReceiptStatus::Committed);
+    let adopted = block_on(kernel.receipt(receipt.operation_id.clone()))
+        .expect("Kernel receipt read")
+        .expect("actual task-bound effect receipt is adopted and readable by original operation id");
+    assert_eq!(adopted, receipt);
+    let effect_calls = kernel.task_bound_calls.lock().expect("effect lock");
+    assert_eq!(effect_calls.len(), 1, "refusals before and after the effect do not duplicate the original operation");
+    assert_eq!(effect_calls[0].0, original_operation_id);
+    assert_eq!(effect_calls[0].1, claim.binding_digest);
+    assert_eq!(effect_calls[0].2, selection);
+    assert_eq!(effect_calls[0].3, current);
+    drop(effect_calls);
+
+    let mut changed = kernel.acceptance.lock().expect("acceptance lock").clone().expect("current owner set");
+    changed.acceptance_digest = "c".repeat(64);
+    *kernel.acceptance.lock().expect("acceptance lock") = Some(changed);
+    let moved_owner = block_on(composition.commit_canonical_with_readiness_for_task_bound(
+        &identity,
+        envelope.clone(),
+        &readiness_inputs!(),
+        &readiness.observed,
+        &readiness.sources,
+        &readiness.privacy,
+        &claim,
+        &owner_readback,
+        &selection,
+        &current,
+    ));
+    assert!(moved_owner.is_err(), "changed live acceptance owner refuses the original operation after the owner-bound handoff");
+    assert_eq!(envelope.operation_id, original_operation_id, "the retained request identity is never rebound");
+    assert_eq!(kernel.task_bound_calls.lock().expect("effect lock").len(), 1, "a moved owner does not cause a second durable effect");
 
     drop(composition);
     drop(owner);

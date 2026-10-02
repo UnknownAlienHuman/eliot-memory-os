@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, AttachBinding, AttachRequest, AttachView, AttemptState, BridgeError,
+    AgentBridgeCore, AttachBinding, AttachOutcome, AttachRequest, AttachView, AttemptState, BridgeError,
     ConnectionId, CoverageGap, CursorPolicy, DeliveryClass, DemandId, EventDisposition,
     EventForwardAck, EventForwardStatus, EventPortOutcome, Generation, HostActivationPort,
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
@@ -59,7 +59,7 @@ use eliot_protocol::{
     AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, ContinuityKind, EncodingProfile,
     EventEnvelope, EventPayload, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity, NORMALIZED_HOST_EVENT_PAYLOAD_TYPE,
+    AgentBridgeDiscoveryBinding, RequestIdentity, NORMALIZED_HOST_EVENT_PAYLOAD_TYPE,
 };
 use eliot_receipts::RequestBinding;
 use eliot_receipts::tool_exposure::{ResultDelivery, ToolExposureError, ToolExposureHistoryEntry};
@@ -193,6 +193,9 @@ struct KernelTransportOwner {
     /// `activated_session`; a pre-activation envelope therefore still carries
     /// no task identity and the Kernel's own gate keeps refusing it.
     activated_task_binding: Option<ActivatedTaskBinding>,
+    /// Exact authenticated no-task session binding. This is present only for
+    /// the discovery activation outcome; it grants no task authority.
+    activated_discovery_binding: Option<AgentBridgeDiscoveryBinding>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
     /// Bridge-held digest-verified durable event receipts per stream.
     /// Receipts remain unbound until an exact owner recovery page matches
@@ -4955,6 +4958,7 @@ fn kernel_faces_from_admission(
         limits,
         activated_session: None,
         activated_task_binding: None,
+        activated_discovery_binding: None,
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
@@ -5570,6 +5574,18 @@ impl BridgeRunner {
     /// receipted never becomes a continuity bound.
     #[allow(clippy::result_large_err)]
     pub fn attach(&mut self, request: AttachRequest) -> Result<AttachView, BridgeError> {
+        match self.attach_outcome(request)? {
+            AttachOutcome::TaskBound(view) => Ok(view),
+            AttachOutcome::DiscoveryOnly(_) => Err(BridgeError::InvalidTransition(
+                "task selection is required; only session-level state discovery is attached",
+            )),
+        }
+    }
+
+    /// Attaches through the authenticated route and keeps taskless discovery
+    /// distinct from a task-bound attach.
+    #[allow(clippy::result_large_err)]
+    pub fn attach_outcome(&mut self, request: AttachRequest) -> Result<AttachOutcome, BridgeError> {
         let fingerprint = admit_bridge_route_launch(
             &mut self.route_registry,
             &self.bridge_route,
@@ -5577,7 +5593,7 @@ impl BridgeRunner {
             self.delegated_user_broker_class.as_deref(),
         )
         .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
-        let view = self.core.attach(request)?;
+        let outcome = self.core.attach_outcome(request)?;
         // The launch receipt is recorded before the launch is sealed. The
         // receipt carries the genuine attach observation: the owner-issued
         // binding as transport-metadata evidence, and no observed route
@@ -5594,7 +5610,16 @@ impl BridgeRunner {
                     "bridge route launch receipt clock precedes the Unix epoch".to_owned(),
                 )
             })?;
-        let binding = view.binding();
+        let (session_id, connection_id) = match &outcome {
+            AttachOutcome::TaskBound(view) => (
+                view.binding().session_id().as_str(),
+                view.binding().connection_id().as_str(),
+            ),
+            AttachOutcome::DiscoveryOnly(view) => (
+                view.session_id().as_str(),
+                view.connection_id().as_str(),
+            ),
+        };
         let launch_receipt = ActualRouteReceipt::new(
             self.bridge_route.clone(),
             self.route_installation.clone(),
@@ -5607,27 +5632,24 @@ impl BridgeRunner {
             observed_at,
             vec![
                 format!("bridge-contour-attach:{}", self.bridge_route.route_id),
-                format!(
-                    "kernel-activation-session:{}",
-                    binding.session_id().as_str()
-                ),
-                format!(
-                    "kernel-activation-connection:{}",
-                    binding.connection_id().as_str()
-                ),
+                format!("kernel-activation-session:{session_id}"),
+                format!("kernel-activation-connection:{connection_id}"),
             ],
         );
         self.route_registry
             .record_receipt(launch_receipt)
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
-        self.retained_route_launch = Some(RetainedRouteLaunch::seal(
-            &self.bridge_route,
-            &self.route_installation,
-            &view,
-        ));
+        self.retained_route_launch = match &outcome {
+            AttachOutcome::TaskBound(view) => Some(RetainedRouteLaunch::seal(
+                &self.bridge_route,
+                &self.route_installation,
+                view,
+            )),
+            AttachOutcome::DiscoveryOnly(_) => None,
+        };
         self.active_route_fingerprint = Some(fingerprint);
         self.reset_bootstrap_gate_on_session_change();
-        Ok(view)
+        Ok(outcome)
     }
     /// Reconnects under a replacement connection: the real bridge resume path
     /// (issue #1816, W4).
@@ -5728,6 +5750,10 @@ impl BridgeRunner {
     #[must_use]
     pub fn attach_view(&self) -> Option<AttachView> {
         self.core.attach_view()
+    }
+    #[must_use]
+    pub fn discovery_attach_view(&self) -> Option<eliot_agent_bridge_core::DiscoveryAttachView> {
+        self.core.discovery_attach_view()
     }
     /// Live kernel-owned session identity for reactive delivery records.
     ///

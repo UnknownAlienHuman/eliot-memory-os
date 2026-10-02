@@ -3886,6 +3886,33 @@ impl CanonicalAdmissionOwner {
                 "prepared transition does not match the owner-rechecked task selection".to_owned(),
             ));
         }
+        // Preserve the task owner revision as an effect-time CAS in the same
+        // immutable canonical request. `task_binding_gate::gate_apply` checks
+        // task/fence and proof-handle shape, but cannot compare the opaque
+        // TaskContract revision or acceptance digest. The canonical store's
+        // existing revision-head transaction is the live gate that can: it
+        // reads this exact key and rejects a changed revision before provider
+        // I/O. Never add/repair a head here, since that would change the
+        // already-recorded request hash; the producer must have included the
+        // original owner revision in the envelope.
+        let task_revision_key = RevisionKey::new(format!("task:{}", selection.task_ref))
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let task_revision_head = envelope
+            .expected_revision_heads
+            .iter()
+            .find(|head| head.key == task_revision_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "task-bound canonical envelope has no owner task revision CAS head".to_owned(),
+                )
+            })?;
+        if task_revision_head.expected_revision != selection.task_revision
+            || task_revision_head.state_fence != current.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "task-bound canonical envelope CAS does not match the original owner task revision and fence".to_owned(),
+            ));
+        }
         Ok(port
             .apply_prepared_with_task_selection(
                 identity,
