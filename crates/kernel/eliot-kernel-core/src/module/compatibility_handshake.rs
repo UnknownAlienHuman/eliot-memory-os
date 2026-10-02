@@ -795,6 +795,63 @@ impl AcceptedCompatibilityEvidence {
 /// refuses the peer with [`MismatchField::NormativeSeal`]. Deleting it would
 /// admit that envelope. See [`expected_seal_tag`] for the precise statement on
 /// what the seal can and cannot prove.
+///
+/// # Which operand each comparison holds
+///
+/// A comparison whose two operands are both supplied by the peer checks the
+/// peer's consistency with itself and changes nothing when deleted, so each
+/// check below is stated with the side the receiver did NOT take from the
+/// candidate. `durable` is state the caller holds; `HANDSHAKE_ENVELOPE_VERSION`
+/// is this crate's own constant.
+///
+/// | Comparison | Receiver-held operand | Independent |
+/// |---|---|---|
+/// | envelope version | `HANDSHAKE_ENVELOPE_VERSION` | yes |
+/// | protocol range | `durable.protocol_range()` | yes |
+/// | contract-set digest | `durable.contract_set_digest()` | yes |
+/// | canonical format range | `durable.canonical_format_range()` | yes |
+/// | architecture digest | `durable.architecture_source_digest()` | yes |
+/// | receipt's architecture digest | `durable.architecture_source_digest()` | yes |
+/// | presented seal tag | none; see below | NO |
+/// | Authority Epoch lineage | `durable.authority_epoch()` | yes |
+/// | required capabilities | `durable.required_capabilities()` | yes |
+/// | migration class | `durable.migration_class()` | yes, with the stated gap |
+///
+/// The receipt's Architecture digest is compared with DURABLE state, not with
+/// the envelope's own digest field. Both operands used to be taken from the one
+/// candidate message, so the arm could only fire for an envelope whose two
+/// digest fields disagreed with each other, and it said nothing about the state
+/// the receiver holds. Bound to durable it states that the receipt is presented
+/// as sealing the Architecture this receiver runs, which the check above has
+/// already proved the envelope agrees with; the arm is therefore
+/// outcome-preserving, and it is NOT removable: an envelope carrying a receipt
+/// over some OTHER digest, with that other digest's own correct tag, is refused
+/// by this arm and by nothing else.
+///
+/// The last two rows are the ones that cannot be bound to a receiver-held
+/// value, and are stated here rather than dressed up:
+///
+/// - **The presented seal tag.** [`NormativePairReceipt::verifies`] compares the
+///   tag with the tag recomputed from the SAME presented digest. No
+///   receiver-held tag exists to compare against, because no external seal
+///   issuer exists in this repository ([`expected_seal_tag`] states the exact
+///   consequence). The missing owner is an external normative-pair seal issuer.
+///   Until one exists this is a self-consistency check on one field of one
+///   message; it is retained only because it is that field's sole constraint,
+///   not because it constrains identity.
+/// - **The migration class.** Both sides are [`StateMigrationClass`] values the
+///   boundary's own producer chose, because I1.12 names the field and defines no
+///   vocabulary to derive a class from. The missing owner is the registry that
+///   maps a durable canonical-format revision to the class it requires; this
+///   crate does not invent one. The comparison itself is exact, so a candidate
+///   that DOES declare a different class is refused.
+///
+/// On a boundary where one producer builds both sides — as the current Kernel
+/// ingress does, `bins/eliot-kernel/src/compatibility_gate.rs:80` against `:110`
+/// — every row above is decided by the epoch and generation the caller passes.
+/// That is a property of that ingress, not of these comparisons, and it is why
+/// a boundary that can diverge must present an envelope issued by the candidate
+/// artifact's own owner.
 pub fn admit_handshake(
     candidate: &CompatibilityEnvelope,
     durable: &DurableCompatibilityState,
@@ -839,7 +896,7 @@ pub fn admit_handshake(
         ));
     }
     if candidate.normative_receipt().architecture_source_digest()
-        != candidate.architecture_source_digest()
+        != durable.architecture_source_digest()
         || !candidate.normative_receipt().verifies()
     {
         return Err(CompatibilityMismatch::new(
@@ -957,6 +1014,15 @@ impl CandidateActivation {
 /// reads no clock, so the same candidate against the same durable state always
 /// produces the same verdict and the only wall-clock input is the value the
 /// caller already holds.
+///
+/// This function makes no compatibility comparison of its own: it delegates the
+/// whole decision to [`admit_handshake`] and then projects the candidate's own
+/// offered fields onto the durable record, so a candidate that is refused keeps
+/// its evidence durably. The per-field comparisons, and which operand of each
+/// one the receiver holds rather than the candidate, are tabulated on
+/// [`admit_handshake`]; two of them — the presented seal tag and the migration
+/// class — have no receiver-held owner in this repository and are named there
+/// rather than implied to be stronger than they are.
 ///
 /// # Errors
 ///
