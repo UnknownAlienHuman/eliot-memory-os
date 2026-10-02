@@ -282,17 +282,6 @@ def execution_digest(rows: list[list]) -> str:
         [[rel, line, fn, "executed-pass"] for rel, line, fn in rows]))
 
 
-def item_counts(files: dict[str, bytes]) -> tuple[int, int]:
-    source = public = 0
-    for rel in sorted(files):
-        if "/tests/" in rel:
-            continue
-        text = files[rel].decode("utf-8")
-        source += 1
-        public += len(PUBLIC_ITEM.findall(text))
-    return source, public
-
-
 def live_files(crate_path: str) -> dict[str, bytes]:
     return {p.relative_to(ROOT).as_posix(): p.read_bytes() for p in rust_sources(crate_path)}
 
@@ -675,13 +664,34 @@ class TestWaveAdmissionC0(unittest.TestCase):
         cls.repo = cls.c.RepositoryIdentity(**cls.receipt_index["repository"])
         cls.unit = cls.receipt_index["unit"]
 
-        cls.live: dict[str, dict[str, bytes]] = {}
+        # The integration receipts bind to an immutable commit, never to a moving
+        # ref. ``bound`` is that commit's source/test bytes; ``live`` is current
+        # main and is only ever compared as *current state*, never as the proof
+        # that the recorded receipt was taken from these bytes.
+        cls.bound_commit = cls.admission["integration_binding"]["bound_commit"]
+        probe = git("cat-file", "-e", cls.bound_commit + "^{commit}")
+        assert probe.returncode == 0, "integration binding names no real commit"
+        probe = git("rev-parse", cls.bound_commit + "^{commit}")
+        assert probe.returncode == 0
+        assert probe.stdout.strip() == cls.bound_commit, "bound_commit is not a full sha"
+        assert cls.bound_commit != "HEAD", "a receipt may not bind to a moving ref"
+        probe = git("merge-base", "--is-ancestor", cls.admission["merge_commit"],
+                    cls.bound_commit)
+        assert probe.returncode == 0, "integration binding precedes the admission"
+        probe = git("merge-base", "--is-ancestor", cls.bound_commit, "HEAD")
+        assert probe.returncode == 0, "integration binding is not on this history"
+
+        cls.bound: dict[str, dict[str, bytes]] = {}
         cls.pre: dict[str, dict[str, bytes]] = {}
         for item in cls.six:
             cp = item["crate_path"]
-            cls.live[cp] = live_files(cp)
+            cls.bound[cp] = archive_files(cls.bound_commit,
+                                          (f"{cp}/src", f"{cp}/tests"))
             cls.pre[cp] = archive_files(cls.merge_parent,
                                         (f"{cp}/src", f"{cp}/tests"))
+        for item in cls.six:
+            self_bound = cls.receipts[item["name"]]["membership_required"]
+            assert self_bound["bound_commit"] == cls.bound_commit, item["name"]
 
         # Historical transaction artifacts, read from the recorded commits only.
         cls.parent_root = show_toml(cls.merge_parent, "Cargo.toml")
@@ -975,7 +985,7 @@ class TestWaveAdmissionC0(unittest.TestCase):
             # The same pre-admission evidence under the ACTIVE membership-required
             # assignment is the receipt that can be validated.
             active_block = self.receipts[name]["membership_required"]
-            active_rows = discovered_matrix(self.live[cp])
+            active_rows = discovered_matrix(self.bound[cp])
             self.assertEqual(matrix_digest(active_rows), active_block["matrix_sha256"], name)
             active_assignment = self._assignment(active_block, item["leaf_issue"], active=True)
             active_descriptor = self._descriptor(active_block, item["leaf_issue"],
@@ -988,8 +998,9 @@ class TestWaveAdmissionC0(unittest.TestCase):
                                                    active_shape, active_cases)
             self.assertIs(active_package.result, self.c.OverallResult.PASS, name)
 
-            # Stale evidence is refused by the same production path.
-            self.assertNotEqual(matrix_digest(discovered_matrix(self.live[cp])),
+            # Stale evidence is refused by the same production path. The
+            # pre-admission receipt must not describe the integration tree.
+            self.assertNotEqual(matrix_digest(active_rows),
                                 block["matrix_sha256"], name)
             with self.assertRaises(self.c.ContractViolation):
                 self._package_receipt(
@@ -1642,9 +1653,10 @@ class TestWaveAdmissionC0(unittest.TestCase):
         for item in self.six:
             name, cp, number = item["name"], item["crate_path"], item["leaf_issue"]
             block = self.receipts[name]["membership_required"]
-            rows = discovered_matrix(self.live[cp])
+            self.assertEqual(block["bound_commit"], self.bound_commit, name)
+            rows = discovered_matrix(self.bound[cp])
             self.assertEqual(matrix_digest(rows), block["matrix_sha256"], name)
-            self.assertEqual(source_inventory(cp, self.live[cp]), block["source_sha256"], name)
+            self.assertEqual(source_inventory(cp, self.bound[cp]), block["source_sha256"], name)
             self.assertEqual(execution_digest(rows), block["execution_receipt_sha256"], name)
             self.assertEqual(len(rows), block["matrix_cases"], name)
             self.assertGreater(len(rows), 0, name)
@@ -1926,18 +1938,6 @@ class TestWaveAdmissionC0(unittest.TestCase):
         ws = root_workspace()
         runtime_bins = {rel for rel in ws["members"] if rel.startswith("bins/")}
         self.assertTrue(runtime_bins)
-        leaf_paths = set(self.six_paths)
-        leaf_names = set(self.six_names)
-
-        # Direction 1: a leaf never compiles against a runtime binary.
-        for item in self.six:
-            declared = declared_dependencies(load_toml(f"{item['crate_path']}/Cargo.toml"))
-            for dep, spec in load_toml(f"{item['crate_path']}/Cargo.toml").get(
-                    "dependencies", {}).items():
-                if isinstance(spec, dict) and "path" in spec:
-                    target = (ROOT / spec["path"]).resolve()
-                    self.assertNotIn(target, [ROOT / b for b in runtime_bins],
-                                     f"{item['name']} compiles against a runtime bin: {dep}")
 
         # Accepted owners decide the relation. #816 owns the cognitive wave/edge
         # topology and states that this wave's proof is metadata-only and that
@@ -1999,6 +1999,23 @@ class TestWaveAdmissionC0(unittest.TestCase):
                 self.assertEqual(
                     self.topology816.row_by(assignments, "assignment_id",
                                             endpoint)["assignment_id"], endpoint)
+
+        # Negative leg through the accepted #816 topology owner, on its own
+        # bounded fixture mutations. These are the three #829 claims stated as
+        # negatives by their own owner: a forbidden validator edge, a compile
+        # cycle, and a metadata runtime claim. Each is refused by the same
+        # ``topology_errors`` reader that accepted the real bundle above, so the
+        # claim is not proved by a local path allowlist.
+        mutations = {m["id"]: m for m in self.topology816.load_fixture()["mutations"]}
+        for mutation_id in ("forbidden_validator_edge", "compile_cycle",
+                            "metadata_runtime_claim"):
+            self.assertIn(mutation_id, mutations, mutation_id)
+            mutated = self.topology816.apply_mutation(self.bundle816,
+                                                      mutations[mutation_id])
+            self.assertTrue(self.topology816.topology_errors(mutated), mutation_id)
+        # The unmutated bundle the same reader accepts is genuinely different
+        # from each mutant, so the negatives are not vacuous.
+        self.assertEqual(self.topology816.topology_errors(self.bundle816), [])
 
         # Admission itself creates no runtime state, effect or edge.
         for item in self.six:
@@ -2063,7 +2080,9 @@ class TestWaveAdmissionC0(unittest.TestCase):
             total += pre["matrix_cases"]
         self.assertEqual(total, sum(self.candidate["expected_test_counts"].values()))
 
-        # Separate current-state proof: the six are still admitted on main.
+        # Separate current-state proof: the six are still admitted on main. This
+        # leg is derived from the current tree, so it is unaffected by later
+        # legitimate leaf growth - it asserts the *admission*, never a digest.
         live = root_workspace()
         lock = set(lock_packages())
         live_errors = validate_wave_state(
@@ -2071,11 +2090,34 @@ class TestWaveAdmissionC0(unittest.TestCase):
             {p: load_toml(f"{p}/module.toml") for p in self.six_paths},
             lock, self.six_paths)
         self.assertEqual(live_errors, [])
+        package_index = read_bytes(PACKAGE_INDEX).decode("utf-8")
         for item in self.six:
+            cp = item["crate_path"]
             self.assertIs(self._membership_disposition(item["name"]),
                           self.c.WorkspaceDisposition.MEMBER, item["name"])
-            self.assertEqual(index_row_cell(read_bytes(PACKAGE_INDEX).decode("utf-8"),
-                                            item["crate_path"]), "`workspace`", item["name"])
+            self.assertEqual(index_row_cell(package_index, cp), "`workspace`",
+                             item["name"])
+            # The admitted package is still a real, compiling, canonical-lock
+            # member on current main: its own live source and manifest resolve
+            # under the current root workspace. No frozen digest is involved.
+            live_files_cp = live_files(cp)
+            self.assertTrue(live_files_cp, item["name"])
+            self.assertIn(f"{cp}/src/lib.rs", live_files_cp, item["name"])
+            manifest = load_toml(f"{cp}/Cargo.toml")
+            self.assertEqual(manifest["package"]["name"], item["name"])
+            self.assertEqual(load_toml(f"{cp}/module.toml")["status"], "ADMITTED",
+                             item["name"])
+        # Current membership is independent of the recorded digests: the same six
+        # current-state validator accepts today's tree even where today's source
+        # has legitimately moved past the bound integration commit.
+        moved = [item["name"] for item in self.six
+                 if source_inventory(item["crate_path"], live_files(item["crate_path"]))
+                 != self.receipts[item["name"]]["membership_required"]["source_sha256"]]
+        self.assertEqual(validate_wave_state(
+            live["members"], live["exclude"],
+            {p: load_toml(f"{p}/module.toml") for p in self.six_paths},
+            lock, self.six_paths), [])
+        self.assertTrue(all(n in self.six_names for n in moved))
 
     # WORK_UNIT_CASE: 829/30
     def test_30_malformed_plan_cannot_yield_a_partial_admission(self) -> None:

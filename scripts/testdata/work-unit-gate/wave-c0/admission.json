@@ -21,6 +21,12 @@
   "scripts/testdata/work-unit-gate/wave-c0/candidate.json",
   "scripts/tests/test_wave_admission_c0.py"
  ],
+ "integration_binding": {
+  "accepted_commit": "f36816b8d3c5c673d1c584823694278c2ca1eb35",
+  "bound_commit": "fe7ef391b6f745f6c7a192d4d64fddea1cbb9216",
+  "rule": "the membership-required integration receipts bind their source, matrix and execution digests to the immutable integration commit named here, never to a moving ref; the six-package rows and the remaining-admitted claim are proved separately from current main, so later legitimate growth cannot invalidate this admission",
+  "why_not_head": "HEAD is a moving ref. Comparing a frozen digest against whatever main happens to be turns every later leaf change into a failure of this admission. Each digest is bound to the commit it was taken from and is validated against that commit's bytes."
+ },
  "index_rows": {
   "crates/smart/eliot-context-contracts": {
    "merge": {
