@@ -2248,7 +2248,10 @@ impl BackupRuntimeControlRequest {
         // internally consistent about a different destination than the one this
         // request was admitted for. The body validates itself first, so an
         // unvalidated body never reaches this comparison.
-        if self.body.declared_destination().map_err(|error| error.to_string())?
+        if self
+            .body
+            .declared_destination()
+            .map_err(|error| error.to_string())?
             != self.destination.as_str()
         {
             return Err(

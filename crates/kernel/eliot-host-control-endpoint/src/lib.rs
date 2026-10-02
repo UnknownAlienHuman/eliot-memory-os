@@ -627,9 +627,13 @@ impl HostRuntimeControl {
         //     caller for the rehearsal/cutover guarantee: the only previous
         //     caller of that predicate was a `debug_assert!`, which a release
         //     build removes, so nothing carried the guarantee there.
-        if backup::resolves_cutover_authority(operation) != (operation == BackupOperationKind::AdmitCutover)
+        if backup::resolves_cutover_authority(operation)
+            != (operation == BackupOperationKind::AdmitCutover)
         {
-            return Err(refusal(operation, backup::CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL));
+            return Err(refusal(
+                operation,
+                backup::CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL,
+            ));
         }
         // 1. Closed Host-accepted method table. Unsupported and absent
         //    methods fail before effects, never as a default success.
@@ -714,10 +718,7 @@ impl HostRuntimeControl {
         let mut ledger = match self.backup_replay.lock() {
             Ok(ledger) => ledger,
             Err(_) => {
-                return Err(refusal(
-                    operation,
-                    "backup replay ledger is unavailable",
-                ));
+                return Err(refusal(operation, "backup replay ledger is unavailable"));
             }
         };
         // The observation is taken under the lock and the guard is released

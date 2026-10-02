@@ -347,9 +347,9 @@ pub fn rehearsal_resolves_cutover() -> bool {
     if resolves_cutover_authority(BackupOperationKind::CompleteRehearsal) {
         return true;
     }
-    accepted_host_backup_methods()
-        .iter()
-        .any(|method| method.op != BackupOperationKind::AdmitCutover && method.needs_cutover_admission)
+    accepted_host_backup_methods().iter().any(|method| {
+        method.op != BackupOperationKind::AdmitCutover && method.needs_cutover_admission
+    })
 }
 
 #[cfg(test)]
@@ -410,9 +410,7 @@ mod rehearsal_cutover_tests {
         // disposition independently of the predicate, so the predicate's inputs
         // really do exclude it.
         assert!(!is_supported(BackupOperationKind::CompleteRehearsal));
-        assert!(
-            requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none()
-        );
+        assert!(requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none());
         // And rehearsal still carries its own wire identity, never cutover's.
         assert!(!authority_matches(
             BackupOperationKind::CompleteRehearsal,
