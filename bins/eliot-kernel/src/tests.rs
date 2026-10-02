@@ -1972,6 +1972,12 @@ fn test_daemon_launch(root: &Path) -> EliotdLaunchDescriptor {
         authority_epoch: test_epoch(1),
         generation: ResourceGeneration::genesis(),
         restart_policy: None,
+        // The two I1.9 launch coordinates are stated absences, the same
+        // disposition the production materializer publishes: this fixture
+        // proves launch identity and digest binding, and invents no approved
+        // limit or readiness contract.
+        job_object_limits: None,
+        health_readiness_contract_ref: None,
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()

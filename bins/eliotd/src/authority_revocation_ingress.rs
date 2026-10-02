@@ -78,11 +78,31 @@
 //! `bins/eliotd/src/daemon_runtime.rs::report_authority_revocation_ingress`.
 //!
 //! The exact remaining gap is named in
-//! [`AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED`]: the canonical
-//! `RecordAuthorityRevocation` commit is still known-but-unsupported in the
-//! closed Store catalogue, so a resumed obligation fails closed at that commit
-//! and stays recorded as a pending stricter revocation instead of being reported
-//! as a recorded revocation.
+//! [`AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED`]. The closed Store
+//! catalogue no longer refuses the operation outright: issue #686 activated the
+//! `RecordAuthorityRevocation` row, so a well-formed revocation is admitted and
+//! typed-validated instead of failing closed at the gate. What that activation
+//! did NOT prove is the execution behind the row, and this branch now supplies
+//! most of it: the per-backend durable write handler
+//! (`crates/storage/eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+//! registered in that crate's `apply.rs` and appended into the canonical
+//! transaction by `append_authority_revocation_statements`), plus the
+//! count-test migration of every stale assertion in this branch to the true
+//! catalogue size of forty-eight entries — six sites in
+//! `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs` and
+//! one each in that crate's `reactive_state_wire.rs`,
+//! `user_automation_state_wire.rs` and `notification_state_wire.rs`, plus
+//! `bins/eliotd/tests/epistemic_readback.rs`. What is still
+//! genuinely absent is the CONSUMER TRIPLE of the paired read: the named read
+//! `GetAuthorityRevocationHistory` is deliberately and truthfully unactivated,
+//! because the Kernel intercepts it and serves it from the retained P-07 ORS
+//! before the store bridge sees it
+//! (`bins/eliot-kernel/src/daemon_request_dispatch.rs`, handler
+//! `crates/kernel/eliot-kernel-service/src/owner_history.rs`). The store
+//! therefore cannot read back what it can now write. A row being writable is
+//! still not the same as a resumed obligation being PROVED to commit end to
+//! end, so a resumed revocation stays recorded as a pending stricter revocation
+//! instead of being reported as a recorded revocation.
 //!
 //! Forbidden boundary: no ORS access (the Kernel owns ORS in its own
 //! process), no second grant graph, no fabricated request, identity or
@@ -144,22 +164,60 @@ const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identit
 /// value to `GovernorComposition::apply_pending_canonical_revocation`, whose
 /// durable link half runs through the Kernel route that owns ORS.
 ///
-/// What still cannot complete is the canonical record itself:
-/// `NamedMutationOperation::RecordAuthorityRevocation` is deliberately
-/// known-but-unsupported in the closed Store catalogue
-/// (`crates/storage/eliot-store-api/src/operation_catalogue.rs`), so the
-/// canonical commit refuses with `StoreError::UnknownOperation` and the second
-/// phase stays pending. Activating that catalogue row (row, proven per-backend
-/// handler, consumer triple, and the count-test migration) is store-owned work.
+/// What still cannot complete is the canonical record itself. The closed Store
+/// catalogue
+/// (`crates/storage/eliot-store-api/src/operation_catalogue.rs`) no longer
+/// refuses `NamedMutationOperation::RecordAuthorityRevocation`:
+/// `StoreError::UnknownOperation` at that gate is gone, because issue #686
+/// activated the row, so a well-formed revocation is typed-validated and
+/// admitted to the canonical write path instead of being turned away at the
+/// catalogue.
+///
+/// The gap that remains is a missing half of the pair, not the gate. This branch
+/// delivers the per-backend write handler, and what it is proven to do is
+/// RENDER the row inside the canonical transaction - the durable commit itself
+/// is not proven on this slice, and nothing here may be read as claiming it
+/// (`crates/storage/eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+/// registered in that crate's `apply.rs` and appended into the canonical
+/// transaction by `append_authority_revocation_statements`) and migrates every
+/// stale catalogue count-test in this branch to the true catalogue size of
+/// forty-eight entries: six sites in
+/// `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`, plus
+/// one each in that crate's `reactive_state_wire.rs`,
+/// `user_automation_state_wire.rs` and `notification_state_wire.rs`, plus
+/// `bins/eliotd/tests/epistemic_readback.rs`. What is still absent is the
+/// CONSUMER TRIPLE of the
+/// paired read: `GetAuthorityRevocationHistory` is deliberately and truthfully
+/// unactivated, because the Kernel intercepts that named read and serves it
+/// from the retained P-07 ORS before the store bridge sees it
+/// (`bins/eliot-kernel/src/daemon_request_dispatch.rs`, handler
+/// `crates/kernel/eliot-kernel-service/src/owner_history.rs`), so the store
+/// cannot read back what it can now write. A row being writable is not the
+/// same as a resumed obligation being PROVED to commit end to end, so this pass
+/// still reports it as a pending stricter revocation, never as a recorded one.
+///
+/// What the value below states is the residual gap exactly as this branch leaves
+/// it: the catalogue gate admits the command and a proven per-backend handler
+/// renders the row into the canonical transaction, so the remaining gap is a missing READ-BACK
+/// rather than a missing gate. The paired read `GetAuthorityRevocationHistory` still carries no
+/// consumer triple, because the Kernel serves it from the retained P-07 ORS
+/// before the store bridge sees it, and nothing on this branch executes the
+/// store end to end, so a resumed revocation is not yet proved to commit. The
+/// value is therefore written in the true present tense: `lib.rs` re-exports it
+/// and a `tracing::warn!` emits it on every pending revocation, where a reason
+/// clause still naming the catalogue gate would send an operator to debug the
+/// wrong layer. Nothing in this repository matches on the literal, so no
+/// in-tree consumer constrains its text.
 ///
 /// Naming it here rather than leaving the pass silent is the point: a pending
 /// canonical second phase is real, actionable, durable state. Reporting it
 /// without naming the blocker would present an unfinished obligation as a
 /// handled one.
-pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str = "canonical second phase cannot complete: the Store catalogue keeps \
-     NamedMutationOperation::RecordAuthorityRevocation known-but-unsupported, so the canonical \
-     revocation commit fails closed and the obligation stays pending instead of becoming a \
-     recorded revocation";
+pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str = "canonical second phase cannot complete: the Store catalogue now admits \
+     NamedMutationOperation::RecordAuthorityRevocation and a proven per-backend handler renders the row \
+     into the canonical transaction, but the paired read GetAuthorityRevocationHistory has no consumer \
+     triple because the Kernel serves it from the retained P-07 ORS, so a resumed revocation is not yet \
+     proved to commit end to end and the obligation stays pending instead of becoming a recorded revocation";
 
 /// One grant the recovered owner graph names, captured before the composition
 /// lock is released.
@@ -211,9 +269,11 @@ impl AuthorityRevocationIngressPlan {
 ///
 /// Every field is the owner's own committed value served by the Kernel. The
 /// `resume_blocked` marker is this module's honest statement of the remaining
-/// Governor drive gap, not a claim that the obligation was discharged. The
-/// `admission` field records what the maintenance-request owner did with the
-/// obligation: only a [`PendingRevocationAdmission::Admitted`] row carries
+/// store-side read-back gap, not a claim that the obligation was discharged:
+/// the Governor drive itself works, and what is missing is the store-side read
+/// back of the record it can now write.
+/// The `admission` field records what the maintenance-request owner did with
+/// the obligation: only a [`PendingRevocationAdmission::Admitted`] row carries
 /// owner authority; a refused row is a non-authoritative diagnostic of a still
 /// pending obligation.
 #[derive(Clone, Debug, Eq, PartialEq)]

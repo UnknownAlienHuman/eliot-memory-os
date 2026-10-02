@@ -916,8 +916,28 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .is_some()
         {
+            // Issue #1884 (I1.9, AUD3): the operator activation is a PRODUCTION
+            // launch, so it reaches the process authority under the immutable
+            // `KernelExecutionManifest` recorded for the exact generation this
+            // activation names, through the same sealed launch gate the bounded
+            // recovery uses. It is not a fallback around that gate: a generation
+            // whose manifest is absent, receipt-less, stale, incompatible,
+            // revoked or identity-mismatched launches nothing here, and I1.9
+            // keeps that a visible degradation and escalation instead of an
+            // improvised start.
+            //
+            // This module stays wiring. The manifest read, the refusal
+            // classification, the durable escalation into the ORS owner's own
+            // reconciliation and lifecycle rows, and the sealed binding all
+            // belong to `KernelComposition::launch_eliotd_for_activation_under_manifest`
+            // in `daemon_runtime.rs`; this call site keeps the same typed
+            // refusal it already owned, and this module no longer names the
+            // process primitive `KernelComposition::launch_eliotd_in_context`
+            // at all. Nothing here admits on "a manifest exists" alone: the
+            // launch is admitted only by the sealed binding the ORS verifier
+            // issued for this exact module and generation.
             let launched = self
-                .launch_eliotd_in_context(context)
+                .launch_eliotd_for_activation_under_manifest(context)
                 .await
                 .map_err(|_| ControlRequestFailure::TerminalOwned(TransportError::SessionFenced))?;
             self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout, context)

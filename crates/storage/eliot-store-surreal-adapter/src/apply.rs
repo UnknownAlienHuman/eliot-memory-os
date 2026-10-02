@@ -44,6 +44,7 @@ mod read_boundary;
 mod receipt_reconciliation;
 mod recovery;
 mod schema_contract;
+pub(crate) mod surreal_authority_revocation;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_capability_evidence;
@@ -2563,19 +2564,20 @@ mod admitted_operation_gate_tests {
             validate_transition(&context, &stale),
             Err(AdapterError::Store(StoreError::ManifestMismatch))
         );
-        // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision, so
-        // the remaining unactivated mutation (RecordAuthorityRevocation) still
-        // fails closed before staging.
-        let unadmitted = transition_with(
+        // Issue #686 activates `RecordAuthorityRevocation`, so it is no longer
+        // the remaining unactivated mutation: a well-formed revocation with the
+        // current set digest and the owner's seven typed fields passes the
+        // pre-stage gate instead of failing closed before staging.
+        let admitted_revocation = transition_with(
             &fence,
             set_digest.clone(),
             TransitionClass::RecoverySchema,
             EffectClass::ReversibleMutation,
             vec![revocation_operation()],
         );
-        assert_eq!(
-            validate_transition(&context, &unadmitted),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
+        assert!(
+            validate_transition(&context, &admitted_revocation).is_ok(),
+            "admitted RecordAuthorityRevocation passes the pre-stage gate"
         );
         // ApplyEpistemicRevision is admitted: an empty payload fails as a
         // typed parameter error, not UnknownOperation.
@@ -2696,12 +2698,13 @@ mod admitted_operation_gate_tests {
         }
     }
 
-    /// Issue #686: the revocation-record mutation is known-but-unsupported
-    /// until a store-owned slice activates its catalogue row with proven
-    /// handlers. The closed name spelling holds and the pre-stage gate
-    /// refuses it with typed `UnknownOperation` — never silent success.
+    /// Issue #686: the store-owned slice activates the revocation-record
+    /// mutation's catalogue row with proven handlers. The closed name spelling
+    /// holds, the plan family stays `RecoverySchema`, and the pre-stage gate
+    /// now admits a well-formed revocation instead of refusing it with typed
+    /// `UnknownOperation`.
     #[test]
-    fn revocation_record_mutation_fails_closed_until_store_activation() {
+    fn revocation_record_mutation_is_activated_and_admitted() {
         use eliot_store_api::{named_mutation_operation_by_name, named_mutation_operation_name};
         assert_eq!(
             named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation),
@@ -2719,16 +2722,16 @@ mod admitted_operation_gate_tests {
         let context = test_context(&fence);
         let entries = generated_operation_manifests().expect("active catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
-        let pending = transition_with(
+        let activated = transition_with(
             &fence,
             set_digest,
             TransitionClass::RecoverySchema,
             EffectClass::ReversibleMutation,
             vec![revocation_operation()],
         );
-        assert_eq!(
-            validate_transition(&context, &pending),
-            Err(AdapterError::Store(StoreError::UnknownOperation))
+        assert!(
+            validate_transition(&context, &activated).is_ok(),
+            "activated RecordAuthorityRevocation passes the pre-stage gate"
         );
     }
 

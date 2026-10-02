@@ -470,50 +470,88 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Kern
 }
 
 /// Issue #1885 (I1.9): service-boundary query joining one effect replay
-/// attempt to its exact unexpired operation lease.
+/// attempt to its exact unexpired operation lease and to the OBSERVED lifecycle
+/// disposition of the generation that lease is bound to.
 ///
 /// Effect-capable generations may resume only exact already-authorized
-/// operations covered by an unexpired operation lease; every invalid or
-/// unavailable authorization state runs in shadow/no-effect diagnostics only.
-/// The join resolves the lease by the attempt's own operation identity
-/// through [`eliot_ors::OperationalRecoveryStore::load_effect_operation_lease_for_operation`],
-/// loads the bound execution manifest, and verifies the triple through the
-/// owning [`eliot_ors::authorize_effect_replay`] verifier. The record itself
-/// stays owned by `eliot-ors`; this join defines no lease type, no alias and
-/// no conversion, so a supervision obligation can never be mistaken for
-/// effect authority here.
+/// operations covered by an unexpired operation lease; every refusal the
+/// verifier classifies carries shadow/no-effect diagnostics only. The join
+/// resolves the lease by the attempt's own operation identity through
+/// [`eliot_ors::RedbRecoveryStore::load_effect_operation_lease_for_operation`],
+/// loads the bound execution manifest, reads that generation's COMPOSED lifecycle
+/// observation through
+/// [`eliot_ors::RedbRecoveryStore::load_observed_generation_lifecycle`], and
+/// verifies all four inputs through the owning
+/// [`eliot_ors::authorize_effect_replay`] verifier. The records stay owned by
+/// `eliot-ors`; this join defines no lease type, no lifecycle disposition, no
+/// alias and no conversion, so a supervision obligation can never be mistaken
+/// for effect authority here.
 ///
-/// Every binding the issue requires (manifest identity/hash, Authority Epoch,
-/// exact operation identity and effect receipt, allowed scope, expiry,
-/// admitting Catalog/Policy revision, revocation/delivery acknowledgement)
-/// is checked by the owners' own `validate()` and verifier; this join
-/// invents none and defaults none. An admitted decision carries the sealed
-/// [`eliot_ors::ActiveEffectOperationLease`], the only value a dispatch path
-/// may treat as effect authority. Every other outcome carries only the
-/// shadow/no-effect diagnostic context plus the durable reconciliation item,
-/// which the caller must persist rather than discard; it is incapable of
-/// producing an external effect or a canonical write admission.
+/// The observation is read for the recorded manifest's OWN admission
+/// `{module_id, generation}` — never a constant, never the request's spelling
+/// and never a default — so it names the same identity the verifier compares it
+/// against. This seam READS that observation and never composes one: the store
+/// owns the composition so no consumer here can present an observation it built
+/// itself. It rests on two durable readbacks, either a `GENERATION_LIFECYCLES`
+/// row for this exact module and generation or no such row PLUS an admitted
+/// manifest row for the same key that satisfies its own `validate()`. A
+/// generation ORS that holds neither has no observation to produce, so a
+/// clearance can never be composed here out of an absence.
 ///
-/// Store failures surface as the owner's typed [`eliot_ors::OrsError`]; they
-/// are unavailable authorization state, so the caller treats them like any
-/// other non-admission and stays in shadow diagnostics.
+/// A recorded `Degraded` or `Quarantined` generation is refused with
+/// [`eliot_ors::OrsError::EffectOperationLeaseGenerationDegraded`], and a row
+/// naming another identity is refused with
+/// [`eliot_ors::OrsError::EffectOperationLeaseManifestBindingMismatch`].
+///
+/// The observation does NOT prove that a process is running for this
+/// generation, that its routes are live, drained or cut, or that the generation
+/// is healthy — the health and readiness contract is the recorded manifest's,
+/// and it is observed elsewhere. An absent degradation row is therefore evidence
+/// of nothing on its own, and the verifier reads it as `Undegraded` only
+/// together with an intact admitted manifest row for the same key.
+///
+/// Every binding the issue requires (manifest identity/hash, generation
+/// lifecycle disposition, Authority Epoch, exact operation identity and effect
+/// receipt, allowed scope, expiry, admitting Catalog/Policy revision,
+/// revocation/delivery acknowledgement) is checked by the owners' own
+/// `validate()` and verifier; this join invents none and defaults none. An
+/// admitted decision carries the sealed
+/// [`eliot_ors::ActiveEffectOperationLease`], and no other outcome of this seam
+/// carries effect authority at all. No production dispatch path consumes that
+/// lease value downstream: the one live consumer of the equivalent ORS query,
+/// `ProcessExecutionGateway::require_effect_replay_authority` in
+/// `bins/eliot-kernel/src/process_execution.rs`, tests only
+/// `decision.authority.authorized_lease().is_some()`. Every classified refusal
+/// carries only the shadow/no-effect diagnostic context plus the durable
+/// reconciliation item; this join reads only and persists nothing, so that item
+/// is returned for a caller to persist rather than discarded. No classified
+/// outcome can produce an external effect or a canonical write admission.
+///
+/// Store failures surface as the owner's typed [`eliot_ors::OrsError`], and a
+/// lifecycle refusal is one of them; they are unavailable authorization state,
+/// so the caller treats them like any other non-admission and stays in shadow
+/// diagnostics.
 ///
 /// # Live status
 ///
-/// No production caller. Measured on this tree, no code in any crate names
-/// this function other than its defining line. The effect-capable restart and
-/// replay paths this doc describes do run the gate before dispatching an
-/// effect, but they do not run *this* join: they resolve the same lease,
-/// manifest and verifier triple one level down, through
-/// `RedbRecoveryStore::authorize_effect_replay_for_operation`, which loads the
-/// same two durable rows, applies the same
-/// [`eliot_ors::authorize_effect_replay`] verifier, and additionally persists
-/// the durable reconciliation intent for a denied, expired or unknown replay.
-/// So this function describes a capability the crate spells out rather than a
-/// call edge into it; the live query is the ORS owner's method and this free
-/// function is the unexercised equivalent. Nothing was wired to close that gap
-/// and no caller was invented; whether one is bound to this spelling or the
-/// entry is retired is an owner decision.
+/// No production caller: `git grep -n query_effect_replay_authority` returns
+/// only this definition. The one production effect-replay gate runs the
+/// equivalent query one level down, through
+/// [`eliot_ors::RedbRecoveryStore::authorize_effect_replay_for_operation`],
+/// reached from `ProcessExecutionGateway::require_effect_replay_authority` on
+/// the replay arm of the process-start pipeline, before the recorded receipt is
+/// replayed and before any effect is executed. That method loads the same two
+/// durable rows, consults the generation lifecycle too, and additionally
+/// persists the durable reconciliation intent for a denied, expired or unknown
+/// replay, so the two paths are not equivalent: this join persists nothing.
+/// Nothing was wired to close that gap and no caller was invented; whether one
+/// is bound to this spelling or the entry is retired is an owner decision.
+///
+/// The production RESTART path does not run this gate at all: it runs
+/// `RedbRecoveryStore::load_and_verify_kernel_execution_restart` from
+/// `bins/eliot-kernel/src/daemon_runtime.rs`, which verifies the recorded
+/// launch binding under `verify_kernel_execution_restart` and resolves no
+/// operation lease.
 pub fn query_effect_replay_authority(
     store: &eliot_ors::RedbRecoveryStore,
     request: &eliot_ors::EffectReplayRequest,
@@ -539,5 +577,16 @@ pub fn query_effect_replay_authority(
             request.observed_at_ms,
         ));
     };
-    eliot_ors::authorize_effect_replay(Some(&lease), Some(&manifest), request)
+    // I1.9 (issue #1884 W1.5): the generation's lifecycle OBSERVATION is a
+    // composition the store owns, derived there from two durable readbacks, so
+    // it is read here and never composed by this seam. It is read for the
+    // recorded manifest's own admission identity — the identity the verifier
+    // compares the observation against — and a generation ORS holding neither a
+    // degradation row nor an intact admitted manifest for that key has no
+    // observation at all, so no clearance is ever handed over from an absence.
+    let lifecycle = store.load_observed_generation_lifecycle(
+        &manifest.admission.module_id,
+        manifest.admission.generation.value(),
+    )?;
+    eliot_ors::authorize_effect_replay(Some(&lease), Some(&manifest), &lifecycle, request)
 }

@@ -918,6 +918,57 @@ impl PersistedValue for KernelReconciliationItem {
     }
 }
 
+/// Issue #1884: the Governor Module Catalog admission receipt rides this ORS
+/// codec like every other durable row, so its `RECORD_TYPE` is the same
+/// `governor_admission_receipt` identity its writer and reader already name.
+/// The receipt's own `validate()` is the single fail-closed gate on readback:
+/// it refuses a foreign `schema_version`, a blank identity, a non-positive
+/// clock and a recorded owner digest that no longer binds the receipt's own
+/// sealed fields, so an edited row is corruption rather than an admission.
+impl PersistedValue for crate::admission_receipt::GovernorAdmissionReceipt {
+    const RECORD_TYPE: &'static str = "governor_admission_receipt";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Issue #1884: the Generation Registry lifecycle record is decoded through the
+/// same codec, and its own `validate()` is what refuses a row whose disposition
+/// and first refusal cause disagree, so a degraded generation cannot be read
+/// back as one that never refused anything.
+impl PersistedValue for crate::generation_lifecycle::GenerationLifecycleRecord {
+    const RECORD_TYPE: &'static str = "generation_lifecycle";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Issue #1884: the observed revocation event is decoded through the same codec,
+/// and its own `validate()` refuses a foreign `schema_version`, a blank identity,
+/// a non-positive clock and a recorded `RevocationAcknowledgement::None`, so an
+/// absent event stays the absence of the row rather than a value inside it.
+impl PersistedValue for crate::effect_current_state::RevocationEventRecord {
+    const RECORD_TYPE: &'static str = "effect_revocation_event";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Issue #1884: the observed effect delivery acknowledgement is decoded through
+/// the same codec, and its own `validate()` refuses a foreign `schema_version`,
+/// a blank identity and a non-positive clock, so a row edited after it was
+/// written fails closed instead of reading as an acknowledged delivery.
+impl PersistedValue for crate::effect_current_state::EffectDeliveryRecord {
+    const RECORD_TYPE: &'static str = "effect_delivery_record";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
 impl PersistedValue for RuntimeLease {
     const RECORD_TYPE: &'static str = "runtime_lease_current";
 
