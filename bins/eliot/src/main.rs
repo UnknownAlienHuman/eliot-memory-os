@@ -5094,9 +5094,9 @@ impl AuthenticatedKernelPort {
     fn transact_controlboard_status(
         &mut self,
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
-        let (served, _identity) =
-            self.client
-                .read_controlboard_status(controlboard_status::status_request_payload())?;
+        let (served, _identity) = self
+            .client
+            .read_controlboard_status(controlboard_status::status_request_payload())?;
         Ok(served)
     }
 }

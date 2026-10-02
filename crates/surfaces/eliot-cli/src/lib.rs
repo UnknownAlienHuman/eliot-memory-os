@@ -857,9 +857,7 @@ pub mod kernel_client {
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .map_err(|_| {
-                KernelClientError::Rejected(
-                    "system clock is before the Unix epoch".to_owned(),
-                )
+                KernelClientError::Rejected("system clock is before the Unix epoch".to_owned())
             })
     }
 
@@ -1069,7 +1067,7 @@ pub mod kernel_client {
             sequence: u64,
             module_bridge_identity: &str,
         ) -> Result<(Value, RequestIdentity), KernelClientError> {
-            let (mut transport, limits, admitted) = self.connect().await?;
+            let (transport, limits, admitted) = self.connect().await?;
             let identity = admitted_operation_identity(
                 &admitted,
                 operation,
@@ -1186,7 +1184,8 @@ pub mod kernel_client {
         #[cfg(windows)]
         async fn connect(
             &self,
-        ) -> Result<(NamedPipeTransport, TransportLimits, AdmittedOperation), KernelClientError> {
+        ) -> Result<(NamedPipeTransport, TransportLimits, AdmittedOperation), KernelClientError>
+        {
             self.config_lease
                 .verify_stable_identity()
                 .and_then(|()| self.config_lease.verify_path_identity())
@@ -1892,12 +1891,12 @@ pub mod kernel_client {
             identity.validate().expect("valid RequestIdentity");
             // The State Fence is the Kernel's live authority tuple, not a local
             // guess: same lineage, same sequence, same generation.
-            assert_eq!(
-                identity.request.state_fence.authority_epoch,
-                test_epoch(7)
-            );
+            assert_eq!(identity.request.state_fence.authority_epoch, test_epoch(7));
             assert_eq!(identity.request.state_fence.resource_generation.value(), 11);
-            assert_eq!(identity.request.state_fence, identity.request.metadata.state_fence);
+            assert_eq!(
+                identity.request.state_fence,
+                identity.request.metadata.state_fence
+            );
             // This front door attaches no semantic session and selects no task.
             assert!(identity.request.metadata.session_id.is_none());
             assert!(identity.request.metadata.task_id.is_none());
@@ -1927,7 +1926,9 @@ pub mod kernel_client {
                 payload: ProtocolPayload::Json(json!({"operation": OPERATOR_LAUNCH_OPERATION})),
                 trace_context: BTreeMap::new(),
             };
-            frame.validate().expect("frame carries the admitted identity");
+            frame
+                .validate()
+                .expect("frame carries the admitted identity");
         }
 
         /// Positive case for `eliot controlboard status` (and the dashboard
@@ -1967,7 +1968,9 @@ pub mod kernel_client {
                 })),
                 trace_context: BTreeMap::new(),
             };
-            frame.validate().expect("frame carries the admitted identity");
+            frame
+                .validate()
+                .expect("frame carries the admitted identity");
         }
 
         /// No-admission refusal: a session the Kernel admitted WITHOUT the
@@ -1978,8 +1981,7 @@ pub mod kernel_client {
         fn admission_refuses_when_the_live_session_lacks_the_required_capability() {
             let mut hello = operator_server_hello();
             hello.allowed_capabilities = vec!["worker.execute".to_owned()];
-            let admitted =
-                admitted_operation(&hello).expect("session is still a valid handshake");
+            let admitted = admitted_operation(&hello).expect("session is still a valid handshake");
             for (operation, capability) in [
                 (OPERATOR_LAUNCH_OPERATION, OPERATOR_LAUNCH_CAPABILITY),
                 (CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_READ_CAPABILITY),
@@ -2028,9 +2030,7 @@ pub mod kernel_client {
             // A live generation the protected declaration does not approve is
             // refused by the existing snapshot validation, before admission.
             let moved = operator_server_hello();
-            assert!(
-                validate_server_snapshot(&moved, &test_epoch(7), 12, &"a".repeat(64)).is_err()
-            );
+            assert!(validate_server_snapshot(&moved, &test_epoch(7), 12, &"a".repeat(64)).is_err());
         }
 
         /// Reuse refusal: launch, status, and a later exact retry must be three
@@ -2062,8 +2062,7 @@ pub mod kernel_client {
             for (index, left) in distinct.iter().enumerate() {
                 for right in distinct.iter().skip(index + 1) {
                     assert_ne!(
-                        left.request.metadata.request_id,
-                        right.request.metadata.request_id,
+                        left.request.metadata.request_id, right.request.metadata.request_id,
                         "two operations shared a request id"
                     );
                     assert_ne!(
