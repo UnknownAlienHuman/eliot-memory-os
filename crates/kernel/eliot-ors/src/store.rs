@@ -7599,7 +7599,12 @@ impl RedbRecoveryStore {
             existing.validate()?;
             let admitted_fence_downgraded =
                 existing.admitted_state_fence.is_some() && record.admitted_state_fence.is_none();
-            if admitted_fence_downgraded || !existing.same_binding(record) {
+            let admitted_input_downgraded =
+                existing.admitted_input_bytes.is_some() && record.admitted_input_bytes.is_none();
+            if admitted_fence_downgraded
+                || admitted_input_downgraded
+                || !existing.same_binding(record)
+            {
                 return Err(OrsError::HostRequestIdentityConflict {
                     operation_id: record.operation_id.as_str().to_owned(),
                     request_digest: record.request_digest.clone(),
@@ -8140,6 +8145,7 @@ impl RedbRecoveryStore {
                 || binding_key == record.record_key()
                 || binding.request_digest != binding_digest
                 || binding.payload_digest != record.payload_digest
+                || binding.admitted_input_bytes.is_some()
                 || !identity_keys.insert(binding_key)
                 || !required_namespaces
                     .iter()
@@ -8154,7 +8160,9 @@ impl RedbRecoveryStore {
             let mut expected = record.clone();
             expected.operation_id.clone_from(&binding.operation_id);
             expected.request_digest.clone_from(&binding.request_digest);
+            expected.admitted_input_bytes = None;
             if expected.admitted_state_fence != binding.admitted_state_fence
+                || expected.admitted_input_bytes != binding.admitted_input_bytes
                 || !expected.same_binding(binding)
             {
                 return Err(OrsError::InvalidField {
@@ -8348,12 +8356,18 @@ impl RedbRecoveryStore {
                     && existing.commit_order == 0;
                 let admitted_fence_downgraded =
                     existing.admitted_state_fence.is_some() && binding.admitted_state_fence.is_none();
+                let admitted_input_downgraded =
+                    existing.admitted_input_bytes.is_some() && binding.admitted_input_bytes.is_none();
                 let same_binding = if compare_semantic_commitment {
                     Self::host_requests_share_logical_commitment(&existing, binding)
                 } else {
                     existing.same_binding(binding)
                 };
-                if !immutable || admitted_fence_downgraded || !same_binding {
+                if !immutable
+                    || admitted_fence_downgraded
+                    || admitted_input_downgraded
+                    || !same_binding
+                {
                     return Err(OrsError::HostRequestIdentityConflict {
                         operation_id: binding.operation_id.as_str().to_owned(),
                         request_digest: binding.request_digest.clone(),
@@ -8625,6 +8639,12 @@ impl RedbRecoveryStore {
             && left.scope_ref == right.scope_ref
             && left.capability_ref == right.capability_ref
             && left.payload_digest == right.payload_digest
+            // The existing linked row is the durable receiver. A historical
+            // candidate may omit either retained snapshot, but it cannot
+            // erase one the receiver already holds; a missing receiver stays
+            // missing because the winner is returned unchanged.
+            && (left.admitted_state_fence.is_none() || right.admitted_state_fence.is_some())
+            && (left.admitted_input_bytes.is_none() || right.admitted_input_bytes.is_some())
     }
 
     /// Validates every logical link against its operation row (issue #2571).
@@ -37344,6 +37364,7 @@ mod host_request_result_tests {
             cancellation_id: label("req-1:invoke:cancel"),
             parent_operation_id: None,
             request_digest: digest.to_owned(),
+            admitted_input_bytes: None,
             payload_digest: "b".repeat(64),
             payload_schema_id: None,
             payload_body: None,

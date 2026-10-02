@@ -9,8 +9,8 @@ use eliot_contracts::{
     EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ors::{
-    CONTRACT_VERSION, HostRequestKind, HostRequestRecord, HostRequestState, OpaqueLabel,
-    OperationIdentity, RedbRecoveryStore,
+    CONTRACT_VERSION, HostRequestEffectEvidence, HostRequestKind, HostRequestRecord,
+    HostRequestState, OpaqueLabel, OperationIdentity, RedbRecoveryStore,
 };
 use serde_json::{Value, json};
 
@@ -31,6 +31,38 @@ fn fence(epoch: u64) -> StateFence {
 
 fn digest(value: &Value) -> String {
     sha256_hex(&canonical_json_bytes(value).expect("JSON value canonicalizes"))
+}
+
+fn admitted_input_bytes(
+    state_fence: &StateFence,
+    payload: &Value,
+    work_scope_id: Option<&str>,
+) -> Vec<u8> {
+    canonical_json_bytes(&json!({
+        "wire_id": "eliot.protocol.host-request",
+        "wire_version": 1,
+        "kind": "INVOCATION",
+        "connection_id": "conn-1838-retained-reopen",
+        "identity": {
+            "request_id": "req-1838-retained-reopen",
+            "idempotency_key": "req-1838-retained-reopen:invoke",
+            "cancellation_id": "req-1838-retained-reopen:invoke:cancel",
+            "parent_operation_id": null,
+            "deadline_unix_ms": 9_999_999,
+            "capability": "eliot.query",
+            "session_id": "session-1838-retained-reopen",
+            "task_id": "task-1838-retained-reopen",
+            "work_scope_id": work_scope_id,
+            "payload_schema_id": "eliot.query.v1",
+            "payload_sha256": digest(payload),
+        },
+        "state_fence": serde_json::to_value(state_fence).expect("fence serializes"),
+        "descriptor_sha256": "a".repeat(64),
+        "peer_admission_receipt_sha256": "b".repeat(64),
+        "activation_binding": null,
+        "envelope_sha256": "",
+    }))
+    .expect("unsigned envelope canonicalizes")
 }
 
 fn label(value: &str) -> OpaqueLabel {
@@ -56,13 +88,14 @@ fn requested_record(
         cancellation_id: label("req-1838-retained-reopen:invoke:cancel"),
         parent_operation_id: None,
         request_digest: request_digest.to_owned(),
+        admitted_input_bytes: None,
         payload_digest: digest(payload),
         payload_schema_id: Some(label("eliot.query.v1")),
         payload_body: None,
         connection_ref: label("conn-1838-retained-reopen"),
         session_ref: Some(label("session-1838-retained-reopen")),
         task_ref: Some(label("task-1838-retained-reopen")),
-        scope_ref: None,
+        scope_ref: Some(label("scope-1838-retained-reopen")),
         capability_ref: label("eliot.query"),
         fence_digest,
         admitted_state_fence: Some(state_fence.clone()),
@@ -81,6 +114,80 @@ fn requested_record(
     }
 }
 
+fn local_read_attempt(
+    operation_id: &OperationIdentity,
+    state_fence: &StateFence,
+    scope_id: &str,
+) -> Value {
+    json!({
+        "wire_id": "eliot.protocol.local-read-attempt",
+        "wire_version": 1,
+        "operation_id": operation_id.as_str(),
+        "attempt_id": "local-read-attempt-1838",
+        "fencing_generation": 2,
+        "session_id": "session-1838-retained-reopen",
+        "authority_epoch": serde_json::to_value(state_fence.authority_epoch)
+            .expect("epoch serializes"),
+        "scope_id": scope_id,
+        "facet_method": "eliot.query",
+        "expires_at_unix_ms": 9_999_999,
+        "use_budget": 1,
+    })
+}
+
+fn actual_route_receipt(
+    operation_id: &OperationIdentity,
+    request_digest: &str,
+    result_digest: &str,
+    state_fence: &StateFence,
+) -> (String, Value) {
+    let mut receipt = json!({
+        "kind": "local_read_actual_route",
+        "operation_id": operation_id.as_str(),
+        "request_digest": request_digest,
+        "result_digest": result_digest,
+        "invoked_operation": "local_read",
+        "named_operation": {"operation": "GetEvidencePack"},
+        "state_fence": serde_json::to_value(state_fence).expect("fence serializes"),
+        "route_facts": {"selected_endpoint": "authenticated-gateway-1838"},
+    });
+    let receipt_digest = digest(&receipt);
+    receipt["receipt_digest"] = Value::String(receipt_digest.clone());
+    (receipt_digest, receipt)
+}
+
+fn activation_resolution_result(state_fence: &StateFence) -> Value {
+    let mut result = json!({
+        "wire_id": "eliot.protocol.agent-activation-resolution-result",
+        "wire_version": 3,
+        "ticket_id": "activation-ticket-1838",
+        "ticket_sha256": "c".repeat(64),
+        "ticket_state_fence": serde_json::to_value(state_fence).expect("fence serializes"),
+        "cancellation_id": "req-1838-retained-reopen:invoke:cancel",
+        "resolved_at_unix_ms": 10,
+        "disposition": {
+            "kind": "RESOLVED",
+            "binding": {
+                "principal_id": "principal-1838",
+                "session_id": "session-1838-retained-reopen",
+                "task_id": "task-1838-retained-reopen",
+                "work_unit_id": "unit-1838",
+                "work_scope_id": "scope-1838-retained-reopen",
+                "task_revision": "3",
+                "plan_id": "plan-1838",
+                "plan_revision": "4",
+            },
+        },
+        "dependency_observation": null,
+        "owner_evidence": null,
+        "cold_start_question": null,
+        "result_sha256": "",
+    });
+    let result_digest = digest(&result);
+    result["result_sha256"] = Value::String(result_digest);
+    result
+}
+
 fn temp_path() -> std::path::PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -94,11 +201,16 @@ fn temp_path() -> std::path::PathBuf {
 #[test]
 fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refused() {
     let path = temp_path();
-    let request_digest = "d".repeat(64);
-    let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
-        .expect("valid operation id");
     let original_fence = fence(7);
     let payload = json!({"tool": "GetEvidencePack", "subject": "evidence-1838"});
+    let input_bytes = admitted_input_bytes(
+        &original_fence,
+        &payload,
+        Some("scope-1838-retained-reopen"),
+    );
+    let request_digest = sha256_hex(&input_bytes);
+    let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
+        .expect("valid operation id");
     let result = json!({
         "request_id": "req-1838-retained-reopen",
         "idempotency_key": "req-1838-retained-reopen:invoke",
@@ -109,12 +221,37 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
             "revision_heads": [{"key": "scope:scope-1838", "revision": 3}],
         },
     });
-    let original = requested_record(
+    let result_digest = digest(&result);
+    let (actual_route_digest, route_receipt) = actual_route_receipt(
+        &operation_id,
+        &request_digest,
+        &result_digest,
+        &original_fence,
+    );
+    let effect_evidence = HostRequestEffectEvidence {
+        operation_id: label(operation_id.as_str()),
+        input_handle: Some(request_digest.clone()),
+        output_handle: Some(result_digest.clone()),
+        side_effects: Some("none".to_owned()),
+        actual_route: Some(actual_route_digest),
+        actual_route_receipt: Some(route_receipt.clone()),
+        local_read_attempt: Some(local_read_attempt(
+            &operation_id,
+            &original_fence,
+            "scope-1838-retained-reopen",
+        )),
+        activation_resolution_result: Some(activation_resolution_result(&original_fence)),
+        invoked_operation: Some("local_read".to_owned()),
+        adapter_identity: Some("adapter-1838".to_owned()),
+        executor_identity: Some("executor-1838".to_owned()),
+    };
+    let mut original = requested_record(
         operation_id.clone(),
         &request_digest,
         original_fence.clone(),
         &payload,
     );
+    original.admitted_input_bytes = Some(input_bytes.clone());
 
     {
         let store = RedbRecoveryStore::open(&path).expect("owner store opens");
@@ -134,9 +271,9 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
             .persist_host_request_result(
                 &operation_id,
                 &request_digest,
-                &digest(&result),
+                &result_digest,
                 &result,
-                None,
+                Some(&effect_evidence),
                 None,
             )
             .expect("exact result is retained");
@@ -149,6 +286,7 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         .expect("original row remains present");
     assert_eq!(retained.operation_id, operation_id);
     assert_eq!(retained.request_digest, request_digest);
+    assert_eq!(retained.admitted_input_bytes.as_deref(), Some(input_bytes.as_slice()));
     assert_eq!(retained.admitted_state_fence.as_ref(), Some(&original_fence));
     assert_eq!(retained.fence_digest, digest(&serde_json::to_value(&original_fence).unwrap()));
     assert_eq!(retained.payload_body.as_ref(), Some(&payload));
@@ -156,6 +294,19 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
     assert_eq!(retained.result_response.as_ref(), Some(&result));
     assert_eq!(retained.result_digest.as_deref(), Some(digest(&result).as_str()));
     assert_eq!(retained.state, HostRequestState::ResultReceived);
+    let retained_evidence = retained
+        .result_evidence
+        .as_ref()
+        .expect("original result evidence remains retained");
+    assert_eq!(retained_evidence.actual_route_receipt.as_ref(), Some(&route_receipt));
+    assert_eq!(
+        retained_evidence.local_read_attempt.as_ref(),
+        effect_evidence.local_read_attempt.as_ref()
+    );
+    assert_eq!(
+        retained_evidence.activation_resolution_result.as_ref(),
+        effect_evidence.activation_resolution_result.as_ref()
+    );
 
     let changed_request_digest = "e".repeat(64);
     assert!(reopened
@@ -163,12 +314,13 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         .expect("altered digest lookup succeeds")
         .is_none());
 
-    let changed_snapshot = requested_record(
+    let mut changed_snapshot = requested_record(
         operation_id.clone(),
         &request_digest,
         fence(8),
         &payload,
     );
+    changed_snapshot.admitted_input_bytes = Some(input_bytes.clone());
     assert!(matches!(
         reopened.stage_host_request(&changed_snapshot),
         Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
@@ -181,12 +333,20 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
     ));
 
-    let substituted_fence = requested_record(
+    let mut omitted_retained_input = original.clone();
+    omitted_retained_input.admitted_input_bytes = None;
+    assert!(matches!(
+        reopened.stage_host_request(&omitted_retained_input),
+        Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
+    ));
+
+    let mut substituted_fence = requested_record(
         operation_id.clone(),
         &request_digest,
         fence(8),
         &payload,
     );
+    substituted_fence.admitted_input_bytes = Some(input_bytes.clone());
     assert!(matches!(
         reopened.stage_host_request(&substituted_fence),
         Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
@@ -198,6 +358,18 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         mismatched_fence_digest.validate(),
         Err(eliot_ors::OrsError::InvalidField {
             field: "host_request_admitted_state_fence",
+            ..
+        })
+    ));
+
+    let mut substituted_input = original.clone();
+    let mut substituted_input_bytes = input_bytes.clone();
+    substituted_input_bytes[0] = b'[';
+    substituted_input.admitted_input_bytes = Some(substituted_input_bytes);
+    assert!(matches!(
+        reopened.stage_host_request(&substituted_input),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_admitted_input_bytes",
             ..
         })
     ));
@@ -242,13 +414,73 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         Err(eliot_ors::OrsError::HostRequestIdentityConflict { .. })
     ));
 
+    let mut substituted_receipt_row = retained.clone();
+    let mut substituted_evidence = retained_evidence.clone();
+    let mut substituted_receipt = substituted_evidence
+        .actual_route_receipt
+        .clone()
+        .expect("original actual-route receipt remains retained");
+    substituted_receipt["route_facts"] = json!({"selected_endpoint": "substituted"});
+    substituted_evidence.actual_route_receipt = Some(substituted_receipt);
+    substituted_receipt_row.result_evidence = Some(substituted_evidence);
+    assert!(matches!(
+        substituted_receipt_row.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_effect_evidence_actual_route_receipt",
+            ..
+        })
+    ));
+
+    let mut substituted_attempt_row = retained.clone();
+    let mut substituted_attempt_evidence = retained_evidence.clone();
+    let mut substituted_attempt = substituted_attempt_evidence
+        .local_read_attempt
+        .clone()
+        .expect("original local-read attempt remains retained");
+    substituted_attempt["session_id"] = Value::String("other-session".to_owned());
+    substituted_attempt_evidence.local_read_attempt = Some(substituted_attempt);
+    substituted_attempt_row.result_evidence = Some(substituted_attempt_evidence);
+    assert!(matches!(
+        substituted_attempt_row.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_effect_evidence_local_read_attempt",
+            ..
+        })
+    ));
+
+    let mut substituted_activation_row = retained.clone();
+    let mut substituted_activation_evidence = retained_evidence.clone();
+    let mut substituted_activation_result = substituted_activation_evidence
+        .activation_resolution_result
+        .clone()
+        .expect("original activation result remains retained");
+    substituted_activation_result["disposition"]["binding"]["principal_id"] =
+        Value::String("substituted-principal".to_owned());
+    substituted_activation_evidence.activation_resolution_result = Some(substituted_activation_result);
+    substituted_activation_row.result_evidence = Some(substituted_activation_evidence);
+    assert!(matches!(
+        substituted_activation_row.validate(),
+        Err(eliot_ors::OrsError::InvalidField {
+            field: "host_request_effect_evidence_activation_resolution_result",
+            ..
+        })
+    ));
+
     let unchanged = reopened
         .load_host_request(&operation_id, &request_digest)
         .expect("original owner row remains readable")
         .expect("original owner row remains retained");
     assert_eq!(unchanged.admitted_state_fence.as_ref(), Some(&original_fence));
+    assert_eq!(unchanged.admitted_input_bytes.as_deref(), Some(input_bytes.as_slice()));
     assert_eq!(unchanged.payload_body.as_ref(), Some(&payload));
     assert_eq!(unchanged.result_response.as_ref(), Some(&result));
+    assert_eq!(
+        unchanged
+            .result_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.actual_route_receipt.as_ref()),
+        Some(&route_receipt)
+    );
 
     drop(reopened);
     let _ = std::fs::remove_file(path);
@@ -257,11 +489,16 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
 #[test]
 fn historical_missing_fence_stays_missing_after_exact_retry_and_reopen() {
     let path = temp_path();
-    let request_digest = "f".repeat(64);
-    let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
-        .expect("valid operation id");
     let original_fence = fence(11);
     let payload = json!({"tool": "GetEvidencePack", "subject": "historical-1838"});
+    let input_bytes = admitted_input_bytes(
+        &original_fence,
+        &payload,
+        Some("scope-1838-retained-reopen"),
+    );
+    let request_digest = sha256_hex(&input_bytes);
+    let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
+        .expect("valid operation id");
     let result = json!({"result": "historical-1838"});
     let mut historical = requested_record(
         operation_id.clone(),
@@ -307,16 +544,18 @@ fn historical_missing_fence_stays_missing_after_exact_retry_and_reopen() {
         assert_eq!(retained.request_digest, request_digest);
         assert_eq!(retained.admitted_state_fence, None);
 
-        let retry_with_original_fence = requested_record(
+        let mut retry_with_original_fence = requested_record(
             operation_id.clone(),
             &request_digest,
             original_fence,
             &payload,
         );
+        retry_with_original_fence.admitted_input_bytes = Some(input_bytes.clone());
         let winner = reopened
             .stage_host_request(&retry_with_original_fence)
             .expect("matching historical retry resolves to the durable owner");
         assert_eq!(winner.admitted_state_fence, None);
+        assert_eq!(winner.admitted_input_bytes, None);
     }
 
     let final_reopen = RedbRecoveryStore::open(&path).expect("owner store reopens again");
@@ -325,6 +564,7 @@ fn historical_missing_fence_stays_missing_after_exact_retry_and_reopen() {
         .expect("historical owner lookup succeeds after retry")
         .expect("historical row is still retained");
     assert_eq!(retained.admitted_state_fence, None);
+    assert_eq!(retained.admitted_input_bytes, None);
     assert_eq!(retained.payload_body.as_ref(), Some(&payload));
     assert_eq!(retained.result_response.as_ref(), Some(&result));
 
