@@ -569,9 +569,57 @@ fn require_distinct_owners(cells: &[(String, String)]) -> Result<(), CellRegistr
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTRACT_TEXT, DECLARED_CELLS, MANIFEST_TEXT, enforce_declared_cells, parse_contract,
+        CONTRACT_TEXT, DECLARED_CELLS, MANIFEST_TEXT, enforce_compiled_table,
+        enforce_declared_cells, enforce_manifest_contract_agreement, parse_contract,
         parse_manifest, require_distinct_owners,
     };
+
+    /// Replace the first occurrence of `from` in REAL baked text with `to`.
+    ///
+    /// `enforce_declared_cells` reads compile-time `include_str!` bytes with
+    /// no arguments, so an arm is driven by mutating that exact text once and
+    /// handing it to the production parsers the guard itself calls. `from`
+    /// must occur in the real file: a drifting anchor panics loudly instead of
+    /// quietly passing a hand-written fixture no real file ever produced.
+    fn replace_once(text: &str, from: &str, to: &str) -> String {
+        let Some(at) = text.find(from) else {
+            panic!("mutation anchor is absent from the baked text: {from}");
+        };
+        let mut mutated = String::with_capacity(text.len() + to.len());
+        mutated.push_str(&text[..at]);
+        mutated.push_str(to);
+        mutated.push_str(&text[at + from.len()..]);
+        mutated
+    }
+
+    /// The one owner row of one real declared cell, as it is written on disk.
+    fn owner_row(cell: &str, state: &str, owner: &str) -> String {
+        format!("  {{ cell = \"{cell}\", state = \"{state}\", owner = \"{owner}\" }},\n")
+    }
+
+    /// Run the real manifest parser over one mutation of the real text.
+    fn enforce_mutated_manifest(from: &str, to: &str) -> Result<(), super::CellRegistryError> {
+        super::parse_manifest(&replace_once(MANIFEST_TEXT, from, to))
+    }
+
+    #[test]
+    fn missing_declaration_section_is_malformed_manifest() {
+        // Arm: `MANIFEST_SECTION` is absent, so `manifest_section` cannot find
+        // the declaration at all and the guard fails closed on the manifest
+        // before it ever compares the two files.
+        let sectionless = replace_once(MANIFEST_TEXT, "[package.metadata.eliot]\n", "");
+
+        let Err(error) = super::parse_manifest(&sectionless) else {
+            panic!("a manifest without [package.metadata.eliot] must not parse");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::MalformedManifest {
+                detail: "[package.metadata.eliot] section is missing".to_owned(),
+            },
+            "the typed refusal must name the missing declaration section"
+        );
+    }
 
     #[test]
     fn real_generated_declarations_enforce_clean() {
