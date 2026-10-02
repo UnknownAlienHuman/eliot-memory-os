@@ -441,9 +441,8 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
         // production: a frozen placeholder is refused by
         // `PreparedTransition::validate` as `ManifestMismatch` before the
         // apply reaches the store.
-        admission_contract_set_digest:
-            eliot_store_api::supported_admission_contract_set_digest()
-                .expect("build supports its own contract set"),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("build supports its own contract set"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
