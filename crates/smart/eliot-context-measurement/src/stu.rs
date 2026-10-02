@@ -44,8 +44,11 @@ pub fn stu_for_bytes(len: u64) -> Result<u64, ContextError> {
 /// observed length. `u = 64` is produced by every `b` in `190..=192`, and
 /// `u = 1` is produced by every `b` in `1..=3`; the value this function returns
 /// is one of those lengths, not a measurement of which one occurred. For `u = 0`
-/// every `b` in `0..=2` estimates to `0` and this function returns `0`, the
-/// whole-multiple member of that set.
+/// only `b = 0` estimates to `0`, and this function returns `0`, that sole
+/// member of the covering set: `u = 0` needs no covering length at all, because
+/// `ceil(b / 3) = 0` holds exactly when `b = 0`. The inverse image of `0` is the
+/// singleton `{ 0 }`; `1` is produced by every `b` in `1..=3` and by no other
+/// length, so the zero boundary is exactly one byte wide.
 ///
 /// This is a covering estimate, not a measurement. It never converts a
 /// measured unit count into an observed byte count; it only names the byte
@@ -96,11 +99,47 @@ mod tests {
         assert_eq!(bytes_for_stu(64)?, 192);
         assert!(bytes_for_stu(64)? > smallest);
 
-        // u = 0: every length in 0..=2 estimates to 0, and 0 is the
-        // whole-multiple member of that covering set.
-        for len in 0_u64..=2 {
-            assert_eq!(stu_for_bytes(len)?, 0);
+        // u = 0: only the length 0 estimates to 0, and 0 is that singleton
+        // covering set's sole member. The zero boundary is exactly one byte wide.
+        assert_eq!(stu_for_bytes(0)?, 0);
+        assert_eq!(bytes_for_stu(0)?, 0);
+        Ok(())
+    }
+
+    // This test carries no WORK_UNIT_CASE marker: the four markers already in
+    // this file are a scope decision belonging to #704's owner and #866/#787,
+    // and this repair neither removes nor renumbers them.
+    #[test]
+    fn stu_is_zero_only_for_the_zero_length() -> Result<(), ContextError> {
+        // `ceil(len / 3) == 0` holds exactly when `len == 0`; the lengths 1 and 2
+        // are produced by `u = 1`, so the old `0..=2` zero claim was false and its
+        // loop failed at len = 1. Pin both sides of the boundary so neither a
+        // widening of the zero set nor a regression to 0 can pass silently.
+        assert_eq!(stu_for_bytes(0)?, 0);
+
+        // First non-zero value: len = 1 is the first length with a non-zero
+        // estimate, and it estimates to exactly 1.
+        assert_eq!(stu_for_bytes(1)?, 1);
+        assert_ne!(stu_for_bytes(1)?, 0);
+
+        // The boundary is exactly one byte wide: no length in 1..=2 estimates to 0.
+        for len in 1_u64..=2 {
+            assert_eq!(stu_for_bytes(len)?, 1);
         }
+
+        // Exhaustively for a small range: the inverse image of 0 is the singleton
+        // { 0 }, and 1 is produced by every length in 1..=3 and by no other.
+        for len in 0_u64..=64 {
+            assert_eq!(
+                stu_for_bytes(len)? == 0,
+                len == 0,
+                "zero-boundary mismatch at len = {len}"
+            );
+        }
+        for len in 1_u64..=3 {
+            assert_eq!(stu_for_bytes(len)?, 1);
+        }
+        assert_eq!(stu_for_bytes(4)?, 2);
         assert_eq!(bytes_for_stu(0)?, 0);
         Ok(())
     }
