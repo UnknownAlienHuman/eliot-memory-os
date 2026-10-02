@@ -23,12 +23,20 @@ _spec.loader.exec_module(vdp)
 run_self_tests = vdp.run_self_tests
 verify_all = vdp.verify_all
 check_cargo_inventory = vdp.check_cargo_inventory
+check_inventory_disposition_evidence = vdp.check_inventory_disposition_evidence
 check_exceptions = vdp.check_exceptions
+check_exception_lock_drift = vdp.check_exception_lock_drift
+check_policy_manifest = vdp.check_policy_manifest
+derive_overall_status = vdp._derive_overall_status
 check_python_ecosystem = vdp.check_python_ecosystem
 check_nuget_ecosystem = vdp.check_nuget_ecosystem
 check_external_executables = vdp.check_external_executables
 build_receipt = vdp.build_receipt
 STATUS_PASS = vdp.STATUS_PASS
+STATUS_INCOMPLETE = vdp.STATUS_INCOMPLETE
+STATUS_FINDINGS = vdp.STATUS_FINDINGS
+
+_POPULATED_FEATURES = ["derive"]
 
 
 class TestVerifyDependencyPolicy(unittest.TestCase):
@@ -162,6 +170,255 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         }
         findings = check_exceptions(manifest_exc, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc))
         self.assertEqual(findings, [])
+
+    # --- issue #1229 A2: direct-dependency disposition evidence ---
+    #
+    # Presence of a required key is not evidence. A disposition that is keyed
+    # but empty (or whitespace-only) must be a DEP-003 finding rather than a
+    # clean run whose empty values are published into the SBOM by
+    # `_inventory_disposition`.
+
+    _DISPOSITION_BLANK_FIELDS = ("consumer", "owner", "reason", "public_exposure", "removal_plan")
+
+    def _rust_disposition_fixture(self, entry: dict) -> dict:
+        return {
+            "schema": "eliot.dependency-policy.v1",
+            "scanner": {"tool": "cargo-deny"},
+            "direct_dependencies": {"serde": entry},
+        }
+
+    def _populated_rust_disposition(self) -> dict:
+        return {
+            "ecosystem": "rust",
+            "version": "1.0.228",
+            "consumer": "crates/foundation/eliot-evidence",
+            "owner": "crates/foundation/eliot-evidence",
+            "reason": "serde derive for canonical evidence records",
+            "features": list(_POPULATED_FEATURES),
+            "public_exposure": "none",
+            "removal_plan": "hand-rolled serialization",
+        }
+
+    def _empty_rust_disposition(self) -> dict:
+        return {
+            "ecosystem": "rust",
+            "version": "1.0.228",
+            "consumer": "",
+            "owner": "",
+            "reason": "",
+            "features": [],
+            "public_exposure": "",
+            "removal_plan": "",
+        }
+
+    def _blank_field_detail(self, findings: list, dep: str) -> str:
+        details = [
+            finding.detail
+            for finding in findings
+            if finding.code == "DEP-003"
+            and dep in finding.detail
+            and "is missing valid fields:" in finding.detail
+        ]
+        self.assertEqual(len(details), 1, f"expected exactly one blank-value finding for '{dep}'")
+        return details[0].split("is missing valid fields:", 1)[1]
+
+    @staticmethod
+    def _named_fields(named: str) -> set[str]:
+        return {part.strip() for part in named.split(",") if part.strip()}
+
+    def test_empty_direct_disposition_rejected(self) -> None:
+        manifest_fixture = self._rust_disposition_fixture(self._empty_rust_disposition())
+        findings = check_cargo_inventory(manifest_fixture, {"serde"})
+        self.assertTrue(findings, "an all-empty disposition must not verify")
+        named = self._named_fields(self._blank_field_detail(findings, "serde"))
+        self.assertEqual(named, set(self._DISPOSITION_BLANK_FIELDS))
+        self.assertNotEqual(derive_overall_status(vdp.STATUS_PASS, findings), STATUS_PASS)
+
+    def test_whitespace_only_direct_disposition_field_rejected(self) -> None:
+        for blank in ("   ", "\t", "\n", " \t\n "):
+            entry = self._populated_rust_disposition()
+            entry["owner"] = blank
+            with self.subTest(owner=repr(blank)):
+                findings = check_cargo_inventory(self._rust_disposition_fixture(entry), {"serde"})
+                self.assertTrue(findings, "a whitespace-only owner must not verify")
+                named = self._named_fields(self._blank_field_detail(findings, "serde"))
+                self.assertEqual(named, {"owner"})
+
+    def test_populated_direct_disposition_accepted(self) -> None:
+        manifest_fixture = self._rust_disposition_fixture(self._populated_rust_disposition())
+        self.assertEqual(check_cargo_inventory(manifest_fixture, {"serde"}), [])
+
+    def test_removed_inventory_key_still_reported_as_missing_field(self) -> None:
+        entry = self._populated_rust_disposition()
+        del entry["removal_plan"]
+        findings = check_cargo_inventory(self._rust_disposition_fixture(entry), {"serde"})
+        self.assertTrue(
+            any(
+                finding.code == "DEP-003"
+                and "missing required field" in finding.detail
+                and "removal_plan" in finding.detail
+                for finding in findings
+            ),
+            findings,
+        )
+
+    def test_blank_feature_name_rejected(self) -> None:
+        entry = self._populated_rust_disposition()
+        entry["features"] = ["  "]
+        findings = check_cargo_inventory(self._rust_disposition_fixture(entry), {"serde"})
+        self.assertIn("features", self._blank_field_detail(findings, "serde"))
+
+    def test_non_ecosystem_disposition_entry_rejected_without_features(self) -> None:
+        # A nuget entry holding only ecosystem+version yields zero findings
+        # today: check_cargo_inventory only ever sees the Rust direct set.
+        manifest_fixture = {
+            "direct_dependencies": {
+                "Microsoft.WindowsAppSDK": {"ecosystem": "nuget", "version": "2.3.1"}
+            }
+        }
+        findings = check_inventory_disposition_evidence(manifest_fixture)
+        named = self._named_fields(self._blank_field_detail(findings, "Microsoft.WindowsAppSDK"))
+        self.assertEqual(named, set(self._DISPOSITION_BLANK_FIELDS))
+        self.assertNotEqual(derive_overall_status(vdp.STATUS_PASS, findings), STATUS_PASS)
+
+    def test_declared_inventory_entries_carry_populated_dispositions(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        _, manifest_data = check_policy_manifest(repo_root)
+        # Every entry the manifest declares carries a populated disposition,
+        # for every ecosystem.
+        self.assertEqual(check_inventory_disposition_evidence(manifest_data), [])
+        # The Rust gate must stay silent on exactly the declared Rust roots.
+        rust_roots = {
+            name
+            for name, entry in manifest_data["direct_dependencies"].items()
+            if isinstance(entry, dict) and entry.get("ecosystem") == "rust"
+        }
+        self.assertTrue(rust_roots)
+        self.assertEqual(check_cargo_inventory(manifest_data, rust_roots), [])
+
+    # --- issue #1229 A6: advisory exception evidence ---
+
+    _EXCEPTION_BLANK_FIELDS = ("owner", "compensating_control", "removal_condition", "expires_at")
+
+    def _exception_fixture(self, entry: dict) -> dict:
+        return {"exceptions": [entry]}
+
+    def _populated_exception(self) -> dict:
+        return {
+            "package": "vuln-pkg",
+            "version": "1.0.0",
+            "advisory": "RUSTSEC-2020-0001",
+            "owner": "security",
+            "compensating_control": "isolated",
+            "expires_at": "2027-01-01T00:00:00Z",
+            "removal_condition": "replace",
+        }
+
+    def _exception_blank_detail(self, findings: list, pkg: str) -> str:
+        details = [
+            finding.detail
+            for finding in findings
+            if finding.code == "DEP-010"
+            and f"exception for package '{pkg}' is missing valid fields:" in finding.detail
+        ]
+        self.assertEqual(len(details), 1, f"expected exactly one blank-evidence finding for '{pkg}'")
+        return details[0].split("is missing valid fields:", 1)[1]
+
+    def test_empty_exception_evidence_rejected(self) -> None:
+        entry = self._populated_exception()
+        for field in self._EXCEPTION_BLANK_FIELDS:
+            entry[field] = ""
+        findings = check_exceptions(self._exception_fixture(entry), now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc))
+        self.assertTrue(findings, "an exception with no evidence must not verify")
+        named = self._named_fields(self._exception_blank_detail(findings, "vuln-pkg"))
+        self.assertEqual(named, set(self._EXCEPTION_BLANK_FIELDS))
+        self.assertNotEqual(derive_overall_status(vdp.STATUS_PASS, findings), STATUS_PASS)
+
+    def test_whitespace_only_exception_evidence_rejected(self) -> None:
+        for blank in ("   ", "\t", "\n", " \t\n "):
+            entry = self._populated_exception()
+            for field in self._EXCEPTION_BLANK_FIELDS:
+                entry[field] = blank
+            with self.subTest(blank=repr(blank)):
+                findings = check_exceptions(
+                    self._exception_fixture(entry), now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)
+                )
+                named = self._named_fields(self._exception_blank_detail(findings, "vuln-pkg"))
+                self.assertEqual(named, set(self._EXCEPTION_BLANK_FIELDS))
+
+    def test_empty_exception_expiry_is_a_finding_not_a_skip(self) -> None:
+        # An exception MUST carry an expiry: docs/DEPENDENCY_POLICY.md:44
+        # ("Advisory and license exceptions are explicit and scoped"), the
+        # manifest header ("owned, expiring and invalidated by drift"), and
+        # the module docstring ("Structured expiring exceptions"). An empty
+        # expires_at used to skip the expiry branch entirely, so the exception
+        # was neither owned, nor expiring, nor bounded.
+        entry = self._populated_exception()
+        entry["expires_at"] = ""
+        findings = check_exceptions(self._exception_fixture(entry), now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc))
+        named = self._named_fields(self._exception_blank_detail(findings, "vuln-pkg"))
+        self.assertEqual(named, {"expires_at"})
+
+    def test_populated_expired_exception_still_reports_expiry(self) -> None:
+        entry = self._populated_exception()
+        entry["expires_at"] = "2020-01-01T00:00:00Z"
+        findings = check_exceptions(self._exception_fixture(entry), now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc))
+        self.assertTrue(
+            any(finding.code == "DEP-010" and "expired on 2020-01-01T00:00:00Z" in finding.detail for finding in findings),
+            findings,
+        )
+
+    def test_populated_drifted_exception_still_reports_drift(self) -> None:
+        denominator = {
+            "rust": {"locked_packages": [{"name": "serde", "version": "1.0.228"}]},
+            "nuget": {"locked_packages": []},
+            "python": {"locked_packages": []},
+        }
+        drifted = self._exception_fixture(self._populated_exception())
+        drifted["exceptions"][0].update(
+            {"package": "serde", "version": "9.9.9", "advisory": "RUSTSEC-2026-0001"}
+        )
+        findings = check_exception_lock_drift(drifted, denominator)
+        self.assertTrue(
+            any(
+                finding.code == "DEP-010" and "drifted from version '9.9.9'" in finding.detail
+                for finding in findings
+            ),
+            findings,
+        )
+
+    def test_bound_exception_passes_drift_join(self) -> None:
+        denominator = {
+            "rust": {"locked_packages": [{"name": "serde", "version": "1.0.228"}]},
+            "nuget": {"locked_packages": []},
+            "python": {"locked_packages": []},
+        }
+        bound = self._exception_fixture(self._populated_exception())
+        bound["exceptions"][0].update({"package": "serde", "version": "1.0.228"})
+        self.assertEqual(check_exception_lock_drift(bound, denominator), [])
+
+    def test_blank_exception_identity_is_not_skipped_by_drift_join(self) -> None:
+        # The drift join used to `continue` past an exception whose
+        # package/version were not non-empty strings, so blank identity was
+        # never bound to a lock at all.
+        denominator = {
+            "rust": {"locked_packages": [{"name": "serde", "version": "1.0.228"}]},
+            "nuget": {"locked_packages": []},
+            "python": {"locked_packages": []},
+        }
+        entry = self._populated_exception()
+        entry["package"] = "  "
+        entry["version"] = ""
+        findings = check_exception_lock_drift(self._exception_fixture(entry), denominator)
+        self.assertTrue(
+            any(
+                finding.code == "DEP-010"
+                and "cannot be bound" in finding.detail
+                and "package and version must be non-empty strings" in finding.detail
+                for finding in findings
+            ),
+            findings,
+        )
 
     def test_unhashed_python_requirement_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

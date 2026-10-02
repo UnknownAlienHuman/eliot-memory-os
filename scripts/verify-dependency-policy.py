@@ -1300,10 +1300,45 @@ def collect_direct_rust_dependencies(root: Path) -> tuple[list[Finding], set[str
     findings, direct_deps, _ = _collect_rust_dependency_graph(root)
     return findings, direct_deps
 
+_DIRECT_DISPOSITION_FIELDS = ("consumer", "owner", "reason", "features", "public_exposure", "removal_plan")
+_DIRECT_DISPOSITION_STRING_FIELDS = ("consumer", "owner", "reason", "public_exposure", "removal_plan")
+
+
+def _malformed_disposition_fields(entry: dict, *, require_features: bool) -> list[str]:
+    """Return required disposition field names whose value carries no evidence.
+
+    This is the rule :func:`check_workspace_dependency_dispositions` already
+    applies to workspace dispositions: a required field must hold a non-empty,
+    non-whitespace-only string, and ``features`` must be a list of non-blank
+    feature names. Only fields that are *present* are reported here, so a
+    removed key keeps its dedicated "missing required field" finding while a
+    keyed-but-blank value is rejected here; either way an empty disposition can
+    never be published through `_inventory_disposition` into the SBOM.
+
+    `features` is required for Rust direct roots and optional for the other
+    ecosystems, where it is not a declared concept. An empty `features` list
+    stays admissible because it is the repository's recorded "no optional
+    features enabled" value; only a non-list or a blank member is malformed.
+    """
+
+    malformed = [
+        field
+        for field in _DIRECT_DISPOSITION_STRING_FIELDS
+        if field in entry and (not isinstance(entry.get(field), str) or not entry[field].strip())
+    ]
+    if require_features or "features" in entry:
+        features = entry.get("features")
+        if not isinstance(features, list) or any(
+            not isinstance(feature, str) or not feature.strip() for feature in features
+        ):
+            malformed.append("features")
+    return sorted(set(malformed))
+
+
 def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Finding]:
     findings: list[Finding] = []
     inventory = manifest_data.get("direct_dependencies", {})
-    required_fields = ("consumer", "owner", "reason", "features", "public_exposure", "removal_plan")
+    required_fields = _DIRECT_DISPOSITION_FIELDS
 
     for dep in sorted(direct_deps):
         if dep not in inventory:
@@ -1330,6 +1365,60 @@ def check_cargo_inventory(manifest_data: dict, direct_deps: set[str]) -> list[Fi
                     )
                 )
 
+        # Presence alone is not evidence: a required key holding an empty or
+        # whitespace-only value is the same gap as a removed key, and would
+        # otherwise be published verbatim into the SBOM disposition.
+        malformed = _malformed_disposition_fields(entry, require_features=True)
+        if malformed:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"direct dependency disposition for '{dep}' is missing valid fields: "
+                    + ", ".join(malformed),
+                )
+            )
+
+    return findings
+
+
+def check_inventory_disposition_evidence(manifest_data: dict) -> list[Finding]:
+    """Require a populated disposition on every declared direct-dependency entry.
+
+    ``check_cargo_inventory`` only ever sees the Rust direct-root set, so a
+    nuget/python/node entry holding only ``ecosystem``+``version`` never reached
+    it. Every ecosystem entry is reconciled both ways by
+    :func:`check_direct_inventory_reconciliation`, so the observed/missing/stale
+    coverage already exists; this adds the same populated-value rule across all
+    ecosystems, using that sibling's finding vocabulary so one gate reads the
+    same way per ecosystem. ``features`` stays Rust-only because the other
+    ecosystems do not declare it; it is still validated wherever it is present.
+    """
+
+    findings: list[Finding] = []
+    inventory = manifest_data.get("direct_dependencies", {})
+    if not isinstance(inventory, dict):
+        return findings
+    for name in sorted(inventory, key=str):
+        entry = inventory[name]
+        if not isinstance(entry, dict):
+            continue
+        malformed = [
+            field
+            for field in _DIRECT_DISPOSITION_STRING_FIELDS
+            if field not in entry
+        ] + _malformed_disposition_fields(entry, require_features=False)
+        if malformed:
+            findings.append(
+                Finding(
+                    "DEP-003",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"direct dependency inventory entry '{name}' is missing valid fields: "
+                    + ", ".join(sorted(set(malformed))),
+                )
+            )
     return findings
 
 
@@ -1551,6 +1640,17 @@ def check_workspace_dependency_dispositions(
     return findings
 
 
+_EXCEPTION_REQUIRED_FIELDS = (
+    "package",
+    "version",
+    "advisory",
+    "owner",
+    "compensating_control",
+    "expires_at",
+    "removal_condition",
+)
+
+
 def check_exceptions(manifest_data: dict, now_dt: datetime | None = None) -> list[Finding]:
     findings: list[Finding] = []
     exceptions = manifest_data.get("exceptions", [])
@@ -1566,31 +1666,53 @@ def check_exceptions(manifest_data: dict, now_dt: datetime | None = None) -> lis
             findings.append(Finding("DEP-010", "config/dependency-policy.toml", 1, "each exception must be a table"))
             continue
 
-        for req in ("package", "version", "advisory", "owner", "compensating_control", "expires_at", "removal_condition"):
+        for req in _EXCEPTION_REQUIRED_FIELDS:
             if req not in exc_entry:
                 findings.append(
                     Finding("DEP-010", "config/dependency-policy.toml", 1, f"exception missing required field '{req}'")
                 )
 
-        exp_str = exc_entry.get("expires_at", "")
-        if exp_str:
-            try:
-                exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                if exp_dt < now_dt:
-                    pkg = exc_entry.get("package", "unknown")
-                    adv = exc_entry.get("advisory", "unknown")
-                    findings.append(
-                        Finding(
-                            "DEP-010",
-                            "config/dependency-policy.toml",
-                            1,
-                            f"exception for package '{pkg}' advisory '{adv}' expired on {exp_str}",
-                        )
-                    )
-            except Exception as e:
-                findings.append(
-                    Finding("DEP-010", "config/dependency-policy.toml", 1, f"invalid expires_at format '{exp_str}': {e}")
+        # A keyed-but-blank exception field carries no ownership, control,
+        # boundary or expiry. Reject the same "missing valid fields" rule the
+        # workspace disposition sibling applies rather than letting an empty
+        # value skip straight into the published receipt/SBOM exception state.
+        pkg = exc_entry.get("package") if isinstance(exc_entry.get("package"), str) else ""
+        malformed = [
+            field
+            for field in _EXCEPTION_REQUIRED_FIELDS
+            if field in exc_entry
+            and (not isinstance(exc_entry.get(field), str) or not exc_entry[field].strip())
+        ]
+        if malformed:
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"exception for package '{pkg or 'unknown'}' is missing valid fields: "
+                    + ", ".join(sorted(set(malformed))),
                 )
+            )
+            # An unusable expiry is already reported above; do not also parse it.
+            continue
+
+        exp_str = exc_entry["expires_at"]
+        try:
+            exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+            if exp_dt < now_dt:
+                adv = exc_entry["advisory"]
+                findings.append(
+                    Finding(
+                        "DEP-010",
+                        "config/dependency-policy.toml",
+                        1,
+                        f"exception for package '{pkg}' advisory '{adv}' expired on {exp_str}",
+                    )
+                )
+        except Exception as e:
+            findings.append(
+                Finding("DEP-010", "config/dependency-policy.toml", 1, f"invalid expires_at format '{exp_str}': {e}")
+            )
 
     return findings
 
@@ -1660,7 +1782,20 @@ def check_exception_lock_drift(
         package = exc_entry.get("package")
         version = exc_entry.get("version")
         advisory = exc_entry.get("advisory", "unknown")
-        if not isinstance(package, str) or not package or not isinstance(version, str) or not version:
+        if not isinstance(package, str) or not package.strip() or not isinstance(version, str) or not version.strip():
+            # An exception with no exact package/version identity cannot be bound
+            # to any lock. Fail closed here instead of skipping the join, so a
+            # blank identity is reported rather than silently excused.
+            findings.append(
+                Finding(
+                    "DEP-010",
+                    "config/dependency-policy.toml",
+                    1,
+                    f"exception for package '{package if isinstance(package, str) else ''}' "
+                    f"advisory '{advisory}' cannot be bound: "
+                    "package and version must be non-empty strings",
+                )
+            )
             continue
         if not locked:
             findings.append(
@@ -6179,6 +6314,7 @@ def verify_all(root: Path, profile: str) -> tuple[list[Finding], str, dict, dict
     all_findings.extend(resolver_findings)
     inv_findings = check_cargo_inventory(manifest_data, direct_deps)
     all_findings.extend(inv_findings)
+    all_findings.extend(check_inventory_disposition_evidence(manifest_data))
     scope_findings = check_inventory_platform_scope(manifest_data)
     all_findings.extend(scope_findings)
 
