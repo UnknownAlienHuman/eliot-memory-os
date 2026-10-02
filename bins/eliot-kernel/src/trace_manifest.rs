@@ -395,13 +395,14 @@ impl TraceManifest {
             missing_parts: Vec::new(),
             unavailable: Vec::new(),
         };
-        if let Some(evidence) = evidence {
-            if let (Some(digest), Some(receipt)) = (
-                evidence.actual_route.as_deref(),
-                evidence.actual_route_receipt.as_ref(),
-            ) && manifest.route_receipt_matches(digest, receipt)
+        if let Some(evidence) = evidence
+            && let Some(digest) = evidence.actual_route.as_deref()
+            && is_lowercase_sha256(digest)
+        {
+            manifest.actual_route = Some(digest.to_owned());
+            if let Some(receipt) = evidence.actual_route_receipt.as_ref()
+                && manifest.route_receipt_matches(digest, receipt)
             {
-                manifest.actual_route = Some(digest.to_owned());
                 manifest.actual_route_receipt = Some(receipt.clone());
             }
         }
@@ -602,11 +603,10 @@ impl TraceManifest {
                 self.actual_route.as_deref(),
                 self.actual_route_receipt.as_ref(),
             ) {
-                (Some(digest), Some(receipt)) => {
-                    self.route_receipt_matches(digest, receipt)
-                }
+                (Some(digest), Some(receipt)) => self.route_receipt_matches(digest, receipt),
+                (Some(digest), None) => is_lowercase_sha256(digest),
                 (None, None) => true,
-                _ => false,
+                (None, Some(_)) => false,
             }
             && self.fence_snapshot_is_consistent()
     }
@@ -855,7 +855,11 @@ impl TraceManifest {
             || route_facts
                 .get("connection_id")
                 .and_then(Value::as_str)
-                != self.connection_id.as_deref()
+                != self.adapter_identity.as_deref()
+            || route_facts
+                .get("approved_artifact_hash")
+                .and_then(Value::as_str)
+                != self.executor_identity.as_deref()
             || route_facts
                 .get("route_identity")
                 .and_then(Value::as_str)
@@ -895,8 +899,14 @@ fn original_admitted_envelope(persisted: &HostRequestRecord) -> Option<HostReque
     if crate::sha256_hex(bytes) != persisted.request_digest {
         return None;
     }
-    let parsed: HostRequestEnvelope = serde_json::from_slice(bytes).ok()?;
-    let envelope = parsed.with_computed_digest().ok()?;
+    let mut envelope: HostRequestEnvelope = serde_json::from_slice(bytes).ok()?;
+    if envelope.canonical_unsigned_bytes().ok()?.as_slice() != bytes {
+        return None;
+    }
+    // The owner row already carries the digest of these exact unsigned bytes.
+    // Restore that original digest for typed validation instead of minting a
+    // new one from a parsed/re-serialized request.
+    envelope.envelope_sha256 = persisted.request_digest.clone();
     envelope.validate().ok()?;
     HostRequestInvokeReadPayload {
         wire_id: HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
@@ -908,7 +918,7 @@ fn original_admitted_envelope(persisted: &HostRequestRecord) -> Option<HostReque
     .ok()?;
     let identity = &envelope.identity;
     let same_optional = |observed: Option<&str>, expected: Option<&str>| observed == expected;
-    if envelope.compute_digest().ok().as_deref() != Some(persisted.request_digest.as_str())
+    if envelope.kind != persisted.kind
         || persisted.operation_id.as_str() != format!("hostreq:{}", persisted.request_digest)
         || identity.request_id.as_str() != persisted.request_id.as_str()
         || identity.idempotency_key != persisted.idempotency_key.as_str()
@@ -1112,7 +1122,7 @@ mod tests {
             input_handle: None,
             output_handle: Some("b".repeat(64)),
             adapter_identity: Some("adapter:trace-test".to_owned()),
-            executor_identity: Some("executor:trace-test".to_owned()),
+            executor_identity: Some("f".repeat(64)),
             side_effects: Some("none".to_owned()),
             principal: None,
             policy_snapshot: None,
@@ -1167,8 +1177,8 @@ mod tests {
             "authority_epoch": serde_json::to_value(&fence.authority_epoch)
                 .expect("epoch serializes"),
             "endpoint": "endpoint:evidence-store",
-            "connection_id": manifest.connection_id.as_deref(),
-            "approved_artifact_hash": "d".repeat(64),
+            "connection_id": manifest.adapter_identity.as_deref(),
+            "approved_artifact_hash": manifest.executor_identity.as_deref(),
             "approved_config_hash": "e".repeat(64),
         });
         let mut receipt = serde_json::json!({
@@ -1229,6 +1239,10 @@ mod tests {
     fn find_sealed_replays_actual_route_only_with_exact_fence_and_route_facts() {
         let mut manifest = absent_evidence_manifest();
         let (digest, receipt) = actual_route_receipt(&manifest);
+        assert_ne!(
+            manifest.connection_id.as_deref(),
+            manifest.adapter_identity.as_deref()
+        );
         manifest.actual_route = Some(digest);
         manifest.actual_route_receipt = Some(receipt.clone());
         manifest.missing_parts = manifest.missing_parts();
@@ -1259,6 +1273,23 @@ mod tests {
         let substituted_digest = crate::sha256_json(&unsigned).expect("new receipt digest");
         substituted["receipt_digest"] = serde_json::Value::String(substituted_digest.clone());
         assert!(!manifest.route_receipt_matches(&substituted_digest, &substituted));
+
+        let (_, mut caller_connection_substitution) = actual_route_receipt(&manifest);
+        caller_connection_substitution["route_facts"]["connection_id"] =
+            serde_json::json!(manifest.connection_id);
+        let mut unsigned = caller_connection_substitution.clone();
+        unsigned
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("receipt_digest");
+        let wrong_adapter_digest =
+            crate::sha256_json(&unsigned).expect("wrong adapter receipt digest");
+        caller_connection_substitution["receipt_digest"] =
+            serde_json::Value::String(wrong_adapter_digest.clone());
+        assert!(!manifest.route_receipt_matches(
+            &wrong_adapter_digest,
+            &caller_connection_substitution,
+        ));
     }
 
     #[test]
@@ -1364,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn find_sealed_refuses_an_actual_route_digest_without_its_original_receipt() {
+    fn find_sealed_replays_a_route_digest_without_its_original_receipt_as_degraded() {
         let mut manifest = absent_evidence_manifest();
         manifest.actual_route = Some("d".repeat(64));
         manifest.missing_parts = manifest.missing_parts();
@@ -1372,7 +1403,11 @@ mod tests {
         manifest.finish = TraceFinish::DegradedNoProof;
         let records = [seal_record(&manifest)];
 
-        assert!(TraceManifest::find_sealed(&records, &manifest.operation_id).is_none());
+        let replay = TraceManifest::find_sealed(&records, &manifest.operation_id)
+            .expect("digest-only route evidence remains honestly degraded");
+
+        assert_eq!(replay.finish, TraceFinish::DegradedNoProof);
+        assert!(replay.missing_parts.iter().any(|part| part == "actual_route"));
     }
 
     #[test]
