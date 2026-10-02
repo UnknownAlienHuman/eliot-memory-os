@@ -8498,7 +8498,12 @@ mod tests {
             PreferenceCasExpected,
         };
 
-        use crate::{
+        // `daemon_runtime` is a module of the `eliotd` BINARY crate root (main.rs
+        // declares `mod daemon_runtime;`), and the library root does not declare it.
+        // `crate::` therefore resolves to the binary root, where neither item is
+        // re-exported, so the path has to name the owning module explicitly. The
+        // items themselves are unchanged - only the path that reaches them.
+        use crate::daemon_runtime::{
             SubmitReplacePreferencePolicyError, submit_replace_preference_policy_candidate,
         };
 
