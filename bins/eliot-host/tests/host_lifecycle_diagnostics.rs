@@ -634,27 +634,10 @@ fn production_boundary_rows(lib: &str) -> Vec<BoundaryRow> {
     rows
 }
 
-// WORK_UNIT_CASE: 891/T-A
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-A keeps stop/drain distinctions, single-terminal, and allowed-diff review in one deterministic probe"
-)]
-fn lifecycle_stop_drain_distinct_single_terminal() {
-    // T-A: `HostComposition::stop` durable states `Requested` -> `Draining` ->
-    // StoppedClean share one `drain_generation` correlation; draining vs
-    // drained and requested vs stopped stay distinct; exactly one terminal on
-    // failure. Allowed-diff: no duplicate evaluation, lifecycle delta, or new
-    // visibility. Liveness is never readiness here.
-    let fixture = lifecycle_fixture();
-    // The literal-count pins below measure PRODUCTION call sites. The landed
-    // case proofs in `lib.rs` re-spell those same literals, so they are read
-    // from the production source: a whole-file haystack would let a proof
-    // satisfy its own guard.
-    let lib = production_source();
-
-    // Call-site proof: the real `stop` contour contains the three durable
-    // states with one shared correlation and one designated terminal.
+/// The real `HostComposition::stop` contour contains the three durable drain
+/// states with one shared correlation and one designated terminal code, and
+/// those three durable writes stay distinct from each other.
+fn assert_stop_contour_pins_three_distinct_durable_states_and_one_terminal(lib: &str) {
     for required in [
         "DrainState::Requested",
         "DrainState::Draining",
@@ -675,14 +658,25 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
     // Requested vs Draining vs StoppedClean are three distinct durable writes.
     assert_ne!("Requested", "Draining");
     assert_ne!("Draining", "StoppedClean");
-    // The terminal code is singular for this operation. The PRIMARY pin is the
-    // RESOLVED VALUE: `BOUNDARY_STOP_TERMINAL` resolves through the owner's own
-    // `boundary_by_event` call, so this binds the exact `code=` production
-    // renders and would fail if the constant were repointed at another event.
-    // (The previous count of the `"host-stop-failed"` literal could not detect
-    // that repointing at all — it counted a spelling, not the emitted value.)
+}
+
+/// The stop terminal code is singular for this operation, and it is bound by
+/// the RESOLVED VALUE rather than by a spelling count.
+///
+/// `BOUNDARY_STOP_TERMINAL` resolves through the owner's own
+/// `boundary_by_event` call, so the PRIMARY pin binds the exact `code=`
+/// production renders and fails if the constant were repointed at another
+/// event. (The previous count of the `"host-stop-failed"` literal could not
+/// detect that repointing at all — it counted a spelling, not the emitted
+/// value.) The resolved value must additionally be a REAL production row, so
+/// the pin cannot be satisfied by a spelling no row owns, and no second stop
+/// terminal may exist anywhere in production.
+fn assert_stop_terminal_code_is_singular_and_resolves_to_the_stop_terminal_row(
+    lib: &str,
+    fixture: &Value,
+) {
     assert_eq!(
-        resolved_boundary_event(&lib, "BOUNDARY_STOP_TERMINAL"),
+        resolved_boundary_event(lib, "BOUNDARY_STOP_TERMINAL"),
         fixture["terminal_codes"]["stop_failed"]
             .as_str()
             .expect("fixture must pin the stop failed code"),
@@ -691,18 +685,18 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
     // The resolved value must be a REAL production row, so the pin cannot be
     // satisfied by a spelling no row owns.
     assert_eq!(
-        production_boundary_rows(&lib)
+        production_boundary_rows(lib)
             .iter()
             .find(|row| row.name == "stop.terminal")
             .map(|row| row.event.clone())
             .as_deref(),
-        Some(resolved_boundary_event(&lib, "BOUNDARY_STOP_TERMINAL").as_str()),
+        Some(resolved_boundary_event(lib, "BOUNDARY_STOP_TERMINAL").as_str()),
         "the stop constant must resolve to the stop.terminal row's own frozen event"
     );
     // SUPPLEMENTARY (source scan, clearly marked): the literal is spelled once,
     // so no duplicate spelling of this code exists in production.
     assert_eq!(
-        count_occurrences(&lib, "\"host-stop-failed\""),
+        count_occurrences(lib, "\"host-stop-failed\""),
         1,
         "stop must spell its terminal code at exactly one production site"
     );
@@ -712,10 +706,12 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
         !lib.contains("\"host-stop-failed-2\""),
         "no second stop terminal may exist"
     );
+}
 
-    // Drive the same facade vocabulary the call sites use, sharing one
-    // correlation across three distinct drain records.
-    let correlation = "drain-generation:891-T-A";
+/// Driving the same facade vocabulary the call sites use emits three distinct
+/// drain records that share ONE correlation, each under the production target
+/// and the fixture's entrypoint event.
+fn assert_three_drain_records_share_one_correlation(fixture: &Value, correlation: &str) {
     let text = capture_emit(|| {
         observe_entrypoint_with_detail(
             EntrypointStage::ShutdownDrain,
@@ -755,9 +751,11 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
         ),
         "capture must contain the entrypoint event, got: {text}"
     );
+}
 
-    // Exactly one terminal on failure; lower-phase observations share
-    // correlation and never count as a second terminal.
+/// A failed stop emits exactly ONE terminal for the shared correlation: the
+/// lower-phase `Requested` observation never counts as a second terminal.
+fn assert_failed_stop_emits_exactly_one_terminal(fixture: &Value, correlation: &str) {
     let failed = capture_emit(|| {
         observe_entrypoint_with_detail(
             EntrypointStage::ShutdownDrain,
@@ -776,9 +774,12 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
         "failed stop must emit exactly one terminal, got: {failed}"
     );
     assert!(failed.contains("host-stop-failed"));
+}
 
-    // Sink failure never alters result/order/status/cleanup: the surrounding
-    // operation result stays intact around every observation.
+/// Sink failure never alters result/order/status/cleanup: the surrounding
+/// operation result stays intact around every observation, and the Event Log
+/// seam stays typed-Unavailable — never FFI, never faked.
+fn assert_sink_failure_leaves_the_stop_result_intact_and_event_log_unavailable() {
     let host_result: Result<(), &'static str> = Ok(());
     let _ = capture_emit(|| {
         observe_entrypoint_with_detail(EntrypointStage::ShutdownDrain, "host.stop requested");
@@ -801,10 +802,16 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
         report_event(&record),
         Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
     );
+}
 
-    // Allowed-diff: no duplicate evaluation (each drain detail emitted once
-    // per site), no lifecycle delta (no new lifecycle enum/state), no new
-    // visibility (no new `pub` logging surface), no mutable global dedup.
+/// The T-A allowed diff holds: no duplicate evaluation (each drain detail
+/// emitted once per site), no lifecycle delta, no new visibility, no mutable
+/// global dedup, no secret material at any logging call site, and unchanged
+/// stdout framing.
+fn assert_stop_contour_adds_no_dedup_no_new_visibility_and_no_secret_canaries(
+    lib: &str,
+    fixture: &Value,
+) {
     for detail in fixture["drain_details"]
         .as_array()
         .expect("fixture must pin drain details")
@@ -850,26 +857,33 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
     );
 }
 
-// WORK_UNIT_CASE: 891/T-B
+// WORK_UNIT_CASE: 891/T-A
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-B keeps SCM receipt/Unknown identity, single-terminal, and canary review in one deterministic probe"
-)]
-fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
-    // T-B: SCM receipt vs `Unknown` via the real `handle_kernel_restart_request`
-    // / `reconcile_kernel_restart_request` shapes. Unsupported op stays typed
-    // Unknown preserving identity; expired-deadline/pending intent stays
-    // Unknown (never false-success); single terminal emission per Unknown
-    // outcome. Failed vs Unknown preserved by distinct codes.
+fn lifecycle_stop_drain_distinct_single_terminal() {
+    // T-A: `HostComposition::stop` durable states `Requested` -> `Draining` ->
+    // StoppedClean share one `drain_generation` correlation; draining vs
+    // drained and requested vs stopped stay distinct; exactly one terminal on
+    // failure. Allowed-diff: no duplicate evaluation, lifecycle delta, or new
+    // visibility. Liveness is never readiness here.
     let fixture = lifecycle_fixture();
-    // Production source only: the landed case proofs re-spell the very
-    // literals this test counts, so a whole-file haystack would let a proof
+    // The literal-count pins below measure PRODUCTION call sites. The landed
+    // case proofs in `lib.rs` re-spell those same literals, so they are read
+    // from the production source: a whole-file haystack would let a proof
     // satisfy its own guard.
     let lib = production_source();
 
-    // Call-site proof: the real SCM handlers distinguish receipt from
-    // Unknown, preserve identity, and own one terminal per Unknown outcome.
+    assert_stop_contour_pins_three_distinct_durable_states_and_one_terminal(&lib);
+    assert_stop_terminal_code_is_singular_and_resolves_to_the_stop_terminal_row(&lib, &fixture);
+    let correlation = "drain-generation:891-T-A";
+    assert_three_drain_records_share_one_correlation(&fixture, correlation);
+    assert_failed_stop_emits_exactly_one_terminal(&fixture, correlation);
+    assert_sink_failure_leaves_the_stop_result_intact_and_event_log_unavailable();
+    assert_stop_contour_adds_no_dedup_no_new_visibility_and_no_secret_canaries(&lib, &fixture);
+}
+
+/// The real SCM handlers distinguish receipt from `Unknown`, preserve request
+/// identity, and own one terminal per `Unknown` outcome.
+fn assert_scm_contour_pins_receipt_unknown_and_reconcile_distinctions(lib: &str) {
     for required in [
         "pub fn handle_kernel_restart_request",
         "pub fn reconcile_kernel_restart_request",
@@ -889,31 +903,41 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
             "lib.rs SCM contour must contain {required:?}"
         );
     }
-    // PRIMARY: the `code=` value production actually renders for the
-    // kernel-restart terminal.
-    //
-    // The previous pin counted the SPELLING of two `const`-call sites, so
-    // repointing `BOUNDARY_KERNEL_RESTART_TERMINAL` at a different event left
-    // the count at 2 and the assertion green while production emitted
-    // something else entirely. This binds the resolved constant instead: the
-    // owner resolves the row through its own `boundary_by_event(…)` call, so
-    // the resolved value IS the value `host_lifecycle_frozen_event` renders as
-    // `code=` at every kernel-restart terminal emission.
-    //
-    // PROOF CEILING, stated plainly: this pins the RESOLVED CONSTANT, not an
-    // observed emission. The `#[cfg(windows)]` `HostComposition` that owns
-    // `handle_kernel_restart_request` needs a live owner lease, job branches,
-    // readiness gate and registry, none of which this non-`cfg(test)`
-    // integration target can construct, so the emission cannot be driven from
-    // here. What IS executed is that the facade renders the resolved value as
-    // `code=`: the capture below observes production's own formatter emitting
-    // `code="host-kernel-restart-unknown"` through
-    // `observe_terminal_error`, which is the same owner function
-    // `host_lifecycle_observe_terminal_with_request_identity` calls. The
-    // unresolved gap is the handler CONTROL FLOW, which no assertion here can
-    // reach and which is reported as a named ceiling rather than claimed.
+}
+
+/// The kernel-restart terminal code binds the RESOLVED CONSTANT, its real
+/// production row, and the supplementary two-site call-site census.
+///
+/// PRIMARY: the `code=` value production actually renders for the
+/// kernel-restart terminal. The previous pin counted the SPELLING of two
+/// `const`-call sites, so repointing `BOUNDARY_KERNEL_RESTART_TERMINAL` at a
+/// different event left the count at 2 and the assertion green while
+/// production emitted something else entirely. This binds the resolved
+/// constant instead: the owner resolves the row through its own
+/// `boundary_by_event(…)` call, so the resolved value IS the value
+/// `host_lifecycle_frozen_event` renders as `code=` at every kernel-restart
+/// terminal emission.
+///
+/// PROOF CEILING, stated plainly: this pins the RESOLVED CONSTANT, not an
+/// observed emission. The `#[cfg(windows)]` `HostComposition` that owns
+/// `handle_kernel_restart_request` needs a live owner lease, job branches,
+/// readiness gate and registry, none of which this non-`cfg(test)`
+/// integration target can construct, so the emission cannot be driven from
+/// here. What IS executed is that the facade renders the resolved value as
+/// `code=`: the capture in
+/// `assert_one_unknown_outcome_emits_one_terminal_rendering_the_resolved_code`
+/// observes production's own formatter emitting
+/// `code="host-kernel-restart-unknown"` through `observe_terminal_error`,
+/// which is the same owner function
+/// `host_lifecycle_observe_terminal_with_request_identity` calls. The
+/// unresolved gap is the handler CONTROL FLOW, which no assertion here can
+/// reach and which is reported as a named ceiling rather than claimed.
+fn assert_kernel_restart_terminal_code_resolves_to_its_own_production_row(
+    lib: &str,
+    fixture: &Value,
+) {
     assert_eq!(
-        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        resolved_boundary_event(lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
         fixture["terminal_codes"]["kernel_restart_unknown"]
             .as_str()
             .expect("fixture must pin the restart unknown code"),
@@ -921,14 +945,14 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
     );
     // The resolved constant must be a REAL production row, so the pin cannot
     // be satisfied by a spelling that no table row owns.
-    let rows = production_boundary_rows(&lib);
+    let rows = production_boundary_rows(lib);
     let terminal_row = rows
         .iter()
         .find(|row| row.name == "kernel-restart.terminal")
         .expect("the production table must own a kernel-restart.terminal row");
     assert_eq!(
         terminal_row.event,
-        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        resolved_boundary_event(lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
         "the constant must resolve to the kernel-restart.terminal row's own frozen event"
     );
     assert_eq!(
@@ -942,14 +966,22 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
     // emitted code, because it is insensitive to which event the constant
     // names.
     assert_eq!(
-        terminal_emission_sites(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        terminal_emission_sites(lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
         2,
         "handle must own exactly its owner-fenced + unknown terminal emissions"
     );
+}
 
-    // Real wire types: a well-formed RestartKernel request validates; an
-    // unsupported RecoverStore request is well-formed on the wire but must
-    // never become a Restarted success in the handler (typed Unknown).
+/// A well-formed RestartKernel request and a well-formed but unsupported
+/// RecoverStore request are DISTINCT in both operation and request identity.
+///
+/// A RecoverStore request is well-formed on the wire but must never become a
+/// Restarted success in the handler; the typed `Unknown` half is asserted by
+/// [`assert_unsupported_operation_answers_typed_unknown_preserving_its_identity`].
+fn assert_unsupported_operation_differs_from_restart_in_operation_and_request_digest() -> (
+    eliot_host::HostRuntimeControlRequest,
+    eliot_host::HostRuntimeControlRequest,
+) {
     let restart = eliot_host::HostRuntimeControlRequest::new(
         eliot_host::HostRuntimeControlOperation::RestartKernel,
         eliot_platform::PlatformHandle::new("891-T-B-restart".to_owned())
@@ -975,22 +1007,32 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         restart.request_digest.as_str(),
         unsupported.request_digest.as_str()
     );
+    (restart, unsupported)
+}
 
-    // Typed non-success preserving identity: Unknown carries the exact
-    // request's pending ref and validates; it is never a Restarted success.
+/// An unsupported operation answers with a typed `Unknown` that preserves the
+/// exact request's identity and is never a false Restarted success.
+///
+/// The `Unknown` carries the exact request's pending ref and validates; it
+/// matches that request and no other, and the pending ref binds the exact
+/// request digest (identity preserved, no payload copied).
+fn assert_unsupported_operation_answers_typed_unknown_preserving_its_identity(
+    unsupported: &eliot_host::HostRuntimeControlRequest,
+    restart: &eliot_host::HostRuntimeControlRequest,
+) {
     let pending_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
         "kernel-restart",
-        &unsupported,
+        unsupported,
     );
     let unknown =
-        eliot_host::HostRuntimeControlResponse::unknown_for(&unsupported, pending_ref.clone());
+        eliot_host::HostRuntimeControlResponse::unknown_for(unsupported, pending_ref.clone());
     unknown.validate().expect("unknown response must validate");
     assert!(
-        eliot_host_service::runtime_control::response_matches_request(&unsupported, &unknown),
+        eliot_host_service::runtime_control::response_matches_request(unsupported, &unknown),
         "unknown must preserve the exact request identity"
     );
     assert!(
-        !eliot_host_service::runtime_control::response_matches_request(&restart, &unknown),
+        !eliot_host_service::runtime_control::response_matches_request(restart, &unknown),
         "unknown for one request must not match another request"
     );
     assert!(
@@ -1008,21 +1050,26 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
             .contains(unsupported.request_digest.as_str()),
         "pending ref must preserve request identity"
     );
+}
 
-    // Expired-deadline/pending intent stays Unknown: a reconcile-unknown for
-    // the same mutation digest validates, matches, and never succeeds.
+/// An expired-deadline/pending intent stays `Unknown`: the reconcile-unknown
+/// for the same mutation digest validates, matches its own request, and never
+/// succeeds.
+fn assert_pending_intent_answers_typed_unknown_never_false_success(
+    restart: &eliot_host::HostRuntimeControlRequest,
+) {
     let reconcile_unknown = eliot_host::HostRuntimeControlResponse::unknown_for(
-        &restart,
+        restart,
         eliot_host_service::runtime_control::runtime_control_unknown_ref(
             "kernel-restart-pending",
-            &restart,
+            restart,
         ),
     );
     reconcile_unknown
         .validate()
         .expect("pending unknown must validate");
     assert!(
-        eliot_host_service::runtime_control::response_matches_request(&restart, &reconcile_unknown),
+        eliot_host_service::runtime_control::response_matches_request(restart, &reconcile_unknown),
         "pending unknown must preserve identity"
     );
     assert!(
@@ -1032,10 +1079,28 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         ),
         "pending/timeout must stay Unknown, never false-success"
     );
+}
 
-    // Single terminal emission per Unknown outcome; receipt vs Unknown share
-    // correlation by detail order, not by a dedup cache.
-    let correlation = restart.request_digest.as_str().to_owned();
+/// One `Unknown` outcome emits exactly ONE terminal, and production's own
+/// formatter renders the RESOLVED terminal constant as `code=`.
+///
+/// Receipt vs Unknown share correlation by detail order, not by a dedup cache.
+/// The failed/Unknown distinction is pinned by EXACT equality against the
+/// value the owner's constant resolves to, not by a substring: the old
+/// `.contains("unknown")` was satisfied by any code merely mentioning the word,
+/// so it could not distinguish the Unknown code from the reconcile-Unknown code
+/// or from any future sibling. Because this capture is production's own
+/// `observe_terminal_error`, the same owner function
+/// `host_lifecycle_observe_terminal_with_request_identity` calls, the rendered
+/// `code=` field is the emitted value rather than a re-spelling.
+///
+/// Returns the captured SCM text so the canary and sink checks read the very
+/// same observation this proof captured.
+fn assert_one_unknown_outcome_emits_one_terminal_rendering_the_resolved_code(
+    lib: &str,
+    fixture: &Value,
+    correlation: &str,
+) -> String {
     let scm_text = capture_emit(|| {
         observe_entrypoint_with_detail(
             EntrypointStage::ScmDispatch,
@@ -1068,7 +1133,7 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         fixture["terminal_codes"]["kernel_restart_unknown"]
             .as_str()
             .expect("fixture must pin the restart unknown code"),
-        resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
+        resolved_boundary_event(lib, "BOUNDARY_KERNEL_RESTART_TERMINAL"),
         "the pinned Unknown code must be exactly the value the terminal constant resolves to"
     );
     assert_ne!(
@@ -1087,12 +1152,19 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
     assert!(
         scm_text.contains(&format!(
             "code={:?}",
-            resolved_boundary_event(&lib, "BOUNDARY_KERNEL_RESTART_TERMINAL")
+            resolved_boundary_event(lib, "BOUNDARY_KERNEL_RESTART_TERMINAL")
         )),
         "production must render the resolved terminal constant as `code=`, got: {scm_text}"
     );
+    scm_text
+}
 
-    // Sink failure never alters result/order/status/cleanup.
+/// Sink failure never alters result/order/status/cleanup on the SCM path, no
+/// secret canary appears in any SCM observation, and the Event Log seam stays
+/// typed-Unavailable.
+fn assert_scm_sink_failure_is_inert_and_observations_carry_no_secret_canaries(
+    scm_text: &str,
+) {
     let host_result: Result<(), &'static str> = Ok(());
     let _ = capture_emit(|| {
         observe_entrypoint_with_detail(
@@ -1119,6 +1191,40 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         event_log_sink_status(),
         Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
     );
+}
+
+// WORK_UNIT_CASE: 891/T-B
+#[test]
+fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
+    // T-B: SCM receipt vs `Unknown` via the real `handle_kernel_restart_request`
+    // / `reconcile_kernel_restart_request` shapes. Unsupported op stays typed
+    // Unknown preserving identity; expired-deadline/pending intent stays
+    // Unknown (never false-success); single terminal emission per Unknown
+    // outcome. Failed vs Unknown preserved by distinct codes.
+    let fixture = lifecycle_fixture();
+    // Production source only: the landed case proofs re-spell the very
+    // literals this test counts, so a whole-file haystack would let a proof
+    // satisfy its own guard.
+    let lib = production_source();
+
+    assert_scm_contour_pins_receipt_unknown_and_reconcile_distinctions(&lib);
+    assert_kernel_restart_terminal_code_resolves_to_its_own_production_row(&lib, &fixture);
+    let (restart, unsupported) =
+        assert_unsupported_operation_differs_from_restart_in_operation_and_request_digest();
+    assert_unsupported_operation_answers_typed_unknown_preserving_its_identity(
+        &unsupported,
+        &restart,
+    );
+    assert_pending_intent_answers_typed_unknown_never_false_success(&restart);
+    // Single terminal emission per Unknown outcome; receipt vs Unknown share
+    // correlation by detail order, not by a dedup cache.
+    let correlation = restart.request_digest.as_str();
+    let scm_text = assert_one_unknown_outcome_emits_one_terminal_rendering_the_resolved_code(
+        &lib,
+        &fixture,
+        correlation,
+    );
+    assert_scm_sink_failure_is_inert_and_observations_carry_no_secret_canaries(&scm_text);
 }
 
 /// The 22-case denominator, asserted exactly: every case in `1..=22` carries
