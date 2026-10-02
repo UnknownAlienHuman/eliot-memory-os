@@ -1137,7 +1137,8 @@ mod tests {
 
     #[test]
     fn installation_document_resolves_when_its_source_layer_matches() {
-        let document = b"layer = \"installation_config\"\nkey = \"task.budget.per_job\"\nlimit = 48\n";
+        let document =
+            b"layer = \"installation_config\"\nkey = \"task.budget.per_job\"\nlimit = 48\n";
         let resolved = resolve_effective_configuration(&[PolicyDocument {
             file_name: "installation.toml",
             expected_layer: ConfigLayer::InstallationConfig,

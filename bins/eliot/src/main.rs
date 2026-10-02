@@ -1816,10 +1816,7 @@ fn observe_legacy_governor_config() -> Result<()> {
         }
         Err(error) => {
             let detail = format!("legacy Governor config observation is unknown: {error}");
-            write_legacy_governor_cutover_rejection(
-                LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
-                &detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_OBSERVATION_UNKNOWN, &detail);
             return Err(anyhow::anyhow!(detail));
         }
     }
@@ -1828,17 +1825,11 @@ fn observe_legacy_governor_config() -> Result<()> {
         Ok(false) => {}
         Ok(true) => {
             let detail = "legacy eliot-governor.exe is running";
-            write_legacy_governor_cutover_rejection(
-                LEGACY_GOVERNOR_PROCESS_RUNNING,
-                detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_PROCESS_RUNNING, detail);
         }
         Err(error) => {
             let detail = format!("legacy Governor process state is unknown: {error}");
-            write_legacy_governor_cutover_rejection(
-                LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
-                &detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_OBSERVATION_UNKNOWN, &detail);
         }
     }
     classify_legacy_governor_process_state(process_state).map_err(|error| anyhow::anyhow!(error))
