@@ -369,6 +369,35 @@ impl LaneIdentity {
         ))
     }
 
+    /// The exact fixture bindings a governed child process of this lane runs
+    /// with, before the envelope is allocated.
+    ///
+    /// This is the same pair [`GovernedWorkEnvelope::fixture_environment`]
+    /// emits, read off the one pre-allocation identity, so a submitting owner
+    /// can name in its declaration the very environment the admitted child will
+    /// be given rather than only the claim the allocator grants a lease
+    /// against. The two derivations are one: both resolve the root through
+    /// [`Self::fixture_root`], which is a function of the retained namespace,
+    /// so the lane and the envelope it allocates cannot describe two different
+    /// lanes.
+    ///
+    /// Without this, the namespace a lane declares would reach disk only
+    /// through the envelope, and the claims it declares before allocation would
+    /// be checked against a derivation the owner cannot read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when a tuple element or the fingerprint is
+    /// invalid.
+    pub fn fixture_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
+        let namespace = self.fixture_namespace()?;
+        let root = self.fixture_root()?;
+        Ok(vec![
+            (FIXTURE_NAMESPACE_ENV.to_owned(), namespace),
+            (FIXTURE_ROOT_ENV.to_owned(), path_text(&root)),
+        ])
+    }
+
     /// The exclusive runtime resources this lane declares before it executes.
     ///
     /// The productive verifier run writes mutable fixture state, and a worktree
@@ -937,7 +966,10 @@ mod tests {
         let root = ok(lane.fixture_root());
         let other_root = ok(other.fixture_root());
         assert_ne!(root, other_root);
-        assert_eq!(root.file_name().and_then(|n| n.to_str()), Some(&namespace));
+        assert_eq!(
+            root.file_name().and_then(|n| n.to_str()),
+            Some(namespace.as_str())
+        );
         assert_eq!(
             root.parent(),
             Some(
@@ -979,18 +1011,23 @@ mod tests {
         std::fs::remove_dir_all(&local_app_data).expect("local app data root must clean");
     }
 
-    /// The pre-allocation lane and the allocated envelope derive ONE namespace
-    /// and ONE physical root. The claims an owner declares before the envelope
-    /// exists and the namespace the store later derives must be the same value
-    /// by construction, not two derivations that happen to agree; the declared
-    /// claim is what the allocator grants a lease against, so a second
-    /// derivation would be a second directory.
+    /// The pre-allocation lane and the allocated envelope derive ONE namespace,
+    /// ONE physical root, and ONE pair of child bindings. The claims an owner
+    /// declares before the envelope exists and the namespace the store later
+    /// derives must be the same value by construction, not two derivations that
+    /// happen to agree; the declared claim is what the allocator grants a lease
+    /// against, so a second derivation would be a second directory. The same
+    /// applies to the environment: the lane states what a child of it will be
+    /// given, and the envelope admitted from that lane states the same thing,
+    /// so the owner's declaration and the admitted child cannot describe two
+    /// different lanes.
     #[test]
     fn lane_and_envelope_derive_one_namespace_and_one_root() {
         let local_app_data = canonical_root("one-derivation");
         let lane = lane_for("wi-1897-shared", "candidate-shared", &local_app_data);
         let lane_namespace = ok(lane.fixture_namespace());
         let lane_root = ok(lane.fixture_root());
+        let lane_environment = ok(lane.fixture_environment());
         let claims = ok(lane.fixture_resource_claims());
         let envelope = ok(GovernedWorkEnvelope::allocate(
             lane,
@@ -1002,10 +1039,15 @@ mod tests {
         assert_eq!(
             ok(envelope.fixture_environment()),
             vec![
-                (FIXTURE_NAMESPACE_ENV.to_owned(), lane_namespace),
+                (FIXTURE_NAMESPACE_ENV.to_owned(), lane_namespace.clone()),
                 (FIXTURE_ROOT_ENV.to_owned(), path_text(&lane_root)),
             ]
         );
+        // The two child environments are byte-identical, not merely equal in
+        // each value separately: the namespace and the root are emitted as one
+        // pair, and a child that received one half of it would resolve a
+        // different lane than the one the other half names.
+        assert_eq!(lane_environment, ok(envelope.fixture_environment()));
         // The claim the owner declared before allocation is exactly the claim
         // the allocated envelope carries, so the grant that backs it names one
         // directory.
