@@ -450,3 +450,337 @@ fn constant_time_handle_equal(left: &PlatformHandle, right: &PlatformHandle) -> 
     }
     difference == 0
 }
+
+// F-LOG-HOST-5 (#980) executed contours of the closed codec reject vocabulary.
+//
+// Placed at the owner because `decode_marker`/`decode_envelope` and
+// `CodecRejectReason` are `pub(super)` inside this private leaf: an integration
+// test under `tests/` cannot name them. Each case drives the REAL decoder with
+// a genuinely different input and asserts the record the owner emitted for
+// exactly that branch, so the five-way split cannot be a catch-all: every other
+// contour must be ABSENT from the same captured text.
+//
+// The capture reuses the crate's existing `tracing` seam: the production record
+// is read back out of a real subscriber (`host_diagnostics` emits through
+// `tracing::info!`), never manufactured by calling the facade directly.
+#[cfg(test)]
+mod codec_reject_contour_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use eliot_installation::{
+        HostCredentialControlIntent, HostCredentialControlOperation, LOCAL_SERVICE_SID,
+        StoreCredentialProvider, StoreCredentialProvisionPlan, StoreCredentialScope,
+        provider_bootstrap_credential_target_for_store_target,
+    };
+
+    use super::*;
+
+    /// Every contour of the closed vocabulary. A case that emits one MUST NOT
+    /// emit any of the others, so a collapsed catch-all fails the assertion
+    /// instead of passing it.
+    const ALL_CONTOURS: [&str; 10] = [
+        "marker-record-shape",
+        "marker-expected-mac",
+        "marker-mac-mismatch",
+        "marker-protected-object-mismatch",
+        "marker-wire-version-mismatch",
+        "envelope-record-shape",
+        "envelope-expected-mac",
+        "envelope-mac-mismatch",
+        "envelope-protected-object-mismatch",
+        "envelope-wire-version-mismatch",
+    ];
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `body` under a real `tracing` subscriber and returns exactly the
+    /// text production emitted while it ran.
+    fn capture(body: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let bytes = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, body);
+            sink.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .clone()
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Asserts the single contour that was emitted, and that every OTHER
+    /// contour of the closed vocabulary is absent from the same record.
+    fn assert_exactly_one_contour(record: &str, expected: &str, boundary: &str) {
+        assert!(
+            record.contains(&format!("reason={expected}")),
+            "expected contour {expected} was not emitted: {record}"
+        );
+        assert!(
+            record.contains(boundary),
+            "expected boundary {boundary} was not emitted: {record}"
+        );
+        for other in ALL_CONTOURS {
+            if other != expected {
+                assert!(
+                    !record.contains(&format!("reason={other}")),
+                    "contour {expected} also emitted sibling {other}: {record}"
+                );
+            }
+        }
+    }
+
+    fn handle(value: impl Into<String>) -> PlatformHandle {
+        PlatformHandle::new(value.into()).unwrap_or_else(|error| panic!("test handle: {error}"))
+    }
+
+    fn provision() -> StoreCredentialProvisionPlan {
+        let target = handle("eliot/store/v1/0123456789abcdef0123456789abcdef");
+        StoreCredentialProvisionPlan {
+            host_state_root: handle(r"C:\ProgramData\Eliot\host"),
+            expected_host_executable: handle(r"C:\ProgramData\Eliot\eliot-host.exe"),
+            target: target.clone(),
+            provider_bootstrap_target: Some(
+                provider_bootstrap_credential_target_for_store_target(&target)
+                    .unwrap_or_else(|error| panic!("test bootstrap target: {error}")),
+            ),
+            provider: StoreCredentialProvider::WindowsCredentialManager,
+            scope: StoreCredentialScope::LocalService,
+            expected_principal_sid: handle(LOCAL_SERVICE_SID),
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            config_digest: handle("c".repeat(64)),
+        }
+    }
+
+    fn request() -> HostCredentialControlRequest {
+        let intent = HostCredentialControlIntent::new(
+            HostCredentialControlOperation::Provision,
+            handle("tx:contour"),
+            handle("effect:contour"),
+            provision(),
+            handle("a".repeat(64)),
+        )
+        .unwrap_or_else(|error| panic!("test intent: {error}"));
+        HostCredentialControlRequest {
+            intent,
+            ownership_key: vec![7; 32],
+            expected_receipt: None,
+            phase_b: None,
+            phase_b_final: None,
+        }
+    }
+
+    /// The protected-object identity production will be asked to prove. The
+    /// `foreign` variant differs only in the served file index, so the same
+    /// record bytes decode against one identity and not the other.
+    fn served_identity(file_index: u64) -> InstallerRootObjectSnapshot {
+        InstallerRootObjectSnapshot {
+            canonical_path_digest: "b".repeat(64),
+            volume_serial_number: 7,
+            file_index,
+            security_descriptor_digest: "d".repeat(64),
+        }
+    }
+
+    const MARKER_BOUNDARY: &str = "host.credential codec marker rejected";
+    const ENVELOPE_BOUNDARY: &str = "host.credential codec envelope rejected";
+
+    fn valid_marker_bytes(
+        request: &HostCredentialControlRequest,
+        identity: &InstallerRootObjectSnapshot,
+    ) -> Vec<u8> {
+        marker_bytes(
+            request,
+            &request.ownership_key,
+            identity,
+            MarkerPhase::Reserved,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("valid marker bytes: {error}"))
+    }
+
+    fn valid_envelope_bytes(
+        request: &HostCredentialControlRequest,
+        identity: &InstallerRootObjectSnapshot,
+        epoch: &PlatformHandle,
+    ) -> Vec<u8> {
+        envelope_bytes(request, &request.ownership_key, epoch, identity, &[9; 32])
+            .unwrap_or_else(|()| panic!("valid envelope bytes"))
+    }
+
+    /// Re-serializes a mutated marker record so the owner re-decodes a genuinely
+    /// different record rather than a different byte string of the same shape.
+    /// The MAC field is left untouched: the owner rebuilds the expected record
+    /// from the SAME served identity, so only the edited field can differ.
+    fn retag_marker(
+        request: &HostCredentialControlRequest,
+        identity: &InstallerRootObjectSnapshot,
+        edit: impl FnOnce(&mut MarkerRecord),
+    ) -> Vec<u8> {
+        let mut record: MarkerRecord =
+            serde_json::from_slice(&valid_marker_bytes(request, identity))
+                .unwrap_or_else(|error| panic!("decode marker for retag: {error}"));
+        edit(&mut record);
+        serde_json::to_vec(&record)
+            .unwrap_or_else(|error| panic!("encode retagged marker: {error}"))
+    }
+
+    /// Same, for the envelope record.
+    fn retag_envelope(
+        request: &HostCredentialControlRequest,
+        identity: &InstallerRootObjectSnapshot,
+        epoch: &PlatformHandle,
+        edit: impl FnOnce(&mut CredentialEnvelope),
+    ) -> Vec<u8> {
+        let mut record: CredentialEnvelope =
+            serde_json::from_slice(&valid_envelope_bytes(request, identity, epoch))
+                .unwrap_or_else(|error| panic!("decode envelope for retag: {error}"));
+        edit(&mut record);
+        serde_json::to_vec(&record)
+            .unwrap_or_else(|error| panic!("encode retagged envelope: {error}"))
+    }
+
+    // WORK_UNIT_CASE: 980/12 — the marker five-way split is five contours.
+    #[test]
+    fn marker_rejections_emit_their_own_contour_and_no_sibling() {
+        let request = request();
+        let identity = served_identity(11);
+        let key = request.ownership_key.clone();
+
+        // 1. Genuinely malformed: not JSON at all.
+        let malformed = capture(|| {
+            assert!(decode_marker(&request, &key, &identity, b"{not json").is_err());
+        });
+        assert_exactly_one_contour(&malformed, "marker-record-shape", MARKER_BOUNDARY);
+
+        // 2. Genuinely MAC-mismatched: well-formed record, wrong ownership key.
+        let bytes = valid_marker_bytes(&request, &identity);
+        let mut wrong_key = key.clone();
+        wrong_key[0] ^= 1;
+        let mac_mismatch = capture(|| {
+            assert!(decode_marker(&request, &wrong_key, &identity, &bytes).is_err());
+        });
+        assert_exactly_one_contour(&mac_mismatch, "marker-mac-mismatch", MARKER_BOUNDARY);
+
+        // 3. Genuinely foreign marker: the record names a different protected
+        // object than the one this call serves, while its MAC stays exact.
+        let foreign = retag_marker(&request, &identity, |record| {
+            record.marker = marker_identity(&served_identity(99));
+        });
+        let protected = capture(|| {
+            assert!(decode_marker(&request, &key, &identity, &foreign).is_err());
+        });
+        assert_exactly_one_contour(
+            &protected,
+            "marker-protected-object-mismatch",
+            MARKER_BOUNDARY,
+        );
+
+        // 4. Genuinely wrong wire version. Only the `version` field is changed:
+        // the expected record is always rebuilt with this codec's own version
+        // constant, so the recomputed MAC still matches and only the version
+        // check can reject the record. Retagging the MAC too would land on
+        // `marker-mac-mismatch` instead and prove nothing about the version.
+        let wrong_version = retag_marker(&request, &identity, |record| {
+            record.version = "eliot.store-credential-marker.v0".to_owned();
+        });
+        let version = capture(|| {
+            assert!(decode_marker(&request, &key, &identity, &wrong_version).is_err());
+        });
+        assert_exactly_one_contour(&version, "marker-wire-version-mismatch", MARKER_BOUNDARY);
+
+        // 5. The admitted case emits NO reject contour at all, so the four
+        // rejections above are real branches and not an always-on label.
+        let admitted = capture(|| {
+            assert!(decode_marker(&request, &key, &identity, &bytes).is_ok());
+        });
+        for contour in ALL_CONTOURS {
+            assert!(
+                !admitted.contains(&format!("reason={contour}")),
+                "an admitted marker emitted reject contour {contour}: {admitted}"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 980/13 — the envelope five-way split is five contours.
+    #[test]
+    fn envelope_rejections_emit_their_own_contour_and_no_sibling() {
+        let request = request();
+        let identity = served_identity(11);
+        let epoch = handle("epoch:one");
+        let key = request.ownership_key.clone();
+
+        // 1. Genuinely malformed: not JSON at all.
+        let malformed = capture(|| {
+            assert!(decode_envelope(&request, &key, &epoch, &identity, b"[1,2,3]").is_err());
+        });
+        assert_exactly_one_contour(&malformed, "envelope-record-shape", ENVELOPE_BOUNDARY);
+
+        // 2. Genuinely MAC-mismatched: well-formed record, wrong host epoch.
+        let bytes = valid_envelope_bytes(&request, &identity, &epoch);
+        let mac_mismatch = capture(|| {
+            assert!(
+                decode_envelope(&request, &key, &handle("epoch:two"), &identity, &bytes).is_err()
+            );
+        });
+        assert_exactly_one_contour(&mac_mismatch, "envelope-mac-mismatch", ENVELOPE_BOUNDARY);
+
+        // 3. Genuinely foreign marker: the record names a different protected
+        // object than the one this call serves, while its MAC stays exact.
+        let foreign = retag_envelope(&request, &identity, &epoch, |record| {
+            record.marker = marker_identity(&served_identity(99));
+        });
+        let protected = capture(|| {
+            assert!(decode_envelope(&request, &key, &epoch, &identity, &foreign).is_err());
+        });
+        assert_exactly_one_contour(
+            &protected,
+            "envelope-protected-object-mismatch",
+            ENVELOPE_BOUNDARY,
+        );
+
+        // 4. Genuinely wrong wire version. Only the `version` field is changed: the
+        // expected envelope is always rebuilt with this codec's own version
+        // constant, so the recomputed MAC still matches and only the version
+        // check can reject the record.
+        let wrong_version = retag_envelope(&request, &identity, &epoch, |record| {
+            record.version = "eliot.store-credential-envelope.v0".to_owned();
+        });
+        let version = capture(|| {
+            assert!(decode_envelope(&request, &key, &epoch, &identity, &wrong_version).is_err());
+        });
+        assert_exactly_one_contour(&version, "envelope-wire-version-mismatch", ENVELOPE_BOUNDARY);
+
+        // 5. The admitted case emits NO reject contour at all.
+        let admitted = capture(|| {
+            assert!(decode_envelope(&request, &key, &epoch, &identity, &bytes).is_ok());
+        });
+        for contour in ALL_CONTOURS {
+            assert!(
+                !admitted.contains(&format!("reason={contour}")),
+                "an admitted envelope emitted reject contour {contour}: {admitted}"
+            );
+        }
+    }
+}

@@ -690,3 +690,539 @@ pub fn phase_b_remove_rollback_backup(destination: &Path, label: &str) -> Result
     }
     Ok(())
 }
+
+// F-LOG-HOST-5 (#980) executed contours of the closed rollback state map.
+//
+// Placed at the owner because `phase_b_write_rollback_backup`,
+// `phase_b_restore_or_remove`, `remove_uncommitted_destination`, and
+// `phase_b_remove_rollback_backup` are `pub(super)`/`pub` inside this private
+// leaf: an integration test under `tests/` cannot name them. Each case drives
+// the REAL state map against an isolated temp directory the test creates and
+// owns, and asserts the record production emitted for exactly that state.
+//
+// The capture reads the record back out of a real `tracing` subscriber, the
+// same seam the crate's other diagnostics tests use; the record under test is
+// never manufactured by calling the diagnostic facade directly.
+#[cfg(test)]
+mod rollback_contour_tests {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use uuid::Uuid;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `body` under a real `tracing` subscriber and returns exactly the
+    /// text production emitted while it ran.
+    fn capture(body: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let bytes = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, body);
+            sink.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .clone()
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn emitted(record: &str, contour: RollbackContour) -> bool {
+        record.contains(contour.label())
+    }
+
+    /// An isolated temp root the test owns, plus the portable lease every
+    /// Phase-B file effect below is admitted through. The lease is released
+    /// before the root is removed so the cleanup is itself deterministic.
+    struct Fixture {
+        root: PathBuf,
+        portable: PathBuf,
+        lease: Option<UserOwnedRootLease>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "eliot-host-rollback-contour-{}",
+                Uuid::new_v4()
+            ));
+            let portable = root.join("portable");
+            std::fs::create_dir_all(&portable)
+                .unwrap_or_else(|error| panic!("create fixture root: {error}"));
+            let lease = UserOwnedRootLease::open_existing(&portable)
+                .unwrap_or_else(|error| panic!("open portable lease: {error}"));
+            Self {
+                root,
+                portable,
+                lease: Some(lease),
+            }
+        }
+
+        fn lease(&self) -> &UserOwnedRootLease {
+            self.lease
+                .as_ref()
+                .unwrap_or_else(|| unreachable!("the fixture lease is live for the whole test"))
+        }
+
+        fn destination(&self, name: &str) -> PathBuf {
+            self.portable.join(name)
+        }
+
+        /// Retains a handle that does NOT share delete, so a real
+        /// `remove_file` against it fails with a sharing violation.
+        fn hold_without_delete_sharing(&self, path: &Path) -> std::fs::File {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(path)
+                .unwrap_or_else(|error| panic!("hold {}: {error}", path.display()))
+        }
+
+        /// Retains a handle that DOES share delete: the delete succeeds and
+        /// marks the entry delete-pending, so it is still enumerated while
+        /// this handle lives. That is exactly the state the post-delete
+        /// absence proof exists to refuse.
+        fn hold_with_delete_sharing(&self, path: &Path) -> std::fs::File {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .unwrap_or_else(|error| panic!("hold {}: {error}", path.display()))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            drop(self.lease.take());
+            let _removed = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// WORK_UNIT_CASE: 980/14 — a prepared sidecar is stated as prepared, with
+    /// the owner-held profile projected as a 1:1 typed label.
+    #[test]
+    fn backup_preparation_is_observed_as_prepared_only_after_the_exact_readback() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let previous = b"{\"phase\":\"previous\"}";
+        std::fs::write(&destination, previous)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+
+        let record = capture(|| {
+            let outcome = phase_b_write_rollback_backup(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                &destination,
+                previous,
+                "Store config",
+            );
+            assert!(outcome.is_ok(), "backup preparation must succeed");
+        });
+        assert!(
+            emitted(&record, RollbackContour::BackupRequested),
+            "preparation must be requested: {record}"
+        );
+        assert!(
+            emitted(&record, RollbackContour::BackupPrepared),
+            "an exact readback must be observed as prepared: {record}"
+        );
+        assert!(
+            record.contains("profile=portable_dev"),
+            "the owner-held profile must be projected: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::BackupUnknownRetained),
+            "an exact readback is not an unknown outcome: {record}"
+        );
+        let sidecar = phase_b_rollback_path(&destination, "Store config")
+            .unwrap_or_else(|error| panic!("sidecar path: {error}"));
+        assert!(sidecar.is_file(), "the retained sidecar must exist");
+    }
+
+    /// WORK_UNIT_CASE: 980/15 — restoration is stated as requested and then as
+    /// verified, carrying the owner's own sidecar digest so two rollbacks of the
+    /// same profile over different material are never byte-identical records.
+    #[test]
+    fn restoration_is_requested_then_verified_with_the_owner_sidecar_digest() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let previous = b"{\"phase\":\"previous\"}";
+        std::fs::write(&destination, previous)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        phase_b_write_rollback_backup(
+            InstallationProfile::PortableDev,
+            Some(fixture.lease()),
+            &destination,
+            previous,
+            "Store config",
+        )
+        .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
+        let sidecar_bytes = std::fs::read(
+            phase_b_rollback_path(&destination, "Store config")
+                .unwrap_or_else(|error| panic!("sidecar path: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("read sidecar: {error}"));
+        std::fs::write(&destination, b"{\"phase\":\"live\"}")
+            .unwrap_or_else(|error| panic!("replace destination: {error}"));
+
+        let record = capture(|| {
+            let outcome = phase_b_restore_or_remove(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                &destination,
+                "Store config",
+                None,
+            );
+            assert!(outcome.is_ok(), "restoration must succeed");
+        });
+        assert!(
+            emitted(&record, RollbackContour::RestoreRequested),
+            "restoration must be requested: {record}"
+        );
+        assert!(
+            emitted(&record, RollbackContour::RestoredVerified),
+            "a completed restoration must be observed as verified: {record}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap_or_else(|error| panic!("read back: {error}")),
+            previous,
+            "the retained bytes must be restored"
+        );
+        let digest = phase_b_bytes_digest(&sidecar_bytes)
+            .unwrap_or_else(|error| panic!("sidecar digest: {error}"));
+        assert!(
+            record.contains(&format!("backup={}", digest.as_str())),
+            "the verified record must carry the owner-held sidecar digest: {record}"
+        );
+    }
+
+    /// WORK_UNIT_CASE: 980/16 — with neither a sidecar nor a destination there
+    /// is nothing to restore and nothing uncommitted to remove. The state map
+    /// states it with the explicit not-required disposition, so a silent no-op
+    /// can never be confused with an unproven removal.
+    #[test]
+    fn absent_sidecar_and_absent_destination_is_an_explicit_not_required_disposition() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-bootstrap.json");
+
+        let record = capture(|| {
+            let outcome = phase_b_restore_or_remove(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                &destination,
+                "Store bootstrap",
+                None,
+            );
+            assert!(outcome.is_ok(), "nothing to roll back must succeed");
+        });
+        assert!(
+            emitted(&record, RollbackContour::UncommittedRemovalNotRequired),
+            "the nothing-to-do state must be stated explicitly: {record}"
+        );
+        for contour in [
+            RollbackContour::RestoredVerified,
+            RollbackContour::UncommittedRemovalRequested,
+            RollbackContour::UncommittedRemovalVerified,
+        ] {
+            assert!(
+                !emitted(&record, contour),
+                "the nothing-to-do state claimed {:?}: {record}",
+                contour.label()
+            );
+        }
+    }
+
+    /// WORK_UNIT_CASE: 980/17 — CRITICAL: `uncommitted removal verified` is
+    /// UNREACHABLE when the delete does not succeed. A destination whose bytes
+    /// are not the immutable template is genuinely removal-requested, the real
+    /// delete then fails against a retained no-delete-sharing handle, and the
+    /// positive claim must be withheld in favour of the explicit failed
+    /// disposition.
+    #[test]
+    fn uncommitted_removal_never_claims_verified_when_the_delete_fails() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("agent-bridge-profile.json");
+        let template = b"{\"phase\":\"template\"}";
+        let uncommitted = b"{\"phase\":\"uncommitted\"}";
+        std::fs::write(&destination, uncommitted)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        let template_digest = phase_b_bytes_digest(template)
+            .unwrap_or_else(|error| panic!("template digest: {error}"));
+        let _blocking = fixture.hold_without_delete_sharing(&destination);
+
+        let record = capture(|| {
+            let outcome = phase_b_restore_or_remove(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                &destination,
+                "Agent Bridge profile",
+                Some(&template_digest),
+            );
+            assert!(outcome.is_err(), "a failed delete must return Err");
+        });
+        assert!(
+            emitted(&record, RollbackContour::UncommittedRemovalRequested),
+            "an uncommitted destination must be removal-requested: {record}"
+        );
+        assert!(
+            emitted(&record, RollbackContour::UncommittedRemovalDeleteFailed),
+            "a failed delete must be observed as failed: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::UncommittedRemovalVerified),
+            "a failed delete must never be claimed as removal verified: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::UncommittedRemovalAbsenceUnproven),
+            "a delete that failed was never absence-proven: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::UncommittedRemovalAbsenceUnknown),
+            "a failed delete has no undetermined absence probe to report: {record}"
+        );
+        assert!(
+            destination.is_file(),
+            "a failed delete must leave the destination in place"
+        );
+    }
+
+    /// WORK_UNIT_CASE: 980/18 — a destination that still holds exactly the
+    /// immutable template has no uncommitted material, so no removal is
+    /// requested and the state is stated as not required. The template is
+    /// retained on disk.
+    #[test]
+    fn template_exact_destination_is_retained_as_an_explicit_not_required_disposition() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let template = b"{\"phase\":\"template\"}";
+        std::fs::write(&destination, template)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        let template_digest = phase_b_bytes_digest(template)
+            .unwrap_or_else(|error| panic!("template digest: {error}"));
+
+        let record = capture(|| {
+            let outcome = phase_b_restore_or_remove(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                &destination,
+                "Store config",
+                Some(&template_digest),
+            );
+            assert!(outcome.is_ok(), "a template-preserved rollback must succeed");
+        });
+        assert!(
+            emitted(&record, RollbackContour::UncommittedRemovalNotRequired),
+            "a template-preserved rollback must state not required: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::UncommittedRemovalRequested),
+            "a template-preserved rollback must not request removal: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::UncommittedRemovalVerified),
+            "a template-preserved rollback claims no removal: {record}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).unwrap_or_else(|error| panic!("read back: {error}")),
+            template,
+            "the immutable template must be retained"
+        );
+    }
+
+    /// WORK_UNIT_CASE: 980/19 — sidecar cleanup is stated as requested and then
+    /// completed, and the cleanup contour owns no profile so it renders the
+    /// explicit missing-evidence disposition instead of a fabricated identity.
+    #[test]
+    fn sidecar_cleanup_is_requested_then_completed_with_no_fabricated_profile() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let previous = b"{\"phase\":\"previous\"}";
+        std::fs::write(&destination, previous)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        phase_b_write_rollback_backup(
+            InstallationProfile::PortableDev,
+            Some(fixture.lease()),
+            &destination,
+            previous,
+            "Store config",
+        )
+        .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
+        let sidecar = phase_b_rollback_path(&destination, "Store config")
+            .unwrap_or_else(|error| panic!("sidecar path: {error}"));
+
+        let record = capture(|| {
+            let outcome = phase_b_remove_rollback_backup(&destination, "Store config");
+            assert!(outcome.is_ok(), "sidecar cleanup must succeed");
+        });
+        assert!(
+            emitted(&record, RollbackContour::CleanupRequested),
+            "cleanup must be requested: {record}"
+        );
+        assert!(
+            emitted(&record, RollbackContour::CleanupCompleted),
+            "a proven-absent sidecar must be observed as cleanup completed: {record}"
+        );
+        assert!(
+            record.contains(&format!("profile={ROLLBACK_IDENTITY_UNAVAILABLE}")),
+            "the cleanup contour owns no profile and must say so: {record}"
+        );
+        assert!(!sidecar.exists(), "the retained sidecar must be gone");
+    }
+
+    /// WORK_UNIT_CASE: 980/20 — CRITICAL: `backup cleanup completed` is
+    /// UNREACHABLE when the post-delete absence proof does not succeed. A
+    /// delete-sharing handle makes the real delete succeed while the sidecar is
+    /// still enumerated, and the positive claim must be withheld in favour of
+    /// the explicit unproven-absence disposition.
+    #[test]
+    fn cleanup_never_claims_completed_while_the_sidecar_is_still_enumerated() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let previous = b"{\"phase\":\"previous\"}";
+        std::fs::write(&destination, previous)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        phase_b_write_rollback_backup(
+            InstallationProfile::PortableDev,
+            Some(fixture.lease()),
+            &destination,
+            previous,
+            "Store config",
+        )
+        .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
+        let sidecar = phase_b_rollback_path(&destination, "Store config")
+            .unwrap_or_else(|error| panic!("sidecar path: {error}"));
+        let _pending = fixture.hold_with_delete_sharing(&sidecar);
+
+        let record = capture(|| {
+            let outcome = phase_b_remove_rollback_backup(&destination, "Store config");
+            assert!(
+                outcome.is_ok(),
+                "a delete that succeeds must not change the returned Result"
+            );
+        });
+        assert!(
+            emitted(&record, RollbackContour::CleanupRequested),
+            "cleanup must be requested: {record}"
+        );
+        assert!(
+            emitted(&record, RollbackContour::CleanupAbsenceUnproven),
+            "a still-enumerated sidecar must be observed as absence unproven: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::CleanupCompleted),
+            "an unproven absence must never be claimed as cleanup completed: {record}"
+        );
+    }
+
+    /// WORK_UNIT_CASE: 980/21 — a cleanup delete that cannot succeed is stated
+    /// as failed, and the positive completion claim stays unreachable.
+    #[test]
+    fn cleanup_never_claims_completed_when_the_delete_fails() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination("store-config.json");
+        let previous = b"{\"phase\":\"previous\"}";
+        std::fs::write(&destination, previous)
+            .unwrap_or_else(|error| panic!("seed destination: {error}"));
+        phase_b_write_rollback_backup(
+            InstallationProfile::PortableDev,
+            Some(fixture.lease()),
+            &destination,
+            previous,
+            "Store config",
+        )
+        .unwrap_or_else(|error| panic!("prepare sidecar: {error}"));
+        let sidecar = phase_b_rollback_path(&destination, "Store config")
+            .unwrap_or_else(|error| panic!("sidecar path: {error}"));
+        let _blocking = fixture.hold_without_delete_sharing(&sidecar);
+
+        let record = capture(|| {
+            let outcome = phase_b_remove_rollback_backup(&destination, "Store config");
+            assert!(outcome.is_err(), "a failed delete must return Err");
+        });
+        assert!(
+            emitted(&record, RollbackContour::CleanupDeleteFailed),
+            "a failed cleanup delete must be observed as failed: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::CleanupCompleted),
+            "a failed delete must never be claimed as cleanup completed: {record}"
+        );
+        assert!(
+            !emitted(&record, RollbackContour::CleanupAbsenceUnproven),
+            "a delete that failed was never absence-proven: {record}"
+        );
+    }
+
+    /// WORK_UNIT_CASE: 980/22 — a destination with no derivable rollback path is
+    /// rejected before any file effect, and the rejection is stated as a path
+    /// failure rather than as a completion.
+    #[test]
+    fn unresolvable_rollback_path_is_rejected_before_any_file_effect() {
+        let fixture = Fixture::new();
+        let root_only = Path::new(r"C:\");
+        assert!(
+            root_only.parent().is_none(),
+            "the fixture path must have no parent so the rollback path cannot be derived"
+        );
+
+        let cleanup = capture(|| {
+            let outcome = phase_b_remove_rollback_backup(root_only, "Store config");
+            assert!(outcome.is_err(), "an underivable path must return Err");
+        });
+        assert!(
+            emitted(&cleanup, RollbackContour::CleanupPathFailed),
+            "an underivable cleanup path must be observed as a path failure: {cleanup}"
+        );
+        assert!(
+            !emitted(&cleanup, RollbackContour::CleanupCompleted),
+            "a rejected cleanup path claims no completion: {cleanup}"
+        );
+
+        let backup = capture(|| {
+            let outcome = phase_b_write_rollback_backup(
+                InstallationProfile::PortableDev,
+                Some(fixture.lease()),
+                root_only,
+                b"previous",
+                "Store config",
+            );
+            assert!(outcome.is_err(), "an underivable path must return Err");
+        });
+        assert!(
+            emitted(&backup, RollbackContour::BackupPathFailed),
+            "an underivable backup path must be observed as a path failure: {backup}"
+        );
+        assert!(
+            !emitted(&backup, RollbackContour::BackupPrepared),
+            "a rejected backup path claims no preparation: {backup}"
+        );
+    }
+}
