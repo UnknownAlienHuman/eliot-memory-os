@@ -108,6 +108,79 @@ function New-FakeRfc3161Evidence {
     }
 }
 
+function Invoke-GovernorApprovalContextCandidateReadbackProof([string]$Repo) {
+    $script:finalizeSigningGovernorCandidateReadbackProof = [pscustomobject]@{
+        release_source_commit = 'b' * 40
+        approval_candidate_commit = 'a' * 40
+        operation_id = 'fixture-retirement-operation'
+        observed_owner_readback_commit = $null
+    }
+    $proof = $script:finalizeSigningGovernorCandidateReadbackProof
+
+    # Keep the real Resolve-GovernorApprovalContext caller and substitute only
+    # its external input owners. C and D deliberately differ: owner readback is
+    # for the historical candidate C named by R(C), while release binding later
+    # evaluates descendant candidate D.
+    function Resolve-GovernorRetirementDetachedInput([string]$Path, [string]$Purpose) {
+        if ($Path -cne 'fixture-detached-approval') {
+            throw 'builder did not use the explicit detached approval input'
+        }
+        [pscustomobject]@{
+            supplied = $true
+            body = [pscustomobject]@{
+                candidate_commit = $script:finalizeSigningGovernorCandidateReadbackProof.approval_candidate_commit
+                operation_id = $script:finalizeSigningGovernorCandidateReadbackProof.operation_id
+            }
+        }
+    }
+    function Resolve-GovernorRetirementTrustRoot([object]$Request) {
+        if ([string]$Request.TrustRootRef -cne 'fixture-owner-pinned-root') {
+            throw 'builder did not preserve the explicit owner-pinned trust root'
+        }
+        [pscustomobject]@{
+            supplied = $true
+            trust_root_ref = 'fixture-owner-pinned-root'
+            trust_policy = [pscustomobject]@{ fixture = $true }
+        }
+    }
+    function Resolve-GovernorRetirementTrustPolicy([string]$Repo, [object]$TrustRoot) {
+        [pscustomobject]@{ body = [pscustomobject]@{ fixture = 'owner-pinned-policy' } }
+    }
+    function Resolve-GovernorRetirementOwnerDecisionReadback(
+        [string]$Repo,
+        [string]$SourceCommit,
+        [object]$TrustRoot,
+        [string]$OperationId,
+        [string]$OwnerReceiptPath
+    ) {
+        $script:finalizeSigningGovernorCandidateReadbackProof.observed_owner_readback_commit = $SourceCommit
+        [pscustomobject]@{ supplied = $false; state = 'ABSENT'; reason = 'fixture readback only'; decision = $null }
+    }
+    function Resolve-GovernorRetirementIssuer([object]$TrustPolicy, [object]$OwnerDecision, [object]$ReceiptVerification) {
+        [pscustomobject]@{ state = 'ISSUER_UNAVAILABLE'; reason = 'fixture has no owner issuer' }
+    }
+
+    $context = Resolve-GovernorApprovalContext `
+        $Repo `
+        $proof.release_source_commit `
+        'fixture-detached-approval' `
+        'fixture-owner-pinned-root' `
+        'fixture-owner-receipt'
+    if ($proof.approval_candidate_commit -ceq $proof.release_source_commit -or
+        $proof.observed_owner_readback_commit -cne $proof.approval_candidate_commit -or
+        [string]$context.issuer.state -cne 'ISSUER_UNAVAILABLE') {
+        throw 'builder did not read the owner decision against R(C) candidate C while preserving the unavailable issuer state'
+    }
+    [pscustomobject]@{
+        release_candidate_differs_from_approval_candidate = $true
+        owner_readback_used_approval_candidate = $true
+        missing_issuer_still_unavailable = $true
+        release_candidate = $proof.release_source_commit
+        approval_candidate = $proof.approval_candidate_commit
+        owner_readback_candidate = $proof.observed_owner_readback_commit
+    }
+}
+
 function Invoke-GovernorRetirementReadbackForwardingProof([string]$TempRoot) {
     $bundle = Join-Path $TempRoot 'governor-retirement-readback-forwarding'
     New-Item -ItemType Directory -Path $bundle -Force | Out-Null
@@ -290,10 +363,14 @@ $fakeCertificate = [pscustomobject]@{
 
 if ($GovernorRetirementReadbackOnly) {
     try {
+        $candidateProof = Invoke-GovernorApprovalContextCandidateReadbackProof $repo
         $proof = Invoke-GovernorRetirementReadbackForwardingProof $root
         [ordered]@{
             component = 'eliot_governor_retirement_readback_tests'
             status = 'VERIFIED'
+            release_candidate_differs_from_approval_candidate = [bool]$candidateProof.release_candidate_differs_from_approval_candidate
+            owner_readback_used_approval_candidate = [bool]$candidateProof.owner_readback_used_approval_candidate
+            missing_issuer_still_unavailable = [bool]$candidateProof.missing_issuer_still_unavailable
             original_context_forwarded_to_online_and_offline_binding = [bool]$proof.normal_original_context_forwarded_to_both_bindings
             substituted_readback_refused = [bool]$proof.substituted_issuer_readback_refused
             missing_readback_refused = [bool]$proof.missing_issuer_readback_refused
@@ -312,6 +389,7 @@ if ($GovernorRetirementReadbackOnly) {
 
 try {
     New-Item -ItemType Directory -Path (Join-Path $source 'runtime') -Force | Out-Null
+    $governorCandidateProof = Invoke-GovernorApprovalContextCandidateReadbackProof $repo
     $governorReadbackProof = Invoke-GovernorRetirementReadbackForwardingProof $root
     Set-Content -LiteralPath $tool -Value 'fake tool; never executed' -Encoding ascii
     $roles = @(Get-AuthenticodeRoleDefinitions)
@@ -1113,6 +1191,8 @@ try {
     [ordered]@{
         component = 'eliot_release_finalize_signing_tests'
         status = 'VERIFIED'
+        governor_retirement_readback_uses_approval_candidate = [bool]$governorCandidateProof.owner_readback_used_approval_candidate
+        governor_retirement_missing_issuer_stays_unavailable = [bool]$governorCandidateProof.missing_issuer_still_unavailable
         governor_retirement_original_context_forwarded = [bool]$governorReadbackProof.normal_original_context_forwarded_to_both_bindings
         governor_retirement_substituted_readback_refused = [bool]$governorReadbackProof.substituted_issuer_readback_refused
         governor_retirement_missing_readback_refused = [bool]$governorReadbackProof.missing_issuer_readback_refused

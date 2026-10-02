@@ -971,10 +971,13 @@ function Resolve-GovernorApprovalContext([string]$Repo, [string]$SourceCommit, [
         if ([bool]$approvalInput.supplied) {
             # `issuer_readback_ref` is EXECUTED here, not recorded: the owner
             # decision is read back at the owner-pinned ref and executed against
-            # the exact operation and candidate, then the detached signed owner
-            # receipt is authenticated against the admitted issuer certificate.
+            # the historical candidate C named by this detached approval. The
+            # release source D is separately checked against C by the binding
+            # verifier; reading the owner decision against D makes the finite
+            # C -> R(C) -> D workflow impossible after legacy removal.
             $operationId = [string](Read-ObjectProperty $approvalInput.body 'operation_id')
-            $issuerReadback = Resolve-GovernorRetirementOwnerDecisionReadback $Repo $SourceCommit $trustRoot $operationId $OwnerReceiptPath
+            $ownerCandidateCommit = [string](Read-ObjectProperty $approvalInput.body 'candidate_commit')
+            $issuerReadback = Resolve-GovernorRetirementOwnerDecisionReadback $Repo $ownerCandidateCommit $trustRoot $operationId $OwnerReceiptPath
             if ([string]$issuerReadback.state -ceq 'SUPPLIED' -and
                 -not [string]::IsNullOrWhiteSpace($OwnerReceiptPath)) {
                 $receiptBytes = Read-GovernorRetirementDetachedBytes $OwnerReceiptPath ([string]$issuerReadback.receipt_sha256) 'detached owner retirement receipt'
