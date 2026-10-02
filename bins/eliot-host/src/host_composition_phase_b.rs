@@ -196,22 +196,25 @@ impl PhaseBAuthorityIdentity {
     /// instead of being implied by a static sentence.
     fn slots(&self) -> [(&'static str, PhaseBIdentity<'_>); 9] {
         [
-            ("installation", self.slot(self.installation.as_deref())),
+            ("installation", Self::slot(self.installation.as_deref())),
             (
                 "live_host_epoch",
-                self.slot(self.live_host_epoch.as_deref()),
+                Self::slot(self.live_host_epoch.as_deref()),
             ),
             (
                 "live_activation",
-                self.slot(self.live_activation.as_deref()),
+                Self::slot(self.live_activation.as_deref()),
             ),
-            ("host_epoch", self.slot(self.host_epoch.as_deref())),
-            ("fence", self.slot(self.state_fence.as_deref())),
-            ("declared", self.slot(self.declared_descriptor.as_deref())),
-            ("authority", self.slot(self.authority_descriptor.as_deref())),
+            ("host_epoch", Self::slot(self.host_epoch.as_deref())),
+            ("fence", Self::slot(self.state_fence.as_deref())),
+            ("declared", Self::slot(self.declared_descriptor.as_deref())),
+            (
+                "authority",
+                Self::slot(self.authority_descriptor.as_deref()),
+            ),
             (
                 "durable_authority",
-                self.slot(self.durable_authority_descriptor.as_deref()),
+                Self::slot(self.durable_authority_descriptor.as_deref()),
             ),
             ("preparation", PhaseBIdentity::Unavailable),
         ]
@@ -219,7 +222,7 @@ impl PhaseBAuthorityIdentity {
 
     /// Projects one slot as the exact bound value or the explicit
     /// missing-evidence disposition; never a fabricated literal.
-    fn slot<'a>(&'a self, value: Option<&'a str>) -> PhaseBIdentity<'a> {
+    fn slot(value: Option<&str>) -> PhaseBIdentity<'_> {
         if let Some(text) = value {
             PhaseBIdentity::Bound(text)
         } else {
