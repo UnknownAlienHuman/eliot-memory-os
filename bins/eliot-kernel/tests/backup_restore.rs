@@ -434,8 +434,14 @@ fn foreign_or_stale_destination_refused() {
         .as_u64()
         .expect("owner manifest binding fixture carries registry_revision");
     let second_evidence = DestinationManifestEvidence::issue_from_owner_manifest(
-        &binding["manifest_digest"].as_str().expect("manifest_digest").to_owned(),
-        &binding["roots_digest"].as_str().expect("roots_digest").to_owned(),
+        &binding["manifest_digest"]
+            .as_str()
+            .expect("manifest_digest")
+            .to_owned(),
+        &binding["roots_digest"]
+            .as_str()
+            .expect("roots_digest")
+            .to_owned(),
         revision + 1,
         &root,
     )
@@ -1368,7 +1374,10 @@ fn interrupted_after_staging_retains_published_material_for_resume() {
         resumed.destination_root == destination_root,
         "the resume continued the same destination, not a fresh one"
     );
-    resumed.receipt.validate().expect("resumed receipt validates");
+    resumed
+        .receipt
+        .validate()
+        .expect("resumed receipt validates");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1542,7 +1551,11 @@ fn a_resumed_receipt_cannot_attest_removed_published_material() {
     // material, not a receipt that was also destroyed.
     let receipts = destination_root.join("phase-receipts");
     assert!(
-        receipts.is_dir() && std::fs::read_dir(&receipts).expect("receipts readable").count() > 0,
+        receipts.is_dir()
+            && std::fs::read_dir(&receipts)
+                .expect("receipts readable")
+                .count()
+                > 0,
         "the phase receipt outlives the material it attests, which is the hazard"
     );
     let resumed = coordinator.restore(&bundle, context, &ports, &mut journal);
