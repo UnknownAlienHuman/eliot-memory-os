@@ -3176,3 +3176,272 @@ fn equal_sequence_foreign_lineage_has_no_current_lineage_fallback() -> TestResul
     ));
     Ok(())
 }
+
+// #2626 audit 5906086103 D5: the re-arm attempt link is enforced by the
+// existing reducer (`journal.rs` `HostStateRecord::Drain` arm). The projection
+// keeps exactly one `DrainRecord`, so without an immutable link from a successor
+// to the exact record it continues, attempt N and attempt N+1 are
+// indistinguishable and a restarted process could substitute a generic
+// continuation. These cases pin the existing behaviour; they do not change it.
+
+/// One `DrainRecord` of the shared `drain_generation` this fixture drains.
+fn rearm_drain_record(
+    host: &HostInstallationEpoch,
+    generation: &EpochTransition,
+    op: &str,
+    state: DrainState,
+    evidence_refs: Vec<PlatformHandle>,
+    expected_predecessor: Option<String>,
+) -> HostStateRecord {
+    HostStateRecord::Drain(DrainRecord {
+        fence: fence(host, generation),
+        operation: operation(op),
+        drain_generation: generation.clone(),
+        state,
+        evidence_refs,
+        expected_predecessor,
+    })
+}
+
+type RearmJournal = (
+    HostStateJournal<MemoryBackend>,
+    HostInstallationEpoch,
+    EpochTransition,
+);
+
+/// Drives one journal to the durable `Cancelled` predecessor of a re-arm.
+fn cancelled_predecessor_journal() -> Result<RearmJournal, Box<dyn std::error::Error>> {
+    let (journal, host, generation) = active_journal();
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-first-requested",
+        DrainState::Requested,
+        vec![h("2626-first-evidence")],
+        None,
+    ))?;
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-first-draining",
+        DrainState::Draining,
+        vec![h("2626-first-evidence")],
+        None,
+    ))?;
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-first-cancelled",
+        DrainState::Cancelled,
+        vec![h("2626-first-evidence"), h("agent-bridge-attach")],
+        None,
+    ))?;
+    Ok((journal, host, generation))
+}
+
+/// Positive and refusal for the `Cancelled -> Requested` re-arm edge (D5).
+// WORK_UNIT_CASE: 2626/1
+#[test]
+fn rearmed_drain_request_must_name_the_exact_cancelled_predecessor_checksum() -> TestResult {
+    let (journal, host, generation) = cancelled_predecessor_journal()?;
+    let cancelled = journal
+        .snapshot()?
+        .drain
+        .ok_or_else(|| std::io::Error::other("cancelled pre-commit drain record is absent"))?;
+    let exact = record_checksum(&HostStateRecord::Drain(cancelled))?;
+
+    // Refusal: the re-arm edge is a re-arm, so the link is mandatory. An absent
+    // `expected_predecessor` is a typed refusal, never a silent re-arm of
+    // whatever attempt the projection currently holds.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-rearm-without-link",
+            DrainState::Requested,
+            vec![h("2626-rearm-evidence")],
+            None,
+        )),
+        Err(JournalError::IllegalTransition {
+            machine: "drain",
+            ..
+        })
+    ));
+
+    // Refusal: a link that names another attempt's record checksum is an
+    // identity conflict, not a re-arm of a different predecessor.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-rearm-wrong-link",
+            DrainState::Requested,
+            vec![h("2626-rearm-evidence")],
+            Some(digest_handle('9').as_str().to_owned()),
+        )),
+        Err(JournalError::IdempotencyConflict)
+    ));
+
+    // The refused attempts above changed nothing, so the exact link is still
+    // admitted: exactly one successor of that exact `Cancelled` record.
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-rearm-exact-link",
+        DrainState::Requested,
+        vec![h("2626-rearm-evidence")],
+        Some(exact.clone()),
+    ))?;
+    let requested = journal.snapshot()?.drain.ok_or_else(|| {
+        std::io::Error::other("re-armed requested pre-commit drain record is absent")
+    })?;
+    assert_eq!(requested.state, DrainState::Requested);
+    assert_eq!(
+        requested.expected_predecessor.as_deref(),
+        Some(exact.as_str())
+    );
+    Ok(())
+}
+
+/// Positive and refusal for the `Requested -> Draining` continuation of a
+/// re-armed attempt (D5).
+// WORK_UNIT_CASE: 2626/2
+#[test]
+fn rearm_continuation_must_name_the_exact_rearmed_requested_checksum() -> TestResult {
+    let (journal, host, generation) = cancelled_predecessor_journal()?;
+    let cancelled = journal
+        .snapshot()?
+        .drain
+        .ok_or_else(|| std::io::Error::other("cancelled pre-commit drain record is absent"))?;
+    let cancelled_checksum = record_checksum(&HostStateRecord::Drain(cancelled))?;
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-rearm-request",
+        DrainState::Requested,
+        vec![h("2626-rearm-evidence")],
+        Some(cancelled_checksum),
+    ))?;
+    let requested = journal.snapshot()?.drain.ok_or_else(|| {
+        std::io::Error::other("re-armed requested pre-commit drain record is absent")
+    })?;
+    let requested_checksum = record_checksum(&HostStateRecord::Drain(requested))?;
+
+    // Refusal: without the link the restarted process could substitute a generic
+    // continuation (fresh operation, fresh evidence) for the durable attempt.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-continuation-without-link",
+            DrainState::Draining,
+            vec![h("2626-rearm-evidence")],
+            None,
+        )),
+        Err(JournalError::IllegalTransition {
+            machine: "drain",
+            ..
+        })
+    ));
+
+    // Refusal: naming another attempt's `Requested` checksum is an identity
+    // conflict.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-continuation-wrong-link",
+            DrainState::Draining,
+            vec![h("2626-rearm-evidence")],
+            Some(digest_handle('8').as_str().to_owned()),
+        )),
+        Err(JournalError::IdempotencyConflict)
+    ));
+
+    // The continuation names the exact re-armed `Requested` record, so the
+    // reducer admits it only for the attempt it continues.
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-continuation-exact-link",
+        DrainState::Draining,
+        vec![h("2626-rearm-evidence")],
+        Some(requested_checksum.clone()),
+    ))?;
+    let draining = journal
+        .snapshot()?
+        .drain
+        .ok_or_else(|| std::io::Error::other("re-arm continuation record is absent"))?;
+    assert_eq!(draining.state, DrainState::Draining);
+    assert_eq!(
+        draining.expected_predecessor.as_deref(),
+        Some(requested_checksum.as_str())
+    );
+    Ok(())
+}
+
+/// A first attempt carries no re-arm link, so its link-less continuation stays
+/// legal; every other drain edge refuses an unexpected attempt link instead of
+/// silently continuing the current attempt (D5).
+// WORK_UNIT_CASE: 2626/3
+#[test]
+fn first_attempt_drain_edges_refuse_an_unexpected_attempt_link() -> TestResult {
+    let (journal, host, generation) = active_journal();
+    let ingress_evidence = vec![h("2626-first-evidence")];
+
+    // Refusal: a first attempt has no predecessor, so it may not claim one.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-first-request-linked",
+            DrainState::Requested,
+            ingress_evidence.clone(),
+            Some(digest_handle('7').as_str().to_owned()),
+        )),
+        Err(JournalError::IdempotencyConflict)
+    ));
+
+    // Positive: the first attempt's link-less continuation stays legal, so an
+    // installation that never re-armed is unaffected by the attempt link.
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-first-request",
+        DrainState::Requested,
+        ingress_evidence.clone(),
+        None,
+    ))?;
+    journal.append(rearm_drain_record(
+        &host,
+        &generation,
+        "2626-first-draining",
+        DrainState::Draining,
+        ingress_evidence.clone(),
+        None,
+    ))?;
+    assert_eq!(
+        journal.snapshot()?.drain.map(|drain| drain.state),
+        Some(DrainState::Draining)
+    );
+
+    // Refusal: a link is unexpected on every edge that continues the current
+    // attempt rather than re-arming or continuing a re-armed attempt.
+    assert!(matches!(
+        journal.append(rearm_drain_record(
+            &host,
+            &generation,
+            "2626-cancel-linked",
+            DrainState::Cancelled,
+            ingress_evidence,
+            Some(digest_handle('6').as_str().to_owned()),
+        )),
+        Err(JournalError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        journal.snapshot()?.drain.map(|drain| drain.state),
+        Some(DrainState::Draining),
+        "a refused linked edge must not advance the current attempt"
+    );
+    Ok(())
+}

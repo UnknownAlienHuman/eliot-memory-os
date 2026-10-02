@@ -1254,16 +1254,12 @@ impl HostComposition {
         // `HostComposition::read_runtime_lease_census_for_activation` and
         // `HostComposition::require_generation_retirement_barrier`), digested
         // into the attempt identity and evidence — never a cached zero, a bare
-        // code, or a second Host-local counter. The barrier revalidates the
-        // same fence before commit, so new work is either included in that
-        // census or prevents the drain.
-        let census_binding = format!(
-            "idle:{}",
-            sha256_json(&(
-                &owner_census.state_fence,
-                &owner_census.supervision_lease_id
-            ))?
-        );
+        // code, or a second Host-local counter.
+        // [`HostComposition::precommit_drain_census_admits_commit`] revalidates
+        // that same binding from a fresh owner read immediately before the
+        // `DrainCommit`, so a census that has moved on cannot commit the attempt
+        // it did not admit.
+        let census_binding = owner_census_binding(owner_census)?;
         let predecessor_checksum = record_checksum(&HostStateRecord::Drain(predecessor.clone()))?;
         // The successor inherits its predecessor's evidence, which is what
         // keeps a delayed first-attempt trigger recognisable as already
@@ -1434,6 +1430,81 @@ impl HostComposition {
         } else {
             Ok(IdleLeaseCensus::StoreObligationLeased { owner_census })
         }
+    }
+
+    /// Requires a freshly read owner census to still be the exact census the
+    /// open pre-commit drain attempt was admitted on, immediately before the
+    /// commit that fences the Kernel authority epoch.
+    ///
+    /// Audit 5906086103 D4, second half: "revalidate its exact fence/revision
+    /// immediately before commit". The `DrainCommit` this admits is the I1.5
+    /// linearization point; after it, `authority_epochs_fenced` stops the
+    /// generation and [`Self::require_generation_retirement_barrier`] is
+    /// post-commit by construction. A read alone is not enough: `census` is
+    /// compared against the attempt's own recorded binding and the activation
+    /// fence, so a census that has moved on cannot commit the attempt it did not
+    /// admit, and the caller may not commit on a cached census.
+    ///
+    /// Two facts are required, both from existing durable seams:
+    ///
+    /// 1. the attempt is still this generation's open window - the D3
+    ///    publication gate (`verify_drain_activation_binding`: matching
+    ///    `Draining` activation, matching fence, matching drain generation,
+    ///    non-empty evidence) plus a `Draining` drain record and no
+    ///    `DrainCommit`; and
+    /// 2. `census` is `Idle`, and for a re-armed attempt its
+    ///    [`HostComposition::owner_census_binding`] equals the binding that
+    ///    attempt recorded. A first attempt records no owner fence - it is the
+    ///    first observation of this generation, not a re-admission of a
+    ///    cancelled predecessor - so for it the exact-fence `Idle` verdict is
+    ///    the whole revalidation and no binding is invented after the fact.
+    ///
+    /// `Ok(false)` is the honest deferral rather than an error: an obligation
+    /// reappeared, or the fence/revision moved on. The caller keeps the
+    /// installation running and a later authenticated trigger cancels and
+    /// re-arms under the current census.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state cannot be read, when the attempt
+    /// is already committed or is not a bound `Draining` window, or when the
+    /// recorded binding cannot be read.
+    pub fn precommit_drain_census_admits_commit(
+        &self,
+        census: &IdleLeaseCensus,
+    ) -> Result<bool, HostError> {
+        let state = self.snapshot()?;
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        let drain = state.drain.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "pre-commit drain revalidation has no durable Host drain".to_owned(),
+            )
+        })?;
+        if state.drain_commit.is_some() {
+            // I14.23: the linearization point already exists, so no pre-commit
+            // window is left to revalidate.
+            return Err(HostError::OwnerLeaseRecovery(
+                "pre-commit drain is already committed; a fresh activation generation is required"
+                    .to_owned(),
+            ));
+        }
+        if drain.state != DrainState::Draining {
+            return Err(HostError::RecoveryRequired(
+                "pre-commit drain revalidation requires the Draining record of the open window; recovery required"
+                    .to_owned(),
+            ));
+        }
+        verify_drain_activation_binding(activation, drain)?;
+        let IdleLeaseCensus::Idle { owner_census } = census else {
+            return Ok(false);
+        };
+        if drain.expected_predecessor.is_none() {
+            return Ok(true);
+        }
+        let admitted = rearm_census_binding_from(drain)?;
+        Ok(admitted == owner_census_binding(owner_census)?)
     }
 
     pub(super) fn live_supervision_obligation_for(
@@ -2088,6 +2159,35 @@ fn verify_drain_activation_binding(
     verify_drain_fence_binding(activation, drain)
 }
 
+/// Owner census binding one pre-commit drain attempt is admitted under.
+///
+/// Audit 5906086103 D4: `idle:<owner-fence-digest>` over the exact `#1751`
+/// `RuntimeLeaseCensus` fence of that owner read - the same
+/// `RuntimeLeaseCensus` contract the Kernel gate and the retirement barrier
+/// consume - so the binding names the observation revision (exact state fence
+/// plus supervision lease identity), not an obligation count or a bare code.
+///
+/// This is the single definition shared by
+/// [`HostComposition::rearm_cancelled_drain`], which records it in the attempt
+/// identity, and [`HostComposition::precommit_drain_census_admits_commit`],
+/// which compares a fresh owner read against it. One definition is what makes
+/// that comparison real: two spellings would only agree by accident.
+///
+/// # Errors
+///
+/// Returns an error when the binding digest cannot be computed.
+fn owner_census_binding(
+    owner_census: &eliot_kernel_service::RuntimeLeaseCensus,
+) -> Result<String, HostError> {
+    Ok(format!(
+        "idle:{}",
+        sha256_json(&(
+            &owner_census.state_fence,
+            &owner_census.supervision_lease_id
+        ))?
+    ))
+}
+
 /// Reads the owner census binding a durable re-armed `Requested` record was
 /// admitted under.
 ///
@@ -2223,4 +2323,1043 @@ fn unix_millis() -> Result<u64, HostError> {
             u64::try_from(elapsed.as_millis())
                 .map_err(|error| HostError::Platform(error.to_string()))
         })
+}
+
+/// #2626 acceptance proof for the re-arm path (external audit 5906086103).
+///
+/// Every case here is a deterministic state-machine case over one isolated
+/// Host state root: a real crash-safe `HostStateJournal` on disk, the real
+/// reducer, and the real `HostComposition` drain methods. Nothing sleeps,
+/// polls, opens a network, installs a service, or writes outside
+/// `std::env::temp_dir()`.
+///
+/// Proof ceiling, stated plainly. Two contours are not reachable hermetically
+/// and are named here rather than faked:
+///
+/// * `HostIdleDrainSupervisor`'s `idle_since` / `precommit_opened_at` live in
+///   the `eliot-host` *binary* crate (`src/main.rs`), which cannot construct a
+///   `HostComposition`, so the timer assignment itself cannot be driven from a
+///   test. What is proven instead is the publication gate it depends on:
+///   `begin_idle_drain` returns `Ok(true)` only for a fully established window,
+///   and a `ReplayAlreadyConsumed` trigger appends nothing and leaves the
+///   successor attempt byte-identical — so no supervisor timer can be reset or
+///   postponed by a delayed duplicate.
+/// * `rearm_cancelled_drain` re-reads the authenticated `#2625`/`#1751`
+///   Kernel/ORS owner census, which no hermetic test can serve (audit D4). The
+///   `Cancelled` re-arm arm therefore starts from the durable record that arm
+///   writes; every decision after it — resuming the successor, reconstructing
+///   its continuation, refusing a foreign one — is the production method.
+#[cfg(all(test, windows))]
+mod rearm_acceptance_tests {
+    use std::path::PathBuf;
+
+    use eliot_host_state::{
+        HostInstallationEpoch, HostStateJournalService, IdempotencyIdentity,
+        ProductionHostStateJournal, RecordFence, RedbJournalBackend,
+    };
+
+    use super::*;
+    use crate::journal_append::{
+        append_reconciled, degraded_activation, initial_activation_record, test_activation_ingress,
+        transition_activation_record,
+    };
+    use crate::{
+        ActivePhaseBRebindRecoveryKind, ApprovedGenerationRegistry, HOST_JOURNAL_FILE_NAME,
+        HostBackupDispatchQueue, HostJobBranches, HostLaunchOptions, HostOwnerLease,
+        HostReadinessGate, HostRuntimeControlProductionBoundary, HostStoreRebindProductionBoundary,
+        ReadinessCadence, StoreRecoveryStartupFence, TestResult, fresh_host_epoch,
+        fresh_lineage_id, root_epoch,
+    };
+
+    /// Evidence handle the first attempt's wake carries. The re-armed successor
+    /// inherits it, which is exactly what makes a delayed duplicate of that wake
+    /// recognisable as already consumed instead of a new cancellation.
+    const FIRST_TRIGGER_EVIDENCE: &str = "2626-first-attempt-trigger-evidence";
+    /// Evidence handle a genuinely new second-attempt wake carries. The
+    /// successor attempt has not consumed it, so it must not classify as a
+    /// replay.
+    const SECOND_TRIGGER_EVIDENCE: &str = "2626-second-attempt-trigger-evidence";
+
+    fn handle(value: &str) -> PlatformHandle {
+        PlatformHandle::new(value).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn platform(error: impl std::fmt::Display) -> HostError {
+        HostError::Platform(error.to_string())
+    }
+
+    /// The owner census binding shape a re-arm records: `idle` for attempts
+    /// admitted before the fence binding landed, `idle:<owner-fence-digest>`
+    /// after. `rearm_census_binding_from` is the only reader of this layout.
+    fn census_binding() -> String {
+        "idle:2626ce051ba4d1e2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f901".to_owned()
+    }
+
+    /// One re-arm attempt fixture: an isolated Host state root plus the exact
+    /// activation identities every appended record of the attempt is bound to.
+    struct DrainFixture {
+        root: PathBuf,
+        installation: PlatformHandle,
+        host: HostInstallationEpoch,
+        activation_generation: EpochTransition,
+        activation_id: PlatformHandle,
+        fence: RecordFence,
+    }
+
+    impl DrainFixture {
+        fn new(label: &str) -> Result<Self, HostError> {
+            let root = std::env::temp_dir().join(format!(
+                "eliot-host-drain-rearm-{label}-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&root).map_err(platform)?;
+            let installation = fresh_identity("drain-rearm-installation")?;
+            let host = fresh_host_epoch(installation.clone(), None)?;
+            let activation_generation = root_epoch(fresh_lineage_id()?);
+            let activation_id = fresh_identity("drain-rearm-activation")?;
+            let fence = record_fence(&host, &activation_id, &activation_generation);
+            Ok(Self {
+                root,
+                installation,
+                host,
+                activation_generation,
+                activation_id,
+                fence,
+            })
+        }
+
+        /// Opens the durable journal. Every reopen is a fresh handle onto the
+        /// same on-disk file, so a dropped-and-reopened fixture is a real
+        /// process restart rather than an in-memory continuation.
+        fn journal(&self) -> Result<ProductionHostStateJournal, HostError> {
+            let backend = RedbJournalBackend::open_unprotected_for_test(
+                self.root.join(HOST_JOURNAL_FILE_NAME),
+            )
+            .map_err(|_| {
+                HostError::OwnerLeaseRecovery("drain fixture journal is unavailable".to_owned())
+            })?;
+            Ok(HostStateJournalService::from_backend(
+                backend,
+                self.host.clone(),
+            )?)
+        }
+
+        fn remove(&self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+
+        /// Appends the three legal same-generation activation records that seal
+        /// this fixture's generation into `ACTIVE`.
+        fn seal_active(&self, journal: &ProductionHostStateJournal) -> Result<(), HostError> {
+            for (state, label) in [
+                (ActivationState::Starting, "2626-seal-starting"),
+                (ActivationState::ControlReady, "2626-seal-control-ready"),
+                (ActivationState::Active, "2626-seal-active"),
+            ] {
+                append_reconciled(
+                    journal,
+                    HostStateRecord::Activation(initial_activation_record(
+                        &self.host,
+                        &self.activation_id,
+                        &self.activation_generation,
+                        state,
+                        label,
+                        &test_activation_ingress(),
+                    )?),
+                )?;
+            }
+            Ok(())
+        }
+
+        /// Moves the current generation through the production transition owner,
+        /// so a case never hand-writes an activation record the reducer refuses.
+        fn transition(
+            &self,
+            journal: &ProductionHostStateJournal,
+            state: ActivationState,
+            label: &str,
+        ) -> Result<(), HostError> {
+            let current = journal.snapshot()?.activation.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+            })?;
+            append_reconciled(
+                journal,
+                HostStateRecord::Activation(transition_activation_record(&current, state, label)?),
+            )?;
+            Ok(())
+        }
+
+        /// Moves the current generation into the production recovery projection.
+        ///
+        /// `EliotActivationRecord::validate` requires every `Failed` /
+        /// `DegradedRecovery` activation to carry a
+        /// `failure_and_recovery_directive`, and the generic `transition` owner
+        /// only ever clears that directive — it never authors one, so asking it
+        /// for either of those terminals fails closed with a journal refusal
+        /// rather than reaching the reducer. `degraded_activation` is the one
+        /// production writer of the directive, and `persist_degraded_activation`
+        /// appends it, so a case that needs a recovery terminal drives this
+        /// projection exactly as a live contour loss does.
+        fn degrade_recovery(
+            &self,
+            journal: &ProductionHostStateJournal,
+            label: &str,
+            failure_ref: &PlatformHandle,
+            directive: &str,
+        ) -> Result<(), HostError> {
+            let current = journal.snapshot()?.activation.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+            })?;
+            append_reconciled(
+                journal,
+                HostStateRecord::Activation(degraded_activation(
+                    &current,
+                    label,
+                    failure_ref,
+                    directive,
+                )?),
+            )?;
+            Ok(())
+        }
+
+        /// One drain record of this fixture's `drain_generation`, with the exact
+        /// activation fence every appended record of the attempt must carry.
+        fn drain_value(
+            &self,
+            operation: IdempotencyIdentity,
+            state: DrainState,
+            evidence_refs: Vec<PlatformHandle>,
+            expected_predecessor: Option<String>,
+        ) -> DrainRecord {
+            DrainRecord {
+                fence: self.fence.clone(),
+                operation,
+                drain_generation: self.activation_generation.clone(),
+                state,
+                evidence_refs,
+                expected_predecessor,
+            }
+        }
+
+        fn drain_record(
+            &self,
+            operation: IdempotencyIdentity,
+            state: DrainState,
+            evidence_refs: Vec<PlatformHandle>,
+            expected_predecessor: Option<String>,
+        ) -> HostStateRecord {
+            HostStateRecord::Drain(self.drain_value(
+                operation,
+                state,
+                evidence_refs,
+                expected_predecessor,
+            ))
+        }
+
+        /// Appends one first attempt and cancels it before linearization: the
+        /// durable `Cancelled` predecessor every re-arm of this fixture re-arms.
+        ///
+        /// The records carry the first-attempt (link-less) identities the
+        /// production prologue appends, and the activation walks the same
+        /// `Active -> Draining -> Active` path an authenticated pre-commit wake
+        /// drives, so the durable history is exactly what an installation woken
+        /// during its first pre-commit window holds.
+        fn append_cancelled_first_attempt(
+            &self,
+            journal: &ProductionHostStateJournal,
+        ) -> Result<DrainRecord, HostError> {
+            let trigger_evidence = vec![handle(FIRST_TRIGGER_EVIDENCE)];
+            self.transition(journal, ActivationState::Draining, "2626-first-drain-open")?;
+            append_reconciled(
+                journal,
+                self.drain_record(
+                    operation("2626-first-drain-request")?,
+                    DrainState::Requested,
+                    trigger_evidence.clone(),
+                    None,
+                ),
+            )?;
+            append_reconciled(
+                journal,
+                self.drain_record(
+                    operation("2626-first-drain-draining")?,
+                    DrainState::Draining,
+                    trigger_evidence.clone(),
+                    None,
+                ),
+            )?;
+            // The authenticated pre-commit wake appends the terminal `Cancelled`
+            // record and leaves the activation `Draining`; the return to
+            // `ACTIVE` is the production readiness revalidation, whose record
+            // this fixture drives through the same transition owner.
+            append_reconciled(
+                journal,
+                self.drain_record(
+                    operation("2626-drain-cancel")?,
+                    DrainState::Cancelled,
+                    vec![
+                        handle(FIRST_TRIGGER_EVIDENCE),
+                        handle(ActivationTriggerClass::CliRequest.as_str()),
+                    ],
+                    None,
+                ),
+            )?;
+            let cancelled = journal.snapshot()?.drain.ok_or_else(|| {
+                HostError::OwnerLeaseRecovery("cancelled drain record is absent".to_owned())
+            })?;
+            self.transition(
+                journal,
+                ActivationState::Active,
+                "2626-drain-cancelled-active",
+            )?;
+            Ok(cancelled)
+        }
+
+        fn composition(
+            &self,
+            journal: ProductionHostStateJournal,
+        ) -> Result<HostComposition, HostError> {
+            let jobs = HostJobBranches::new_test_support(&self.host).map_err(platform)?;
+            let launch_options = HostLaunchOptions {
+                config_descriptor_path: self.root.join("runtime-descriptor.json"),
+                config_descriptor_digest: handle("2626-config-descriptor-digest"),
+                installation: self.installation.clone(),
+                transaction_plan_generation: 1,
+                host_state_root: self.root.clone(),
+                registration_nonce: None,
+            };
+            let owner_lease = HostOwnerLease::acquire(&self.installation)
+                .map_err(|error| HostError::OwnerLeaseRecovery(error.to_string()))?;
+            Ok(HostComposition {
+                store_rebind_boundary: HostStoreRebindProductionBoundary,
+                runtime_control_boundary: HostRuntimeControlProductionBoundary,
+                journal,
+                registry_host_root: self.root.clone(),
+                test_registry_file: Some(self.root.join("installation-registry.redb")),
+                registry: ApprovedGenerationRegistry::default(),
+                launch_options,
+                host: self.host.clone(),
+                activation_generation: self.activation_generation.clone(),
+                activation_id: self.activation_id.clone(),
+                running: true,
+                jobs,
+                readiness_gate: HostReadinessGate::with_cadence(ReadinessCadence::default()),
+                phase_b: None,
+                watchdog_start_recovery: None,
+                runtime_restarts: std::collections::HashMap::new(),
+                runtime_control_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                user_automation_execution_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::VecDeque::new(),
+                )),
+                backup_dispatch_queue: HostBackupDispatchQueue::bounded(),
+                store_recovery_startup_fence: StoreRecoveryStartupFence::Clear,
+                active_phase_b_rebind_recovery: ActivePhaseBRebindRecoveryKind::None,
+                owner_lease,
+                pending_record: None,
+                durable_finalized: false,
+                owner_released: false,
+                shutdown_failed: false,
+            })
+        }
+    }
+
+    /// Builds and appends the durable re-armed `Requested` record of the second
+    /// attempt in the re-arm writer's own record layout: the exact `Cancelled`
+    /// predecessor checksum, the owner census binding, the predecessor's
+    /// inherited trigger evidence, and the deterministic per-stage operation
+    /// identity. `operation_override` substitutes a foreign operation identity so
+    /// a case can prove such a record is refused rather than continued.
+    fn append_rearmed_requested(
+        fixture: &DrainFixture,
+        journal: &ProductionHostStateJournal,
+        cancelled: &DrainRecord,
+        operation_override: Option<IdempotencyIdentity>,
+    ) -> Result<DrainRecord, HostError> {
+        let cancelled_checksum = record_checksum(&HostStateRecord::Drain(cancelled.clone()))?;
+        let mut evidence_refs = vec![
+            handle(&format!("drain-rearm-predecessor:{cancelled_checksum}")),
+            handle(&census_binding()),
+        ];
+        for bound in &cancelled.evidence_refs {
+            if !evidence_refs.contains(bound) {
+                evidence_refs.push(bound.clone());
+            }
+        }
+        let requested = fixture.drain_record(
+            operation_override.unwrap_or(drain_rearm_operation(
+                &fixture.fence,
+                &cancelled.drain_generation,
+                &cancelled_checksum,
+                &census_binding(),
+                "request",
+            )?),
+            DrainState::Requested,
+            evidence_refs,
+            Some(cancelled_checksum),
+        );
+        append_reconciled(journal, requested)?;
+        journal.snapshot()?.drain.ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("re-armed requested drain record is absent".to_owned())
+        })
+    }
+
+    fn drain_of(state: &HostState) -> DrainRecord {
+        state
+            .drain
+            .clone()
+            .unwrap_or_else(|| unreachable!("drain fixture must hold a pre-commit drain record"))
+    }
+
+    fn activation_state_of(state: &HostState) -> ActivationState {
+        state
+            .activation
+            .as_ref()
+            .map(|activation| activation.state)
+            .unwrap_or_else(|| unreachable!("drain fixture must hold an activation record"))
+    }
+
+    // -----------------------------------------------------------------
+    // Behaviour 1 (audit D1) — classify before mutating.
+    // -----------------------------------------------------------------
+
+    /// WORK_UNIT_CASE: 2626/4 — audit 5906086103 D1. A
+    /// `ReplayAlreadyConsumed` delayed duplicate of the *first* attempt's wake
+    /// is a true no-op for the successor attempt, so it can neither reset the
+    /// pre-commit window nor postpone the commit: nothing is appended and the
+    /// successor's attempt record stays byte-identical.
+    ///
+    /// Refusal direction: the same trigger carrying evidence the successor has
+    /// *not* consumed is a genuine new observable use and does cancel the
+    /// attempt, so the no-op is specific to already-consumed evidence.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps the durable attempt, the delayed duplicate and the genuine-use refusal adjacent"
+    )]
+    fn delayed_duplicate_of_the_first_attempt_wake_cannot_alter_the_successor_attempt() -> TestResult
+    {
+        let fixture = DrainFixture::new("replay")?;
+        let (requested_checksum, opened_sequence) = {
+            let journal = fixture.journal()?;
+            fixture.seal_active(&journal)?;
+            let cancelled = fixture.append_cancelled_first_attempt(&journal)?;
+            let requested = append_rearmed_requested(&fixture, &journal, &cancelled, None)?;
+            let requested_checksum = record_checksum(&HostStateRecord::Drain(requested))?;
+            // Continue the successor through the production resume path so its
+            // pre-commit window is genuinely opened by production code.
+            let mut host = fixture.composition(journal)?;
+            assert!(
+                host.begin_idle_drain("idle")?,
+                "a durable re-armed Requested must resume into an open window"
+            );
+            let opened = host.snapshot()?;
+            assert_eq!(activation_state_of(&opened), ActivationState::Draining);
+            assert_eq!(
+                drain_of(&opened).expected_predecessor.as_deref(),
+                Some(requested_checksum.as_str()),
+                "the successor's Draining continuation must name the exact durable re-armed Requested record"
+            );
+            (requested_checksum, opened.sequence)
+        };
+
+        // Real restart: the journal handle is dropped and reopened from disk.
+        let mut host = fixture.composition(fixture.journal()?)?;
+        let before = host.snapshot()?;
+        assert_eq!(before.sequence, opened_sequence);
+        let before_drain = drain_of(&before);
+        let before_checksum = record_checksum(&HostStateRecord::Drain(before_drain.clone()))?;
+
+        // The delayed duplicate carries the evidence the first attempt already
+        // consumed, which the successor inherited.
+        let outcome = host.note_observable_use(
+            ActivationTriggerClass::CliRequest,
+            &handle(FIRST_TRIGGER_EVIDENCE),
+        )?;
+        assert_eq!(outcome.outcome, DrainWakeOutcome::ReplayAlreadyConsumed);
+        assert_eq!(outcome.expired_wake_intents, 0);
+
+        let after = host.snapshot()?;
+        assert_eq!(
+            after.sequence, before.sequence,
+            "a delayed duplicate must not append anything: no cancel record, no phase, no commit"
+        );
+        assert_eq!(
+            record_checksum(&HostStateRecord::Drain(drain_of(&after)))?,
+            before_checksum,
+            "the successor attempt must stay byte-identical after a delayed duplicate"
+        );
+        assert_eq!(drain_of(&after), before_drain);
+        assert_eq!(
+            activation_state_of(&after),
+            ActivationState::Draining,
+            "the successor's pre-commit window stays open, so the commit is not postponed by a rebuild"
+        );
+        assert!(after.drain_commit.is_none());
+
+        // Refusal direction: the replay classification is specific to evidence
+        // this attempt already consumed. The same trigger with fresh evidence is
+        // a genuine new observable use and does reset the attempt.
+        let genuine = host.note_observable_use(
+            ActivationTriggerClass::CliRequest,
+            &handle(SECOND_TRIGGER_EVIDENCE),
+        )?;
+        assert_eq!(genuine.outcome, DrainWakeOutcome::CancelDrain);
+        let cancelled = drain_of(&host.snapshot()?);
+        assert_eq!(cancelled.state, DrainState::Cancelled);
+        assert_eq!(
+            cancelled.evidence_refs,
+            vec![
+                handle(SECOND_TRIGGER_EVIDENCE),
+                handle(ActivationTriggerClass::CliRequest.as_str()),
+            ],
+            "a genuine observable use must cancel this attempt"
+        );
+        assert_eq!(
+            cancelled.expected_predecessor, None,
+            "a cancellation continues the current attempt; it is not a re-arm"
+        );
+        fixture.remove();
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 2626/7 — audit 5906086103 D1 refusal direction: a fresh
+    /// observable use on a generation with no drain open coalesces (`Proceed`)
+    /// instead of being absorbed as a replay no-op.
+    #[test]
+    fn genuine_observable_use_on_a_generation_without_a_drain_proceeds() -> TestResult {
+        let fixture = DrainFixture::new("proceed")?;
+        let mut host = fixture.composition(fixture.journal()?)?;
+        fixture.seal_active(&host.journal)?;
+        let outcome = host.note_observable_use(
+            ActivationTriggerClass::CliRequest,
+            &handle(SECOND_TRIGGER_EVIDENCE),
+        )?;
+        assert_eq!(outcome.outcome, DrainWakeOutcome::Proceed);
+        let state = host.snapshot()?;
+        assert!(
+            state.drain.is_none(),
+            "coalescing observable use opens no drain attempt"
+        );
+        assert_eq!(activation_state_of(&state), ActivationState::Active);
+        fixture.remove();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Behaviour 2 (audit D2) — restart between appends recovers the SAME
+    // successor; a foreign attempt is refused.
+    // -----------------------------------------------------------------
+
+    /// WORK_UNIT_CASE: 2626/5 — audit 5906086103 D2. A crash between the re-arm
+    /// appends leaves the durable `Requested` record alone. The restarted
+    /// process resumes *that* successor: the reconstructed `Draining`
+    /// continuation names the exact record checksum of the durable `Requested`
+    /// record, inherits its `evidence_refs`, keeps the same `drain_generation`,
+    /// and carries the same deterministic operation — byte-for-byte
+    /// reproducible, and provably not the generic first-attempt continuation
+    /// the audit named as the defect.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps the pre-restart attempt facts next to the byte-for-byte reproducibility check"
+    )]
+    fn restart_between_rearm_appends_recovers_the_same_successor() -> TestResult {
+        let fixture = DrainFixture::new("restart")?;
+        let (cancelled, requested) = {
+            let journal = fixture.journal()?;
+            fixture.seal_active(&journal)?;
+            let cancelled = fixture.append_cancelled_first_attempt(&journal)?;
+            let requested = append_rearmed_requested(&fixture, &journal, &cancelled, None)?;
+            (cancelled, requested)
+        };
+        let cancelled_checksum = record_checksum(&HostStateRecord::Drain(cancelled.clone()))?;
+        let requested_checksum = record_checksum(&HostStateRecord::Drain(requested.clone()))?;
+
+        // Real restart onto the same durable file.
+        let mut host = fixture.composition(fixture.journal()?)?;
+        assert!(
+            host.begin_idle_drain("idle")?,
+            "a durable re-armed Requested must resume into an open window"
+        );
+        let state = host.snapshot()?;
+        let resumed = drain_of(&state);
+        assert_eq!(resumed.state, DrainState::Draining);
+        assert_eq!(
+            resumed.expected_predecessor.as_deref(),
+            Some(requested_checksum.as_str()),
+            "the continuation must name the exact durable re-armed Requested record checksum"
+        );
+        assert_eq!(
+            resumed.drain_generation, cancelled.drain_generation,
+            "a re-arm never changes the drain generation"
+        );
+        assert_eq!(
+            resumed.evidence_refs, requested.evidence_refs,
+            "the continuation inherits the durable attempt's evidence, including the consumed trigger"
+        );
+        assert_eq!(
+            resumed.operation,
+            drain_rearm_operation(
+                &fixture.fence,
+                &cancelled.drain_generation,
+                &cancelled_checksum,
+                &census_binding(),
+                "draining",
+            )?,
+            "the continuation must carry the same deterministic re-arm operation the uninterrupted path uses"
+        );
+        assert_ne!(
+            resumed.operation,
+            operation("host-idle-drain-draining")?,
+            "the resumed successor must not be the generic first-attempt continuation"
+        );
+        assert_ne!(
+            resumed.operation,
+            operation("2626-first-drain-draining")?,
+            "the resumed successor must not reuse the cancelled attempt's operation identity"
+        );
+        assert_eq!(activation_state_of(&state), ActivationState::Draining);
+
+        // Byte-for-byte reproducibility: rebuild the whole continuation from the
+        // durable `Requested` facts captured *before* the restart and prove it is
+        // the same record the restarted process persisted.
+        let rebuilt = fixture.drain_value(
+            drain_rearm_operation(
+                &fixture.fence,
+                &requested.drain_generation,
+                &cancelled_checksum,
+                &census_binding(),
+                "draining",
+            )?,
+            DrainState::Draining,
+            requested.evidence_refs.clone(),
+            Some(requested_checksum.clone()),
+        );
+        assert_eq!(
+            record_checksum(&HostStateRecord::Drain(rebuilt))?,
+            record_checksum(&HostStateRecord::Drain(resumed))?,
+            "the reconstructed continuation must reproduce the persisted record byte-for-byte"
+        );
+        fixture.remove();
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 2626/6 — audit 5906086103 D2 refusal direction. A
+    /// `Requested` record that does not reproduce this activation's
+    /// deterministic re-arm operation is refused with
+    /// `HostError::RecoveryRequired`, never silently regenerated as a fresh
+    /// continuation.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps the refused-record evidence next to the exact predecessor assertion"
+    )]
+    fn durable_requested_record_with_a_foreign_operation_is_refused_not_regenerated() -> TestResult
+    {
+        let fixture = DrainFixture::new("foreign-rearm")?;
+        let (cancelled_checksum, requested_checksum) = {
+            let journal = fixture.journal()?;
+            fixture.seal_active(&journal)?;
+            let cancelled = fixture.append_cancelled_first_attempt(&journal)?;
+            let cancelled_checksum = record_checksum(&HostStateRecord::Drain(cancelled.clone()))?;
+            let requested = append_rearmed_requested(
+                &fixture,
+                &journal,
+                &cancelled,
+                Some(operation("2626-foreign-rearm-request")?),
+            )?;
+            let requested_checksum = record_checksum(&HostStateRecord::Drain(requested))?;
+            (cancelled_checksum, requested_checksum)
+        };
+
+        // Real restart onto the same durable file.
+        let mut host = fixture.composition(fixture.journal()?)?;
+        let refused = host.begin_idle_drain("idle");
+        assert!(
+            matches!(&refused, Err(HostError::RecoveryRequired(_))),
+            "a durable Requested record that is not this activation's re-arm attempt must fail closed, got {refused:?}"
+        );
+
+        let state = host.snapshot()?;
+        let drain = drain_of(&state);
+        assert_eq!(
+            drain.state,
+            DrainState::Requested,
+            "a refused continuation must not append a Draining record"
+        );
+        assert_eq!(
+            drain.expected_predecessor.as_deref(),
+            Some(cancelled_checksum.as_str()),
+            "the refused attempt stays linked to the exact predecessor it named"
+        );
+        assert_eq!(
+            record_checksum(&HostStateRecord::Drain(drain))?,
+            requested_checksum,
+            "the refused attempt must be left exactly as durable"
+        );
+        assert_eq!(
+            activation_state_of(&state),
+            ActivationState::Active,
+            "a refused continuation must not open the pre-commit window"
+        );
+        assert!(state.drain_commit.is_none());
+        fixture.remove();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Behaviour 3 (audit D3) — no timer without a verified window.
+    // -----------------------------------------------------------------
+
+    /// WORK_UNIT_CASE: 2626/8 — audit 5906086103 D3. A crash after the
+    /// `Draining` append but before the activation transition leaves
+    /// `drain = Draining` with `activation = Active`. The restarted process
+    /// finishes *the exact recorded attempt* — no new drain record, same attempt
+    /// identity — instead of publishing a partially opened window, and an
+    /// already-established window stays established without appending again.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps the durable draining prefix next to the finished-window checks"
+    )]
+    fn draining_prefix_finishes_the_exact_recorded_attempt_before_publishing_a_window() -> TestResult
+    {
+        let fixture = DrainFixture::new("draining-prefix")?;
+        let (draining_checksum, partial_sequence) = {
+            let journal = fixture.journal()?;
+            fixture.seal_active(&journal)?;
+            let evidence = vec![handle(FIRST_TRIGGER_EVIDENCE)];
+            append_reconciled(
+                &journal,
+                fixture.drain_record(
+                    operation("2626-partial-request")?,
+                    DrainState::Requested,
+                    evidence.clone(),
+                    None,
+                ),
+            )?;
+            append_reconciled(
+                &journal,
+                fixture.drain_record(
+                    operation("2626-partial-draining")?,
+                    DrainState::Draining,
+                    evidence,
+                    None,
+                ),
+            )?;
+            // The activation transition is deliberately absent: this is the
+            // crash between the second append and the third.
+            let partial = journal.snapshot()?;
+            assert_eq!(activation_state_of(&partial), ActivationState::Active);
+            let checksum = record_checksum(&HostStateRecord::Drain(drain_of(&partial)))?;
+            (checksum, partial.sequence)
+        };
+
+        let mut host = fixture.composition(fixture.journal()?)?;
+        assert!(
+            host.begin_idle_drain("idle")?,
+            "a Draining prefix bound to this activation must finish its activation transition"
+        );
+        let finished = host.snapshot()?;
+        assert_eq!(
+            activation_state_of(&finished),
+            ActivationState::Draining,
+            "the exact recorded attempt must be finished through its own activation transition"
+        );
+        assert_eq!(
+            record_checksum(&HostStateRecord::Drain(drain_of(&finished)))?,
+            draining_checksum,
+            "finishing the window must not substitute a new drain record or attempt"
+        );
+        assert!(finished.sequence > partial_sequence);
+
+        // Positive: an already-established window stays established and appends
+        // nothing, so a repeated tick cannot fork a second attempt.
+        let established_sequence = finished.sequence;
+        assert!(host.begin_idle_drain("idle")?);
+        let repeated = host.snapshot()?;
+        assert_eq!(repeated.sequence, established_sequence);
+        assert_eq!(activation_state_of(&repeated), ActivationState::Draining);
+        fixture.remove();
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 2626/9 — audit 5906086103 D3 refusal direction. A
+    /// `Failed` attempt is refused closed with `HostError::RecoveryRequired`
+    /// and resets nothing, and a `Draining` record whose activation is neither
+    /// `Active` nor `Draining` is a partial attempt rather than a window. In
+    /// both cases `begin_idle_drain` never returns `Ok(true)` — the only value a
+    /// supervisor publishes `precommit_opened_at` on.
+    ///
+    /// Ceiling on the first half, stated rather than faked. `drain_transition`
+    /// admits `Requested -> Failed` and `Draining -> Failed`, so the durable
+    /// prefix below is a real reducer-legal journal state, and the arm it drives
+    /// is a real production refusal in `begin_idle_drain`. But no production
+    /// writer anywhere emits `DrainState::Failed`: the only constructions of a
+    /// `DrainRecord` in this crate write `Requested`, `Draining` or `Cancelled`.
+    /// So the `Failed` attempt here is authored by the fixture, and what is
+    /// proven is that the production reader refuses such durable state instead
+    /// of publishing a window — not that a live installation can produce one.
+    /// The second half carries no such ceiling: it reaches its recovery terminal
+    /// through the production recovery projection, so its `Draining` prefix is
+    /// one a live contour loss really does abandon.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps the Failed and unestablished-window refusals adjacent"
+    )]
+    fn unestablished_window_and_failed_attempt_never_publish_a_timer() -> TestResult {
+        let fixture = DrainFixture::new("no-window")?;
+        {
+            let journal = fixture.journal()?;
+            fixture.seal_active(&journal)?;
+            let evidence = vec![handle(FIRST_TRIGGER_EVIDENCE)];
+            append_reconciled(
+                &journal,
+                fixture.drain_record(
+                    operation("2626-failed-request")?,
+                    DrainState::Requested,
+                    evidence.clone(),
+                    None,
+                ),
+            )?;
+            append_reconciled(
+                &journal,
+                fixture.drain_record(
+                    operation("2626-failed-attempt")?,
+                    DrainState::Failed,
+                    evidence,
+                    None,
+                ),
+            )?;
+        }
+        let mut host = fixture.composition(fixture.journal()?)?;
+        let refused = host.begin_idle_drain("idle");
+        assert!(
+            matches!(&refused, Err(HostError::RecoveryRequired(_))),
+            "a Failed pre-commit attempt must fail closed, got {refused:?}"
+        );
+        let after_failure = host.snapshot()?;
+        assert_eq!(drain_of(&after_failure).state, DrainState::Failed);
+        assert_eq!(
+            activation_state_of(&after_failure),
+            ActivationState::Active,
+            "a refused Failed attempt must not reset the activation or open a window"
+        );
+        assert!(after_failure.drain_commit.is_none());
+        let failed_sequence = after_failure.sequence;
+
+        // Repeated evaluation keeps failing closed and appends nothing, so a
+        // failed attempt can never be mistaken for an opened window.
+        assert!(matches!(
+            host.begin_idle_drain("idle"),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        assert_eq!(host.snapshot()?.sequence, failed_sequence);
+        fixture.remove();
+
+        // Refusal: a `Draining` record with neither an `Active` nor a `Draining`
+        // activation is a partial attempt, not a window. `Active ->
+        // DegradedRecovery` is the legal same-generation recovery terminal, so
+        // this activation can never open a pre-commit window again.
+        let partial = DrainFixture::new("no-window-partial")?;
+        {
+            let journal = partial.journal()?;
+            partial.seal_active(&journal)?;
+            let evidence = vec![handle(FIRST_TRIGGER_EVIDENCE)];
+            append_reconciled(
+                &journal,
+                partial.drain_record(
+                    operation("2626-orphan-request")?,
+                    DrainState::Requested,
+                    evidence.clone(),
+                    None,
+                ),
+            )?;
+            append_reconciled(
+                &journal,
+                partial.drain_record(
+                    operation("2626-orphan-draining")?,
+                    DrainState::Draining,
+                    evidence,
+                    None,
+                ),
+            )?;
+            // The contour loss that abandons the half-open attempt is the
+            // production recovery projection, directive and all, so the
+            // activation really is `Draining`-unbound in a live installation.
+            partial.degrade_recovery(
+                &journal,
+                "2626-orphan-degraded",
+                &handle("2626-orphan-degraded-failure-ref"),
+                "recover-runtime-readiness",
+            )?;
+        }
+        let mut orphan = partial.composition(partial.journal()?)?;
+        let orphan_drain = drain_of(&orphan.snapshot()?);
+        let orphan_sequence = orphan.snapshot()?.sequence;
+        let refused = orphan.begin_idle_drain("idle");
+        assert!(
+            matches!(&refused, Err(HostError::RecoveryRequired(_))),
+            "a Draining prefix with no Active-or-Draining activation must fail closed, got {refused:?}"
+        );
+        let after = orphan.snapshot()?;
+        assert_eq!(
+            record_checksum(&HostStateRecord::Drain(drain_of(&after)))?,
+            record_checksum(&HostStateRecord::Drain(orphan_drain))?,
+            "a refused partial attempt must append nothing"
+        );
+        assert_eq!(after.sequence, orphan_sequence);
+        assert!(after.drain_commit.is_none());
+        partial.remove();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Behaviour 5 (audit D5) — a foreign or unbound attempt is refused.
+    // -----------------------------------------------------------------
+
+    /// WORK_UNIT_CASE: 2626/10 — audit 5906086103 D5. A record bound to another
+    /// attempt's activation, an unbound attempt with no admission evidence, a
+    /// record whose drain generation is not this activation's, and a record
+    /// without the matching `Draining` activation are all refused instead of
+    /// adopted; the owner census binding is read only from the attempt's own
+    /// evidence layout, so a foreign record cannot be continued.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acceptance case keeps every foreign and unbound record refusal adjacent to its positive bound case"
+    )]
+    fn foreign_or_unbound_attempt_records_are_refused_instead_of_adopted() -> TestResult {
+        let fixture = DrainFixture::new("foreign-binding")?;
+        let active = initial_activation_record(
+            &fixture.host,
+            &fixture.activation_id,
+            &fixture.activation_generation,
+            ActivationState::Active,
+            "2626-binding-active",
+            &test_activation_ingress(),
+        )?;
+        let draining_activation = initial_activation_record(
+            &fixture.host,
+            &fixture.activation_id,
+            &fixture.activation_generation,
+            ActivationState::Draining,
+            "2626-binding-draining",
+            &test_activation_ingress(),
+        )?;
+        let bound = fixture.drain_value(
+            operation("2626-binding-bound")?,
+            DrainState::Draining,
+            vec![handle(FIRST_TRIGGER_EVIDENCE)],
+            None,
+        );
+
+        // Positive: this activation's own bound attempt verifies.
+        assert!(verify_drain_fence_binding(&active, &bound).is_ok());
+
+        // Refusal: a continuation naming another attempt's activation fence and
+        // drain generation is not this activation's attempt. The predecessor
+        // checksum half of the link is enforced by the reducer; see
+        // `crates/kernel/eliot-host-state/src/tests.rs` WORK_UNIT_CASE 2626/1
+        // and 2626/2.
+        let foreign_generation = root_epoch(fresh_lineage_id()?);
+        let foreign_id = fresh_identity("2626-binding-foreign-activation")?;
+        let mut foreign_fence = bound.clone();
+        foreign_fence.fence = record_fence(&fixture.host, &foreign_id, &foreign_generation);
+        foreign_fence.drain_generation = foreign_generation.clone();
+        assert!(matches!(
+            verify_drain_fence_binding(&active, &foreign_fence),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        // Refusal: an unbound attempt carries no admission evidence, so it can
+        // never authorize a window.
+        let mut unbound = bound.clone();
+        unbound.evidence_refs = Vec::new();
+        assert!(matches!(
+            verify_drain_fence_binding(&active, &unbound),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        // Refusal: a record whose drain generation is not this activation's is
+        // not this activation's attempt.
+        let mut other_generation = bound.clone();
+        other_generation.drain_generation = foreign_generation;
+        assert!(matches!(
+            verify_drain_fence_binding(&active, &other_generation),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        // Positive: a fully established window verifies.
+        assert!(verify_drain_activation_binding(&draining_activation, &bound).is_ok());
+        // Refusal: the same record without a `Draining` activation is not a
+        // window, so no timer may be published for it.
+        assert!(matches!(
+            verify_drain_activation_binding(&active, &bound),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        // The owner census binding a durable re-armed record is admitted under is
+        // read from that attempt's own evidence layout; anything else is a
+        // foreign record.
+        let cancelled_checksum = "ab".repeat(32);
+        let rearmed = fixture.drain_value(
+            drain_rearm_operation(
+                &fixture.fence,
+                &fixture.activation_generation,
+                &cancelled_checksum,
+                &census_binding(),
+                "request",
+            )?,
+            DrainState::Requested,
+            vec![
+                handle(&format!("drain-rearm-predecessor:{cancelled_checksum}")),
+                handle(&census_binding()),
+                handle(FIRST_TRIGGER_EVIDENCE),
+            ],
+            Some(cancelled_checksum.clone()),
+        );
+        assert_eq!(rearm_census_binding_from(&rearmed)?, census_binding());
+
+        let mut no_predecessor_evidence = rearmed.clone();
+        no_predecessor_evidence.evidence_refs = vec![handle(&census_binding())];
+        assert!(matches!(
+            rearm_census_binding_from(&no_predecessor_evidence),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        let mut no_census_binding = rearmed.clone();
+        no_census_binding.evidence_refs = vec![handle(&format!(
+            "drain-rearm-predecessor:{cancelled_checksum}"
+        ))];
+        assert!(matches!(
+            rearm_census_binding_from(&no_census_binding),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        let mut foreign_predecessor_evidence = rearmed.clone();
+        foreign_predecessor_evidence.evidence_refs = vec![
+            handle("2626-not-a-predecessor-marker"),
+            handle(FIRST_TRIGGER_EVIDENCE),
+        ];
+        assert!(matches!(
+            rearm_census_binding_from(&foreign_predecessor_evidence),
+            Err(HostError::RecoveryRequired(_))
+        ));
+
+        let mut foreign_census_binding = rearmed.clone();
+        foreign_census_binding.evidence_refs = vec![
+            handle(&format!("drain-rearm-predecessor:{cancelled_checksum}")),
+            handle("2626-not-an-owner-census"),
+        ];
+        assert!(matches!(
+            rearm_census_binding_from(&foreign_census_binding),
+            Err(HostError::RecoveryRequired(_))
+        ));
+        fixture.remove();
+        Ok(())
+    }
 }

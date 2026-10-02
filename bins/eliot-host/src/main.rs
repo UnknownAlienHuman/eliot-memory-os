@@ -2828,9 +2828,59 @@ impl HostIdleDrainSupervisor {
             };
         };
         if now.duration_since(opened) < HOST_DRAIN_PRECOMMIT_WINDOW {
-            IdleDrainTick::PreCommitWindowOpen
-        } else {
-            IdleDrainTick::CommitDue
+            return IdleDrainTick::PreCommitWindowOpen;
+        }
+        // Audit 5906086103 D4, second half: the `DrainCommit` this decision
+        // authorises fences the Kernel authority epoch, and the retirement
+        // barrier is post-commit by construction, so the owner census is read
+        // and compared here — inside the open window, after it elapsed, and
+        // before the append. The `next_census_at` cache that admitted the
+        // attempt is bypassed, so an obligation that arose after that cache was
+        // taken is observed rather than missed.
+        let revalidated = host
+            .idle_lease_census()
+            .unwrap_or(IdleLeaseCensus::Unavailable {
+                reason: "census-unreadable",
+            });
+        let admits = host.precommit_drain_census_admits_commit(&revalidated);
+        self.last_census = revalidated;
+        match admits {
+            Ok(true) => IdleDrainTick::CommitDue,
+            Ok(false) => {
+                // The census that admitted this attempt is not the current one:
+                // an obligation reappeared, the census could not be
+                // established, or the owner fence/revision moved on. The attempt
+                // does not commit a census it was not admitted on; the window is
+                // dropped and the grace restarts, so a later authenticated
+                // trigger can cancel and re-arm the attempt under the current
+                // census instead of forcing a commit.
+                self.idle_since = None;
+                self.precommit_opened_at = None;
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: idle drain deferred; the owner census read immediately before commit is not the census this attempt was admitted on"
+                );
+                IdleDrainTick::CensusDeferred
+            }
+            Err(error) => {
+                // A `Failed` attempt, a durable `DrainCommitRecord`, an attempt
+                // not bound to the current activation, or an unreadable
+                // recorded binding is a visible recovery obligation at this
+                // boundary, reported with the same bounded reason class as the
+                // other blocked drain paths. These conditions are durable, so
+                // the window is dropped rather than retried every 250 ms: the
+                // next window has to be re-established through
+                // `begin_idle_drain`, which refuses it again until the
+                // obligation behind the reason is reconciled.
+                let reason = host_error_variant(&error);
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "eliot-host: idle drain is blocked and cannot commit its pre-commit window (reason={reason}): {error}"
+                );
+                self.idle_since = None;
+                self.precommit_opened_at = None;
+                IdleDrainTick::DrainBlocked { reason }
+            }
         }
     }
 }
