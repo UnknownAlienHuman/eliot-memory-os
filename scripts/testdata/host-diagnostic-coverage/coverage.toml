@@ -928,9 +928,9 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 markers = ["HostStopCode::ScmRegisterNull", "HostStopCode::InvalidScmArgvOrBootstrap", "HostStopCode::InvalidRegistration", "HostStopCode::ReporterStartFailed", "HostStopCode::OpenHostFailed", "HostStopCode::ReporterProgressFailed", "HostStopCode::CredentialControlFailed", "HostStopCode::SpawnCredentialFailed", "HostStopCode::RuntimeControlFailed", "HostStopCode::SpawnRuntimeFailed", "HostStopCode::DurableShutdownFailed"]
 [[boundary.absence]]
-start = 933
-end = 1258
-digest = "da941b82be8067d3e306e17009a596163c44847679627f24d82c4dc5b5e7da70"
+start = 1770
+end = 2103
+digest = "e3855e4c61a6389f90682738f114bee2361ade44712fbd09837e95385cb956f4"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_console_diagnostics.rs"
 case = "host_console_boundaries_are_complete_and_singular"
@@ -1839,9 +1839,9 @@ detail = "Path verified: start_watchdog (8011) errors -> cleanup_launched_contou
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
-start = 8011
-end = 8470
-digest = "afb7c65aad4ec5fedaa5ce8b606f71aef599f838bbdcd5afcd46076f6df3b5a5"
+start = 13057
+end = 13516
+digest = "a211d0d65d34a27771a9db2bc48f547ba3638bd766e3015f39b36ff25d8981fd"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
 line = 13541
