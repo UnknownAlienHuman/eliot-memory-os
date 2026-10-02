@@ -25,6 +25,11 @@ pub use durable_host_event_ingest::{
     StageOutcome, StageRedacted, StoredPayload, StreamCursorState, contains_forbidden_content,
     deterministic_redacted_bytes,
 };
+mod execution_unit_driver;
+pub use execution_unit_driver::{
+    ExecutionUnitDisclosure, ExecutionUnitDriverEvent, ExecutionUnitRunError,
+    ProducedExecutionUnitEvent, produce_execution_unit_events,
+};
 mod host_event_producer;
 pub use host_event_producer::{
     ExecutionUnitFrame, ProduceOutcome, ProducerError, ProducerFrame, produce_allowed,
