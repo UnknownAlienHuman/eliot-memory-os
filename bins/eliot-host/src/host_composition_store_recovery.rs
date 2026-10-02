@@ -527,7 +527,11 @@ impl HostComposition {
                 "Store recovery reconciliation has no approved generation".to_owned(),
             )
         })?;
-        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation_handle)?;
+        let control = self
+            .jobs
+            .begin_fresh_supervision_control_context(&generation_handle)?;
+        let readiness_contour =
+            self.persist_fresh_authenticated_readiness(&generation_handle, control)?;
         let readiness_observation = self
             .journal
             .snapshot()?
@@ -1435,7 +1439,10 @@ impl HostComposition {
             .validate()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let approved_config = config_digest.clone();
-        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation)?;
+        let control = self
+            .jobs
+            .begin_fresh_supervision_control_context(&generation)?;
+        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation, control)?;
         let readiness_observation = self
             .journal
             .snapshot()?

@@ -350,6 +350,17 @@ impl HeartbeatTransportDescriptor {
     ///
     /// Returns an error for oversize, unparsable, or binding-invalid files.
     pub fn load(host_state_root: &Path) -> Result<Option<Self>, HostError> {
+        Self::load_with_verified_digest(host_state_root)
+            .map(|loaded| loaded.map(|(descriptor, _)| descriptor))
+    }
+
+    /// Loads the current descriptor together with the digest present on the
+    /// wire and verified against its canonical bytes. This is the exact
+    /// descriptor identity used by heartbeat admission; it is not minted or
+    /// refreshed by this method.
+    pub(super) fn load_with_verified_digest(
+        host_state_root: &Path,
+    ) -> Result<Option<(Self, String)>, HostError> {
         let path = host_state_root.join(WATCHDOG_HEARTBEAT_TRANSPORT_FILE_NAME);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
@@ -368,6 +379,7 @@ impl HeartbeatTransportDescriptor {
                 "heartbeat descriptor schema is unsupported".to_owned(),
             ));
         }
+        let verified_digest = wire.descriptor_digest.clone();
         let descriptor = Self {
             pipe_name: wire.pipe_name,
             host_challenge_nonce: wire.host_challenge_nonce,
@@ -388,7 +400,7 @@ impl HeartbeatTransportDescriptor {
             ));
         }
         verify_transport_file(&path)?;
-        Ok(Some(descriptor))
+        Ok(Some((descriptor, verified_digest)))
     }
 
     /// Binds the published descriptor to the SCM-verified watchdog
@@ -1829,6 +1841,8 @@ impl HeartbeatListener {
 pub struct AdmittedHostHeartbeat {
     /// Validated derived observation.
     pub observation: HostObservedWatchdogHeartbeat,
+    /// Exact digest read from the verified transport descriptor on disk.
+    pub transport_descriptor_digest: Option<String>,
     /// Evidence refs for the readiness observation record.
     pub evidence_refs: Vec<PlatformHandle>,
 }
@@ -2008,6 +2022,10 @@ pub fn admit_heartbeat_observation(
     ))?);
     Ok(AdmittedHostHeartbeat {
         observation: observed,
+        // Direct admission callers have no descriptor-file provenance. The
+        // authenticated transport producer fills this only after verifying
+        // the descriptor's on-disk digest.
+        transport_descriptor_digest: None,
         evidence_refs,
     })
 }
@@ -2121,7 +2139,9 @@ pub fn observe_armed_heartbeat_admitted(
     expected_watchdog_epoch: u64,
     scm: &VerifiedWatchdogScmRunning,
 ) -> Result<AdmittedHostHeartbeat, HostError> {
-    let Some(descriptor) = HeartbeatTransportDescriptor::load(host_state_root)? else {
+    let Some((descriptor, transport_descriptor_digest)) =
+        HeartbeatTransportDescriptor::load_with_verified_digest(host_state_root)?
+    else {
         return Err(HostError::RecoveryRequired(
             "supervised readiness requires a bound Watchdog heartbeat descriptor".to_owned(),
         ));
@@ -2216,6 +2236,7 @@ pub fn observe_armed_heartbeat_admitted(
     admitted.evidence_refs.push(heartbeat_evidence_ref(format!(
         "host-heartbeat-rejected-peers:{rejected_peers}"
     ))?);
+    admitted.transport_descriptor_digest = Some(transport_descriptor_digest);
     persist_heartbeat_observation(host_state_root, &admitted.observation)?;
     Ok(admitted)
 }

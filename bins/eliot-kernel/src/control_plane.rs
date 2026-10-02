@@ -23,6 +23,23 @@
 use super::*;
 use tracing::Instrument;
 
+/// Owner-local admission context retained only for one authenticated control
+/// connection. The freshness anchor is opened by the exact-fence revocation
+/// that immediately precedes a Host heartbeat attempt, then consumed by the
+/// next report on that same sequenced connection.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct KernelControlSessionContext {
+    supervision_freshness: Option<KernelSupervisionFreshnessContext>,
+}
+
+struct KernelSupervisionFreshnessContext {
+    candidate_digest: String,
+    state_fence: StateFence,
+    revoke_sequence: u64,
+    anchored_at: Instant,
+}
+
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
 /// Observation only, via #895's facade: fixed `kernel.control.*` event names
@@ -245,6 +262,22 @@ impl KernelComposition {
         peer: &PeerIdentity,
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
+        let mut session = KernelControlSessionContext::default();
+        self.apply_control_request_in_session(request, peer, expected_sequence, &mut session)
+            .await
+    }
+
+    /// Applies an authenticated request while retaining context bound to the
+    /// original control connection. Production control dispatch uses this
+    /// path so a reconnect cannot move or refresh a heartbeat admission.
+    #[doc(hidden)]
+    pub async fn apply_control_request_in_session(
+        &self,
+        request: KernelControlRequest,
+        peer: &PeerIdentity,
+        expected_sequence: u64,
+        session: &mut KernelControlSessionContext,
+    ) -> Result<KernelControlResponse, TransportError> {
         let validated = request.validate().is_ok();
         let generation = validated.then(|| request.generation.value().to_string());
         let epoch = validated
@@ -265,9 +298,15 @@ impl KernelComposition {
             );
         }
         observe_control_in_context("kernel.control.request_received", "attempt", &context);
-        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
-            .instrument(context.clone())
-            .await
+        match Box::pin(self.apply_control_request_inner(
+            request,
+            peer,
+            expected_sequence,
+            session,
+            &context,
+        ))
+        .instrument(context.clone())
+        .await
         {
             Ok(response) => {
                 observe_control_in_context("kernel.control.request_admitted", "success", &context);
@@ -311,6 +350,7 @@ impl KernelComposition {
         request: KernelControlRequest,
         peer: &PeerIdentity,
         expected_sequence: u64,
+        session: &mut KernelControlSessionContext,
         context: &tracing::Span,
     ) -> Result<KernelControlResponse, ControlRequestFailure> {
         request
@@ -433,30 +473,75 @@ impl KernelComposition {
             evidence
                 .validate(&request.candidate, request.generation)
                 .map_err(|_| TransportError::SessionFenced)?;
-            // I1.5/A8.1: this carrier is the one owner-correct route by which a
-            // Host-observed Watchdog branch reaches Kernel. Host just
-            // revalidated the live SCM Watchdog incarnation (bound PID/start
-            // pair plus image bytes equal to the approved Watchdog artifact);
-            // Kernel binds that observation to the presented candidate contour
-            // and only then marks the I1.11 supervision step. Without that
-            // step there is no supervised health projection and no
-            // Material/Critical admission.
+            // Process probes alone only advance their own I1.11 steps. The
+            // final supervision step has exactly one producer: the original
+            // Host-admitted continuous heartbeat bound to its verified
+            // descriptor, receive/deadline, incarnation, candidate and fence.
             #[cfg(windows)]
-            {
+            if let Some(heartbeat) = &evidence.supervision_heartbeat {
                 let target =
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
+                let candidate_digest = request
+                    .candidate
+                    .compute_digest()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let freshness = session
+                    .supervision_freshness
+                    .as_ref()
+                    .filter(|freshness| {
+                        freshness.candidate_digest == candidate_digest
+                            && freshness.state_fence == target
+                            && freshness.revoke_sequence.checked_add(1) == Some(request.sequence)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
                 self.admit_host_observed_watchdog_branch(
                     &evidence.startup_evidence,
+                    heartbeat,
                     &request.candidate,
                     &target,
+                    freshness.anchored_at,
                 )
                 .map_err(|_| TransportError::SessionFenced)?;
+            }
+            #[cfg(not(windows))]
+            if evidence.supervision_heartbeat.is_some() {
+                return Err(TransportError::SessionFenced.into());
             }
             // Typed provenance rows are validated as transport input above.
             // They are not an I1.11 probe and have no Kernel candidate
             // admission/readback owner yet, so this path does not turn them
             // into startup or generation authority.
             self.consume_host_startup_evidence(&evidence.startup_evidence)?;
+        }
+        let supervision_revocation =
+            if let KernelControlCommand::RevokeHostSupervisionEvidence(revocation) =
+                &request.command
+            {
+                Some(
+                    self.revoke_host_observed_supervision_evidence(
+                        &revocation.candidate_digest,
+                        &revocation.state_fence,
+                        revocation.expected_observation_digest.as_ref(),
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?,
+                )
+            } else {
+                None
+            };
+        if supervision_revocation.is_some() {
+            let candidate_digest = request
+                .candidate
+                .compute_digest()
+                .map_err(|_| TransportError::SessionFenced)?;
+            session.supervision_freshness = Some(KernelSupervisionFreshnessContext {
+                candidate_digest,
+                state_fence: StateFence::new(
+                    request.candidate.kernel_epoch.clone(),
+                    request.generation,
+                ),
+                revoke_sequence: request.sequence,
+                anchored_at: Instant::now(),
+            });
         }
         if let Some(handoff) = bootstrap {
             self.install_store_bootstrap(handoff.clone())
@@ -703,10 +788,13 @@ impl KernelComposition {
             // could admit a contour whose branch had never been observed. The
             // replacement requires an independent Watchdog observation bound to
             // THIS contour and to the exact consumer State Fence and still
-            // inside its own finite validity interval (only `HostStartupEvidence`
-            // can record one, and only after Host revalidated the PID/start pair
-            // against the live OS and the live image bytes against the approved
-            // Watchdog artifact), plus the whole supervised-branch conjunction.
+            // inside its own finite validity interval. Only the
+            // `ReportHostStartupEvidence` command with its original admitted
+            // heartbeat proof can record that observation, after the same
+            // authenticated control session's immediately preceding exact-fence
+            // revocation anchored Kernel-local time. The process-only startup
+            // carrier and its SCM identity fields cannot establish step 11.
+            // The whole supervised-branch conjunction must also succeed.
             //
             // What this gate establishes, precisely: it refuses every case the
             // dropped lease-derived equality refused, and it additionally
@@ -955,6 +1043,7 @@ impl KernelComposition {
                 | KernelControlCommand::ReconcileActivation(_)
                 | KernelControlCommand::RebindStore(_)
                 | KernelControlCommand::ReconcileRebindStore(_)
+                | KernelControlCommand::RevokeHostSupervisionEvidence(_)
                 | KernelControlCommand::ReportHostStartupEvidence(_)
                 // I18.53 ACT-1 (#1918): the retirement census is a read-only
                 // owner read, never a service state transition. Serving it
@@ -1026,6 +1115,7 @@ impl KernelComposition {
             // only on its dedicated wire arm, never beside another receipt.
             runtime_lease_census,
             introduction_rows: None,
+            supervision_revocation,
             error: None,
             payload_digest: String::new(),
         }
@@ -2198,6 +2288,24 @@ mod control_plane_diagnostics_tests {
         kernel
             .consume_host_startup_evidence(&host_startup_evidence(None))
             .expect("Host steps 1 and 2 should be recorded");
+        assert_eq!(
+            kernel
+                .startup_status(GovernanceProfile::minimal())
+                .completed_step,
+            2,
+            "process-only Host evidence must not complete supervision step 11"
+        );
+        assert!(
+            kernel.record_startup_evidence(11).is_err(),
+            "the generic startup evidence seam must refuse step 11"
+        );
+        assert_eq!(
+            kernel
+                .startup_status(GovernanceProfile::minimal())
+                .completed_step,
+            2,
+            "refused process-only step 11 leaves the cursor unchanged"
+        );
         kernel
             .record_startup_evidence(3)
             .expect("step 3 test evidence");

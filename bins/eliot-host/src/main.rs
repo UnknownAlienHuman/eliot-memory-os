@@ -149,6 +149,14 @@ fn host_error_variant(error: &HostError) -> &'static str {
         HostError::StoreNotLive { .. } => "store_not_live",
         HostError::RecoveryRequired(_) => "recovery_required",
         #[cfg(windows)]
+        HostError::KernelSupervisionRevocationUncontained(_) => {
+            "kernel_supervision_revocation_uncontained"
+        }
+        #[cfg(windows)]
+        HostError::KernelSupervisionRevocationSuperseded(_) => {
+            "kernel_supervision_revocation_superseded"
+        }
+        #[cfg(windows)]
         HostError::OriginCollisionUnproven(_) => "origin_collision_unproven",
         #[cfg(windows)]
         HostError::StoreEndpointOwnerUnreadable(_) => "store_endpoint_owner_unreadable",
