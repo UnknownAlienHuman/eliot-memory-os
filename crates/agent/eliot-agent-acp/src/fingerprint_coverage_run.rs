@@ -55,7 +55,9 @@
 //! and a plan that names any other revision cannot be built from this
 //! constructor at all.
 
-use eliot_agent_api::{AdmittedRouteReceipt, ProviderExecutionBinding, route_fingerprint_digest_for};
+use eliot_agent_api::{
+    AdmittedRouteReceipt, ProviderExecutionBinding, route_fingerprint_digest_for,
+};
 use eliot_contracts::ProductId;
 use eliot_evaluation_contracts::{
     CoverageCompleteness, DenominatorOrigin, MaterialActionCoverage, RunFingerprint,
@@ -185,7 +187,9 @@ pub fn run_fingerprint_coverage_denominator(
     if run.session.route != run.execution.route
         || run.admission.selected_route.as_ref() != Some(&run.session.route)
     {
-        return Err(IngestError::InvalidInput("coverage_manifest.route_fingerprint"));
+        return Err(IngestError::InvalidInput(
+            "coverage_manifest.route_fingerprint",
+        ));
     }
     // The roster is the journal's own observed stream set, never a caller list:
     // facts are resolved over exactly the streams the denominator will measure.
@@ -204,8 +208,7 @@ pub fn run_fingerprint_coverage_denominator(
     let plan = CoverageManifestPlan {
         fingerprint: &fingerprint,
         allowed_manifest_digest: run.allowed.manifest_digest,
-        expected_event_sources_and_event_classes: declared
-            .expected_event_sources_and_event_classes,
+        expected_event_sources_and_event_classes: declared.expected_event_sources_and_event_classes,
         observable_actions: declared.observable_actions,
         unobservable_actions: declared.unobservable_actions,
         missing_source_reasons: declared.missing_source_reasons,

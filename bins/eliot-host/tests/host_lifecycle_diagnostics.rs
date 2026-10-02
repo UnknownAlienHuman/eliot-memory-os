@@ -688,9 +688,9 @@ fn case_matrix_denominator_is_exactly_1_to_22() {
         let Some((number, _)) = name.split_once('_') else {
             panic!("a case test must name its case number, got {name:?}");
         };
-        let number = number.parse::<u32>().unwrap_or_else(|_| {
-            panic!("a case test must name its case number, got {name:?}")
-        });
+        let number = number
+            .parse::<u32>()
+            .unwrap_or_else(|_| panic!("a case test must name its case number, got {name:?}"));
         assert!(
             markers.iter().any(|(case, _)| *case == number),
             "{name} claims matrix case {number} with no WORK_UNIT_CASE marker"
