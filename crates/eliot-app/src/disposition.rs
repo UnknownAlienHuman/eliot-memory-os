@@ -1544,39 +1544,108 @@ fn baked_surface(path: &str) -> Option<&'static ConsumerSurface> {
         .find(|surface| surface.path == path)
 }
 
-/// Fail when a [`Disposition::TemporaryFixture`] has no dated removal
-/// condition, or when that condition is not strictly later than
+/// The way one temporary fixture's recorded removal condition fails the
+/// expiry rule, as a typed cause instead of only failure text.
+///
+/// Every refusal [`expiry_condition_guard`] builds for a
+/// [`Disposition::TemporaryFixture`] row carries exactly one of these, so the
+/// refusal branches are distinguishable by type rather than by matching an
+/// error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryRefusal {
+    /// The recorded condition never says the path is removed at all.
+    NoRemovalCondition {
+        /// Inventory proof of the offending row.
+        proof: &'static str,
+    },
+    /// The condition names removal but carries no `YYYY-MM-DD` date.
+    UndatedRemovalCondition {
+        /// Inventory proof of the offending row.
+        proof: &'static str,
+    },
+    /// The dated condition is not strictly later than the inventory revision,
+    /// so the fixture outlived its own recorded deadline.
+    ExpiredFixture {
+        /// Inventory proof of the offending row.
+        proof: &'static str,
+        /// The date already reached, as eight digits.
+        expired_on: [u8; 8],
+    },
+}
+
+impl ExpiryRefusal {
+    /// Inventory proof of the row this refusal was built for.
+    const fn proof(self) -> &'static str {
+        match self {
+            Self::NoRemovalCondition { proof }
+            | Self::UndatedRemovalCondition { proof }
+            | Self::ExpiredFixture { proof, .. } => proof,
+        }
+    }
+}
+
+/// Fail when a [`Disposition::TemporaryFixture`] in `entries` has no dated
+/// removal condition, or when that condition is not strictly later than
 /// [`INVENTORY_REVISION`], which means the fixture outlived its own deadline.
-pub fn expiry_condition_guard() -> Result<(), String> {
+///
+/// `entries` is the inventory this rule is applied to;
+/// [`expiry_condition_guard`] passes [`current_consumer_inventory`], so the
+/// shipped entry gate and this function are one rule with one threshold.
+pub fn expiry_condition_guard_over<'a>(entries: &'a [ConsumerEntry]) -> Result<(), ExpiryRefusal> {
     let Some(revision) = first_iso_date_digits(INVENTORY_REVISION) else {
-        return Err("inventory revision constant is not an ISO date".to_owned());
+        return Err(ExpiryRefusal::UndatedRemovalCondition {
+            proof: INVENTORY_REVISION,
+        });
     };
-    for entry in current_consumer_inventory() {
+    for entry in entries {
         if entry.disposition != Disposition::TemporaryFixture {
             continue;
         }
         if !entry.expiry.to_ascii_lowercase().contains("remove") {
-            return Err(format!(
-                "temporary fixture {} records no removal condition in {:?}",
-                entry.proof, entry.expiry
-            ));
+            return Err(ExpiryRefusal::NoRemovalCondition { proof: entry.proof });
         }
         let Some(expiry_date) = first_iso_date_digits(entry.expiry) else {
-            return Err(format!(
-                "temporary fixture {} records no YYYY-MM-DD removal date in {:?}",
-                entry.proof, entry.expiry
-            ));
+            return Err(ExpiryRefusal::UndatedRemovalCondition { proof: entry.proof });
         };
         if expiry_date <= revision {
-            return Err(format!(
-                "temporary fixture {} expired on {}; record the removal or give it a condition later than {}",
-                entry.proof,
-                iso_date_text(expiry_date),
-                INVENTORY_REVISION
-            ));
+            return Err(ExpiryRefusal::ExpiredFixture {
+                proof: entry.proof,
+                expired_on: expiry_date,
+            });
         }
     }
     Ok(())
+}
+
+/// Fail when a [`Disposition::TemporaryFixture`] has no dated removal
+/// condition, or when that condition is not strictly later than
+/// [`INVENTORY_REVISION`], which means the fixture outlived its own deadline.
+pub fn expiry_condition_guard() -> Result<(), String> {
+    expiry_condition_guard_over(current_consumer_inventory()).map_err(|refusal| {
+        let proof = refusal.proof();
+        match refusal {
+            ExpiryRefusal::NoRemovalCondition { .. } => {
+                format!("temporary fixture {proof} records no removal condition")
+            }
+            ExpiryRefusal::UndatedRemovalCondition { .. } => format!(
+                "temporary fixture {proof} records no YYYY-MM-DD removal date in {:?}",
+                entries_expiry_for(proof)
+            ),
+            ExpiryRefusal::ExpiredFixture { expired_on, .. } => format!(
+                "temporary fixture {proof} expired on {}; record the removal or give it a condition later than {}",
+                iso_date_text(expired_on),
+                INVENTORY_REVISION
+            ),
+        }
+    })
+}
+
+/// Recorded expiry text of the inventory row with `proof`, when one exists.
+fn entries_expiry_for(proof: &'static str) -> &'static str {
+    current_consumer_inventory()
+        .iter()
+        .find(|entry| entry.proof == proof)
+        .map_or("<unknown proof>", |entry| entry.expiry)
 }
 
 /// Digits of the first `YYYY-MM-DD` token in `text`.
@@ -2031,10 +2100,9 @@ mod tests {
         // decided by the data, not by the guard. This reads that condition back
         // over the shipped inventory and pins what it actually does.
         let inventory = current_consumer_inventory();
-        let (extract_rows, fixture_rows): (Vec<&ConsumerEntry>, Vec<&ConsumerEntry>) =
-            inventory
-                .iter()
-                .partition(|entry| entry.disposition == Disposition::ExtractToCurrentOwner);
+        let (extract_rows, fixture_rows): (Vec<&ConsumerEntry>, Vec<&ConsumerEntry>) = inventory
+            .iter()
+            .partition(|entry| entry.disposition == Disposition::ExtractToCurrentOwner);
 
         assert!(
             !fixture_rows.is_empty(),
@@ -2168,8 +2236,7 @@ mod tests {
                 recorded.len()
             );
             assert_eq!(
-                recorded[0].live_reference,
-                surface.live_reference,
+                recorded[0].live_reference, surface.live_reference,
                 "inventory entry for {} disagrees with the baked surface reference",
                 surface.path
             );
