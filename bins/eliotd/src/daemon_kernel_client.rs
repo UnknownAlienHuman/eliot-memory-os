@@ -2548,6 +2548,15 @@ impl DaemonKernelClient {
         }
     }
 
+    /// Seeds the retained binding as if a validated handshake had established
+    /// it. Test-only: the production writer stays `connect_transport`.
+    #[cfg(test)]
+    pub(super) fn seed_validated_session_binding_for_test(&self, binding: &str) {
+        if let Ok(mut slot) = self.validated_session_binding.lock() {
+            *slot = Some(binding.to_owned());
+        }
+    }
+
     /// Mints this connection's canonical Kernel request identity for one
     /// admitted canonical write whose exact canonical request bytes the caller
     /// already holds.

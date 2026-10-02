@@ -807,10 +807,7 @@ mod tests {
     fn kernel_with_session(fence: &StateFence) -> Arc<DaemonKernelClient> {
         let mut client =
             DaemonKernelClient::new_for_test(fence.authority_epoch.clone(), fence.clone());
-        *client
-            .validated_session_binding
-            .lock()
-            .expect("session binding lock") = Some(TEST_PRINCIPAL.to_owned());
+        client.seed_validated_session_binding_for_test(TEST_PRINCIPAL);
         Arc::new(client)
     }
 
