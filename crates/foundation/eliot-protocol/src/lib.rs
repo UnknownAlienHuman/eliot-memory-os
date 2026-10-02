@@ -1369,11 +1369,21 @@ pub enum ModuleLifecyclePhase {
 /// `RestoreCheckpoint` restores this exact checkpoint instead of treating
 /// the restart as a new uncorrelated request. `bytes` are the exact
 /// canonical snapshot bytes the module published in the `Checkpoint` frame
-/// payload, retained verbatim as the persisted owner result: they survive a
-/// restart through [`ModuleLifecycle::checkpoint`] readback and both
-/// [`ModuleLifecycle::restore`] and [`ModuleLifecycle::restore_retained`], so
-/// generation restart/restore/resume replays the same bytes instead of a
-/// fabricated empty checkpoint.
+/// payload, retained verbatim: an owner returns them unchanged through
+/// [`ModuleLifecycle::checkpoint`] instead of a fabricated empty checkpoint.
+/// An owner that holds the checkpoint without recording its publication, that
+/// is one rebuilt through [`ModuleLifecycle::restore_retained`], resumes from
+/// them through a correlated `RestoreCheckpoint` or `Start` resume. An owner
+/// that published the checkpoint itself also holds the publication under this
+/// checkpoint's idempotency key, so the same correlated resume is refused as
+/// [`ProtocolError::ReplayConflict`]; see
+/// [`ModuleLifecycle::restore_retained`].
+///
+/// That retention is process-local. [`ModuleLifecycleSnapshot`] carries these
+/// bytes across a serialization boundary and [`ModuleLifecycle::restore`]
+/// validates them on the way back, but no production caller performs either
+/// step, so nothing currently carries them across a process restart; see
+/// [`ModuleLifecycleSnapshot`] for the exact boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleCheckpoint {
@@ -1383,7 +1393,7 @@ pub struct ModuleCheckpoint {
     pub request_id: RequestId,
     /// Originating idempotency key.
     pub idempotency_key: String,
-    /// Persisted checkpoint snapshot bytes published by the module.
+    /// Retained checkpoint snapshot bytes published by the module.
     pub bytes: Vec<u8>,
 }
 
@@ -1500,10 +1510,14 @@ pub const LIFECYCLE_CANONICAL_ENCODING: &str = "eliot.module-lifecycle.canonical
 /// idempotency records (I5.27 `retention_and_collision_window`).
 ///
 /// An owner that already holds this many distinct idempotency identities
-/// refuses a further effectful control rather than growing without bound. A
-/// caller that needs a wider window persists
-/// [`ModuleLifecycle::snapshot`] and rebuilds the owner through
-/// [`ModuleLifecycle::restore`] instead of raising this bound.
+/// refuses a further effectful control rather than growing without bound.
+/// [`ModuleLifecycle::snapshot`] and [`ModuleLifecycle::restore`] define the
+/// readback that would let a receiver carry the retained records into a fresh
+/// owner instead of raising this bound, but no such receiver exists in the
+/// current source. In practice this is a cap on one live owner's retention, not
+/// yet a cross-restart window; and that readback carries the retained records
+/// rather than a resumable checkpoint, so the correlated restart/resume tail is
+/// served by [`ModuleLifecycle::restore_retained`] instead (see there).
 pub const MAX_LIFECYCLE_RETAINED_OPERATIONS: usize = 1024;
 
 /// Projects the versioned canonical bytes one lifecycle request's idempotency
@@ -1566,9 +1580,12 @@ pub fn lifecycle_request_hash(frame: &Frame) -> Result<String, ProtocolError> {
 ///
 /// The record is serializable on purpose: it travels in
 /// [`ModuleLifecycleSnapshot`] and is read back through
-/// [`ModuleLifecycle::restore`], so a lifecycle rebuilt in a new process
-/// observes the same idempotency identity as an already recorded operation
-/// rather than admitting it as a first admission.
+/// [`ModuleLifecycle::restore`], which is what would make a lifecycle rebuilt
+/// in a new process observe the same idempotency identity as an already
+/// recorded operation rather than admitting it as a first admission. No
+/// production caller serializes a snapshot or restores one today, so that
+/// rebuild does not currently happen: the round-trip is defined, not driven
+/// (see [`ModuleLifecycleSnapshot`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleOperationRecord {
@@ -1590,16 +1607,33 @@ impl LifecycleOperationRecord {
     }
 }
 
-/// Durable readback of one [`ModuleLifecycle`] owner.
+/// Durable readback shape of one [`ModuleLifecycle`] owner.
 ///
-/// The snapshot is the owner's persistence surface: it carries the explicit
-/// phase, the retained checkpoint, the observed in-flight denominator, and
-/// every retained idempotency record. A lifecycle rebuilt through
-/// [`ModuleLifecycle::restore`] from this snapshot therefore admits a
-/// previously used idempotency key as a replay, not as a first admission.
-/// Persisting the snapshot itself remains the caller's duty: this crate does
-/// not open a store (I7.2 leaves persistence with the receiver's durable
-/// owner).
+/// The snapshot carries the explicit phase, the retained checkpoint, the
+/// observed in-flight denominator, and every retained idempotency record, and
+/// [`ModuleLifecycle::restore`] adopts it only after validating the retained
+/// window bound, the checkpoint and every record. Read back through that pair,
+/// a lifecycle admits a previously used idempotency key as a replay, not as a
+/// first admission.
+///
+/// Cross-restart durability is not established here, and this crate does not
+/// claim it. This type is the readback shape and its validation; it is not a
+/// store. Persisting the snapshot remains the receiver's duty (I7.2 leaves
+/// persistence with the receiver's durable owner), and this crate opens no
+/// store, path or encoding of its own.
+///
+/// Measured against the current source, that duty has no production holder: no
+/// caller serializes a snapshot or restores one, and the only production
+/// consumer of [`ModuleLifecycle`] is the IPC lifecycle dispatcher, which holds
+/// no lifecycle state of its own, persists nothing, and is itself not yet driven
+/// by any transport/session owner. So [`ModuleLifecycle::snapshot`] and
+/// [`ModuleLifecycle::restore`] are a complete but currently unexercised
+/// round-trip, and a lifecycle does not survive a process restart today. A
+/// receiver that owns a durable store and persists the encoded snapshot is the
+/// missing prerequisite; until one exists, the retained phase, checkpoint and
+/// idempotency records are process-local. The correlated restart/resume tail is
+/// a separate readback, [`ModuleLifecycle::restore_retained`], which carries no
+/// records; see there for why a snapshot rebuild cannot serve it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleLifecycleSnapshot {
@@ -1654,16 +1688,19 @@ impl ModuleLifecycleSnapshot {
 /// [`ExecuteDisposition::Duplicate`] over the recorded request identity, so the
 /// retrying caller can tell that no second effect ran.
 ///
-/// That retention is durable and not process-local:
-/// [`ModuleLifecycle::snapshot`] projects the phase, the retained checkpoint
-/// and every retained idempotency record, and [`ModuleLifecycle::restore`]
-/// rebuilds the owner from that readback. A lifecycle rebuilt in a new process
-/// therefore replays a previously used idempotency key instead of admitting it
-/// as a first admission, so a retry after a crash cannot double-apply a
-/// recorded effect. Persisting the snapshot is the caller's duty and lives
-/// outside this crate; a caller that persists only the checkpoint and restores
-/// through [`ModuleLifecycle::restore_retained`] gets checkpoint-only
-/// readback and no idempotency records.
+/// That retention is defined as a cross-restart readback but is not currently
+/// durable. [`ModuleLifecycle::snapshot`] projects the phase, the retained
+/// checkpoint and every retained idempotency record, and
+/// [`ModuleLifecycle::restore`] rebuilds the owner from that readback after
+/// validating it, so a lifecycle rebuilt in a new process from a persisted
+/// snapshot would replay a previously used idempotency key instead of admitting
+/// it as a first admission, and a retry after a crash could not double-apply a
+/// recorded effect. That guarantee is conditional on a receiver persisting the
+/// snapshot, and no production caller does: in the current source the retention
+/// is process-local. See [`ModuleLifecycleSnapshot`] for the exact boundary.
+/// This readback carries the records rather than a resumable checkpoint; the
+/// correlated restart/resume tail is served by
+/// [`ModuleLifecycle::restore_retained`].
 ///
 /// `Checkpoint` retains the published snapshot bytes verbatim (bounded by
 /// [`MAX_FRAME_BYTES`]); a fresh publication under a new key supersedes the
@@ -1672,8 +1709,12 @@ impl ModuleLifecycleSnapshot {
 /// `RestoreCheckpoint` resumes the module to `Active`. [`Self::fatal`] is the
 /// explicit `Fatal` control flow: it requires a `Control`-kind `Fatal` frame,
 /// records the terminal failure, and refuses a second fatal on a terminated or
-/// failed lifecycle, so the terminal phase survives a restart through the
-/// snapshot instead of being inferred from process state.
+/// failed lifecycle, so the terminal phase is carried in
+/// [`ModuleLifecycle::snapshot`] and kept fencing by a lifecycle rebuilt
+/// through [`ModuleLifecycle::restore`], rather than being inferred from
+/// process state. That carry-across holds once some receiver persists the
+/// snapshot, which no production caller does today (see
+/// [`ModuleLifecycleSnapshot`]).
 ///
 /// `apply` takes no clock: presenting-deadline expiry is detected by the
 /// caller, which owns the clock, and recorded through the cancellation owner
@@ -1704,10 +1745,12 @@ impl ModuleLifecycle {
 
     /// Projects the durable readback of this owner.
     ///
-    /// The projection is the owner's persistence surface: persisting it and
-    /// rebuilding through [`ModuleLifecycle::restore`] is what carries the
-    /// phase, the retained checkpoint and every retained idempotency record
-    /// across a process restart.
+    /// The projection is the readback shape [`ModuleLifecycle::restore`]
+    /// accepts: the phase, the retained checkpoint, the observed in-flight
+    /// denominator and every retained idempotency record. Projecting it writes
+    /// nothing. Carrying it across a process restart additionally requires a
+    /// receiver that persists the encoded snapshot, which the current source
+    /// does not contain (see [`ModuleLifecycleSnapshot`]).
     #[must_use]
     pub fn snapshot(&self) -> ModuleLifecycleSnapshot {
         ModuleLifecycleSnapshot {
@@ -1725,9 +1768,22 @@ impl ModuleLifecycle {
     /// must all hold, so a truncated, fabricated or oversized readback is
     /// refused instead of producing a lifecycle that admits an already used
     /// idempotency key as a first admission. Because the records are restored,
-    /// a `Failed` phase restored from the snapshot still fences a repeated
-    /// `Fatal` and a `Quiesced` phase still refuses new `Execute` work, exactly
-    /// as the owner that produced the snapshot did.
+    /// a `Failed` phase read back from a snapshot still fences a repeated
+    /// `Fatal` and a `Quiesced` phase still refuses new `Execute` work,
+    /// exactly as the owner that produced the snapshot did.
+    ///
+    /// No production caller rebuilds a lifecycle from a snapshot today: the
+    /// receiver that would persist one does not exist in the current source (see
+    /// [`ModuleLifecycleSnapshot`]). This is the readback half of a restart path
+    /// that is defined but not yet driven.
+    ///
+    /// This readback deliberately does not serve the correlated restart/resume
+    /// tail. The checkpoint it restores carries its publication in the retained
+    /// records, so a `RestoreCheckpoint` or `Start` resume under the
+    /// checkpoint's own idempotency key is refused as
+    /// [`ProtocolError::ReplayConflict`] by the owner-held replay;
+    /// [`ModuleLifecycle::restore_retained`] is the readback that installs the
+    /// checkpoint without that record.
     ///
     /// # Errors
     ///
@@ -1744,10 +1800,17 @@ impl ModuleLifecycle {
 
     /// Returns the standing disposition recorded for one idempotency key.
     ///
-    /// Observing never advances state, so a retrying caller can read the
-    /// recorded disposition before deciding whether a deadline or cancellation
-    /// terminal applies to it. An unrecorded key reports `None` rather than
-    /// minting a record.
+    /// Observing never advances state, so a caller can read the recorded
+    /// disposition before deciding whether a deadline or cancellation terminal
+    /// applies to it. An unrecorded key reports `None` rather than minting a
+    /// record, and a recorded [`ModuleControlEffect::ExecuteRecorded`] effect is
+    /// returned exactly as stored: this read does not restate it as a duplicate,
+    /// which only [`ModuleLifecycle::apply`] does on replay.
+    ///
+    /// Reachability, stated as measured: this accessor has no non-test caller
+    /// in the workspace. The transport/session receiver that would consult a
+    /// standing disposition before applying a terminal is not built, so the
+    /// accessor is reachable but not driven in production.
     #[must_use]
     pub fn recorded_control(&self, idempotency_key: &str) -> Option<&ModuleControlEffect> {
         self.control_effects
@@ -1767,26 +1830,38 @@ impl ModuleLifecycle {
         matches!(self.phase, ModuleLifecyclePhase::Active)
     }
 
-    /// Restores a persisted checkpoint into a fresh lifecycle after a restart
-    /// (restart restore).
+    /// Installs a persisted checkpoint into a fresh lifecycle (restart restore).
     ///
-    /// The checkpoint is the durable owner result previously published through
-    /// [`ModuleLifecycle::apply`] (`CheckpointRecorded`) and read back
-    /// through [`ModuleLifecycle::checkpoint`]: identity shape and snapshot
-    /// bytes are re-validated, and a fabricated or empty checkpoint is
-    /// refused. A lifecycle that already runs (non-active phase) or already
-    /// retains a checkpoint refuses the restore instead of silently
-    /// overwriting owner state. The restored lifecycle is quiesced with the
-    /// checkpoint retained, so the correlated `RestoreCheckpoint` (which
-    /// resumes to active) or `Start` resume must still carry the checkpoint
-    /// `idempotency_key`.
-    ///
-    /// This is the checkpoint-only readback: it restores the phase and the
+    /// This is the checkpoint-only readback: it adopts the phase and the
     /// retained checkpoint and nothing else, so it carries no idempotency
-    /// records. A caller that wants the retained idempotency/outcome records
-    /// across the restart persists [`ModuleLifecycle::snapshot`] and rebuilds
-    /// through [`ModuleLifecycle::restore`] instead. The restart-path call
-    /// sites live outside this crate (named STITCH).
+    /// records. The checkpoint is the owner result previously published through
+    /// [`ModuleLifecycle::apply`] (`CheckpointRecorded`) and read back through
+    /// [`ModuleLifecycle::checkpoint`]: identity shape and snapshot bytes are
+    /// re-validated, and a fabricated or empty checkpoint is refused. A
+    /// lifecycle that already runs (non-active phase) or already retains a
+    /// checkpoint refuses the restore instead of silently overwriting owner
+    /// state. The restored lifecycle is quiesced with the checkpoint retained,
+    /// so the correlated `RestoreCheckpoint` or `Start` resume must still carry
+    /// the checkpoint `idempotency_key`.
+    ///
+    /// This is the only readback that leaves the correlated restart/resume tail
+    /// reachable, and the reason is the owner-held replay rather than a
+    /// preference. `apply` records the `Checkpoint` publication under the
+    /// checkpoint's own idempotency key, and `replay_control` refuses a key
+    /// reused under a different message; so a lifecycle rebuilt through
+    /// [`ModuleLifecycle::restore`] still holds that key as a recorded
+    /// `Checkpoint`, and a correlated `RestoreCheckpoint` or `Start` resume
+    /// carrying it is refused as [`ProtocolError::ReplayConflict`] rather than
+    /// resumed. Installing the checkpoint without its publication record is
+    /// what lets the resume proceed. Neither readback is therefore a substitute
+    /// for the other: this one carries no idempotency records, and the other
+    /// makes the resume tail unreachable.
+    ///
+    /// Reachability, stated as measured: this readback has no non-test caller in
+    /// the workspace, and neither does [`ModuleLifecycle::restore`]. The
+    /// transport/session receiver that would restore a checkpoint on the way in
+    /// is not built, so nothing performs this on a real restart today and the
+    /// retained checkpoint is process-local until such a receiver exists.
     ///
     /// # Errors
     ///
@@ -1900,7 +1975,7 @@ impl ModuleLifecycle {
         {
             return Err(ProtocolError::InvalidField {
                 field: "module_lifecycle.control_effects",
-                reason: "retained lifecycle operation records are full: persist the snapshot and restore a fresh owner",
+                reason: "retained lifecycle operation records are full: this owner admits no further distinct identity",
             });
         }
         self.control_effects.insert(
@@ -2165,9 +2240,11 @@ impl ModuleLifecycle {
     ///
     /// `Fatal` carries no request identity on its control frame, so it is not
     /// keyed in the retained idempotency records. The `Failed` phase is
-    /// therefore the durable fence: it travels in
-    /// [`ModuleLifecycle::snapshot`] and a lifecycle rebuilt through
-    /// [`ModuleLifecycle::restore`] still refuses a repeated `Fatal`.
+    /// therefore the fence: it travels in [`ModuleLifecycle::snapshot`], so a
+    /// lifecycle rebuilt through [`ModuleLifecycle::restore`] refuses a repeated
+    /// `Fatal` exactly as the owner that recorded it did. No production caller
+    /// persists a snapshot today, so the fence is process-local until a receiver
+    /// owns one (see [`ModuleLifecycleSnapshot`]).
     ///
     /// # Errors
     ///
@@ -8817,6 +8894,10 @@ mod tests {
             bytes: b"{\"snapshot\":true}".to_vec(),
         };
         let mut lifecycle = ModuleLifecycle::new();
+        // A restart restores through `restore_retained`, not `restore`: a
+        // snapshot rebuild still holds the checkpoint publication under this
+        // key, so the correlated resume below would be refused as a replay
+        // conflict rather than admitted.
         lifecycle.restore_retained(checkpoint)?;
         let mut resume = frame()?;
         resume.message_type = MessageType::Start;
