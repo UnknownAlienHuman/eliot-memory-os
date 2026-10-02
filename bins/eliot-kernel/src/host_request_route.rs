@@ -4673,8 +4673,13 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
+        validate_local_read_actual_route_owner_binding(
+            body,
+            queued_envelope.as_ref(),
+            route_evidence,
+        )?;
         if let Some(envelope) = queued_envelope.as_ref() {
-            validate_local_read_actual_route_owner_binding(body, envelope, route_evidence)?;
+            validate_retained_host_request_envelope(&stored, envelope)?;
             if capability == LOCAL_READ_QUERY_CAPABILITY {
                 let original_activation = self.retained_activation_resolution_for_host_request_in(
                     envelope,
@@ -4682,8 +4687,6 @@ impl KernelComposition {
                 )?;
                 validate_retained_activation_resolution(body, original_activation.as_ref())?;
             }
-        } else if route_evidence.is_some() {
-            return Err(TransportError::SessionFenced);
         }
         // I7.24 (#1945): the retained tool bytes for the same pair. The
         // queue owner holds the exact admitted envelope+tool per durable
@@ -6641,12 +6644,37 @@ struct RetainedResultProvenance {
 /// bytes, so an external result submit cannot introduce a route claim.
 fn validate_local_read_actual_route_owner_binding(
     body: &HostRequestResultBody,
-    envelope: &HostRequestEnvelope,
+    envelope: Option<&HostRequestEnvelope>,
     observed_route: Option<&NamedReadRouteEvidence>,
 ) -> Result<(), TransportError> {
     let evidence = body.evidence.as_ref();
     let actual_route = evidence.and_then(|item| item.actual_route.as_deref());
     let receipt = evidence.and_then(|item| item.actual_route_receipt.as_ref());
+    let activation_resolution =
+        evidence.and_then(|item| item.activation_resolution_result.as_ref());
+    let Some(envelope) = envelope else {
+        // A terminal exact replay is handled before this gate and must match
+        // the original ORS evidence byte-for-byte. A first persist with no
+        // live admitted envelope cannot re-establish execution or semantic
+        // activation provenance, even if a caller supplies a valid
+        // self-digest. Only a genuinely absent observation stays admissible.
+        let presented_execution_claim = evidence.is_some_and(|item| {
+            item.invoked_operation.is_some()
+                || item.actual_route.is_some()
+                || item.actual_route_receipt.is_some()
+                || item.activation_resolution_result.is_some()
+                || item.adapter_identity.is_some()
+                || item.executor_identity.is_some()
+                || item.input_handle.is_some()
+                || item.output_handle.is_some()
+                || item.side_effects.is_some()
+        });
+        return if !presented_execution_claim && observed_route.is_none() {
+            Ok(())
+        } else {
+            Err(TransportError::SessionFenced)
+        };
+    };
     match (actual_route, receipt, observed_route) {
         (None, None, None) => Ok(()),
         (Some(_), Some(receipt), Some(observed)) => {
@@ -6686,6 +6714,31 @@ fn validate_local_read_actual_route_owner_binding(
         // without the corresponding receipt is not a first-persist proof.
         _ => Err(TransportError::SessionFenced),
     }
+}
+
+/// Checks any retained original request bytes and StateFence against the
+/// exact admitted queue envelope. Missing legacy copies stay explicit; a
+/// present copy that disagrees cannot be hidden by the envelope's digest slot.
+fn validate_retained_host_request_envelope(
+    stored: &HostRequestRecord,
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if let Some(retained_bytes) = stored.admitted_input_bytes.as_deref() {
+        let expected = envelope
+            .canonical_unsigned_bytes()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if retained_bytes != expected.as_slice() {
+            return Err(TransportError::SessionFenced);
+        }
+    }
+    if stored
+        .admitted_state_fence
+        .as_ref()
+        .is_some_and(|retained| retained != &envelope.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
 }
 
 /// Joins the caller's typed activation carrier to the exact result retained by
@@ -6956,9 +7009,37 @@ mod local_read_actual_route_owner_tests {
         let (envelope, route, body) = fixture();
         assert!(body.validate().is_ok());
         assert!(
-            validate_local_read_actual_route_owner_binding(&body, &envelope, Some(&route),).is_ok()
+            validate_local_read_actual_route_owner_binding(&body, Some(&envelope), Some(&route),)
+                .is_ok()
         );
-        assert!(validate_local_read_actual_route_owner_binding(&body, &envelope, None).is_err());
+        assert!(
+            validate_local_read_actual_route_owner_binding(&body, Some(&envelope), None).is_err()
+        );
+        assert!(validate_local_read_actual_route_owner_binding(&body, None, None).is_err());
+        let mut activation_claim = body.clone();
+        if let Some(evidence) = activation_claim.evidence.as_mut() {
+            evidence.actual_route = None;
+            evidence.actual_route_receipt = None;
+            evidence.activation_resolution_result =
+                Some(serde_json::json!({"principal_id":"claimed"}));
+        }
+        assert!(
+            validate_local_read_actual_route_owner_binding(&activation_claim, None, None).is_err()
+        );
+        let mut no_proof = body.clone();
+        no_proof.evidence = None;
+        assert!(validate_local_read_actual_route_owner_binding(&no_proof, None, None).is_ok());
+
+        let mut stored = requested_host_request_record(&envelope).expect("retained row");
+        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_ok());
+        stored.admitted_input_bytes = Some(b"different original input".to_vec());
+        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_err());
+        stored.admitted_input_bytes = envelope.canonical_unsigned_bytes().ok();
+        let mut changed_fence = envelope.state_fence.clone();
+        changed_fence.resource_generation =
+            eliot_contracts::ResourceGeneration::new(8).expect("changed generation");
+        stored.admitted_state_fence = Some(changed_fence);
+        assert!(validate_retained_host_request_envelope(&stored, &envelope).is_err());
 
         let mut forged_route = route.clone();
         forged_route.connection_id = "caller-forged-connection".to_owned();
@@ -6985,8 +7066,12 @@ mod local_read_actual_route_owner_tests {
         }
         assert!(forged_body.validate().is_ok());
         assert!(
-            validate_local_read_actual_route_owner_binding(&forged_body, &envelope, Some(&route),)
-                .is_err()
+            validate_local_read_actual_route_owner_binding(
+                &forged_body,
+                Some(&envelope),
+                Some(&route),
+            )
+            .is_err()
         );
     }
 }

@@ -5393,10 +5393,12 @@ pub struct LocalReadExecutionEvidence {
     /// transport peer identity is never a substitute.
     #[serde(default)]
     pub activation_resolution_result: Option<Value>,
-    /// Presenting transport adapter instance (connection identity).
+    /// Adapter connection identity. When an actual-route receipt is present,
+    /// this optional duplicate must equal its authenticated route-facts
+    /// `connection_id`.
     pub adapter_identity: Option<String>,
-    /// Executing-process identity (stable artifact digest when the executor
-    /// has one; absent when the executor cannot name itself stably).
+    /// Executing-process artifact identity. When an actual-route receipt is
+    /// present, this optional duplicate must equal the approved artifact hash.
     pub executor_identity: Option<String>,
     /// Immutable input handle: the exact admitted envelope digest.
     pub input_handle: Option<String>,
@@ -5482,6 +5484,12 @@ impl LocalReadExecutionEvidence {
             if let Some(digest) = value {
                 lowercase_sha256(digest, field)?;
             }
+        }
+        if self.actual_route.is_some() != self.actual_route_receipt.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "local_read_execution_evidence.actual_route_receipt",
+                reason: "actual route digest and original receipt must be present together",
+            });
         }
         if let Some(receipt) = &self.actual_route_receipt {
             validate_local_read_actual_route_receipt(self, receipt)?;
@@ -5589,10 +5597,18 @@ fn validate_local_read_actual_route_receipt(
         || receipt.route_facts.state_fence != receipt.state_fence
         || receipt.route_facts.active_generation != receipt.state_fence.resource_generation.value()
         || receipt.route_facts.authority_epoch != receipt.state_fence.authority_epoch
+        || evidence
+            .adapter_identity
+            .as_deref()
+            .is_some_and(|adapter| adapter != receipt.route_facts.connection_id)
+        || evidence
+            .executor_identity
+            .as_deref()
+            .is_some_and(|executor| executor != receipt.route_facts.approved_artifact_hash)
     {
         return Err(ProtocolError::InvalidField {
             field: "local_read_execution_evidence.actual_route_receipt.route_facts",
-            reason: "route facts must bind the exact named operation and state fence",
+            reason: "route facts and any duplicate adapter/executor identities must bind the original observation",
         });
     }
     for (value, field) in [
@@ -6901,8 +6917,8 @@ mod tests {
             actual_route: Some(receipt_digest),
             actual_route_receipt: Some(receipt),
             activation_resolution_result: None,
-            adapter_identity: None,
-            executor_identity: None,
+            adapter_identity: Some("store-connection-7".to_owned()),
+            executor_identity: Some("c".repeat(64)),
             input_handle: Some(input_handle),
             output_handle: Some(output_handle),
             side_effects: Some(LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
@@ -6925,6 +6941,18 @@ mod tests {
         let mut changed_input = evidence.clone();
         changed_input.input_handle = Some("e".repeat(64));
         assert!(changed_input.validate().is_err());
+
+        let mut changed_adapter = evidence.clone();
+        changed_adapter.adapter_identity = Some("caller-substituted-connection".to_owned());
+        assert!(changed_adapter.validate().is_err());
+
+        let mut changed_executor = evidence.clone();
+        changed_executor.executor_identity = Some("caller-substituted-artifact".to_owned());
+        assert!(changed_executor.validate().is_err());
+
+        let mut unpaired_route = evidence.clone();
+        unpaired_route.actual_route_receipt = None;
+        assert!(unpaired_route.validate().is_err());
 
         let mut malformed_activation = evidence;
         malformed_activation.activation_resolution_result = Some(serde_json::json!({

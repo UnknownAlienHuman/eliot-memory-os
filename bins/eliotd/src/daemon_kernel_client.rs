@@ -4069,12 +4069,34 @@ mod tests {
             actual_route: Some(receipt_digest.clone()),
             actual_route_receipt: Some(actual_route_receipt.clone()),
             invoked_operation: Some("local_read".to_owned()),
-            adapter_identity: Some("kernel-store-connection-17".to_owned()),
-            executor_identity: Some("store-artifact-digest".to_owned()),
+            adapter_identity: Some("eliot-store-connection-17".to_owned()),
+            executor_identity: Some("d".repeat(64)),
             local_read_attempt: Some(serde_json::to_value(&attempt)?),
             activation_resolution_result: None,
         };
         let retained = serde_json::to_value(retained)?;
+        let mut wrong_adapter = retained.clone();
+        wrong_adapter["adapter_identity"] = json!("substituted-store-connection");
+        assert!(
+            retained_local_read_execution_evidence(
+                Some(&wrong_adapter),
+                &operation_id,
+                &input_handle,
+                &output_handle,
+            )
+            .is_err()
+        );
+        let mut wrong_executor = retained.clone();
+        wrong_executor["executor_identity"] = json!("substituted-store-artifact");
+        assert!(
+            retained_local_read_execution_evidence(
+                Some(&wrong_executor),
+                &operation_id,
+                &input_handle,
+                &output_handle,
+            )
+            .is_err()
+        );
         let (forwarded, forwarded_attempt) = retained_local_read_execution_evidence(
             Some(&retained),
             &operation_id,
@@ -4094,11 +4116,11 @@ mod tests {
         );
         assert_eq!(
             forwarded.adapter_identity.as_deref(),
-            Some("kernel-store-connection-17")
+            Some("eliot-store-connection-17")
         );
         assert_eq!(
             forwarded.executor_identity.as_deref(),
-            Some("store-artifact-digest")
+            Some("d".repeat(64).as_str())
         );
         assert_eq!(
             forwarded.input_handle.as_deref(),
