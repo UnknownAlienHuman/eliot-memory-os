@@ -28,7 +28,7 @@ use eliot_contracts::{
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
-    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
+    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId, McpResponse,
     KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
     WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
     build_host_cancellation, build_host_invocation, decode_cancel_notification,
@@ -3310,13 +3310,51 @@ fn run_loopback_http_bridge(
     }
 }
 
+/// Port surface used by the MCP front doors.
+///
+/// The production client forwards resource binding to its shared Kernel
+/// owner; the generic surface lets the HTTP handler prove non-dispatch cases.
+trait McpFrontDoorPort: KernelHostRequestPort {
+    /// Captures the current owner binding for a delivered resource response.
+    fn capture_resource_binding(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        response: &McpResponse,
+    ) -> Result<String, PortFailure>;
+
+    /// Revalidates one retained resource against the current owner binding.
+    fn authorize_resource_read(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        expected_binding: &str,
+    ) -> Result<(), PortFailure>;
+}
+
+impl McpFrontDoorPort for KernelHostRequestClient {
+    fn capture_resource_binding(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        response: &McpResponse,
+    ) -> Result<String, PortFailure> {
+        KernelHostRequestClient::capture_resource_binding(self, operation_handle, response)
+    }
+
+    fn authorize_resource_read(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        expected_binding: &str,
+    ) -> Result<(), PortFailure> {
+        KernelHostRequestClient::authorize_resource_read(self, operation_handle, expected_binding)
+    }
+}
+
 /// Serves one keep-alive loopback HTTP connection until the peer closes, a
 /// request is rejected, or a provider failure ends the bridge.
 fn serve_loopback_http_connection(
     mut stream: std::net::TcpStream,
     profile: &LoopbackHttpProfile,
     gateway: HostRequestGateway,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     provider_failure: &mut bool,
 ) -> Result<(), String> {
@@ -3384,7 +3422,7 @@ fn validate_and_dispatch(
     request: &LoopbackHttpRequest,
     profile: &LoopbackHttpProfile,
     gateway: HostRequestGateway,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     provider_failure: &mut bool,
@@ -3755,7 +3793,7 @@ fn write_mcp_frame(frame: &Value) -> StdioWriteReceipt {
 )]
 fn handle_mcp_frame(
     gateway: HostRequestGateway,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     text: &str,
@@ -3842,7 +3880,7 @@ fn handle_mcp_frame(
 /// connection identities, exactly like the private `op` attach.
 fn handle_mcp_initialize(
     runner: &mut BridgeRunner,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
     params: &Value,
@@ -3958,7 +3996,7 @@ fn handle_mcp_tools_list(id: &JsonRpcId, params: &Value) -> Value {
 /// unchanged.
 fn handle_mcp_tools_call(
     gateway: HostRequestGateway,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
@@ -4002,7 +4040,7 @@ fn handle_mcp_tools_call(
 /// result, retaining the exact admitted handle and any hot-resource
 /// evidence for later cancellation and expansion.
 fn render_mcp_invocation(
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
@@ -4070,7 +4108,7 @@ fn render_mcp_invocation(
 /// captures its current attach/session/task/scope binding. Anything else
 /// leaves the owner response exactly as shaped.
 fn record_mcp_delivery(
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &mut BridgeRunner,
     state: &mut McpFrontDoor,
     outcome: &HostInvocationOutcome,
@@ -4140,7 +4178,7 @@ fn handle_mcp_resources_list(state: &McpFrontDoor, id: &JsonRpcId, params: &Valu
 /// Unknown URIs fail explicitly: only handles retained from a real delivery
 /// on this connection expand, never an invented or stale identity.
 fn handle_mcp_resources_read(
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     runner: &BridgeRunner,
     state: &McpFrontDoor,
     id: &JsonRpcId,
@@ -4210,7 +4248,7 @@ fn handle_mcp_resources_read(
 /// invents an outcome or retries the call.
 fn handle_mcp_cancelled(
     gateway: HostRequestGateway,
-    port: &mut KernelHostRequestClient,
+    port: &mut impl McpFrontDoorPort,
     state: &mut McpFrontDoor,
     params: &Value,
 ) {
@@ -5384,6 +5422,174 @@ mod tests {
         .expect("test runner composes")
     }
 
+    const HTTP_TEST_TOKEN: &str = "loopback-http-handler-test-token";
+    const HTTP_HANDLER_TEST_CUSHION: Duration = Duration::from_secs(5);
+
+    struct NoCallHttpPort {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl KernelHostRequestPort for NoCallHttpPort {
+        fn invoke(
+            &mut self,
+            _request: &HostInvocationRequest,
+        ) -> Result<HostInvocationPortOutcome, PortFailure> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(PortFailure::PlanGap {
+                missing_capability: "http-test.invoke".to_owned(),
+                reason: "the HTTP handler proof must not invoke the host port".to_owned(),
+            })
+        }
+
+        fn cancel(
+            &mut self,
+            _request: &HostCancellationRequest,
+        ) -> Result<HostCancellationPortOutcome, PortFailure> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(PortFailure::PlanGap {
+                missing_capability: "http-test.cancel".to_owned(),
+                reason: "the HTTP handler proof must not invoke the host port".to_owned(),
+            })
+        }
+    }
+
+    impl McpFrontDoorPort for NoCallHttpPort {
+        fn capture_resource_binding(
+            &mut self,
+            _operation_handle: &HostOperationHandle,
+            _response: &McpResponse,
+        ) -> Result<String, PortFailure> {
+            panic!("ping and admission refusal must not capture a resource binding");
+        }
+
+        fn authorize_resource_read(
+            &mut self,
+            _operation_handle: &HostOperationHandle,
+            _expected_binding: &str,
+        ) -> Result<(), PortFailure> {
+            panic!("ping and admission refusal must not authorize a resource read");
+        }
+    }
+
+    fn loopback_http_handler_fixture() -> (
+        std::net::TcpListener,
+        std::net::SocketAddr,
+        LoopbackHttpProfile,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener binds loopback");
+        let endpoint = listener
+            .local_addr()
+            .expect("listener has a local address");
+        let profile = eliot_agent_bridge::admit_loopback_http(
+            &endpoint.to_string(),
+            HTTP_TEST_TOKEN,
+            Duration::from_secs(60),
+        )
+        .expect("test endpoint admits the existing bounded bearer profile");
+        (listener, endpoint, profile)
+    }
+
+    fn spawn_loopback_http_handler(
+        listener: std::net::TcpListener,
+        profile: LoopbackHttpProfile,
+    ) -> (
+        std::sync::mpsc::Receiver<Result<(), String>>,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port_calls = calls.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = (|| {
+                let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                let mut runner = fixture_runner();
+                let mut port = NoCallHttpPort { calls: port_calls };
+                let mut provider_failure = false;
+                let result = serve_loopback_http_connection(
+                    stream,
+                    &profile,
+                    HostRequestGateway,
+                    &mut port,
+                    &mut runner,
+                    &mut provider_failure,
+                );
+                if provider_failure {
+                    return Err("HTTP handler unexpectedly reported provider failure".to_owned());
+                }
+                result
+            })();
+            let _ = done_tx.send(result);
+        });
+        (done_rx, worker, calls)
+    }
+
+    fn send_loopback_http_test_request(
+        client: &mut std::net::TcpStream,
+        profile: &LoopbackHttpProfile,
+        token: &str,
+        body: &[u8],
+    ) {
+        use std::io::Write as _;
+        let host = profile
+            .admitted_host_forms()
+            .into_iter()
+            .next()
+            .expect("test profile admits one canonical Host");
+        let headers = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client
+            .write_all(headers.as_bytes())
+            .expect("test peer sends complete HTTP headers");
+        client
+            .write_all(body)
+            .expect("test peer sends the declared HTTP body");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("test peer closes its write side after one request");
+    }
+
+    fn read_loopback_http_test_response(client: &mut std::net::TcpStream) -> (u16, Value) {
+        use std::io::Read as _;
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = client
+                .read(&mut chunk)
+                .expect("production handler returns a bounded HTTP response");
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let separator = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("handler response contains an HTTP header terminator");
+        let headers = String::from_utf8(response[..separator].to_vec())
+            .expect("handler response headers are UTF-8");
+        let mut header_lines = headers.split("\r\n");
+        let status = header_lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u16>().ok())
+            .expect("handler response has a numeric status");
+        let content_length = headers
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("handler response declares its body length");
+        let body = &response[separator + 4..];
+        assert_eq!(body.len(), content_length, "handler body matches its bound");
+        let body = serde_json::from_slice(body).expect("handler response body is JSON");
+        (status, body)
+    }
+
     fn attached_bootstrap_fixture_runner() -> BridgeRunner {
         struct StaticActivation {
             result: ActivationPortResult,
@@ -5440,34 +5646,86 @@ mod tests {
     }
 
     #[test]
-    fn loopback_http_partial_request_peer_times_out_at_production_deadline() {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds loopback");
-        let mut client = std::net::TcpStream::connect(
-            listener.local_addr().expect("listener has a local address"),
-        )
-        .expect("test client connects");
-        let (mut server, _) = listener.accept().expect("test server accepts");
-        configure_loopback_http_deadlines(&mut server)
-            .expect("production loopback deadlines install on the accepted socket");
-        use std::io::Write as _;
+    fn loopback_http_handler_serves_authenticated_ping() {
+        let (listener, endpoint, profile) = loopback_http_handler_fixture();
+        let (done_rx, worker, calls) = spawn_loopback_http_handler(listener, profile.clone());
+        let mut client = std::net::TcpStream::connect(endpoint).expect("test client connects");
         client
-            .write_all(b"POST /mcp HTTP/1.1\r\n")
-            .expect("peer sends an incomplete request header");
+            .set_read_timeout(Some(HTTP_HANDLER_TEST_CUSHION))
+            .expect("test response wait has a finite upper bound");
+        let request = br#"{"jsonrpc":"2.0","id":"http-ping-1","method":"ping","params":{}}"#;
+        send_loopback_http_test_request(&mut client, &profile, HTTP_TEST_TOKEN, request);
+
+        let (status, body) = read_loopback_http_test_response(&mut client);
+        assert_eq!(status, 200, "authenticated MCP request receives success");
+        assert_eq!(body["id"], "http-ping-1");
+        assert_eq!(body["result"], serde_json::json!({}));
+        done_rx
+            .recv_timeout(HTTP_HANDLER_TEST_CUSHION)
+            .expect("production handler finishes after the peer closes")
+            .expect("production handler completes the admitted request");
+        worker.join().expect("production handler thread exits");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn loopback_http_handler_rejects_wrong_bearer_before_dispatch() {
+        let (listener, endpoint, profile) = loopback_http_handler_fixture();
+        let (done_rx, worker, calls) = spawn_loopback_http_handler(listener, profile.clone());
+        let mut client = std::net::TcpStream::connect(endpoint).expect("test client connects");
+        client
+            .set_read_timeout(Some(HTTP_HANDLER_TEST_CUSHION))
+            .expect("test response wait has a finite upper bound");
+        let request = br#"{"jsonrpc":"2.0","id":"http-ping-1","method":"ping","params":{}}"#;
+        send_loopback_http_test_request(&mut client, &profile, "wrong-test-token", request);
+
+        let (status, body) = read_loopback_http_test_response(&mut client);
+        assert_eq!(status, 401, "wrong bearer receives the admission refusal");
+        assert!(body["error"].is_string());
+        done_rx
+            .recv_timeout(HTTP_HANDLER_TEST_CUSHION)
+            .expect("production handler finishes after refusing the credential")
+            .expect("typed credential refusal is a normal handler completion");
+        worker.join().expect("production handler thread exits");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn loopback_http_partial_request_peer_times_out_at_production_deadline() {
+        use std::io::Write as _;
+
+        let (listener, endpoint, profile) = loopback_http_handler_fixture();
+        let (done_rx, worker, calls) = spawn_loopback_http_handler(listener, profile.clone());
+        let mut client = std::net::TcpStream::connect(endpoint).expect("test client connects");
+        let host = profile
+            .admitted_host_forms()
+            .into_iter()
+            .next()
+            .expect("test profile admits one canonical Host");
+        let incomplete = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {HTTP_TEST_TOKEN}\r\nContent-Length: 1\r\n"
+        );
+        client
+            .write_all(incomplete.as_bytes())
+            .expect("peer sends a partial request and remains connected");
 
         let started = std::time::Instant::now();
+        done_rx
+            .recv_timeout(HTTP_REQUEST_READ_TIMEOUT + HTTP_HANDLER_TEST_CUSHION)
+            .expect("production handler returns within its read deadline and cushion")
+            .expect("timeout closes the partial request as a normal connection end");
+        let elapsed = started.elapsed();
         assert!(
-            matches!(
-                read_loopback_http_request(&mut server),
-                LoopbackHttpRead::Eof
-            ),
-            "a peer that stalls mid-header must close when the production deadline elapses"
+            elapsed + Duration::from_secs(2) >= HTTP_REQUEST_READ_TIMEOUT,
+            "handler must wait for the configured 30-second production deadline"
         );
         assert!(
-            started.elapsed() + Duration::from_secs(2) >= HTTP_REQUEST_READ_TIMEOUT,
-            "the peer must remain blocked until the declared production deadline"
+            elapsed <= HTTP_REQUEST_READ_TIMEOUT + HTTP_HANDLER_TEST_CUSHION,
+            "handler completion must remain within the explicit upper-bound cushion"
         );
         drop(client);
+        worker.join().expect("production handler thread exits");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
