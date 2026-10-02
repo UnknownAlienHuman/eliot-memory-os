@@ -22,9 +22,7 @@ use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
     HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
-use host_request_route::{
-    LocalReadPairKind, LocalReadSubmitDisposition, StaleLocalReadReason,
-};
+use host_request_route::{LocalReadPairKind, LocalReadSubmitDisposition, StaleLocalReadReason};
 
 fn tool_digest(tool: &serde_json::Value) -> String {
     let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
@@ -64,7 +62,13 @@ fn query_envelope(
     request_id: &str,
     tool_digest: &str,
 ) -> HostRequestEnvelope {
-    read_envelope(fence, deadline_unix_ms, request_id, tool_digest, "eliot.query")
+    read_envelope(
+        fence,
+        deadline_unix_ms,
+        request_id,
+        tool_digest,
+        "eliot.query",
+    )
 }
 
 /// The one bounded-read envelope builder, shared by both carrier forms.
@@ -99,10 +103,8 @@ fn read_envelope(
         kind: HostRequestKind::Invocation,
         connection_id: "conn-test-1".to_owned(),
         identity: HostRequestIdentity {
-            request_id: eliot_contracts::RequestId::new(
-                correlation_projection.occurrence_text(),
-            )
-            .expect("valid request id"),
+            request_id: eliot_contracts::RequestId::new(correlation_projection.occurrence_text())
+                .expect("valid request id"),
             correlation_projection: Some(correlation_projection),
             idempotency_key: format!("{request_id}:invoke"),
             cancellation_id: format!("{request_id}:invoke:cancel"),

@@ -56,8 +56,10 @@
 use super::*;
 use eliot_ors::{
     HostRequestRecord, HostRequestRetainedLineage, HostRequestRetainedResultClass,
-    HostRequestState, InfluenceState, OperationIdentity,
+    HostRequestState, OperationIdentity,
 };
+use eliot_security_contracts::InfluenceState;
+
 use eliot_protocol::{
     HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
 };
@@ -181,9 +183,7 @@ fn state_lineage(envelope: &HostRequestEnvelope, revision: u64) -> HostRequestRe
 }
 
 /// The admission receipt for one exact envelope, from the production issuer.
-fn state_receipt(
-    envelope: &HostRequestEnvelope,
-) -> eliot_protocol::HostRequestAdmissionReceipt {
+fn state_receipt(envelope: &HostRequestEnvelope) -> eliot_protocol::HostRequestAdmissionReceipt {
     eliot_protocol::HostRequestAdmissionReceipt::issue(envelope)
         .expect("admission receipt must issue for the exact envelope")
 }
@@ -271,8 +271,10 @@ fn load_state_record(
 }
 
 fn readback_kernel(name: &str) -> (std::path::PathBuf, KernelComposition, StateFence) {
-    let root = std::env::temp_dir()
-        .join(format!("eliot-kernel-state-readback-{name}-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-state-readback-{name}-{}",
+        std::process::id()
+    ));
     std::fs::remove_dir_all(&root).ok();
     std::fs::create_dir_all(&root).expect("test work root");
     let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
@@ -303,8 +305,12 @@ fn readback_kernel(name: &str) -> (std::path::PathBuf, KernelComposition, StateF
 fn retained_state_answer_is_served_by_the_validating_replay_reader() {
     let (root, kernel, fence) = readback_kernel("validating-reader");
     let tool = state_tool();
-    let envelope =
-        state_envelope(&fence, unix_ms().saturating_add(60_000), "host-request-state-1", &tool);
+    let envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-1",
+        &tool,
+    );
     let retained = retained_state_record(&kernel, &envelope, 3);
 
     // The durable row IS a real owner-stored State result under the state
@@ -438,7 +444,11 @@ fn validating_reader_refuses_a_forged_retained_lineage() {
     lineage.semantic_receipt_ref = Some("semantic-receipt-forged".to_owned());
     forged_receipt_lineage.result_lineage = Some(lineage);
     assert_eq!(
-        host_request_route::local_read_replay_response(&receipt, &forged_receipt_lineage, &envelope),
+        host_request_route::local_read_replay_response(
+            &receipt,
+            &forged_receipt_lineage,
+            &envelope
+        ),
         Err(TransportError::SessionFenced),
         "a non-canonical retained read may not carry a semantic receipt"
     );
@@ -461,16 +471,19 @@ fn validating_reader_refuses_a_forged_retained_lineage() {
 fn exact_replay_serves_the_retained_result_and_leaves_the_row_unchanged() {
     let (root, kernel, fence) = readback_kernel("replay");
     let tool = state_tool();
-    let envelope =
-        state_envelope(&fence, unix_ms().saturating_add(60_000), "host-request-state-replay", &tool);
+    let envelope = state_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-replay",
+        &tool,
+    );
     let retained = retained_state_record(&kernel, &envelope, 3);
     let receipt = state_receipt(&envelope);
 
     let first = load_state_record(&kernel, &envelope);
-    let served_first =
-        host_request_route::local_read_replay_response(&receipt, &first, &envelope)
-            .expect("validating reader must not fail")
-            .expect("the retained state row must replay");
+    let served_first = host_request_route::local_read_replay_response(&receipt, &first, &envelope)
+        .expect("validating reader must not fail")
+        .expect("the retained state row must replay");
     assert_eq!(
         served_first["value"]["record"]["result_response"],
         state_answer(3),
