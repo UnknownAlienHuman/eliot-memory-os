@@ -29,6 +29,15 @@
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
 //! accept a view the current owner cells refused.
+//!
+//! #1862 BLOCK-2 adds one further binding on this route, and it is on the
+//! delivered lane rather than on the view: the authenticated `ContextDelivery`
+//! row's retained owner closures carry the exact delivered
+//! `ActiveUnderstandingView`, whose `ContextExecutionIdentity` states the codec
+//! its bytes were produced under. `KernelContextReadClient::require_delivered_context_render_codec`
+//! binds those recorded values to `canonical_render_serializer()`. I2.16:163
+//! places the requirement where the delivered bytes are used, and the delivered
+//! lane is where they already exist.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -247,7 +256,10 @@ enum CampaignPacketGapCode {
     ///   `PacketAdmissionBundle::build` now refuses any profile whose identity
     ///   half is not that owner record, which makes the admission cell's
     ///   serializer equality a statement about a real codec instead of two
-    ///   caller strings.
+    ///   caller strings. The DELIVERED lane's identity is bound to that same
+    ///   owner record by `DeliveredRenderCodecUnbound` below, which is the one
+    ///   place a delivered execution identity could previously be compared only
+    ///   against its own delivery's measurement.
     /// - `AdmissionMeasurement` (per candidate atom/representation) — ABSENT.
     ///   `AdmissionInput::validate` forces these to equal the candidate atom set
     ///   exactly, and each names the candidate's own subject and measurement
@@ -312,6 +324,31 @@ enum CampaignPacketGapCode {
     /// bindings — and the admission cell's adds the I7.11 floor coverage check —
     /// so passing the candidate cell is never evidence for admission.
     OwnerCellRefusedCampaignView,
+    /// The DELIVERED Context lane records a codec the Context render owner does
+    /// not publish.
+    ///
+    /// #1862 BLOCK-2. The authenticated `ContextDelivery` row's retained
+    /// `PriorDeliveryBinding` closures carry the exact `ActiveUnderstandingView`
+    /// this owner delivered, and that view's `ContextExecutionIdentity` states
+    /// the serializer, revision and options digest its bytes were produced under.
+    /// `ActiveUnderstandingView::validate` compares that identity against the
+    /// view's own measurement, but both records come from the same delivery, so
+    /// that comparison cannot tell the canonical codec from any other one.
+    /// `KernelContextReadClient::require_delivered_context_render_codec` closes
+    /// the half of BLOCK-2 that had no owner by comparing the delivered
+    /// identity's ORIGINAL recorded values against
+    /// `eliot_context_contracts::canonical_render_serializer()` — the record
+    /// issued by the crate that owns the canonical rendered payload and
+    /// `CONTEXT_CONTRACT_VERSION`, naming `eliot_contracts::canonical_json_bytes`
+    /// with an options digest taken from the options in force.
+    ///
+    /// The binding is on the delivered lane on purpose. It is NOT a rule inside
+    /// `ActiveUnderstandingView::validate`, which is shared with routes and
+    /// fixtures that legitimately render under other codecs; I2.16:163 places
+    /// the requirement where the delivered bytes are used. A delivery rendered
+    /// under a codec the Context owner does not publish is refused here rather
+    /// than accepted as evidence of this lane's own canonical output.
+    DeliveredRenderCodecUnbound,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1351,6 +1388,62 @@ async fn resolve_compile_and_bind_result(
                 prior.is_some() && !prior_is_current,
             ),
         );
+    }
+    // #1862 BLOCK-2: bind the DELIVERED Context lane's execution identity to
+    // the codec the Context render owner publishes.
+    //
+    // The `ContextDelivery` row this route already read through an authenticated
+    // named read and re-derived through the Context owner's own publication
+    // carries the exact `ActiveUnderstandingView` that was delivered. That view
+    // states, in its own `ContextExecutionIdentity`, the serializer, revision and
+    // options digest its bytes were produced under. Every owner validator on
+    // that row compares the identity against the SAME delivery's measurement, so
+    // a delivery rendered under a codec the Context owner does not publish has
+    // passed all of them; nothing bound those three values to their issuer.
+    //
+    // `require_delivered_context_render_codec` is that binding: it re-proves the
+    // delivered identity's own recorded fields and then compares them as
+    // recorded against `canonical_render_serializer()`. Two sides with
+    // independent producers — a persisted owner delivery record and the Context
+    // contracts' own codec owner record — so this is a real comparison and not a
+    // record agreeing with itself. No digest is recomputed and no value is
+    // defaulted.
+    //
+    // The check runs only when a delivery row was actually read. A recipe that
+    // declares no `ContextDelivery` requirement publishes no delivered Context
+    // view, and there is then no delivered execution identity to bind; that is
+    // the owner's own absence and it is reported through
+    // `context_owner_source_reads`, not manufactured here. Every delivered
+    // closure present is checked, not just the first, so one conforming
+    // delivery cannot carry a non-conforming sibling.
+    if let Some(delivery) = context_delivery_snapshot.as_ref() {
+        for (index, record) in delivery.records.iter().enumerate() {
+            let Some(closure) = record.closure.as_ref() else {
+                continue;
+            };
+            if let Err(refusal) =
+                crate::kernel_context_read_client::require_delivered_context_render_codec(
+                    &closure.context_view.view.execution,
+                )
+            {
+                tracing::warn!(
+                    reason = %refusal,
+                    record_index = index,
+                    "delivered Context lane names a codec the Context render owner does not publish"
+                );
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    context_blocked_response(
+                        publication,
+                        CampaignPacketGapCode::DeliveredRenderCodecUnbound,
+                        Some(CampaignSourceRole::ContextDelivery),
+                        &resolved.resolutions,
+                        prior.is_some() && !prior_is_current,
+                    ),
+                );
+            }
+        }
     }
     // Issue #1948: the Task Plan is the load-bearing source this packet is
     // compiled from, so before it may support a compiled packet its exact

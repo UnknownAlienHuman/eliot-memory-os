@@ -312,7 +312,15 @@ pub use improvement_candidate_route::{
     reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
-pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+// #1862 BLOCK-2: the delivered-lane codec binding is re-exported because the
+// campaign packet route (a sibling module) calls it and its positive / refusal
+// proof is a package-local integration test. It is owner logic over a persisted
+// owner delivery record, so it belongs to the context read client rather than to
+// the caller that happens to hold the record.
+pub use kernel_context_read_client::{
+    KernelContextReadClient, ReconstructionReadComposition,
+    require_delivered_context_render_codec,
+};
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,

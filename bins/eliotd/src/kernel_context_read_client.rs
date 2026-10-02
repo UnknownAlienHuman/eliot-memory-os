@@ -89,10 +89,10 @@ use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, ResolvedContextRecipe,
-    SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
-    canonical_render_serializer,
+    ContextExecutionIdentity, HeadroomAllocationLedger, HeadroomDimension,
+    MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId, QualityRefusal,
+    QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity, SerializedContextMeasurement,
+    SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
@@ -2527,6 +2527,53 @@ fn require_context_render_codec(
         serializer_id,
         serializer_version,
         serializer_options_digest,
+    )
+}
+
+/// #1862 BLOCK-2: require the DELIVERED execution identity to name the codec in
+/// force.
+///
+/// I2.16 places `serializer_id_version_and_options` on the serialized-context
+/// record and states at `:163` that "Context admission and profile qualification
+/// use the exact bytes that the selected route will receive, not an abstract
+/// source estimate". The delivered lane is where those bytes already exist: a
+/// `SessionDeliverySnapshot` read from the authenticated `ContextDelivery` row
+/// carries, inside every retained `PriorDeliveryBinding`'s owner closure, the
+/// exact `ActiveUnderstandingView` that was delivered — and that view records
+/// the `ContextExecutionIdentity` its bytes were produced under.
+///
+/// `ActiveUnderstandingView::validate` already compares that identity against the
+/// view's own `SerializedContextMeasurement` through
+/// `ContextExecutionIdentity::binds_measurement`, but both of those records come
+/// from the SAME delivery. That comparison therefore proves the delivered view
+/// is internally consistent and says nothing about WHICH codec produced it: a
+/// delivery rendered under `json-v1`, `serde-json` or any other route codec
+/// satisfies it exactly as well as the canonical one. Nothing on the delivered
+/// lane bound those three values to the owner that issues them, which is the
+/// half of BLOCK-2 that had no owner.
+///
+/// This closes it with the ORIGINAL recorded values on both sides. The delivered
+/// identity's own `validate()` runs first so a malformed record is refused as
+/// such, and the three values are then handed to the same
+/// [`require_context_render_codec`] the pre-render policy check uses, which
+/// compares them as recorded against `canonical_render_serializer()`. No digest
+/// is recomputed, no value is defaulted, and this execution identity is not an
+/// input to any digest the owner record is checked against, so the comparison
+/// cannot be satisfied by a record describing itself.
+///
+/// This is deliberately NOT a rule inside `ActiveUnderstandingView::validate`:
+/// that validator is shared with out-of-scope routes and fixtures that
+/// legitimately render under other codecs, so demanding the canonical serializer
+/// there would refuse them. The binding belongs on the delivered lane, which is
+/// where the document says the delivered bytes are used.
+pub fn require_delivered_context_render_codec(
+    delivered: &ContextExecutionIdentity,
+) -> Result<(), ContextError> {
+    delivered.validate()?;
+    require_context_render_codec(
+        &delivered.serializer_id,
+        &delivered.serializer_version,
+        &delivered.serializer_options_digest,
     )
 }
 
