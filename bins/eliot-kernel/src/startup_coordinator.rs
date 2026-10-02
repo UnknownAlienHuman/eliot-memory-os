@@ -1462,12 +1462,11 @@ mod tests {
         sequence: u64,
         receive_wall_ms: u64,
     ) -> (WatchdogSupervisionObservation, Instant) {
-        let candidate_digest = PlatformHandle::new("candidate-digest")
-            .expect("candidate digest handle");
+        let candidate_digest =
+            PlatformHandle::new("candidate-digest").expect("candidate digest handle");
         let state_fence = StateFence::new(
             EpochId::new(
-                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                    .expect("epoch lineage"),
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("epoch lineage"),
                 std::num::NonZeroU64::new(1).expect("epoch sequence"),
             )
             .expect("kernel epoch"),
@@ -1665,21 +1664,24 @@ mod tests {
     #[test]
     fn owner_sequence_advances_and_exact_replay_cannot_refresh_deadline() {
         let received_wall_ms = crate::unix_ms();
-        let (observation, first_deadline) =
-            admitted_owner_observation(41, received_wall_ms);
+        let (observation, first_deadline) = admitted_owner_observation(41, received_wall_ms);
         let mut coordinator = coordinator_at_step(10);
 
-        assert!(coordinator
-            .record_live_supervision_evidence(observation, first_deadline)
-            .expect("first admitted owner heartbeat advances step 11"));
+        assert!(
+            coordinator
+                .record_live_supervision_evidence(observation, first_deadline)
+                .expect("first admitted owner heartbeat advances step 11")
+        );
         assert_eq!(coordinator.completed_step(), STARTUP_FINAL_STEP);
 
         let next_receive_wall_ms = crate::unix_ms();
         let (next_observation, original_deadline) =
             admitted_owner_observation(42, next_receive_wall_ms);
-        assert!(coordinator
-            .record_live_supervision_evidence(next_observation.clone(), original_deadline)
-            .expect("new owner sequence advances the retained proof"));
+        assert!(
+            coordinator
+                .record_live_supervision_evidence(next_observation.clone(), original_deadline)
+                .expect("new owner sequence advances the retained proof")
+        );
         assert_eq!(
             coordinator
                 .current_supervision_observation
@@ -1691,10 +1693,15 @@ mod tests {
         );
 
         let later_deadline = Instant::now() + std::time::Duration::from_secs(90);
-        assert!(!coordinator
-            .record_live_supervision_evidence(next_observation, later_deadline)
-            .expect("exact replay is idempotent"));
-        assert_eq!(coordinator.current_supervision_deadline, Some(original_deadline));
+        assert!(
+            !coordinator
+                .record_live_supervision_evidence(next_observation, later_deadline)
+                .expect("exact replay is idempotent")
+        );
+        assert_eq!(
+            coordinator.current_supervision_deadline,
+            Some(original_deadline)
+        );
         assert_eq!(
             coordinator
                 .current_supervision_observation
@@ -1710,8 +1717,7 @@ mod tests {
     #[test]
     fn revoked_owner_heartbeat_cannot_be_replayed_to_restore_step_11() {
         let received_wall_ms = crate::unix_ms();
-        let (observation, local_deadline) =
-            admitted_owner_observation(41, received_wall_ms);
+        let (observation, local_deadline) = admitted_owner_observation(41, received_wall_ms);
         let mut coordinator = coordinator_at_step(10);
         coordinator
             .record_live_supervision_evidence(observation.clone(), local_deadline)
