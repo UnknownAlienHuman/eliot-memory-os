@@ -357,7 +357,7 @@ fn verified_episode_groups_only_propose_a_pattern() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn exact_distillation_reduces_active_bytes_without_losing_current_truth()
+fn exact_distillation_reduces_the_covering_active_estimate_without_losing_current_truth()
 -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let snapshot_revision = MemoryRevision::new(12);
@@ -380,11 +380,54 @@ fn exact_distillation_reduces_active_bytes_without_losing_current_truth()
         empty_ledger(project_id, snapshot_revision, true),
     )?;
 
-    let before = plan.corpus_profile_before.active_bytes;
-    let after = i64::try_from(before)? + plan.expected_active_bytes_delta;
+    let before = plan.corpus_profile_before.estimated_covering_active_bytes;
+    let after = i64::try_from(before)? + plan.expected_estimated_covering_active_bytes_delta;
     assert!(before > 0);
     assert!(after >= 0);
     assert!(after * 100 <= i64::try_from(before)? * 60);
+    // The figures above are a covering ESTIMATE over `token_units`, not
+    // observed storage bytes, so the field NAME is part of what this test pins:
+    // ten items of 64 units cover 10 * bytes_for_stu(64) == 1920, which is the
+    // whole-multiple covering length and NOT the smallest covering length 190
+    // per item, and never an observed byte count.
+    assert_eq!(plan.corpus_profile_before.estimated_covering_total_bytes, 1_920);
+    assert_eq!(plan.corpus_profile_before.estimated_covering_active_bytes, 1_920);
+    assert_eq!(
+        plan.expected_estimated_covering_active_bytes_delta,
+        -9 * 192
+    );
+
+    // Serialised-plan pinning: the honest keys must appear on the wire and the
+    // misnamed byte keys must not. A ratio-only assertion stays green under any
+    // renaming and under either bytes-per-unit ratio, so it could never catch
+    // this defect class; these assertions fail if the rename is reverted.
+    let encoded = serde_json::to_value(&plan)?;
+    // `estimated_covering_*` fields live inside `corpus_profile_before`; the
+    // delta lives at the top level of the plan.
+    let profile = &encoded["corpus_profile_before"];
+    for key in [
+        "estimated_covering_total_bytes",
+        "estimated_covering_active_bytes",
+    ] {
+        assert!(
+            profile.get(key).is_some(),
+            "missing honest covering-estimate key {key} in the serialised plan"
+        );
+    }
+    assert_eq!(
+        encoded.get("expected_estimated_covering_active_bytes_delta"),
+        Some(&json!(-9 * 192)),
+        "the serialised plan must publish the covering ESTIMATE delta under its honest name"
+    );
+    assert!(
+        profile.get("total_bytes").is_none() && profile.get("active_bytes").is_none(),
+        "the serialised plan still advertises observed-byte keys it cannot honour"
+    );
+    assert!(
+        encoded.get("expected_active_bytes_delta").is_none(),
+        "the serialised plan still advertises the misnamed byte delta"
+    );
+
     assert_eq!(plan.expected_reconstruction_delta, 0);
     assert_eq!(plan.protected_refs, ["claim:duplicate-0"]);
     assert_eq!(

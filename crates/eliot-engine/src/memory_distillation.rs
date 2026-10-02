@@ -199,7 +199,7 @@ impl MemoryDistillationService {
         candidates.dedup_by(|left, right| left.candidate_id == right.candidate_id);
         unresolved_items.sort();
         unresolved_items.dedup();
-        let expected_active_bytes_delta = candidates
+        let expected_estimated_covering_active_bytes_delta = candidates
             .iter()
             .filter(|candidate| candidate.automatic_apply_allowed)
             .filter_map(|candidate| candidate.target_refs.first())
@@ -228,7 +228,7 @@ impl MemoryDistillationService {
             corpus_profile_before: profile,
             candidates,
             protected_refs,
-            expected_active_bytes_delta,
+            expected_estimated_covering_active_bytes_delta,
             expected_reconstruction_delta: 0,
             unresolved_items,
         })
@@ -858,18 +858,18 @@ fn corpus_profile(
         .map(|entry| (entry.target_ref.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut tier_counts = BTreeMap::new();
-    let mut active_bytes = 0_u64;
-    let mut total_bytes = 0_u64;
+    let mut estimated_covering_active_bytes = 0_u64;
+    let mut estimated_covering_total_bytes = 0_u64;
     for item in items {
         let tier =
             MemoryDistillationService::tier(item, utility.get(item.target_ref.as_str()).copied());
         *tier_counts.entry(tier).or_insert(0) += 1;
         let item_bytes = canonical_bytes_for_measured_units(item.token_units)?;
-        total_bytes = total_bytes
+        estimated_covering_total_bytes = estimated_covering_total_bytes
             .checked_add(item_bytes)
             .ok_or(EngineError::ContextMeasurement(ContextError::Overflow))?;
         if matches!(tier, MemoryTier::Hot | MemoryTier::Warm) {
-            active_bytes = active_bytes
+            estimated_covering_active_bytes = estimated_covering_active_bytes
                 .checked_add(item_bytes)
                 .ok_or(EngineError::ContextMeasurement(ContextError::Overflow))?;
         }
@@ -881,8 +881,8 @@ fn corpus_profile(
             .map(|item| item.target_ref.as_str())
             .collect::<BTreeSet<_>>()
             .len(),
-        total_bytes,
-        active_bytes,
+        estimated_covering_total_bytes,
+        estimated_covering_active_bytes,
         tier_counts,
     })
 }
@@ -971,25 +971,39 @@ fn canonical_context_cost_from_payload(payload: &Value) -> Option<u64> {
     measure.get("stu_estimate")?.get("value")?.as_u64()
 }
 
-/// Canonical #704 byte length that covers one measured corpus unit count.
+/// Canonical #704 covering-ESTIMATE byte length for one measured corpus unit
+/// count.
 ///
-/// `MemoryDistillationCorpusItem::token_units` is a measured unit count and
-/// the byte fields (`total_bytes`, `active_bytes`, `expected_active_bytes_delta`)
-/// are true storage metrics that stay in bytes, so the stored figure is the
-/// covering byte length `bytes_for_stu(u) = 3 * u` from #704 - the smallest
-/// byte length whose normative `STU(bytes) = ceil(bytes / 3)` estimate still
-/// covers `u`, and its exact inverse (`stu_for_bytes(3u) == u`). The conversion
-/// reaches #704's canonical helper rather than repeating the factor locally,
-/// and an unrepresentable length fails closed through `EngineError` instead of
-/// saturating to a figure that no longer covers `u`. One integer never
-/// silently means two units, and this conversion never produces a token or STU
-/// claim.
+/// `MemoryDistillationCorpusItem::token_units` is a measured unit count, so
+/// the fields fed from it (`estimated_covering_total_bytes`,
+/// `estimated_covering_active_bytes`, `expected_estimated_covering_active_bytes_delta`)
+/// are named as covering ESTIMATES precisely because no observed serialized or
+/// storage byte length exists to report. The stored figure is the #704 covering
+/// byte length `bytes_for_stu(u) = 3 * u`.
 ///
-/// The figure is a storage length, not an observed one: `token_units` carries no
-/// serialized length, so `3 * u` is the covering lower bound, never evidence of
-/// an actual byte count. The removed local `* 4` ratio reported 1.33x the
-/// covering figure it replaced; no threshold, retention or distillation policy
-/// is retuned here, and only the unit conversion is corrected.
+/// `3 * u` is NOT the smallest covering length. For `u >= 1`,
+/// `ceil(b / 3) >= u` holds exactly when `b >= 3u - 2`, so the smallest
+/// covering length is `3u - 2`, `ceil((3u - 1) / 3) = u` (not `u - 1`), and
+/// `ceil((3u - 2) / 3) = u`. The repository fixture `u = 64` is covered from
+/// length 190, while this function returns 192. `3u` is the whole-multiple
+/// member of the covering set: it never under-covers, so it is an UPPER bound
+/// on the smallest covering length, never a lower one. It is returned so the
+/// ratio stays exactly three bytes per unit and no second ratio appears here.
+///
+/// The round-trip `stu_for_bytes(bytes_for_stu(u)?) == u` is true and that is
+/// all it proves: it shows `3 * u` is A covering length whose `STU` estimate
+/// still covers `u`, never that it is the smallest. `STU` is many-to-one, so no
+/// inverse of it recovers an observed length: `u = 64` is produced by every `b`
+/// in `190..=192`.
+///
+/// The conversion therefore reaches #704's canonical helper rather than
+/// repeating the factor locally, and an unrepresentable length fails closed
+/// through `EngineError` instead of saturating to a figure that no longer
+/// covers `u`. One integer never silently means two units, and this conversion
+/// never produces a token, an STU, or an observed-byte claim. The removed local
+/// `* 4` ratio reported 1.33x the covering figure it replaced; no threshold,
+/// retention or distillation policy is retuned here, and only the unit
+/// conversion is corrected.
 fn canonical_bytes_for_measured_units(measured_units: u64) -> Result<u64, EngineError> {
     bytes_for_stu(measured_units).map_err(EngineError::from)
 }

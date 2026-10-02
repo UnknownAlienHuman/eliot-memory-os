@@ -177,8 +177,18 @@ pub struct MemoryDistillationCorpusItem {
 pub struct MemoryDistillationCorpusProfile {
     pub physical_records: usize,
     pub logical_items: usize,
-    pub total_bytes: u64,
-    pub active_bytes: u64,
+    /// Covering ESTIMATE over the corpus items, not an observed byte count.
+    ///
+    /// Every item carries `token_units` and no serialized length, so the
+    /// covering estimate `bytes_for_stu(token_units)` is what can be reported.
+    /// `STU` is many-to-one, so one unit count is produced by several lengths
+    /// and no inverse of it recovers an observed byte count. A field whose
+    /// contract is actual bytes must be fed from exact serialized/storage byte
+    /// evidence, never from here.
+    pub estimated_covering_total_bytes: u64,
+    /// Covering ESTIMATE over the hot/warm items, not an observed byte count.
+    /// Same construction and same limit as `estimated_covering_total_bytes`.
+    pub estimated_covering_active_bytes: u64,
     #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub tier_counts: BTreeMap<MemoryTier, usize>,
 }
@@ -248,7 +258,13 @@ pub struct MemoryDistillationPlan {
     pub corpus_profile_before: MemoryDistillationCorpusProfile,
     pub candidates: Vec<MemoryDistillationCandidate>,
     pub protected_refs: Vec<String>,
-    pub expected_active_bytes_delta: i64,
+    /// Signed change of the covering ACTIVE-BYTE ESTIMATE this plan expects.
+    ///
+    /// It is a delta over an estimate, not over observed storage bytes: every
+    /// term is a #704 covering estimate derived from `token_units`, and no item
+    /// carries a serialized length to subtract. Same limit as
+    /// `MemoryDistillationCorpusProfile::estimated_covering_active_bytes`.
+    pub expected_estimated_covering_active_bytes_delta: i64,
     pub expected_reconstruction_delta: i64,
     pub unresolved_items: Vec<String>,
 }
@@ -381,11 +397,22 @@ mod tests {
         for required in [
             "snapshot_revision",
             "protected_refs",
-            "expected_active_bytes_delta",
+            "expected_estimated_covering_active_bytes_delta",
             "unresolved_items",
         ] {
             assert!(plan.contains(required));
         }
+        // The published schema must not keep advertising a byte field whose
+        // contract is actual bytes: the delta it carries is a covering
+        // ESTIMATE, so the honest key is published and the old misnamed one is
+        // gone from the same schema.
+        assert!(!plan.contains("expected_active_bytes_delta"));
+        assert!(
+            plan.contains("estimated_covering_total_bytes")
+                && plan.contains("estimated_covering_active_bytes")
+        );
+        assert!(!plan.contains("\"total_bytes\""));
+        assert!(!plan.contains("\"active_bytes\""));
         for required in [
             "preserved_exact_atoms",
             "applicability_boundary",
