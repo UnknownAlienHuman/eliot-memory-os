@@ -2292,6 +2292,7 @@ impl WatchdogSpool {
                 WatchdogSpoolPayload::Recovery { .. } => "recovery".to_owned(),
                 WatchdogSpoolPayload::ProblemIntent { .. } => "problem_intent".to_owned(),
                 WatchdogSpoolPayload::IncidentIntent { .. } => "incident_intent".to_owned(),
+                WatchdogSpoolPayload::PublicationIntent { .. } => "publication_intent".to_owned(),
             }
         }
 
