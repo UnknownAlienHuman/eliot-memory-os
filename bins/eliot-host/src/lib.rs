@@ -6955,12 +6955,13 @@ impl HostComposition {
         // is created and nothing is retained, and a publication that committed
         // without a readable identity leaves the created root preserved, never
         // removed by path name.
-        let re_inspected =
-            crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
-                .map_err(|_| {
-                    "the source installation owner evidence could not be re-inspected, so the \
+        let re_inspected = crate::backup_preparation::OwnerEvidence::inspect(
+            &self.registry_host_root,
+        )
+        .map_err(|_| {
+            "the source installation owner evidence could not be re-inspected, so the \
                      currency of the destination cannot be proved before it is created"
-                })?;
+        })?;
         let re_inspected_active_generation = re_inspected.approved().manifest.generation.clone();
         let materialisation = eliot_installation::materialise_prepared_isolated_destination(
             &allocation.admission,
