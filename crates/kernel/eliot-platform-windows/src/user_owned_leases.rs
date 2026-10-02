@@ -151,7 +151,8 @@ impl std::error::Error for UserSelectedResourceError {}
 /// One read-only, no-follow physical proof for an Operator-selected root and
 /// object. Every directory handle from the volume root through the object
 /// parent is retained with delete sharing disabled; a directory object is
-/// itself retained in that contour. A file object is retained separately.
+/// itself retained in that contour. A file object is retained separately with
+/// write and delete sharing denied.
 ///
 /// The lease does not authorize a later child to reopen the pathname. Broker
 /// must perform `remeasure_for_use` at its use boundary and keep this lease
@@ -249,6 +250,100 @@ impl UserSelectedResourceLease {
             Err(UserSelectedResourceError::UnsupportedPlatform)
         }
     }
+
+    /// Reads one bounded regular-file snapshot from the retained handle and
+    /// verifies that its identity, size and change metadata are stable across
+    /// the read. It never reopens the selected pathname. The caller supplies
+    /// the policy-derived byte limit and must keep this lease alive while it
+    /// uses the returned original bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for directory selections, oversized content, read
+    /// failures, or any identity/size/change-time movement across the read.
+    pub fn read_bounded_snapshot(
+        &self,
+        limit: u64,
+    ) -> Result<
+        (
+            Vec<u8>,
+            UserSelectedResourceMeasurement,
+            UserSelectedResourceMeasurement,
+        ),
+        UserSelectedResourceError,
+    > {
+        #[cfg(windows)]
+        {
+            if self.object_kind != UserSelectedResourceKind::File {
+                return Err(UserSelectedResourceError::InvalidPath);
+            }
+            let before = measure_user_selected_resource(self)?;
+            let expected_size = before
+                .file_size_bytes
+                .ok_or(UserSelectedResourceError::IdentityMismatch)?;
+            if expected_size > limit {
+                return Err(UserSelectedResourceError::SizeExceeded);
+            }
+            if before.last_write_filetime_100ns.is_none()
+                || before.metadata_change_time_filetime_100ns.is_none()
+            {
+                return Err(UserSelectedResourceError::Io);
+            }
+            let retained = self
+                .object_file
+                .as_ref()
+                .ok_or(UserSelectedResourceError::IdentityMismatch)?;
+            let mut reader = retained
+                .try_clone()
+                .map_err(|_| UserSelectedResourceError::Io)?;
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| UserSelectedResourceError::Io)?;
+            let capacity = usize::try_from(expected_size)
+                .map_err(|_| UserSelectedResourceError::Io)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(capacity)
+                .map_err(|_| UserSelectedResourceError::Io)?;
+            reader
+                .take(limit)
+                .read_to_end(&mut bytes)
+                .map_err(|_| UserSelectedResourceError::Io)?;
+            if u64::try_from(bytes.len()).map_err(|_| UserSelectedResourceError::Io)?
+                != expected_size
+            {
+                return Err(UserSelectedResourceError::IdentityMismatch);
+            }
+            let after = measure_user_selected_resource(self)?;
+            if after.last_write_filetime_100ns.is_none()
+                || after.metadata_change_time_filetime_100ns.is_none()
+            {
+                return Err(UserSelectedResourceError::Io);
+            }
+            if before.root_identity != after.root_identity
+                || before.object_identity != after.object_identity
+                || before.ancestor_contour != after.ancestor_contour
+                || before.file_size_bytes != after.file_size_bytes
+                || before.last_write_filetime_100ns != after.last_write_filetime_100ns
+                || before.metadata_change_time_filetime_100ns
+                    != after.metadata_change_time_filetime_100ns
+                || !before.reparse_free
+                || !after.reparse_free
+                || before.network
+                || after.network
+                || before.device
+                || after.device
+            {
+                return Err(UserSelectedResourceError::IdentityMismatch);
+            }
+            Ok((bytes, before, after))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = limit;
+            Err(UserSelectedResourceError::UnsupportedPlatform)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -293,8 +388,9 @@ fn open_user_selected_resource(
                 (UserSelectedResourceKind::Directory, None)
             }
             Err(ProtectedPathError::InvalidPath) => {
-                let (identity, handle) = crate::open_no_follow_file(&selected_object.path)
-                    .map_err(map_selected_resource_path_error)?;
+                let (identity, handle) =
+                    open_user_selected_file_deny_write_delete(&selected_object.path)
+                        .map_err(map_selected_resource_path_error)?;
                 if identity.volume_serial_number != contour.volume_identity.volume_serial_number {
                     return Err(UserSelectedResourceError::IdentityMismatch);
                 }
@@ -328,6 +424,52 @@ fn open_user_selected_resource(
     };
     let measurement = measure_user_selected_resource(&lease)?;
     Ok((lease, measurement))
+}
+
+#[cfg(windows)]
+fn open_user_selected_file_deny_write_delete(
+    path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ,
+    };
+
+    if !path.is_absolute() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(FILE_GENERIC_READ)
+        // Omitting FILE_SHARE_WRITE and FILE_SHARE_DELETE rejects a selected
+        // file that is already open for mutation and prevents new writers or
+        // deleters while this retained source handle is live.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path).map_err(|_| ProtectedPathError::Io)?;
+    let metadata = file.metadata().map_err(|_| ProtectedPathError::Io)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProtectedPathError::ReparsePoint);
+    }
+    if !metadata.is_file() {
+        return Err(ProtectedPathError::InvalidPath);
+    }
+    ensure_single_user_file_link(&file)?;
+    let identity = crate::process_identity::file_identity_from_handle(&file)
+        .map_err(|_| ProtectedPathError::Io)?;
+    if identity.volume_serial_number == 0 || identity.file_index == 0 {
+        return Err(ProtectedPathError::Io);
+    }
+    Ok((identity, file))
+}
+
+#[cfg(not(windows))]
+fn open_user_selected_file_deny_write_delete(
+    _path: &Path,
+) -> Result<(FileIdentity, std::fs::File), ProtectedPathError> {
+    Err(ProtectedPathError::UnsupportedPlatform)
 }
 
 #[cfg(windows)]

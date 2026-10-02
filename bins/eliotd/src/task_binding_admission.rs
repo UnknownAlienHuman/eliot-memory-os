@@ -291,6 +291,9 @@ pub struct ExplicitColdStartBootstrapRequest {
     pub explicit_root: PathBuf,
     pub scope_ref: String,
     pub generation: u64,
+    /// Caller-declared privacy decision; it is a claim and must exactly match
+    /// the current scope privacy owner output before source expansion.
+    pub privacy: Option<PrivacyProfile>,
     pub sources: Vec<ExplicitSourceClaim>,
     pub precedences: Vec<PrecedenceDeclaration>,
     pub absence_reason_ref: Option<String>,
@@ -317,7 +320,17 @@ pub struct ExplicitColdStartOwnerInput<'a> {
     /// acceptance digests are not substitutes for selection provenance.
     pub current_binding: Option<&'a TaskBindingState>,
     pub owner_candidates: &'a [GoverningSourceCandidate],
+    /// Independent name-only scan from the exact root and discovery lease.
+    /// This is required to distinguish explicit absence from skipped reads.
+    pub expected_candidates: Option<&'a [GoverningSourceCandidateEvidence]>,
+    /// Exact discovery lease that authorized the current source-content
+    /// snapshot. A name-only scan is not source evidence.
+    pub discovery_lease: Option<&'a DiscoveryReadLease>,
+    /// Current owner privacy policy for the scope.
+    pub privacy: &'a PrivacyProfile,
     pub scope_ref: &'a str,
+    /// Root identity observed by the authenticated workspace owner.
+    pub explicit_root_identity_ref: &'a str,
     pub generation: u64,
     pub expires_at: u64,
 }
@@ -344,6 +357,7 @@ pub fn build_explicit_source_admission_request(
         || input.request.expires_at != input.expires_at
         || input.request.scope_ref != input.scope_ref
         || input.request.generation != input.generation
+        || input.explicit_root_identity_ref.trim().is_empty()
         || input.request.explicit_root.as_os_str().is_empty()
         || !input.request.explicit_root.is_absolute()
         || input.principal_ref.trim().is_empty()
@@ -358,7 +372,66 @@ pub fn build_explicit_source_admission_request(
         TaskBindingError::scope_incompatible(format!("live state fence is invalid: {error}"))
     })?;
 
+    if !input.request.sources.is_empty() && input.request.privacy.as_ref() != Some(input.privacy) {
+        return Err(TaskBindingError::scope_incompatible(
+            "explicit source request privacy decision differs from current scope privacy owner",
+        ));
+    }
+    let expected_candidates = input.expected_candidates.ok_or_else(|| {
+        TaskBindingError::selection_required(
+            "explicit source intake has no independent root candidate scan for its exact lease",
+        )
+    })?;
+    let expected_refs: std::collections::BTreeSet<_> = expected_candidates
+        .iter()
+        .map(|candidate| candidate.source_ref.as_str())
+        .collect();
+    if expected_refs.len() != expected_candidates.len() {
+        return Err(TaskBindingError::scope_incompatible(
+            "independent root scan contains duplicate candidate identities",
+        ));
+    }
+    let declared_refs: std::collections::BTreeSet<_> = input
+        .request
+        .sources
+        .iter()
+        .map(|source| source.source_ref.as_str())
+        .collect();
+    if declared_refs.len() != input.request.sources.len() || expected_refs != declared_refs {
+        return Err(TaskBindingError::selection_required(
+            "explicit source expansion must name every independently scanned source exactly once",
+        ));
+    }
+    if input.request.sources.iter().any(|declared| {
+        !expected_candidates.iter().any(|expected| {
+            expected.source_ref == declared.source_ref && expected.role == declared.role
+        })
+    }) {
+        return Err(TaskBindingError::scope_incompatible(
+            "explicit source role differs from the independent root scan",
+        ));
+    }
+    if input.request.sources.is_empty() != input.request.absence_reason_ref.is_some() {
+        return Err(TaskBindingError::selection_required(
+            "explicit source absence needs an independent empty scan and a caller reason",
+        ));
+    }
+
     let mut candidates = Vec::with_capacity(input.request.sources.len());
+    if !input.request.sources.is_empty() {
+        let lease = input.discovery_lease.ok_or_else(|| {
+            TaskBindingError::scope_incompatible(
+                "explicit source content has no live discovery-lease owner read",
+            )
+        })?;
+        lease
+            .authorize(DiscoveryRead::GoverningSourceCandidates, input.now)
+            .map_err(|error| {
+                TaskBindingError::scope_incompatible(format!(
+                    "explicit source content is outside its live discovery lease: {error:?}"
+                ))
+            })?;
+    }
     for declared in &input.request.sources {
         if let Some(AuthorityBasis::HumanOwner { owner_ref }) = &declared.claim {
             if owner_ref != input.required_owner_ref {
@@ -383,6 +456,41 @@ pub fn build_explicit_source_admission_request(
         if matches.next().is_some() {
             return Err(TaskBindingError::selection_required(
                 "declared source matches ambiguous owner candidates",
+            ));
+        }
+        candidate.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "source owner candidate failed its original validation: {error}"
+            ))
+        })?;
+        let lease = input.discovery_lease.ok_or_else(|| {
+            TaskBindingError::scope_incompatible(
+                "explicit source content has no live discovery-lease owner read",
+            )
+        })?;
+        match &candidate.origin {
+            eliot_workscope::SourceCandidateOrigin::DiscoveryLease { lease_ref }
+                if lease_ref == &lease.lease_ref
+                    && lease.candidate_root_ref == input.explicit_root_identity_ref => {}
+            _ => {
+                return Err(TaskBindingError::scope_incompatible(
+                    "source owner candidate does not name the exact explicit root discovery lease",
+                ));
+            }
+        }
+        if candidate.assurance.state_fence != *input.live_fence
+            || candidate.domains.is_empty()
+            || !input
+                .privacy
+                .admitted_classes
+                .contains(&candidate.assurance.privacy_class)
+            || candidate.domains.iter().any(|domain| {
+                domain.state_fence != *input.live_fence
+                    || !input.privacy.admitted_classes.contains(&domain.privacy_class)
+            })
+        {
+            return Err(TaskBindingError::scope_incompatible(
+                "source assurance, domain, or privacy owner read differs from the live scope fence/policy",
             ));
         }
         candidate.claim = declared.claim.clone();

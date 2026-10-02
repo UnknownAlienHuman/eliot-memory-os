@@ -1002,7 +1002,11 @@ impl BootstrapContext {
             })
         };
         let supported_count = count(|disposition| disposition != EventDisposition::Unavailable)?;
-        let verified_count = count(|disposition| disposition == EventDisposition::Enforced)?;
+        let verified_count = if coverage.is_some_and(|profile| profile.verified) {
+            count(|disposition| disposition == EventDisposition::Enforced)?
+        } else {
+            0
+        };
         let candidate_count = count(|disposition| {
             matches!(
                 disposition,
@@ -1026,7 +1030,11 @@ impl BootstrapContext {
         conflicts_unknowns.extend(problem_handles.iter().cloned());
         let mut unique = std::collections::BTreeSet::new();
         conflicts_unknowns.retain(|handle| unique.insert(handle.clone()));
-        let safety_floor_refs = receipt.limiting_integration_evidence.clone();
+        // Coverage gaps are diagnostic evidence, not members of the I7.11
+        // Decision Safety Floor. No floor owner is present in this response,
+        // so retain the missing floor as empty and let cap_assessment keep
+        // Material readiness below Ready.
+        let safety_floor_refs = Vec::new();
         let mut context = Self {
             principal_ref: receipt.principal_ref.clone(),
             profile_ref: receipt.governance_profile_ref.clone(),
