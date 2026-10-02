@@ -1946,6 +1946,11 @@ fn dry_run_binding(runner: &BridgeRunner) -> DryRunBinding {
 /// disposition in that order.
 fn dry_run_invoke_plan(tool: &ToolRequest) -> (&'static str, &'static str, &'static str) {
     match tool {
+        ToolRequest::State(input) if input.bootstrap.is_some() => (
+            "read-only",
+            DRY_RUN_INVOKE_READ_OPERATION,
+            DRY_RUN_PREVIEW_DISPOSITION,
+        ),
         ToolRequest::State(_) => (
             "read-only",
             DRY_RUN_SUBMIT_OPERATION,

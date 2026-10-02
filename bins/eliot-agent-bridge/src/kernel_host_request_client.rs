@@ -1970,7 +1970,7 @@ fn host_request_observe_submit_frame(
 ///
 /// | tool | bridge entry | Kernel operation | completion boundary |
 /// |---|---|---|---|
-/// | `eliot.state` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the state dispatch binding pre-staging; projection-owner readback (Kernel pair + daemon flight + task/scope projection owner) is the remaining join |
+/// | `eliot.state` | ordinary projection uses submit; explicit `bootstrap` uses invoke-read with exact tool bytes | `agent_host_request_submit` / `agent_host_request_invoke_read` | bootstrap result is the exact bounded owner response joined to the retained attach and live Governor evidence before the bridge composes its bootstrap projection |
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes, dispatch-time revalidated) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg; the bridge answers completed only with the owner-retained receipt |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
@@ -2061,6 +2061,9 @@ enum CanonicalDispatchEntry {
 /// above. Behavior is byte-identical to the previous scattered predicates.
 fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
     match tool {
+        ToolRequest::State(input) if input.bootstrap.is_some() => {
+            CanonicalDispatchEntry::InvokeRead
+        }
         ToolRequest::State(_) => CanonicalDispatchEntry::SubmitStateGated {
             completion_join: "projection-owner readback: submit-record execution (Kernel pair + daemon flight + task/scope projection owner)",
         },
@@ -2085,6 +2088,7 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
     }
 }
+
 
 /// Dispatch-time revalidation for one `eliot.act` effect dispatch (issue
 /// #1742 W4 via #1739 dispatch).

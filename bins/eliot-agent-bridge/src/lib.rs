@@ -7681,7 +7681,8 @@ mod tests {
                 let owner_event: eliot_protocol::EventEnvelope = serde_json::from_value(
                     payload
                         .get("event_envelope")
-                        .expect("normalized host carrier is sent"),
+                        .expect("normalized host carrier is sent")
+                        .clone(),
                 )
                 .expect("carrier envelope remains typed");
                 assert_eq!(
