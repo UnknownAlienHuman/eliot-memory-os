@@ -1,6 +1,6 @@
 //! Kernel production restore adapter tests (issue #960).
 //!
-//! Twenty-two substantive cases binding the coordinator to the accepted owner
+//! Twenty-five substantive cases binding the coordinator to the accepted owner
 //! contracts. The durable journal behind every execution is an injected
 //! `J: RestoreJournalPort`: memory/file fixtures below prove adapter
 //! mapping only and always carry fixture-marked admission, while production
@@ -20,7 +20,7 @@ use eliot_backup::{
     BackupBundle, BackupClass, BackupError, BackupInput, CutoverAuthorization, EventRange,
     ExportFence, ObservedLineageLimit, OwnerTrustBinding, RestoreContext, RestoreEvidenceLevel,
     RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord, RestoreJournalState,
-    RestoreObligationState, RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
+    RestoreObligationState, RestorePhase, RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
@@ -191,6 +191,20 @@ struct FixtureJournal {
     /// refuses the engine at a point where N phases have already published
     /// their material and the journal is mid-transaction.
     fail_cas_after_completed: Option<u64>,
+    /// Refuse the one compare-and-swap that would persist `ReceiptPersisted`
+    /// for exactly this phase, and never a different one.
+    ///
+    /// This is the interruption point that makes RECONCILIATION observable, and
+    /// it is a different point from `fail_cas_after_completed`. The engine only
+    /// reconciles a phase when it re-enters the loop holding that phase's
+    /// `IntentPersisted`: from `ReceiptPersisted` it advances to the next phase
+    /// and from `Ready` it applies the phase outright. So a phase interrupted
+    /// after its receipt was journalled is re-APPLIED on resume (overwriting
+    /// whatever is at the member path), while a phase interrupted BEFORE its
+    /// receipt was journalled is re-READ on resume. Refusing the receipt swap is
+    /// therefore the only way to observe what a resume does with a phase whose
+    /// journaled receipt and on-disk material can disagree.
+    fail_cas_persisting_receipt_for: Option<RestorePhase>,
 }
 
 /// Completed phases a record already attests.
@@ -235,6 +249,16 @@ impl RestoreJournalPort for FixtureJournal {
                 .is_some_and(|current| completed_phases(current) == target)
         }) {
             self.fail_cas_after_completed = None;
+            return Err(BackupError::RestoreJournalCasConflict);
+        }
+        // The swap that would make this phase's journaled receipt durable. The
+        // phase has already published its member and its receipt file by this
+        // point, so refusing here leaves the journal holding `IntentPersisted`
+        // over material that is on disk — the state a resume reconciles.
+        if matches!(next.state, RestoreJournalState::ReceiptPersisted)
+            && self.fail_cas_persisting_receipt_for.as_ref() == Some(&next.phase)
+        {
+            self.fail_cas_persisting_receipt_for = None;
             return Err(BackupError::RestoreJournalCasConflict);
         }
         self.record = Some(next);
@@ -348,9 +372,21 @@ fn exact_verified_archive_and_admitted_destination_restore() {
     );
     let evidence = outcome.evidence.expect("finalize evidence observed");
     evidence.validate().expect("evidence validates");
+    // This archive carries NO purge entry, so the purge phase applied nothing
+    // and no owner issued a purge revision. The obligation is therefore reported
+    // as NOT established, not as `Satisfied`: publishing `Satisfied` here would
+    // attest a privacy-purge closure out of the caller's own emptiness. The
+    // restore itself still succeeds — an isolated restore does not require a
+    // purge owner it never used — and the slot stays fail-closed at the gate
+    // that consumes it, where `MissingCapability` refuses cutover.
+    assert!(
+        bundle.purge_ledger.is_empty(),
+        "this fixture's premise: the archive carries no purge entry"
+    );
     assert_eq!(
         evidence.obligations.purge.state,
-        RestoreObligationState::Satisfied
+        RestoreObligationState::MissingCapability,
+        "an archive that carried no purge entry established no purge closure"
     );
     assert!(!evidence.active_authority_restored);
     let _ = std::fs::remove_dir_all(&root);
@@ -1302,7 +1338,16 @@ fn interrupted_after_staging_retains_published_material_for_resume() {
     );
     // RESUMING THE SAME TRANSACTION resumes rather than restarts: the phase log
     // of the resumed run does not re-apply prepare, because the journal already
-    // records it applied and the receipt still attests the material.
+    // records it applied.
+    //
+    // The retention proof above is the ON-DISK survival of the published member,
+    // not this log: the engine advances from `ReceiptPersisted` without
+    // re-reading that phase's material, so a resume would report the same phase
+    // log even if cleanup had unlinked the member. Cases 960/24 and 960/25 cover
+    // the reconciliation readback that does re-read it. What this log proves is
+    // the narrower, separate claim — that the interrupted transaction RESUMED
+    // rather than restarting, and that the retry reused the interrupted run's
+    // destination instead of minting a fresh execution identity.
     let resumed = coordinator
         .restore(&bundle, context, &ports, &mut journal)
         .expect("the same transaction resumes");
@@ -1311,9 +1356,17 @@ fn interrupted_after_staging_retains_published_material_for_resume() {
         "a resume does not re-apply a phase the journal already recorded: {:?}",
         resumed.phase_log
     );
+    assert_eq!(
+        resumed.phase_log,
+        vec!["purge", "rebuild", "verify", "finalize"],
+        "the resume applied exactly the phases the interrupted run had not reached"
+    );
+    // The resumed run carried the SAME transaction forward rather than minting a
+    // new execution identity for the retry: it wrote into the destination the
+    // interrupted run's prepare pinned, not a fresh root.
     assert!(
-        !resumed.phase_log.is_empty(),
-        "the resume did carry the remaining phases forward"
+        resumed.destination_root == destination_root,
+        "the resume continued the same destination, not a fresh one"
     );
     resumed.receipt.validate().expect("resumed receipt validates");
     let _ = std::fs::remove_dir_all(&root);
@@ -1384,5 +1437,199 @@ fn unowned_temporary_with_this_owners_suffix_survives_cleanup_byte_for_byte() {
         &error,
         KernelRestoreError::RetainedForResume { retained, .. } if retained.members > 0
     ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/23
+#[test]
+fn interruption_before_any_publication_reports_no_retained_material() {
+    let target = "t960-23";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("23");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    // The journal's FIRST compare-and-swap is the engine's genesis write, which
+    // happens before any phase runs. Refusing it interrupts the restore with
+    // NOTHING published, which is the other half of the retention disposition:
+    // `RetainedForResume` must not be reachable when this execution published
+    // nothing, or a caller would be told to resume over state that never existed.
+    let mut journal = FixtureJournal {
+        fail_next_cas: true,
+        ..FixtureJournal::default()
+    };
+    let error = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect_err("interrupted before any phase fails typed");
+    // The refusal is the PLAIN engine failure, not a retention disposition:
+    // nothing was published, so there is no retained set to report and nothing
+    // was left for the caller to resume from.
+    assert!(
+        matches!(error, KernelRestoreError::TargetFailed(_)),
+        "an interruption before any publication is a plain engine failure, got {error}"
+    );
+    assert!(
+        !matches!(error, KernelRestoreError::RetainedForResume { .. }),
+        "no retained-material claim is made for a run that published nothing"
+    );
+    // The engine's own typed cause survives the seam unchanged.
+    assert_eq!(
+        error,
+        KernelRestoreError::TargetFailed(BackupError::RestoreJournalCasConflict),
+        "the primary is preserved as the cause and is never replaced"
+    );
+    // And the destination really is empty of phase material: no phase receipt
+    // was written, so there is nothing a resume could reconcile.
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    let receipts = destination_root.join("phase-receipts");
+    assert!(
+        !receipts.exists(),
+        "no phase receipt was published before the interruption"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/24
+#[test]
+fn a_resumed_receipt_cannot_attest_removed_published_material() {
+    let target = "t960-24";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("24");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    // Publish the PREPARE phase's member and its receipt file, then refuse the
+    // swap that would journal that receipt. The journal is therefore left
+    // holding `IntentPersisted` for prepare, while the member and the receipt
+    // file are both on disk — the coherent resumable state the defect lives in.
+    let mut journal = FixtureJournal {
+        fail_cas_persisting_receipt_for: Some(RestorePhase::PrepareIsolatedRoot),
+        ..FixtureJournal::default()
+    };
+    coordinator
+        .restore(&bundle, context.clone(), &ports, &mut journal)
+        .expect_err("the interrupted run fails typed");
+    // The journal is demonstrably still at the intent for prepare, so the resume
+    // below RECONCILES that phase rather than re-applying it. That is what makes
+    // this case about a resumed receipt rather than about a re-apply.
+    let record = journal.record.as_ref().expect("the journal holds a record");
+    assert!(
+        matches!(record.state, RestoreJournalState::IntentPersisted),
+        "the journal is parked at the intent, got {:?}",
+        record.state
+    );
+    // Now REMOVE the material prepare published, leaving its receipt in place.
+    // The journal and the receipt file still say "prepare applied"; only the
+    // bytes are gone. A receipt is a description of an effect, not the effect, so
+    // the resume must re-read the material and refuse rather than advance the
+    // journal over a phase whose bytes no longer exist.
+    let pinned_path = destination_root.join(DESTINATION_ADMISSION_FILE);
+    assert!(
+        pinned_path.is_file(),
+        "prepare published the pinned admission before the interruption"
+    );
+    std::fs::remove_file(&pinned_path).expect("remove the published member");
+    assert!(
+        !pinned_path.exists(),
+        "the member the receipt attests is genuinely gone"
+    );
+    // The receipts themselves are still present: this is a receipt surviving its
+    // material, not a receipt that was also destroyed.
+    let receipts = destination_root.join("phase-receipts");
+    assert!(
+        receipts.is_dir() && std::fs::read_dir(&receipts).expect("receipts readable").count() > 0,
+        "the phase receipt outlives the material it attests, which is the hazard"
+    );
+    let resumed = coordinator.restore(&bundle, context, &ports, &mut journal);
+    // The resume REFUSES. It does not re-apply prepare over the missing member
+    // (which would have restored the file and succeeded) and it does not report
+    // success over a phase whose material is gone.
+    let error = resumed.expect_err("a resume over removed material refuses");
+    assert_eq!(
+        error,
+        KernelRestoreError::TargetFailed(BackupError::RestoreJournalCorrupt),
+        "a receipt whose material is gone is corrupt evidence, not an applied phase"
+    );
+    // The refusal created no new execution identity and did not re-stage: had
+    // the resume re-applied the phase instead, the member would be back.
+    assert!(
+        !pinned_path.exists(),
+        "the refused resume did not silently re-apply the removed phase"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/25
+#[test]
+fn a_substituted_member_under_a_retained_receipt_is_refused_as_substitution() {
+    let target = "t960-25";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("25");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    // Park the journal at the PURGE phase's intent: the purge phase publishes
+    // `purge_ledger.json` and its receipt file, and refusing the receipt swap
+    // leaves the engine to reconcile that phase on resume.
+    let mut journal = FixtureJournal {
+        fail_cas_persisting_receipt_for: Some(RestorePhase::ApplyPurgeLedger),
+        ..FixtureJournal::default()
+    };
+    coordinator
+        .restore(&bundle, context.clone(), &ports, &mut journal)
+        .expect_err("the interrupted run fails typed");
+    let record = journal.record.as_ref().expect("the journal holds a record");
+    assert!(
+        matches!(record.state, RestoreJournalState::IntentPersisted)
+            && record.phase == RestorePhase::ApplyPurgeLedger,
+        "the journal is parked at the purge intent, got {:?}/{:?}",
+        record.state,
+        record.phase
+    );
+    // SUBSTITUTE rather than remove: a same-length, different-bytes file stands
+    // where the phase's member was. This is the harder hazard than absence,
+    // because every existence check still succeeds — the path is there, it is
+    // readable, and it is the right size. Only a digest comparison over the
+    // ACTUAL bytes on disk distinguishes it from the material the receipt
+    // attests.
+    //
+    // The purge member is the one chosen because its receipt digest IS the
+    // digest of the member it published (`PhaseMaterial::receipt_digests_member`),
+    // so substitution is observable at all. Prepare's own member is excluded
+    // from that set by design (its receipt digests an observation document that
+    // is never persisted), which is why substituting THAT file could not be
+    // detected and is not asserted here.
+    let member = destination_root.join("purge_ledger.json");
+    assert!(member.is_file(), "the purge phase published its member");
+    let original = std::fs::read(&member).expect("member bytes");
+    let mut substituted = original.clone();
+    substituted[0] ^= 0xff;
+    assert_ne!(
+        original, substituted,
+        "the substitution must actually differ, or nothing is proved"
+    );
+    std::fs::write(&member, &substituted).expect("substitute the member");
+    // The resume reconciles the purge phase against the receipt still on disk.
+    let resumed = coordinator.restore(&bundle, context, &ports, &mut journal);
+    let error = resumed.expect_err("a resume over substituted material refuses");
+    assert_eq!(
+        error,
+        KernelRestoreError::TargetFailed(BackupError::RestoreJournalMismatch),
+        "a retained receipt cannot attest bytes that are not the ones it published"
+    );
+    // The substituted bytes were NOT quietly accepted as the applied phase.
+    assert_eq!(
+        std::fs::read(&member).expect("member still readable"),
+        substituted,
+        "the refusal did not overwrite the substitution with a re-applied member"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
