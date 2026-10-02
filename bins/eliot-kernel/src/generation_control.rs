@@ -632,7 +632,23 @@ enum GenerationCutoverInnerFailure {
 /// accepted evidence is bound to. This runs before
 /// [`GenerationCutoverLiveEndpoint`] classification and before any ORS write,
 /// so an incompatible candidate is refused before activation rather than after.
+///
+/// The refusal reports the exact incompatible I1.12 field, so an overlapping
+/// protocol range can never hide a canonical-format, sealed normative-pair
+/// receipt, Authority Epoch or migration-class incompatibility.
 fn admit_cutover_candidate(
+    service: &KernelService,
+    decision: &CutoverDecision,
+) -> Result<(), KernelServiceError> {
+    admit_cutover_compatibility(service, decision).map_err(|mismatch| {
+        KernelServiceError::HandshakeMismatch {
+            field: mismatch.field().label(),
+        }
+    })
+}
+
+/// The I1.12 verdict for one cutover candidate generation.
+fn admit_cutover_compatibility(
     service: &KernelService,
     decision: &CutoverDecision,
 ) -> Result<(), eliot_kernel_core::CompatibilityMismatch> {
@@ -641,11 +657,7 @@ fn admit_cutover_candidate(
     // lineage is refused before the durable state it would be judged against is
     // even built. This is the epoch-lineage half of the I1.12 boundary; the
     // remaining envelope fields are judged below.
-    if !decision
-        .new_epoch()
-        .lineage_id
-        .eq(&service.authority_epoch().lineage_id)
-    {
+    if decision.new_epoch().lineage_id != service.authority_epoch().lineage_id {
         return Err(eliot_kernel_core::CompatibilityMismatch::new(
             eliot_kernel_core::MismatchField::AuthorityEpoch,
             "candidate authority epoch lineage is not the live durable lineage",
@@ -656,10 +668,7 @@ fn admit_cutover_candidate(
         decision.new_epoch(),
         i64::try_from(unix_ms()).unwrap_or(i64::MAX),
     )?;
-    activation
-        .require_admitted()
-        .map(|_| ())
-        .map_err(|mismatch| mismatch.clone())
+    activation.require_admitted().map(|_| ()).map_err(Clone::clone)
 }
 
 impl ServiceFenceObservation {
@@ -909,22 +918,12 @@ impl KernelComposition {
                     GenerationCutoverInnerFailure::Gateway("service lock poisoned".to_owned())
                 })?;
 
-                // I1.12: the candidate generation of this cutover must be
-                // verified compatible with CURRENT durable state - protocol
-                // range, contract-set digest, canonical format range,
-                // Architecture source digest with its externally sealed
-                // `NormativePairIdentity` receipt, module generation and
-                // Authority Epoch, required/optional capabilities and state
-                // migration class - BEFORE any route, registry or epoch state
-                // moves. A refusal is a refusal of the frame, not a gateway
-                // failure: nothing is poisoned and nothing is published, and the
-                // caller receives the exact mismatching field.
-                if let Err(mismatch) = admit_cutover_candidate(&service, decision) {
-                    return Err(GenerationCutoverInnerFailure::Refused(
-                        KernelServiceError::HandshakeMismatch {
-                            field: mismatch.field().label(),
-                        },
-                    ));
+                // I1.12: refuse an incompatible candidate generation BEFORE
+                // any ORS write, route move or epoch change. See
+                // `admit_cutover_candidate`; a refusal is a refusal of the
+                // frame, not a gateway failure, so nothing is poisoned here.
+                if let Err(error) = admit_cutover_candidate(&service, decision) {
+                    return Err(GenerationCutoverInnerFailure::Refused(error));
                 }
 
                 // I14.14: the authenticated production path reaches this point

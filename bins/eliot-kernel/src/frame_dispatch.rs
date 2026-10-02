@@ -83,14 +83,15 @@ pub(crate) fn runtime_contract_set_digest() -> Result<String, TransportError> {
 }
 
 /// Runs the Kernel-owned compatibility admission for one authenticated
-/// generation/epoch. The protocol and canonical-format revisions are the
-/// current I1.12 handshake revisions; the contract-set digest is derived
-/// above from the four public owners rather than from a binary or config hash.
+/// generation/epoch and persists the verdict it admitted on. The protocol and
+/// canonical-format revisions are the current I1.12 handshake revisions; the
+/// contract-set digest is derived above from the four public owners rather than
+/// from a binary or config hash.
 ///
 /// It returns the accepted evidence AND the durable verdict the same admission
 /// produced, so the caller persists exactly the verdict it admitted on rather
 /// than deciding compatibility a second time.
-fn runtime_compatibility_evidence(
+fn runtime_compatibility_admission(
     generation: eliot_contracts::ResourceGeneration,
     authority_epoch: &eliot_contracts::EpochId,
 ) -> Result<
@@ -120,28 +121,6 @@ fn runtime_compatibility_evidence(
         .require_admitted()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok((admitted.clone(), activation))
-}
-
-/// Persists the accepted compatibility evidence for the authenticated Module
-/// generation that just handshaked, bound to its own artifact identity,
-/// generation and Authority Epoch.
-///
-/// The durable verdict is the ONLY thing a later rollback is re-verified
-/// against, so an admitted generation whose evidence was not persisted can
-/// never become a rollback target. Staging the recorded verdict is not a route
-/// switch: it leaves the active executable untouched.
-fn persist_runtime_compatibility(
-    ors: &eliot_ors::RedbRecoveryStore,
-    module_generation: &eliot_runtime_contracts::ModuleGeneration,
-    activation: &eliot_kernel_core::CandidateActivation,
-) -> Result<(), TransportError> {
-    super::compatibility_gate::persist_generation_compatibility(
-        ors,
-        module_generation.module_id.as_str(),
-        module_generation.artifact_id.as_str(),
-        activation,
-    )
-    .map_err(|_| TransportError::SessionFenced)
 }
 
 fn observe_frame(event: &'static str, outcome: &'static str) {
@@ -388,6 +367,31 @@ impl KernelComposition {
         self.runtime_health_evidence_from_policy_generation(policy_generation)
     }
 
+    /// The I1.12 verdict for one authenticated replaceable Module generation,
+    /// with the verdict this admission produced persisted against that
+    /// generation's own artifact identity, generation and Authority Epoch.
+    ///
+    /// The durable record is the only thing a later rollback is re-verified
+    /// against, so an admitted generation whose evidence was not persisted can
+    /// never become a rollback target. Staging the recorded verdict is not a
+    /// route switch: the active executable is untouched.
+    fn runtime_module_compatibility(
+        &self,
+        module_generation: &eliot_runtime_contracts::ModuleGeneration,
+    ) -> Result<eliot_kernel_core::AcceptedCompatibilityEvidence, TransportError> {
+        let authority_epoch = &module_generation.state_fence.authority_epoch;
+        let (compatibility, activation) =
+            runtime_compatibility_admission(module_generation.generation, authority_epoch)?;
+        super::compatibility_gate::persist_generation_compatibility(
+            &self.generation_gateway.ors,
+            module_generation.module_id.as_str(),
+            module_generation.artifact_id.as_str(),
+            &activation,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        Ok(compatibility)
+    }
+
     fn runtime_health_evidence_from_policy_generation(
         &self,
         policy_generation: eliot_runtime_contracts::ModuleGeneration,
@@ -442,15 +446,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        let (compatibility, activation) = runtime_compatibility_evidence(
-            policy_generation.generation,
-            &policy_generation.state_fence.authority_epoch,
-        )?;
-        persist_runtime_compatibility(
-            &self.generation_gateway.ors,
-            &policy_generation,
-            &activation,
-        )?;
+        let compatibility = self.runtime_module_compatibility(&policy_generation)?;
         let cutover_state = self.runtime_cutover_state(
             policy_generation.generation,
             &policy_generation.state_fence.authority_epoch,
