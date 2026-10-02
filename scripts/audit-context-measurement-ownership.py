@@ -2792,6 +2792,32 @@ def evaluate(root: Path) -> OwnershipResult:
     # import, a test-only call and dead code each name themselves.
     dependency = _dependency_evidence(root, producer, rows)
     proven: dict[str, dict[str, Any]] = {}
+    # The owner of record's reach is proved at its DECLARED scope, not at its
+    # definition site. That scope is the owner's own ``source_paths`` in the
+    # externally supplied frozen owner map -- the same closed, exact allocation
+    # #866 resolves every row owner against
+    # (``context_measurement_inventory.py::load_owner_map``,
+    # ``_owner_confirmed`` at ``:1264-1287``). The map's own header states the
+    # rule that makes it a scope rather than a hint: "every row is one exact file
+    # path; no prefix, glob, directory or 'anything under' scope is permitted,
+    # and the loader rejects ``*`` and any trailing ``/``"
+    # (``.github/work-units/context-measurement-owner-map.toml:17-18``), and the
+    # loader enforces it (``context_measurement_inventory.py:1245-1250``).
+    #
+    # It is loaded here, once, through the producer's own accepted loader -- the
+    # same call ``_producer_check`` already makes twice for its own
+    # ``owner_map_digest`` validation. It is NOT re-read per row: the result is
+    # read once here and the resulting path set is bound into the single owner
+    # proof record, so ``_reach_scope`` never touches the filesystem. Nothing is
+    # invented: these are the owner's own declared paths, verbatim.
+    try:
+        owner_map_mapping, owner_map_state, _owner_map_digest = producer.load_owner_map(root)
+    except producer.InventoryError as exc:
+        raise OracleError(
+            "OWNER_MAP_UNREADABLE",
+            f"the frozen owner map required by #{PRODUCER_ISSUE} could not be read for the "
+            f"canonical owner's declared scope: {exc.code}: {exc.detail}",
+        ) from exc
     for owner in sorted(CONSUMER_DEPENDENCY_CONTRACTS):
         contract = CONSUMER_DEPENDENCY_CONTRACTS[owner]
         if contract.role == "owner":
@@ -2800,20 +2826,47 @@ def evaluate(root: Path) -> OwnershipResult:
             # dependency conjuncts do not apply to it and a self-dependency is
             # never demanded.
             #
-            # The DEFINED AT paths travel in the proof because that is where the
+            # The DECLARED SCOPE travels in the proof because that is where the
             # proof actually lives: the owner of record has no closed dependency
             # contract and no self-dependency, so its canonical reach is proved
-            # by its definition site -- and a definition site is at a path.
-            # Collapsing that to a bare owner key is what let a #704 row at a
-            # path with no definition site read as canonical; keeping the
-            # measured paths makes the same single-definition-site fact askable
-            # per row. No new measurement and no widened rule: these are exactly
-            # the ``owner_sites`` paths measured a few lines above.
+            # by the exact file paths the accepted owner map allocates to it, and
+            # a declared path is a path. Collapsing that to a bare owner key is
+            # what once let a #704 row at any path read as canonical; keeping the
+            # measured paths makes the same closed allocation askable per row.
+            #
+            # The scope is the DECLARED allocation, not the set of definition
+            # sites. The two are different facts about different things: a
+            # definition site says where the port is written, while the owner map
+            # says where #704's measurement implementation is owned at all. #704
+            # owns four exact files -- ``envelope.rs``, ``lib.rs``, ``receipt.rs``
+            # and ``stu.rs`` -- but DEFINES the port in only two of them, and its
+            # own non-definition spans in the other two are the owner's, declared
+            # by the accepted map this audit is required to reconcile against
+            # ("reconcile new candidates through #866's existing rules and
+            # accepted owner map"). Case 22 says the canonical STU formula is
+            # accepted "only in its owner"; *its owner* is the declared
+            # ``source_paths`` entry, so that is the path the reach proof is
+            # asked at.
+            #
+            # Both measured facts travel in the record -- ``source_paths`` is the
+            # scope :func:`_reach_scope` reads, ``definition_paths`` the
+            # definition-site fact this run measured -- so the proof stays
+            # auditable rather than restating one of them.
+            _declared_scope = (
+                [
+                    str(p)
+                    for p in (owner_map_mapping or {}).get(owner, {}).get("source_paths", [])
+                ]
+                if owner_map_state == "SUPPLIED"
+                else []
+            )
             proven[owner] = {
                 "kind": "canonical-port-owner",
                 "port_symbol": contract.port_symbol,
                 "definition_proved_by": "canonical-owner",
                 "definition_paths": sorted({str(site["path"]) for site in owner_sites}),
+                "scope_proved_by": "frozen-owner-map",
+                "source_paths": sorted(_declared_scope),
             }
             continue
         owner_cargo = dependency["cargo_dependencies"].get(owner, {})
@@ -3168,12 +3221,12 @@ def _canonical_reach_proven(
     proved only at a path it actually called the port at; an
     ``approved-adapter`` proof is proved only at a path the adapter's measured
     Cargo metadata actually declared it at; a ``canonical-port-owner`` proof is
-    proved only at a path the canonical entry point is actually DEFINED at.
-    Every one of those is a fact this run already measured at a named path, so
-    scoping the lookup widens no rule and invents no field. Before this was
-    path-scoped, a row at one path inherited another path's proof from the same
-    owner -- a row whose own site carried no measurement evidence at all was
-    reported as a canonical consumer.
+    proved only at a path the accepted owner map actually DECLARES the owner at
+    (its exact ``source_paths``). Every one of those is a fact this run already
+    measured at a named path, so scoping the lookup widens no rule and invents
+    no field. Before this was path-scoped, a row at one path inherited another
+    path's proof from the same owner -- a row whose own site carried no
+    measurement evidence at all was reported as a canonical consumer.
     """
     if not dependency_proofs:
         return (False, "no consumer dependency proof was measured for this run")
@@ -3216,12 +3269,20 @@ def _reach_scope(proof: Mapping[str, Any]) -> set[str]:
         implementation of #704's port for one owner -- and this is where that is
         made a per-path claim instead of an inherited one.
     ``canonical-port-owner``
-        the paths at which the canonical measurement entry point is actually
-        DEFINED, as measured by :func:`_measurement_owner_sites`. The owner of
-        record has no closed dependency contract and no self-dependency: its
-        reach is proved by its definition site, and a definition site is at a
-        path. So this is not a widening of #704's proof -- it is the same
-        measured fact, asked per row instead of asked once.
+        the owner's DECLARED ``source_paths`` in the externally supplied frozen
+        owner map, as measured by :func:`producer.load_owner_map` and bound into
+        the proof record by ``evaluate``. The owner of record has no closed
+        dependency contract and no self-dependency, so its reach is proved by the
+        exact file paths the accepted owner map allocates to it. That map is a
+        closed, exact, per-owner scope by its own declared rule
+        (``context-measurement-owner-map.toml:17-18``: "every row is one exact
+        file path; no prefix, glob, directory or 'anything under' scope is
+        permitted"), which is what makes the declared paths -- and not the
+        definition sites -- the paths this proof is asked at. The owner's other
+        measured fact, its ``definition_paths``, still travels in the record and
+        is still what the single-definition-site finding is derived from; this
+        reader simply reads the scope, so #704's own non-definition spans inside
+        its declared files are proved at the paths the map declares them.
     """
     kind = str(proof.get("kind", ""))
     if kind == "canonical-port-call":
@@ -3231,7 +3292,7 @@ def _reach_scope(proof: Mapping[str, Any]) -> set[str]:
             if isinstance(site, str) and ":" in site
         }
     if kind == "canonical-port-owner":
-        return {str(p) for p in proof.get("definition_paths", [])}
+        return {str(p) for p in proof.get("source_paths", [])}
     if kind == "approved-adapter":
         return {str(p) for p in proof.get("cargo_dependency", [])}
     return set()
@@ -3655,7 +3716,8 @@ def render_text(result: OwnershipResult) -> str:
             lines.append(
                 f"  dependency[{owner}]   = canonical-port-owner "
                 f"{proof.get('port_symbol')} proved by {proof.get('definition_proved_by')} "
-                f"defined at {sorted(_reach_scope(proof))}"
+                f"defined at {sorted(proof.get('definition_paths', []))}, "
+                f"declared scope {sorted(_reach_scope(proof))}"
             )
         else:
             lines.append(
@@ -3995,26 +4057,70 @@ def run_self_test() -> int:
     assert _derive_baseline_disposition(_genuine, _proven_call) == "canonical-owner-consumer", (
         "the same owner at the proven path is still canonical -- scoping must not invert it"
     )
-    # The owner of record is proved by its DEFINITION SITE, which is at a path.
+    # The owner of record is proved at its DECLARED SCOPE -- the exact
+    # ``source_paths`` the accepted frozen owner map allocates to it -- not at
+    # its definition sites. Those are two different measured facts and this
+    # binds the difference, because #704 DECLARES four exact files while it
+    # DEFINES the port in only two of them: a row at ``receipt.rs`` or
+    # ``envelope.rs`` is inside the owner's declared scope with no definition
+    # site of its own, and a row at a path the map does not declare to #704 is
+    # outside the owner's scope entirely.
     _owner_proof = {
         "#704": {
             "kind": "canonical-port-owner",
             "port_symbol": CANONICAL_MEASUREMENT_PORT,
             "definition_proved_by": "canonical-owner",
-            "definition_paths": ["crates/smart/eliot-context-measurement/src/stu.rs"],
+            "scope_proved_by": "frozen-owner-map",
+            # #704's four DECLARED files, verbatim from the accepted owner map.
+            "source_paths": [
+                "crates/smart/eliot-context-measurement/src/envelope.rs",
+                "crates/smart/eliot-context-measurement/src/lib.rs",
+                "crates/smart/eliot-context-measurement/src/receipt.rs",
+                "crates/smart/eliot-context-measurement/src/stu.rs",
+            ],
+            # The port is DEFINED in only two of those four. The definition-site
+            # fact still travels in the record and is still measured; it is just
+            # not the scope the reach is asked at.
+            "definition_paths": [
+                "crates/smart/eliot-context-measurement/src/lib.rs",
+                "crates/smart/eliot-context-measurement/src/stu.rs",
+            ],
         }
     }
     _owner_row = dict(_genuine, owner="#704")
+    # A declared, non-definition file IS the owner's own scope.
     assert _derive_baseline_disposition(
         dict(_owner_row, path="crates/smart/eliot-context-measurement/src/stu.rs"),
         _owner_proof,
-    ) == "canonical-owner-consumer", "the owner's own definition-site row is canonical"
+    ) == "canonical-owner-consumer", "the owner's row at a declared path is canonical"
     assert _derive_baseline_disposition(
         dict(_owner_row, path="crates/smart/eliot-context-measurement/src/receipt.rs"),
         _owner_proof,
+    ) == "canonical-owner-consumer", (
+        "an owner-of-record row at a DECLARED path with no definition site of its own is "
+        "inside the owner's scope: the accepted owner map allocates that exact file to "
+        "#704, and 'only in its owner' means its declared source_paths entry"
+    )
+    # A path the accepted map does NOT declare to #704 is outside the scope,
+    # however close it is to the owner's crate.
+    assert _derive_baseline_disposition(
+        dict(_owner_row, path="crates/eliot-engine/src/skill_curator.rs"),
+        _owner_proof,
     ) == "explicit-unresolved", (
-        "an owner-of-record row at a path with no definition site is not proved by the "
-        "definition site elsewhere in the same crate"
+        "an owner-of-record row at a path the owner map does not declare to #704 is not "
+        "proved by the owner's declared scope elsewhere"
+    )
+    # A record that names no declared scope proves nothing at any path -- the
+    # per-kind reader is total, and a canonical-port-owner record with an empty
+    # ``source_paths`` is exactly the over-broad proof this reader exists to stop.
+    assert _derive_baseline_disposition(
+        _owner_row,
+        {"#704": {"kind": "canonical-port-owner", "definition_paths": [
+            "crates/smart/eliot-context-measurement/src/stu.rs",
+        ]}},
+    ) == "explicit-unresolved", (
+        "a canonical-port-owner record that names no declared source_paths proves nothing "
+        "at any path; the definition-site list alone is not the reach scope"
     )
     # (6) The declared-but-underived disposition is still never returned, by any
     # of the reachable shapes.
