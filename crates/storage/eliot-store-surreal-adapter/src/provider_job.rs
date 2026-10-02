@@ -177,11 +177,31 @@ where
 
 /// Launches one fixture-owned provider through [`spawn_provider_kill_on_close`].
 ///
-/// Every test starter in this repository that runs its own `surreal.exe`
-/// bootstrap — the kernel S-CONC harness, the adapter transaction-allocation
-/// suite, and every `prepare_initial_root_user` fixture — routes through this
-/// one function rather than through its own `Command::spawn()`. There is no
-/// second launch path to keep in step and no fixture that can leak by omission.
+/// The test starters routed through this one function so far are the kernel
+/// S-CONC harness, the S-CONC-TX bootstrap, the adapter transaction-allocation
+/// suite, and every `prepare_initial_root_user` fixture. They use it rather than
+/// their own `Command::spawn()`, so the assigned-set teardown is defined once.
+///
+/// # This is NOT yet every `surreal.exe` starter in the repository
+///
+/// A verification pass on this delivery found at least fourteen further launch
+/// paths still spawning `surreal.exe` with no Job Object, which the leak report
+/// marks "Survives external kill: YES": `start_surreal` in
+/// `crates/eliot-store/tests/{ul_dependency_activation,ul_token_policy,ul_observability_store}.rs`,
+/// `crates/eliot-engine/tests/{ul_observability_writer,ul_onboarding,ul_cue_firing,ul_admission_graph}.rs`,
+/// `crates/eliot-app/tests/{ul_observability_mcp,ul_cue_candidate,ul_contract_errors,multi_agent_access,first_working_loop}.rs`
+/// and `support/ul_t04.rs`, `Bootstrap::bootstrap` in the adapter's
+/// `epistemic_revision.rs` test and in `src/apply.rs` and `src/apply/read_boundary.rs`,
+/// the `payload_tests.rs` / `session.rs` / `session_pool.rs` harnesses, and
+/// `bootstrap_root_user` in `crates/kernel/eliot-kernel-service/src/store_gateway.rs`
+/// — which is a `src/` fixture rather than a test, and is among the orphans the
+/// package was raised for.
+///
+/// They stay open in `v2/issues/1888/REMAINING.md` under package K-STORE's
+/// consumer link. An earlier version of this comment claimed there was "no second
+/// launch path to keep in step and no fixture that can leak by omission"; that was
+/// false when written and is corrected here rather than left to mislead the next
+/// reader.
 ///
 /// # Errors
 ///

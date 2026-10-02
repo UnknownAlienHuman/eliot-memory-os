@@ -33,7 +33,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eliot_platform_windows::{WindowsAdapterError, WindowsPlatform};
 use eliot_store_surreal_adapter::{
@@ -45,6 +45,16 @@ type RefusalResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Interval at which liveness is re-read from the operating system.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long the parent waits for a refused launch's provider to be observed gone.
+///
+/// The bound is what makes the refusal half a proof rather than a hang: the claim
+/// under test is that a REFUSED launch leaves no provider behind, so a provider
+/// that never dies must fail as a named assertion rather than block a thread
+/// until the runner's own timeout reports an unexplained red. This is the same
+/// 60 s the sibling positive test uses for provider readiness, so it introduces
+/// no new policy number.
+const REAP_BOUND: Duration = Duration::from_secs(60);
 
 /// The pinned provider artifact every suite in this crate launches.
 const PINNED_SURREAL_EXE: &str = r"C:\Tools\SurrealDB\surreal.exe";
@@ -116,18 +126,30 @@ fn provider_is_running(process_id: u32) -> bool {
 
 /// Polls the operating system until it reports `process_id` absent.
 ///
-/// `BATCH.md` acceptance requires the provider pid to be "gone within a bounded
-/// wait" but names no number for that bound anywhere in the issue text or the
-/// docs, so none is invented: the assertion is exactly "the provider pid is
-/// gone, polled until the OS reports it absent". The loop returns only on a
-/// positive absence observation.
+/// # Panics
+/// Panics when the process is still present after [`REAP_BOUND`].
+///
+/// `BATCH.md` names no number for its "bounded wait", and none is invented as a
+/// POLICY number. But a test that cannot fail is not a proof, and an unbounded
+/// loop here would block a thread forever instead of failing: the refusal path's
+/// whole claim is that a refused launch leaves NO provider behind, and a
+/// provider that never dies must be a named assertion failure rather than a
+/// hang the runner eventually kills. The bound below is the same 60 s the
+/// sibling positive test uses for provider readiness.
 fn poll_until_absent(process_id: u32) -> bool {
     let platform = WindowsPlatform::new(std::env::temp_dir())
         .unwrap_or_else(|error| panic!("platform: {error}"));
+    let deadline = Instant::now() + REAP_BOUND;
     loop {
         if platform.process_identity(process_id).is_err() {
             return true;
         }
+        assert!(
+            Instant::now() < deadline,
+            "provider {process_id} is still present {}ms after the launch was refused: \
+             the refused launch left a provider running",
+            REAP_BOUND.as_millis(),
+        );
         std::thread::sleep(LIVENESS_POLL_INTERVAL);
     }
 }

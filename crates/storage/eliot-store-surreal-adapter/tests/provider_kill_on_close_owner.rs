@@ -58,6 +58,18 @@ const OWNER_PORT_ENV: &str = "ELIOT_1888_KSTORE_PORT";
 /// Interval at which the parent polls for the owner's report.
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long the parent waits for the operating system to report a killed
+/// provider's assigned set terminated.
+///
+/// This is the SAME 60 s this file already uses for provider readiness, so it
+/// introduces no new policy number. The bound is required, not decorative: an
+/// unbounded poll would mean that if the kill-on-close Job ever regressed - the
+/// exact failure package K-STORE exists to prevent - the test would block a
+/// thread forever instead of failing, and the runner's own timeout would report
+/// an unexplained red rather than a named assertion. A test that cannot fail is
+/// not a proof.
+const TERMINATION_BOUND: Duration = Duration::from_secs(60);
+
 /// File the owner publishes the provider pid under, inside the shared sandbox.
 const OWNER_REPORT_FILE: &str = "provider.pid";
 
@@ -142,16 +154,24 @@ fn provider_is_running(process_id: u32) -> bool {
 
 /// Polls the operating system until it reports `process_id` absent.
 ///
-/// No bound is invented here; see the module docs.
+/// # Panics
+/// Panics when the process is still present after [`TERMINATION_BOUND`]. The
+/// bound is what makes this a proof rather than a hang: see that constant's doc.
 fn poll_until_absent(process_id: u32) -> bool {
     let platform = WindowsPlatform::new(std::env::temp_dir())
         .unwrap_or_else(|error| panic!("process identity platform must bind: {error}"));
+    let deadline = Instant::now() + TERMINATION_BOUND;
     loop {
-        if platform.process_identity(process_id).is_ok() {
-            std::thread::sleep(PARENT_POLL_INTERVAL);
-        } else {
+        if platform.process_identity(process_id).is_err() {
             return true;
         }
+        assert!(
+            Instant::now() < deadline,
+            "provider {process_id} is still present {}ms after its owner was killed from \
+             outside: the kill-on-close Job did not terminate the assigned set",
+            TERMINATION_BOUND.as_millis(),
+        );
+        std::thread::sleep(PARENT_POLL_INTERVAL);
     }
 }
 
@@ -224,10 +244,7 @@ fn provider_owner_entrypoint() -> OwnerResult {
     let deadline = Instant::now() + Duration::from_secs(60);
     while TcpStream::connect(&bind_address).is_err() {
         if Instant::now() >= deadline {
-            return Err(std::io::Error::other(
-                "owner provider never accepted a connection",
-            )
-            .into());
+            return Err(std::io::Error::other("owner provider never accepted a connection").into());
         }
         std::thread::sleep(PARENT_POLL_INTERVAL);
     }
