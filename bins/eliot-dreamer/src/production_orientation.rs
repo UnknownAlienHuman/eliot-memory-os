@@ -616,7 +616,8 @@ fn check_carrier_deadline(deadline_unix_ms: u64) -> Result<(), PulseError> {
 ///
 /// Checks the admitted job/bundle/operation, task/`WorkScope`, complete
 /// `StateFence`, `CC-002` request/outcome/privacy bindings, `CC-004` binding,
-/// and every `CEP` handle against the declared shared identity, so
+/// every `CEP` handle, and — via [`check_curation_member_identity`] — the two
+/// curation-typed supply members against the declared shared identity, so
 /// compatible-looking fields
 /// from different snapshots cannot be stitched into one pulse. Returns the
 /// static field that refused. The validated candidate and sealed policy were
@@ -713,6 +714,175 @@ fn validate_identity_closure(
         handle
             .validate_for(&inputs.admitted_job.job)
             .map_err(|_| "cep handle binding")?;
+    }
+    check_curation_member_identity(inputs)?;
+    Ok(())
+}
+
+/// The shared task/scope/fence identity one pulse declares.
+#[derive(Clone, Copy)]
+struct DeclaredIdentity<'a> {
+    task_id: &'a str,
+    scope_id: &'a str,
+    state_fence: &'a StateFence,
+}
+
+impl<'a> DeclaredIdentity<'a> {
+    fn new(task_id: &'a str, scope_id: &'a str, state_fence: &'a StateFence) -> Self {
+        Self {
+            task_id,
+            scope_id,
+            state_fence,
+        }
+    }
+
+    /// Admits one labelled member's own identity into this closure.
+    ///
+    /// Compares CONTENT, not shape: a member that merely carries the right
+    /// fields proves nothing, so each value is compared against the declared
+    /// one. `task_id`/`scope_id` are exact identity and must match exactly;
+    /// the fence is compared for mutual compatibility, the same rule the
+    /// pulse's own members use, because that is what one authority epoch means
+    /// for a fence pair.
+    ///
+    /// The refusal names the member and the field, so a blocked result stays
+    /// specific instead of reporting one undifferentiated identity fault.
+    fn admits(&self, member: &NamedMember<'_>) -> Result<(), &'static str> {
+        if member.identity.task_id != self.task_id {
+            return Err(member.refusal("task"));
+        }
+        if member.identity.scope_id != self.scope_id {
+            return Err(member.refusal("scope"));
+        }
+        if !fences_compatible(member.identity.state_fence, self.state_fence) {
+            return Err(member.refusal("fence"));
+        }
+        Ok(())
+    }
+}
+
+/// One curation-typed member's own task/scope/fence identity.
+#[derive(Clone, Copy)]
+struct MemberIdentity<'a> {
+    task_id: &'a str,
+    scope_id: &'a str,
+    state_fence: &'a StateFence,
+}
+
+impl<'a> MemberIdentity<'a> {
+    fn new(task_id: &'a str, scope_id: &'a str, state_fence: &'a StateFence) -> Self {
+        Self {
+            task_id,
+            scope_id,
+            state_fence,
+        }
+    }
+}
+
+/// A member identity paired with the ledger member it belongs to.
+#[derive(Clone, Copy)]
+struct NamedMember<'a> {
+    label: &'static str,
+    identity: MemberIdentity<'a>,
+}
+
+impl<'a> NamedMember<'a> {
+    fn new(label: &'static str, identity: MemberIdentity<'a>) -> Self {
+        Self { label, identity }
+    }
+
+    /// The static refusal naming this member and the field that refused.
+    fn refusal(&self, field: &str) -> &'static str {
+        match (self.label, field) {
+            ("classification target", "task") => "classification target task",
+            ("classification target", "scope") => "classification target scope",
+            ("classification target", _) => "classification target fence",
+            ("classification acceptance", "task") => "classification acceptance task",
+            ("classification acceptance", "scope") => "classification acceptance scope",
+            ("classification acceptance", _) => "classification acceptance fence",
+            ("conflict item", "task") => "conflict item task",
+            ("conflict item", "scope") => "conflict item scope",
+            _ => "conflict item fence",
+        }
+    }
+}
+
+/// Joins the curation-typed supply members to the declared shared identity.
+///
+/// These two members are the only ledger members whose owner records arrive
+/// over the supply channel carrying their OWN task/scope/fence rather than
+/// borrowing the pulse's. `validate_identity_closure` re-proves the pulse's
+/// admitted records, but nothing compared these against the declared closure,
+/// so a `ClassificationInput` admitted for one task and a `ConflictSet`
+/// admitted for another could be stitched into a third task's pulse and still
+/// pass every existing check — exactly the "compatible-looking fields from
+/// different snapshots" the closure exists to prevent.
+///
+/// The Classification member's acceptance context is joined too, and its
+/// `job_class` deliberately is NOT: a curation acceptance context is a
+/// Curation-class admission — `validate_classification_acceptance` refuses any
+/// other class — so demanding it equal the pulse's Orientation class would be
+/// unsatisfiable by construction and would break every real curation job. Its
+/// task/scope/fence must still join this pulse, which is what coherence
+/// requires and what a curation admission for an unrelated task fails.
+fn check_curation_member_identity(
+    inputs: &ProductionOrientationInputs<'_>,
+) -> Result<(), &'static str> {
+    let declared = DeclaredIdentity::new(&inputs.task_id, &inputs.scope_id, &inputs.state_fence);
+    let classification = &inputs.classification;
+    let target = &classification.input.target;
+    let members = [
+        NamedMember::new(
+            "classification target",
+            MemberIdentity::new(
+                target.task_id.as_str(),
+                target.scope_id.as_str(),
+                &target.state_fence,
+            ),
+        ),
+        NamedMember::new(
+            "classification acceptance",
+            MemberIdentity::new(
+                classification.context.job.task_id.as_str(),
+                classification.context.job.scope_id.as_str(),
+                &classification.context.job.state_fence,
+            ),
+        ),
+        NamedMember::new(
+            "conflict item",
+            MemberIdentity::new(
+                &inputs.conflict.item.task_id,
+                &inputs.conflict.item.scope_id,
+                &inputs.conflict.item.state_fence,
+            ),
+        ),
+    ];
+    curation_identity(declared, &members, &inputs.conflict.conflict_set)
+}
+
+/// Compares every curation-typed member against the declared closure.
+///
+/// Split from the carrier read so the comparison itself is exercised directly:
+/// assembling a `ProductionOrientationInputs` in a test would mean fabricating
+/// the whole Governor supply channel, which is precisely the caller-built
+/// lookalike this module's contract refuses.
+fn curation_identity(
+    declared: DeclaredIdentity<'_>,
+    members: &[NamedMember<'_>],
+    conflict_set: &ConflictSet,
+) -> Result<(), &'static str> {
+    for member in members {
+        declared.admits(member)?;
+    }
+    if conflict_set.scope != declared.scope_id {
+        return Err("conflict set scope");
+    }
+    // A `None` task means the conflict is not task-localized, which the owner
+    // itself permits; a present task must be this pulse's task.
+    if let Some(task_id) = &conflict_set.task_id
+        && task_id.as_str() != declared.task_id
+    {
+        return Err("conflict set task");
     }
     Ok(())
 }
@@ -1102,4 +1272,266 @@ fn unusable_model_blocked(
         omissions: vec![reason.to_owned()],
         missing_owners: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod curation_member_identity_tests {
+    use eliot_contracts::{
+        EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence, TaskId,
+    };
+    use eliot_epistemic_contracts::{
+        ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictPosition, ConflictSetParams,
+    };
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU64;
+
+    use super::*;
+
+    const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence(sequence: u64) -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(LINEAGE).expect("valid lineage"),
+                NonZeroU64::new(sequence).expect("nonzero sequence"),
+            )
+            .expect("valid epoch"),
+            ResourceGeneration::genesis(),
+        )
+    }
+
+    /// A conflict set over the declared scope, optionally task-localized.
+    ///
+    /// Carries two real positions so the owner's own denominator rules
+    /// (`positions` non-empty, denominator at least two, `owners` non-empty)
+    /// hold: this fixture must be refused only by the identity closure under
+    /// test, never by the owner's shape validation.
+    fn conflict_set_over(task: Option<&str>) -> ConflictSet {
+        let owner = SourceId::new("owner-1").expect("valid owner");
+        let rival = SourceId::new("owner-2").expect("valid rival");
+        ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-1".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: task.map(|value| TaskId::new(value).expect("valid task")),
+            positions: vec![
+                ConflictPosition::new(
+                    owner.clone(),
+                    "first position",
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+                ConflictPosition::new(
+                    rival.clone(),
+                    "second position",
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                    false,
+                )
+                .expect("valid position"),
+            ],
+            missing_positions: Vec::new(),
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([owner.clone(), rival.clone()]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::new(),
+            unresolved_owners: BTreeSet::new(),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: owner,
+            affected_actions: Vec::new(),
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: "a".repeat(64),
+        })
+        .expect("valid conflict set")
+    }
+
+    /// Every curation-typed member admitted under one task, scope and fence.
+    fn check(
+        declared_fence: &StateFence,
+        task: &str,
+        scope: &str,
+        member_fence: &StateFence,
+        conflict_set: &ConflictSet,
+    ) -> Result<(), &'static str> {
+        let declared = DeclaredIdentity::new("task-1", "scope-1", declared_fence);
+        let member = MemberIdentity::new(task, scope, member_fence);
+        let members = [
+            NamedMember::new("classification target", member),
+            NamedMember::new("classification acceptance", member),
+            NamedMember::new("conflict item", member),
+        ];
+        curation_identity(declared, &members, conflict_set)
+    }
+
+    /// The positive case: a curation member admitted under exactly the declared
+    /// task, scope and fence joins the closure.
+    ///
+    /// A curation acceptance context is a Curation-class admission, so this
+    /// also pins that the check compares identity CONTENT and never the
+    /// pulse's own `job_class` against the member's.
+    #[test]
+    fn curation_member_over_the_declared_identity_is_admitted() {
+        let admitted = fence(1);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-1",
+                "scope-1",
+                &admitted,
+                &conflict_set_over(Some("task-1")),
+            ),
+            Ok(()),
+            "a member over the declared identity must join the closure"
+        );
+    }
+
+    /// The refusal case for task: a member admitted for ANOTHER task is
+    /// refused even though it carries the right fields and a compatible fence.
+    ///
+    /// Shape is not identity: only the task content differs, which is exactly
+    /// the cross-snapshot stitch the closure exists to prevent.
+    #[test]
+    fn curation_member_over_another_task_is_refused() {
+        let admitted = fence(1);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-other",
+                "scope-1",
+                &admitted,
+                &conflict_set_over(Some("task-1")),
+            ),
+            Err("classification target task"),
+            "a foreign task must be refused and must name the member"
+        );
+    }
+
+    /// The refusal case for scope: same task, same compatible fence, wrong
+    /// scope. Proves the comparison is per-field and not one coarse flag.
+    #[test]
+    fn curation_member_over_another_scope_is_refused() {
+        let admitted = fence(1);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-1",
+                "scope-other",
+                &admitted,
+                &conflict_set_over(Some("task-1")),
+            ),
+            Err("classification target scope"),
+            "a foreign scope must be refused"
+        );
+    }
+
+    /// The refusal case for the fence: identical task and scope, but a fence
+    /// from a different authority epoch.
+    ///
+    /// Fence compatibility is the same mutual rule the pulse's own members
+    /// use, so a differing epoch sequence must not be admitted.
+    #[test]
+    fn curation_member_over_another_epoch_is_refused() {
+        let admitted = fence(1);
+        let other_epoch = fence(2);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-1",
+                "scope-1",
+                &other_epoch,
+                &conflict_set_over(Some("task-1")),
+            ),
+            Err("classification target fence"),
+            "an incompatible fence must be refused"
+        );
+    }
+
+    /// The refusal case for the curation acceptance context alone: the target
+    /// and the item join, but the acceptance admission is for another task.
+    ///
+    /// The acceptance context is a separate admission from the retained input,
+    /// so it is the one place a curation job could otherwise be joined from an
+    /// unrelated task while every other member looks coherent.
+    #[test]
+    fn classification_acceptance_over_another_task_is_refused() {
+        let admitted = fence(1);
+        let declared = DeclaredIdentity::new("task-1", "scope-1", &admitted);
+        let joined = MemberIdentity::new("task-1", "scope-1", &admitted);
+        let members = [
+            NamedMember::new("classification target", joined),
+            NamedMember::new(
+                "classification acceptance",
+                MemberIdentity::new("task-other", "scope-1", &admitted),
+            ),
+            NamedMember::new("conflict item", joined),
+        ];
+        assert_eq!(
+            curation_identity(declared, &members, &conflict_set_over(Some("task-1"))),
+            Err("classification acceptance task"),
+            "a curation acceptance for another task must be refused"
+        );
+    }
+
+    /// The refusal case for the conflict item alone: the classification members
+    /// join, but the validated curation item is bound to another scope.
+    #[test]
+    fn conflict_item_over_another_scope_is_refused() {
+        let admitted = fence(1);
+        let declared = DeclaredIdentity::new("task-1", "scope-1", &admitted);
+        let joined = MemberIdentity::new("task-1", "scope-1", &admitted);
+        let members = [
+            NamedMember::new("classification target", joined),
+            NamedMember::new("classification acceptance", joined),
+            NamedMember::new(
+                "conflict item",
+                MemberIdentity::new("task-1", "scope-other", &admitted),
+            ),
+        ];
+        assert_eq!(
+            curation_identity(declared, &members, &conflict_set_over(Some("task-1"))),
+            Err("conflict item scope"),
+            "a conflict item bound to another scope must be refused"
+        );
+    }
+
+    /// A conflict set with NO task is task-unlocalized, which the owner itself
+    /// permits, so it must be admitted rather than refused for absence.
+    #[test]
+    fn task_unlocalized_conflict_set_is_admitted() {
+        let admitted = fence(1);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-1",
+                "scope-1",
+                &admitted,
+                &conflict_set_over(None),
+            ),
+            Ok(()),
+            "a set with no task is task-unlocalized and must be admitted"
+        );
+    }
+
+    /// The refusal case for a conflict set carrying a FOREIGN task: the owner
+    /// permits `None`, so only a present foreign task is refused.
+    #[test]
+    fn conflict_set_carrying_a_foreign_task_is_refused() {
+        let admitted = fence(1);
+        assert_eq!(
+            check(
+                &admitted,
+                "task-1",
+                "scope-1",
+                &admitted,
+                &conflict_set_over(Some("task-other")),
+            ),
+            Err("conflict set task"),
+            "a set carrying a foreign task must be refused"
+        );
+    }
 }
