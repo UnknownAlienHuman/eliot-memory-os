@@ -442,6 +442,16 @@ struct OperatorSessionBinding {
     capabilities: Vec<String>,
     challenge_peer: Option<ProcessIdentity>,
     redeemed_peer: Option<ProcessIdentity>,
+    /// Windows SID the OS named-pipe server reported for the redeeming peer,
+    /// recorded from the live authenticated pipe at redemption. It is absent
+    /// until redemption, so a row that was never redeemed on an observed peer
+    /// can never name a principal for a state-changing request.
+    redeemed_windows_sid: Option<String>,
+    /// Interactive logon Session the OS named-pipe server reported for the
+    /// redeeming peer, recorded from that same live authenticated pipe. It is
+    /// the owner of the session half of every Human authority built for this
+    /// row, distinct from the launch declaration's declared session above.
+    redeemed_interactive_session_id: Option<String>,
     redeemed: bool,
     /// The broker-local registration epoch the *core* held its handoff ledger
     /// under when this row was inserted. It is recorded from the live
@@ -508,6 +518,62 @@ impl OperatorClientBinding {
 }
 
 impl HumanStateAuthority {
+    /// Builds the authenticated Human authority for one state-changing request
+    /// out of the owners that observed it, and out of nothing else.
+    ///
+    /// This is the only construction site of a [`HumanStateAuthority`], and it
+    /// is a broker one: the request line is never an input to it. Every field
+    /// is read back from the owner that proved it —
+    ///
+    /// * `principal` and `interactive_session_id` from the Windows SID and
+    ///   logon Session the OS named-pipe server reported for the redeeming
+    ///   peer on the live authenticated pipe
+    ///   ([`OperatorSessionBinding::redeemed_windows_sid`] and
+    ///   [`OperatorSessionBinding::redeemed_interactive_session_id`], recorded
+    ///   in [`BrokerComposition::redeem_operator_handoff`]);
+    /// * `role` and `capabilities` from the exact grant the broker admitted for
+    ///   that binding ([`OperatorSessionBinding::role`] /
+    ///   [`OperatorSessionBinding::capabilities`]), which is the same grant the
+    ///   Kernel minted its session token against;
+    /// * `kernel_session_token` from the value the Kernel issued for this
+    ///   binding ([`OperatorSessionBinding::kernel_session_token`], recorded
+    ///   from [`BrokerComposition::kernel_session_token_grant`]), never from
+    ///   the presented copy;
+    /// * `approval_hash` from the Approver's own claim, which is the one field
+    ///   no owner in this crate holds an independent value for. It is carried
+    ///   verbatim and no more: it is a claim, and
+    ///   `BrokerComposition::admit_human_state_change` still refuses it by
+    ///   name because this broker cannot derive the approved action digest.
+    ///
+    /// Nothing is defaulted, guessed or synthesized. A row that was never
+    /// redeemed against an OS-observed peer has no observed principal or
+    /// session to read, so it is refused here instead of being given a value.
+    fn from_redeemed_binding(
+        row: &OperatorSessionBinding,
+        approval_hash: &str,
+    ) -> Result<Self, CompositionError> {
+        let principal = row.redeemed_windows_sid.clone().ok_or_else(|| {
+            BrokerAdmissionRefusal::HumanPrincipalRequired.with_platform(
+                "redeemed binding retains no OS-observed Windows SID, so it can name no Human principal",
+            )
+        })?;
+        let interactive_session_id = row.redeemed_interactive_session_id.clone().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorBindingCrossSession.with_platform(
+                "redeemed binding retains no OS-observed logon Session",
+            )
+        })?;
+        let authority = Self {
+            principal,
+            interactive_session_id,
+            role: row.role.clone(),
+            capabilities: row.capabilities.clone(),
+            approval_hash: approval_hash.to_owned(),
+            kernel_session_token: row.kernel_session_token.clone(),
+        };
+        authority.validate()?;
+        Ok(authority)
+    }
+
     fn validate(&self) -> Result<(), CompositionError> {
         if !is_bounded_text(&self.principal) {
             return Err(
@@ -2017,6 +2083,12 @@ impl BrokerComposition {
                 capabilities: endpoint.capabilities.clone(),
                 challenge_peer: None,
                 redeemed_peer: None,
+                // The OS-observed peer tuple exists only once a redeemed peer
+                // has actually been seen on a live authenticated pipe. An
+                // issued-but-unchallenged binding names none, so it cannot be
+                // matched by principal or session at a state change.
+                redeemed_windows_sid: None,
+                redeemed_interactive_session_id: None,
                 redeemed: false,
                 core_ledger_broker_epoch: live.user_broker_epoch,
                 core_ledger_interactive_session_id: live.interactive_session_id.clone(),
@@ -2296,6 +2368,12 @@ impl BrokerComposition {
             .get_mut(&endpoint.handoff_nonce)
         {
             stored.redeemed_peer = Some(peer.process().clone());
+            // The principal and session a Human authority for this row will
+            // carry are the ones the OS reported for the connected peer on this
+            // pipe, recorded from the observation itself rather than from the
+            // caller's JSON or from the launch declaration's declared tuple.
+            stored.redeemed_windows_sid = Some(peer.sid().to_owned());
+            stored.redeemed_interactive_session_id = Some(peer.session_id().to_string());
             stored.redeemed = true;
         }
         self.operator_session_bindings.retain(|nonce, stored| {
@@ -2390,18 +2468,28 @@ impl BrokerComposition {
     /// then dispatched on the existing typed Kernel path, where approval
     /// semantics stay Kernel-canonicalized:
     ///
-    /// * the principal must be present and must be the Windows SID this
-    ///   broker session was admitted for (omitted or foreign principals are
-    ///   refused);
+    /// The authority is not taken from the request. `authority` is the
+    /// request's *claim* about who it acts as, and this gate builds the
+    /// authority it admits with
+    /// `HumanStateAuthority::from_redeemed_binding` out of the owners that
+    /// observed it — the OS-observed named-pipe peer that redeemed the binding
+    /// and the Kernel-issued session token of that binding — and admits the
+    /// claim only where it agrees with that construction. Fields with no owner
+    /// are refused rather than filled, so a row whose peer was never observed
+    /// cannot name a principal at all.
+    ///
+    /// * the claim must be present and must name the Windows SID this broker
+    ///   session was admitted for (omitted or foreign principals are refused);
     /// * the presented Kernel session token must be the current token of a
     ///   redeemed binding in this session, inside that token's own lease, and
     ///   the registration that binding was issued under must still be the live
     ///   one (missing, expired, or foreign tokens refused);
-    /// * the presented SID/Session must equal the bound tuple
+    /// * the presented SID/Session must equal the tuple the OS observed for the
+    ///   redeeming peer of that binding, and this broker's own admitted session
     ///   (cross-session requests refused);
-    /// * the presented role/capabilities must be covered by a redeemed
-    ///   Kernel-backed binding for that live session (capability expansion
-    ///   refused);
+    /// * the presented role/capabilities must equal the granted set of a
+    ///   redeemed Kernel-backed binding for that live session (capability
+    ///   expansion refused);
     /// * the presented approval hash must be one exact lowercase SHA-256 *and*
     ///   must be provably the digest of the action this broker performs. A hash
     ///   that is merely well-formed is refused: this broker holds no
@@ -2451,8 +2539,13 @@ impl BrokerComposition {
                 && row.kernel_registration_digest == live.registration_digest
                 && row.kernel_session_token == authority.kernel_session_token
                 && row.kernel_session_expires_at > now
-                && row.windows_sid == authority.principal
-                && row.interactive_session_id == authority.interactive_session_id
+                // Matched against the SID/session the OS reported for the
+                // redeeming peer on the live pipe, not against the launch
+                // declaration's declared tuple: the binding that grants
+                // authority is one this broker observed authenticate a peer.
+                && row.redeemed_windows_sid.as_deref() == Some(authority.principal.as_str())
+                && row.redeemed_interactive_session_id.as_deref()
+                    == Some(authority.interactive_session_id.as_str())
         });
         let Some(granted) = granted else {
             return Err(
@@ -2470,7 +2563,16 @@ impl BrokerComposition {
         };
         let artifact = self.operator_artifact()?;
         Self::observe_operator_client(redeemed_peer, &artifact)?;
-        if authority.role != granted.role || authority.capabilities != granted.capabilities {
+        // The authority this gate admits is BUILT by this broker from the
+        // owners above, not taken from the request. The request's own copy is
+        // admitted only by agreeing with that construction field for field: its
+        // principal, session and Kernel token were matched against the
+        // observed peer and the Kernel-issued grant to select this row in the
+        // first place, and its role and capability set must equal the grant
+        // exactly. A capability outside the grant is refused, never narrowed.
+        let admitted =
+            HumanStateAuthority::from_redeemed_binding(granted, &authority.approval_hash)?;
+        if authority.role != admitted.role || authority.capabilities != admitted.capabilities {
             return Err(
                 BrokerAdmissionRefusal::HumanCapabilityNotGranted.with_platform(
                     "state-changing request role and capability set must exactly match the redeemed binding",
