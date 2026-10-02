@@ -977,6 +977,17 @@ const fn project_host_error_reason(error: &HostError) -> &'static str {
 /// text, zero, false) in a slot field are meaningless unless that flag
 /// reads false. Readers must check the flag first. Only actual owner
 /// state held at the construction site may support a positive assertion.
+///
+/// One slot additionally binds the runtime-control REQUEST identity through
+/// the SAME [`HostRequestIdentityCorrelation`] the terminal emission of that
+/// request's failure already carries, so the `host.request` record and the
+/// `host.terminal_error` record of one runtime-control operation are joined
+/// by exact `req_id`/`mutation`/`req` field equality rather than by stage
+/// order or adjacency (I13.11). It is a stored copy of that one projection —
+/// not a recomputation, not a digest, and not a second identity scheme — so a
+/// reader can never see the two records disagree about the owner-issued
+/// handles. A projection built where no runtime-control request is in hand
+/// leaves the slot explicitly missing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostRequestProjection {
     evidence: HostRequestEvidence,
@@ -990,6 +1001,7 @@ pub struct HostRequestProjection {
     reason: Option<&'static str>,
     receipt_sequence: Option<u64>,
     receipt_exit: Option<i32>,
+    request_identity: Option<HostRequestIdentityCorrelation>,
 }
 
 impl HostRequestProjection {
@@ -1078,6 +1090,7 @@ impl HostRequestProjection {
             reason: None,
             receipt_sequence: None,
             receipt_exit: None,
+            request_identity: None,
         }
     }
 
@@ -1110,6 +1123,32 @@ impl HostRequestProjection {
     #[must_use]
     pub const fn with_process(mut self, process_id: u32) -> Self {
         self.process = Some(process_id);
+        self
+    }
+
+    /// Attaches the runtime-control request identity this record is about,
+    /// taken from the very same [`HostRequestIdentityCorrelation`] the
+    /// terminal emission of that request's failure carries.
+    ///
+    /// This is the log-to-log half of the kernel-restart correlation
+    /// (F-LOG-HOST-2, #893 D3): the `host.request` record emitted here and the
+    /// `host.terminal_error` record emitted for the same operation then carry
+    /// identical `req_id`/`mutation`/`req` values, so a reader joins them by
+    /// field equality, never by stage order or adjacency (I13.11: timeline
+    /// **and** correlation).
+    ///
+    /// Pass the projection the request's owner already built — nothing is
+    /// probed, hashed, synthesized, cached, or re-derived here, so the two
+    /// records cannot disagree about the owner-issued handles. It inherits that
+    /// projection's bounding ([`bound_field`], the one scheme in this facade)
+    /// and its nonsecret scope: three opaque request handles, never a
+    /// credential value, payload, path, connection string, nonce, or arbitrary
+    /// error text (I15.4). A projection built where no runtime-control request
+    /// is in hand simply omits this call and the slot renders explicitly
+    /// missing.
+    #[must_use]
+    pub fn with_request_identity(mut self, correlation: &HostRequestIdentityCorrelation) -> Self {
+        self.request_identity = Some(correlation.clone());
         self
     }
 
@@ -1153,6 +1192,7 @@ impl HostRequestProjection {
 pub fn observe_host_request(projection: &HostRequestProjection) {
     publish_projected_event_log_record(projection);
     let installation = projection.installation.as_ref();
+    let request_identity = projection.request_identity.as_ref();
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
         event = "host.request",
@@ -1179,6 +1219,23 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
         receipt_sequence_missing = projection.receipt_sequence.is_none(),
         receipt_exit = projection.receipt_exit.unwrap_or(0),
         receipt_exit_missing = projection.receipt_exit.is_none(),
+        // The runtime-control request identity, rendered under the exact
+        // `req_id`/`mutation`/`req` keys the single terminal record of the same
+        // operation carries, so the two records join by field equality rather
+        // than by stage order or adjacency (F-LOG-HOST-2, #893 D3; I13.11).
+        // Same bounding, same values: no recomputation, no second scheme.
+        req_id = request_identity.map_or("", |c| c.request_id.text()),
+        req_id_bytes = request_identity.map_or(0, |c| c.request_id.original_bytes()),
+        req_id_truncated = request_identity.is_some_and(|c| c.request_id.truncated()),
+        req_id_missing = request_identity.is_none(),
+        mutation = request_identity.map_or("", |c| c.mutation.text()),
+        mutation_bytes = request_identity.map_or(0, |c| c.mutation.original_bytes()),
+        mutation_truncated = request_identity.is_some_and(|c| c.mutation.truncated()),
+        mutation_missing = request_identity.is_none(),
+        req = request_identity.map_or("", |c| c.request.text()),
+        req_bytes = request_identity.map_or(0, |c| c.request.original_bytes()),
+        req_truncated = request_identity.is_some_and(|c| c.request.truncated()),
+        req_missing = request_identity.is_none(),
         "host request projection"
     );
 }
