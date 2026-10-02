@@ -1,5 +1,5 @@
 use crate::StoreError;
-use eliot_types::SurrealServerConfig;
+use eliot_types::{StrictJsonErrorKind, SurrealServerConfig, strict_json_has_no_duplicate_members};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,39 @@ impl SurrealRpcTransport {
     }
 }
 
+/// Decodes one RPC response frame, refusing a lexical duplicate object member
+/// before the response id is read (#937, #938, #940).
+///
+/// `serde_json::from_str` collapses a repeated member to last-wins the instant
+/// raw bytes become a `serde_json::Value`: this workspace builds
+/// `serde_json::Map` without the `preserve_order` feature, so `Map` is a
+/// `BTreeMap`. The call sites above then compare `response.id` against the
+/// request id, so a duplicate-keyed frame was already an admission and routing
+/// decision by the time any closed record in this crate could be validated.
+/// Every decoder downstream therefore could not distinguish a duplicate
+/// document from its last-wins equivalent, including the
+/// `deny_unknown_fields` activation-graph rows that name this function as the
+/// transport ingress owner whose byte-level guarantee they deliberately do not
+/// claim (`crates/eliot-store/src/canonical_activation_graph_models.rs`).
+///
+/// This is the single raw-ingress gate for both the text and the binary frame
+/// path, and it is a thin reuse of the shared `eliot_types::strict_json`
+/// decoder — the same implementation `canonical_record.rs` consumes. It is not
+/// a second parser, and it is not an extra per-call-site check. The typed decode
+/// below is unchanged, so a duplicate member is refused and a duplicate-free
+/// document keeps every previously accepted byte.
+///
+/// Named absence: these frames have no ELIOT-owned byte ceiling. Nothing in this
+/// crate sets `WebSocketConfig`, `max_message_size` or `max_frame_size`, so only
+/// the tungstenite library default bounds a frame. This gate therefore uses the
+/// shared decoder's no-ceiling entry point rather than inventing a `max_bytes`
+/// that no requirement states; the bytes are already received and resident
+/// here, so a ceiling at this point could only newly refuse large but
+/// legitimate query results. An ELIOT-owned response ceiling remains unowned.
 fn parse_response(text: &str) -> Result<RpcResponse, StoreError> {
+    strict_json_has_no_duplicate_members(text.as_bytes())
+        .map_err(|error| StoreError::Decode(error.kind.as_str().to_owned()))?;
+
     serde_json::from_str(text).map_err(|error| StoreError::Decode(error.to_string()))
 }
 
