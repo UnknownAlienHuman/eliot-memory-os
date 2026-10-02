@@ -927,7 +927,7 @@ mod tests {
                 reason: "exceeds the bounded identity length"
             }
         );
-        assert!(!refused.to_string().contains('64'));
+        assert!(!refused.to_string().contains("64"));
     }
 
     #[test]
