@@ -7280,13 +7280,11 @@ impl HostComposition {
         // phase: that is precisely the fabrication the explicit `*_missing`
         // dispositions exist to prevent, and it would render an identity the
         // owner does not hold. They stay explicitly missing in the record.
-        host_terminal.bind_operation(
-            host_diagnostics::HostTerminalCorrelation::partially_bound(
-                Some(request.operation_id.as_str()),
-                None,
-                None,
-            ),
-        );
+        host_terminal.bind_operation(host_diagnostics::HostTerminalCorrelation::partially_bound(
+            Some(request.operation_id.as_str()),
+            None,
+            None,
+        ));
         // Route through the shared dispatch validation before delegating:
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
