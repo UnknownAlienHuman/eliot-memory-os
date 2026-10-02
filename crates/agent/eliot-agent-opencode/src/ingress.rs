@@ -31,6 +31,31 @@
 //!   verifies it with its own copy of that credential; a foreign loopback
 //!   listener without the credential cannot manufacture a usable permit.
 //!
+//! # Reconciling a lost response against the OWNER's durable record
+//!
+//! An exact retry or a lost HTTP response must return the one durable event and
+//! the one durable decision, and must never perform a second policy evaluation
+//! of an operation that already holds one. The reconciliation authority is the
+//! OWNER's persisted record, reached through the existing bridge-event route's
+//! own idempotency — never process memory:
+//!
+//! * The route answers `Duplicate` only after comparing the presented
+//!   canonical envelope against the durable row it holds (identity, sequence,
+//!   producer, generation, authority epoch, representation and provenance).
+//!   That answer is the read-back: it proves the row holds precisely the
+//!   presented bytes, so the record travelling back to the handler *is* the
+//!   persisted decision.
+//! * A stored record therefore reaches the handler only with the owner's
+//!   `Duplicate` behind it; an in-memory candidate is only ever re-presented,
+//!   and a bridge restart costs at most one extra route round trip, never a
+//!   lost decision and never an `Unavailable` that would surface as a
+//!   retryable `503` inviting resubmission of settled content.
+//! * [`classify_decision_replay`] then adjudicates the request-derived
+//!   bindings against that persisted record leg by leg. Identical bindings
+//!   replay the original answer; any difference under the same operation
+//!   identity is the determined `IDENTITY_CONFLICT` of I5.27, which performs
+//!   no transition.
+//!
 //! # First-contact server authentication
 //!
 //! Plain loopback location is not server identity, so the request credential
@@ -786,18 +811,21 @@ pub struct HostEventAdmissionReceipt {
     pub fence_id: String,
     /// Bridge generation bound from current owner state.
     pub bridge_generation: u64,
-    /// Stored effect decision when this admission already committed one for
-    /// this exact operation identity (issue #2898, step 10).
+    /// The OWNER's persisted effect decision for this exact operation
+    /// identity, read back from the durable route (issue #2898, step 10).
     ///
-    /// This is a process-local cache of what the owner already holds, not the
-    /// authority: it spares one durable round trip when the same process
-    /// serves a retry. The authority is always the owner's durable record,
-    /// which reconciles a retry that crossed a bridge restart through the
-    /// route's own idempotency answer on
-    /// [`HostEventAdmission::commit_decision`]. The returned record is what
-    /// the handler compares by content against the decision this request would
-    /// produce, so a changed effect, scope, fence, generation or policy
-    /// revision under one identity is a determined conflict.
+    /// `Some` only when the route's own ORS idempotency answered `Duplicate`
+    /// for the exact canonical decision envelope this admission re-presented,
+    /// which is the owner's proof that its durable row holds precisely this
+    /// persisted content. Process memory is never the authority: an
+    /// implementation may keep a candidate in memory only as a hint to
+    /// re-present, and the returned record is the one the owner proved.
+    ///
+    /// The returned record is what the handler compares by identity and
+    /// binding against the decision this request would produce (see
+    /// [`classify_decision_replay`]), so a changed effect, scope, fence,
+    /// generation, event commitment or policy revision under one identity is a
+    /// determined conflict rather than a replay.
     pub replayed_decision: Option<EffectDecisionRecord>,
 }
 
@@ -925,13 +953,26 @@ pub trait HostEventAdmission {
     /// identity, through the same durable bridge-event route
     /// (issue #2898, step 10).
     ///
-    /// The route's own ORS idempotency answers: the same operation identity
-    /// carrying the same decision content replays the stored record
-    /// (`replayed_decision` set to that stored value), and the same identity
-    /// carrying changed content is a determined conflict
-    /// ([`HostEventAdmissionFailure::Conflict`]) that performs no transition.
-    /// An exact retry or a lost response therefore produces one durable event
-    /// and one decision, never a second policy evaluation.
+    /// This operation is also the OWNER's decision read-back, and the route's
+    /// own ORS idempotency is the only authority it may use:
+    ///
+    /// * the route answers `Duplicate` for the same operation identity
+    ///   carrying the same decision content, and the returned receipt then
+    ///   carries `replayed_decision` set to that **persisted** record — the
+    ///   owner's proof that its durable row holds exactly these canonical
+    ///   bytes. An exact retry or a lost response therefore reconciles the one
+    ///   durable decision, never a second policy evaluation and never a second
+    ///   durable write, and it must never be reported as `Unavailable`;
+    /// * the route answers fresh for an operation identity it holds nothing
+    ///   for, and the receipt then reports `replayed_decision: None`, because
+    ///   nothing was replayed;
+    /// * the same identity carrying changed content is a determined conflict
+    ///   ([`HostEventAdmissionFailure::Conflict`]) that performs no
+    ///   transition.
+    ///
+    /// An implementation may hold a candidate decision in process memory, but
+    /// only to re-present it: a stored record may never be reported without
+    /// the route having answered `Duplicate` for these exact bytes.
     fn commit_decision(
         &mut self,
         record: &EffectDecisionRecord,
@@ -1168,18 +1209,28 @@ pub enum DecisionReplay {
     Conflict,
 }
 
-/// Classifies a presented decision record against the stored original.
+/// Classifies a presented decision record against the OWNER's persisted one.
 ///
-/// The comparison is on **content**, not on identity existence: the stored
-/// and presented `content_digest` values are computed from the two records'
-/// own bound fields and compared. Equal digests mean every bound field
-/// (effect, task, fence, both generations, policy/authority revision,
-/// decision, expiry, and both receipt commitments) is the same, so the
-/// original decision replays without a second evaluation. A different digest
-/// under the same operation identity is `Conflict` and performs no
-/// transition. A lost response reconciles the original operation through
-/// this comparison, never through the legacy process transport or a second
-/// decision evaluation.
+/// The comparison is an **identity/binding comparison against the persisted
+/// record's own bound fields**, leg by leg: the stable operation identity
+/// first, then every binding this decision is committed to — the canonical
+/// request hash, the recomputed effect digest, the exact tool, the task/scope,
+/// the bridge and `OpenCode` generations, the fence, the authority epoch, the
+/// policy and authority revisions, the decision, its closed refusal reason,
+/// the expiry, the durable event commitment, the decision commitment, and the
+/// reconciliation owner. It never asks "does a record exist", and it never
+/// substitutes a freshly recomputed digest for the stored bytes: a locally
+/// recomputed digest cannot observe what the owner persisted, and only these
+/// fields, read off the record the owner's idempotency proved, can.
+///
+/// Every leg equal means the presented content *is* the persisted content, so
+/// the original decision replays with no second durable write and no second
+/// authority. Any leg differing under the same operation identity is
+/// [`DecisionReplay::Conflict`]: a determined refusal that performs no
+/// transition, exactly as I5.27 requires for a reused idempotency key with a
+/// different canonical request hash. A lost response reconciles the original
+/// operation through this comparison, never through the legacy process
+/// transport.
 #[must_use]
 pub fn classify_decision_replay(
     stored: &EffectDecisionRecord,
@@ -1188,11 +1239,27 @@ pub fn classify_decision_replay(
     if stored.operation_id != presented.operation_id {
         return None;
     }
-    if stored.content_digest() == presented.content_digest() {
-        Some(DecisionReplay::Replay)
+    let same_binding = stored.request_hash == presented.request_hash
+        && stored.effect_digest == presented.effect_digest
+        && stored.tool == presented.tool
+        && stored.task_id == presented.task_id
+        && stored.bridge_generation == presented.bridge_generation
+        && stored.opencode_generation == presented.opencode_generation
+        && stored.fence_id == presented.fence_id
+        && stored.authority_epoch == presented.authority_epoch
+        && stored.policy_revision == presented.policy_revision
+        && stored.authority_revision == presented.authority_revision
+        && stored.decision == presented.decision
+        && stored.reason_code == presented.reason_code
+        && stored.expires_at_ms == presented.expires_at_ms
+        && stored.event_receipt == presented.event_receipt
+        && stored.decision_receipt == presented.decision_receipt
+        && stored.reconciliation_owner == presented.reconciliation_owner;
+    Some(if same_binding {
+        DecisionReplay::Replay
     } else {
-        Some(DecisionReplay::Conflict)
-    }
+        DecisionReplay::Conflict
+    })
 }
 
 /// Computes the canonical effect-request hash binding the exact fields a
@@ -2081,11 +2148,17 @@ where
         &receipt.envelope_digest,
     );
     if let Some(stored) = receipt.replayed_decision.clone() {
-        // A lost response reconciles the original operation: the stored
-        // decision is compared with the decision this request would produce.
-        // Same content replays the original answer with no second policy
-        // evaluation and no process-bridge fallback; changed content is a
-        // determined conflict that performs no transition.
+        // The admission already proved, through the route's own ORS
+        // idempotency, that this exact operation identity holds this exact
+        // persisted decision. A lost response reconciles the original
+        // operation here: the OWNER's persisted record is compared, identity
+        // and binding leg by leg, with the decision this request would produce.
+        //
+        // The `ActionGate` is deliberately not consulted on this path — the
+        // operation already holds a durable decision, so there is nothing left
+        // to evaluate. Identical bindings replay the original answer with no
+        // second evaluation and no process-bridge fallback; changed bindings
+        // are a determined conflict that performs no transition.
         let presented = presented_gate_decision(
             introduction,
             event_id,
@@ -2116,7 +2189,13 @@ where
         }
     };
     // Persist the decision with its exact decision identity before answering,
-    // so the durable event and its decision are one reconciled record.
+    // so the durable event and its decision are one reconciled record. This is
+    // also where a retry that crossed the process lifecycle is resolved: the
+    // route's own idempotency either proves this exact content is already the
+    // persisted one (the OWNER returns it and nothing is written twice) or
+    // proves the identity carries changed content (a determined conflict). The
+    // owner never answers `Unavailable` here, so a lost response can never
+    // turn into a retryable 503 that invites resubmitting settled content.
     let record = gate_decision_record(
         introduction,
         event_id,
@@ -2140,10 +2219,11 @@ where
     HttpOutcome::ok(encode_host_event_response(&fields, credential))
 }
 
-/// Answers one presented decision against the stored original it was matched
-/// with, by the same content comparison on both reconciliation paths: an exact
-/// content replay reproduces the original answer, and changed content under a
-/// known identity is a determined conflict that performs no transition.
+/// Answers one presented decision against the OWNER's persisted record it was
+/// matched with, by the same identity/binding comparison on both
+/// reconciliation paths: an exact binding replay reproduces the original
+/// answer, and changed bindings under a known identity are a determined
+/// conflict that performs no transition.
 fn reconcile_stored_decision(
     introduction: &OpenCodeBridgeIntroduction,
     event_id: &str,
@@ -2196,19 +2276,24 @@ fn gate_failure_outcome(
     }
 }
 
-/// Projects the decision identity this request presents for the stored
-/// original, without re-evaluating policy.
+/// Projects the decision identity this request presents for the OWNER's
+/// persisted record, without evaluating policy a second time.
 ///
 /// The request-derived bindings come from **this** request — the recomputed
 /// effect digest, the tool, the task/scope, the live bridge generation, the
 /// `OpenCode` generation, the fence, the authority epoch, the recomputed
-/// request hash and the durable event commitment. The evaluation facts come
-/// from the stored original, because a reconciled retry reuses the decision
-/// that was already made instead of evaluating a second one. The result is
+/// request hash and the durable event commitment. Those are the legs
+/// [`classify_decision_replay`] actually adjudicates on this path.
+///
+/// The evaluation legs (policy/authority revision, decision, refusal reason,
+/// expiry, decision commitment) are carried over from the persisted record
+/// because a reconciled retry reuses the decision the OWNER already holds
+/// instead of evaluating another one: they are not re-derived and not guessed,
+/// so they can never turn a replay into a conflict on their own. The result is
 /// therefore the exact record this request *would* have produced for the same
-/// operation: identical content for an exact retry (`Replay`), and a changed
-/// effect, argument set, scope, fence, generation or event commitment under
-/// the same operation identity yields different content (`Conflict`).
+/// operation — identical bindings for an exact retry (`Replay`), and a changed
+/// effect, argument set, scope, fence, generation, or event commitment under
+/// the same operation identity yields different bindings (`Conflict`).
 fn presented_gate_decision(
     introduction: &OpenCodeBridgeIntroduction,
     event_id: &str,

@@ -274,12 +274,14 @@ where
 /// Builds the admission receipt for one committed effect decision.
 ///
 /// The owner-state bindings come from the live attach fence the decision was
-/// admitted under, never reconstructed from the record. `stored` is the record
-/// the owner already held for this operation identity, and it is supplied only
-/// when the route proved that by answering `Duplicate` for these exact bytes;
-/// a freshly written decision passes `None`. The receipt's `replayed` flag and
-/// `duplicate` disposition are therefore both derived from that same proof, so
-/// the handler never reconciles a first evaluation against itself.
+/// admitted under, never reconstructed from the record. `stored` is the
+/// OWNER's persisted record for this operation identity, and it is supplied
+/// only when the route's own idempotency proved that by answering `Duplicate`
+/// for these exact canonical bytes; a freshly written decision passes `None`.
+/// The receipt's `replayed` flag and `duplicate` disposition are therefore
+/// both derived from that same owner answer, so the handler never reconciles a
+/// first evaluation against itself and never learns a stored record from
+/// process memory.
 fn decision_receipt(
     stream_id: String,
     event_id: String,
@@ -354,15 +356,21 @@ fn bridge_failure(error: &BridgeError) -> HostEventAdmissionFailure {
 /// owner-state join rules.
 pub struct BridgeHostEventAdmission<'runner> {
     runner: &'runner mut BridgeRunner,
-    /// Process-local **cache** of the effect decisions this admission already
-    /// committed, keyed by their exact operation identity.
+    /// Process-local **candidate** set of the effect decisions this admission
+    /// has already put through the route, keyed by their exact operation
+    /// identity.
     ///
-    /// This is a cache and never the authority: it spares one route round trip
-    /// when the same process serves a retry. The authority is always the
-    /// owner's durable record: the route's own ORS idempotency answers
-    /// `Duplicate` only when the presented envelope is byte-identical to the
-    /// stored durable one, so that answer — not this map — is what reconciles a
-    /// retry that crossed a bridge restart.
+    /// This is a hint and never the authority. It exists only so a retry
+    /// served by the same process can *re-present* the exact bytes without
+    /// rebuilding them, and it is emptied by a bridge restart. A record leaves
+    /// this set towards [`HostEventAdmissionReceipt::replayed_decision`] only
+    /// after the owner's durable route answered `Duplicate` for those exact
+    /// canonical bytes, so process memory can never make a replayed decision
+    /// appear. The authority is always the OWNER's persisted row: the route's
+    /// own ORS idempotency answers `Duplicate` only when the presented
+    /// envelope matches the stored durable one in identity, sequence, producer,
+    /// generation, authority epoch, representation and provenance, which is
+    /// what makes that answer a read-back of what was actually persisted.
     committed_decisions: BTreeMap<String, EffectDecisionRecord>,
 }
 
@@ -415,6 +423,99 @@ impl<'runner> BridgeHostEventAdmission<'runner> {
             ));
         }
         Ok(fence)
+    }
+
+    /// Returns whether one decision record is still bound to the live attach
+    /// fence. A decision made under a fence, generation or authority that has
+    /// since moved must never be re-presented or persisted: the write would
+    /// bind stale owner state.
+    fn decision_binds_live_fence(record: &EffectDecisionRecord, fence: &FencingToken) -> bool {
+        fence.nonce() == record.fence_id && fence.generation().get() == record.bridge_generation
+    }
+
+    /// Builds the durable decision envelope for one record under the live
+    /// attach fence, through the same closed, versioned payload type every
+    /// effect-decision commitment uses.
+    fn decision_envelope(
+        record: &EffectDecisionRecord,
+        epoch: &EpochId,
+    ) -> Result<EventEnvelope, HostEventAdmissionError> {
+        let generation = ResourceGeneration::new(record.bridge_generation)
+            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        let envelope = EventEnvelope {
+            stream_id: format!("{OPENCODE_DECISION_OWNER}.decisions"),
+            producer_id: HOST_EVENTS_DECISION_PRODUCER_ID.to_owned(),
+            producer_generation: generation,
+            authority_epoch: epoch.clone(),
+            event_id: record.operation_id.clone(),
+            // A decision is a per-operation commitment, not a stream position;
+            // its own content is what identifies it.
+            sequence: 1,
+            causal_predecessor_refs: Vec::new(),
+            delivery_class: DeliveryClass::DurableControl,
+            ack_required: true,
+            payload_type: HOST_EVENTS_DECISION_PAYLOAD_TYPE.to_owned(),
+            payload_or_blob_ref: EventPayload::Inline(Box::new(ProtocolPayload::Json(
+                record.to_json(),
+            ))),
+            state_fence: StateFence::new(epoch.clone(), generation),
+            trace_context: BTreeMap::new(),
+        };
+        envelope
+            .validate()
+            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        Ok(envelope)
+    }
+
+    /// Reads the OWNER's persisted decision for one exact operation identity.
+    ///
+    /// This is the durable read-back, and it is the only way a stored record
+    /// reaches a receipt. A candidate this process already produced is
+    /// re-presented through the same bridge-event route the decision is
+    /// committed on, and the record is returned **only** when the route's own
+    /// idempotency answers `Duplicate` for those exact canonical bytes — the
+    /// owner's proof that its durable row holds precisely this persisted
+    /// content. `None` means the owner holds nothing for this identity, and
+    /// changed content under a known identity is the determined
+    /// [`HostEventAdmissionFailure::Conflict`] carried by `bridge_failure`,
+    /// never an `Unavailable` and never a second record.
+    ///
+    /// A candidate that the owner does not hold yet is made durable by this
+    /// call, which is the completion of a write whose response was lost inside
+    /// this same process — not a new decision, and never a second one.
+    fn read_back_persisted_decision(
+        &mut self,
+        record: &EffectDecisionRecord,
+        epoch: &EpochId,
+        fence: &FencingToken,
+    ) -> Result<Option<EffectDecisionRecord>, HostEventAdmissionError> {
+        if !Self::decision_binds_live_fence(record, fence) {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Fenced,
+            ));
+        }
+        let envelope = Self::decision_envelope(record, epoch)?;
+        let status = self
+            .runner
+            .forward_event(&envelope)
+            .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
+        let EventForwardStatus::Durable {
+            phase, disposition, ..
+        } = status
+        else {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        };
+        if !matches!(
+            phase,
+            AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
+        ) {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        }
+        Ok(matches!(disposition, EventDisposition::Duplicate).then(|| record.clone()))
     }
 }
 
@@ -487,6 +588,24 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                         HostEventAdmissionFailure::Unavailable,
                     ));
                 }
+                let candidate = self.committed_decisions.get(&submission.event_id).cloned();
+                let replayed_decision = match candidate {
+                    // The durable read-back. The retained event carries no
+                    // decision yet, so the only question this admission can
+                    // answer for the handler is whether the OWNER already
+                    // persists a decision for this exact operation identity —
+                    // and it may answer that only by re-presenting the bytes
+                    // and taking the route's own `Duplicate`. A candidate that
+                    // survives that proof is the persisted decision, so a retry
+                    // served by this process takes the replay branch and the
+                    // `ActionGate` is never consulted a second time. With no
+                    // candidate in hand there is nothing to re-present, and the
+                    // owner alone decides the outcome on the commit below.
+                    Some(candidate) => {
+                        self.read_back_persisted_decision(&candidate, &epoch, &fence)?
+                    }
+                    None => None,
+                };
                 let admitted = HostEventAdmissionReceipt {
                     stream_id: submission.stream_id.clone(),
                     event_id: submission.event_id.clone(),
@@ -498,13 +617,7 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                     authority_epoch: epoch,
                     fence_id: fence.nonce().to_owned(),
                     bridge_generation: generation_value,
-                    // The retained event carries no decision yet: the decision
-                    // is committed under its own identity by `commit_decision`
-                    // once the Governor has evaluated it. A decision this
-                    // admission already committed for this exact operation is
-                    // returned here so a retry after a lost response reconciles
-                    // the original decision instead of evaluating a second one.
-                    replayed_decision: self.committed_decisions.get(&submission.event_id).cloned(),
+                    replayed_decision,
                 };
                 // #2899: the event is now in the owner's live journal, so a
                 // terminal invocation can be joined against the correlation it
@@ -534,52 +647,20 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
         // The decision must still be bound to the live owner state: a fence,
         // generation or authority that moved after the evaluation refuses the
         // write rather than persisting a decision under stale bindings.
-        if fence.nonce() != record.fence_id || fence.generation().get() != record.bridge_generation
-        {
+        if !Self::decision_binds_live_fence(record, &fence) {
             return Err(HostEventAdmissionError::of(
                 HostEventAdmissionFailure::Fenced,
             ));
         }
         let stream_id = format!("{OPENCODE_DECISION_OWNER}.decisions");
         let event_id = record.operation_id.clone();
-        if let Some(stored) = self.committed_decisions.get(&event_id) {
-            // This exact operation identity already holds a decision. The
-            // handler compares the presented record against this stored one by
-            // content, so a changed effect, scope, fence, generation or policy
-            // revision under one identity is refused without a second policy
-            // evaluation and without a second durable write.
-            return Ok(decision_receipt(
-                stream_id,
-                event_id,
-                epoch,
-                &fence,
-                Some(stored.clone()),
-            ));
-        }
-        let generation = ResourceGeneration::new(record.bridge_generation)
-            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
-        let envelope = EventEnvelope {
-            stream_id: stream_id.clone(),
-            producer_id: HOST_EVENTS_DECISION_PRODUCER_ID.to_owned(),
-            producer_generation: generation,
-            authority_epoch: epoch.clone(),
-            event_id: event_id.clone(),
-            // A decision is a per-operation commitment, not a stream position;
-            // its own content is what identifies it.
-            sequence: 1,
-            causal_predecessor_refs: Vec::new(),
-            delivery_class: DeliveryClass::DurableControl,
-            ack_required: true,
-            payload_type: HOST_EVENTS_DECISION_PAYLOAD_TYPE.to_owned(),
-            payload_or_blob_ref: EventPayload::Inline(Box::new(ProtocolPayload::Json(
-                record.to_json(),
-            ))),
-            state_fence: StateFence::new(epoch.clone(), generation),
-            trace_context: BTreeMap::new(),
-        };
-        envelope
-            .validate()
-            .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        // The route is asked every time, never a process-memory short cut: a
+        // stored decision may only be reported because the OWNER's idempotency
+        // proved these exact canonical bytes are the ones it persisted. A
+        // candidate held in memory buys nothing here that the owner does not
+        // already prove, so it cannot answer for the route even inside one
+        // process.
+        let envelope = Self::decision_envelope(record, &epoch)?;
         let status = self
             .runner
             .forward_event(&envelope)
@@ -592,13 +673,12 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionFailure::Unavailable,
             ));
         };
-        // Same-identity/different-content never reaches this arm either: the
-        // core route turns `Conflict` into
-        // `BridgeError::InvalidEventDisposition` before it builds a status, so
-        // the determined refusal is already carried by the `bridge_failure`
-        // mapping on the line above. The stored record is deliberately not
-        // disclosed to a conflicting presenter; it reconciles by replaying its
-        // own original content under the same identity.
+        // Same-identity/different-content never reaches this arm: the core route
+        // turns `Conflict` into `BridgeError::InvalidEventDisposition` before it
+        // builds a status, so the determined refusal is already carried by the
+        // `bridge_failure` mapping on the line above. The stored record is
+        // deliberately not disclosed to a conflicting presenter; it reconciles
+        // by replaying its own original content under the same identity.
         if !matches!(
             phase,
             AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
@@ -607,31 +687,29 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionFailure::Unavailable,
             ));
         }
-        // The owner's durable row is the authority on this outcome, and the
-        // `Duplicate` answer is what proves it.
+        // The OWNER's durable row is the authority on this outcome, and its
+        // `Duplicate` answer is the read-back of what was actually persisted.
         //
         // The route compares the stored row's envelope digest, sequence,
-        // producer, generation, authority epoch and privacy legs against these
-        // exact presented bytes and answers `Duplicate` only when every one of
-        // them agrees; any difference is the determined conflict carried by
+        // producer, generation, authority epoch, representation and provenance
+        // against these exact presented bytes and answers `Duplicate` only when
+        // every leg agrees; any difference is the determined conflict carried by
         // `bridge_failure`. So on `Duplicate` the presented record *is* the
-        // record the owner holds, byte for byte - which is precisely what
-        // reconciles a retry whose response was lost across a bridge restart.
-        // One durable event, one durable decision, no second write, and the
-        // handler reconciles against the record the owner actually holds rather
-        // than against this process's cache.
+        // record the owner holds, byte for byte, and it is returned as the
+        // persisted decision: one durable event, one durable decision, no
+        // second durable write, and never an `Unavailable` — so an exact retry
+        // or a lost response that crosses a bridge restart reconciles the
+        // original decision instead of failing closed with a retryable 503.
         let replayed = matches!(disposition, EventDisposition::Duplicate);
+        // The record is retained only as a candidate to re-present; a later
+        // report of it still requires the owner's `Duplicate`.
+        self.committed_decisions
+            .insert(event_id.clone(), record.clone());
         // A fresh write proves no replay happened, so it reports no replayed
         // decision. Returning the just-written record here would make the
         // handler reconcile a first evaluation against itself and report
         // `replayed: true` for a decision that was never replayed.
-        let replayed_decision = if replayed {
-            self.committed_decisions
-                .insert(event_id.clone(), record.clone());
-            Some(record.clone())
-        } else {
-            None
-        };
+        let replayed_decision = if replayed { Some(record.clone()) } else { None };
         Ok(decision_receipt(
             stream_id,
             event_id,
@@ -793,7 +871,12 @@ pub enum HostEventsStartup {
 /// exact endpoint this bridge incarnation will own. An unintroduced
 /// composition resolves [`HostEventsStartup::Unintroduced`] and no socket is
 /// ever opened.
-fn host_events_startup(
+///
+/// This is the composition decision itself, so it is `pub`: the package-local
+/// wiring/negative proof `bins/AGENTS.md` requires reaches the same resolver
+/// the shipped front door uses instead of a second implementation of it.
+#[must_use]
+pub fn host_events_startup(
     store: &BridgeIntroductionStore,
 ) -> Result<HostEventsStartup, HostEventsServiceError> {
     let Some(introduction) = store.current_introduction() else {
