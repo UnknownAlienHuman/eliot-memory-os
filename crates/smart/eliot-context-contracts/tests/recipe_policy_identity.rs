@@ -29,13 +29,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use eliot_context_contracts::{
-    BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind, ContextRecipePolicy,
-    ContextSectionBudget, CounterMetricMovement, LossPolicy, OmissionReason, ProtectedReservePolicy,
-    QualityDimension, RecipeAdmissionPolicy, RecipeApplicability,
+    BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind,
+    CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, ContextRecipePolicy, ContextSectionBudget,
+    CounterMetricMovement, EXECUTED_REPETITION_POLICY, LossPolicy, OmissionReason,
+    ProtectedReservePolicy, QualityDimension, RecipeAdmissionPolicy, RecipeApplicability,
     RecipeCounterMetric, RecipeExecutionContour, RecipeLayoutPolicy, RecipeOmissionPolicy,
     RecipeQualification, RecipeQualificationState, RecipeRolePosition, RecipeStage,
-    RecipeSupersession, CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, EXECUTED_REPETITION_POLICY,
-    SemanticRole,
+    RecipeSupersession, SemanticRole,
 };
 use eliot_contracts::{ArtifactId, ContractVersion, PolicyRevision};
 use eliot_receipts::ProtectedReserves;
@@ -212,7 +212,9 @@ fn recorded_digest_is_validated_against_policy_content() {
     other.policy_sha256 = other
         .canonical_policy_digest()
         .expect("other content digest");
-    other.validate().expect("other revision is independently valid");
+    other
+        .validate()
+        .expect("other revision is independently valid");
 
     let mut substituted = valid.clone();
     substituted.policy_sha256 = other.policy_sha256.clone();

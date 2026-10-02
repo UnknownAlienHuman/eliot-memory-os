@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{sha256_hex, SourceId};
+use eliot_contracts::{SourceId, sha256_hex};
 use eliot_epistemic_contracts::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictPosition, ConflictSet,
     ConflictSetParams, ContractError, MemberDisposition, MissingConflictPosition,
@@ -105,7 +105,11 @@ fn expect_refused(
         vec![absent(ABSENT)?],
     )?;
     control.validate()?;
-    assert_eq!(control.position_denominator(), 2, "{label}: control denominator");
+    assert_eq!(
+        control.position_denominator(),
+        2,
+        "{label}: control denominator"
+    );
     let refused =
         ConflictSet::new_with_missing_positions(params(unresolved_owners)?, records.clone());
     assert_eq!(
