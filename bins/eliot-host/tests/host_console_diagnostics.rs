@@ -41,13 +41,19 @@ fn host_console_boundaries_are_complete_and_singular() {
             .and_then(|next| next.rsplit("::").next())
             .unwrap_or_default();
         let code = code.trim().trim_end_matches(',');
-        assert!(!code.is_empty(), "terminal emission must name its typed code");
+        assert!(
+            !code.is_empty(),
+            "terminal emission must name its typed code"
+        );
         terminals.push((owner.clone(), code.to_owned()));
     }
     assert_eq!(
         terminals,
         vec![
-            ("main".to_owned(), "HOST_TERMINAL_CODE_CONSOLE_FAILED".to_owned()),
+            (
+                "main".to_owned(),
+                "HOST_TERMINAL_CODE_CONSOLE_FAILED".to_owned()
+            ),
             (
                 "fail_scm_dispatcher".to_owned(),
                 "HOST_TERMINAL_CODE_DISPATCHER_FAILED".to_owned()
