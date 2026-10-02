@@ -5485,12 +5485,6 @@ impl LocalReadExecutionEvidence {
                 lowercase_sha256(digest, field)?;
             }
         }
-        if self.actual_route.is_some() != self.actual_route_receipt.is_some() {
-            return Err(ProtocolError::InvalidField {
-                field: "local_read_execution_evidence.actual_route_receipt",
-                reason: "actual route digest and original receipt must be present together",
-            });
-        }
         if let Some(receipt) = &self.actual_route_receipt {
             validate_local_read_actual_route_receipt(self, receipt)?;
         }
@@ -6950,9 +6944,9 @@ mod tests {
         changed_executor.executor_identity = Some("caller-substituted-artifact".to_owned());
         assert!(changed_executor.validate().is_err());
 
-        let mut unpaired_route = evidence.clone();
-        unpaired_route.actual_route_receipt = None;
-        assert!(unpaired_route.validate().is_err());
+        let mut legacy_digest_only = evidence.clone();
+        legacy_digest_only.actual_route_receipt = None;
+        legacy_digest_only.validate()?;
 
         let mut malformed_activation = evidence;
         malformed_activation.activation_resolution_result = Some(serde_json::json!({

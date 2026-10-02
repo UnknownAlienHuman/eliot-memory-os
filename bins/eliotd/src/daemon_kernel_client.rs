@@ -434,11 +434,6 @@ fn retained_local_read_execution_evidence(
                 .to_owned(),
         ));
     }
-    if retained.actual_route.is_some() != retained.actual_route_receipt.is_some() {
-        return Err(KernelPortError::Contract(
-            "Kernel local read admission carries an unsealed route claim".to_owned(),
-        ));
-    }
     let attempt = retained
         .local_read_attempt
         .map(serde_json::from_value::<LocalReadAttempt>)
@@ -4097,6 +4092,22 @@ mod tests {
             )
             .is_err()
         );
+        let mut legacy_digest_only = retained.clone();
+        legacy_digest_only["actual_route_receipt"] = serde_json::Value::Null;
+        let (legacy_evidence, legacy_attempt) = retained_local_read_execution_evidence(
+            Some(&legacy_digest_only),
+            &operation_id,
+            &input_handle,
+            &output_handle,
+        )?;
+        let legacy_evidence = legacy_evidence.ok_or("legacy evidence carrier must be retained")?;
+        assert_eq!(
+            legacy_evidence.actual_route.as_deref(),
+            Some(receipt_digest.as_str())
+        );
+        assert!(legacy_evidence.actual_route_receipt.is_none());
+        assert_eq!(legacy_attempt, Some(attempt.clone()));
+
         let (forwarded, forwarded_attempt) = retained_local_read_execution_evidence(
             Some(&retained),
             &operation_id,
