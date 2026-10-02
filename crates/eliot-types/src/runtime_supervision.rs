@@ -136,6 +136,137 @@ where
     deserialize_protected_string(deserializer, "key")
 }
 
+/// Bounded refusal for an optional protected identifier that decoded as the
+/// spelled-out-empty spelling of an absent value.
+///
+/// The required-field path already refuses an absent lease, hash, job or
+/// process identity, but `Some("")` is the same absence written down, and a
+/// durable checkpoint, restart window, operation detail or supervision report is
+/// trusted by those identities. The message is fixed and never echoes the
+/// received value onto an operator surface.
+fn deserialize_optional_protected_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(text) = &value
+        && text.is_empty()
+    {
+        return Err(empty_protected_identifier(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_invocation_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "invocation_id")
+}
+
+fn deserialize_optional_adapter_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "adapter_id")
+}
+
+fn deserialize_optional_service_generation<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "service_generation")
+}
+
+fn deserialize_executable_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "executable_sha256")
+}
+
+fn deserialize_expected_governor_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "expected_governor_sha256")
+}
+
+fn deserialize_observed_governor_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "observed_governor_sha256")
+}
+
+fn deserialize_optional_job_object_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "job_object_name")
+}
+
+fn deserialize_role_lease_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "role_lease_id")
+}
+
+fn deserialize_runtime_contract_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "runtime_contract_sha256")
+}
+
+fn deserialize_root_executable_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "root_executable_sha256")
+}
+
+/// Bounded refusal for an optional process identity written as the zero PID.
+///
+/// A zero PID is not a weaker process identity, it is an absent one, and the
+/// descendant capture evidence at the reap boundary already refuses a zero
+/// `root_pid` for the same reason. This closes the spelled-out-zero spelling of
+/// that absence on the durable checkpoint and operation-detail records. The
+/// message is fixed and never echoes a received value.
+fn zero_protected_pid<E>(field: &'static str) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("zero protected process identity: {field}"))
+}
+
+fn deserialize_optional_pid<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(zero_protected_pid(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_root_pid<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_pid(deserializer, "root_pid")
+}
+
 fn deserialize_descendants_at_root_exit_schema_version<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -261,16 +392,21 @@ pub struct OperationRuntimeCheckpoint {
     pub schema_version: String,
     #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
+    #[serde(default, deserialize_with = "deserialize_invocation_id")]
     pub invocation_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_adapter_id")]
     pub adapter_id: Option<String>,
     pub generation: u64,
     pub phase: OperationPhase,
     pub dispatch_state: ProviderDispatchState,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub root_process_start_ticks: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_root_executable_sha256")]
     pub root_executable_sha256: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_job_object_name")]
     pub job_object_name: Option<String>,
     pub active_process_count: u32,
     pub stdin_bytes: u64,
@@ -290,8 +426,10 @@ pub struct OperationRuntimeCheckpoint {
     pub absolute_deadline_at: OffsetDateTime,
     pub restart_count: u32,
     pub restart_window_started_at: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_runtime_contract_sha256")]
     pub runtime_contract_sha256: Option<String>,
     pub last_error_class: Option<String>,
     pub last_evidence_refs: Vec<String>,
@@ -597,6 +735,7 @@ pub struct ProcessReapReceipt {
     pub generation: u64,
     #[serde(deserialize_with = "deserialize_job_object_name")]
     pub job_object_name: String,
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub process_count_before: u32,
     pub process_count_after: u32,
@@ -633,7 +772,9 @@ pub struct RuntimeCoreHealth {
     pub db_ready: bool,
     pub writer_ready: bool,
     pub read_service_ready: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_service_generation")]
     pub service_generation: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_executable_sha256")]
     pub executable_sha256: Option<String>,
 }
 
@@ -672,6 +813,7 @@ pub struct RuntimeOperationDetail {
     pub phase: OperationPhase,
     pub last_progress_at: String,
     pub phase_deadline_at: String,
+    #[serde(default, deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub active_process_count: u32,
     pub stdin_state: String,
@@ -679,6 +821,7 @@ pub struct RuntimeOperationDetail {
     pub stderr_state: String,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
+    #[serde(default, deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
 }
@@ -714,7 +857,9 @@ pub struct RuntimeAuthorityIntegrity {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIntegrityHealth {
     pub clean: bool,
+    #[serde(default, deserialize_with = "deserialize_expected_governor_sha256")]
     pub expected_governor_sha256: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_observed_governor_sha256")]
     pub observed_governor_sha256: Option<String>,
     pub locked_active_binary: Option<String>,
     pub process_orphans: u32,
