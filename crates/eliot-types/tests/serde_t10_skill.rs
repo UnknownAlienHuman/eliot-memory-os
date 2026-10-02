@@ -128,9 +128,8 @@ fn nested_case_result_unknown_identity_dimension_refused() {
 // WORK_UNIT_CASE: 939/5
 #[test]
 fn nested_baseline_nine_fields_decode_and_match_current_identity() {
-    let decoded: EvalBaseline =
-        serde_json::from_value(case("nested_baseline_nine_field_accept"))
-            .expect("a baseline carrying all nine known identity fields must decode");
+    let decoded: EvalBaseline = serde_json::from_value(case("nested_baseline_nine_field_accept"))
+        .expect("a baseline carrying all nine known identity fields must decode");
     let recorded = decoded
         .integrity_fingerprints
         .expect("this baseline retains identity fingerprints");
