@@ -155,6 +155,7 @@ pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
 pub mod startup_readiness;
+pub mod state_projection_owner;
 mod store_failure_projection;
 pub mod supervision_progress;
 pub mod swarm_composition;
@@ -354,6 +355,10 @@ pub use startup_evidence_producer::{
     MAX_EVIDENCE_REFS, MAX_REQUIRED_CAPABILITIES, MirrorObservation, RetainedCapabilitySummary,
     StartupEvidenceError, StartupEvidenceRequest, build_startup_evidence,
     publish_daemon_startup_evidence, summarize_retained_capabilities,
+};
+pub use state_projection_owner::{
+    StateProjectionError, StateProjectionField, is_state_projection_request,
+    project_state_projection, serve_state_projection_pair, state_projection_fields,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
 pub use supervision_progress::{
