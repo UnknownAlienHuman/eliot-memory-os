@@ -1414,7 +1414,7 @@ mod tests {
         let refusal = evidence.refusal().expect("the refusal is durable");
         assert_eq!(refusal.field(), "canonical_format_range");
         // Generation and epoch lineage survive the refusal.
-        assert_eq!(evidence.module_generation(), ResourceGeneration::genesis());
+        assert_eq!(evidence.module_generation(), ResourceGeneration::genesis().value());
         assert_eq!(evidence.authority_lineage_id(), LINEAGE);
         assert_eq!(evidence.authority_sequence(), 3);
         // An admitted candidate keeps the same record with no refusal, and the
