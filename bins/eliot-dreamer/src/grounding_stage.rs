@@ -10,6 +10,18 @@
 //! is surfaced unmodified so the frozen claim denominator is preserved
 //! losslessly (the denominator arrives with governed material; Dreamer never
 //! selects it, and never synthesizes a frozen universe locally).
+//!
+//! The production chain reaches that owner through
+//! [`ground_and_bind_validation_carrier`](crate::validation_stage::ground_and_bind_validation_carrier),
+//! not through [`ground_admitted_draft`] below: grounding and the A-05 carrier
+//! binding are one call into the owning crate
+//! ([`ground_for_validation`](eliot_dreamer_claim_grounding::ground_for_validation)),
+//! which also owns the carrier's single construction site. Grounding therefore
+//! still runs exactly once per admitted job — inside that one owner call — and
+//! calling both entries would ground the same draft twice. The seam kept here
+//! is the injectable one: it proves the once-per-admission shape against the
+//! real owner function, and it remains the grounding entry for a caller that
+//! needs the grounded draft without the A-05 handoff.
 
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
 use eliot_dreamer_contracts::ContractViolation;
@@ -61,14 +73,19 @@ pub(crate) fn ground_admitted_draft_with(
     ground_once(request).map_err(|error| grounding_denied(&error))
 }
 
-/// Production entry: the real A-14b grounding, once per admission.
+/// The real A-14b grounding, once per admission, over
+/// [`ground_admitted_draft_with`].
 ///
-/// Unwired until the pipeline threads the model draft through; `submit`
-/// cannot supply a [`StructuredModelDraft`] yet, so the entry is exercised by the slice
-/// tests below. Remove the allowance once the pipeline calls this entry.
+/// Not on the production chain, and deliberately so: the chain's grounding now
+/// travels with the A-05 carrier binding inside the single owner call
+/// ([`ground_and_bind_validation_carrier`](crate::validation_stage::ground_and_bind_validation_carrier)),
+/// so calling this entry as well would ground the same admitted draft twice for
+/// one admission. It stays as the grounding-only entry — the seam a caller needs
+/// when it wants the [`GroundedDreamDraft`] without the A-05 handoff — and the
+/// slice tests below are its current callers.
 #[allow(
     dead_code,
-    reason = "wired once the pipeline threads the model draft; tests cover it until then"
+    reason = "grounding now runs inside the owner handoff; this grounding-only entry is covered by the slice tests"
 )]
 pub(crate) fn ground_admitted_draft(
     request: GroundingRequest,

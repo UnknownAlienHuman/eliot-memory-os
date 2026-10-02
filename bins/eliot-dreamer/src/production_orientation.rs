@@ -15,7 +15,7 @@
 //! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
 //! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
-//! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
+//! | Ground the admitted draft and bind the A-05 carrier | `validation_stage::ground_and_bind_validation_carrier` -> `eliot_dreamer_claim_grounding::ground_for_validation` (the owner's single construction site) | wired |
 //! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | NOT REACHABLE IN PRODUCTION: the producer has no production caller, and the supply seam itself sits behind two upstream gates that refuse unconditionally |
 //! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | NOT REACHABLE IN PRODUCTION: no owner publishes these records to this binary, and the seam that would read them is unreachable |

@@ -1937,16 +1937,20 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
-            Ok(grounded) => grounded,
-            Err(error) => panic!("fixture grounding must prove, got {error:?}"),
-        };
-        let carrier =
-            match crate::admitted_material::validation_input_for(admission, job, grounded, Some(0))
-            {
-                Ok(carrier) => carrier,
-                Err(error) => panic!("fixture carrier must build, got {error:?}"),
+        // Same wiring production runs: the root supplies the A-05 attachment
+        // and the owning crate grounds and constructs the carrier.
+        let attachment =
+            match crate::admitted_material::validation_attachment_for(admission, job, Some(0)) {
+                Ok(attachment) => attachment,
+                Err(error) => panic!("fixture A-05 attachment must derive, got {error:?}"),
             };
+        let carrier = match crate::validation_stage::ground_and_bind_validation_carrier(
+            request.clone(),
+            attachment,
+        ) {
+            Ok(carrier) => carrier,
+            Err(error) => panic!("fixture carrier must build, got {error:?}"),
+        };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
             Ok(validated) => (request, validated),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),

@@ -26,9 +26,10 @@ use eliot_dreamer_contracts::{
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
-    CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationError, OrientationPacketCandidate, OrientationPolicy,
-    OrientationResidue, project_orientation,
+    CurrentEpistemicPositionHandle, InertProbeStatus, LocalOrientationFrame,
+    OrientationCoverageDenominator, OrientationDisposition, OrientationError,
+    OrientationPacketCandidate, OrientationPolicy, OrientationResidue, OrientationResidueKind,
+    project_orientation,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -664,7 +665,7 @@ fn preserves_model_and_grounding_without_promoting_residue_to_evidence() {
     );
     assert_eq!(
         packet.recommended_probes_or_next_actions[0].status,
-        "model_recommendation_inert"
+        InertProbeStatus::ModelRecommendationInert
     );
 }
 
@@ -1051,7 +1052,7 @@ fn exact_duplicate_rivals_preserve_every_lineage() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.rival_models_and_dissent.len(), 2);
     for rival in &packet.rival_models_and_dissent {
-        assert_eq!(rival.kind, "counterevidence");
+        assert_eq!(rival.kind, OrientationResidueKind::Counterevidence);
         assert_eq!(rival.text, "same rival");
         assert_eq!(rival.source, "model_draft");
     }
@@ -1182,7 +1183,7 @@ fn relation_projection_stays_explicit() {
     assert_eq!(
         open.hidden_relation_candidates,
         vec![OrientationResidue {
-            kind: "unsupported".into(),
+            kind: OrientationResidueKind::Unsupported,
             text: "typed relation projection is outside the basic Orientation owner".into(),
             source: "orientation_contract".into(),
         }]
@@ -1313,7 +1314,10 @@ fn similarity_signals_cannot_create_relations() {
     )
     .expect("projection");
     assert_eq!(open.hidden_relation_candidates.len(), 1);
-    assert_eq!(open.hidden_relation_candidates[0].kind, "unsupported");
+    assert_eq!(
+        open.hidden_relation_candidates[0].kind,
+        OrientationResidueKind::Unsupported
+    );
 }
 
 // WORK_UNIT_CASE: 628/18
@@ -1328,7 +1332,7 @@ fn unsupported_causal_relation_stays_limited() {
     assert_eq!(
         packet.hidden_relation_candidates,
         vec![OrientationResidue {
-            kind: "unsupported".into(),
+            kind: OrientationResidueKind::Unsupported,
             text: "typed relation projection is outside the basic Orientation owner".into(),
             source: "orientation_contract".into(),
         }]
@@ -1349,13 +1353,19 @@ fn material_gap_denominator_carries_one_disposition_per_gap() {
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
     assert_eq!(packet.disposition, OrientationDisposition::Partial);
     assert_eq!(packet.unknowns_and_gaps.len(), 2);
-    assert_eq!(packet.unknowns_and_gaps[0].kind, "unavailable");
+    assert_eq!(
+        packet.unknowns_and_gaps[0].kind,
+        OrientationResidueKind::Unavailable
+    );
     assert_eq!(
         packet.unknowns_and_gaps[0].text,
         "gap-a awaits a future source"
     );
     assert_eq!(packet.unknowns_and_gaps[0].source, "gap-a");
-    assert_eq!(packet.unknowns_and_gaps[1].kind, "unavailable");
+    assert_eq!(
+        packet.unknowns_and_gaps[1].kind,
+        OrientationResidueKind::Unavailable
+    );
     assert_eq!(packet.unknowns_and_gaps[1].text, "gap-b source retired");
     assert_eq!(packet.unknowns_and_gaps[1].source, "gap-b");
     let unknowns = packet
@@ -1385,7 +1395,7 @@ fn bounded_existing_probe_stays_inert() {
     );
     assert_eq!(
         packet.recommended_probes_or_next_actions[0].status,
-        "model_recommendation_inert"
+        InertProbeStatus::ModelRecommendationInert
     );
     assert!(
         packet.recommended_probes_or_next_actions[0]
@@ -1422,7 +1432,7 @@ fn probe_execution_text_cannot_become_live() {
     assert_eq!(packet.disposition, OrientationDisposition::Complete);
     assert_eq!(packet.recommended_probes_or_next_actions.len(), 3);
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
         assert!(probe.result_space.is_none());
     }
     let wire = serde_json::to_string(&packet_value(&packet)).expect("packet json");
@@ -1441,7 +1451,7 @@ fn projection_is_pure_with_no_planning_call() {
     assert_eq!(first, second);
     assert_eq!(first.packet_id, second.packet_id);
     for probe in &first.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
         assert!(probe.result_space.is_none());
     }
     let wire = serde_json::to_string(&packet_value(&first)).expect("packet json");
@@ -1466,7 +1476,7 @@ fn ambiguity_stays_partial_not_a_question() {
     assert_eq!(packet.disposition, OrientationDisposition::Partial);
     assert!(!packet.unknowns_and_gaps.is_empty());
     for gap in &packet.unknowns_and_gaps {
-        assert_eq!(gap.kind, "unavailable");
+        assert_eq!(gap.kind, OrientationResidueKind::Unavailable);
     }
     let mut emitted: Vec<&str> = Vec::new();
     emitted.push(packet.synthesized_interpretations[0].statement.as_str());
@@ -1492,7 +1502,7 @@ fn ambiguity_stays_partial_not_a_question() {
         );
     }
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
     }
 }
 
@@ -1534,7 +1544,10 @@ fn no_brief_payload_or_algorithm() {
     ] {
         assert!(!wire.contains(forbidden), "no brief artifact: {forbidden}");
     }
-    assert_eq!(packet.architecture_implications.kind, "known_empty");
+    assert_eq!(
+        packet.architecture_implications.kind,
+        OrientationResidueKind::KnownEmpty
+    );
     assert_eq!(
         packet.architecture_implications.text,
         "no architecture implications admitted"
@@ -1944,12 +1957,12 @@ fn no_rival_or_probe_algorithm_dependencies() {
         candidate.model.source_handles
     );
     for rival in &packet.rival_models_and_dissent {
-        assert_eq!(rival.kind, "counterevidence");
+        assert_eq!(rival.kind, OrientationResidueKind::Counterevidence);
         assert_eq!(rival.source, "model_draft");
         assert!(candidate.model.counterevidence.contains(&rival.text));
     }
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(probe.status, InertProbeStatus::ModelRecommendationInert);
         assert!(probe.result_space.is_none());
         assert!(candidate.model.recommended_probes.contains(&probe.text));
     }
@@ -1996,4 +2009,150 @@ fn no_model_provider_store_authority_effect_finish_path() {
     let replay =
         project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("reprojection");
     assert_eq!(packet, replay);
+}
+
+// WORK_UNIT_CASE: 262/1
+//
+// ORI-03: the two previously free-String discriminants are closed classes
+// owned by this crate. The positive case pins both the derived wire spelling
+// and the fact that every variant has a real measured producer path.
+#[test]
+fn residue_kind_and_probe_status_are_closed_classes_over_measured_producers() {
+    // Partial + extra omissions: rivals, gaps, hidden relations and the
+    // unsupported architecture marker all become known producers.
+    let (open_job, open_bundle, open_candidate, open_policy, open_handles) =
+        assemble_with(|options| {
+            options.partial = true;
+            options.extra_omissions = true;
+        });
+    open_candidate
+        .validate_binding()
+        .expect("candidate binding");
+    let open_packet = project_orientation(
+        &open_job,
+        &open_bundle,
+        &open_candidate,
+        &open_handles,
+        &open_policy,
+    )
+    .expect("projection");
+    // Complete: the architecture implication is proven empty instead.
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let known_packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+
+    let spelling = |value: serde_json::Value| -> String {
+        match value.as_str() {
+            Some(text) => text.to_owned(),
+            None => panic!("a closed class must serialize as one wire string"),
+        }
+    };
+    let mut residue_kinds: BTreeSet<String> = BTreeSet::new();
+    let mut probe_statuses: BTreeSet<String> = BTreeSet::new();
+    for packet in [&open_packet, &known_packet] {
+        for residue in packet
+            .rival_models_and_dissent
+            .iter()
+            .chain(&packet.hidden_relation_candidates)
+            .chain(&packet.unknowns_and_gaps)
+            .chain(std::iter::once(&packet.architecture_implications))
+            .chain(std::iter::once(&packet.model_routes_and_cost))
+        {
+            residue_kinds.insert(spelling(
+                serde_json::to_value(residue.kind).expect("residue kind json"),
+            ));
+        }
+        for probe in &packet.recommended_probes_or_next_actions {
+            probe_statuses.insert(spelling(
+                serde_json::to_value(probe.status).expect("probe status json"),
+            ));
+        }
+    }
+
+    // The derived enum is the wire spelling, unchanged from the previously
+    // emitted bytes, so no packet digest moves.
+    for (kind, wire) in [
+        (OrientationResidueKind::Counterevidence, "counterevidence"),
+        (OrientationResidueKind::Unavailable, "unavailable"),
+        (OrientationResidueKind::Unsupported, "unsupported"),
+        (OrientationResidueKind::KnownEmpty, "known_empty"),
+        (
+            OrientationResidueKind::BudgetProvenanceUnavailable,
+            "budget_provenance_unavailable",
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("kind json"),
+            serde_json::json!(wire),
+            "residue kind wire spelling must stay {wire}"
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(InertProbeStatus::ModelRecommendationInert).expect("status json"),
+        serde_json::json!("model_recommendation_inert")
+    );
+
+    // Every declared variant is reached by a real producer and no producer
+    // reaches outside the closed set.
+    assert_eq!(
+        residue_kinds,
+        BTreeSet::from([
+            "budget_provenance_unavailable".to_owned(),
+            "counterevidence".to_owned(),
+            "known_empty".to_owned(),
+            "unavailable".to_owned(),
+            "unsupported".to_owned(),
+        ])
+    );
+    assert_eq!(
+        probe_statuses,
+        BTreeSet::from(["model_recommendation_inert".to_owned()])
+    );
+
+    // A closed class round-trips through the packet wire unchanged.
+    let wire = serde_json::to_value(&known_packet).expect("packet json");
+    let decoded =
+        serde_json::from_value::<OrientationPacketCandidate>(wire).expect("packet round trip");
+    assert_eq!(decoded, known_packet);
+}
+
+// WORK_UNIT_CASE: 262/2
+//
+// ORI-03 refusal: a discriminant outside the closed set is refused at the
+// packet deserializer instead of being carried as invented free text.
+#[test]
+fn invented_residue_kind_and_probe_status_are_refused() {
+    let (job, bundle, candidate, policy, handles) = fixture(false, false);
+    let packet =
+        project_orientation(&job, &bundle, &candidate, &handles, &policy).expect("projection");
+    let admitted = serde_json::to_value(&packet).expect("packet json");
+
+    let mut rival_kind = admitted.clone();
+    rival_kind["rival_models_and_dissent"][0]["kind"] = serde_json::json!("rival_model");
+    assert!(
+        serde_json::from_value::<OrientationPacketCandidate>(rival_kind).is_err(),
+        "a residue kind outside the closed set must be refused"
+    );
+
+    let mut relation_kind = admitted.clone();
+    relation_kind["model_routes_and_cost"]["kind"] = serde_json::json!("");
+    assert!(
+        serde_json::from_value::<OrientationPacketCandidate>(relation_kind).is_err(),
+        "an empty residue kind must be refused"
+    );
+
+    let mut probe_status = admitted.clone();
+    probe_status["recommended_probes_or_next_actions"][0]["status"] =
+        serde_json::json!("probe_authorized");
+    assert!(
+        serde_json::from_value::<OrientationPacketCandidate>(probe_status).is_err(),
+        "a probe status outside the closed set must be refused"
+    );
+
+    let mut probe_status = admitted;
+    probe_status["recommended_probes_or_next_actions"][0]["status"] = serde_json::json!("");
+    assert!(
+        serde_json::from_value::<OrientationPacketCandidate>(probe_status).is_err(),
+        "an empty probe status must be refused"
+    );
 }

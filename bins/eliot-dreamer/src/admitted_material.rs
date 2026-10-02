@@ -4,10 +4,22 @@
 //! [`DreamJobAdmission`](eliot_dreamer_contracts::DreamJobAdmission),
 //! [`DreamInputBundle`](eliot_dreamer_contracts::DreamInputBundle),
 //! [`AllowedReferenceManifest`](eliot_dreamer_contracts::grounding::AllowedReferenceManifest),
-//! the v2 validation carrier, and the v1 hypothesis pair — from the admitted
-//! pair only. No retrieval, ranking, model work, or truth promotion happens
-//! here: every digest below is owner-computed and every value passes the real
-//! owner validation before it leaves.
+//! the A-05 validation attachment, and the v1 hypothesis pair — from the
+//! admitted pair only. No retrieval, ranking, model work, or truth promotion
+//! happens here: every digest below is owner-computed and every value passes
+//! the real owner validation before it leaves.
+//!
+//! The A-14b -> A-05 handoff has exactly one production construction site, and
+//! it is not here. `eliot-dreamer-claim-grounding` owns it
+//! (`validation_bridge::ground_for_validation` -> `bind_validation_input`,
+//! which calls the frozen `GroundingValidationInput::new`): `ARCH-MOD-03`
+//! ("one causal responsibility, one owner") and the crate's own
+//! `module.toml` put the carrier construction in the cell that owns the
+//! `GroundedDreamDraft` it carries. This module therefore supplies only the
+//! A-05 half that the owner cannot know: the policy, usage, and preservation
+//! data derived from admitted material, plus the caller's explicit
+//! observation time. A member this root does not hold stays absent rather than
+//! becoming a fabricated default.
 //!
 //! Binary-derived bindings, documented once here:
 //!
@@ -56,6 +68,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, TaskId, sha256_hex};
+use eliot_dreamer_claim_grounding::ValidationAttachment;
 use eliot_dreamer_contracts::budget::{
     ATTEMPTS_CEILING, CANDIDATES_CEILING, INPUT_BYTES_CEILING, MODEL_CALLS_CEILING,
     OUTPUT_BYTES_CEILING, REFERENCE_WIDTH_CEILING, REPORT_BYTES_CEILING, SOURCE_WIDTH_CEILING,
@@ -65,13 +78,11 @@ use eliot_dreamer_contracts::candidate::{
     DimensionVerdict, PRESERVATION_DIMENSIONS, PreservationDimension,
 };
 use eliot_dreamer_contracts::grounding::{
-    AllowedReferenceManifest, ClaimKind, GROUNDING_SCHEMA_VERSION, GroundedDreamDraft,
-    GroundingPolicy,
+    AllowedReferenceManifest, ClaimKind, GROUNDING_SCHEMA_VERSION, GroundingPolicy,
 };
 use eliot_dreamer_contracts::job::DREAM_JOB_SCHEMA_VERSION;
 use eliot_dreamer_contracts::validation::MAX_CANONICAL_BYTES;
 use eliot_dreamer_contracts::validation::model_digest;
-use eliot_dreamer_contracts::validation::structured::GroundingValidationInput;
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
     DreamJobAdmission, GroundedDreamDraft as TextGroundedDraft, JobClass,
@@ -426,33 +437,46 @@ pub(crate) fn preservation_of() -> Result<PreservationReport, DreamerError> {
     Ok(report)
 }
 
-/// Builds the v2 A-05 input carrier for one grounded draft.
+/// Supplies the A-05 half of the A-14b -> A-05 handoff for one admission.
 ///
-/// Derives usage, policy (bound to the admitted `policy_ref`), and
-/// preservation from admitted material only, with no rival declarations and
-/// no cancellation. The caller supplies the explicit observation time:
-/// pass `Some(0)` (start of attempt) for jobs with a positive deadline.
-/// Proved with the real [`GroundingValidationInput::new`](eliot_dreamer_contracts::validation::structured::GroundingValidationInput::new).
-pub(crate) fn validation_input_for(
+/// This is **not** a carrier: it is the explicitly supplied
+/// [`ValidationAttachment`] the owning crate binds to the grounded draft. Every
+/// member is derived from admitted material or passed in by the caller —
+/// usage from the admitted budget, policy sealed against the admitted
+/// `policy_ref`, preservation from the candidate-only bundle, and the
+/// caller's explicit observation time (`Some(0)`, start of attempt, for jobs
+/// with a positive deadline).
+///
+/// Two members stay absent because this root does not hold them. Cancellation
+/// is Kernel-owned and arrives as a proved disposition, not as a locally
+/// observed flag, so `cancellation_requested` is `false` — the honest
+/// "none observed", never a claim that cancellation was checked. Rival
+/// declarations are not admitted material at all, so `rival_declarations` is
+/// `None`: absence is recorded as absence, never filled from the grounded
+/// value, the ledger, or model text. Both then stay `None`/`false` all the way
+/// into the carrier, which is what keeps a self-certified or empty substitute
+/// from entering A-05.
+///
+/// The carrier itself is constructed in exactly one production place, inside
+/// the crate whose `module.toml` claims that ownership
+/// (`eliot_dreamer_claim_grounding::validation_bridge`).
+pub(crate) fn validation_attachment_for(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-    grounded: GroundedDreamDraft,
     observation_time_ms: Option<u64>,
-) -> Result<GroundingValidationInput, DreamerError> {
+) -> Result<ValidationAttachment, DreamerError> {
     let admitted = admission_of(admission, job)?;
-    let usage = usage_of(&admitted.budget);
-    let policy = validation_policy_of(admitted.policy_ref.as_str())?;
-    let preservation = preservation_of()?;
-    GroundingValidationInput::new(
-        grounded,
-        policy,
-        usage,
-        preservation,
+    Ok(ValidationAttachment {
+        policy: validation_policy_of(admitted.policy_ref.as_str())?,
+        usage: usage_of(&admitted.budget),
+        preservation: preservation_of()?,
         observation_time_ms,
-        false,
-        None,
-    )
-    .map_err(|_| DreamerError::InvalidAdmission("validation input binding invalid"))
+        // Kernel-owned cancellation arrives as a proved disposition; this
+        // root never originates or infers it, so it observes none.
+        cancellation_requested: false,
+        // No rival declarations are admitted material on this path.
+        rival_declarations: None,
+    })
 }
 
 /// Derives the v1 hypothesis text from the admitted pair.

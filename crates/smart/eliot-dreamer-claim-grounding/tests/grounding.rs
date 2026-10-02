@@ -5,7 +5,9 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_dreamer_claim_grounding::{
-    Cancellation, GroundingControls, GroundingRequest, ground_draft, ground_draft_with_controls,
+    Cancellation, GroundingControls, GroundingRequest, GroundingValidationRequest,
+    ValidationAttachment, bind_validation_input, ground_draft, ground_draft_with_controls,
+    ground_for_validation,
 };
 use eliot_dreamer_contracts::grounding::canonical::{GradeAssignment, SupportResult};
 use eliot_dreamer_contracts::grounding::{ClaimKind, PrecisionPayload};
@@ -3309,5 +3311,177 @@ fn supported_claims_have_complete_exact_coverage_without_promotion() {
         presence.ledger.records["claim-presence"].disposition,
         SupportResult::Supported,
         "references alone cannot prove truth or causality"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A-14b -> A-05 carrier producer (issue #262, R-UNRESOLVED-ROWS "A-14b -> A-05
+// producer link" and the A2 static-vs-runtime acceptance gap behind it).
+//
+// `cognitive-wave-10.toml` records `rust_owner =
+// "eliot-dreamer-claim-grounding"` for the `GroundingValidationInput` carrier,
+// so this crate owns the one production construction site
+// (`validation_bridge.rs::bind_validation_input`) and its production caller
+// (`validation_bridge.rs::ground_for_validation`, which grounds through
+// `grounding.rs::ground_draft_with_controls`). The carrier type itself is
+// frozen in `eliot-dreamer-contracts`, and its `validate()` remains the single
+// binding validator.
+// ---------------------------------------------------------------------------
+
+/// Maximum receipt-excluded canonical preimage byte ceiling, from the frozen
+/// validation-bounds owner.
+fn max_canonical_bytes() -> u64 {
+    u64::try_from(eliot_dreamer_contracts::validation::MAX_CANONICAL_BYTES)
+        .expect("canonical ceiling fits u64")
+}
+
+/// Builds the independently supplied A-05 leg of the handoff.
+///
+/// The policy identity is the only variable input: it is what the carrier
+/// contract binds against the grounded job's `policy_ref`.
+fn validation_attachment(policy_ref: &str) -> ValidationAttachment {
+    let mut policy =
+        eliot_dreamer_contracts::ValidationPolicy::new(policy_ref, 1, max_canonical_bytes());
+    policy.seal().expect("validation policy seals");
+    let verdicts = eliot_dreamer_contracts::PRESERVATION_DIMENSIONS
+        .iter()
+        .map(
+            |spelling| eliot_dreamer_contracts::candidate::DimensionVerdict {
+                dimension: eliot_dreamer_contracts::PreservationDimension::parse(spelling)
+                    .expect("known preservation dimension"),
+                passed: true,
+                known: true,
+                note: "candidate-only grounding handoff; verbatim retention, no fact promoted"
+                    .to_owned(),
+            },
+        )
+        .collect();
+    ValidationAttachment {
+        policy,
+        usage: eliot_dreamer_contracts::BudgetUsage::default(),
+        preservation: eliot_dreamer_contracts::PreservationReport { verdicts },
+        observation_time_ms: None,
+        cancellation_requested: false,
+        rival_declarations: None,
+    }
+}
+
+/// One real, fully grounded A03 v2 context bound to a supported claim.
+fn grounding_request_for_producer() -> GroundingRequest {
+    let manifest = manifest_for("proposition-1", Some(supported_record()));
+    let model_draft = draft(
+        &manifest,
+        vec![claim("claim-1", "proposition-1", Some("evidence-1"))],
+        eliot_dreamer_contracts::JobClass::Orientation,
+    );
+    GroundingRequest::new(
+        model_draft.job.clone(),
+        model_draft.bundle.clone(),
+        manifest,
+        model_draft,
+        policy(),
+    )
+}
+
+/// The owner producer builds the carrier from real grounding inputs and the
+/// frozen carrier contract accepts it.
+#[test]
+fn owner_producer_binds_the_carrier_from_real_grounding() {
+    let carrier = ground_for_validation(GroundingValidationRequest::new(
+        grounding_request_for_producer(),
+        validation_attachment("grounding-policy"),
+    ))
+    .expect("owner binds the A-05 carrier");
+    carrier
+        .validate()
+        .expect("carrier contract accepts the bound value");
+    assert_eq!(
+        carrier.grounded.ledger.job_id, carrier.grounded.job_id,
+        "the ledger records the grounded job identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.task_id, carrier.grounded.task_id,
+        "the ledger records the grounded task identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.scope_id, carrier.grounded.scope_id,
+        "the ledger records the grounded scope identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.state_fence, carrier.grounded.state_fence,
+        "the ledger records the grounded state fence"
+    );
+    assert_eq!(
+        carrier.policy.policy_id, carrier.grounded.input.job.policy_ref,
+        "the A-05 policy is bound to the grounded job"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.records["claim-1"].disposition,
+        SupportResult::Supported,
+        "the carrier carries real owner-computed grounding, not an empty ledger"
+    );
+    carrier
+        .input_digest_and_size()
+        .expect("the bound carrier has a receipt-excluded input digest");
+}
+
+/// Refusal: an A-05 leg recorded against a different job cannot be sealed into
+/// this carrier. The frozen `validate()` owns this join; the producer routes
+/// every outcome through it instead of restating it.
+#[test]
+fn owner_producer_refuses_a_carrier_whose_binding_does_not_match_its_input() {
+    let error = ground_for_validation(GroundingValidationRequest::new(
+        grounding_request_for_producer(),
+        validation_attachment("other-policy"),
+    ))
+    .expect_err("a policy recorded for another job cannot seal this carrier");
+    assert!(
+        matches!(
+            error,
+            eliot_dreamer_contracts::DreamDraftValidationError::InvalidContract {
+                field: "structured.policy.policy_ref",
+                ..
+            }
+        ),
+        "unexpected refusal: {error}"
+    );
+}
+
+/// Refusal: issue #262 hard boundary, "model output never self-certifies
+/// grounding" (I9.5: "Model text cannot declare them confirmed."). A
+/// self-consistent grounded value whose own ledger claims an epistemic position
+/// above the candidate-only ceiling is refused at the construction site; no
+/// downstream check would catch it, because the frozen carrier contract does
+/// not own the epistemic ceiling.
+#[test]
+fn owner_producer_refuses_a_self_certified_grounding_position() {
+    let mut forged = ground_draft_with_controls(grounding_request_for_producer())
+        .expect("owner grounds the context");
+    let record = forged
+        .ledger
+        .records
+        .get_mut("claim-1")
+        .expect("the grounded claim has a record");
+    record.assertability_ceiling =
+        eliot_dreamer_contracts::grounding::canonical::PositionAssertability::ObservedFact;
+    record.record_digest = record.computed_digest().expect("record digest");
+    let ledger_digest = forged.ledger.computed_digest().expect("ledger digest");
+    forged.ledger.ledger_digest = ledger_digest;
+    let output_digest = forged.computed_digest().expect("output digest");
+    forged.output_digest = output_digest;
+    forged
+        .validate()
+        .expect("the forged value is internally self-consistent");
+    let error = bind_validation_input(forged, validation_attachment("grounding-policy"))
+        .expect_err("a self-certified epistemic position is not a grounding receipt");
+    assert!(
+        matches!(
+            error,
+            eliot_dreamer_contracts::DreamDraftValidationError::InvalidContract {
+                field: "grounding.assertability_ceiling",
+                ..
+            }
+        ),
+        "unexpected refusal: {error}"
     );
 }

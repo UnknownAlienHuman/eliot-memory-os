@@ -11,22 +11,54 @@
 //! Mechanism Review rather than another equivalent retry.
 //!
 //! The exact deterministic trigger identity a candidate bears on travels as
-//! its own member ([`NegativeMemoryExtinctionCandidate::trigger`]), separate
-//! from the composite failure fingerprint, because the governing donor states
+//! its own member, as a typed and observation/fence-bound [`ExactTrigger`]
+//! beside the composite failure fingerprint, because the governing donor states
 //! the two apart: "Exact deterministic trigger can block/requires probe within
 //! matching scope. Semantic similarity only warns."
 //! (`docs/architecture/I12-19-negative-memory.md:3`, restated by
-//! `crates/smart/eliot-dreamer-memory-revision/module.toml:96` `omission_semantics`
-//! and its gate `W9-MR-EXACT-TRIGGER-VERSUS-SIMILARITY` at line 148). One
+//! `crates/smart/eliot-dreamer-memory-revision/module.toml:104` `omission_semantics`
+//! and its gate `W9-MR-EXACT-TRIGGER-VERSUS-SIMILARITY` at line 159). One
 //! opaque fingerprint string carries neither, so it could only ever prove
-//! shape; [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`] is the
-//! single place an exact-trigger requirement is decided, and it decides it on
-//! the trigger identity compared with the governing exact-trigger identities.
+//! shape.
+//!
+//! The closed [`ExactTrigger`] shape is derived from what this crate's own
+//! measured producer already carries — `FailureObservation::trigger` and
+//! `FailureObservation::state_fence`, bound to the observation handle they were
+//! read under — and adds no vocabulary. The candidate's existing
+//! [`NegativeMemoryExtinctionCandidate::validate`] is the single place the shape
+//! is enforced, so a composite near-match can neither be promoted into the
+//! exact-trigger slot nor satisfy an exact-trigger requirement by omission;
+//! [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`] then decides the
+//! requirement itself, on the recorded identity compared with the governing
+//! exact-trigger identities.
+//!
+//! That construction-time binding is not re-derived: `validate` takes no owner
+//! input, so it compares the recorded trigger only against members of the same
+//! record, and the recorded identity is re-decided against the Governor owner's
+//! governing set out of band. Each side states this limit where its own check
+//! is — in [`ExactTrigger`], in
+//! [`NegativeMemoryExtinctionCandidate::validate`], and in `module.toml`'s
+//! `superseded_field_family_owners` — rather than claiming a provenance binding
+//! it does not enforce.
 //!
 //! There are no parallel observation, evidence, query, or projection types
 //! here: failure/revision shapes stay with `eliot-observation-contracts`,
 //! self-query/accepted-source shapes stay with `eliot-dreamer-contracts`,
-//! and task/safety projections stay with `eliot-context-contracts`. The bound
+//! and task/safety projections stay with `eliot-context-contracts`. That
+//! boundary is also what decided the candidate's own field family: a field
+//! contract that named twenty-one members of this candidate, nineteen of which
+//! were in fact the `FailureFingerprint` field list (`docs/architecture/I12-19-negative-memory.md:6-17`)
+//! or the `MemoryRevisionEvidence` field list
+//! (`docs/architecture/I12-21-memory-ecology-residual-experience-and-transfer.md:100-110`)
+//! and one the `MemoryLifecycleEvaluation` list (same file `:117-128`),
+//! is the stale side, because `I12-21:97-98` requires exactly that split —
+//! "not a second memory system". The corrected family is therefore the twelve
+//! members declared below, each already bound by [`finish`] to what
+//! [`RevisionIntake`] holds, and it is recorded with the sentence it was
+//! decided by in this crate's own `module.toml` row `field_family_authority`
+//! and held member by member in `src/field_family_tests.rs`.
+//!
+//! The bound
 //! freeze revision is embedded at compile time and verified before any intake
 //! is read, so an absent or drifted schema freeze produces no candidate. This
 //! crate performs no compilation, admission, briefing, or model work, owns no
@@ -37,6 +69,8 @@
 
 #[cfg(test)]
 mod exact_trigger_gate_tests;
+#[cfg(test)]
+mod field_family_tests;
 
 use std::collections::BTreeSet;
 
@@ -172,6 +206,63 @@ impl ClosureDenominator {
     }
 }
 
+/// The exact deterministic trigger a candidate bears on, bound to the
+/// observation and the fence within which it matched.
+///
+/// Every member is an echo of what this crate's own measured producer already
+/// carries, and nothing else: [`FailureObservation::trigger`] for the matched
+/// identity and [`FailureObservation::state_fence`] for the fence it was read
+/// under, plus the observation handle those two were read under. No composite
+/// fingerprint content belongs in this shape. The governing donor states the two
+/// apart — "Exact deterministic trigger can block/requires probe within matching
+/// scope. Semantic similarity only warns."
+/// (`docs/architecture/I12-19-negative-memory.md:3`), and `module.toml`'s `fence`
+/// row names the same binding: "Task scope plus `StateFence` revisions; exact
+/// deterministic trigger scope for block/probe."
+///
+/// The matching scope and task are not restated here as untyped text. They live
+/// on the observation itself as its own `ObservationScope`
+/// (`FailureObservation::scope`), and the binding is a recorded chain rather
+/// than a copied value: [`Self::observation_ref`] names the exact observation
+/// whose scope `validate_intake` proved equal to both admitted projections'
+/// scope before any classification, and [`Self::state_fence`] names the fence
+/// that observation was read under. Restating `WorkScopeId` as a `String` here
+/// would create the string facade of an existing typed owner
+/// (`crates/foundation/eliot-contracts/AGENTS.md`: "Reuse an existing owner and
+/// never create a third same-meaning type, package, wrapper, or string
+/// facade"), and restating it as the typed owner would add a dependency edge on
+/// `eliot-receipts` that this package does not hold.
+///
+/// These three members are echoes of an owner record the candidate does not
+/// carry, so their agreement with [`FailureObservation::observation_id`],
+/// [`FailureObservation::trigger`] and [`FailureObservation::state_fence`] is
+/// established once, where that record is reachable -- in the `ExactTrigger`
+/// literal in `finish` at src/lib.rs:957 -- and is never re-read afterwards,
+/// because `validate` is given no owner input. What
+/// `validate` re-derives is internal coherence only: [`Self::observation_ref`]
+/// against the candidate's own `observation_ref`, and [`Self::state_fence`]
+/// against `denominator.fence`. The one member a downstream holder re-decides
+/// against a value this record does not carry is [`ExactTrigger::identity`],
+/// through [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`].
+///
+/// This type carries no validator of its own:
+/// [`NegativeMemoryExtinctionCandidate::validate`] is the single place the
+/// closed shape is enforced, exactly as it already recomputes
+/// [`ClosureDenominator`]'s digest, so no second check can exist beside it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExactTrigger {
+    /// Verbatim exact deterministic trigger identity, compared verbatim
+    /// against the governing exact trigger identities the Governor owner
+    /// supplies and never against [`NegativeMemoryExtinctionCandidate::fingerprint`].
+    pub identity: String,
+    /// Observation handle this exact trigger fired under.
+    pub observation_ref: ArtifactId,
+    /// Fence the exact trigger was read under, which stays compatible with the
+    /// closure fence recorded on the candidate.
+    pub state_fence: StateFence,
+}
+
 /// One advisory negative-memory extinction candidate.
 ///
 /// History fields are echoed verbatim from the observation; only
@@ -186,9 +277,9 @@ pub struct NegativeMemoryExtinctionCandidate {
     pub candidate_id: ArtifactId,
     /// Observation handle this candidate bears on.
     pub observation_ref: ArtifactId,
-    /// Exact deterministic trigger identity this candidate bears on, echoed
-    /// verbatim from [`FailureObservation::trigger`] — the member that member's
-    /// owner documents as "Exact deterministic trigger identity".
+    /// Exact deterministic trigger this candidate bears on: the typed,
+    /// observation/fence-bound [`ExactTrigger`] built from
+    /// [`FailureObservation::trigger`] and [`FailureObservation::state_fence`].
     ///
     /// This is the only member an exact-trigger requirement may be decided on,
     /// and it is a separate member from `fingerprint` precisely so a composite
@@ -200,13 +291,17 @@ pub struct NegativeMemoryExtinctionCandidate {
     ///
     /// No stored candidate exists to migrate: this cell declares
     /// `owned_mutable_state = []` and `state_class = STATELESS`
-    /// (`module.toml:22` and `:185`), so the added required member is read
-    /// only from a candidate this crate just proposed.
-    pub trigger: String,
-    /// Failure fingerprint echoed verbatim. This is the semantic content of the
-    /// owner failure memory — the trigger, failed-action and outcome identity as
-    /// the owner admitted them — and never the exact trigger: a similarity of
-    /// this value only warns. Decide exact-trigger requirements on `trigger`.
+    /// (`module.toml:22` and `:196`), so the required member is read
+    /// only from a candidate this crate just proposed. The only construction
+    /// site is [`finish`].
+    pub trigger: ExactTrigger,
+    /// Composite failure fingerprint echoed verbatim. This is the semantic
+    /// content of the owner failure memory — the trigger, failed-action and
+    /// outcome identity as the owner admitted them — and never the exact
+    /// trigger: a similarity of this value only warns. Decide exact-trigger
+    /// requirements on `trigger`, and note that `validate` refuses this exact
+    /// value in `trigger.identity`, so a near match can never be promoted into
+    /// the exact-trigger slot.
     pub fingerprint: String,
     /// Posed self-query digest this candidate was assessed under.
     pub query_digest: String,
@@ -244,7 +339,43 @@ impl NegativeMemoryExtinctionCandidate {
         .map_err(|_| RevisionError::NotDigestible)
     }
 
-    /// Validate version, bounds, state/denominator coherence, and the digest.
+    /// Validate version, bounds, the closed exact-trigger shape,
+    /// state/denominator coherence, and the digest.
+    ///
+    /// The exact-trigger block below is the only enforcement of the
+    /// exact/near-match distinction this crate performs on shape: the recorded
+    /// trigger must be a bounded identity, must not be the composite
+    /// [`Self::fingerprint`], must name the observation this candidate bears on,
+    /// and must stay fence-compatible with the closure denominator. The matching
+    /// scope and task are the named observation's own scope, which
+    /// `validate_intake` proved equal to both admitted projections' scope before
+    /// anything was classified. [`Self::recheck_exact_trigger`] then decides the
+    /// exact-trigger requirement itself against the governing exact-trigger
+    /// identities; a candidate refused by either check is not a candidate.
+    ///
+    /// Every comparison in the exact-trigger block is between two members this
+    /// same record carries, because `validate` takes no owner input: nothing in
+    /// its signature reaches a `FailureObservation`, a `TaskProjection` or a
+    /// `SafetyProjection`. What is therefore proven here about
+    /// `trigger.identity` is that it is bounded and control-character-free
+    /// (src/lib.rs:392), that it is not the composite `fingerprint`
+    /// (src/lib.rs:406), and that it is committed to by `digest`
+    /// (src/lib.rs:462) -- not that it equals
+    /// [`FailureObservation::trigger`]. That equality is established only where
+    /// the owner record is reachable: `validate_intake` revalidates the
+    /// observation at src/lib.rs:732, and the `ExactTrigger` literal in `finish`
+    /// copies `observation.trigger` and `observation.state_fence` verbatim at
+    /// src/lib.rs:957. `validate` never re-reads either, so a writer who
+    /// rewrites `trigger.identity`, or `trigger.state_fence` together with
+    /// `denominator.fence`, and recomputes
+    /// `denominator.recheck_digest` and `digest` produces a record this function
+    /// accepts. That residual is reported rather than papered over: closing it
+    /// here would need either an owner value this function is not given or a
+    /// keyed mechanism, and this crate holds no keyed primitive to name.
+    /// The identity is instead re-decided out of band, against a value the
+    /// record does not carry, by [`Self::recheck_exact_trigger`] (src/lib.rs:505),
+    /// which compares it verbatim with the Governor owner's governing set and
+    /// which `finish` calls on every candidate it emits (src/lib.rs:984).
     pub fn validate(&self) -> Result<(), RevisionError> {
         if self.contract_version != CANDIDATE_CONTRACT_VERSION {
             return Err(RevisionError::DigestMismatch {
@@ -258,12 +389,53 @@ impl NegativeMemoryExtinctionCandidate {
         }
         // The exact trigger is an identity, checked exactly like
         // `intake.candidate_id`, and never folded into `fingerprint`.
-        if self.trigger.trim().is_empty()
-            || self.trigger.chars().any(char::is_control)
-            || self.trigger.chars().count() > MAX_ID_CHARS
+        if self.trigger.identity.trim().is_empty()
+            || self.trigger.identity.chars().any(char::is_control)
+            || self.trigger.identity.chars().count() > MAX_ID_CHARS
         {
             return Err(RevisionError::DigestMismatch {
-                field: "candidate.trigger",
+                field: "candidate.trigger.identity",
+            });
+        }
+        // A composite fingerprint is the semantic near-match description, so it
+        // can never occupy the exact-trigger slot: that is the promotion a
+        // "valid near match" would need, and the donor separates them
+        // ("Exact deterministic trigger can block/requires probe within matching
+        // scope. Semantic similarity only warns.",
+        // `docs/architecture/I12-19-negative-memory.md:3`).
+        if self.trigger.identity == self.fingerprint {
+            return Err(RevisionError::ScopeMismatch {
+                field: "candidate.trigger.identity",
+            });
+        }
+        if self.trigger.observation_ref != self.observation_ref {
+            return Err(RevisionError::ScopeMismatch {
+                field: "candidate.trigger.observation_ref",
+            });
+        }
+        // The counterpart compared here is `self.denominator.fence`, the closure
+        // fence this same record carries -- NOT the governing task fence. That
+        // task fence is reachable only inside `finish`: it lives on
+        // `RevisionIntake::task` (src/lib.rs:680) and is copied into the
+        // denominator at src/lib.rs:944, so no member of `validate`'s `&self`
+        // is the task fence and none is re-read here. `validate_intake` applies
+        // the same rule one step earlier, comparing `observation.state_fence`
+        // against that same `intake.task.binding.state_fence` at src/lib.rs:756,
+        // so the two transported members carry that comparison into the record.
+        // `StateFence::is_compatible_with`
+        // (crates/foundation/eliot-contracts/src/lib.rs:981-989) requires exact
+        // `EpochId` lineage-and-sequence equality and equal
+        // `resource_generation`, so no foreign authority epoch or resource
+        // generation survives; a rewriter who restates BOTH members consistently
+        // still gets a valid record, which `validate`'s doc comment records as
+        // an open residual instead of claiming this check closed it.
+        if !self
+            .trigger
+            .state_fence
+            .is_compatible_with(&self.denominator.fence)
+        {
+            return Err(RevisionError::FenceMismatch {
+                field: "candidate.trigger.state_fence",
             });
         }
         if self.denominator.recheck_digest != self.denominator.compute_digest()? {
@@ -309,7 +481,7 @@ impl NegativeMemoryExtinctionCandidate {
     /// with the governing set it actually holds.
     ///
     /// The requirement is decided on exactly one comparison: verbatim equality
-    /// of [`Self::trigger`] with a member of `governing_triggers`. Neither the
+    /// of [`ExactTrigger::identity`] with a member of `governing_triggers`. Neither the
     /// presence nor the shape nor any containment or similarity of
     /// [`Self::fingerprint`] is consulted, because the governing donor
     /// (`docs/architecture/I12-19-negative-memory.md:3`) states "Exact
@@ -336,7 +508,7 @@ impl NegativeMemoryExtinctionCandidate {
     ) -> Result<(), RevisionError> {
         let exact_trigger_fired = governing_triggers
             .iter()
-            .any(|identity| identity == &self.trigger);
+            .any(|identity| identity == &self.trigger.identity);
         if exact_trigger_fired != (self.state == CandidateState::Unsupported) {
             return Err(RevisionError::ScopeMismatch {
                 field: "candidate.exact_trigger",
@@ -782,7 +954,11 @@ fn finish(
         contract_version: CANDIDATE_CONTRACT_VERSION,
         candidate_id: intake.candidate_id.clone(),
         observation_ref: intake.observation.observation_id.clone(),
-        trigger: intake.observation.trigger.clone(),
+        trigger: ExactTrigger {
+            identity: intake.observation.trigger.clone(),
+            observation_ref: intake.observation.observation_id.clone(),
+            state_fence: intake.observation.state_fence.clone(),
+        },
         fingerprint: intake.observation.fingerprint.clone(),
         query_digest,
         narrowing,

@@ -708,16 +708,24 @@ fn run_admitted_pipeline(
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
     let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
-    // The grounding owner takes its request by value; the same admitted request
-    // is retained here so the Orientation carrier joins the exact one this
-    // stage ran under instead of rebuilding a lookalike.
-    let grounded = grounding_stage::ground_admitted_draft(grounding_request.clone())?;
     // Non-Curation classes pass the screen through with no binding to carry:
     // the resolve above already proved the pass-through.
     let screen_binding = None;
     let _validation = validation_stage::resolve_validation_inputs(admission, job)?;
-    let validation_input =
-        admitted_material::validation_input_for(admission, job, grounded, Some(0))?;
+    // A-14b -> A-05 handoff, one owner call. This root supplies only the A-05
+    // data it actually holds (policy, usage, preservation, and the caller's
+    // explicit observation time); the owner grounds the request and constructs
+    // the carrier at its single construction site, so no `GroundingValidationInput`
+    // is built here and the grounded leg's identity, scope, fence, and task
+    // joins are never restated by the composition. The owner consumes the
+    // request by value, so the exact admitted request is retained here for the
+    // Orientation carrier to join instead of rebuilding a lookalike.
+    let validation_attachment =
+        admitted_material::validation_attachment_for(admission, job, Some(0))?;
+    let validation_input = validation_stage::ground_and_bind_validation_carrier(
+        grounding_request.clone(),
+        validation_attachment,
+    )?;
     // The structured A-05 gate runs exactly once here; the validated receipt
     // threads into dispatch, which proves its binding before any native
     // handler runs and never re-runs the owner validation.
