@@ -844,11 +844,18 @@ mod tests {
     /// every call site hands an owned `Value` to `serde_json::from_value`
     /// (which takes `Value`, not `&Value`).
     ///
+    /// The owned `Value` is moved out of the argument rather than borrowed and
+    /// cloned: the clone was pure overhead on a fixture, and destructuring is
+    /// also what refuses a non-object fixture here instead of the caller.
+    ///
     /// The removal is checked rather than assumed: a misspelled member name
     /// would otherwise leave the fixture untouched and the caller's refusal
     /// would be attributed to the wrong cause.
     fn without(value: Value, field: &str) -> Value {
-        let mut object = value.as_object().expect("object").clone();
+        let mut object = match value {
+            Value::Object(object) => object,
+            other => panic!("the fixture must be a JSON object, got: {other}"),
+        };
         assert!(
             object.remove(field).is_some(),
             "the fixture must actually carry a `{field}` member to remove"
@@ -868,8 +875,10 @@ mod tests {
         serde_json::from_value::<T>(value.clone())
             .unwrap_or_else(|error| panic!("the complete fixture must decode: {error}"));
 
-        let error = serde_json::from_value::<T>(without(value, field))
-            .expect_err("an omitted effect-bearing member must be refused");
+        let error = match serde_json::from_value::<T>(without(value, field)) {
+            Ok(_) => panic!("an omitted effect-bearing member `{field}` must be refused"),
+            Err(error) => error,
+        };
         let message = error.to_string();
         assert!(
             message.contains(&format!("missing field `{field}`")),
@@ -957,8 +966,10 @@ mod tests {
         for version in ["0", "2", "", "1.0"] {
             let mut value = manifest_value();
             value["schema_version"] = Value::String(version.to_owned());
-            let error = serde_json::from_value::<BackupManifest>(value)
-                .expect_err("a misselected schema_version must be refused");
+            let error = match serde_json::from_value::<BackupManifest>(value) {
+                Ok(_) => panic!("a misselected schema_version `{version}` must be refused"),
+                Err(error) => error,
+            };
             let message = error.to_string();
             assert!(
                 message.contains("unsupported backup manifest schema_version"),
