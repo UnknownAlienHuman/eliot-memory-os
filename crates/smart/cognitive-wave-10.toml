@@ -2,11 +2,13 @@ schema_version = 6
 wave_id = "cognitive-micromodules-wave-10"
 status = "PROTOTYPE_ASSIGNMENT_GATED"
 base_commit = "cdf4a29430e6ea51010e00a9b9301abda0b67895"
+dispositions_re_read_on = "95f556b5873198eeb24a722103154b28db69e857"
+dispositions_re_read_rule = "base_commit is the commit this catalogue was authored against and is not the base of its dispositions. Every disposition, defining_refs entry and owner claim in this file was re-read on dispositions_re_read_on, which is an ancestor of the current branch head. A recorded disposition is not evidence that it is still true: if a path this file names changes after that base, the affected row is stale until it is re-read, exactly as scripts/verify-cognitive-donor-dispositions-816.py refuses a self-consistent but stale map for the same reason. The rows changed by that rule in this increment say so in their own text."
 normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
 normative_pair_receipt = "docs/normative-pair.toml"
 normative_pair_authority = "docs/normative-pair.toml::pair_key"
 pair_key_copy_rule = "This catalogue does not restate the pair key. The key is read from docs/normative-pair.toml, which is the only owner of it; an earlier copy of the value into this header is removed rather than refreshed, because a second maintained copy is exactly the divergence this rule exists to prevent. Measured on the current base: the receipt now reads sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1, while the copy this header used to carry read sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea, so the copy had already gone stale. No [[type_contract]] row, [[validation_gate]] rule or [[field_contract]] denominator depends on the key value, so removing the copy changes no contract."
-normative_pair_residual = "The repository-level state is measured, not assumed, and the surviving disagreement is narrower than a contradiction. An exact scan for a pair_key assignment under crates/smart/ and docs/ finds two: the authority at docs/normative-pair.toml::pair_key, and one stale copy at crates/smart/cognitive-wave-09.toml::pair_key. That wave-09 row is a deliberate, self-declared preservation: its pair_key_status reads ISSUE_DECLARED_PAIR_SUPERSEDED_NOT_REPAIRED_HERE and its pair_key_note states that the value is the issue's own authority statement kept verbatim, so it is evidence of what an issue declared rather than a second live owner of the accepted pair. The superseded sha256:105558fc... also appears in docs/ARCHITECTURE_CONTRACT.md, but only inside the section headed Preserved pre-sharding authority contract, which that file itself marks as retained migration evidence superseded by the accepted sharded pair; it is not a competing authority. The repair of the wave-09 row and of the CC-W2-NORMATIVE-PAIR-KEY row that records it stays with the catalogue owner named there, and no duplicate pair owner is created here."
+normative_pair_residual = "Re-read on the current base, the earlier record of a surviving disagreement is stale and is corrected here. An exact scan for a pair_key assignment under crates/smart/ and docs/ finds two and they now agree: the authority at docs/normative-pair.toml::pair_key (sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1, status accepted, schema_version eliot-normative-pair-v2-sharded) and the projection in crates/smart/cognitive-wave-09.toml::pair_key, whose pair_key_status reads ACCEPTED_PAIR_PINNED_VERIFIED_NOT_COPIED, whose pair_key_authority names the single owner, and whose pair_key_verified_by names the independent recomputation over the receipt's own document digests. The superseded pre-sharding sha256:105558fc... is retained there under issue_declared_pair_key with status SUPERSEDED_PRE_SHARDING_PAIR_RETAINED_AS_MIGRATION_EVIDENCE_NOT_AUTHORITY, and it appears in docs/ARCHITECTURE_CONTRACT.md only inside the section that file itself heads Preserved pre-sharding authority contract; neither is a second live owner. crates/smart/cognitive-wave-01.toml carries no pair_key row at all, so the previously recorded coordinated two-file re-pin does not exist; the only wave-01 hand-maintained identity is its normative_pair version string, whose revisions and edition (4.5-draft, 0.29-draft, 2026-08-28) match docs/normative-pair.toml today. What remains is a standing drift risk on any hand-maintained copy, named by H-W2-NORMATIVE-PAIR-CORRECTION and CC-W2-NORMATIVE-PAIR-KEY; this catalogue keeps no copy of its own and creates no second pair owner."
 purpose = "Freeze field-complete specialized semantic payload contracts for the ten Issue #262 Dreamer families by binding every row to a measured current defining Rust symbol. Reconciles the issue crate labels against measured physical crates; invents no crate, no order and no type."
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
@@ -17,8 +19,9 @@ workspace_rule = "This catalogue is metadata only. It creates no crate, changes 
 authority_rule = "No row here owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
 dependency_rule = "depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 order_rule = "No order is created, renumbered or reused by this catalogue. Every [[assignment]] order and every [[assignment_ref]] order below is a value already measured in crates/smart/cognitive-crate-decisions.toml (orders 1-43), crates/smart/cognitive-wave-09.toml (orders 76-86), or a [package.metadata.eliot] agent_order read from the crate's own Cargo.toml."
-label_resolution_rule = "The Issue #262 body names ten crate labels. Six of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning, and by extension any function-only package) do not name a physical crate on base cdf4a29. Each such label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
-freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff."
+label_resolution_rule = "The Issue #262 body names ten crate labels. On the current base five of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning) name no physical crate, and [[label_resolution]] carries exactly five physical_crate_found = false rows against exactly five physical_crate_found = true rows; the five rows are what this rule is checked against. Each unresolved label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
+freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff. Measured on the current base: the freeze is freeze_id cognitive-rev12-contract-schema-freeze-2026-09-22-r8 at revision 8, its bytes are 64160 long and hash to sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0, and that value is exactly what REQUIRED_FREEZE_DIGEST holds and exactly what CC-W9-REV12-HANDOFF records, so the pin is currently satisfied and this catalogue changes none of the three. This index is not inside the freeze at any revision: r7 and r8 were published for other owners, so the next candidate is r9 and not the r7 the handoffs below used to name."
+freeze_pin_state = "MEASURED_CURRENT / r8 / digest and byte length agree across the freeze bytes, REQUIRED_FREEZE_DIGEST and the CC-W9-REV12-HANDOFF row / seven of the eight freeze-identity string pins read r8 and the eighth, crates/smart/eliot-experience-provider/src/lib.rs, is a deliberate recorded exception at r5 under CC-W2-CONSUMER-REPIN / this index remains unpromoted"
 disjointness_rule = "This catalogue does not modify bins/, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file. The only Rust files it edits are the three alias retirements in [[retired_name]]: crates/smart/eliot-dreamer-orientation/src/input.rs, crates/smart/eliot-dreamer-orientation/src/lib.rs, crates/smart/eliot-dreamer-concept/src/lib.rs, crates/smart/eliot-dreamer-concept/src/synthesis.rs, crates/smart/eliot-dreamer-cycle/src/durable.rs and crates/smart/eliot-dreamer-cycle/src/lib.rs. No other memory-curation or dreamer-cycle file is touched."
 single_ownership_rule = "A concern in this catalogue has exactly one live owner. A second name for a concern is a duplicate owner, not a convenience: an alias, a re-export or a compat spelling that keeps both names live is retired rather than kept, and the retirement is recorded once in [[retired_name]] with its single surviving owner. A re-export that exists only as a consumer boundary over a type the owning crate already declares is not a second owner and is not retired; the two cases are told apart by whether the second name defines anything. Two DISTINCT types that happen to share one name are also not duplicates and are never unified here."
 
@@ -30,7 +33,7 @@ gate = "Every specialized semantic payload is bound to one measured defining sym
 [[stage]]
 id = "W2_LABEL_RECONCILIATION"
 orders = [5, 21, 25, 39, 41, 42, 43]
-gate = "Six issue-named labels resolve to measured physical owners or to an explicit missing contract decision; no function-only Cargo package is created."
+gate = "All ten issue-named labels resolve to measured physical owners or to an explicit missing contract decision: five rows with physical_crate_found = true and five with physical_crate_found = false. No function-only Cargo package is created."
 
 [[stage]]
 id = "W2_CANDIDATE_ONLY_BOUNDARIES"
@@ -99,7 +102,7 @@ owner_crate = "eliot-dreamer-curation"
 owner_module_id = "smart.dreamer.curation"
 measured_order = 31
 family_owner_crates = ["eliot-dreamer-classification", "eliot-dreamer-relation", "eliot-dreamer-episode", "eliot-dreamer-concept", "eliot-dreamer-failure", "eliot-dreamer-structure-repair", "eliot-dreamer-reconsolidation", "eliot-dreamer-accessibility", "eliot-dreamer-memory-repair"]
-note = "No shared family envelope type exists in any of the ten; eliot-dreamer-concept emits no result type at all."
+note = "Re-read on the current base: the shared family envelope does exist and is the contracts-owned TypedCurationHandlerResult, populated today by concept, episode and failure only; the other seven families carry no such field. Every one of the ten families emits its own result or candidate type, and the concept family emits the contracts-owned ConceptCandidate. Both facts are recorded per row in [[type_contract]] MM-04 and MM-11."
 
 [[label_resolution]]
 issue_label = "eliot-dreamer-procedural"
@@ -521,13 +524,14 @@ status = "FROZEN_STATIC_FIELD_CONTRACT_WITH_ONE_MISSING_OWNER_DECISION"
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
-fields = ["candidate_id_kind_source_handles_proposed_transformation_support_counterevidence", "scope_and_applicability_preservation_report_uncertainty_verifier_or_replay_expected_benefit_rollback", "kind_Classification_Relation_Episode_Concept_Procedure_Failure_Merge_Split_Reconsolidation_Accessibility_Repair", "handler_result_type_per_kind_ClassificationResult_RelationResult_EpisodeCandidate_ABSENT_FailureAssessment_and_FailureHandlerDecision_StructureRepairCandidate_ReconsolidationResult_AdjustmentProposal_MemoryRepairCandidate", "merge_split_equivalence_report_rollback_plan_invalidation_plan_dependent_dispositions", "reconsolidation_added_and_child_propositions_reactivation_binding_evidence_independence_dependent_outcome", "accessibility_axis_surface_standing_influence_change_protection_and_negative_memory_local_closure", "memory_repair_defect_kind_operation_kind_provenance_repair_spec_contamination_closure_representation_proposal", "chronology_chronology_link_boundary_gap_coverage_overlap_assessment_rollback"]
+fields = ["candidate_id_kind_source_handles_proposed_transformation_support_counterevidence", "scope_and_applicability_preservation_report_uncertainty_verifier_or_replay_expected_benefit_rollback", "kind_Classification_Relation_Episode_Concept_Procedure_Failure_Merge_Split_Reconsolidation_Accessibility_Repair", "handler_result_type_per_kind_ClassificationResult_RelationResult_EpisodeCandidate_ConceptCandidate_FailureAssessment_and_FailureHandlerDecision_StructureRepairCandidate_ReconsolidationResult_AdjustmentProposal_MemoryRepairCandidate", "shared_family_envelope_TypedCurationHandlerResult_populated_by_concept_episode_failure_absent_on_the_other_seven_families", "merge_split_equivalence_report_rollback_plan_invalidation_plan_dependent_dispositions", "reconsolidation_added_and_child_propositions_reactivation_binding_evidence_independence_dependent_outcome", "accessibility_axis_surface_standing_influence_change_protection_and_negative_memory_local_closure", "memory_repair_defect_kind_operation_kind_provenance_repair_spec_contamination_closure_representation_proposal", "chronology_chronology_link_boundary_gap_coverage_overlap_assessment_rollback"]
 denominator = "per-kind denominator over the retained source handles and the declared coverage member set, with explicit omissions, at the named fence"
 denominator_rule = "RECHECK: re-enumerate the affected members, dependent closure and revalidation plan from the retained source handles at the named fence. Similarity only warns; an exact trigger blocks or requires a probe."
 complete_rule = "A kind is Complete only when its own result type reports complete coverage with no unnamed omission. There is no family-level completeness: completeness is per kind."
 fence = "per-kind scope and fence; the family index carries no single fence of its own."
 omission_semantics = "Every kind carries its own omission class; an omitted member stays addressable and is never replaced by a family aggregate."
-invariants = ["merge, split, reconsolidation, accessibility and influence are forward reversible candidates only", "chronology stays separate from causal hypothesis", "no shared family envelope type is invented", "no aggregate intelligence, confidence or utility score across kinds", "the concept handler has no emitted result type on this base and is an explicit missing contract decision"]
+open_owner_decision = "One, and it is MM-11: whether the seven families that carry no handler_result field adopt the existing eliot-dreamer-contracts TypedCurationHandlerResult, or the family stays per-kind unenveloped. MM-04 is no longer one of them: the concept family emits the contracts-owned ConceptCandidate and is recorded as corrected_static_description."
+invariants = ["merge, split, reconsolidation, accessibility and influence are forward reversible candidates only", "chronology stays separate from causal hypothesis", "no shared family envelope type is invented; the envelope that exists is the contracts-owned TypedCurationHandlerResult and it is reused, not redefined here", "no aggregate intelligence, confidence or utility score across kinds", "the concept family emits the contracts-owned ConceptCandidate through propose_concept_or_abstraction, so no handler in the family is result-free; the earlier ABSENT entry for that kind was false on this base and is corrected"]
 
 [[field_contract]]
 id = "ProceduralCandidateContract"
@@ -778,13 +782,14 @@ consumers = ["Controller phase boundary (immutable projection)"]
 
 [[ownership]]
 public_type = "GroundingValidationInput"
-rust_owner = "eliot-dreamer-claim-grounding"
-defining_symbol = "crates/smart/eliot-dreamer-claim-grounding/src/grounding.rs::GroundingRequest and the A-14b structured carrier consumed by StructuredCandidateRejectionReport.input"
+rust_owner = "eliot-dreamer-contracts"
+defining_symbol = "crates/smart/eliot-dreamer-contracts/src/validation/structured/mod.rs::GroundingValidationInput"
 contract_index = "ValidationGroundingReceiptContract"
 functional_cells = ["smart.dreamer.claim_grounding"]
 manifest = "crates/smart/eliot-dreamer-claim-grounding/module.toml"
 consumers = ["eliot-dreamer-candidate-validation (structured leg)"]
-open_gap = "The exact A-14b carrier symbol name is not a top-level pub type in eliot-dreamer-claim-grounding; only GroundingRequest, GroundingControls and Cancellation are. Recorded as missing_contract_decision in CC-W2-VALIDATION-PAYLOAD rather than asserted as a located symbol."
+consumer_boundary = "rust_owner names the defining crate; the manifest and functional_cells rows below it name the A-14b claim-grounding cell whose GroundedDreamDraft this carrier retains, because that cell is the capability boundary this carrier serves. eliot-dreamer-claim-grounding defines and re-exports only GroundingRequest, GroundingControls and Cancellation (crates/smart/eliot-dreamer-claim-grounding/src/lib.rs line 13 pub use grounding::{...}); it neither defines nor re-exports this carrier. Its own module manifest is crates/smart/eliot-dreamer-claim-grounding/module.toml and the defining crate's is crates/smart/eliot-dreamer-contracts/module.toml."
+open_gap = "The carrier symbol is located and named on this base, so the earlier open gap is closed for the symbol itself: crates/smart/eliot-dreamer-contracts/src/validation/structured/mod.rs::GroundingValidationInput, re-exported at the contracts root (crates/smart/eliot-dreamer-contracts/src/lib.rs line 183), with new(), validate(), input_digest_and_size() and output_digest_and_size(); its retained sibling ValidatedGroundingCandidate is defined in the same file. The remaining missing link is the producer: git grep for GroundingValidationInput::new and for the struct literal outside tests/ finds no production construction site in the current tree, so the join from an A-14b grounding run to the A-05 policy, usage and preservation inputs has no named producer. That link is recorded here as missing rather than assigned, because no crate owner claim for it exists that this catalogue could cite."
 
 # ---------------------------------------------------------------------------
 # Field-complete per-type rows. One disposition per load-bearing row.
@@ -930,7 +935,8 @@ units_bounds = "unbounded in source; no MAX_* const applies to these three Strin
 identity_scope_fence = "not applicable"
 provenance_privacy = "not applicable"
 validation_error = "not applicable"
-compatibility = "the kind and status discriminants are free String, so an implementation agent can still invent values; this is an open gap, not a closed class"
+compatibility = "the kind and status discriminants are free String on this base and stay recorded as an open gap, not a closed class"
+open_gap = "Re-read on the current base: OrientationResidue.kind, InertProbe.status and InertProbe.result_space are still String / Option<String> in crates/smart/eliot-dreamer-orientation/src/projection.rs, with no closed class and no validator over them, while the same crate does close OrientationSectionKind to eleven variants. Closing this needs a new closed enum or a validator in eliot-dreamer-orientation, which is a .rs change in another writer's crate; this catalogue records the measured shape and the owner of the decision (CC-W2-ORIENTATION-PACKET required_owner: Owner of smart.dreamer.orientation) and does not invent a vocabulary or a type."
 disposition = "missing_contract_decision"
 
 [[type_contract]]
@@ -1225,24 +1231,31 @@ disposition = "reused_exact"
 [[type_contract]]
 id = "MM-04"
 contract_index = "MemoryModelCandidateContract"
-crate = "eliot-dreamer-concept"
-rust_path = "crates/smart/eliot-dreamer-concept/src/evidence.rs"
-defining_refs = ["crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceLedger",
+crate = "eliot-dreamer-contracts"
+rust_path = "crates/smart/eliot-dreamer-contracts/src/concept/result.rs"
+defining_refs = ["crates/smart/eliot-dreamer-contracts/src/concept/result.rs::ConceptCandidate",
+    "crates/smart/eliot-dreamer-contracts/src/concept/result.rs::ConceptDisposition",
+    "crates/smart/eliot-dreamer-contracts/src/concept/result.rs::seal_concept",
+    "crates/smart/eliot-dreamer-contracts/src/registry.rs::TypedCurationHandlerResult",
+    "crates/smart/eliot-dreamer-contracts/src/registry.rs::CurationFamily",
+    "crates/smart/eliot-dreamer-contracts/src/candidate.rs::CandidateDisposition",
+    "crates/smart/eliot-dreamer-concept/src/synthesis.rs::propose_concept_or_abstraction",
+    "crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceLedger",
     "crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceAssessment",
     "crates/smart/eliot-dreamer-concept/src/policy.rs::ConceptPolicy",
     ]
-symbol = "EvidenceLedger, EvidenceAssessment, ConceptPolicy"
-kind = "struct"
-fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
-wire_spelling = "not restated; owned by the defining module"
-wire_boundary = "not restated; owned by the defining module"
-required_optional_none = "not restated; owned by the defining module"
-units_bounds = "not restated; owned by the defining module"
-identity_scope_fence = "not restated; owned by the defining module"
-provenance_privacy = "EvidenceLedger is the provenance surface for this kind"
-validation_error = "owned by the defining module"
-compatibility = "not determinable for a result type that does not exist. The alias ConceptDecision was retired under W2-ONE-OWNER-PER-CONCERN and is recorded in [[retired_name]]; the surviving name is eliot-dreamer-contracts ConceptDisposition, so retiring the alias does not decide the missing result type"
-disposition = "missing_contract_decision"
+symbol = "ConceptCandidate, ConceptDisposition, seal_concept, TypedCurationHandlerResult, CurationFamily, CandidateDisposition, propose_concept_or_abstraction, EvidenceLedger, EvidenceAssessment, ConceptPolicy"
+kind = "struct plus enums plus one producer function"
+fields = ["ConceptCandidate{schema_version, candidate_id, operation_id, input_digest, policy_digest, mode, proposal, disposition, common_disposition, preservation, rollback, proof_ceiling, handler_result}", "TypedCurationHandlerResult{request_id, kind, family, disposition, handler_id, request_digest, result_digest}", "EvidenceLedger and EvidenceAssessment are the provenance and verdict surface produced by build_ledger inside the producer", "ConceptPolicy is the local policy the producer validates against"]
+wire_spelling = "snake_case under serde deny_unknown_fields plus JsonSchema on ConceptCandidate, ConceptDisposition, TypedCurationHandlerResult, CurationFamily and CandidateDisposition"
+wire_boundary = "serde deny_unknown_fields on ConceptCandidate and TypedCurationHandlerResult; the candidate is sealed by seal_concept before it leaves the producer"
+required_optional_none = "no Option field on ConceptCandidate; rival declarations and observation time are Option inside GroundingValidationInput on the validation side, not here"
+units_bounds = "the contracts-side MAX_TEXT and per-field length checks inside ConceptCandidate::validate_against and ConceptPolicy::check_input"
+identity_scope_fence = "candidate_id is derived from operation_id, input_digest and policy_digest and validate_against refuses any candidate whose identity does not bind the exact input"
+provenance_privacy = "EvidenceLedger is the provenance surface for this kind and ConceptRollback carries predecessor, history, reversal and invalidation refs"
+validation_error = "ContractViolation from propose_concept_or_abstraction, ConceptCandidate::validate_against and seal_concept; the terminal class is ConceptDisposition"
+compatibility = "the earlier statement that the concept handler emits no result type at all was false on this base and is corrected here: propose_concept_or_abstraction returns Result<ConceptCandidate, ContractViolation> and seals the candidate through seal_concept. The crate declares no result struct of its own; ConceptCandidate is owned by eliot-dreamer-contracts, which is the same single owner the [[donor]] row for that crate already records. Adding a field to ConceptCandidate is a breaking change for every pinned consumer."
+disposition = "corrected_static_description"
 
 [[type_contract]]
 id = "MM-05"
@@ -1429,39 +1442,43 @@ disposition = "reused_exact"
 [[type_contract]]
 id = "MM-10"
 contract_index = "MemoryModelCandidateContract"
-crate = "eliot-dreamer-curation"
-rust_path = "crates/smart/eliot-dreamer-curation/src/lib.rs"
-defining_refs = ["crates/smart/eliot-dreamer-curation/src/lib.rs::NativeCurationHandler",]
+crate = "eliot-dreamer-contracts"
+rust_path = "crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs"
+defining_refs = ["crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs::NativeCurationHandler",]
 symbol = "NativeCurationHandler"
-kind = "re-export"
-fields = ["eliot_dreamer_contracts::NativeCurationHandler"]
-wire_spelling = "owned by eliot-dreamer-contracts"
-wire_boundary = "owned by eliot-dreamer-contracts"
-required_optional_none = "not applicable"
-units_bounds = "not applicable"
-identity_scope_fence = "the typed handler registry protocol is owned by eliot-dreamer-contracts (A-31)"
+kind = "trait definition"
+fields = ["handle(&self, call: &BoundCurationCall) -> Result<ProducedCurationContent, ContractViolation>"]
+wire_spelling = "NativeCurationHandler; the trait itself carries no serde boundary and is a Rust port contract"
+wire_boundary = "the typed port crosses the A-31 dispatch boundary inside eliot-dreamer-contracts; the trait defines no wire form of its own"
+required_optional_none = "not applicable; the trait declares one required method and no optional member"
+units_bounds = "not applicable; BoundCurationCall and ProducedCurationContent carry the bounds of their own definitions"
+identity_scope_fence = "the typed handler registry protocol is owned by eliot-dreamer-contracts (A-31); the trait body names exactly one handle call per accepted invocation with no retry, no fallback and no sibling call"
 provenance_privacy = "not applicable"
-validation_error = "owned by eliot-dreamer-contracts"
-compatibility = "this is a re-export and is recorded as the family index owner only because it is the dispatch facade; it is not a second type owner"
+validation_error = "ContractViolation from eliot-dreamer-contracts, preserved terminally by the caller"
+compatibility = "this row is the single defining site. crates/smart/eliot-dreamer-curation/src/lib.rs line 668 is a pub use re-export of this trait for its dispatch facade and is a consumer boundary, not a second owner; the family index names the facade crate in [[crate_manifest]], this row names the definition. Adding a required method is a breaking change for every implementor."
+consumer_boundary = "crates/smart/eliot-dreamer-curation/src/lib.rs re-exports NativeCurationHandler from eliot-dreamer-contracts and implements it for its own dispatch handler"
 disposition = "reused_exact"
 
 [[type_contract]]
 id = "MM-11"
 contract_index = "MemoryModelCandidateContract"
-crate = "none"
-rust_path = "none"
-defining_refs = []
-symbol = "a shared MemoryModelCandidate family envelope"
-kind = "absent"
-fields = ["none"]
-wire_spelling = "none"
-wire_boundary = "none"
-required_optional_none = "none"
-units_bounds = "none"
-identity_scope_fence = "none"
-provenance_privacy = "none"
-validation_error = "none"
-compatibility = "not determinable: the type does not exist on base cdf4a29 in any of the ten handler crates, and eliot-dreamer-concept emits no result type at all"
+crate = "eliot-dreamer-contracts"
+rust_path = "crates/smart/eliot-dreamer-contracts/src/registry.rs"
+defining_refs = ["crates/smart/eliot-dreamer-contracts/src/registry.rs::TypedCurationHandlerResult",
+    "crates/smart/eliot-dreamer-contracts/src/registry.rs::CurationFamily",
+    ]
+symbol = "the shared MemoryModelCandidate family envelope, measured as the existing TypedCurationHandlerResult"
+kind = "typed result envelope that already exists and is already populated by three of the ten handler families"
+fields = ["TypedCurationHandlerResult{request_id, kind, family, disposition, handler_id, request_digest, result_digest}", "CurationFamily is the closed ten-value family discriminant, derived from CurationKind by family_map"]
+wire_spelling = "snake_case under serde deny_unknown_fields plus JsonSchema on TypedCurationHandlerResult and CurationFamily"
+wire_boundary = "serde deny_unknown_fields; TypedCurationHandlerResult::validate refuses a family that no longer agrees with its kind"
+required_optional_none = "no Option field on the envelope; every identity and digest is required, so no field can be filled with None in place of owner data"
+units_bounds = "MAX_TEXT identity checks inside TypedCurationHandlerResult::validate; each digest must be 64-character lowercase hex sha256"
+identity_scope_fence = "request_id plus the registry-bound request_digest and the recomputed result_digest bind the envelope to one accepted invocation of one handler"
+provenance_privacy = "the envelope carries identities and digests only; it carries no free text, no generic JSON and no vendor SDK type"
+validation_error = "ContractViolation KindPayload or Malformed from TypedCurationHandlerResult::validate"
+compatibility = "the earlier statement that no shared family envelope exists is corrected by measurement: TypedCurationHandlerResult is the family envelope, it is owned and validated by eliot-dreamer-contracts, and it is populated today by exactly three families (concept in crates/smart/eliot-dreamer-concept/src/synthesis.rs, episode in crates/smart/eliot-dreamer-episode/src/result.rs, failure in crates/smart/eliot-dreamer-failure/src/result.rs). The remaining seven families carry no such field, so the open decision is narrower than the earlier row stated and is not decided here."
+open_gap = "Owner decision still required, and only this: whether the seven families that carry no handler_result field adopt the existing TypedCurationHandlerResult, or the family stays per-kind unenveloped. Measured absence is on this base only, by git grep for the handler_result field across crates/smart: concept, episode and failure carry it; classification, relation, procedure, structure-repair, reconsolidation, accessibility and memory-repair do not. This catalogue records that measurement and does not assign the adoption to any crate owner."
 disposition = "missing_contract_decision"
 
 [[type_contract]]
@@ -2264,6 +2281,12 @@ workspace_admission_change = "none; recorded as the memory-model family index ow
 # ---------------------------------------------------------------------------
 
 [[validation_gate]]
+id = "W2-DONOR-DISPOSITION-IS-A-RECORDED-VALUE"
+rule = "Every [[donor]] row carries exactly one named disposition class, never a prose sentence in the disposition field, and names the owner of that decision plus the issue refs of that call. Positive case: all six rows carry a disposition class drawn from the shape crates/smart/cognitive-donor-map.toml already uses, a rationale, a rejected_overgeneralization, a current_owner, an owner_issue_refs list, evidence naming what was re-read on the current base, and an uncertainty; the row for crates/smart/eliot-dreamer-contracts restates the RETAIN_A03_CONTRACT_OWNER decision the donor map already records for that path rather than adding a second one. Refusal case: a row is refused when its disposition is descriptive prose, when it names no current_owner, when it carries no owner_issue_refs, when its stated class is contradicted by the content it names, when a path present in the tree carries a RETIRED_* class, or when it claims a shape its own owner records as open. One refusal instance is already recorded rather than fixed: an earlier version of the freeze row attributed a seven-class disposition vocabulary to the freeze, which that file's own rows record as NOT_FROZEN, and the row now refuses that claim and says so. All six paths are present in the tree, so no row here may carry a RETIRED_* class."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
 id = "W2-TOML-PARSE"
 rule = "Every file edited by this work unit parses with python tomllib, and every field-shape denominator is recheckable by the stated denominator_rule."
 status = "TARGET"
@@ -2272,18 +2295,21 @@ evidence_execution_status = "NOT_EXECUTED"
 [[validation_gate]]
 id = "W2-NO-INVENTED-SYMBOL"
 rule = "Every identifier named in the symbol field of a [[type_contract]] row has exactly one entry in that row's defining_refs, and every defining_refs entry is a path::symbol whose file exists and defines that symbol on the current base, or the row carries disposition missing_contract_decision with an empty defining_refs. A row-level rust_path is the row's primary module and never the whole row's source reference. A guessed schema is never presented as frozen."
+measured = "Re-read on the current base: 43 [[type_contract]] rows carry 383 defining_refs entries and every one of them resolves to a public definition in a file that exists. Before this increment exactly one entry failed, the MM-10 entry that cited the eliot-dreamer-curation pub use re-export of NativeCurationHandler instead of its definition; that row now names crates/smart/eliot-dreamer-contracts/src/curation_invocation.rs. The only rows with an empty defining_refs are PR-03 and MR-04, which name manifest metadata and a prior static description and no Rust symbol at all."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-ONE-OWNER-PER-CONCERN"
 rule = "Exactly one live name owns a retired concern. Every name this catalogue retires appears once in [[retired_name]] with its single surviving owner, has zero remaining Rust occurrences across crates/ after the change, and is never kept as a re-export, type alias or compat spelling. A retired name is not a fourth disposition value: the retirement mechanism has one owner, [[retired_name]], and the disposition vocabulary stays at three values."
+measured = "Re-read on the current base, two rows no longer name a facade as the owner of a type it does not define. MM-10 names the eliot-dreamer-contracts definition of NativeCurationHandler and records the eliot-dreamer-curation pub use as a consumer_boundary; the [[ownership]] row for GroundingValidationInput names the eliot-dreamer-contracts definition and records eliot-dreamer-claim-grounding as the producer of the embedded GroundedDreamDraft and not the owner of the carrier. The earlier [[ownership]] row for ProbePlan already named src/model.rs::ProbePlan on this base, so no correction was needed there."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-ONE-DISPOSITION-PER-ROW"
 rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision. No row is both reused and missing."
+measured = "Re-read on the current base the 43 rows carry 34 reused_exact, 7 corrected_static_description and 2 missing_contract_decision, and no fourth value. The two open rows are MM-11 and ORI-03, each of which states its measured state and the owner of the remaining decision; a missing_contract_decision is never used as a convenient default for a row whose owner data this catalogue could have read."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
@@ -2308,12 +2334,14 @@ evidence_execution_status = "NOT_EXECUTED"
 [[validation_gate]]
 id = "W2-PLANNING-OWNS-NO-EFFECT"
 rule = "No planning family output carries a DurableJob, a Ready Queue entry, a route reservation, a launch, a schedule, a configuration write, an effect, an authority or a task finish. The ten admitted maintenance verbs are inert; DecompositionOutcome::Overlapped and ::Challenge block the two obvious escapes."
+measured = "Re-read on the current base: a search for DurableJob, ReadyQueue, a route reservation or a launch call across crates/smart/eliot-dreamer-maintenance-plan, crates/smart/eliot-dreamer-configuration-plan, crates/smart/eliot-dreamer-orchestration-plan and crates/smart/eliot-dreamer-probe-plan returns exactly one hit, and it is the crate doc comment of crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs line 21 naming scheduling, recurrence, ReadyQueue, wake, route and launch as things the cell does not do. EffectClass in crates/smart/eliot-dreamer-procedure stays a closed four-value class whose Unknown variant blocks every retry until an external owner reconciles the exact operation."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-CYCLE-ONE-CYCLE-NO-SCHEDULE"
 rule = "PlanHorizon has exactly one variant and ExperimentKind admits only a clarification or reconciliation probe, so the cycle is one finite bounded adjacent phase and cannot self-schedule. Adding a recurring horizon or a schedule field is a contract break."
+measured = "Re-read on the current base: crates/smart/eliot-dreamer-cycle/src/plan.rs still declares PlanHorizon with the single variant OneCycle, documented as covering exactly the single adjacent controller phase, and a search for a schedule or self-schedule field across the cycle crate finds none. One finite bounded cycle is therefore still what the shipped shape can express."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
@@ -2325,7 +2353,7 @@ evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-EXACT-TRIGGER-NOT-SIMILARITY"
-rule = "An exact trigger blocks or requires a probe; a semantic near-match only warns. NegativeMemoryExtinctionCandidate.fingerprint is one opaque String on this base, so the structured exact-trigger boundary is recorded as an open gap rather than frozen as satisfied."
+rule = "An exact trigger blocks or requires a probe; a semantic near-match only warns. Re-read on the current base, NegativeMemoryExtinctionCandidate.fingerprint is still one opaque String in crates/smart/eliot-dreamer-memory-revision/src/lib.rs with no structured trigger field, so the boundary is recorded as an open gap rather than frozen as satisfied. The only existing type named FailureFingerprint in the repository is crates/eliot-types/src/memory.rs::FailureFingerprint{fingerprint, summary, payload}, where payload is a generic serde_json::Value and no member separates an exact trigger from a semantic near match; it therefore cannot be adopted as the structured trigger without an owner decision and without breaking the no-generic-JSON boundary. This row names that candidate and its blocker instead of inventing a field."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
@@ -2350,6 +2378,7 @@ evidence_execution_status = "NOT_EXECUTED"
 [[validation_gate]]
 id = "W2-NO-AGGREGATE-SCORE"
 rule = "No frozen type carries an aggregate intelligence, confidence, utility or learning score, and no generic JSON or vendor SDK type appears in a public contract field."
+measured = "Re-read on the current base across the 22 crates named by the [[type_contract]] crate and [[ownership]] rust_owner fields plus eliot-dreamer-concept: a search for a public field whose name begins confidence, utility, score or intelligence returns zero hits, and a search for a public field typed as serde_json::Value or Value returns zero hits. The boundary is therefore not contradicted by current source; it is not thereby implemented, and evidence_execution_status stays NOT_EXECUTED."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
@@ -2367,9 +2396,9 @@ evidence_execution_status = "NOT_EXECUTED"
 id = "H-W2-FREEZE-PROMOTION"
 from = "crates/smart/cognitive-wave-10.toml"
 to = "crates/smart/cognitive-rev12-contract-schema-freeze.toml owner"
-trigger = "The owner decides to promote this semantic contract index into the freeze as revision 7."
+trigger = "The owner decides to promote this semantic contract index into the freeze."
 order = 1
-rule = "Publish r7 with a revision marker and supersedes_freeze_id plus supersedes_freeze_digest rows, then hand off to H-W2-DIGEST-REPIN. The r6 readback digest validates the r6 bytes only and never validates new bytes."
+rule = "Measured on the current base the freeze is r8, so the next candidate is r9: publish r9 with a revision marker and supersedes_freeze_id plus supersedes_freeze_digest rows naming r8 and sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0, then hand off to H-W2-DIGEST-REPIN. The r8 readback digest validates the r8 bytes only and never validates new bytes. The r7 revision named by earlier revisions of this row has already been published by another owner, so promoting into r7 is no longer possible under the readback rule."
 blocking_consumer = "eliot-dreamer-memory-revision::verify_freeze_binding, called from propose"
 status = "BLOCKED_PENDING_OWNER_DECISION"
 
@@ -2377,31 +2406,31 @@ status = "BLOCKED_PENDING_OWNER_DECISION"
 id = "H-W2-DIGEST-REPIN"
 from = "freeze owner"
 to = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs owner"
-trigger = "An r7 freeze is published."
+trigger = "An r9 freeze is published."
 order = 2
-rule = "Update REQUIRED_FREEZE_DIGEST to the sha256 over the exact new freeze bytes. FREEZE_BYTES is an include_bytes! of the file itself, so no second copy or hand-copied digest is introduced. This is a .rs edit and is therefore out of scope for a TOML-only work unit."
+rule = "Update REQUIRED_FREEZE_DIGEST to the sha256 over the exact new freeze bytes, and FREEZE_ID to the new id, in one edit. FREEZE_BYTES is an include_bytes! of the file itself, so no second copy or hand-copied digest is introduced. This is a .rs edit and is therefore out of scope for a TOML-only work unit. Measured on the current base this pair is already correct for r8, so this step is a re-pin to new bytes only and never a hand-copied constant."
 blocking_consumer = "eliot-dreamer-memory-revision::propose"
-status = "REQUIRED_BEFORE_R7_MERGE"
+status = "REQUIRED_BEFORE_R9_MERGE"
 
 [[handoff]]
 id = "H-W2-READBACK-ROW"
 from = "freeze owner"
 to = "crates/smart/cognitive-contract-challenges.toml owner"
-trigger = "An r7 freeze is published."
+trigger = "An r9 freeze is published."
 order = 3
-rule = "Repoint the CC-W9-REV12-HANDOFF resolution_evidence recorded digest and recorded byte length to the r7 values, then re-run python scripts/read_freeze_digest.py green. The recorded value lives here because a digest of a file's own bytes cannot live inside those bytes."
+rule = "Repoint the CC-W9-REV12-HANDOFF resolution_evidence recorded digest and recorded byte length to the r9 values, then re-run python scripts/read_freeze_digest.py green. The recorded value lives here because a digest of a file's own bytes cannot live inside those bytes. Measured on the current base that row already records the r8 digest sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0 and the r8 byte length 64160, which are the values the freeze bytes actually hash to."
 blocking_consumer = "scripts/read_freeze_digest.py"
-status = "REQUIRED_BEFORE_R7_MERGE"
+status = "REQUIRED_BEFORE_R9_MERGE"
 
 [[handoff]]
 id = "H-W2-IDENTITY-PINS"
 from = "freeze owner"
 to = "eliot-cognitive-quality, eliot-dreamer-memory-revision, eliot-dreamer-self-query, eliot-epistemic-context-provider, eliot-experience-projection, eliot-experience-provider, eliot-memory-quality, eliot-understanding-assessment"
-trigger = "An r7 freeze is published."
+trigger = "An r9 freeze is published."
 order = 4
-rule = "Update all eight FREEZE_ID or CONSUMED_FREEZE_ID string pins in the same work unit as the digest re-pin, plus the six freeze_ref Cargo.toml rows and the four module.toml path rows. eliot-experience-provider is already stale on r5 and must move to the same revision rather than being left behind. Never mass find-and-replace the id: the self-comparison assertion in eliot-memory-quality must be updated together with its constant."
+rule = "Move all eight FREEZE_ID or CONSUMED_FREEZE_ID string pins in the same work unit as the digest re-pin, plus the six freeze_ref Cargo.toml rows and the four module.toml path rows. Never mass find-and-replace the id: the self-comparison assertion in eliot-memory-quality must be updated together with its constant. Measured on the current base seven of the eight already read r8 (eliot-cognitive-quality, eliot-dreamer-memory-revision, eliot-dreamer-self-query, eliot-epistemic-context-provider, eliot-experience-projection, eliot-memory-quality, eliot-understanding-assessment). The eighth, crates/smart/eliot-experience-provider/src/lib.rs, still reads r5 and is a deliberate recorded exception under CC-W2-CONSUMER-REPIN, whose own missing_contract records that its doc comment declines the re-pin pending an owner decision; this row therefore does not claim it must move, and moving it blindly would assert a compatibility that owner has not granted."
 blocking_consumer = "every crate declaring freeze_ref in its Cargo.toml"
-status = "REQUIRED_BEFORE_R7_MERGE"
+status = "REQUIRED_BEFORE_R9_MERGE"
 
 [[handoff]]
 id = "H-W2-CATALOGUE-PROMOTION"
@@ -2419,7 +2448,7 @@ from = "crates/smart/cognitive-wave-10.toml"
 to = "crates/smart/cognitive-wave-01.toml and crates/smart/cognitive-wave-09.toml owners"
 trigger = "Any pair identity in a wave catalogue is read."
 order = 6
-rule = "docs/normative-pair.toml is the only owner of the pair key, the revisions and the edition. The pair_key carried by wave-09 and the version string carried by wave-01 do not match it. This catalogue copies from docs/normative-pair.toml and records the discrepancy under CC-W2-NORMATIVE-PAIR-KEY rather than repairing the other wave files, because this work unit does not rewrite unrelated wave rows."
+rule = "docs/normative-pair.toml is the only owner of the pair key, the revisions and the edition. Measured on the current base the wave-09 side is repaired: its pair_key equals the authority value, its pair_key_status is ACCEPTED_PAIR_PINNED_VERIFIED_NOT_COPIED and its pair_key_verified_by names the independent recomputation, and wave-01 carries no pair_key row at all. What remains for those two owners is the standing drift risk of any hand-maintained identity: wave-01 still hand-maintains a normative_pair version string that matches today and is forbidden to be maintained by hand, and any future pair move must repoint a derived projection rather than leave two live keys in one header. This catalogue keeps no copy and records the state in its own header under normative_pair_residual."
 blocking_consumer = "every catalogue that hand-maintains a pair_key or a document version string"
 status = "ADVISORY"
 
@@ -2429,7 +2458,7 @@ from = "crates/smart/cognitive-wave-10.toml"
 to = "cognitive-crate-decisions.toml owner"
 trigger = "The next wave assignment is issued."
 order = 7
-rule = "Three measured gaps are recorded, not repaired: eliot-dreamer-cycle has no agent_order and no decisions row; eliot-dreamer-research-synthesis declares agent_order 6, which collides with eliot-dreamer-orientation and has no decisions row; eliot-dreamer-probe-plan declares agent_order 17 with no decisions row. Assigning any of them an order is an owner decision, and a duplicate order is rejected at wave review."
+rule = "Four measured gaps are recorded, not repaired, and each is re-read on the current base: (1) crates/smart/eliot-dreamer-cycle declares functional_cell smart.dreamer.cycle and no agent_order, and has no row in crates/smart/cognitive-crate-decisions.toml, which stops at order 43; (2) crates/smart/eliot-dreamer-research-synthesis declares agent_order 6, which is the order crates/smart/cognitive-crate-decisions.toml already assigns to eliot-dreamer-orientation and which eliot-dreamer-orientation also declares in its own Cargo metadata, and it has no decisions row; (3) crates/smart/eliot-dreamer-probe-plan declares agent_order 17, which is the order the decisions ledger already assigns to eliot-context-admission, and it has no decisions row of its own; (4) crates/smart/eliot-experience-provider pins freeze id r5 while the canonical freeze is r8, which CC-W2-CONSUMER-REPIN records as a deliberate exception pending its own owner decision. Assigning any of the three orders or moving that one pin is an owner decision in another file or another crate, and a duplicate order is rejected at wave review."
 blocking_consumer = "crates/smart/cognitive-crate-decisions.toml"
 status = "ADVISORY"
 
@@ -2527,47 +2556,90 @@ to = "a second type owner duplicating an existing frozen type under a new name, 
 reason = "A re-export is not a second owner, and an unbounded escape field defeats deny_unknown_fields."
 
 # ---------------------------------------------------------------------------
-# Donors.
+# Donors. Each row records one named disposition class and the owner of that
+# decision, in the row shape crates/smart/cognitive-donor-map.toml already uses
+# and that scripts/verify-cognitive-donor-dispositions-816.py checks: a named
+# disposition value, its reason, the boundary it refuses, the owner that made the
+# call, the issue refs of that call, the evidence it was read against, and what
+# remains open. A prose sentence in `disposition` is not a disposition, and a
+# donor row with no named owner is an unowned claim. All six paths below are
+# present in the tree, so none may carry a RETIRED_* class.
 # ---------------------------------------------------------------------------
 
 [[donor]]
 path = "docs/architecture/I06-04-module-contract.md"
-disposition = "authoritative module contract shape: inputs/outputs, owned state, authority/effects, typed dependency ports, startup/drain and invalidation triggers, failure domain, health/freshness, rebuild boundary, proof entrypoints and removal boundary"
+disposition = "RETAIN_AS_ACCEPTED_IMPLEMENTATION_FRAGMENT"
+rationale = "authoritative module contract shape: inputs/outputs, owned state, authority/effects, typed dependency ports, startup/drain and invalidation triggers, failure domain, health/freshness, rebuild boundary, proof entrypoints and removal boundary"
+rejected_overgeneralization = "A module.toml in this catalogue, or any inference that a crate manifest in crates/smart/ satisfies this fragment without the twelve-item MUST declare list."
+current_owner = "the accepted ELIOT Implementation shard; docs/normative-pair.toml::implementation_path with implementation_revision 0.29-draft and implementation_edition 2026-08-28, recorded at decision_ref github:UnknownAlienHuman/eliot-memory-os#25"
+owner_issue_refs = [25, 262]
+evidence = "Re-read on the current base: the fragment is the shard entry at order 117 of docs/architecture/implementation/manifest.json with source_sha256 4198b329f8ab8d6dda7156b5492a738fb4cbc54127f453c9aebfde416b7952d2 over 2082 bytes, and the MUST declare list it carries still contains every element named in the rationale above."
+uncertainty = "The fragment states the contract shape only; it does not establish that any hot module in this repository implements it, and this catalogue makes no such claim."
 targets = ["eliot-dreamer-cycle", "eliot-dreamer-validation family", "eliot-dreamer-orientation", "eliot-dreamer-self-query"]
 
 [[donor]]
 path = "docs/architecture/I09-06-curation-candidate.md"
-disposition = "authoritative CurationCandidate field set: candidate_id, kind, source_handles, proposed_transformation, support, counterevidence, scope_and_applicability, preservation_report, uncertainty, verifier_or_replay, expected_benefit, rollback; and the eleven closed kind values"
+disposition = "RETAIN_AS_ACCEPTED_IMPLEMENTATION_FRAGMENT"
+rationale = "authoritative CurationCandidate field set: candidate_id, kind, source_handles, proposed_transformation, support, counterevidence, scope_and_applicability, preservation_report, uncertainty, verifier_or_replay, expected_benefit, rollback; and the eleven closed kind values"
+rejected_overgeneralization = "A Rust field list derived from the fragment alone; where the shipped Rust shape and this fragment disagree, the Rust owner is authoritative and the disagreement is recorded per row, never resolved by copying prose into a type."
+current_owner = "the accepted ELIOT Implementation shard; docs/normative-pair.toml::implementation_path with implementation_revision 0.29-draft and implementation_edition 2026-08-28, recorded at decision_ref github:UnknownAlienHuman/eliot-memory-os#25"
+owner_issue_refs = [25, 262]
+evidence = "Re-read on the current base: the fragment is the shard entry at order 186 of docs/architecture/implementation/manifest.json with source_sha256 b43f0bf521fdc6598bdd244cad8a0c7f82abfa166093f6c5188441436d2df4f8 over 414 bytes, and it still carries exactly the twelve field names and the eleven kind values named above."
+uncertainty = "The eleven kinds are the issue's closed vocabulary; the family envelope that would carry them across crates is still an owner decision recorded under MM-11."
 targets = ["MemoryModelCandidateContract", "eliot-dreamer-curation", "the ten smart.dreamer.* handler crates"]
 
 [[donor]]
 path = "docs/architecture/I09-07-memory-transformation-validation.md"
-disposition = "authoritative seven transformation checks: coverage, preservation, faithfulness, lineage, reversibility, source authority, dependency closure; and the rule that failure leaves the original data intact and stores a rejected candidate only when useful for diagnosis"
+disposition = "RETAIN_AS_ACCEPTED_IMPLEMENTATION_FRAGMENT"
+rationale = "authoritative seven transformation checks: coverage, preservation, faithfulness, lineage, reversibility, source authority, dependency closure; and the rule that failure leaves the original data intact and stores a rejected candidate only when useful for diagnosis"
+rejected_overgeneralization = "A seventh-preservation score, an aggregate confidence or utility number, or an irreversible rewrite presented as a passing transformation."
+current_owner = "the accepted ELIOT Implementation shard; docs/normative-pair.toml::implementation_path with implementation_revision 0.29-draft and implementation_edition 2026-08-28, recorded at decision_ref github:UnknownAlienHuman/eliot-memory-os#25"
+owner_issue_refs = [25, 262]
+evidence = "Re-read on the current base: the fragment is the shard entry at order 187 of docs/architecture/implementation/manifest.json with source_sha256 5cf0c4d36c2972360c698baeac7e9cda48f30092c649b6626fa5a2c57bfb74ad over 555 bytes, and it still lists exactly those seven checks plus the intact-on-failure rule."
+uncertainty = "The checks are verdicts to be computed over owner material; this catalogue records them as gate rules and claims no executed verdict."
 targets = ["ResearchSynthesisBriefContract", "MemoryModelCandidateContract", "ProceduralCandidateContract", "ValidationGroundingReceiptContract", "DreamCycleCandidateContract"]
 
 [[donor]]
 path = "crates/smart/cognitive-rev12-contract-schema-freeze.toml"
-disposition = "upstream owner-neutral contracts reused verbatim: the self_query input, accepted-source, anchor and denominator vocabulary; the seven-class disposition vocabulary; the observation FailureObservation and MemoryRevisionEvidence shapes. Referenced by name only; no bytes copied and no type redefined here."
+disposition = "RETAIN_AS_ACCEPTED_FREEZE_SURFACE"
+rationale = "upstream owner-neutral contracts reused verbatim by reference: the self_query input, accepted-source, anchor and denominator vocabulary, and the observation FailureObservation and MemoryRevisionEvidence shapes. Referenced by name only; no bytes copied and no type redefined here."
+rejected_overgeneralization = "Reading anything into this file that it records as open. Its rows state that the rev12 closed seven-class provider enum stays NOT_FROZEN, so no seven-class disposition vocabulary may be attributed to it; an earlier version of this row asserted exactly that and is corrected here. Equally, this catalogue's own index is not inside the freeze at any revision."
+current_owner = "the freeze owner named by the CC-W9-REV12-HANDOFF challenge row in crates/smart/cognitive-contract-challenges.toml; the delivered revision is r8"
+owner_issue_refs = [223, 2403, 2407, 196]
+evidence = "Re-read on the current base: freeze_id cognitive-rev12-contract-schema-freeze-2026-09-22-r8 at revision 8, 64160 bytes hashing to sha256:154f56c186eb2353bb907e1c15fcbc7b8d50a104cf8757022a9bd40ae4abade0, which is exactly what REQUIRED_FREEZE_DIGEST in crates/smart/eliot-dreamer-memory-revision/src/lib.rs holds and exactly what the CC-W9-REV12-HANDOFF row records. grep for FailureObservation and MemoryRevisionEvidence finds both as rust_path bindings to eliot_observation_contracts in this file, and its own rows for the seven-class provider enum read NOT_FROZEN."
+uncertainty = "Promotion of this catalogue's index into the freeze is still an owner handoff, and the next candidate is r9; the freeze is byte-pinned, so no verdict here may claim freeze validation of this index."
 targets = ["SelfQueryBriefContract", "MemoryRevisionCandidateContract", "ValidationGroundingReceiptContract"]
 
 [[donor]]
 path = "crates/smart/eliot-dreamer-contracts"
-disposition = "the single owner of DreamJobAdmission, DreamInputBundle, ModelDraft, GroundedDreamDraft, ValidationPolicy, BudgetUsage, PreservationReport, BundleMaterial, OmissionHandle, RequesterOrigin, NativeCurationHandler and the self_query module. Every re-export of these types in this catalogue is a consumer boundary, not a second owner."
+disposition = "RETAIN_A03_CONTRACT_OWNER"
+rationale = "the single owner of DreamJobAdmission, DreamInputBundle, ModelDraft, GroundedDreamDraft, ValidationPolicy, BudgetUsage, PreservationReport, BundleMaterial, OmissionHandle, RequesterOrigin, NativeCurationHandler and the self_query module. Every re-export of these types in this catalogue is a consumer boundary, not a second owner."
+rejected_overgeneralization = "A second owner for any of these twelve types in a Dreamer crate, a facade that redefines one of them, or treating a pub use re-export as the defining site."
+current_owner = "A-03, the typed registry hub, as already recorded by the topology_donor row for the same path in crates/smart/cognitive-donor-map.toml; that row's observed_disposition is RETAIN_A03_CONTRACT_OWNER and this row restates the same decision rather than adding one"
+owner_issue_refs = [578, 1292]
+evidence = "Re-read on the current base: all eleven named types resolve to a public definition inside this crate (job.rs, bundle.rs, draft.rs, grounding/mod.rs, validation/policy.rs, budget.rs, candidate.rs, curation_invocation.rs) and the self_query module directory exists. Two rows in this catalogue are corrected to name the definition here rather than a re-export: MM-10 names src/curation_invocation.rs::NativeCurationHandler instead of the eliot-dreamer-curation facade, and the [[ownership]] row for GroundingValidationInput names src/validation/structured/mod.rs::GroundingValidationInput instead of eliot-dreamer-claim-grounding."
+uncertainty = "Presence of a type here is not runtime support; A-31 dispatch composition and every consumer edge stay outside this static catalogue's proof ceiling."
 targets = ["every contract in this catalogue"]
 
 [[donor]]
 path = "crates/smart/cognitive-wave-09.toml"
-disposition = "the W9 precedent for the [[field_contract]], [[ownership]], [[field_contract_index]], [[validation_gate]], [[edge]] and [[forbidden_edge]] shapes used here, and the prior static description of NegativeMemoryExtinctionCandidate reconciled under MR-04. Its orders 76-86 and its scope_rule are untouched."
+disposition = "RETAIN_AS_ACCEPTED_SIBLING_CATALOGUE"
+rationale = "the W9 precedent for the [[field_contract]], [[ownership]], [[field_contract_index]], [[validation_gate]], [[edge]] and [[forbidden_edge]] shapes used here, and the prior static description of NegativeMemoryExtinctionCandidate reconciled under MR-04. Its orders 76-86 and its scope_rule are untouched."
+rejected_overgeneralization = "Renumbering, absorbing or rewriting wave-09 rows from this catalogue, or treating the two catalogues as two owners of NegativeMemoryExtinctionCandidate."
+current_owner = "the catalogue owner of crates/smart/cognitive-wave-09.toml, named as required_owner by CC-W2-NORMATIVE-PAIR-KEY in crates/smart/cognitive-contract-challenges.toml"
+owner_issue_refs = [259, 262]
+evidence = "Re-read on the current base: wave-09 still carries the six row shapes named above and its NegativeMemoryExtinctionCandidate [[field_contract]] still overlaps MR-04, which is why H-W2-CATALOGUE-PROMOTION stays ADVISORY. Its pair_key now equals docs/normative-pair.toml::pair_key with status ACCEPTED_PAIR_PINNED_VERIFIED_NOT_COPIED, so the normative-pair part of the earlier disagreement in this catalogue's header was stale and is corrected."
+uncertainty = "The NegativeMemoryExtinctionCandidate overlap stays a two-catalogue ambiguity until the wave-09 owner re-points its field list or cites MR-04; this catalogue does not edit that file."
 targets = ["this catalogue"]
 
 [[deferred]]
 capability = "Rust implementation of the frozen W2 semantic payload contracts"
-activation = "the owner promotes this index into the freeze as r7 under H-W2-FREEZE-PROMOTION, the digest and identity pins are re-pinned under H-W2-DIGEST-REPIN and H-W2-IDENTITY-PINS, then package Module Proof, real provider-consumer Edge Proof and named Product Pulse execution exist per contract"
+activation = "the owner promotes this index into the freeze under H-W2-FREEZE-PROMOTION; measured on the current base the canonical freeze is r8, so the next candidate is r9, and the digest plus identity pins are re-pinned under H-W2-DIGEST-REPIN and H-W2-IDENTITY-PINS in the same work unit; then package Module Proof, real provider-consumer Edge Proof and named Product Pulse execution exist per contract"
 
 [[deferred]]
-capability = "The two recorded missing contract decisions: a shared memory-model family envelope and a structured exact-trigger field on the failure fingerprint"
-activation = "the owner decides whether each is a new frozen type in an existing crate or a correction to an existing one; neither may be realized as a new function-only Cargo package"
+capability = "The three missing contract decisions still open on the current base: the shared memory-model family envelope adoption (MM-11), the closed discriminants for OrientationResidue.kind and InertProbe.status (ORI-03), and a structured exact-trigger field on the failure fingerprint. The concept result type is no longer among them: MM-04 is corrected to the contracts-owned ConceptCandidate that the producer already emits."
+activation = "an owner decision per item. MM-11 is whether the seven families without a handler_result field adopt the existing eliot-dreamer-contracts TypedCurationHandlerResult. ORI-03 needs a new closed enum or a validator in eliot-dreamer-orientation. The exact-trigger field has one existing candidate, crates/eliot-types/src/memory.rs::FailureFingerprint, whose generic serde_json::Value payload and absent trigger discriminant block adoption under the no-generic-JSON boundary. None may be realized as a new function-only Cargo package, and none may be filled with a placeholder value."
 
 [[deferred]]
-capability = "Closing the measured topology gaps: the missing wave order for eliot-dreamer-cycle, the duplicated agent_order 6 for eliot-dreamer-research-synthesis, the missing decisions row for eliot-dreamer-probe-plan, and the stale r5 pin in eliot-experience-provider"
-activation = "an owner decision in cognitive-crate-decisions.toml and a coordinated re-pin work unit; recorded, never invented, in this catalogue"
+capability = "Closing the measured topology gaps: the missing wave order for eliot-dreamer-cycle, the duplicated agent_order 6 for eliot-dreamer-research-synthesis, the colliding agent_order 17 for eliot-dreamer-probe-plan, and the r5 freeze-id pin in eliot-experience-provider against a canonical r8"
+activation = "an owner decision in cognitive-crate-decisions.toml for the three orders and, for the pin, the owner decision CC-W2-CONSUMER-REPIN already records as pending; recorded, never invented, in this catalogue"
