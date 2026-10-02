@@ -87,6 +87,7 @@ eliot-evaluation-contracts.workspace = true
 eliot-epistemic-contracts.workspace = true
 eliot-experience-provider = { path = "../../crates/smart/eliot-experience-provider", version = "0.1.0" }
 eliot-governor.workspace = true
+eliot-host-state.workspace = true
 eliot-improvement = { path = "../../crates/meta/eliot-improvement", version = "0.1.0" }
 eliot-self-quality = { path = "../../crates/meta/eliot-self-quality", version = "0.1.0" }
 eliot-conformance-contracts.workspace = true
@@ -140,6 +141,7 @@ eliot-watchdog-core.workspace = true
 eliot-workscope.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

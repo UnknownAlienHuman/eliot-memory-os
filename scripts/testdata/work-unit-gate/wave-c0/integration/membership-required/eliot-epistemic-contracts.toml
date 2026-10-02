@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-580"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 580}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-epistemic-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-epistemic-contracts/src"}, {value = "crates/smart/eliot-epistemic-contracts/tests"}]
+matrix_cases = 51
+proof_ceiling = {value = "workspace-integration"}
+revision = 1
+body_sha256 = "cbe0f4b473c6cd08ddcf9c61850a3034ea61f2c02725b44dfbfa1fdf8835f0dc"
+matrix_sha256 = "a69c16341499c282d6a1d4dc6cde380fad45bb9a2f7eef63f85e560ba1ae56dd"
+require_workspace_member = true
+package = {name = "eliot-epistemic-contracts"}
+module = {value = "smart.epistemic.contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 51, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 51, child_processes = 64}

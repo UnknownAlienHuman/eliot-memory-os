@@ -2613,3 +2613,325 @@ mod slice_7_native_owner_tests {
         ));
     }
 }
+
+/// Coverage for [`map_orientation_packet`], the packet-to-result mapping.
+///
+/// # Why this module exists, and what it deliberately does NOT do
+///
+/// A prior session recorded that this mapping "has no direct test coverage on
+/// this tree" and that the gap "cannot" be closed without fabricating an
+/// [`OrientationSupply`](crate::OrientationSupply). That premise is false, and
+/// this module is the proof.
+///
+/// [`map_orientation_packet`] takes
+/// `(&OrientationPacketCandidate, &DreamJobInput)`. It does **not** take a
+/// supply, does not read a carrier, and performs no stage work. The
+/// [`OrientationSupply`] is an input to
+/// [`compose_production_result`](crate::production_orientation::compose_production_result),
+/// a different function in a different module, which runs the nine mandatory
+/// stages *before* it ever reaches `build_projection` and this mapping.
+///
+/// Every input this mapping actually consumes is derived in-binary by this
+/// crate's own stages, with no owner channel involved:
+///
+/// - the admitted job, frame, bundle and validation receipt come from
+///   [`admission_of`], [`bundle_of`], [`orientation_frame_of`],
+///   [`v1_model_of`], [`v1_grounded_of`] and the real v1 A-05 entry
+///   [`validate_grounded_dream_draft_at`], exactly as
+///   [`dispatch_orientation`] derives them;
+/// - the packet itself comes from the owner's own
+///   `eliot_dreamer_orientation::projection::build_projection`, invoked over
+///   those five admitted values;
+/// - the CEP handle slice is **empty**, which is the owner's own documented
+///   lawful state here, not a shortcut: `build_projection`'s
+///   `validate_coverage_denominator` returns `Ok(())` immediately when the
+///   admitted job pins no coverage denominator (the crate's own
+///   `orientation_admitted_job` sets `coverage_denominator: None` and
+///   `admitted_evidence: Vec::new()` on exactly this reasoning), and every
+///   handle check in `validate_position_inputs` is vacuous over an empty slice.
+///
+/// So the packet below is a **genuine owner-produced packet**, not a
+/// fabricated one: it is built by the owner's producer from the crate's own
+/// admitted material and then re-proved against that same material with the
+/// owner's own [`OrientationPacketCandidate::validate_against`]. The mapping
+/// then runs on it.
+///
+/// What this module does NOT do, and must not: it does not construct an
+/// [`OrientationSupply`], does not assert that the supply channel is reachable,
+/// and does not weaken the carrier to make a packet appear. The supply channel
+/// remains unbuilt; that is a separate, real gap recorded in
+/// `production_orientation`'s module contract. These cases cover the MAPPING,
+/// which was never blocked by the missing supply in the first place.
+#[cfg(test)]
+mod orientation_packet_mapping_tests {
+    use super::*;
+    use crate::admitted_material::{
+        admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
+        v1_model_of, validation_policy_of,
+    };
+    use eliot_dreamer_orientation::projection::build_projection;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const SCOPE: &str = "scope-packet-map";
+    const TASK: &str = "task-packet-map";
+    const OPERATION: &str = "op-packet-map";
+    const QUESTION: &str = "What does ELIOT know about this scope?";
+    const CONFLICT: &str = "conflict-packet-map";
+
+    fn fence() -> StateFence {
+        let Ok(lineage) = EpochLineageId::new(TEST_LINEAGE) else {
+            panic!("valid test lineage must parse");
+        };
+        let Some(sequence) = NonZeroU64::new(1) else {
+            panic!("nonzero test sequence must construct");
+        };
+        let Ok(epoch) = EpochId::new(lineage, sequence) else {
+            panic!("valid test epoch must construct");
+        };
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn admission() -> KernelJobAdmission {
+        KernelJobAdmission {
+            job_id: "job-packet-map".to_owned(),
+            attempt_id: "attempt-packet-map".to_owned(),
+            scope_id: SCOPE.to_owned(),
+            request_id: OPERATION.to_owned(),
+            idempotency_key: "job-packet-map:attempt-packet-map".to_owned(),
+            cancellation_id: "cancel-packet-map".to_owned(),
+            deadline_unix_ms: u64::MAX,
+            state_fence: fence(),
+        }
+    }
+
+    fn job() -> DreamJobInput {
+        DreamJobInput {
+            job_id: "job-packet-map".to_owned(),
+            job_class: JobClass::Orientation,
+            exact_question: QUESTION.to_owned(),
+            requester: "test-harness".to_owned(),
+            scope_id: SCOPE.to_owned(),
+            task_id: Some(TASK.to_owned()),
+            state_fence: fence(),
+            evidence_handles: vec!["evidence-packet-map".to_owned()],
+            memory_handles: vec!["memory-packet-map".to_owned()],
+            architecture_handles: vec!["architecture-packet-map".to_owned()],
+            implementation_handles: vec!["implementation-packet-map".to_owned()],
+            conformance_handles: vec!["conformance-packet-map".to_owned()],
+            conflicts_and_unknowns: vec![CONFLICT.to_owned()],
+            privacy_profile: "local_only".to_owned(),
+            allowed_tools: Vec::new(),
+            allowed_model_routes: vec!["route-test".to_owned()],
+            budget_units: 1,
+            deadline_ms: 1,
+            output_schema: "eliot.dreamer.v1".to_owned(),
+            forbidden_effects: Vec::new(),
+        }
+    }
+
+    /// The four inputs the owner's packet producer consumes: the admitted
+    /// Orientation job, the v1 validated candidate, the bounded bundle, and the
+    /// sealed policy.
+    type PacketMaterial = (
+        AdmittedOrientationJob,
+        eliot_dreamer_contracts::ValidatedCandidate,
+        DreamInputBundle,
+        OrientationPolicy,
+    );
+
+    fn admitted_packet_material() -> PacketMaterial {
+        let admission = admission();
+        let job = job();
+        let admitted = admission_of(&admission, &job).expect("admitted job must derive");
+        let bundle = bundle_of(&admission, &job).expect("admitted bundle must derive");
+        let frame_source = orientation_frame_source(&bundle).expect("frame source must resolve");
+        let model = v1_model_of(&admission, &job).expect("admitted model must derive");
+        let grounded = v1_grounded_of(&model).expect("admitted grounding must derive");
+        let usage = usage_of(&admitted.budget);
+        let validation_policy =
+            validation_policy_of(admitted.policy_ref.as_str()).expect("validation policy seals");
+        let preservation = preservation_of().expect("preservation report must build");
+        let candidate = match validate_grounded_dream_draft_at(
+            &admitted,
+            &bundle,
+            &model,
+            &grounded,
+            &validation_policy,
+            &usage,
+            &preservation,
+            Some(0),
+            false,
+        ) {
+            Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
+            Ok(CandidateValidationOutcome::Rejected(report)) => {
+                panic!("fixture candidate must be accepted, got {report:?}")
+            }
+            Err(error) => panic!("fixture candidate must validate, got {error:?}"),
+        };
+        let frame = orientation_frame_of(&admission, &admitted, &job, frame_source.as_str())
+            .expect("orientation frame must build");
+        let admitted_job = orientation_admitted_job(admitted, frame);
+        let policy = orientation_dispatch_policy().expect("dispatch policy must seal");
+        (admitted_job, candidate, bundle, policy)
+    }
+
+    /// Positive case: the mapping is exercised on a GENUINE owner-produced
+    /// packet, with no [`OrientationSupply`] anywhere in this module.
+    ///
+    /// The packet is built by the owner's own `build_projection` over the
+    /// crate's own admitted material, then re-proved with the owner's own
+    /// `validate_against` against that same material. Every mapping guarantee
+    /// the doc comment states is then asserted on the real result: identity
+    /// bindings travel verbatim, the five handle families travel verbatim,
+    /// interpreted statements stay at the candidate-only ceiling, and the
+    /// ABSOLUTE G4 rule holds — both owner residues are appended after the
+    /// rival texts, so neither marker is dropped or thinned.
+    #[test]
+    fn owner_packet_maps_with_g4_residues_and_verbatim_bindings() {
+        let job = job();
+        let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+        // No owner channel: the crate's own `orientation_admitted_job` pins no
+        // coverage denominator and no admitted evidence, so the owner's
+        // denominator validator returns Ok over this admitted set by design.
+        let packet = build_projection(&admitted_job, &candidate, &bundle, &[], &policy)
+            .expect("owner projection must build over the admitted five-input set");
+        // The packet is the owner's, re-proved against the very same admitted
+        // material. A fabricated or drifted packet cannot pass this.
+        packet
+            .validate_against(&admitted_job, &bundle, &candidate, &[], &policy)
+            .expect("owner packet must revalidate against its own admitted inputs");
+
+        let mapped = map_orientation_packet(&packet, &job);
+
+        // Identity bindings travel verbatim from the owner packet; the state
+        // fence is the admitted semantic input's, proved equal to the
+        // Kernel-admitted fence by the binding check these values came through.
+        assert_eq!(mapped.packet_id, packet.packet_id);
+        assert_eq!(mapped.job_id, packet.job_id);
+        assert_eq!(mapped.question, QUESTION);
+        assert_eq!(mapped.scope_id, SCOPE);
+        assert_eq!(mapped.state_fence, job.state_fence);
+        // The five admitted handle families travel verbatim.
+        assert_eq!(mapped.source_coverage.evidence, job.evidence_handles);
+        assert_eq!(mapped.source_coverage.memory, job.memory_handles);
+        assert_eq!(
+            mapped.source_coverage.architecture,
+            job.architecture_handles
+        );
+        assert_eq!(
+            mapped.source_coverage.implementation,
+            job.implementation_handles
+        );
+        assert_eq!(mapped.source_coverage.conformance, job.conformance_handles);
+        // Interpreted statements travel with their source handles, promoted to
+        // nothing. Asserted as a correspondence with the owner's own
+        // interpretation set plus the fixed candidate-only ceiling, so the
+        // guarantee is that nothing is promoted and nothing is dropped, not a
+        // count this fixture happens to produce.
+        assert_eq!(
+            mapped.synthesized_interpretations.len(),
+            packet.synthesized_interpretations.len()
+        );
+        for (index, interpretation) in mapped.synthesized_interpretations.iter().enumerate() {
+            let owner = &packet.synthesized_interpretations[index];
+            assert_eq!(interpretation.statement, owner.statement);
+            assert_eq!(interpretation.support_handles, owner.source_handles);
+            assert_eq!(interpretation.epistemic_status, "candidate_only");
+        }
+        // ABSOLUTE G4 RULE: BOTH owner residues are appended to the rival list
+        // after the rival texts, so neither marker can be dropped or thinned by
+        // this mapping. Asserted against the owner's own residue texts, not a
+        // count, so the guarantee is the one the contract states.
+        let rivals = &mapped.rival_models_and_dissent;
+        assert_eq!(rivals.len(), packet.rival_models_and_dissent.len() + 2);
+        assert_eq!(
+            rivals[rivals.len() - 2],
+            packet.architecture_implications.text,
+            "architecture implications must be appended as a rival marker"
+        );
+        assert_eq!(
+            rivals[rivals.len() - 1],
+            packet.model_routes_and_cost.text,
+            "model routes and cost must be appended as a rival marker"
+        );
+        // The four screening-side families are accounted as omissions and
+        // surface as unknowns, never silently dropped. Asserted as a
+        // correspondence with the owner's own unknown residue set rather than a
+        // hardcoded count, so the guarantee is that no unknown is thinned or
+        // dropped by this mapping.
+        assert_eq!(
+            mapped.unknowns_and_gaps.len(),
+            packet.unknowns_and_gaps.len()
+        );
+        for (index, gap) in mapped.unknowns_and_gaps.iter().enumerate() {
+            assert_eq!(gap, &packet.unknowns_and_gaps[index].text);
+        }
+        // Inert probes travel as text only; probes never execute. Asserted as
+        // a correspondence with the owner's own probe set.
+        assert_eq!(
+            mapped.recommended_probes_or_next_actions.len(),
+            packet.recommended_probes_or_next_actions.len()
+        );
+        for (index, probe) in mapped.recommended_probes_or_next_actions.iter().enumerate() {
+            assert_eq!(
+                probe,
+                &packet.recommended_probes_or_next_actions[index].text
+            );
+        }
+        // Invalidation conditions travel verbatim.
+        assert_eq!(
+            mapped.invalidation_conditions,
+            packet.invalidation_conditions
+        );
+        assert!(
+            mapped.provenance.contains(&OPERATION.to_owned()),
+            "provenance must carry the projection-input proof, got {:?}",
+            mapped.provenance
+        );
+    }
+
+    /// Refusal case: the mapping's own input gate refuses a packet that is not
+    /// the owner's output for the admitted material it is presented with.
+    ///
+    /// [`map_orientation_packet`] performs no validation itself — the owner's
+    /// producer does — so the proof that a packet is genuine lives in the owner's
+    /// `validate_against`. This case shows that gate is real: a packet whose
+    /// body was altered after production (its `question`, a field the owner
+    /// binds the frame lineage against) is REFUSED, so nothing downstream can be
+    /// built on an unowned packet. Without this, "the packet is genuine" would
+    /// rest on the positive case alone.
+    #[test]
+    fn altered_owner_packet_is_refused_by_its_own_revalidation() {
+        let job = job();
+        let (admitted_job, candidate, bundle, policy) = admitted_packet_material();
+        let packet = build_projection(&admitted_job, &candidate, &bundle, &[], &policy)
+            .expect("owner projection must build over the admitted five-input set");
+
+        let mut altered = packet.clone();
+        altered.question = "a question the admitted frame never carried".to_owned();
+
+        // The owner's own revalidation refuses the altered packet against the
+        // admitted material it does not belong to.
+        let refused = altered.validate_against(&admitted_job, &bundle, &candidate, &[], &policy);
+        assert!(
+            refused.is_err(),
+            "an altered packet must not revalidate against its own admitted inputs"
+        );
+        // And the untouched original still does, so the refusal above is caused
+        // by the alteration and not by a fixture that never validated at all.
+        assert!(
+            packet
+                .validate_against(&admitted_job, &bundle, &candidate, &[], &policy)
+                .is_ok(),
+            "the unaltered owner packet must still revalidate"
+        );
+        // The mapping itself is total over a packet and never re-derives one:
+        // it maps whatever packet it is handed, which is exactly why the
+        // owner's revalidation is the gate that must hold.
+        let mapped = map_orientation_packet(&altered, &job);
+        assert_eq!(mapped.question, altered.question);
+    }
+}

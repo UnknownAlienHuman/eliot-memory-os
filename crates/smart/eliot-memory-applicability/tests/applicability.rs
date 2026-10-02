@@ -10,7 +10,7 @@ use std::num::NonZeroU64;
 
 use eliot_contracts::{
     ArtifactId, EpochId, EpochLineageId, ResourceGeneration, SessionId, SourceId, StateFence,
-    TaskId,
+    TaskId, TaskRevision,
 };
 use eliot_evidence::{Assertability, EpistemicStatus, LifecycleState, Provenance};
 use eliot_memory_applicability::{ApplicabilityRequest, evaluate_applicability};
@@ -50,6 +50,20 @@ fn fence() -> StateFence {
         .expect("fixture epoch"),
         ResourceGeneration::genesis(),
     )
+}
+
+/// A fence compatible with [`fence`] but unequal to it.
+///
+/// `StateFence::is_compatible_with` treats an absent optional revision as a
+/// match, so this pair is mutually compatible while comparing unequal. The
+/// declared-binding rule is about the scope a record CLAIMS, so the tests that
+/// exercise it need a fence pair that separates the two questions instead of
+/// failing the compatibility check first.
+fn fence_with_task_revision() -> StateFence {
+    StateFence {
+        task_revision: Some(TaskRevision::new(1).expect("fixture revision")),
+        ..fence()
+    }
 }
 
 fn binding() -> MemoryScopeBinding {
@@ -252,6 +266,10 @@ fn missing_denominator_fails_closed() {
     candidate.batch.coverage.denominator = DenominatorState::Unknown {
         reason: "read side could not count".to_owned(),
     };
+    // The batch owner requires the incomplete state to carry its own ceiling,
+    // so the fixture is an honest one. The refusal under test is still the
+    // evaluator's: it never manufactures a denominator of its own.
+    candidate.batch.coverage.revalidation_required = true;
     let error = evaluate_applicability(&candidate).expect_err("unknown denominator");
     assert!(matches!(
         error,
@@ -262,6 +280,7 @@ fn missing_denominator_fails_closed() {
 #[test]
 fn truncation_and_revalidation_echo_to_the_set() {
     let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 2 };
     candidate.batch.coverage.truncated = true;
     candidate.batch.coverage.frontier = vec!["resume-after-mem-1".to_owned()];
     candidate.batch.coverage.revalidation_required = true;
@@ -269,6 +288,135 @@ fn truncation_and_revalidation_echo_to_the_set() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
+    // The recovery identities stay on the batch this operation consumed; the
+    // verdict carries only the ceiling that says the result is incomplete.
+    assert_eq!(
+        candidate.batch.coverage.frontier,
+        vec!["resume-after-mem-1"]
+    );
+    set.validate()
+        .expect("the incomplete verdict declares its proof ceiling");
+}
+
+#[test]
+fn unaccounted_known_remainder_fails_before_evaluation() {
+    // The empty/total-one counterexample: a batch that declares one observed
+    // record, projects none of it, and neither omits nor defers it.
+    let mut candidate = request(vec![]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 1 };
+    let error = evaluate_applicability(&candidate)
+        .expect_err("an unaccounted known remainder must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+        )
+    ));
+}
+
+#[test]
+fn duplicate_and_overlapping_recovery_identities_are_refused() {
+    let mut duplicated = request(vec![record("mem-1")]);
+    duplicated.batch.coverage.denominator = DenominatorState::Known { total: 3 };
+    duplicated.batch.coverage.revalidation_required = true;
+    duplicated.batch.coverage.omissions = vec![
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "fence-mismatch".to_owned(),
+        },
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "scope-mismatch".to_owned(),
+        },
+    ];
+    assert!(matches!(
+        evaluate_applicability(&duplicated),
+        Err(eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+        ))
+    ));
+
+    let mut overlapping = request(vec![record("mem-1")]);
+    overlapping.batch.coverage.denominator = DenominatorState::Known { total: 2 };
+    overlapping.batch.coverage.revalidation_required = true;
+    overlapping.batch.coverage.omissions =
+        vec![eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-1"),
+            reason: "fence-mismatch".to_owned(),
+        }];
+    assert!(matches!(
+        evaluate_applicability(&overlapping),
+        Err(eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+        ))
+    ));
+}
+
+#[test]
+fn a_record_declaring_another_scope_fence_never_reaches_a_verdict() {
+    // The evaluator's own scope rule runs first and would name the record
+    // SCOPE_MISMATCH, so this proves the refusal happens earlier: at the batch
+    // owner that proves the denominator. A wrong-scope record inside an
+    // otherwise valid batch must never become an ordinary exclusion, because
+    // an exclusion still counts the record toward the assessed denominator
+    // while the record itself belongs to a different scope.
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.binding.state_fence = fence_with_task_revision();
+    candidate.batch.records[0].binding = binding();
+    let error = evaluate_applicability(&candidate)
+        .expect_err("a wrong-scope record must fail closed before evaluation");
+    assert!(matches!(
+        error,
+        eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::FenceMismatch {
+                left: "record.binding.state_fence",
+                right: "batch.binding.state_fence",
+            }
+        )
+    ));
+}
+
+#[test]
+fn a_compatible_projection_fence_still_evaluates() {
+    // The positive half: a record read under an older compatible fence with a
+    // matching declared binding is evaluated normally and stays applicable.
+    let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.binding.state_fence = fence_with_task_revision();
+    candidate.batch.records[0].binding = candidate.batch.binding.clone();
+    candidate.batch.records[0].state_fence = fence();
+    let set = evaluate_applicability(&candidate).expect("compatible fence evaluates");
+    assert_eq!(set.applicable.len(), 1);
+}
+
+#[test]
+fn a_standalone_verdict_cannot_claim_a_short_closed_denominator() {
+    // The set is independently deserializable, so this proves the ceiling is
+    // checked on the verdict itself, not only while the evaluator runs.
+    let set = evaluate(vec![record("mem-1")]);
+    set.validate()
+        .expect("the exact verdict is closed and complete");
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] = serde_json::json!({ "state": "KNOWN", "total": 2 });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    assert!(matches!(
+        decoded.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_standalone_verdict_over_an_unknown_denominator_fails_closed() {
+    let set = evaluate(vec![record("mem-1")]);
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] =
+        serde_json::json!({ "state": "UNKNOWN", "reason": "read side could not count" });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    assert!(matches!(
+        decoded.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
 }
 
 #[test]

@@ -2,11 +2,11 @@
 //!
 //! Pure in-crate proofs only: a closed versioned projection carries mapped
 //! ORS reservation evidence across the Kernel-to-Store boundary as shape
-//! only, bound by two recomputed canonical digests. Fifteen cases (`990/1`
-//! through `990/13`, `990/15`, `990/16`; `990/14` retired with the removed
-//! Store-client reserved-write entry point) cover the owner mapping, round
-//! trip, every rejection family, ordinary-apply compatibility, legacy
-//! compatibility, and the exported-interface authority guard. No reservation, wire, commit, or
+//! only, bound by two recomputed canonical digests. Sixteen cases (`990/1`
+//! through `990/16`) cover the owner mapping, round trip, every rejection
+//! family, unsupported-client refusal without an ordinary-apply fallback,
+//! ordinary-apply compatibility, legacy compatibility, and the
+//! exported-interface authority guard. No reservation, wire, commit, or
 //! concurrent execution is established by these types. Slice #991 activates
 //! the reserved-write wire variant and client entry point with an explicit
 //! unsupported backend; the authority guard below now pins the declared-but-
@@ -65,6 +65,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
+    let manifests = eliot_store_api::generated_operation_manifests().unwrap();
     let mut transition = eliot_store_api::PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
@@ -81,8 +82,10 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .unwrap(),
+        operation_manifest_digest: eliot_store_api::operation_manifest_set_digest(&manifests)
+            .unwrap(),
         // Derived bindings, never placeholders. The envelope path renders
         // the admitted expected heads; every request built on this
         // transition below carries exactly `revision_heads()`.
@@ -296,6 +299,7 @@ fn valid_bounded_projection_and_request_round_trip() {
     assert_eq!(reencoded, encoded, "canonical raw bytes are stable");
     let fixture = include_str!("data/write_admission.json");
     let from_fixture: ReservedWriteRequest = serde_json::from_str(fixture).unwrap();
+    let manifests = eliot_store_api::generated_operation_manifests().unwrap();
     // Independent fixture contract: every committed field is asserted
     // literally, so fixture drift fails here even if the builder helpers
     // above changed in lockstep (no tautological builder equality).
@@ -313,21 +317,38 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea"
+        "b65218b42694a3daf3d4a4878e0c971c2d4b47378db17d1022fe33750ac38775"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3"
+        "492e2e7951923788e1bbf8b842cd8482e1997ad7e998481bcd58777e115b344f"
     );
     // Issue #18: the frozen transition carries derived (never defaulted)
     // decision/plan digests plus the rendered source revisions.
     assert_eq!(
         from_fixture.transition.admission_digest,
-        "85c55439e5ab7cab499f106a2cfad50fe9a7dd0c3d6796b15278963bb02ff7e4"
+        "7cb3f14c0b151b309388d27e51d5892863428e54d10aed766a50660bbea38023"
     );
     assert_eq!(
         from_fixture.transition.mutation_plan_digest,
         "f67bc87634ad01aa2ccbdcd3bb8546e379fed288e3886193c42942c648cbbae2"
+    );
+    assert_eq!(
+        from_fixture.transition.admission_contract_set_digest,
+        eliot_store_api::supported_admission_contract_set_digest().unwrap(),
+        "the raw fixture names the current supported contract set"
+    );
+    assert_eq!(
+        from_fixture.transition.operation_manifest_digest,
+        eliot_store_api::operation_manifest_set_digest(&manifests).unwrap(),
+        "the raw fixture names the complete generated manifest set"
+    );
+    assert!(
+        from_fixture
+            .transition
+            .validate_against_catalogue(&manifests)
+            .is_ok(),
+        "the raw prepared transition passes the current operation catalogue owner"
     );
     assert_eq!(
         from_fixture.transition.semantic_source_revisions,
@@ -834,30 +855,15 @@ fn store_request_op_tag(request: &StoreRequest) -> &'static str {
     }
 }
 
-// WORK_UNIT_CASE: 990/10
-#[test]
-fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
-    let mut missing = serde_json::to_value(valid_request()).unwrap();
-    missing.as_object_mut().unwrap().remove("admission");
-    assert!(serde_json::from_value::<ReservedWriteRequest>(missing).is_err());
-    let legacy = StoreRequest::Apply {
-        context: context(),
-        transition: transition(),
-        expected_revision_heads: revision_heads(),
-        expected_ordering_heads: ordering_heads_for(&[("scope-admit-1".to_owned(), 6)]),
-    };
-    let legacy_json = serde_json::to_value(&legacy).unwrap();
-    assert!(serde_json::from_value::<ReservedWriteRequest>(legacy_json).is_err());
-    let reserved_json = serde_json::to_value(valid_request()).unwrap();
-    assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
+fn assert_closed_store_request_catalogue(legacy: StoreRequest) {
     // Closed wire-variant catalogue: every exported `StoreRequest` variant
     // encodes under its fixed `op` tag, round-trips, and validates. Slice
     // #991 adds exactly one variant (`reserved_write`) and slice #975 adds
     // exactly one variant (`backup`), covered in the catalogue below; the
     // legacy eleven keep their exact tags, encodings, and advertised
-    // capabilities unchanged, while the reserved-write and backup
-    // capabilities stay declared-but-unadvertised (proven in the loop and
-    // again explicitly below).
+    // capabilities unchanged, backup selects its advertised capability, and
+    // only reserved-write stays declared-but-unadvertised; case 10 checks its
+    // explicit wrapper separately.
     let catalogue = vec![
         StoreRequest::Health,
         StoreRequest::Readiness,
@@ -892,21 +898,25 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         let decoded: StoreRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(&decoded, variant);
         assert!(decoded.validate().is_ok());
-        if matches!(store_request_op_tag(variant), "reserved_write" | "backup") {
-            let expected = if store_request_op_tag(variant) == "reserved_write" {
+        if store_request_op_tag(variant) == "reserved_write" {
+            assert_eq!(
+                decoded.capability(),
                 eliot_store_api::CAPABILITY_RESERVED_WRITE
-            } else {
-                eliot_store_api::CAPABILITY_STORE_BACKUP
-            };
-            assert_eq!(decoded.capability(), expected);
+            );
             assert!(
                 !CAPABILITIES.contains(&decoded.capability()),
-                "the reserved-write/backup capability is declared but stays unadvertised"
+                "the reserved-write capability is declared but stays unadvertised"
             );
         } else {
+            if store_request_op_tag(variant) == "backup" {
+                assert_eq!(
+                    decoded.capability(),
+                    eliot_store_api::CAPABILITY_STORE_BACKUP
+                );
+            }
             assert!(
                 CAPABILITIES.contains(&decoded.capability()),
-                "every legacy wire variant selects an advertised capability"
+                "every accepted legacy or backup wire variant selects an advertised capability"
             );
         }
     }
@@ -930,6 +940,25 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
         ],
         "closed wire catalogue contains the legacy variants plus the single #991 reserved-write variant and the single #975 backup variant"
     );
+}
+
+// WORK_UNIT_CASE: 990/10
+#[test]
+fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
+    let mut missing = serde_json::to_value(valid_request()).unwrap();
+    missing.as_object_mut().unwrap().remove("admission");
+    assert!(serde_json::from_value::<ReservedWriteRequest>(missing).is_err());
+    let legacy = StoreRequest::Apply {
+        context: context(),
+        transition: transition(),
+        expected_revision_heads: revision_heads(),
+        expected_ordering_heads: ordering_heads_for(&[("scope-admit-1".to_owned(), 6)]),
+    };
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert!(serde_json::from_value::<ReservedWriteRequest>(legacy_json).is_err());
+    let reserved_json = serde_json::to_value(valid_request()).unwrap();
+    assert!(serde_json::from_value::<StoreRequest>(reserved_json).is_err());
+    assert_closed_store_request_catalogue(legacy);
     // Reserved-write evidence selects no wire operation by itself: the bare
     // projection carries no `op` tag while every `StoreRequest` encoding
     // requires one. Only the explicit #991 `ReservedWrite` wrapper selects
@@ -1061,6 +1090,38 @@ fn canonical_token_or_transition_mutation_invalidates_the_binding() {
         head.validate(),
         Err(StoreError::TransitionDigestMismatch { .. })
     ));
+}
+
+// WORK_UNIT_CASE: 990/14
+#[test]
+fn unsupported_default_refuses_reserved_write_without_apply_fallback_or_effect() {
+    let client = StubClient::new();
+    assert_eq!(
+        client.apply_call_count(),
+        0,
+        "the ordinary-write effect counter starts empty"
+    );
+    let request = valid_request();
+    assert!(
+        request.validate().is_ok(),
+        "exercise the unsupported path with a valid reserved-write request"
+    );
+
+    // StubClient inherits CanonicalStoreClient's real default method. Its
+    // apply_prepared counter records any fallback into ordinary unreserved
+    // Apply, including an attempted effect whose receipt is then discarded.
+    let error = block_on(client.apply_reserved_write(request))
+        .expect_err("the unsupported default must return its typed refusal");
+    assert_eq!(
+        error,
+        eliot_store_api::ReservedWriteUnsupported::REFUSAL.into_error(),
+        "the inherited default preserves the exact unsupported refusal"
+    );
+    assert_eq!(
+        client.apply_call_count(),
+        0,
+        "unsupported reserved write must perform no unreserved apply or write effect"
+    );
 }
 
 struct StubClient {
@@ -1251,14 +1312,12 @@ fn exported_api_surface_exposes_no_reserved_write_authority() {
     // proof is the declared-but-unadvertised capability in 990/10. This test
     // pins the rest: the advertised capability and effect sets.
     assert!(
-        CAPABILITIES
-            .iter()
-            .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
-        "no hidden capability activation: {CAPABILITIES:?}"
-    );
-    assert!(
         !CAPABILITIES.contains(&eliot_store_api::CAPABILITY_RESERVED_WRITE),
         "the declared reserved-write capability stays unadvertised until the backend slice"
+    );
+    assert!(
+        CAPABILITIES.contains(&"store.dreamer_job.record_admission"),
+        "reserved-write checks leave the unrelated Dreamer record-admission capability intact"
     );
     assert_eq!(
         EFFECTS,

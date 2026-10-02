@@ -39,8 +39,6 @@ use eliot_platform_windows::{
 use eliot_runtime_contracts::{RestartPolicyV1, RuntimeLiveStoreIdentity};
 use eliot_store_surreal::{StoreLaunchConfig, launch_config_digest};
 mod backup_entry;
-#[cfg(windows)]
-mod legacy_governor_config;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -1752,6 +1750,42 @@ fn validate_active_phase_b_runtime_binding(
 }
 
 #[cfg(windows)]
+const LEGACY_GOVERNOR_CANONICAL_ROUTE: &str = concat!(
+    "eliot setup through the Kernel canonical configuration surface: ",
+    "the Kernel-owned runtime.toml queue/admission profile (eliot_agent_coordinator::runtime_profile) ",
+    "plus the Host-managed StoreLaunchConfig bound to the installation manifest; ",
+    "Governor operates only as outbound-only eliotd polling Kernel; ",
+    "typed policy resolves only through eliotd::canonical_config_precedence",
+);
+#[cfg(windows)]
+const LEGACY_GOVERNOR_CONFIG_RETIRED: &str = "LEGACY_GOVERNOR_CONFIG_RETIRED";
+#[cfg(windows)]
+const LEGACY_GOVERNOR_PROCESS_RUNNING: &str = "LEGACY_GOVERNOR_PROCESS_RUNNING";
+#[cfg(windows)]
+const LEGACY_GOVERNOR_OBSERVATION_UNKNOWN: &str = "LEGACY_GOVERNOR_OBSERVATION_UNKNOWN";
+#[cfg(any(windows, test))]
+const LEGACY_GOVERNOR_CONFIG_MIGRATION_ACTION: &str = concat!(
+    "Migration action: delete LocalAppData\\Eliot\\config\\governor.toml. ",
+    "Queue and admission capacity is configured only in the Kernel canonical configuration surface: ",
+    "the Kernel-owned runtime.toml decoded by eliot_agent_coordinator::runtime_profile into the I14.2 nine-class SchedulingProfile ",
+    "(fail closed on any unreadable, malformed, unknown-field or incomplete document; the four I14.2 classes with no documented item ceiling, and the byte ceiling of all nine, are required there and never defaulted). ",
+    "Durable state remains the Host-managed StoreLaunchConfig bound to the installation manifest, and the Governor operates only as outbound-only eliotd polling Kernel. ",
+    "Typed Governor policy resolves only through eliotd::canonical_config_precedence (seven-layer TOML/JSON precedence with generated schema; lower layers narrow unless a higher layer delegates the exact expansion; scripts are invalid policy). ",
+    "This binary creates and loads no runtime.toml (the Kernel owner does), and it never adopts a legacy byte as authority. ",
+    "File lifecycle: workstreams/legacy/retirement-1189.toml (T7-S1 ledger, S9 integrator-owned); adjacent root config/: #1219. ",
+    "Remove the legacy file and retry with no legacy config.",
+);
+
+#[cfg(any(windows, test))]
+fn retired_legacy_governor_config_detail(path: &Path) -> String {
+    format!(
+        "legacy Governor config at {} is retired and never adopted as authority. {}",
+        path.display(),
+        LEGACY_GOVERNOR_CONFIG_MIGRATION_ACTION
+    )
+}
+
+#[cfg(windows)]
 fn classify_legacy_governor_process_state(state: Result<bool, String>) -> Result<(), String> {
     match state {
         Ok(false) => Ok(()),
@@ -1773,27 +1807,16 @@ fn observe_legacy_governor_config() -> Result<()> {
     // local control channel, or alternate launch journal.
     match observe_current_user_config(INSTALLATION_INPUT_LIMIT) {
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Absent { .. }) => {
-            legacy_governor_config::gate_legacy_config_observation(None)
-                .map_err(|error| anyhow::anyhow!(error))?;
+            // Absence is the only config observation that proceeds.
         }
         Ok(eliot_platform_windows::LocalAppDataConfigObservation::Present(read)) => {
-            if let Err(error) = legacy_governor_config::gate_legacy_config_observation(Some((
-                read.path(),
-                read.bytes(),
-            ))) {
-                write_legacy_governor_cutover_rejection(
-                    legacy_governor_config::LEGACY_GOVERNOR_CONFIG_RETIRED,
-                    &error,
-                );
-                return Err(anyhow::anyhow!(error));
-            }
+            let detail = retired_legacy_governor_config_detail(read.path());
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_CONFIG_RETIRED, &detail);
+            return Err(anyhow::anyhow!(detail));
         }
         Err(error) => {
             let detail = format!("legacy Governor config observation is unknown: {error}");
-            write_legacy_governor_cutover_rejection(
-                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
-                &detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_OBSERVATION_UNKNOWN, &detail);
             return Err(anyhow::anyhow!(detail));
         }
     }
@@ -1802,17 +1825,11 @@ fn observe_legacy_governor_config() -> Result<()> {
         Ok(false) => {}
         Ok(true) => {
             let detail = "legacy eliot-governor.exe is running";
-            write_legacy_governor_cutover_rejection(
-                legacy_governor_config::LEGACY_GOVERNOR_PROCESS_RUNNING,
-                detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_PROCESS_RUNNING, detail);
         }
         Err(error) => {
             let detail = format!("legacy Governor process state is unknown: {error}");
-            write_legacy_governor_cutover_rejection(
-                legacy_governor_config::LEGACY_GOVERNOR_OBSERVATION_UNKNOWN,
-                &detail,
-            );
+            write_legacy_governor_cutover_rejection(LEGACY_GOVERNOR_OBSERVATION_UNKNOWN, &detail);
         }
     }
     classify_legacy_governor_process_state(process_state).map_err(|error| anyhow::anyhow!(error))
@@ -4832,7 +4849,7 @@ fn write_legacy_governor_cutover_rejection(code: &str, detail: &str) {
             "status": "ERROR",
             "code": code,
             "detail": detail,
-            "canonical_route": legacy_governor_config::LEGACY_GOVERNOR_CANONICAL_ROUTE,
+            "canonical_route": LEGACY_GOVERNOR_CANONICAL_ROUTE,
             "completed": false,
         })
     );
@@ -5424,6 +5441,16 @@ mod tests {
                 command: CatalogueCommand::Help
             }
         ));
+    }
+
+    #[test]
+    fn present_retired_legacy_governor_config_is_refused_with_migration_action() {
+        let path = std::path::Path::new(r"C:\Users\test\AppData\Local\Eliot\config\governor.toml");
+        let detail = retired_legacy_governor_config_detail(path);
+
+        assert!(detail.contains(path.to_string_lossy().as_ref()));
+        assert!(detail.contains("never adopted as authority"));
+        assert!(detail.contains("Remove the legacy file and retry"));
     }
 
     #[cfg(windows)]

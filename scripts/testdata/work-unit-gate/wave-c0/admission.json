@@ -1,0 +1,253 @@
+{
+ "admission_note": "admitted via #829 (T8-A0) root workspace membership",
+ "authorized_delta_paths": [
+  "Cargo.lock",
+  "Cargo.toml",
+  "crates/smart/eliot-context-contracts/Cargo.toml",
+  "crates/smart/eliot-context-contracts/module.toml",
+  "crates/smart/eliot-cue-contracts/Cargo.toml",
+  "crates/smart/eliot-cue-contracts/module.toml",
+  "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+  "crates/smart/eliot-dreamer-contracts/module.toml",
+  "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+  "crates/smart/eliot-epistemic-contracts/module.toml",
+  "crates/smart/eliot-learning-contracts/Cargo.toml",
+  "crates/smart/eliot-learning-contracts/module.toml",
+  "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+  "crates/smart/eliot-memory-curation-contracts/module.toml",
+  "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+  "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
+  "scripts/testdata/work-unit-gate/wave-c0/baseline.json",
+  "scripts/testdata/work-unit-gate/wave-c0/candidate.json",
+  "scripts/tests/test_wave_admission_c0.py"
+ ],
+ "integration_binding": {
+  "accepted_commit": "f36816b8d3c5c673d1c584823694278c2ca1eb35",
+  "bound_commit": "fe7ef391b6f745f6c7a192d4d64fddea1cbb9216",
+  "rule": "the membership-required integration receipts bind their source, matrix and execution digests to the immutable integration commit named here, never to a moving ref; the six-package rows and the remaining-admitted claim are proved separately from current main, so later legitimate growth cannot invalidate this admission",
+  "why_not_head": "HEAD is a moving ref. Comparing a frozen digest against whatever main happens to be turns every later leaf change into a failure of this admission. Each digest is bound to the commit it was taken from and is validated against that commit's bytes."
+ },
+ "index_rows": {
+  "crates/smart/eliot-context-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  },
+  "crates/smart/eliot-cue-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  },
+  "crates/smart/eliot-dreamer-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  },
+  "crates/smart/eliot-epistemic-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  },
+  "crates/smart/eliot-learning-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  },
+  "crates/smart/eliot-memory-curation-contracts": {
+   "merge": {
+    "package": "`workspace`",
+    "prototype": null
+   },
+   "parent": {
+    "package": null,
+    "prototype": "`nonmember prototype`"
+   }
+  }
+ },
+ "issue": 829,
+ "merge_commit": "f36816b8d3c5c673d1c584823694278c2ca1eb35",
+ "merge_commit_subject": "T8-A0 / #829 admit six C0 contract leaves (Implements #829) (#1456)",
+ "merge_parent": "bf219fe3a9615877c6870c0dfbecc1dce97b3904",
+ "module_status_at_merge": {
+  "crates/smart/eliot-context-contracts": {
+   "agent_order": 15,
+   "module_id": "smart.context.contracts",
+   "module_sha256": "aa1ce78c1ad58c950bd65cfeaf76594f11ca836e97c6892a84ae154b2b7247e7",
+   "source_layer": "C0",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  },
+  "crates/smart/eliot-cue-contracts": {
+   "agent_order": 10,
+   "module_id": "smart.cue.contracts",
+   "module_sha256": "4b70388d1bdcfa1253bded827f4a0c3a9485229e755f7bc76eb0db1a1e65c952",
+   "source_layer": "C1",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  },
+  "crates/smart/eliot-dreamer-contracts": {
+   "agent_order": 3,
+   "module_id": "smart.dreamer.contracts",
+   "module_sha256": "fd61bc5c942cb5de54d0f868204ebb2613ab87c6b0c7cc58e20d428090845558",
+   "source_layer": "C0",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  },
+  "crates/smart/eliot-epistemic-contracts": {
+   "agent_order": 6,
+   "module_id": "smart.epistemic.contracts",
+   "module_sha256": "0eb12e700319f5de623a0f1703c2e84555e53ae93a21e632f986fc026c8cf224",
+   "source_layer": "C1",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  },
+  "crates/smart/eliot-learning-contracts": {
+   "agent_order": 32,
+   "module_id": "smart.learning.contracts",
+   "module_sha256": "7e1a6edf159743b8112f08d44e4b82e91c47dd96308d6261d3cc0a09d95f27a6",
+   "source_layer": "C0",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  },
+  "crates/smart/eliot-memory-curation-contracts": {
+   "agent_order": 19,
+   "module_id": "smart.memory.curation_contracts",
+   "module_sha256": "c42786d9d834de80347e791c48cc7a581c50a669e029fe85ed2a23d3a29fc839",
+   "source_layer": "C1",
+   "status": "ADMITTED",
+   "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
+  }
+ },
+ "navigation_blockers": [
+  {
+   "claim": "package/target-local AGENTS.md route/block/handle closure in the generated package docs index",
+   "issue": 690,
+   "owned_by_829": false,
+   "owner": "code_navigation package index generator",
+   "recorded_for": "the navigation acceptance claim of this admission",
+   "resolution_required": "rerun the navigation cases after the generator owner is repaired and accepted",
+   "withheld": "docs/code-navigation target closure acceptance"
+  },
+  {
+   "claim": "the committed PACKAGE_DOCS_INDEX.md on this tree is stale for the eliot-instrument-runner and eliot-windows-ipc/eliot-types bin targets added by #1914 after the last index regeneration, so code_navigation check exits nonzero before this admission",
+   "issue": 1914,
+   "owned_by_829": false,
+   "owner": "code_navigation package index generator",
+   "recorded_for": "the navigation acceptance claim of this admission",
+   "resolution_required": "the index owner regenerates the index and this suite reruns; #829 does not regenerate an index it does not own and does not weaken the check to accept staleness",
+   "withheld": "the code_navigation check exit status of this admission"
+  }
+ ],
+ "module_status_at_parent": {
+  "crates/smart/eliot-context-contracts": {
+   "agent_order": 15,
+   "module_id": "smart.context.contracts",
+   "module_sha256": "f01502a3ec34330639adf05aaaddeb6561db4cad1ecab100120928f2b97e906e",
+   "source_layer": "C0",
+   "status": "PROTOTYPE",
+   "workspace_admission": "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+  },
+  "crates/smart/eliot-cue-contracts": {
+   "agent_order": 10,
+   "module_id": "smart.cue.contracts",
+   "module_sha256": "3c3ecc6d4a0556264e5fef2f838038fea741f7d18a627d7ca67bbfe1ed2f146b",
+   "source_layer": "C1",
+   "status": "PROTOTYPE",
+   "workspace_admission": "pending_agent_implementation_and_proof"
+  },
+  "crates/smart/eliot-dreamer-contracts": {
+   "agent_order": 3,
+   "module_id": "smart.dreamer.contracts",
+   "module_sha256": "c634d16fc42e41c6372e522f82cf758a84a21b41ef7600d051ff04e6d93681cd",
+   "source_layer": "C0",
+   "status": "PROTOTYPE",
+   "workspace_admission": "forbidden until implementation, package proof, affected Edge proof, current-main ancestry and integration-owner review"
+  },
+  "crates/smart/eliot-epistemic-contracts": {
+   "agent_order": 6,
+   "module_id": "smart.epistemic.contracts",
+   "module_sha256": "4df00f6bdc3860e8fa6d3808a45f8e41c44b167ade8e3c7a2d0609fa298b7814",
+   "source_layer": "C1",
+   "status": "PROTOTYPE",
+   "workspace_admission": "forbidden until src/lib.rs, package proof, resolver edge proof and integration-owner review"
+  },
+  "crates/smart/eliot-learning-contracts": {
+   "agent_order": 32,
+   "module_id": "smart.learning.contracts",
+   "module_sha256": "d75420312d6f47430f2e94807046e7c01e626df7fdb905d516f41c2743e3a656",
+   "source_layer": "C0",
+   "status": "PROTOTYPE",
+   "workspace_admission": "forbidden until implementation, package proof, affected edge proof, current-main rebase and integration-owner review"
+  },
+  "crates/smart/eliot-memory-curation-contracts": {
+   "agent_order": 19,
+   "module_id": "smart.memory.curation_contracts",
+   "module_sha256": "89fcc453918fe2dfd2f3720bc98456ce99d6f886a23b371dd7f628b0a6e5d844",
+   "source_layer": "C1",
+   "status": "PROTOTYPE",
+   "workspace_admission": "forbidden until src/lib.rs, package proof and both consumer edges pass"
+  }
+ },
+ "observed_delta_paths": [
+  "Cargo.lock",
+  "Cargo.toml",
+  "crates/smart/eliot-context-contracts/Cargo.toml",
+  "crates/smart/eliot-context-contracts/module.toml",
+  "crates/smart/eliot-cue-contracts/Cargo.toml",
+  "crates/smart/eliot-cue-contracts/module.toml",
+  "crates/smart/eliot-dreamer-contracts/Cargo.toml",
+  "crates/smart/eliot-dreamer-contracts/module.toml",
+  "crates/smart/eliot-dreamer-contracts/src/failure/input.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/classification_contracts.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/concept_contracts.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/consumer_and_source_proof.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/curation_invocation.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/failure_contracts.rs",
+  "crates/smart/eliot-dreamer-contracts/tests/relation_contracts.rs",
+  "crates/smart/eliot-epistemic-contracts/Cargo.toml",
+  "crates/smart/eliot-epistemic-contracts/module.toml",
+  "crates/smart/eliot-learning-contracts/Cargo.toml",
+  "crates/smart/eliot-learning-contracts/module.toml",
+  "crates/smart/eliot-memory-curation-contracts/Cargo.toml",
+  "crates/smart/eliot-memory-curation-contracts/module.toml",
+  "crates/smart/eliot-memory-curation-contracts/tests/contracts.rs",
+  "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+  "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md",
+  "scripts/testdata/work-unit-gate/wave-c0/baseline.json",
+  "scripts/testdata/work-unit-gate/wave-c0/candidate.json",
+  "scripts/tests/test_wave_admission_c0.py"
+ ],
+ "root_exclude_at_merge": 39,
+ "root_exclude_at_parent": 45,
+ "root_members_at_merge": 131,
+ "root_members_at_parent": 125,
+ "schema": "eliot-wave-c0-admission-transaction-v1",
+ "stale_comment": "A cell moves from `exclude` to `members` in its own work unit",
+ "wave": "T8-A0",
+ "writer_comment": "Wave admission (#829/T8-A0) is the single serialized root turn"
+}

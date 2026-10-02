@@ -6,7 +6,9 @@
 //! determinism, ambiguous fallback preservation, no epistemic promotion, and
 //! exact replay identity, plus fail-closed conflicting-hint behavior.
 
-use eliot_contracts::{ClockReading, EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ClockReading, ContractVersion, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+};
 use eliot_observation::{
     AmbiguousOrdinaryRecordV2, CandidateDisposition, CaptureMode, CaptureRoute,
     CoverageDisposition, CoverageEvidence, CoverageInterval, Durability,
@@ -15,7 +17,9 @@ use eliot_observation::{
     ObservationScope, ObservationSubmission, PrivacyRetentionDisclosure, ProducerTrace,
     RecordFamilyClassification, RecordFamilyPayloadV2, admit_record_family_v2,
 };
-use eliot_observation_contracts::{AuditRecord, TelemetryRecord};
+use eliot_observation_contracts::{
+    AuditRecord, MaintenanceRecord, TelemetryRecord, record_family_contract_identity,
+};
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -32,6 +36,10 @@ fn fence() -> StateFence {
 }
 
 fn event() -> ObservationEventCore {
+    event_of(ObservationKind::QueueResource)
+}
+
+fn event_of(kind: ObservationKind) -> ObservationEventCore {
     let work_scope = "scope:test"
         .parse()
         .unwrap_or_else(|_| panic!("fixture work scope must parse"));
@@ -39,7 +47,7 @@ fn event() -> ObservationEventCore {
         CoverageInterval::new(1, 1).unwrap_or_else(|_| panic!("fixture interval must be valid"));
     ObservationEventCore {
         event_id_and_time: ObservationEventIdentity {
-            event_id: "event:test".to_owned(),
+            event_id: format!("event:{kind:?}"),
             clock: ClockReading::default(),
         },
         producer_generation_and_trace: ProducerTrace {
@@ -47,7 +55,7 @@ fn event() -> ObservationEventCore {
             generation: "generation:test".to_owned(),
             trace_ref: None,
         },
-        kind: ObservationKind::QueueResource,
+        kind,
         affected_scope: ObservationScope {
             work_scope,
             task_ref: None,
@@ -331,5 +339,157 @@ fn conflicting_hint_fails_closed_with_candidate_preserved() {
     assert!(
         rejection.safe_capture_fallback.is_some(),
         "conflict rejection must preserve the safe candidate"
+    );
+}
+
+/// A real `MaintenanceRecord` family, shaped exactly as the production producer
+/// `crates/governor/eliot-governor/src/observation_reconciliation.rs::
+/// maintenance_result_submission` builds it.
+fn maintenance_family_v2(record_id: &str) -> ObservationRecordEnvelopeV2 {
+    ObservationRecordEnvelopeV2 {
+        payload: RecordFamilyPayloadV2::Maintenance(MaintenanceRecord {
+            record_id: record_id.to_owned(),
+            core: event_of(ObservationKind::Maintenance),
+            maintenance_action: "rebuild projection".to_owned(),
+            trigger_ref: "problem:1".to_owned(),
+            result: None,
+        }),
+        caller_family_hint: Some(ObservationRecordKind::Maintenance),
+        parent_record_id: None,
+    }
+}
+
+fn maintenance_submission(record_id: &str) -> ObservationSubmission {
+    let record_v2 = maintenance_family_v2(record_id);
+    ObservationSubmission {
+        operation_id: format!("operation:{record_id}"),
+        idempotency_key: format!("idempotency:{record_id}"),
+        state_fence: fence(),
+        record: ObservationRecordEnvelope {
+            record_id: record_id.to_owned(),
+            kind: ObservationRecordKind::Maintenance,
+            event: Some(event_of(ObservationKind::Maintenance)),
+            coverage_gap: None,
+            journal_control_event: false,
+            parent_record_id: None,
+        },
+        record_v2: Some(record_v2),
+        capture_route: CaptureRoute::OperationalLog,
+        durability: Durability::Volatile,
+        plan: None,
+        task_selection: None,
+        evidence: None,
+    }
+}
+
+/// A1: the versioned compatibility rule is ESTABLISHED from the record-family
+/// owner at admission, so the receipt is bound to the one field-level owner
+/// rather than to a caller-supplied label. The rule is derived, not selected.
+#[test]
+fn admission_records_the_record_family_contract_identity_of_its_owner() {
+    let mut journal = ObservationJournal::default();
+    let result = journal
+        .admit(maintenance_submission("record:owner"))
+        .unwrap_or_else(|error| panic!("exact maintenance family must be admitted: {error}"));
+    let ObservationAdmissionResult::Accepted { receipt } = result else {
+        panic!("an exact maintenance family must be accepted");
+    };
+    assert_eq!(receipt.record_id, "record:owner");
+    let owner_identity = record_family_contract_identity()
+        .unwrap_or_else(|error| panic!("record-family identity must resolve: {error}"));
+    assert_eq!(
+        receipt.record_family_contract,
+        Some(owner_identity.clone()),
+        "the receipt must record the identity the record-family owner publishes"
+    );
+    owner_identity
+        .validate()
+        .unwrap_or_else(|error| panic!("recorded identity must validate: {error}"));
+    assert_eq!(
+        owner_identity.version,
+        eliot_observation_contracts::RECORD_FAMILY_CONTRACT_VERSION,
+        "the recorded rule must be the owner's current v2 compatibility rule"
+    );
+}
+
+/// Positive case: a real record family validates through the new caller. The
+/// receipt round-trips through the ordinary persisted read/restart consumer,
+/// which re-proves the recorded identity instead of trusting it.
+#[test]
+fn real_record_family_revalidates_through_the_recorded_identity_on_rebuild() {
+    let mut journal = ObservationJournal::default();
+    let result = journal
+        .admit(maintenance_submission("record:rebuild"))
+        .unwrap_or_else(|error| panic!("exact maintenance family must be admitted: {error}"));
+    let ObservationAdmissionResult::Accepted { receipt } = result else {
+        panic!("an exact maintenance family must be accepted");
+    };
+    assert!(receipt.record_v2.is_some());
+    receipt
+        .validate()
+        .unwrap_or_else(|error| panic!("admitted receipt must re-validate: {error}"));
+    let rebuilt = ObservationJournal::from_entries(journal.snapshot())
+        .unwrap_or_else(|error| panic!("journal must rebuild: {error}"));
+    let entry = rebuilt
+        .get(&receipt.idempotency_key)
+        .unwrap_or_else(|| panic!("rebuilt journal must retain the accepted receipt"));
+    let ObservationAdmissionResult::Accepted {
+        receipt: rebuilt_receipt,
+    } = &entry.result
+    else {
+        panic!("rebuilt entry must stay the original accepted receipt");
+    };
+    assert_eq!(rebuilt_receipt, &receipt);
+}
+
+/// Refusal case: a family whose recorded record-family identity does not match
+/// the owner's is refused — the recorded value is never rewritten to match, and
+/// the typed mismatch identity is preserved through the rebuild consumer.
+#[test]
+fn receipt_recorded_under_another_record_family_identity_is_refused() {
+    let mut journal = ObservationJournal::default();
+    let result = journal
+        .admit(maintenance_submission("record:refused"))
+        .unwrap_or_else(|error| panic!("exact maintenance family must be admitted: {error}"));
+    let ObservationAdmissionResult::Accepted {
+        receipt: mut receipt,
+    } = result
+    else {
+        panic!("an exact maintenance family must be accepted");
+    };
+    // A different-but-well-formed identity: the same owner name under another
+    // rule revision. The shape digest stays valid, so only the identity
+    // comparison can refuse this receipt.
+    let admitted_identity = receipt
+        .record_family_contract
+        .clone()
+        .unwrap_or_else(|| panic!("admitted receipt must carry an identity"));
+    receipt.record_family_contract = Some(eliot_contracts::ContractIdentity {
+        version: ContractVersion::new(2, 0, 1),
+        ..admitted_identity.clone()
+    });
+    let refused = match receipt.validate() {
+        Ok(()) => panic!("a receipt admitted under another record-family identity must be refused"),
+        Err(error) => error,
+    };
+    match &refused {
+        eliot_observation::GovernorObservationError::RecordFamilyContractMismatch {
+            recorded,
+            current,
+        } => assert_eq!(
+            (recorded.version, current.version),
+            (ContractVersion::new(2, 0, 1), admitted_identity.version),
+            "the refusal reports both sides verbatim; the recorded value is never rewritten"
+        ),
+        other => panic!("refusal must keep its typed mismatch identity, got: {other:?}"),
+    }
+    let entry = eliot_observation::ObservationJournalEntry {
+        idempotency_key: receipt.idempotency_key.clone(),
+        request_digest: receipt.request_digest.clone(),
+        result: ObservationAdmissionResult::Accepted { receipt },
+    };
+    assert!(
+        ObservationJournal::from_entries([entry]).is_err(),
+        "rebuild must refuse a receipt admitted under another record-family identity"
     );
 }

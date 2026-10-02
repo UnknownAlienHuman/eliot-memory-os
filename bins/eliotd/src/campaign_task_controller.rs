@@ -15,7 +15,9 @@ use eliot_governor::{
     TaskCommand, TaskCommandContext, TaskProposal,
 };
 use eliot_learning_contracts::{
-    CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
+    CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, ContractBinding,
+    LearningStateViewRecipe, ProofCeiling, WorkScopeId,
+    identity::{LEARNING_SCHEMA_VERSION, SourceLineage},
 };
 use eliot_protocol::{
     TaskControllerAction, TaskControllerCampaignOwnerMaterials, TaskControllerResultBody,
@@ -407,6 +409,69 @@ fn task_controller_rejection(
     )
 }
 
+/// Canonical issuer of the `ContractBinding` the Task Controller owner
+/// publishes together with the campaign learning-state recipe.
+///
+/// This is the single place in the daemon where a `ContractBinding` is
+/// constructed. `eliot_learning_contracts::ContractBinding` carries no
+/// constructor of its own, so before this issuer existed every durable
+/// candidate family that binds one (use attribution, improvement experiment,
+/// promotion boundary, and the campaign recipe itself) could only obtain a
+/// binding from a test literal. The daemon is the composition root that already
+/// holds every admitted owner value of one claim, so the binding is minted here
+/// from those values and never projected from a neighbouring family's fields.
+///
+/// # Admitted owner values
+///
+/// | `ContractBinding` field | admitted owner value on `claimed` |
+/// |---|---|
+/// | `request_id` | `claimed.request_identity.request.metadata.request_id` |
+/// | `operation_id` | `claimed.operation_id` (== `host_request_operation_id(&claimed.envelope)`) |
+/// | `product_id` | `claimed.request_identity.request.metadata.product_id` |
+/// | `task_id` | `claimed.invocation.task_id` (== `metadata.task_id`) |
+/// | `source.owner` | `claimed.request_identity.request.metadata.source_id` |
+/// | `state_fence` | `claimed.envelope.state_fence` |
+/// | `scope` | `claimed.invocation.work_scope_id` (== `envelope.identity.work_scope_id`) |
+///
+/// `schema_version` and `proof_ceiling` are the two values this contract family
+/// itself declares: `LEARNING_SCHEMA_VERSION` and `ProofCeiling::CandidateArtifact`,
+/// the only ceiling `ContractBinding::validate` admits.
+///
+/// # Values this site does not own
+///
+/// `policy_revision` and `source.{snapshot,revision,digest}` are not held by any
+/// admitted value of this claim and are therefore carried verbatim from the
+/// presented recipe's own declaration. They are never defaulted, generated or
+/// substituted here. No production consumer compares them against an owner value:
+/// the recipe anchor compares `source.owner` only
+/// (`eliot_governor::task_lifecycle::validate_campaign_recipe_anchor`) and the
+/// remaining lineage fields are checked for shape only by `SourceLineage::validate`.
+pub fn issue_admitted_campaign_recipe_binding(
+    claimed: &TaskControllerClaimedInvocation,
+    presented: &LearningStateViewRecipe,
+) -> Result<ContractBinding, String> {
+    let metadata = &claimed.request_identity.request.metadata;
+    let scope = WorkScopeId::new(claimed.invocation.work_scope_id.as_str())
+        .map_err(|error| format!("admitted work scope is not a scope identity: {error}"))?;
+    Ok(ContractBinding {
+        schema_version: LEARNING_SCHEMA_VERSION,
+        policy_revision: presented.binding.policy_revision,
+        request_id: metadata.request_id.clone(),
+        operation_id: claimed.operation_id.clone(),
+        product_id: metadata.product_id.clone(),
+        task_id: claimed.invocation.task_id.clone(),
+        scope,
+        state_fence: claimed.envelope.state_fence.clone(),
+        source: SourceLineage {
+            owner: metadata.source_id.clone(),
+            snapshot: presented.binding.source.snapshot.clone(),
+            revision: presented.binding.source.revision,
+            digest: presented.binding.source.digest.clone(),
+        },
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+    })
+}
+
 /// Decodes one claim and performs every external campaign read before the
 /// caller borrows the shared composition. Owner-specific checks still happen
 /// under that composition through `prepare_task_controller_transition`.
@@ -425,11 +490,13 @@ pub async fn prepare_task_controller_claim(
                 )));
             }
         };
-    if recipe.validate().is_err()
-        || recipe.binding.task_id.as_str() != invocation.task_id.as_str()
-        || recipe.binding.scope.as_str() != invocation.work_scope_id
-        || recipe.binding.state_fence != claimed.envelope.state_fence
-    {
+    // The binding is re-issued here from the admitted owner values of this claim
+    // and must equal the binding the recipe presents. The recipe is not rewritten
+    // to the issued value: a foreign request, operation, product, task, source
+    // owner, work scope or fence stays a refusal, exactly as the Governor task
+    // owner's own anchor check refuses it a layer down.
+    let admitted_binding = issue_admitted_campaign_recipe_binding(&claimed, &recipe);
+    if recipe.validate().is_err() || !admitted_binding.is_ok_and(|issued| issued == recipe.binding) {
         return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
             task_controller_rejection(&claimed, "invalid_recipe")?,
         )));

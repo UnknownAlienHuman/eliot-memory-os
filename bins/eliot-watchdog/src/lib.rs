@@ -2002,6 +2002,99 @@ mod tests {
                 .is_ok()
         );
 
+        let active = fixture.active_only();
+        let approvals = active["service_registration_approvals"]
+            .as_array()
+            .unwrap_or_else(|| unreachable!());
+        let host_grant = approvals
+            .iter()
+            .find(|approval| approval["role"] == "HOST")
+            .unwrap_or_else(|| unreachable!())["service_control_grant"]
+            .clone();
+        let watchdog_grant = approvals
+            .iter()
+            .find(|approval| approval["role"] == "WATCHDOG")
+            .unwrap_or_else(|| unreachable!())["service_control_grant"]
+            .clone();
+
+        let mut invalid_sid_grant = host_grant.clone();
+        invalid_sid_grant["principal_sid"] = serde_json::json!("S-1-5-80-01-2-3-4-5");
+
+        let alternate_sid = "S-1-5-80-6-7-8-9-10";
+        let alternate_sid_digest =
+            eliot_platform_windows::host_service_security_descriptor_digest(alternate_sid)
+                .unwrap_or_else(|error| panic!("alternate service SID grant fixture: {error}"));
+        let mut alternate_sid_grant = host_grant.clone();
+        alternate_sid_grant["principal_sid"] = serde_json::json!(alternate_sid);
+        alternate_sid_grant["security_descriptor_digest"] = serde_json::json!(alternate_sid_digest);
+
+        let mut wrong_access_mask_grant = host_grant.clone();
+        wrong_access_mask_grant["access_mask"] =
+            serde_json::json!(eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK);
+
+        let substituted_descriptor_digest =
+            eliot_platform_windows::watchdog_service_security_descriptor_digest(
+                eliot_platform_windows::ELIOT_HOST_SERVICE_SID,
+            )
+            .unwrap_or_else(|error| panic!("substituted descriptor digest fixture: {error}"));
+        let mut substituted_digest_grant = host_grant.clone();
+        substituted_digest_grant["security_descriptor_digest"] =
+            serde_json::json!(substituted_descriptor_digest);
+
+        for (case, grant, malformed_wire) in [
+            ("missing", None, false),
+            ("null", Some(serde_json::Value::Null), false),
+            ("malformed JSON type", Some(serde_json::json!([])), true),
+            ("invalid SID", Some(invalid_sid_grant), false),
+            ("Watchdog grant on Host", Some(watchdog_grant), false),
+            ("alternate valid SID", Some(alternate_sid_grant), false),
+            ("wrong access mask", Some(wrong_access_mask_grant), false),
+            (
+                "substituted descriptor digest",
+                Some(substituted_digest_grant),
+                false,
+            ),
+        ] {
+            let projection = fixture.substituted_host_service_control_grant(grant);
+            fixture.write_registry(&projection);
+            let protected_read = read_registry_for_bootstrap(&fixture.base_bootstrap());
+            let error = protected_read.err().unwrap_or_else(|| {
+                panic!("{case} Host grant unexpectedly passed protected readback")
+            });
+            assert!(
+                error
+                    .to_string()
+                    .contains("installation registry is corrupt"),
+                "{case} Host grant failed outside registry approval validation: {error}"
+            );
+
+            let host_approval = projection["service_registration_approvals"]
+                .as_array()
+                .unwrap_or_else(|| unreachable!())
+                .iter()
+                .find(|approval| approval["role"] == "HOST")
+                .unwrap_or_else(|| unreachable!())
+                .clone();
+            let decoded =
+                serde_json::from_value::<InstallerServiceRegistrationApproval>(host_approval);
+            if malformed_wire {
+                assert!(
+                    decoded.is_err(),
+                    "{case} service_control_grant unexpectedly decoded as an approval"
+                );
+            } else {
+                let approval = decoded
+                    .unwrap_or_else(|error| panic!("{case} Host approval did not decode: {error}"));
+                assert!(
+                    matches!(
+                        approval.validate(),
+                        Err(eliot_installation::InstallationError::IdentityConflict)
+                    ),
+                    "{case} Host grant did not fail approval identity validation"
+                );
+            }
+        }
+
         for (field, replacement) in [
             ("role", serde_json::json!("WATCHDOG")),
             ("generation", serde_json::json!("generation-other")),
@@ -2204,7 +2297,7 @@ mod tests {
         };
         let service_control_grant = match role {
             InstallerServiceRole::Host => {
-                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
                 let security_descriptor_digest =
                     match eliot_platform_windows::host_service_security_descriptor_digest(
                         principal_sid,
@@ -2216,11 +2309,13 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner": eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group": eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
             InstallerServiceRole::Watchdog => {
-                let principal_sid = "S-1-5-80-1-2-3-4-5";
+                let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
                 let security_descriptor_digest =
                     match eliot_platform_windows::watchdog_service_security_descriptor_digest(
                         principal_sid,
@@ -2232,6 +2327,8 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner": eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group": eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
@@ -2311,7 +2408,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("test supervision anchor: {error}"));
         let key_reference = eliot_runtime_contracts::SupervisionSealedKeyReference::new(
             "test-supervision-authority.sealed",
-            "S-1-5-80-1-2-3-4-5",
+            eliot_platform_windows::ELIOT_HOST_SERVICE_SID,
             eliot_runtime_contracts::SupervisionSealedKeyFileIdentity {
                 canonical_path_digest: "1".repeat(64),
                 volume_serial_number: 7,
@@ -2330,8 +2427,35 @@ mod tests {
             trust_anchor,
         )
         .unwrap_or_else(|error| panic!("test provisioned supervision authority: {error}"));
+        let installation_root = format!(r"C:\ProgramData\Eliot\installations\{installation}");
+        let runtime_state_roots = serde_json::json!({
+            "profile": "system_service",
+            "profile_anchor_root": r"C:\ProgramData",
+            "installation_root": installation_root,
+            "host_state_root": host_state_root,
+            "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
+            "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
+            "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
+            "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
+            "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
+            "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
+            "roots_digest": roots_digest
+        });
+        let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        let profile_governed_roots = serde_json::json!({
+            "binding_version": eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            "immutable_binaries": r"C:\Program Files\Eliot\eliot\test-version",
+            "durable_data": installation_root,
+            "user_config": installer_user_root,
+            "user_cache": installer_user_root,
+            "runtime_state_roots": runtime_state_roots.clone()
+        });
         let descriptor = serde_json::json!({
             "profile": "system_service",
+            "profile_component": "eliot",
+            "profile_version": "test-version",
+            "profile_installation_key": installation,
+            "profile_governed_roots": profile_governed_roots,
             "portable_root": null,
             "installation_epoch": {
                 "installation": installation,
@@ -2356,19 +2480,7 @@ mod tests {
                 "state": "PROVISIONED",
                 "authority": provisioned_authority
             },
-            "runtime_state_roots": {
-                "profile": "system_service",
-                "profile_anchor_root": r"C:\ProgramData",
-                "installation_root": r"C:\ProgramData\Eliot\installations\installation-7",
-                "host_state_root": host_state_root,
-                "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
-                "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
-                "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
-                "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
-                "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
-                "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
-                "roots_digest": roots_digest
-            },
+            "runtime_state_roots": runtime_state_roots,
             "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
             "kernel_artifact_digest": "0".repeat(64),
             "eliotd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.exe",
