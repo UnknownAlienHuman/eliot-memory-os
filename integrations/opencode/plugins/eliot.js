@@ -21,6 +21,19 @@ const ALLOWED_HTTP_HOSTS = new Set(["127.0.0.1", "::1", "[::1]"])
 // path requires the versioned owner-proved response (see verifyGatePermit).
 const ALLOWED_GATE_DECISIONS = new Set(["recorded", "allow", "allowed", "pass"])
 
+// First-contact server authentication (issue #2898, step 4). Plain loopback
+// location is not server identity, so the request credential is never the
+// first protected byte on the connection: the plugin first sends one
+// challenge probe carrying no credential, and only discloses the credential to
+// a peer that answered with a proof of the installation-pinned server identity
+// the User Broker projected into this process. A process that merely bound the
+// pinned loopback port holds a challenge and never a reusable secret.
+const BRIDGE_IDENTITY_VERSION = "eliot.opencode.bridge-identity.v1"
+const BRIDGE_CHALLENGE_HEADER = "X-ELIOT-Bridge-Challenge"
+const BRIDGE_CHALLENGE_BYTES = 32
+const BRIDGE_CHALLENGE_PATTERN = /^[0-9a-f]{64}$/
+const LOWER_SHA256_HEX = /^[0-9a-f]{64}$/
+
 const BRIDGE_ENV_KEYS = [
   "APPDATA",
   "COMSPEC",
@@ -471,9 +484,23 @@ function httpBridgeConfiguration() {
   if (!token) {
     throw new HttpBridgeError("ELIOT OpenCode bridge token is unavailable")
   }
+  // The installation-pinned server identity is the material the first-contact
+  // proof is verified against. A configuration that cannot authenticate the
+  // bridge is not an admitted installation path: the plugin refuses rather
+  // than sending the credential to whatever holds the pinned port.
+  const serverIdentity = process.env.ELIOT_OPENCODE_BRIDGE_SERVER_IDENTITY
+  if (!serverIdentity || !LOWER_SHA256_HEX.test(serverIdentity)) {
+    throw new HttpBridgeError(
+      "ELIOT OpenCode bridge server identity is unavailable: loopback location is not server identity",
+    )
+  }
   return {
     endpoint: new URL("/v1/host-events", base).toString(),
+    // The owner's canonical pinned form carries no path at all, so the URL
+    // parser's root slash is dropped before any identity comparison.
+    pinnedEndpoint: base.href.replace(/\/$/, ""),
     token,
+    serverIdentity,
   }
 }
 
@@ -528,7 +555,171 @@ function parseBridgeResponse(text) {
   return value
 }
 
+function newBridgeChallenge() {
+  const bytes = new Uint8Array(BRIDGE_CHALLENGE_BYTES)
+  // Bound to the Crypto instance: a detached `getRandomValues` reference is
+  // not a callable CSPRNG, and an unbound challenge would be predictable.
+  if (typeof globalThis.crypto?.getRandomValues !== "function") {
+    throw new HttpBridgeError("ELIOT OpenCode bridge cannot mint a first-contact challenge")
+  }
+  globalThis.crypto.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+// The exact canonical message the bridge HMACs with the installation-pinned
+// server identity: `eliot_agent_opencode::bootstrap_identity_message` encodes
+// the same array in the same order through serde_json, so both sides agree on
+// the UTF-8 bytes. Any drift fails closed at the proof comparison.
+function bridgeIdentityMessage(answer, challenge) {
+  return JSON.stringify([
+    BRIDGE_IDENTITY_VERSION,
+    challenge,
+    answer.installation_id,
+    answer.endpoint,
+    answer.server_identity,
+    answer.introduction_digest,
+    answer.bridge_generation,
+  ])
+}
+
+function untrustedPeer(detail) {
+  return new HttpBridgeError(`ELIOT OpenCode bridge identity is unverified: ${detail}`)
+}
+
+// Authenticates the bridge before any protected disclosure.
+//
+// One challenge probe, no credential, no host-event payload: the request is
+// refused server-side if it carries an `Authorization` or `Idempotency-Key`
+// header or a body. The answer must be the closed versioned identity record
+// naming the same pinned endpoint and installation, echoing this contact's
+// fresh challenge, and proving possession of the installation-pinned server
+// identity. Anything else throws before the credential is read again, so a
+// competing loopback listener is refused without ever learning it.
+async function proveBridgeIdentity(config) {
+  const challenge = newBridgeChallenge()
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), bridgeTimeoutMs())
+  let response
+  try {
+    response = await fetch(config.endpoint, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        [BRIDGE_CHALLENGE_HEADER]: challenge,
+        "X-ELIOT-Host": "opencode",
+      },
+      body: "",
+      redirect: "error",
+      signal: controller.signal,
+    })
+  } catch (error) {
+    throw new HttpBridgeError(
+      error?.name === "AbortError"
+        ? "ELIOT OpenCode bridge identity probe timed out"
+        : "ELIOT OpenCode bridge identity probe transport failed",
+      true,
+    )
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  try {
+    if (TRANSIENT_HTTP_STATUS.has(response.status)) {
+      await cancelResponseBody(response, "ELIOT OpenCode bridge identity probe transient response rejected")
+      throw new HttpBridgeError(
+        `ELIOT OpenCode bridge identity probe returned transient HTTP status ${response.status}`,
+        true,
+      )
+    }
+    if (!response.ok) {
+      await cancelResponseBody(response, "ELIOT OpenCode bridge identity probe non-success response rejected")
+      throw new HttpBridgeError(
+        `ELIOT OpenCode bridge identity probe returned HTTP status ${response.status}`,
+        true,
+      )
+    }
+    if (!isJsonMediaType(response.headers.get("content-type"))) {
+      await cancelResponseBody(response, "ELIOT OpenCode bridge identity probe media type rejected")
+      throw untrustedPeer("identity probe returned a non-JSON content type")
+    }
+    const text = await readBoundedWebStream(response.body, maximumBridgeOutputBytes())
+    const answer = parseBridgeIdentityAnswer(text)
+    if (answer.challenge !== challenge) {
+      throw untrustedPeer("identity probe answer does not answer this contact's challenge")
+    }
+    if (answer.server_identity !== config.serverIdentity) {
+      throw untrustedPeer("identity probe answer names a different bridge incarnation")
+    }
+    if (answer.endpoint !== config.pinnedEndpoint) {
+      throw untrustedPeer("identity probe answer names a different pinned endpoint")
+    }
+    const expected = await hmacSha256Hex(config.serverIdentity, bridgeIdentityMessage(answer, challenge))
+    if (expected == null || !commitmentsEqual(expected, answer.identity_proof)) {
+      throw untrustedPeer("identity probe owner proof mismatch")
+    }
+  } catch (error) {
+    if (error instanceof HttpBridgeError) throw error
+    throw untrustedPeer("identity probe answer is not the closed versioned record")
+  }
+}
+
+function parseBridgeIdentityAnswer(text) {
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch {
+    throw untrustedPeer("identity probe answer is not JSON")
+  }
+  if (!value || Array.isArray(value) || typeof value !== "object") {
+    throw untrustedPeer("identity probe answer is not an object")
+  }
+  const expected = [
+    "bridge_generation",
+    "challenge",
+    "endpoint",
+    "identity_proof",
+    "identity_version",
+    "installation_id",
+    "introduction_digest",
+    "server_identity",
+  ]
+  const keys = Object.getOwnPropertyNames(value).sort()
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw untrustedPeer("identity probe answer carries unknown or missing fields")
+  }
+  if (value.identity_version !== BRIDGE_IDENTITY_VERSION) {
+    throw untrustedPeer("identity probe answer is not a versioned identity record")
+  }
+  if (!BRIDGE_CHALLENGE_PATTERN.test(value.challenge)) {
+    throw untrustedPeer("identity probe answer carries no exact challenge")
+  }
+  if (!LOWER_SHA256_HEX.test(value.identity_proof)) {
+    throw untrustedPeer("identity probe answer carries no owner proof")
+  }
+  if (!LOWER_SHA256_HEX.test(value.introduction_digest)) {
+    throw untrustedPeer("identity probe answer binds no introduction")
+  }
+  if (typeof value.installation_id !== "string" || value.installation_id.length === 0) {
+    throw untrustedPeer("identity probe answer binds no installation")
+  }
+  if (typeof value.endpoint !== "string" || value.endpoint.length === 0) {
+    throw untrustedPeer("identity probe answer binds no pinned endpoint")
+  }
+  if (typeof value.server_identity !== "string" || value.server_identity.length === 0) {
+    throw untrustedPeer("identity probe answer binds no server identity")
+  }
+  if (!Number.isSafeInteger(value.bridge_generation) || value.bridge_generation <= 0) {
+    throw untrustedPeer("identity probe answer binds no bridge generation")
+  }
+  return value
+}
+
 async function postHttpBridge(config, payload) {
+  // The credential is read only after this contact's identity proof verifies.
+  // A transient probe failure is retried by the caller with a fresh challenge;
+  // a proof mismatch never reaches the credential read at all.
+  await proveBridgeIdentity(config)
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), bridgeTimeoutMs())
   try {
