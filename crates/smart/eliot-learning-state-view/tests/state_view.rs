@@ -295,14 +295,25 @@ fn compile_with(
                     field: "projection.slot_id",
                 },
             )?;
-        bound_recipe
+        let reference = bound_recipe
             .source_requirements
             .iter_mut()
             .find(|requirement| requirement.role == spec.source_role)
             .expect("slot source role is declared")
             .expected_reference
             .as_mut()
-            .expect("slot source has an exact reference")
+            .expect("slot source has an exact reference");
+        // One owner record carries one payload digest per declared slot. A slot
+        // delivered twice is a duplicate for the compiler to refuse; it never
+        // becomes a second digest on the same source reference.
+        if reference
+            .slot_projection_digests
+            .iter()
+            .any(|recorded| recorded.slot_id == projection.slot_id)
+        {
+            continue;
+        }
+        reference
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
@@ -578,13 +589,19 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
 
+    // A `Conditional` requirement may only name a slot the recipe itself
+    // declares, so the over-long label is declared as slot 0's own id and named
+    // by slot 1. The recipe is then internally sound and the declared label
+    // ceiling is the one bound left for the compiler to refuse.
+    let oversized_slot = SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
     let mut oversized_dependency = recipe(
-        vec![SlotRequirement::Required],
-        vec![1],
+        vec![SlotRequirement::Required, SlotRequirement::Required],
+        vec![1, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    oversized_dependency.slots[0].requirement = SlotRequirement::Conditional {
-        depends_on: SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?),
+    oversized_dependency.slots[0].slot_id = oversized_slot.clone();
+    oversized_dependency.slots[1].requirement = SlotRequirement::Conditional {
+        depends_on: oversized_slot,
     };
     oversized_dependency.seal()?;
     let oversized_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
@@ -595,7 +612,7 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
             &[artifact("ref")?]
         ),
         Err(eliot_learning_contracts::LearningContractError::Bound {
-            field: "slot.depends_on"
+            field: "slot.slot_id"
         })
     ));
 
@@ -2342,7 +2359,17 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         "env::",
         "Store",
         "Model",
-        "clock",
+        "std::time",
+        // The lowercase `clock` word appears in this file's own prose about a
+        // caller-supplied `generated_at_ms`, so the bare word cannot be banned.
+        // These are the SPECIFIC clock-reading identifiers it stood in for: the
+        // libc entry points and the `CLOCK_*` domain constants they take.
+        "clock_gettime",
+        "clock_getres",
+        "clock_nanosleep",
+        "clock_reading",
+        "CLOCK_MONOTONIC",
+        "CLOCK_REALTIME",
         "Clock",
         "Cell<",
         "RefCell",
@@ -2360,19 +2387,21 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let digest_before = recipe.canonical_digest.clone();
     let first = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
+    // The first compilation binds the supplied slot digest into the recipe; a
+    // second compilation over the same inputs must be a fixed point.
+    let bound_digest = recipe.canonical_digest.clone();
     let second = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
     assert_eq!(first, second);
-    assert_eq!(recipe.canonical_digest, digest_before);
+    assert_eq!(recipe.canonical_digest, bound_digest);
     assert_eq!(supplied.members.len(), 1);
     Ok(())
 }
