@@ -19,6 +19,7 @@ use eliot_installation::{
     provider_bootstrap_credential_target_for_store_target, source_bundle_publication_operation_id,
 };
 use eliot_kernel_service::EliotdLaunchDescriptor;
+use eliot_ors::ManifestResourceLimits;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerifier, DirectoryPublicationOutcome,
     DirectoryPublicationReceipt, FileIdentity, OwnedDirectoryPublication, PackageFileSpec,
@@ -73,6 +74,29 @@ pub const REQUIRED_ROLES: [(&str, bool); 15] = [
 ];
 
 /// Explicit inputs for one immutable source-bundle publication.
+///
+/// Every value that reaches `EliotdLaunchDescriptor` is a coordinate of this
+/// struct, so every coordinate of that descriptor is something a launch-approving
+/// owner approved. The Job Object/resource limits and the health/readiness
+/// contract reference arrive here exactly as the approved `eliotd` restart policy
+/// does: as declared inputs, published unchanged onto the Host-approved,
+/// digest-bound descriptor, inside the bytes `descriptor_sha256` covers. This
+/// composition root derives no limit, no Job Object policy token and no contract
+/// reference from the Kernel executable, the current directory, the environment,
+/// the running process or a default.
+///
+/// An owner that declares NEITHER limits NOR a readiness contract states a real
+/// absence, and the absence stays a stated absence: each field serializes an
+/// explicit `null` and both `null`s are inside `descriptor_sha256`, so neither can
+/// be substituted after approval without changing the digest. The refusal that
+/// absence then produces is the correct fail-closed direction and is owned
+/// elsewhere: the Kernel reads both coordinates off the ACTIVE Host-approved
+/// descriptor and forwards them unchanged through
+/// `KernelComposition::admit_daemon_restart_under_manifest`
+/// (`bins/eliot-kernel/src/daemon_runtime.rs`), and ORS refuses the launch under
+/// `ManifestResourceLimitsUnobserved` or
+/// `ManifestReadinessContractUnobserved`. This materializer therefore keeps the
+/// refusal path intact and never works around it.
 #[derive(Clone, Debug)]
 pub struct CanarySourceBundleMaterializeInput {
     /// Release `eliot-host.exe` path.
@@ -137,6 +161,45 @@ pub struct CanarySourceBundleMaterializeInput {
     /// the fail-closed disposition that withholds automatic restart for the
     /// child, and it is never widened into a default or an unlimited budget.
     pub eliotd_restart_policy: Option<RestartPolicyV1>,
+    /// The exact Job Object and resource limits the launch-approving owner
+    /// declares for the supervised `eliotd` child (I1.9), or `None` when that
+    /// owner declares none.
+    ///
+    /// This is a pass-through carrier of the one `eliot_ors::ManifestResourceLimits`
+    /// value the Generation Registry manifest records for this generation: the
+    /// declared Job Object policy token, the hard process-count ceiling, the hard
+    /// working-set byte ceiling and the CPU rate-control percentage (I1.6). It is
+    /// not a second limits vocabulary — the value the process adapter applies at
+    /// launch is a different, ownerless vocabulary, and nothing here translates
+    /// either one into the other or narrows one to fit the other. This
+    /// materializer declares no limit, ceiling, percentage or token of its own.
+    ///
+    /// The declared value is proved once, by the owner's own
+    /// `ManifestResourceLimits::validate`, when the descriptor is validated below.
+    /// An out-of-range declaration is refused there and nothing is published; it
+    /// is never clamped, rounded or replaced. `None` is preserved exactly onto
+    /// the descriptor and into its digest: an unstated declaration is published as
+    /// an explicit `null`, and the manifest-bound launch gate then refuses the
+    /// launch instead of applying implicit limits.
+    pub eliotd_job_object_limits: Option<ManifestResourceLimits>,
+    /// The exact health/readiness contract reference the launch-approving owner
+    /// declares for the supervised `eliotd` child (I1.9), or `None` when that
+    /// owner declares none.
+    ///
+    /// This is a pass-through carrier only. It is inert text: naming a contract
+    /// grants no readiness, evaluates nothing by itself, and is compared by the
+    /// manifest-bound launch gate against the contract the Generation Registry
+    /// manifest recorded for this generation. This materializer derives no
+    /// reference from the artifact, the config, the executable or a default.
+    ///
+    /// The declared value is proved once, by the descriptor's own non-blank text
+    /// rule, when the descriptor is validated below; a blank or control-bearing
+    /// declaration is refused there and nothing is published. `None` is preserved
+    /// exactly onto the descriptor and into its digest: an unstated declaration is
+    /// published as an explicit `null`, and the manifest-bound launch gate then
+    /// refuses the launch instead of evaluating readiness against an unstated
+    /// contract.
+    pub eliotd_health_readiness_contract_ref: Option<String>,
 }
 
 /// One receipt fact for a published source role.
@@ -948,6 +1011,28 @@ fn build_typed_bundle_with_selection(
         // descriptor digest unchanged and the Kernel withholds automatic
         // restart for it.
         restart_policy: input.eliotd_restart_policy.clone(),
+        // The two remaining I1.9 launch coordinates travel the same approved
+        // path as the restart policy above: the owner's declared value is
+        // published onto the same Host-approved, digest-bound descriptor that
+        // already admits this launch, and `with_computed_digest` below seals it
+        // into `descriptor_sha256`, so neither coordinate can be substituted
+        // after approval without changing the digest. Nothing here invents,
+        // clamps, rounds, derives or defaults either value, and this materializer
+        // does not translate the limits vocabulary into the different vocabulary
+        // the process adapter applies.
+        //
+        // `None` is preserved exactly and is a real owner statement that this
+        // generation declares no such value: each field then serializes an
+        // explicit `null`, and both `null`s are inside the digest. The refusal
+        // that absence produces is the intended fail-closed direction and it is
+        // owned elsewhere: `KernelComposition::admit_daemon_restart_under_manifest`
+        // (`bins/eliot-kernel/src/daemon_runtime.rs`) forwards both absences
+        // unchanged and ORS refuses the launch under
+        // `ManifestResourceLimitsUnobserved` or
+        // `ManifestReadinessContractUnobserved`. The absence is published and the
+        // child is not launched; it is never filled in here.
+        job_object_limits: input.eliotd_job_object_limits.clone(),
+        health_readiness_contract_ref: input.eliotd_health_readiness_contract_ref.clone(),
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()
@@ -2181,6 +2266,8 @@ mod tests {
             transaction_id: handle("transaction:test"),
             staging_root,
             eliotd_restart_policy: None,
+            eliotd_job_object_limits: None,
+            eliotd_health_readiness_contract_ref: None,
         }
     }
 
@@ -2971,5 +3058,168 @@ mod tests {
 
         drop(publication);
         fs::remove_dir_all(temporary).unwrap();
+    }
+
+    /// The one approved limits record shape the launch-approving owner may
+    /// declare (I1.9). Every number here is a fixture value chosen by this
+    /// test, never one the materializer could derive.
+    #[cfg(windows)]
+    fn approved_limits() -> ManifestResourceLimits {
+        ManifestResourceLimits {
+            job_object_policy: "eliot-job-object-v1".to_owned(),
+            max_processes: 64,
+            max_working_set_bytes: 1_073_741_824,
+            cpu_rate_control_percent: 25,
+        }
+    }
+
+    #[cfg(windows)]
+    fn published_eliotd_descriptor(bundle: &Path) -> EliotdLaunchDescriptor {
+        let bytes = fs::read(bundle.join("eliotd.json")).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approved_launch_coordinates_are_published_inside_the_descriptor_digest() {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let mut input = test_input(&source_parent, &anchor, &staging);
+        input.eliotd_job_object_limits = Some(approved_limits());
+        input.eliotd_health_readiness_contract_ref = Some("eliotd-readiness-v1".to_owned());
+        let CanarySourceBundleMaterializeOutcome::Published(receipt) =
+            materialize_with_executables(&input, &fake_executables(), false).unwrap()
+        else {
+            panic!("exact materializer publication unexpectedly requires reconciliation");
+        };
+
+        let descriptor = published_eliotd_descriptor(Path::new(&receipt.bundle_path));
+        assert_eq!(
+            descriptor.job_object_limits,
+            Some(approved_limits()),
+            "the approved Job Object and resource limits must reach the descriptor unchanged"
+        );
+        assert_eq!(
+            descriptor.health_readiness_contract_ref.as_deref(),
+            Some("eliotd-readiness-v1"),
+            "the approved readiness contract reference must reach the descriptor unchanged"
+        );
+        descriptor.validate().unwrap();
+        assert_eq!(
+            descriptor.compute_digest().unwrap(),
+            descriptor.descriptor_sha256,
+            "both approved coordinates must be inside the bytes the descriptor digest covers"
+        );
+
+        // Substitution after approval must move the digest, for each coordinate
+        // independently: neither is a value a later writer can replace.
+        let mut substituted_limits = descriptor.clone();
+        substituted_limits.job_object_limits = None;
+        assert_ne!(
+            substituted_limits.compute_digest().unwrap(),
+            descriptor.descriptor_sha256,
+            "dropping the approved limits must change the descriptor digest"
+        );
+        let mut substituted_contract = descriptor.clone();
+        substituted_contract.health_readiness_contract_ref = Some("other-contract".to_owned());
+        assert_ne!(
+            substituted_contract.compute_digest().unwrap(),
+            descriptor.descriptor_sha256,
+            "substituting the readiness contract must change the descriptor digest"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absent_or_invalid_launch_coordinates_are_never_defaulted() {
+        // An owner that declares neither coordinate publishes both absences
+        // explicitly; nothing is invented to fill them.
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let input = test_input(&source_parent, &anchor, &staging);
+        assert!(input.eliotd_job_object_limits.is_none());
+        assert!(input.eliotd_health_readiness_contract_ref.is_none());
+        let CanarySourceBundleMaterializeOutcome::Published(receipt) =
+            materialize_with_executables(&input, &fake_executables(), false).unwrap()
+        else {
+            panic!("exact materializer publication unexpectedly requires reconciliation");
+        };
+        let descriptor = published_eliotd_descriptor(Path::new(&receipt.bundle_path));
+        assert!(
+            descriptor.job_object_limits.is_none(),
+            "an unstated limits coordinate must stay unstated, never become a default"
+        );
+        assert!(
+            descriptor.health_readiness_contract_ref.is_none(),
+            "an unstated readiness contract must stay unstated, never become a default"
+        );
+        descriptor.validate().unwrap();
+        let wire = String::from_utf8(
+            fs::read(PathBuf::from(&receipt.bundle_path).join("eliotd.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            wire.contains("\"job_object_limits\":null")
+                && wire.contains("\"health_readiness_contract_ref\":null"),
+            "both stated absences must be visible in the published wire bytes"
+        );
+
+        // An owner that declares an inadmissible value is refused before
+        // anything is published, by the owner's own validator, and is never
+        // clamped or replaced.
+        for invalid in [
+            ManifestResourceLimits {
+                job_object_policy: "   ".to_owned(),
+                ..approved_limits()
+            },
+            ManifestResourceLimits {
+                max_processes: 0,
+                ..approved_limits()
+            },
+            ManifestResourceLimits {
+                max_working_set_bytes: 0,
+                ..approved_limits()
+            },
+            ManifestResourceLimits {
+                cpu_rate_control_percent: 0,
+                ..approved_limits()
+            },
+            ManifestResourceLimits {
+                cpu_rate_control_percent: 101,
+                ..approved_limits()
+            },
+        ] {
+            assert_refused(&invalid, None, "eliotd.job_object_limits");
+        }
+        assert_refused(
+            &approved_limits(),
+            Some("  ".to_owned()),
+            "eliotd.health_readiness_contract_ref",
+        );
+    }
+
+    /// Materializes an input carrying `limits` and `contract`, and proves the
+    /// descriptor owner refused it under `field` and published nothing.
+    #[cfg(windows)]
+    fn assert_refused(limits: &ManifestResourceLimits, contract: Option<String>, field: &str) {
+        let source_parent = TempDir::new().unwrap();
+        let anchor = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        let mut input = test_input(&source_parent, &anchor, &staging);
+        input.eliotd_job_object_limits = Some(limits.clone());
+        input.eliotd_health_readiness_contract_ref = contract;
+        let error = materialize_with_executables(&input, &fake_executables(), false)
+            .expect_err("an inadmissible launch coordinate must be refused")
+            .to_string();
+        assert!(
+            error.contains(field),
+            "the refusal must name {field}, got {error}"
+        );
+        assert!(
+            !input.output_bundle.exists(),
+            "a refused descriptor must publish nothing"
+        );
     }
 }

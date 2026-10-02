@@ -46,7 +46,32 @@ struct GatewayTestState {
     fail_context: bool,
     abort_not_released: bool,
     abort_calls: usize,
+    /// #1884 AUD4: the new-operation authority this fixture's own data states.
+    /// Empty by default, because this fixture has no recorded
+    /// `KernelExecutionManifest` and no ORS effect operation lease.
+    new_effect_authority: BTreeSet<GatewayTestEffectAuthority>,
+    /// #1885 (I1.9, W2): the effect-replay authority this fixture's own data
+    /// states. Empty by default, for the same reason: the effect operation
+    /// lease an effect-capable replay needs is an ORS-owned durable record this
+    /// fixture does not have.
+    effect_replay_authority: BTreeSet<GatewayTestEffectAuthority>,
     pause_executor: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// One admitted operation authority, stated exactly as a test records it.
+///
+/// These are the coordinates the production seam compares: the authenticated
+/// owner identity (module id and generation) plus this operation's own
+/// identity, and the effect receipt the production lease records — the
+/// admission digest `run_process_start` computes over the admitted request.
+/// A grant is a recorded row and never a flag, so a foreign, substituted or
+/// empty input cannot be admitted by a row some other test case recorded.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GatewayTestEffectAuthority {
+    module_id: String,
+    generation: u64,
+    operation_id: OperationId,
+    admission_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +103,23 @@ impl Drop for GatewayTestGuard {
             }
             let _ = state.context_count_tx.send(state.retained_contexts.len());
         }
+    }
+}
+
+/// The one admitted operation authority a test records for its own scenario.
+///
+/// The coordinates are exactly the ones the production seam binds: the
+/// authenticated owner identity, this operation's identity, and the admission
+/// digest the production lease records as its effect receipt.
+fn gateway_test_authority(
+    owner: &ProcessOwnerBinding,
+    admission: &ProcessExecutionAdmissionRequest,
+) -> GatewayTestEffectAuthority {
+    GatewayTestEffectAuthority {
+        module_id: owner.module_id().to_owned(),
+        generation: owner.generation().get(),
+        operation_id: admission.intent().operation_id().clone(),
+        admission_digest: process_admission_digest(admission).expect("admission digest"),
     }
 }
 
@@ -117,6 +159,8 @@ impl GatewayTestPorts {
                 fail_context: false,
                 abort_not_released: false,
                 abort_calls: 0,
+                new_effect_authority: BTreeSet::new(),
+                effect_replay_authority: BTreeSet::new(),
                 pause_executor: None,
             })),
         }
@@ -152,6 +196,46 @@ impl GatewayTestPorts {
 
     fn allow_abort(&self) {
         self.state.lock().expect("test state").abort_not_released = false;
+    }
+
+    /// Records the admitted authority for exactly this one new operation
+    /// (#1884 AUD4).
+    ///
+    /// The gate refuses by default, so a scenario that needs the granted path
+    /// states here the owner identity and the admitted request whose digest
+    /// the production lease would record as its effect receipt. Nothing else
+    /// admits a new operation: a different operation, a different owner
+    /// identity, or a substituted digest is refused by the comparison in
+    /// `require_new_effect_operation_authority`.
+    fn admit_new_effect_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) {
+        self.state
+            .lock()
+            .expect("test state")
+            .new_effect_authority
+            .insert(gateway_test_authority(owner, admission));
+    }
+
+    /// Records the admitted authority for exactly this one replayed operation
+    /// (#1885; I1.9, W2).
+    ///
+    /// The `Existing(record)` arm reaches `require_effect_replay_authority`,
+    /// which refuses by default for the same reason. A scenario that needs the
+    /// granted resume states the exact owner identity and operation it is
+    /// resuming; a different operation identity is refused.
+    fn admit_effect_replay_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        admission: &ProcessExecutionAdmissionRequest,
+    ) {
+        self.state
+            .lock()
+            .expect("test state")
+            .effect_replay_authority
+            .insert(gateway_test_authority(owner, admission));
     }
 
     fn counts(&self) -> (usize, usize, usize, usize, usize) {
@@ -228,17 +312,88 @@ impl ProcessStartPorts for GatewayTestPorts {
         Ok(ProcessExecutionReplayBegin::Acquired)
     }
 
+    /// #1885 (I1.9, W2): the effect operation lease an effect-capable replay
+    /// needs is an ORS-owned durable record, and this fixture has none, so the
+    /// recorded default is a TYPED REFUSAL: nothing in this double can resume
+    /// an operation no test stated. Only
+    /// [`GatewayTestPorts::admit_effect_replay_authority`] records one, and it
+    /// records the exact owner identity, operation identity and admission
+    /// digest the production store resolves the lease by — so a foreign,
+    /// substituted or empty input is still refused.
     fn require_effect_replay_authority(
         &self,
-        _owner: &ProcessOwnerBinding,
-        _operation_id: &OperationId,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
         _context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
-        // The effect operation lease is an ORS-owned durable record; this
-        // fixture has no ORS store, so it admits every replay it is asked
-        // about. Adding the trait method keeps the existing process-execution
-        // scenarios exercising the pipeline itself.
-        Ok(())
+        let admitted = self
+            .state
+            .lock()
+            .map_err(|_| ProcessExecutionError::Unavailable("test state".to_owned()))?
+            .effect_replay_authority
+            .iter()
+            .any(|recorded| {
+                recorded.module_id == owner.module_id()
+                    && recorded.generation == owner.generation().get()
+                    && recorded.operation_id == *operation_id
+            });
+        if admitted {
+            return Ok(());
+        }
+        // The refusal is typed and it says why: this test recorded no admitted
+        // replay authority for the operation it asked about. No lease, no
+        // receipt and no permit is invented here, and the denied replay is
+        // never reported as an admitted or shadow one.
+        Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::InvalidValue {
+                field: "test_scripted_effect_replay_authority",
+                reason: "this test recorded no admitted replay authority for this operation",
+            },
+        ))
+    }
+
+    /// #1884 AUD4: the recorded `KernelExecutionManifest` and the effect
+    /// operation lease an effect-capable generation needs are ORS-owned durable
+    /// records, and this fixture has neither, so the recorded default is a
+    /// TYPED REFUSAL. Only
+    /// [`GatewayTestPorts::admit_new_effect_authority`] admits one, and it
+    /// admits exactly the owner identity, operation identity and admission
+    /// digest the test recorded — the same coordinates the production lease
+    /// binds — so a foreign, substituted or empty input is refused here too
+    /// rather than admitted by a flag.
+    fn require_new_effect_operation_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &OperationId,
+        admission_digest: &str,
+        _deadline_unix_ms: u64,
+        _context: &tracing::Span,
+    ) -> Result<(), ProcessExecutionError> {
+        let admitted = self
+            .state
+            .lock()
+            .map_err(|_| ProcessExecutionError::Unavailable("test state".to_owned()))?
+            .new_effect_authority
+            .iter()
+            .any(|recorded| {
+                recorded.module_id == owner.module_id()
+                    && recorded.generation == owner.generation().get()
+                    && recorded.operation_id == *operation_id
+                    && recorded.admission_digest == admission_digest
+            });
+        if admitted {
+            return Ok(());
+        }
+        // The refusal is typed and it says why: this test recorded no admitted
+        // new-operation authority for the operation, owner identity and effect
+        // receipt it asked about. No permit, lease or generation is invented
+        // here, and no admission is reported as an unavailable or shadow one.
+        Err(ProcessExecutionError::Contract(
+            eliot_process::ContractError::InvalidValue {
+                field: "test_scripted_new_effect_operation_authority",
+                reason: "this test recorded no admitted new-effect authority for this operation",
+            },
+        ))
     }
 
     async fn completed_receipt(
@@ -463,6 +618,7 @@ async fn actual_process_start_orchestration_proves_canonical_ordering() {
     let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
     let owner = gateway_test_owner();
     let admission = gateway_test_admission("gateway-positive");
+    ports.admit_new_effect_authority(&owner, &admission);
     let receipt = run_process_start(
         &ports,
         &owner,
@@ -521,10 +677,20 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
 
     let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
     let owner = gateway_test_owner();
+    // The scenario states both authorities it exercises: the new-operation
+    // authority for each first start, and the exact replay authority for the
+    // one same-identity resume the `Existing(record)` arm takes. The resumed
+    // attempt still fails below because the recorded `Completed` state has no
+    // fresh live executor evidence, which is the property this test is about.
+    let old_admission = gateway_test_admission(old_operation.as_str());
+    let restarted_admission = gateway_test_admission(restarted_operation.as_str());
+    ports.admit_new_effect_authority(&owner, &old_admission);
+    ports.admit_new_effect_authority(&owner, &restarted_admission);
+    ports.admit_effect_replay_authority(&owner, &old_admission);
     run_process_start(
         &ports,
         &owner,
-        gateway_test_admission(old_operation.as_str()),
+        old_admission.clone(),
         (),
         None,
         &tracing::Span::none(),
@@ -536,7 +702,7 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
         run_process_start(
             &ports,
             &owner,
-            gateway_test_admission(old_operation.as_str()),
+            old_admission,
             (),
             None,
             &tracing::Span::none(),
@@ -550,7 +716,7 @@ async fn stale_completed_restart_never_replays_and_new_attempt_starts_fresh() {
     run_process_start(
         &ports,
         &owner,
-        gateway_test_admission(restarted_operation.as_str()),
+        restarted_admission,
         (),
         None,
         &tracing::Span::none(),
@@ -587,6 +753,9 @@ async fn actual_process_start_orchestration_fails_closed_and_releases_reserved()
         let ports = GatewayTestPorts::new(snapshot);
         let owner = gateway_test_owner();
         let admission = gateway_test_admission(&format!("gateway-{name}"));
+        // This scenario is about the fail-closed snapshot, not the new-operation
+        // gate, so it states the one authority the `Acquired` arm needs.
+        ports.admit_new_effect_authority(&owner, &admission);
         assert!(
             run_process_start(
                 &ports,
@@ -622,6 +791,9 @@ async fn actual_process_start_context_failure_explicitly_aborts_and_maps_abort_f
     ports.fail_abort();
     let owner = gateway_test_owner();
     let admission = gateway_test_admission("gateway-context-failure");
+    // Both starts in this scenario are first starts of the same operation, so
+    // the one recorded authority covers the `Acquired` arm each time.
+    ports.admit_new_effect_authority(&owner, &admission);
     assert!(matches!(
         run_process_start(
             &ports,
@@ -679,13 +851,19 @@ async fn actual_process_start_context_failure_explicitly_aborts_and_maps_abort_f
 async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicate_ops() {
     let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
     let owner = gateway_test_owner();
+    // Two distinct first starts, so two distinct recorded authorities: the
+    // concurrent second one is not covered by the first one's row.
+    let concurrent_a = gateway_test_admission("gateway-concurrent-a");
+    let concurrent_b = gateway_test_admission("gateway-concurrent-b");
+    ports.admit_new_effect_authority(&owner, &concurrent_a);
+    ports.admit_new_effect_authority(&owner, &concurrent_b);
     let first_ports = ports.clone();
     let first_owner = owner.clone();
     let first = tokio::spawn(async move {
         run_process_start(
             &first_ports,
             &first_owner,
-            gateway_test_admission("gateway-concurrent-a"),
+            concurrent_a,
             (),
             None,
             &tracing::Span::none(),
@@ -699,7 +877,7 @@ async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicat
         run_process_start(
             &second_ports,
             &second_owner,
-            gateway_test_admission("gateway-concurrent-b"),
+            concurrent_b,
             (),
             None,
             &tracing::Span::none(),
@@ -716,6 +894,12 @@ async fn actual_process_start_orchestration_isolated_for_concurrent_and_duplicat
     let pause = Arc::new(tokio::sync::Notify::new());
     paused.pause_executor(Arc::clone(&pause));
     let duplicate_admission = gateway_test_admission("gateway-duplicate");
+    // The duplicate below is a same-identity RESUME, so the `Existing(record)`
+    // arm is the one it reaches; this scenario states that exact replay
+    // authority as well as the first start's own. The duplicate still fails,
+    // because the reserved record carries no outcome yet.
+    paused.admit_new_effect_authority(&owner, &duplicate_admission);
+    paused.admit_effect_replay_authority(&owner, &duplicate_admission);
     let first_admission = duplicate_admission.clone();
     let duplicate_ports = paused.clone();
     let duplicate_owner = owner.clone();
@@ -759,12 +943,14 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
     ports.pause_executor(Arc::clone(&pause));
     let task_ports = ports.clone();
     let owner = gateway_test_owner();
+    let cancelled_admission = gateway_test_admission("gateway-cancelled");
+    ports.admit_new_effect_authority(&owner, &cancelled_admission);
     let task_owner = owner.clone();
     let task = tokio::spawn(async move {
         run_process_start(
             &task_ports,
             &task_owner,
-            gateway_test_admission("gateway-cancelled"),
+            cancelled_admission,
             (),
             None,
             &tracing::Span::none(),
@@ -779,12 +965,16 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
     assert_eq!(ports.retained(), (0, 0));
     assert!(ports.state.lock().expect("test state").replay.is_empty());
 
+    // A fresh double has no recorded authority of its own, so this retry states
+    // the one it is about to exercise rather than inheriting a grant.
     let retry = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let retry_admission = gateway_test_admission("gateway-cancelled");
+    retry.admit_new_effect_authority(&owner, &retry_admission);
     assert!(
         run_process_start(
             &retry,
             &owner,
-            gateway_test_admission("gateway-cancelled"),
+            retry_admission,
             (),
             None,
             &tracing::Span::none(),
@@ -794,4 +984,118 @@ async fn actual_process_start_orchestration_abort_cleans_exact_context_path_and_
         .is_ok()
     );
     assert_eq!(retry.counts(), (1, 1, 1, 1, 1));
+}
+
+/// The recorded default of both #1884 AUD4 gates is a TYPED REFUSAL, not a
+/// grant: a test that exercises the double without scripting the admitted
+/// authority is refused before the snapshot, the context, the issued request
+/// and the executor handoff that follow the `Acquired` arm's gate, and it is
+/// refused with the recorded reason rather than an invented permit.
+#[tokio::test]
+async fn an_unscripted_new_effect_operation_is_refused_and_releases_its_reservation() {
+    let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let owner = gateway_test_owner();
+    let admission = gateway_test_admission("gateway-unscripted-authority");
+    // No `admit_new_effect_authority` call: this scenario exists to show the
+    // default is a refusal.
+    let error = run_process_start(
+        &ports,
+        &owner,
+        admission,
+        (),
+        None,
+        &tracing::Span::none(),
+        &mut false,
+    )
+    .await
+    .expect_err("an unscripted new operation must not be admitted");
+    assert!(matches!(
+        error,
+        ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
+            field: "test_scripted_new_effect_operation_authority",
+            reason: "this test recorded no admitted new-effect authority for this operation",
+        })
+    ));
+    // The gate refused before the rest of the `Acquired` arm ran, and the
+    // reservation it had taken was released, so nothing is left reserved.
+    assert_eq!(ports.counts(), (0, 0, 0, 0, 0));
+    assert_eq!(ports.retained(), (0, 0));
+    assert_eq!(ports.abort_calls(), 1);
+    assert!(ports.state.lock().expect("test state").replay.is_empty());
+}
+
+/// The granted path is bound to the exact identity the production seam
+/// compares, so an authority recorded for one operation does not admit a
+/// foreign operation, a substituted owner identity or a substituted digest.
+#[tokio::test]
+async fn a_recorded_authority_admits_only_its_own_exact_operation_owner_and_digest() {
+    let ports = GatewayTestPorts::new(Ok(gateway_test_snapshot()));
+    let owner = gateway_test_owner();
+    let recorded = gateway_test_admission("gateway-recorded-authority");
+    let foreign = gateway_test_admission("gateway-foreign-authority");
+    ports.admit_new_effect_authority(&owner, &recorded);
+    let recorded_digest = process_admission_digest(&recorded).expect("recorded digest");
+    let foreign_digest = process_admission_digest(&foreign).expect("foreign digest");
+    let substituted_owner = ProcessOwnerBinding::new(
+        "eliotd",
+        "a".repeat(64),
+        test_epoch(1),
+        Generation::new(2).expect("generation"),
+    )
+    .expect("substituted owner");
+
+    for (name, owner, operation, digest) in [
+        (
+            "foreign operation",
+            &owner,
+            foreign.intent().operation_id(),
+            foreign_digest.as_str(),
+        ),
+        (
+            "substituted owner generation",
+            &substituted_owner,
+            recorded.intent().operation_id(),
+            recorded_digest.as_str(),
+        ),
+        (
+            "substituted admission digest",
+            &owner,
+            recorded.intent().operation_id(),
+            foreign_digest.as_str(),
+        ),
+    ] {
+        assert!(
+            ports
+                .require_new_effect_operation_authority(
+                    owner,
+                    operation,
+                    digest,
+                    foreign.deadline_unix_ms(),
+                    &tracing::Span::none(),
+                )
+                .is_err(),
+            "{name} must not be admitted by another operation's recorded authority"
+        );
+    }
+    // The recorded row still admits exactly the identity it names.
+    ports
+        .require_new_effect_operation_authority(
+            &owner,
+            recorded.intent().operation_id(),
+            &recorded_digest,
+            recorded.deadline_unix_ms(),
+            &tracing::Span::none(),
+        )
+        .expect("the recorded exact identity is admitted");
+    // The replay gate is bound the same way and has no grant of its own.
+    assert!(
+        ports
+            .require_effect_replay_authority(
+                &owner,
+                recorded.intent().operation_id(),
+                &tracing::Span::none(),
+            )
+            .is_err(),
+        "a new-operation authority must not admit a replay"
+    );
 }

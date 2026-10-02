@@ -1736,25 +1736,11 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelService
     Ok(())
 }
 
-/// Projects one ORS refusal onto the existing [`KernelServiceError`] variants
-/// without collapsing its class into a string.
+/// Carries one foundation contract refusal across as the Kernel's own recovery
+/// state, keeping its typed [`OrsError::StoreContract`] cause intact.
 ///
-/// Every current [`OrsError`] class is classified. A class that asserts the
-/// presented ORS state does not match the required authority, fence, epoch,
-/// owner or durable head becomes [`KernelServiceError::HandshakeMismatch`] with
-/// a `field` naming that exact class, so it stays distinguishable from a field
-/// rejection, a transition refusal and an unavailability. The remaining
-/// bounded-field, bound, conflict and lifecycle classes become
-/// [`KernelServiceError::InvalidField`] with a `field` naming that exact class;
-/// [`OrsError::InvalidField`], which already carries both values, maps across
-/// with both `&'static str` values verbatim. Only the classes that are strings
-/// in the source type — a foundation contract text, a
-/// storage/encoding/staging text, canonical-evidence text, a migration reason
-/// and an integrity reason — reach [`KernelServiceError::Platform`], because
-/// there is nothing typed left to preserve in them.
-///
-/// The match is exhaustive by construction: a new ORS class is a compile error
-/// here rather than a silently stringified refusal.
+/// This helper projects exactly one class and does no classification: the caller
+/// is [`ors_refusal`], whose doc states how every class is classified.
 fn store_contract_refusal(source: &eliot_store_api::StoreError) -> KernelServiceError {
     KernelServiceError::Core(eliot_kernel_core::KernelError::RecoveryState(
         OrsError::StoreContract(Box::new(source.clone())),
@@ -1767,11 +1753,26 @@ fn legacy_host_refusal() -> KernelServiceError {
 
 /// One identity-ticket refusal of ORS projected onto this crate's bounded field.
 ///
-/// Every variant here is a durable identity conflict over one admitted ticket —
-/// a campaign learning state view, a campaign source publication, an activation
-/// result ticket, an activation lifecycle ticket (identity, expiry or state) or a
-/// native worker claim. Each keeps its own bounded field so a caller can still
-/// tell the causes apart.
+/// Every variant named here is a durable identity conflict over one admitted
+/// ticket — a campaign learning state view, a campaign source publication, an
+/// activation result ticket, an activation lifecycle ticket (identity, expiry or
+/// state) or a native worker claim. Each keeps its own bounded field so a caller
+/// can still tell the causes apart.
+///
+/// Any OTHER class that reaches this helper reads as its own text, exactly as
+/// the free-form classes above are projected: a future ORS identity class routed
+/// here has to be named by an explicit arm above, or it reads as itself instead
+/// of silently claiming the native-worker-claim cause. That matters because the
+/// name would otherwise be a false durable-identity claim about the wrong
+/// subsystem. The native-worker-claim arm is explicit for the same reason even
+/// though its own seam never needs it: `OrsError::NativeWorkerClaimIdentityConflict`
+/// is intercepted before ORS-error mapping on its own seam in
+/// `stage_and_finish_native_worker_claim_admission`
+/// (`crates/kernel/eliot-kernel-service/src/lifecycle.rs:1916` and `:1974`, both
+/// turning it into an `Ok` conflict response and never an `Err`), so the wildcard
+/// is only a secondary route; and `git grep -n '"native_worker_claim_identity"'`
+/// returns exactly one hit, the literal itself, so no test or golden string
+/// asserts it.
 fn identity_ticket_refusal(error: &OrsError) -> KernelServiceError {
     let field = match error {
         OrsError::CampaignLearningStateViewConflict { .. } => "campaign_learning_state_view",
@@ -1780,7 +1781,8 @@ fn identity_ticket_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::ActivationLifecycleIdentityConflict { .. } => "activation_lifecycle_ticket",
         OrsError::ActivationLifecycleExpired { .. } => "activation_lifecycle_ticket_expired",
         OrsError::ActivationLifecycleStateConflict { .. } => "activation_lifecycle_ticket_state",
-        _ => "native_worker_claim_identity",
+        OrsError::NativeWorkerClaimIdentityConflict { .. } => "native_worker_claim_identity",
+        _ => return KernelServiceError::Platform(error.to_string()),
     };
     invalid_field(field)
 }
@@ -1813,6 +1815,25 @@ fn ors_lease_refusal(error: &OrsError) -> KernelServiceError {
     }
 }
 
+/// Projects one ORS refusal onto the existing [`KernelServiceError`] variants
+/// without collapsing its class into a string.
+///
+/// Every current [`OrsError`] class is classified here or delegated to a named
+/// helper arm. A class that asserts the presented ORS state does not match the
+/// required authority, fence, epoch, owner or durable head becomes
+/// [`KernelServiceError::HandshakeMismatch`] with a `field` naming that exact
+/// class, so it stays distinguishable from a field rejection, a transition
+/// refusal and an unavailability. The remaining bounded-field, bound, conflict
+/// and lifecycle classes become [`KernelServiceError::InvalidField`] with a
+/// `field` naming that exact class; [`OrsError::InvalidField`], which already
+/// carries both values, maps across with both `&'static str` values verbatim.
+/// Only the classes that are strings in the source type — a foundation contract
+/// text, a storage/encoding/staging text, canonical-evidence text, a migration
+/// reason and an integrity reason — reach [`KernelServiceError::Platform`]
+/// directly, because there is nothing typed left to preserve in them.
+///
+/// The match is exhaustive by construction: a new ORS class is a compile error
+/// here rather than a silently stringified refusal.
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
     match error {
         OrsError::StoreContract(source) => store_contract_refusal(source),

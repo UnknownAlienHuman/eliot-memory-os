@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission_receipt;
 mod admission_reservation;
 mod admission_reservation_release;
 mod admission_reservation_stage;
@@ -14,8 +15,10 @@ mod backup_snapshot;
 mod control_reserve;
 mod cutover_ownership;
 mod doctor;
+mod effect_current_state;
 mod effect_operation_lease;
 mod execution_manifest;
+mod generation_lifecycle;
 mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
@@ -33,6 +36,7 @@ mod versioned_artifact;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
+pub use admission_receipt::{GOVERNOR_ADMISSION_RECEIPT_SCHEMA_VERSION, GovernorAdmissionReceipt};
 pub use admission_reservation::{
     ActiveAdmissionReservation, AdmissionReservationActivatedOutcome,
     AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
@@ -82,12 +86,14 @@ pub use cutover_ownership::{
     OldDaemonProposalFence, OperationContinuationPermit, StateMigrationDecision,
 };
 pub use doctor::*;
+pub use effect_current_state::{
+    EFFECT_CURRENT_STATE_SCHEMA_VERSION, EffectDeliveryRecord, RevocationEventRecord,
+};
 pub use effect_operation_lease::{
     ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
     EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
-    EffectOperationLeaseGenerationDisposition, EffectOperationLeaseReplayQuery,
-    EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics,
-    authorize_effect_operation_lease_replay, authorize_effect_replay,
+    EffectOperationLeaseReplayQuery, EffectReplayDecision, EffectReplayRequest,
+    ShadowEffectDiagnostics, authorize_effect_operation_lease_replay, authorize_effect_replay,
     deny_effect_replay_without_manifest, deny_unleased_effect_replay,
 };
 pub use execution_manifest::{
@@ -101,6 +107,10 @@ pub use execution_manifest::{
     LifecycleAdmissionDisposition, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_exact_effect_replay, verify_kernel_execution_restart,
+};
+pub use generation_lifecycle::{
+    GENERATION_LIFECYCLE_SCHEMA_VERSION, GenerationDisposition, GenerationLifecycleRecord,
+    ObservedGenerationLifecycle,
 };
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
