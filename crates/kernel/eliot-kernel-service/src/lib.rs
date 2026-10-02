@@ -228,7 +228,7 @@ pub use storage_replacement::{
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreBackupClientError, StoreClientError,
-    StoreClientFault, StoreClientFaultHarness,
+    StoreClientFault, StoreClientFaultHarness, kernel_store_api_contract_set_digest,
 };
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;

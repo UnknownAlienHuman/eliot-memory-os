@@ -182,7 +182,9 @@ impl ClaudeSidecarBridgeDeclaration {
                 field: "state_fence",
                 detail: "declaration state fence is not a valid authority fence",
             })?;
-        self.contract.validate().map_err(BridgeContractError::Contract)?;
+        self.contract
+            .validate()
+            .map_err(BridgeContractError::Contract)?;
         if self.contract.bridge_id.as_str() != self.adapter_id.as_str() {
             return Err(BridgeContractError::InvalidDeclaration {
                 field: "contract.bridge_id",

@@ -55,12 +55,39 @@
 //!   `artifact_hash` and `module_generation` against
 //!   `ServerHandshakePolicy.module_generation`, the registry-selected
 //!   generation the server owner holds.
+//!
+//! # Who owns each field a producer must supply
+//!
+//! These owners are PUBLIC exports, so they are not a secrecy boundary and must
+//! not be described as one: `bins/eliotd` already depends on this crate, so any
+//! producer in another binary can build an envelope that presents exactly these
+//! values. What the exports remove is DRIFT — a producer cannot restate a value
+//! and present one this build does not produce — not the possibility of building
+//! an envelope at all. A peer whose build differs disagrees at the comparison,
+//! which is where it is detected. The field VALUES a producer needs are owned
+//! here and exported:
+//!
+//! - `protocol range` -> [`handshake_protocol_range`];
+//! - `canonical format range` -> [`handshake_canonical_format_range`];
+//! - `contract-set digest` -> [`contract_set_digest`];
+//! - `state migration class` -> **no owner exists**, and none was invented;
+//!   read [`StateMigrationClass`] for why I1.12 defines no vocabulary this
+//!   crate could derive one from.
+//!
+//! The remaining fields are not owned here because their owners are already
+//! reachable from outside the Kernel binary: the Architecture source digest is
+//! `CURRENT_ARCHITECTURE_SOURCE_DIGEST`, the receipt tag is
+//! [`expected_seal_tag`], the envelope revision is
+//! [`HANDSHAKE_ENVELOPE_VERSION`], and the generation and Authority Epoch come
+//! from the registry and the epoch lineage rather than from this crate.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU64;
 
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, sha256_hex};
+use eliot_contracts::{
+    ContractIdentity, EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +95,30 @@ use crate::error::{KernelError, validate_id};
 
 /// Versioned envelope wire revision for the I1.12 handshake.
 pub const HANDSHAKE_ENVELOPE_VERSION: u32 = 1;
+
+/// The I1.12 protocol revision this build speaks.
+///
+/// Private on purpose. The I1.12 field is the RANGE, and
+/// [`handshake_protocol_range`] is its single owner; publishing the bare
+/// revision would invite a second spelling of the field at each producer,
+/// which is the self-comparison this module exists to prevent. Value unchanged
+/// from the single definition this replaced.
+const HANDSHAKE_PROTOCOL_REVISION: u32 = 1;
+
+/// The I1.12 canonical format revision this build speaks.
+///
+/// Private on the same terms as [`HANDSHAKE_PROTOCOL_REVISION`]:
+/// [`handshake_canonical_format_range`] is the field's single owner.
+const HANDSHAKE_CANONICAL_FORMAT_REVISION: u32 = 1;
+
+/// The number of public contract identities the I1.12 `contract_set_digest`
+/// covers.
+///
+/// A digest over an ordered tuple is only comparable across two sides if both
+/// sides contribute the same identities in the same order, so the arity is part
+/// of the field's shape and belongs to [`contract_set_digest`] rather than to
+/// each producer. Four is the count the single previous definition used.
+const CONTRACT_SET_IDENTITY_COUNT: usize = 4;
 
 /// The domain tag this crate separates the normative-pair tag with.
 ///
@@ -240,7 +291,85 @@ impl VersionRange {
     }
 }
 
+/// Returns the I1.12 `protocol range` a current producer presents.
+///
+/// This function is the field's only owner, here in the crate that owns the
+/// envelope: a producer in any binary calls it instead of restating the range,
+/// so the envelope side and the durable side cannot come to disagree about a
+/// value one of them invented. The value is the single revision this build
+/// already spoke, carried unchanged.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] if the owned revision cannot form a
+/// valid range, which the current constant cannot.
+pub fn handshake_protocol_range() -> Result<VersionRange, KernelError> {
+    VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
+}
+
+/// Returns the I1.12 `canonical format range` a current producer presents.
+///
+/// Owned on the same terms as [`handshake_protocol_range`]: one definition, in
+/// the envelope's owner crate, that every producer reads rather than restates.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] if the owned revision cannot form a
+/// valid range, which the current constant cannot.
+pub fn handshake_canonical_format_range() -> Result<VersionRange, KernelError> {
+    VersionRange::new(
+        HANDSHAKE_CANONICAL_FORMAT_REVISION,
+        HANDSHAKE_CANONICAL_FORMAT_REVISION,
+    )
+}
+
+/// Derives the I1.12 `contract-set digest` from the ordered contract identities.
+///
+/// The digest is SHA-256 over the canonical JSON encoding of the four public
+/// contract identities in wire order — `eliot-contracts`,
+/// `eliot-kernel-service`, `eliot-protocol`, `eliot-runtime-contracts` — and
+/// never over an artifact or configuration hash, so a matching digest states
+/// that the same public surfaces were admitted on both sides of the carrier.
+///
+/// The derivation lives here, in the envelope's owner crate, so a producer in
+/// another binary derives the digest exactly as this crate's own producers do
+/// instead of holding a private second spelling. Each owner crate still
+/// supplies its own identity; what is owned here is the order, the arity and
+/// the hashing, which are the parts two sides must agree on byte for byte.
+///
+/// # Errors
+///
+/// Returns [`KernelError::InvalidField`] when the identities have no canonical
+/// encoding.
+pub fn contract_set_digest(
+    identities: &[ContractIdentity; CONTRACT_SET_IDENTITY_COUNT],
+) -> Result<String, KernelError> {
+    let bytes = canonical_json_bytes(identities).map_err(|_| KernelError::InvalidField {
+        field: "contract_set_digest",
+        reason: "contract identities have no canonical encoding",
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// The durable state migration class carried by a handshake.
+///
+/// # I1.12 names this field but defines no vocabulary for it
+///
+/// I1.12 lists "state migration class" among the fields every process handshake
+/// exchanges and nothing more: it does not enumerate classes, does not say what
+/// a class MEANS relative to a durable format, and does not name any owner that
+/// derives one. The four variants below are therefore this crate's closed
+/// implementation vocabulary, not a projection of a normative list, and no
+/// mapping from any other spelling exists or is invented here.
+///
+/// The consequence is bounded and stated rather than papered over: because I1.12
+/// defines no vocabulary, there is no I1.12-derived value this crate can own and
+/// export for a producer to present, so this field has no owner export at all.
+/// A producer that supplies a migration class supplies one of these variants as
+/// its own declaration. [`MismatchField::MigrationClass`] still refuses a
+/// candidate whose class differs from durable state, so the gate is exact; what
+/// an independently-issued class is *supposed to assert about a durable format*
+/// remains undefined because the Architecture does not define it.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StateMigrationClass {
@@ -277,6 +406,15 @@ pub enum MismatchField {
     RequiredCapability,
     /// The state migration class differs from durable state.
     MigrationClass,
+    /// The Store API operation-manifest catalogue the peer presented is not
+    /// the one this build's own compiled `eliot_store_api` produces.
+    ///
+    /// This is a DIFFERENT comparison from [`MismatchField::ContractSetDigest`],
+    /// which is the digest over the public contract identities in the envelope.
+    /// The two must not share one label: a refusal naming
+    /// `contract_set_digest` when that comparison could not have fired points
+    /// the diagnosis at a field the operator cannot change.
+    StoreApiContractSet,
 }
 
 impl MismatchField {
@@ -298,6 +436,7 @@ impl MismatchField {
             Self::AuthorityEpoch => "authority_epoch",
             Self::RequiredCapability => "required_capability",
             Self::MigrationClass => "migration_class",
+            Self::StoreApiContractSet => "store_api_contract_set_digest",
         }
     }
 }
@@ -606,6 +745,19 @@ pub struct DurableCompatibilityState {
     authority_epoch: EpochId,
     required_capabilities: Vec<String>,
     migration_class: StateMigrationClass,
+    /// The Store API operation-manifest catalogue digest THIS receiver's own
+    /// compiled `eliot_store_api` produces, when the receiver holds one.
+    ///
+    /// This is the receiver-held operand of the store-catalogue comparison. It
+    /// is derived by the boundary that has the `eliot_store_api` compiled into
+    /// it (`eliot_kernel_service::kernel_store_api_contract_set_digest`, i.e.
+    /// `generated_operation_manifests` + `operation_manifest_set_digest`) and
+    /// handed in here, because this crate does not depend on `eliot_store_api`
+    /// and must not restate the derivation. `None` means the receiver holds no
+    /// such value, which is the ordinary case for a boundary that runs no store
+    /// and a refusal for one that does.
+    #[serde(default)]
+    store_api_contract_set_digest: Option<String>,
 }
 
 impl DurableCompatibilityState {
@@ -644,7 +796,35 @@ impl DurableCompatibilityState {
             authority_epoch,
             required_capabilities,
             migration_class,
+            store_api_contract_set_digest: None,
         })
+    }
+
+    /// Binds the Store API catalogue digest this receiver's own compiled
+    /// `eliot_store_api` produces, as the receiver-held side of the rollback
+    /// comparison for that field.
+    ///
+    /// It is a separate builder rather than a constructor argument so a
+    /// boundary that runs no store keeps the ordinary `new` shape, and so the
+    /// value can only ever come from the receiver's own compiled catalogue: the
+    /// caller supplies what the receiver's build produces, never what a peer
+    /// presented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelError::InvalidField`] when the supplied digest is not
+    /// lowercase SHA-256 hex.
+    pub fn with_store_api_contract_set_digest(
+        mut self,
+        store_api_contract_set_digest: impl Into<String>,
+    ) -> Result<Self, KernelError> {
+        let store_api_contract_set_digest = store_api_contract_set_digest.into();
+        validate_digest(
+            &store_api_contract_set_digest,
+            "durable_state.store_api_contract_set_digest",
+        )?;
+        self.store_api_contract_set_digest = Some(store_api_contract_set_digest);
+        Ok(self)
     }
 
     /// Returns the durable protocol range.
@@ -688,6 +868,13 @@ impl DurableCompatibilityState {
     pub const fn migration_class(&self) -> StateMigrationClass {
         self.migration_class
     }
+
+    /// Returns the Store API catalogue digest this receiver's own compiled
+    /// `eliot_store_api` produces, when the receiver holds one.
+    #[must_use]
+    pub fn store_api_contract_set_digest(&self) -> Option<&str> {
+        self.store_api_contract_set_digest.as_deref()
+    }
 }
 
 /// The persisted evidence for one accepted handshake.
@@ -707,6 +894,15 @@ pub struct AcceptedCompatibilityEvidence {
     module_generation: ResourceGeneration,
     authority_epoch: EpochId,
     migration_class: StateMigrationClass,
+    /// The Store API catalogue digest the STORE PROCESS presented and this
+    /// receiver confirmed when the generation was admitted.
+    ///
+    /// It is the recorded peer operand, kept verbatim so
+    /// [`admit_rollback`] re-verifies the ORIGINAL recorded value against the
+    /// receiver's own compiled catalogue rather than recomputing something to
+    /// compare. `None` is an absent claim, which is refused wherever the
+    /// receiver holds an expectation; it is never read as agreement.
+    store_api_contract_set_digest: Option<String>,
 }
 
 impl AcceptedCompatibilityEvidence {
@@ -766,6 +962,13 @@ impl AcceptedCompatibilityEvidence {
     #[must_use]
     pub const fn migration_class(&self) -> StateMigrationClass {
         self.migration_class
+    }
+
+    /// Returns the Store API catalogue digest the store process presented when
+    /// this evidence was accepted, when one was recorded.
+    #[must_use]
+    pub fn store_api_contract_set_digest(&self) -> Option<&str> {
+        self.store_api_contract_set_digest.as_deref()
     }
 }
 
@@ -945,6 +1148,10 @@ pub fn admit_handshake(
         module_generation: candidate.module_generation(),
         authority_epoch: candidate.authority_epoch().clone(),
         migration_class: candidate.migration_class(),
+        // The envelope carries no Store API catalogue field: that operand comes
+        // from the store PROCESS, and only the boundary that ran the live
+        // comparison may record it (`CandidateActivation::record_store_api_contract_set`).
+        store_api_contract_set_digest: None,
     })
 }
 
@@ -995,6 +1202,43 @@ impl CandidateActivation {
             Some(mismatch) => Err(mismatch),
             None => Ok(&self.evidence),
         }
+    }
+
+    /// Binds the Store API catalogue digest a store PROCESS presented onto the
+    /// durable evidence this activation persists.
+    ///
+    /// Only a boundary that actually ran the live store comparison calls this,
+    /// and only after that comparison passed: the value is the peer's operand,
+    /// already checked against the receiver's own compiled `eliot_store_api`, and
+    /// recording it is what makes a later rollback re-verify the store's claim
+    /// instead of trusting that it once matched. It is deliberately NOT derived
+    /// here and NOT taken from `DurableCompatibilityState`: a receiver storing
+    /// its own expectation next to the check is the self-comparison this exists
+    /// to avoid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the candidate's own refusal when the activation was refused —
+    /// a refused candidate has no accepted store claim to record — and a
+    /// [`MismatchField::StoreApiContractSet`] refusal when the presented value is
+    /// not a well-formed digest.
+    pub fn record_store_api_contract_set(
+        &self,
+        presented_store_api_contract_set_digest: &str,
+    ) -> Result<Self, CompatibilityMismatch> {
+        if let Some(mismatch) = &self.refusal {
+            return Err(mismatch.clone());
+        }
+        let mut evidence = self.evidence.clone();
+        evidence
+            .record_store_api_contract_set(presented_store_api_contract_set_digest)
+            .map_err(|error| {
+                CompatibilityMismatch::new(MismatchField::StoreApiContractSet, error.to_string())
+            })?;
+        Ok(Self {
+            evidence,
+            refusal: None,
+        })
     }
 }
 
@@ -1071,6 +1315,11 @@ pub fn admit_candidate_activation(
         admitted_protocol_version,
         admitted_canonical_format_version,
         refusal_record,
+        // `None` until a boundary that ran the live store comparison records
+        // the digest the store process presented. See
+        // `CandidateActivation::record_store_api_contract_set`; the envelope has
+        // no such field, so no producer could restate it here.
+        None,
     )?;
     Ok(CandidateActivation {
         evidence,
@@ -1156,6 +1405,10 @@ pub fn restore_recorded_evidence(
         module_generation,
         authority_epoch,
         migration_class: recorded_migration_class(recorded.migration_class())?,
+        // The recorded peer operand, kept verbatim. It is NOT validated against
+        // anything here: this function reconstructs, and the comparison against
+        // the receiver's own compiled catalogue is `admit_rollback`'s.
+        store_api_contract_set_digest: recorded.store_api_contract_set_digest().map(str::to_owned),
     })
 }
 
@@ -1196,6 +1449,12 @@ fn recorded_migration_class(value: &str) -> Result<StateMigrationClass, Compatib
 /// passes the digest comparison and is refused at
 /// [`MismatchField::NormativeSeal`] by this check alone. That is exactly why it
 /// is retained: so a corrupted or rewritten ORS row is still refused.
+///
+/// The Store API catalogue is re-verified here too, through
+/// [`admit_recorded_store_api_contract_set`], which is the one field on this
+/// path whose two operands come from different builds rather than from one
+/// message. The envelope fields were checked once, live, against a store; this
+/// check is what stops a rollback from inheriting that one-time result.
 pub fn admit_rollback(
     evidence: &AcceptedCompatibilityEvidence,
     durable: &DurableCompatibilityState,
@@ -1251,7 +1510,58 @@ pub fn admit_rollback(
             "recorded migration class differs from durable state",
         ));
     }
-    Ok(())
+    admit_recorded_store_api_contract_set(
+        durable.store_api_contract_set_digest(),
+        evidence.store_api_contract_set_digest.as_deref(),
+    )
+}
+
+/// Re-verifies the Store API operation-manifest catalogue a generation's
+/// accepted handshake was admitted on.
+///
+/// This is the I1.12 rollback half of the store-bridge comparison, and it is the
+/// only comparison on this boundary whose two operands were produced by two
+/// different builds of the same source:
+/// | side | value | produced by |
+/// |---|---|---|
+/// | receiver-held | `receiver_held` | the digest of the catalogue generated by the `eliot_store_api` compiled into THIS receiver |
+/// | recorded | `recorded` | the digest the store PROCESS presented, stored when that generation was admitted |
+///
+/// Neither side receives its value from the other, so deleting this comparison
+/// cannot be compensated for elsewhere and turning it into `recorded ==
+/// recorded` cannot be reached by echoing anything. Every absent case is a
+/// refusal except the one absence that is not a claim at all:
+///
+/// - receiver holds one, record holds none: refused. An absent recorded value is
+///   a generation whose store contract set was never proven, and "never proven"
+///   is not agreement.
+/// - receiver holds none, record holds one: refused. A recorded peer claim the
+///   receiver cannot check is exactly the "previously launched" degradation.
+/// - neither holds one: admitted, because no store boundary is in scope and
+///   there is nothing to compare.
+fn admit_recorded_store_api_contract_set(
+    receiver_held: Option<&str>,
+    recorded: Option<&str>,
+) -> Result<(), CompatibilityMismatch> {
+    match (receiver_held, recorded) {
+        (Some(receiver), Some(recorded_digest)) if receiver == recorded_digest => Ok(()),
+        (Some(_), Some(_)) => Err(CompatibilityMismatch::new(
+            MismatchField::StoreApiContractSet,
+            "recorded Store API contract-set digest is not the one this receiver's own \
+             compiled store API produces",
+        )),
+        (Some(_), None) => Err(CompatibilityMismatch::new(
+            MismatchField::StoreApiContractSet,
+            "recorded evidence carries no Store API contract-set digest, which is not \
+             agreement",
+        )),
+        (None, Some(_)) => Err(CompatibilityMismatch::new(
+            MismatchField::StoreApiContractSet,
+            "this receiver holds no Store API contract-set digest of its own, so the \
+             recorded one cannot be verified",
+        )),
+        (None, None) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1266,6 +1576,19 @@ mod tests {
     const OTHER_LINEAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
     const CONTRACTS: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ARCH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    /// The Store API catalogue digest THIS build's own compiled `eliot_store_api`
+    /// produces - the receiver-held operand, standing in for
+    /// `eliot_kernel_service::kernel_store_api_contract_set_digest`, which this
+    /// crate cannot call because it does not depend on `eliot_store_api`.
+    const RECEIVER_STORE_CATALOGUE: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    /// What a DIFFERENTLY BUILT store process presents: the digest of the
+    /// catalogue generated by the `eliot_store_api` compiled into IT. It is a
+    /// literal that never reads [`RECEIVER_STORE_CATALOGUE`], so the mismatch in
+    /// these proofs is produced by editing what a STORE would present, and the
+    /// comparison cannot be satisfied by echoing the receiver's own value.
+    const STORE_PRESENTED_OTHER_CATALOGUE: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
 
     fn epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
@@ -1480,7 +1803,10 @@ mod tests {
         let refusal = evidence.refusal().expect("the refusal is durable");
         assert_eq!(refusal.field(), "canonical_format_range");
         // Generation and epoch lineage survive the refusal.
-        assert_eq!(evidence.module_generation(), ResourceGeneration::genesis().value());
+        assert_eq!(
+            evidence.module_generation(),
+            ResourceGeneration::genesis().value()
+        );
         assert_eq!(evidence.authority_lineage_id(), LINEAGE);
         assert_eq!(evidence.authority_sequence(), 3);
         // An admitted candidate keeps the same record with no refusal, and the
@@ -1504,6 +1830,133 @@ mod tests {
         assert_eq!(evidence.admitted_canonical_format_version(), Some(7));
         assert_eq!(evidence.refusal(), None);
         assert_eq!(evidence.migration_class(), "ADDITIVE");
+        Ok(())
+    }
+
+    /// Durable state carrying this build's own Store API catalogue digest as the
+    /// receiver-held operand of the rollback comparison.
+    fn durable_with_receiver_store_catalogue() -> DurableCompatibilityState {
+        durable()
+            .with_store_api_contract_set_digest(RECEIVER_STORE_CATALOGUE)
+            .expect("a well-formed receiver-held digest is accepted")
+    }
+
+    /// An ADMITTED activation whose durable evidence records the digest a store
+    /// PROCESS presented, or records nothing when `presented` is `None`.
+    fn admitted_activation_recording_store_catalogue(
+        presented: Option<&str>,
+    ) -> Result<CandidateActivation, KernelError> {
+        let activation = admit_candidate_activation(
+            &envelope(
+                VersionRange::new(6, 9).unwrap(),
+                receipt_for(ARCH),
+                epoch(LINEAGE, 3),
+                StateMigrationClass::Additive,
+            ),
+            &durable(),
+            1_700_000_000_000,
+        )?;
+        let Some(digest) = presented else {
+            return Ok(activation);
+        };
+        activation
+            .record_store_api_contract_set(digest)
+            .map_err(|_mismatch| KernelError::InvalidField {
+                field: "compatibility_evidence.store_api_contract_set_digest",
+                reason: "the presented store catalogue digest is not recordable on this verdict",
+            })
+    }
+
+    /// Restores the durable row's evidence, mapping a refusal onto the test
+    /// module's error type.
+    ///
+    /// `KernelError::InvalidField` carries `&'static str` field and reason, so a
+    /// refusal whose reason is computed is surfaced as a fixed reason and the
+    /// typed mismatch is asserted separately by the caller. That is why the
+    /// proofs below read the `CompatibilityMismatch` rather than its rendering.
+    fn restored(
+        recorded: &eliot_ors::CompatibilityEvidence,
+    ) -> Result<AcceptedCompatibilityEvidence, KernelError> {
+        restore_recorded_evidence(recorded).map_err(|_mismatch| KernelError::InvalidField {
+            field: "compatibility_evidence",
+            reason: "the recorded row cannot be projected onto the current evidence shape",
+        })
+    }
+
+    /// I1.12 acceptance, the half that was missing: a rollback re-verifies the
+    /// store's catalogue claim instead of trusting that it once matched.
+    ///
+    /// The two operands are the digest THIS build's own compiled `eliot_store_api`
+    /// produces (receiver-held, in durable state) and the digest the store PROCESS
+    /// presented (recorded on the durable evidence when the generation was
+    /// admitted). The mismatch is built by editing what a STORE would present,
+    /// never the receiver's value, so this proof fails if the comparison is
+    /// deleted or degenerates into a value against itself.
+    #[test]
+    fn rollback_refuses_a_recorded_store_catalogue_this_build_does_not_produce()
+    -> Result<(), KernelError> {
+        assert_ne!(
+            STORE_PRESENTED_OTHER_CATALOGUE, RECEIVER_STORE_CATALOGUE,
+            "the two operands must be distinct, or the refusal proves nothing"
+        );
+        let activation =
+            admitted_activation_recording_store_catalogue(Some(STORE_PRESENTED_OTHER_CATALOGUE))?;
+        let recorded = activation.evidence();
+        assert_eq!(
+            recorded.store_api_contract_set_digest(),
+            Some(STORE_PRESENTED_OTHER_CATALOGUE),
+            "the record keeps the peer operand, not the receiver's expectation"
+        );
+        let evidence = restored(recorded)?;
+        let mismatch =
+            admit_rollback(&evidence, &durable_with_receiver_store_catalogue()).unwrap_err();
+        assert_eq!(mismatch.field(), MismatchField::StoreApiContractSet);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_admits_a_recorded_store_catalogue_this_build_produces() -> Result<(), KernelError> {
+        let activation =
+            admitted_activation_recording_store_catalogue(Some(RECEIVER_STORE_CATALOGUE))?;
+        let evidence = restored(activation.evidence())?;
+        assert_eq!(
+            evidence.store_api_contract_set_digest(),
+            Some(RECEIVER_STORE_CATALOGUE)
+        );
+        admit_rollback(&evidence, &durable_with_receiver_store_catalogue()).map_err(
+            |_mismatch| KernelError::InvalidField {
+                field: "rollback",
+                reason: "a matching recorded store catalogue must still be admitted",
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_an_absent_recorded_store_catalogue() -> Result<(), KernelError> {
+        let activation = admitted_activation_recording_store_catalogue(None)?;
+        assert_eq!(activation.evidence().store_api_contract_set_digest(), None);
+        let evidence = restored(activation.evidence())?;
+        let mismatch =
+            admit_rollback(&evidence, &durable_with_receiver_store_catalogue()).unwrap_err();
+        assert_eq!(
+            mismatch.field(),
+            MismatchField::StoreApiContractSet,
+            "an absent recorded value is a claim never made, not agreement"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_a_recorded_store_catalogue_the_receiver_cannot_check()
+    -> Result<(), KernelError> {
+        let activation =
+            admitted_activation_recording_store_catalogue(Some(STORE_PRESENTED_OTHER_CATALOGUE))?;
+        let evidence = restored(activation.evidence())?;
+        // Durable state holds no receiver-side catalogue at all: the recorded
+        // peer claim is unverifiable here, so it is refused rather than passed.
+        let mismatch = admit_rollback(&evidence, &durable()).unwrap_err();
+        assert_eq!(mismatch.field(), MismatchField::StoreApiContractSet);
         Ok(())
     }
 }

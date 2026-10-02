@@ -253,8 +253,7 @@ fn console_exit_code() -> i32 {
 
 /// The real Host executable this integration target launches.
 fn host_binary() -> PathBuf {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|error| panic!("current_exe: {error}"));
+    let exe = std::env::current_exe().unwrap_or_else(|error| panic!("current_exe: {error}"));
     let top = exe
         .ancestors()
         .nth(2)
@@ -480,17 +479,15 @@ fn assert_forced_failure_contour(run: &IsolatedRun, observed: &HostRun, fixture:
     let terminal_at = observed
         .position_of("event", &terminal_event)
         .unwrap_or_else(|| panic!("no terminal: {}", observed.stderr));
-    assert!(opened < terminal_at, "open at {opened}, terminal at {terminal_at}");
+    assert!(
+        opened < terminal_at,
+        "open at {opened}, terminal at {terminal_at}"
+    );
 
     // Cleanup: production closed its bounded Event Log admission exactly once
     // and reported outstanding delivery as unknown rather than as a drain.
     let shutdowns = observed.records_binding("event", &shutdown_event);
-    assert_eq!(
-        shutdowns.len(),
-        1,
-        "stderr: {}",
-        observed.stderr
-    );
+    assert_eq!(shutdowns.len(), 1, "stderr: {}", observed.stderr);
     assert!(
         shutdowns[0].contains(&binding("outstanding_delivery", &outstanding)),
         "shutdown: {}",
@@ -661,10 +658,7 @@ fn cross_child_forced_failure_emits_one_terminal_and_unchanged_result() {
         assert_eq!(receipt["record_type"], receipt_type.as_str());
         assert_eq!(receipt["failure_class"], failure_class.as_str());
         assert_eq!(receipt["installation_id"], run.installation.as_str());
-        assert_eq!(
-            receipt["tx_plan_generation"].as_u64(),
-            Some(run.generation)
-        );
+        assert_eq!(receipt["tx_plan_generation"].as_u64(), Some(run.generation));
         assert_eq!(
             receipt["win32_exit_code"].as_i64(),
             Some(i64::from(console_exit_code()))
@@ -675,20 +669,20 @@ fn cross_child_forced_failure_emits_one_terminal_and_unchanged_result() {
     // receipt that is not its own, so no reader can pair one child's terminal
     // with the other child's failure.
     for (run, observed, receipt) in &observations {
-        for (other, other_receipt) in observations.iter() {
+        for (other, _, other_receipt) in observations.iter() {
             if other.installation == run.installation {
                 continue;
             }
             for line in observed.records() {
                 assert!(
                     !line.contains(&binding("installation", other.installation.as_str())),
-                    "{other} identity claimed by {}: {line}",
+                    "{} identity claimed by {}: {line}",
+                    other.installation,
                     run.installation
                 );
             }
             assert_ne!(
-                receipt["installation_id"],
-                other_receipt["installation_id"],
+                receipt["installation_id"], other_receipt["installation_id"],
                 "receipts must stay per-child"
             );
         }
@@ -786,10 +780,7 @@ fn isolated_event_log_start_delivery_is_real_and_distinct() {
         report_event(&rejected_record),
         Err(WindowsEventLogError::InvalidRecord)
     );
-    assert_eq!(
-        WindowsEventLogError::InvalidRecord.as_str(),
-        rejected
-    );
+    assert_eq!(WindowsEventLogError::InvalidRecord.as_str(), rejected);
     assert!(
         EventLogRecord::new(AdmittedEvent::ServiceStart, &marker).original_bytes()
             <= EVENT_LOG_MAX_INSERTION_BYTES,
@@ -864,12 +855,8 @@ fn a_real_child_admits_its_event_log_start_record() {
         ("event", admission_event.as_str()),
         ("operation", start_operation.as_str()),
     ]);
-    let admission = admissions.unwrap_or_else(|| {
-        panic!(
-            "no Event Log start admission: {}",
-            observed.stderr
-        )
-    });
+    let admission =
+        admissions.unwrap_or_else(|| panic!("no Event Log start admission: {}", observed.stderr));
     assert!(
         admission.contains(&binding("phase", &start_phase)),
         "admission: {admission}"
@@ -919,14 +906,19 @@ fn main_terminal_emissions_are_owned_per_failed_operation() {
     let mentions = fixture_u64(&fixture, &["main_terminal_drift", "callee_name_mentions"]);
     let sites = fixture_u64(&fixture, &["main_terminal_drift", "emission_sites"]);
     let console_code = fixture_text(&fixture, &["main_terminal_drift", "console_terminal_code"]);
-    let dispatcher_code =
-        fixture_text(&fixture, &["main_terminal_drift", "dispatcher_terminal_code"]);
+    let dispatcher_code = fixture_text(
+        &fixture,
+        &["main_terminal_drift", "dispatcher_terminal_code"],
+    );
     assert_eq!(console_code, HOST_TERMINAL_CODE_CONSOLE_FAILED);
     assert_eq!(dispatcher_code, HOST_TERMINAL_CODE_DISPATCHER_FAILED);
 
     // The drift itself: the callee name occurs more often than there are real
     // emission sites, so no occurrence count of this name can be an invariant.
-    assert_eq!(MAIN_SRC.matches("observe_terminal_error").count() as u64, mentions);
+    assert_eq!(
+        MAIN_SRC.matches("observe_terminal_error").count() as u64,
+        mentions
+    );
     assert!(mentions > sites);
 
     let lines: Vec<&str> = MAIN_SRC.lines().collect();
@@ -1150,17 +1142,15 @@ fn census_claims(lines: &[&str]) -> Vec<(u32, String, usize)> {
                 continue;
             }
             if let Some(name) = trimmed.strip_prefix("fn ") {
-                signature = Some(
-                    name.split(['(', ' '])
-                        .next()
-                        .unwrap_or(name)
-                        .to_owned(),
-                );
+                signature = Some(name.split(['(', ' ']).next().unwrap_or(name).to_owned());
             }
             break;
         }
         let name = signature.unwrap_or_else(|| {
-            panic!("the 985/{number} marker on line {} precedes no `fn`", index + 1)
+            panic!(
+                "the 985/{number} marker on line {} precedes no `fn`",
+                index + 1
+            )
         });
         assert!(
             is_test,
@@ -1173,7 +1163,11 @@ fn census_claims(lines: &[&str]) -> Vec<(u32, String, usize)> {
         );
         let body_line = lines
             .iter()
-            .position(|line| code_view(line).trim_start().starts_with(&format!("fn {name}(")))
+            .position(|line| {
+                code_view(line)
+                    .trim_start()
+                    .starts_with(&format!("fn {name}("))
+            })
             .unwrap_or_else(|| panic!("{name} must be a real `fn` in this file"));
         claims.push((
             number

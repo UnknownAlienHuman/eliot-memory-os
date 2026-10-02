@@ -411,7 +411,8 @@ fn production_bound_locals(body: &str) -> Vec<String> {
             cursor += "mut ".len();
         }
         let name_start = cursor;
-        while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
         {
             cursor += 1;
         }
@@ -454,9 +455,7 @@ fn span_reads_production(span: &str, bound: &[String]) -> bool {
     if span.contains("super::") {
         return true;
     }
-    bound
-        .iter()
-        .any(|name| token_bounded(span, name))
+    bound.iter().any(|name| token_bounded(span, name))
 }
 
 /// Whether `identifier` occurs in `haystack` delimited by non-identifier
@@ -1172,9 +1171,7 @@ fn assert_one_unknown_outcome_emits_one_terminal_rendering_the_resolved_code(
 /// Sink failure never alters result/order/status/cleanup on the SCM path, no
 /// secret canary appears in any SCM observation, and the Event Log seam stays
 /// typed-Unavailable.
-fn assert_scm_sink_failure_is_inert_and_observations_carry_no_secret_canaries(
-    scm_text: &str,
-) {
+fn assert_scm_sink_failure_is_inert_and_observations_carry_no_secret_canaries(scm_text: &str) {
     let host_result: Result<(), &'static str> = Ok(());
     let _ = capture_emit(|| {
         observe_entrypoint_with_detail(
@@ -1439,8 +1436,14 @@ fn lifecycle_start_requested_boundary_observation_is_emitted_and_distinct() {
     // The four facts the binding property separates: the request, the attempt
     // being issued, the process being observed, and authenticated readiness.
     let siblings = [
-        ("start.started", production_row_event(&rows, "start.started")),
-        ("start.terminal", production_row_event(&rows, "start.terminal")),
+        (
+            "start.started",
+            production_row_event(&rows, "start.started"),
+        ),
+        (
+            "start.terminal",
+            production_row_event(&rows, "start.terminal"),
+        ),
         (
             "start-manifest.requested",
             production_row_event(&rows, "start-manifest.requested"),
@@ -1641,7 +1644,9 @@ fn case_bodies_assert_against_production_seams() {
         let fn_line = lines
             .iter()
             .position(|line| {
-                code_view(line).trim_start().starts_with(&format!("fn case_{case}_"))
+                code_view(line)
+                    .trim_start()
+                    .starts_with(&format!("fn case_{case}_"))
             })
             .unwrap_or_else(|| panic!("matrix case {case} must own a `fn case_{case}_..` test"));
         let body = case_body_code(&lines, fn_line);
@@ -1856,7 +1861,9 @@ fn boundary_rows_bind_a_landed_case() {
             whole
                 .lines()
                 .position(|line| {
-                    code_view(line).trim_start().starts_with(&format!("fn case_{case}_"))
+                    code_view(line)
+                        .trim_start()
+                        .starts_with(&format!("fn case_{case}_"))
                 })
                 .unwrap_or_else(|| {
                     panic!(
@@ -2073,9 +2080,8 @@ fn lifecycle_each_failed_operation_emits_exactly_one_terminal() {
 
     // An operation whose owner owns no terminal boundary contributes none.
     let rejected = capture_emit(|| {
-        let outcome = eliot_host::HostLaunchOptions::parse([std::ffi::OsString::from(
-            "--config-descriptor",
-        )]);
+        let outcome =
+            eliot_host::HostLaunchOptions::parse([std::ffi::OsString::from("--config-descriptor")]);
         assert!(outcome.is_err(), "a one-pair argv must be refused");
     });
     assert!(

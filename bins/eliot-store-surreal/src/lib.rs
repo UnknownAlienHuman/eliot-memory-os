@@ -41,7 +41,7 @@ use eliot_store_api::{
     RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
     WriteReceipt, decode_request_frame_with_authority, generated_operation_manifests,
-    genesis_manifest, verify_canonical_request_hash,
+    genesis_manifest, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
     ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
@@ -1532,6 +1532,38 @@ pub fn admit_handshake(
     )
 }
 
+/// The Store API contract-set digest this bridge binary presents at the
+/// handshake.
+///
+/// It binds the operation-manifest catalogue that the `eliot_store_api`
+/// compiled INTO THIS store binary generates, produced by the same two existing
+/// functions every other producer of this value uses
+/// (`eliot_store_api::generated_operation_manifests` and
+/// `eliot_store_api::operation_manifest_set_digest`). Nothing is invented,
+/// configured, or taken from the peer: the Kernel derives the same value from
+/// the `eliot_store_api` compiled into the Kernel, so the two values are
+/// independent and a disagreement means the two processes were built against
+/// different `eliot_store_api` revisions.
+///
+/// This is a different domain from
+/// [`StoreHandshakeIdentity::operation_manifest_digest`], which is the digest
+/// of the single genesis entry and therefore says nothing about the rest of the
+/// catalogue. One entry cannot stand in for the set.
+fn store_api_contract_set_digest() -> Result<String, String> {
+    let entries = generated_operation_manifests().map_err(|error| error.to_string())?;
+    // `as_str().to_owned()` is the SAME form the Kernel side uses
+    // (`eliot_kernel_service::kernel_store_api_contract_set_digest`). `as_str`
+    // returns the identifier text the `OperationManifestDigest` itself carries,
+    // so the string that travels in `ServerHello.config_snapshot` is the
+    // digest's raw inner text: no trimming, no casing change, no truncation.
+    // Because both processes serialise the identical bytes, the Kernel's
+    // comparison is a real byte comparison of two independently derived
+    // operands and not a formatting coincidence.
+    operation_manifest_set_digest(&entries)
+        .map(|digest| digest.as_str().to_owned())
+        .map_err(|error| error.to_string())
+}
+
 fn admit_handshake_inner(
     frame: Frame,
     limits: TransportLimits,
@@ -1582,6 +1614,10 @@ fn admit_handshake_inner(
     if identity.operation_manifest_digest.trim().is_empty() {
         return Err("store operation manifest digest is empty".to_owned());
     }
+    // I1.12 contract-set field. A malformed catalogue fails the handshake closed
+    // rather than presenting a snapshot with the field silently absent, because
+    // the Kernel treats absence as an incompatible contract set.
+    let store_api_contract_set = store_api_contract_set_digest()?;
     let server_range = ProtocolRange {
         minimum: ProtocolVersion::CURRENT,
         maximum: ProtocolVersion::CURRENT,
@@ -1610,6 +1646,7 @@ fn admit_handshake_inner(
             "artifact_hash": config.approved_artifact_hash,
             "config_hash": config.approved_config_hash,
             "operation_manifest_digest": identity.operation_manifest_digest,
+            "operation_manifest_set_digest": store_api_contract_set,
             "blob_root_owner": identity.blob_root_owner,
         }),
         heartbeat_ms: 30_000,

@@ -284,9 +284,7 @@ fn owner_contour_labels(owner: &str) -> Vec<(String, String)> {
 /// materialization and therefore still requires recovery - and the live
 /// `materialize_phase_b` caller plus the historical authority evidence stay
 /// distinct from it.
-fn assert_previous_projection_failure_vocabulary_is_not_live_materialization(
-    inner: &str,
-) {
+fn assert_previous_projection_failure_vocabulary_is_not_live_materialization(inner: &str) {
     let prev = src("src/phase_b_previous_projection.rs");
     assert!(prev.contains("fn phase_b_previous_projection_observe") && prev.contains(inner));
     assert!(
@@ -966,11 +964,7 @@ fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
                 .iter()
                 .any(|(admitted, name)| *admitted == event && **name == **label);
             assert_projection_reaches_the_event_log_only_when_the_owner_proof_exists(
-                label,
-                projection,
-                evidence,
-                event,
-                proven,
+                label, projection, evidence, event, proven,
             );
         }
     }
@@ -1419,17 +1413,15 @@ fn census_claims(lines: &[&str]) -> Vec<(u32, String, usize)> {
                 continue;
             }
             if let Some(name) = trimmed.strip_prefix("fn ") {
-                signature = Some(
-                    name.split(['(', ' '])
-                        .next()
-                        .unwrap_or(name)
-                        .to_owned(),
-                );
+                signature = Some(name.split(['(', ' ']).next().unwrap_or(name).to_owned());
             }
             break;
         }
         let name = signature.unwrap_or_else(|| {
-            panic!("the 980/{number} marker on line {} precedes no `fn`", index + 1)
+            panic!(
+                "the 980/{number} marker on line {} precedes no `fn`",
+                index + 1
+            )
         });
         assert!(
             is_test,
@@ -1442,7 +1434,11 @@ fn census_claims(lines: &[&str]) -> Vec<(u32, String, usize)> {
         );
         let body_line = lines
             .iter()
-            .position(|line| code_view(line).trim_start().starts_with(&format!("fn {name}(")))
+            .position(|line| {
+                code_view(line)
+                    .trim_start()
+                    .starts_with(&format!("fn {name}("))
+            })
             .unwrap_or_else(|| panic!("{name} must be a real `fn` in this file"));
         let assertions = assertion_count(lines, body_line);
         claims.push((

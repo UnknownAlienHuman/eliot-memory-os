@@ -297,7 +297,10 @@ fn assert_real_delivery_disposition(event: AdmittedEvent, record: &EventLogRecor
             // `RegisteredSourceAccepted` assertion pinned an arm
             // production cannot construct.
             assert!(
-                matches!(delivery, EventLogDelivery::OsAcceptedRegistrationUnknown { .. }),
+                matches!(
+                    delivery,
+                    EventLogDelivery::OsAcceptedRegistrationUnknown { .. }
+                ),
                 "wired delivery must report registration-unknown acceptance, got: {delivery:?}"
             );
             // Production's own disposition name for that acceptance. A real
@@ -567,7 +570,8 @@ fn host_reference_failure_and_registration_are_singular() {
     // `observe_terminal_error` no longer describes landed production; what
     // must still hold is that no typed code is emitted from two sites.
     assert_eq!(
-        main.matches("host_diagnostics::observe_terminal_error(").count(),
+        main.matches("host_diagnostics::observe_terminal_error(")
+            .count(),
         2,
         "main must keep exactly one reference failure emitter per typed terminal code"
     );

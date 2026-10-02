@@ -46,7 +46,7 @@ use super::{
     TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
     route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::StateFence;
 use eliot_kernel_core::{
     CapabilityReadiness, HealthDimensionKind, KernelRuntimeHealthEvidence, ProcessHealthStatus,
     ProcessHealthVector, RouteScope, admit_candidate_activation,
@@ -59,34 +59,55 @@ use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
 /// Crate-visible so the restart rollback gate (`generation_recovery`) builds the
 /// same durable required-capability set as this handshake path.
 pub(crate) const RUNTIME_HEALTH_CAPABILITY: &str = "worker.execute";
-const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
+/// The route scope a replaceable Module generation's recorded compatibility
+/// verdict is keyed under, and the key the restart rollback gate
+/// (`generation_recovery::admit_generation_rollback`) re-reads that verdict by,
+/// because it looks each committed cutover record up under `route_scope`.
+///
+/// Crate-visible so the round-trip proof in `generation_recovery` asserts the
+/// two sides against this exact constant instead of a second spelling of it.
+pub(crate) const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 
-/// Computes the I1.12 contract-set digest from the live contract identities.
+/// Supplies the contract identities this binary contributes to the I1.12
+/// contract-set digest, in the wire order the digest is defined over.
 ///
-/// The tuple order is the wire order for this producer. It is deliberately
-/// made from contract shapes rather than artifact/configuration material, so a
-/// successful digest proves the same public surfaces were admitted on both
-/// sides of the carrier.
+/// This binary owns WHICH contracts it speaks, not the digest's derivation: the
+/// order, the arity and the hashing belong to
+/// `eliot_kernel_core::contract_set_digest`, the envelope's owner crate, so no
+/// second binary can hold a private spelling that drifts. Every failure below is
+/// a fence, unchanged from before the derivation moved; the identities are the
+/// contract shapes rather than artifact or configuration material, so the digest
+/// is over WHICH public surfaces were admitted, never over an artifact or a
+/// configuration.
 ///
-/// Crate-visible so the restart rollback gate (`generation_recovery`) compares
-/// against the SAME derivation as this handshake path rather than a second
-/// spelling of it that could drift.
+/// What this digest does NOT prove on this binary's own ingresses, stated here
+/// rather than implied: its two production callers are
+/// `compatibility_gate::durable_compatibility_state` and
+/// `compatibility_gate::process_compatibility_envelope`, and both run in this
+/// process over these same constants, so the value is compared with itself and
+/// cannot disagree with a peer. The same boundary's module documentation says so
+/// directly. A boundary that can diverge must present an envelope issued by the
+/// candidate artifact's own owner, as the store bridge does with the separate
+/// [`admit_store_api_contract_set`] comparison, whose two operands really are
+/// derived in two different processes.
+///
+/// `eliot-kernel-service` depends on `eliot-kernel-core`, so the owner crate
+/// cannot name the service's identity itself; this adapter is that one input.
 pub(crate) fn runtime_contract_set_digest() -> Result<String, TransportError> {
-    let identities = (
+    let identities = [
         eliot_kernel_core::contract_identity().map_err(|_| TransportError::SessionFenced)?,
         eliot_kernel_service::contract_identity().map_err(|_| TransportError::SessionFenced)?,
         eliot_protocol::protocol_contract_identity().map_err(|_| TransportError::SessionFenced)?,
         eliot_runtime_contracts::contract_identity().map_err(|_| TransportError::SessionFenced)?,
-    );
-    let bytes = canonical_json_bytes(&identities).map_err(|_| TransportError::SessionFenced)?;
-    Ok(sha256_hex(&bytes))
+    ];
+    eliot_kernel_core::contract_set_digest(&identities).map_err(|_| TransportError::SessionFenced)
 }
 
 /// Runs the Kernel-owned compatibility admission for one authenticated
 /// generation/epoch and persists the verdict it admitted on. The protocol and
-/// canonical-format revisions are the current I1.12 handshake revisions; the
-/// contract-set digest is derived above from the four public owners rather than
-/// from a binary or config hash.
+/// canonical-format ranges and the contract-set digest all come from their
+/// owners in `eliot-kernel-core`; the digest is derived above from the four
+/// public contract owners rather than from a binary or config hash.
 ///
 /// It returns the accepted evidence AND the durable verdict the same admission
 /// produced, so the caller persists exactly the verdict it admitted on rather
@@ -104,11 +125,9 @@ fn runtime_compatibility_admission(
     // The envelope and the durable state are the ones every Kernel process
     // boundary, the candidate-activation gate and the restart rollback gate
     // share, so one derivation cannot drift into several.
-    let candidate = super::compatibility_gate::process_compatibility_envelope(
-        generation,
-        authority_epoch,
-    )
-    .map_err(|_| TransportError::SessionFenced)?;
+    let candidate =
+        super::compatibility_gate::process_compatibility_envelope(generation, authority_epoch)
+            .map_err(|_| TransportError::SessionFenced)?;
     let durable = super::compatibility_gate::durable_compatibility_state(authority_epoch)
         .map_err(|_| TransportError::SessionFenced)?;
     let activation = admit_candidate_activation(
@@ -117,10 +136,17 @@ fn runtime_compatibility_admission(
         i64::try_from(unix_ms()).unwrap_or(i64::MAX),
     )
     .map_err(|_| TransportError::SessionFenced)?;
+    // The admitted evidence is READ BACK from the durable record this admission
+    // produced, through the owner's own `restore_recorded_evidence`, rather than
+    // recomputed from the candidate. Nothing is derived a second time here: the
+    // record is validated by its own `validate()` first, so a verdict this
+    // boundary hands to a consumer is one the durable record can also produce.
     let admitted = activation
         .require_admitted()
         .map_err(|_| TransportError::SessionFenced)?;
-    Ok((admitted.clone(), activation))
+    let compatibility = eliot_kernel_core::restore_recorded_evidence(admitted)
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok((compatibility, activation))
 }
 
 fn observe_frame(event: &'static str, outcome: &'static str) {
@@ -382,9 +408,22 @@ impl KernelComposition {
         let authority_epoch = &module_generation.state_fence.authority_epoch;
         let (compatibility, activation) =
             runtime_compatibility_admission(module_generation.generation, authority_epoch)?;
+        // The evidence is recorded under the ROUTE SCOPE this generation is
+        // routed under, which is the key `generation_recovery` re-reads it by:
+        // it iterates committed cutover records and calls
+        // `admit_generation_rollback(&record.route_scope, generation, ..)`, and
+        // that lookup is a strict `(key, generation)` pair with no fallback.
+        //
+        // Recording it under `module_generation.module_id` instead — a different
+        // namespace: the front-door policy module is `eliotd` while its route
+        // scope is `daemon` — writes a row no rollback gate can ever find, so
+        // every restored `daemon` route was refused with "no recorded
+        // compatibility verdict exists for this generation" no matter what the
+        // durable state was. The artifact identity below is still this
+        // generation's own; only the lookup key is the route owner.
         super::compatibility_gate::persist_generation_compatibility(
             &self.generation_gateway.ors,
-            module_generation.module_id.as_str(),
+            RUNTIME_HEALTH_ROUTE_SCOPE,
             module_generation.artifact_id.as_str(),
             &activation,
         )

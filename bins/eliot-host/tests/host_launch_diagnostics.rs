@@ -424,7 +424,9 @@ fn launch_02_options_descriptor_typed_rejection() {
     );
     let mut admitted = None;
     let with_nonce = capture_emit(|| {
-        admitted = Some(eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()));
+        admitted = Some(eliot_host::HostLaunchOptions::parse_system_service(
+            valid_system_args(),
+        ));
     });
     assert_capture_carries_production(&with_nonce, "the valid SystemService argv");
     assert!(
@@ -612,7 +614,10 @@ fn launch_05_start_identity_vs_pid() {
         );
     });
     assert_capture_carries_production(&absent, "the Absent SCM readback contour");
-    assert!(matches!(absent_cause, Some(HostScmRegistrationCause::Absent { .. })));
+    assert!(matches!(
+        absent_cause,
+        Some(HostScmRegistrationCause::Absent { .. })
+    ));
     assert!(
         absent.contains(&format!(
             "detail=\"host.scm-launch request observed {prefix}\""
@@ -725,7 +730,10 @@ fn launch_07_nonce_handshake_auth_activation_distinct() {
         "host.kernel-front-door authenticated peer observed",
         "host.kernel-front-door control requested",
     ] {
-        assert!(frontdoor.contains(fact), "the front door must keep {fact:?}");
+        assert!(
+            frontdoor.contains(fact),
+            "the front door must keep {fact:?}"
+        );
     }
     assert_ne!(
         "host.kernel-activation nonce issued",
@@ -804,7 +812,10 @@ fn launch_09_before_start_vs_timeout_disconnect_unknown() {
         "fn validate_authenticated_kernel_peer",
         "fn connect_authenticated_kernel_front_door",
     ] {
-        assert!(frontdoor.contains(entry), "the front door must keep {entry:?}");
+        assert!(
+            frontdoor.contains(entry),
+            "the front door must keep {entry:?}"
+        );
     }
     let outcomes = [
         "host.kernel-front-door before-start observed",
@@ -835,7 +846,10 @@ fn launch_10_one_terminal_across_nesting() {
     let request = canonical_scm_registration_request();
     let inspections = [
         ("absent", ServiceRegistrationRuntimeInspection::Absent),
-        ("mismatched", ServiceRegistrationRuntimeInspection::Mismatched),
+        (
+            "mismatched",
+            ServiceRegistrationRuntimeInspection::Mismatched,
+        ),
         (
             "unknown",
             ServiceRegistrationRuntimeInspection::Unknown {
@@ -942,13 +956,15 @@ fn launch_11_sink_failure_leaves_operation_identical() {
     // while still admitting a terminal record.
     let mut admitted_outcome = None;
     let admitted = capture_emit(|| {
-        admitted_outcome =
-            Some(eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()));
+        admitted_outcome = Some(eliot_host::HostLaunchOptions::parse_system_service(
+            valid_system_args(),
+        ));
     });
     let mut filtered_outcome = None;
-    let filtered = capture_emit_at_level(tracing::Level::Error, || {
-        filtered_outcome =
-            Some(eliot_host::HostLaunchOptions::parse_system_service(valid_system_args()));
+    let filtered = capture_emit_at_level(tracing::Level::ERROR, || {
+        filtered_outcome = Some(eliot_host::HostLaunchOptions::parse_system_service(
+            valid_system_args(),
+        ));
     });
     // Non-emptiness PRECONDITION, asserted before every denial below: this
     // capture really carries production output on this platform.
@@ -992,7 +1008,10 @@ fn launch_11_sink_failure_leaves_operation_identical() {
         "detail=\"host.launch-options parse admitted\"",
         "detail=\"host.launch-options system-service admitted\"",
     ] {
-        assert!(admitted.contains(frozen), "production must emit {frozen:?}, got: {admitted}");
+        assert!(
+            admitted.contains(frozen),
+            "production must emit {frozen:?}, got: {admitted}"
+        );
     }
     let requested = admitted
         .find("host.launch-options parse requested")
@@ -1125,12 +1144,7 @@ fn frontdoor_source() -> String {
 // WORK_UNIT_CASE: 978/13
 #[test]
 fn launch_13_deterministic_semantic_fields() {
-    let combined = format!(
-        "{}{}{}",
-        scm_source(),
-        sequence_source(),
-        driver_source()
-    );
+    let combined = format!("{}{}{}", scm_source(), sequence_source(), driver_source());
     for required in [
         "host.scm-launch probe requested",
         "HOST_SCM_TRANSIENT_MAX_INSPECTIONS",
@@ -1181,7 +1195,10 @@ fn launch_13_deterministic_semantic_fields() {
         "detail=\"host.launch-options parse admitted\"",
         "detail=\"host.launch-options system-service admitted\"",
     ] {
-        assert!(first.contains(frozen), "production must emit {frozen:?}, got: {first}");
+        assert!(
+            first.contains(frozen),
+            "production must emit {frozen:?}, got: {first}"
+        );
     }
 }
 
@@ -1335,7 +1352,10 @@ fn launch_15_one_terminal_owner_and_distinct_launch_facts() {
             OsString::from(ELIOT_HOST_SERVICE_NAME),
         ]));
     });
-    assert!(matches!(callback, Some(Ok(()))), "the canonical ServiceMain argv must be admitted");
+    assert!(
+        matches!(callback, Some(Ok(()))),
+        "the canonical ServiceMain argv must be admitted"
+    );
     assert_launch_15_no_terminal(
         &callback_capture,
         "the SCM service-main callback",
@@ -1363,9 +1383,15 @@ fn launch_15_one_terminal_owner_and_distinct_launch_facts() {
 fn assert_launch_15_no_terminal(capture: &str, contour: &str, positive: &[&str], negative: &str) {
     assert_capture_carries_production(capture, contour);
     for frozen in positive {
-        assert!(capture.contains(frozen), "{contour} must emit {frozen:?}: {capture}");
+        assert!(
+            capture.contains(frozen),
+            "{contour} must emit {frozen:?}: {capture}"
+        );
     }
-    assert!(!capture.contains(negative), "{contour} claimed {negative:?}: {capture}");
+    assert!(
+        !capture.contains(negative),
+        "{contour} claimed {negative:?}: {capture}"
+    );
     assert_eq!(
         count_occurrences(capture, "host.terminal_error"),
         0,

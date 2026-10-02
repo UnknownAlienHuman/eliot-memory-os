@@ -54,20 +54,37 @@
 //! migration class or epoch lineage drift after it was written — each with the
 //! exact mismatching field. That is the "verified compatible with current state"
 //! half of I1.12, and it is real on the restart path today.
+//!
+//! ## The one field whose two sides are not this build's own constants
+//!
+//! Every field above is a constant of this build on both sides of the comparison,
+//! so it cannot disagree with a peer. The Store API operation-manifest catalogue
+//! digest is the single exception on this binary, and only on the rollback half:
+//! the store-bridge seam records the digest the store PROCESS presented onto the
+//! evidence it persists, so the recorded half of that comparison is a peer
+//! operand while the receiver-held half is
+//! `eliot_kernel_service::kernel_store_api_contract_set_digest` — the catalogue
+//! digest of the `eliot_store_api` compiled into THIS receiver. Neither side
+//! receives its value from the other, and the recorded half is never this build's
+//! own expectation.
+//!
+//! The receiver-held half is therefore bound on the rollback path and NOT here.
+//! [`durable_compatibility_state`] is shared by every route, and handing a Store
+//! API digest to a route that runs no store would make `admit_rollback` refuse
+//! that route for recording no Store API claim at all. It is bound per route
+//! scope, for the store-bridge route alone, by
+//! `generation_recovery::store_bridge_durable_compatibility_state`. The
+//! store-bridge seam's own live decision is untouched by that: a store which
+//! presents no digest, or one this build's compiled `eliot_store_api` does not
+//! produce, is still refused there before any durable write happens.
 
 use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_kernel_core::{
     CandidateActivation, CompatibilityEnvelope, CompatibilityMismatch, DurableCompatibilityState,
-    MismatchField, NormativePairReceipt, StateMigrationClass, VersionRange,
-    admit_candidate_activation, expected_seal_tag,
+    MismatchField, NormativePairReceipt, StateMigrationClass, admit_candidate_activation,
+    expected_seal_tag, handshake_canonical_format_range, handshake_protocol_range,
 };
 use eliot_ors::RedbRecoveryStore;
-
-/// The I1.12 protocol revision this build speaks.
-const HANDSHAKE_PROTOCOL_REVISION: u32 = 1;
-
-/// The I1.12 canonical format revision this build speaks.
-const HANDSHAKE_CANONICAL_FORMAT_REVISION: u32 = 1;
 
 /// The durable compatibility state the Kernel is running under.
 ///
@@ -76,17 +93,26 @@ const HANDSHAKE_CANONICAL_FORMAT_REVISION: u32 = 1;
 /// and rollback gates are compared against ONE durable state rather than
 /// several independently derived projections. Nothing here is invented and
 /// nothing is carried over from a previous process.
+///
+/// The protocol range, canonical format range and contract-set digest are read
+/// from their owners in `eliot-kernel-core` rather than restated here, so this
+/// binary holds no second definition of any of them and a producer in another
+/// binary presents the same values. The migration class is this binary's own
+/// declaration, because I1.12 names the field without defining a vocabulary
+/// this crate could own one from; see `StateMigrationClass`.
+///
+/// It deliberately carries NO Store API contract-set digest, because this is the
+/// state of every route rather than of one boundary: a route that runs no store
+/// records no Store API claim, so a receiver-held digest on such a route makes
+/// `admit_rollback` refuse it. The receiver-held side of that one cross-build
+/// comparison is bound where it can be scoped — on the rollback path, for the
+/// store-bridge route scope alone; see the module documentation.
 pub(crate) fn durable_compatibility_state(
     authority_epoch: &EpochId,
 ) -> Result<DurableCompatibilityState, String> {
-    let protocol_range =
-        VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
-            .map_err(|error| error.to_string())?;
-    let canonical_format_range = VersionRange::new(
-        HANDSHAKE_CANONICAL_FORMAT_REVISION,
-        HANDSHAKE_CANONICAL_FORMAT_REVISION,
-    )
-    .map_err(|error| error.to_string())?;
+    let protocol_range = handshake_protocol_range().map_err(|error| error.to_string())?;
+    let canonical_format_range =
+        handshake_canonical_format_range().map_err(|error| error.to_string())?;
     let contract_set_digest =
         super::frame_dispatch::runtime_contract_set_digest().map_err(|error| error.to_string())?;
     DurableCompatibilityState::new(
@@ -106,23 +132,18 @@ pub(crate) fn durable_compatibility_state(
 ///
 /// Every field except the generation and the Authority Epoch comes from this
 /// build's own identity, and the receipt's seal tag is recomputed here from that
-/// identity rather than issued by the external normative-pair owner. The envelope
-/// is therefore the shape and the single producer of the durable evidence; it is
-/// NOT an independently declared claim about a different artifact, so a peer can
-/// never disagree with it about these fields. See the module documentation for
-/// what this does and does not prove.
+/// identity rather than issued by the external normative-pair owner. The
+/// envelope is therefore the shape and the single producer of the durable
+/// evidence; it is NOT an independently declared claim about a different
+/// artifact, so a peer can never disagree with it about these fields. See the
+/// module documentation for what this does and does not prove.
 pub(crate) fn process_compatibility_envelope(
     generation: ResourceGeneration,
     authority_epoch: &EpochId,
 ) -> Result<CompatibilityEnvelope, String> {
-    let protocol_range =
-        VersionRange::new(HANDSHAKE_PROTOCOL_REVISION, HANDSHAKE_PROTOCOL_REVISION)
-            .map_err(|error| error.to_string())?;
-    let canonical_format_range = VersionRange::new(
-        HANDSHAKE_CANONICAL_FORMAT_REVISION,
-        HANDSHAKE_CANONICAL_FORMAT_REVISION,
-    )
-    .map_err(|error| error.to_string())?;
+    let protocol_range = handshake_protocol_range().map_err(|error| error.to_string())?;
+    let canonical_format_range =
+        handshake_canonical_format_range().map_err(|error| error.to_string())?;
     let contract_set_digest =
         super::frame_dispatch::runtime_contract_set_digest().map_err(|error| error.to_string())?;
     let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
@@ -170,7 +191,8 @@ pub(crate) fn admit_generation_activation(
 ) -> Result<CandidateActivation, CompatibilityMismatch> {
     let candidate = process_compatibility_envelope(generation, authority_epoch)
         .map_err(|reason| gate_construction_failure(reason))?;
-    let durable = durable_compatibility_state(authority_epoch).map_err(gate_construction_failure)?;
+    let durable =
+        durable_compatibility_state(authority_epoch).map_err(gate_construction_failure)?;
     admit_candidate_activation(&candidate, &durable, observed_at_ms)
         .map_err(|error| gate_construction_failure(error.to_string()))
 }

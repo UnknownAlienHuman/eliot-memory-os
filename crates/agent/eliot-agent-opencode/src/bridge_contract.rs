@@ -189,7 +189,9 @@ impl OpenCodeBridgeDeclaration {
                 field: "state_fence",
                 detail: "declaration state fence is not a valid authority fence",
             })?;
-        self.contract.validate().map_err(BridgeContractError::Contract)?;
+        self.contract
+            .validate()
+            .map_err(BridgeContractError::Contract)?;
         if self.contract.bridge_id.as_str() != self.adapter_id.as_str() {
             return Err(BridgeContractError::InvalidDeclaration {
                 field: "contract.bridge_id",
@@ -467,7 +469,8 @@ mod tests {
     }
 
     fn fixture_epoch(lineage: &str, sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
-        let sequence = std::num::NonZeroU64::new(sequence).ok_or("epoch sequence must be nonzero")?;
+        let sequence =
+            std::num::NonZeroU64::new(sequence).ok_or("epoch sequence must be nonzero")?;
         Ok(EpochId::new(EpochLineageId::new(lineage)?, sequence)?)
     }
 
@@ -532,8 +535,7 @@ mod tests {
 
         // A declaration edited after issuance without re-deriving its digest.
         let mut declaration = admitted_declaration()?;
-        declaration.contract.side_effects[0].authority =
-            "caller-selected-authority".to_owned();
+        declaration.contract.side_effects[0].authority = "caller-selected-authority".to_owned();
         assert_refused(&declaration, &route, &fence)?;
 
         // A declaration whose declared capabilities were dropped, with a
@@ -568,11 +570,16 @@ mod tests {
         );
         assert_eq!(declaration.route, route);
         assert_eq!(declaration.state_fence, fence);
-        assert_eq!(declaration.declaration_sha256, declaration.compute_digest()?);
+        assert_eq!(
+            declaration.declaration_sha256,
+            declaration.compute_digest()?
+        );
         declaration.validate()?;
-        assert!(declaration.contract.binds_admitted_generation(
-            &route_fingerprint_digest_for(&route)?
-        ));
+        assert!(
+            declaration
+                .contract
+                .binds_admitted_generation(&route_fingerprint_digest_for(&route)?)
+        );
         validate_opencode_declaration(&declaration, &route, &fence)?;
         Ok(())
     }

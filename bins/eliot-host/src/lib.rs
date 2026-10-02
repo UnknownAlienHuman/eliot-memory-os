@@ -3945,8 +3945,10 @@ mod host_lifecycle_boundary_table_tests {
 
     /// Case 14 fixture: the wire restart request and the durable Kernel restart
     /// receipt whose rebind the durable owner must refuse as a rollback.
-    fn case_14_restart_request_and_receipt(
-    ) -> (super::HostRuntimeControlRequest, super::HostKernelRestartReceipt) {
+    fn case_14_restart_request_and_receipt() -> (
+        super::HostRuntimeControlRequest,
+        super::HostKernelRestartReceipt,
+    ) {
         let restart = super::HostRuntimeControlRequest::new(
             super::HostRuntimeControlOperation::RestartKernel,
             PlatformHandle::new("891-case-14-restart").unwrap(),
@@ -13508,11 +13510,7 @@ impl HostComposition {
         else {
             return Ok(());
         };
-        self.reconcile_watchdog_start_bound(
-            &registration,
-            platform_root,
-            &heartbeat_state_root,
-        )
+        self.reconcile_watchdog_start_bound(&registration, platform_root, &heartbeat_state_root)
     }
 
     #[cfg(windows)]
@@ -16177,11 +16175,7 @@ impl HostComposition {
         else {
             return Ok(());
         };
-        self.reconcile_watchdog_start_bound(
-            &registration,
-            platform_root,
-            &heartbeat_state_root,
-        )
+        self.reconcile_watchdog_start_bound(&registration, platform_root, &heartbeat_state_root)
     }
 
     #[cfg(windows)]

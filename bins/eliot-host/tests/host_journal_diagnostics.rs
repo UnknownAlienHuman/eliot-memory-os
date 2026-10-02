@@ -307,7 +307,9 @@ fn journal_06_terminal_sink_redaction_cleanup() {
 // ---------------------------------------------------------------------------
 
 /// Two owner-issued restart operations that reach the SAME typed outcome.
-fn restart_pair(suffix: &str) -> (
+fn restart_pair(
+    suffix: &str,
+) -> (
     eliot_host::HostRuntimeControlRequest,
     eliot_host::HostRuntimeControlRequest,
 ) {
@@ -353,15 +355,19 @@ fn journal_two_same_outcome_restart_operations_are_distinguishable_by_content() 
     // every handle, so a terminal or projection carrying it is joinable by field
     // equality. Nothing here depends on which record came first.
     assert_ne!(first.request_id.as_str(), second.request_id.as_str());
-    assert_ne!(first.mutation_digest.as_str(), second.mutation_digest.as_str());
-    assert_ne!(first.request_digest.as_str(), second.request_digest.as_str());
+    assert_ne!(
+        first.mutation_digest.as_str(),
+        second.mutation_digest.as_str()
+    );
+    assert_ne!(
+        first.request_digest.as_str(),
+        second.request_digest.as_str()
+    );
 
     // The production join predicate agrees: each Unknown answer belongs to its
     // own request and to no other, which is exactly the field-equality pairing
     // the audit requires in place of order inference.
-    assert!(
-        eliot_host_service::runtime_control::response_matches_request(&first, &first_unknown)
-    );
+    assert!(eliot_host_service::runtime_control::response_matches_request(&first, &first_unknown));
     assert!(
         eliot_host_service::runtime_control::response_matches_request(&second, &second_unknown)
     );
@@ -377,14 +383,10 @@ fn journal_two_same_outcome_restart_operations_are_distinguishable_by_content() 
     // The identity production projects into the operation's own receipt is also
     // distinct per operation, so even the wire-level Unknown handle separates
     // the two same-outcome operations by content.
-    let first_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
-        "kernel-restart",
-        &first,
-    );
-    let second_ref = eliot_host_service::runtime_control::runtime_control_unknown_ref(
-        "kernel-restart",
-        &second,
-    );
+    let first_ref =
+        eliot_host_service::runtime_control::runtime_control_unknown_ref("kernel-restart", &first);
+    let second_ref =
+        eliot_host_service::runtime_control::runtime_control_unknown_ref("kernel-restart", &second);
     assert_ne!(first_ref.as_str(), second_ref.as_str());
     assert!(
         first_ref.as_str().contains(first.request_digest.as_str()),

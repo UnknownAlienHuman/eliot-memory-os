@@ -27,7 +27,8 @@ use eliot_store_api::{
     ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
     StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
-    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
+    WriteReceipt, dreamer_job_capability, generated_operation_manifests, map_durable_error,
+    operation_manifest_set_digest, validate_genesis_receipt_envelope,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use thiserror::Error;
@@ -231,6 +232,16 @@ pub struct EbpCanonicalStoreClient<T> {
     /// it through this atomic; the transport path never invents faults on
     /// its own.
     fault: AtomicU8,
+    /// The Store API contract-set digest the store presented in its
+    /// `ServerHello` `config_snapshot`, retained verbatim and undecoded.
+    ///
+    /// `None` when the handshake carried no such field. It is never defaulted,
+    /// synthesised, or filled from this binary's own catalogue: the caller that
+    /// admits this session decides what an absent value means, and the value is
+    /// only ever compared against
+    /// [`kernel_store_api_contract_set_digest`], which this binary derives from
+    /// its own compiled `eliot_store_api`.
+    presented_store_api_contract_set_digest: Option<String>,
 }
 
 impl<T> std::fmt::Debug for EbpCanonicalStoreClient<T> {
@@ -273,6 +284,15 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         }
         let response = transport.receive_frame(limits).await?;
         let server = decode_server_hello(&response, &requirement)?;
+        // Retained verbatim, never derived here. The comparison against the
+        // Kernel's own value belongs to the boundary that admits this store
+        // generation, not to the transport decode, so the handshake records
+        // what the peer said and leaves the verdict to that caller.
+        let presented_store_api_contract_set_digest = server
+            .config_snapshot
+            .get("operation_manifest_set_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let client = Self {
             transport: Arc::new(Mutex::new(transport)),
             requirement,
@@ -280,6 +300,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             limits,
             request_counter: AtomicU64::new(1),
             fault: AtomicU8::new(StoreClientFault::NONE),
+            presented_store_api_contract_set_digest,
         };
         client.verify_readiness().await?;
         Ok(client)
@@ -313,6 +334,19 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     #[must_use]
     pub const fn requirement(&self) -> &HostStoreBootstrapRequirement {
         &self.requirement
+    }
+
+    /// The Store API contract-set digest the store presented in its
+    /// `ServerHello` `config_snapshot`, exactly as it arrived.
+    ///
+    /// `None` when the store presented no such field. A caller that admits this
+    /// session is responsible for refusing that absence; the client itself
+    /// neither fills in a value nor decides the comparison, because only the
+    /// admitting boundary knows whether the digest is a required field of its
+    /// own handshake.
+    #[must_use]
+    pub fn presented_store_api_contract_set_digest(&self) -> Option<&str> {
+        self.presented_store_api_contract_set_digest.as_deref()
     }
 
     async fn verify_readiness(&self) -> Result<(), StoreClientError> {
@@ -2654,6 +2688,35 @@ fn client_hello(
             .map_err(|_| StoreClientError::Contract("protocol max frame exceeds u32".to_owned()))?,
         authority_epoch: requirement.authority_epoch().clone(),
     })
+}
+
+/// The Store API contract-set digest the KERNEL holds, derived from the
+/// `eliot_store_api` compiled into this binary.
+///
+/// This is the receiver half of the I1.12 contract-set comparison at the
+/// store-bridge seam. The store process presents the digest of the operation
+/// manifest catalogue produced by the `eliot_store_api` compiled INTO the store
+/// binary; this value is produced here, by the same two existing functions, from
+/// the `eliot_store_api` compiled into the Kernel. Neither side receives the
+/// value from the other, so the two operands are independent: a store binary
+/// built against a different `eliot_store_api` disagrees here, and the
+/// disagreement cannot be manufactured by anything either side echoes.
+///
+/// It is a property of the compiled crate, not of a session, a request, a
+/// configuration or an epoch, so it is recomputed on demand and stored nowhere.
+///
+/// # Errors
+///
+/// Returns [`StoreClientError::Store`] when this build's generated operation
+/// manifest catalogue cannot be produced or hashed. That is a build defect
+/// rather than a peer observation, and it is reported as such instead of being
+/// weakened into a permissive default.
+pub fn kernel_store_api_contract_set_digest() -> Result<String, StoreClientError> {
+    let entries = generated_operation_manifests()?;
+    // `as_str` is the identifier text the type itself carries, so this is the
+    // same bytes the peer serialises into `config_snapshot`; no trimming,
+    // casing or shortening happens here.
+    Ok(operation_manifest_set_digest(&entries)?.as_str().to_owned())
 }
 
 fn decode_server_hello(

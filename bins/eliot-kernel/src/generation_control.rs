@@ -1335,7 +1335,9 @@ impl KernelComposition {
     ) -> Result<(), KernelServiceError> {
         let claimed_new_epoch = std::num::NonZeroU64::new(replacement.cutover.new_epoch.value())
             .ok_or_else(|| {
-                KernelServiceError::Platform("claimed cutover epoch is not representable".to_owned())
+                KernelServiceError::Platform(
+                    "claimed cutover epoch is not representable".to_owned(),
+                )
             })?;
         let service = self
             .service

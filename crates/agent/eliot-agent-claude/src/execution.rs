@@ -1966,13 +1966,9 @@ mod tests {
         declaration.validate()?;
         // The contract binds the admitted generation through the route owner's
         // own digest, not a self-reported version.
-        assert!(
-            declaration
-                .contract
-                .binds_admitted_generation(&eliot_agent_api::route_fingerprint_digest_for(
-                    &binding.route
-                )?)
-        );
+        assert!(declaration.contract.binds_admitted_generation(
+            &eliot_agent_api::route_fingerprint_digest_for(&binding.route)?
+        ));
         crate::bridge_contract::validate_claude_sidecar_declaration(
             &declaration,
             &binding.route,

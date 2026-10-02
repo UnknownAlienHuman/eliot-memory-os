@@ -3723,10 +3723,30 @@ mod console_primary_outcome_tests {
         // protocol failures (stdin read error, unwritten response) with each
         // drain result.
         let judged: [(&str, ConsoleOutcome, bool, bool); 4] = [
-            ("clean EOF, completed drain", ConsoleOutcome::Served, true, false),
-            ("clean protocol run, incomplete drain", ConsoleOutcome::Served, false, true),
-            ("protocol failure, completed drain", ConsoleOutcome::Failed, true, true),
-            ("protocol failure, incomplete drain", ConsoleOutcome::Failed, false, true),
+            (
+                "clean EOF, completed drain",
+                ConsoleOutcome::Served,
+                true,
+                false,
+            ),
+            (
+                "clean protocol run, incomplete drain",
+                ConsoleOutcome::Served,
+                false,
+                true,
+            ),
+            (
+                "protocol failure, completed drain",
+                ConsoleOutcome::Failed,
+                true,
+                true,
+            ),
+            (
+                "protocol failure, incomplete drain",
+                ConsoleOutcome::Failed,
+                false,
+                true,
+            ),
         ];
         for (path, primary, drained, expected) in judged {
             assert_eq!(
@@ -3775,10 +3795,8 @@ mod console_primary_outcome_tests {
     /// registration nonce the same options carry is proven absent from it.
     #[test]
     fn failed_console_run_owes_the_typed_console_failed_receipt_and_exit() {
-        let root = std::env::temp_dir().join(format!(
-            "eliot-host-console-outcome-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("eliot-host-console-outcome-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("fixture root: {error}"));
         let options = console_test_options(&root);
         let nonce = options
@@ -3794,8 +3812,8 @@ mod console_primary_outcome_tests {
         );
         let stored = std::fs::read_to_string(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME))
             .unwrap_or_else(|error| panic!("capsule readback: {error}"));
-        let parsed: serde_json::Value = serde_json::from_str(&stored)
-            .unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stored).unwrap_or_else(|error| panic!("capsule JSON: {error}"));
         assert_eq!(parsed["record_type"], "host_start_failure");
         assert_eq!(parsed["service"], SERVICE_NAME);
         assert_eq!(parsed["failure_class"], "console_failed");
@@ -3844,7 +3862,6 @@ mod console_primary_outcome_tests {
             std::ffi::OsString::from("--registration-nonce"),
             std::ffi::OsString::from("b".repeat(64)),
         ];
-        parse_process_bootstrap(args)
-            .unwrap_or_else(|error| panic!("test launch options: {error}"))
+        parse_process_bootstrap(args).unwrap_or_else(|error| panic!("test launch options: {error}"))
     }
 }

@@ -57,7 +57,8 @@ use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, bound_detail, bound_field,
-    note_event_log_sink_status, observe_entrypoint_with_detail, observe_terminal_error, sink_status,
+    note_event_log_sink_status, observe_entrypoint_with_detail, observe_terminal_error,
+    sink_status,
 };
 use eliot_host::windows_event_log::{AdmittedEvent, event_log_sink_status, report_event};
 use serde_json::Value;
@@ -1852,15 +1853,9 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
         MARKER,
         ENVELOPE,
     );
-    let contours: Vec<&str> = MARKER
-        .iter()
-        .chain(ENVELOPE.iter())
-        .copied()
-        .collect();
+    let contours: Vec<&str> = MARKER.iter().chain(ENVELOPE.iter()).copied().collect();
     assert_the_codec_owns_ten_distinct_contours_in_two_disjoint_families(
-        &contours,
-        MARKER,
-        ENVELOPE,
+        &contours, MARKER, ENVELOPE,
     );
     assert_the_codec_owner_source_names_every_contour_and_no_collapsed_catch_all(
         &contours,

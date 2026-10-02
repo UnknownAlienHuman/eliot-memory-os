@@ -664,7 +664,12 @@ fn a_filtered_diagnostic_sink_leaves_the_console_result_unchanged() {
     // Without this the invariance assertion below would be satisfied by two
     // runs that each did nothing observable at all.
     for run in [&admitted, &filtered] {
-        assert_eq!(run.code, Some(console_exit_code()), "stderr: {}", run.stderr);
+        assert_eq!(
+            run.code,
+            Some(console_exit_code()),
+            "stderr: {}",
+            run.stderr
+        );
         assert_eq!(
             run.terminal_codes(),
             vec![HOST_TERMINAL_CODE_CONSOLE_FAILED.to_owned()],
