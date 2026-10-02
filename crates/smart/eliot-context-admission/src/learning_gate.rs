@@ -234,20 +234,30 @@ pub(crate) fn check_governed_admission_carriage(
 /// failure refuses the whole retrieval before any value surfaces.
 ///
 /// This is a thin projection of the composed admission entrypoint onto the
-/// historical result-only signature: it presents
-/// [`LearningGovernance::Presented`] and [`DownstreamReservation::NotReserved`],
-/// so the composed decision reports `HeadroomCheck::NotReserved` for this
-/// compilation. A compilation that holds an owner-issued downstream reservation
-/// calls [`admit_context_governed`](crate::admit_context_governed) with
-/// [`DownstreamReservation::Reserved`], which runs the same two screens before
-/// the same single selection.
+/// historical result-only signature. The caller declares which
+/// [`DownstreamReservation`] arm accompanies this compilation, and the learning
+/// governance is presented as [`LearningGovernance::Presented`]; both are
+/// forwarded into `admit_context_composed`, which still runs the owner-bound
+/// carriage gate and then the reservation arm the caller declared, before the
+/// same single selection. [`DownstreamReservation::NotReserved`] is therefore a
+/// declared fact about this compilation instead of an assumption this function
+/// makes on the caller's behalf, and a compilation holding an owner-issued
+/// reservation passes [`DownstreamReservation::Reserved`] and reaches the same
+/// two screens before the same single selection.
+///
+/// The projection is still result-only: it does not surface the
+/// [`HeadroomCheck`](crate::HeadroomCheck) the composed decision reached, so
+/// which arm ran is known from the caller's own declaration rather than read
+/// back out of this return. A caller that needs the bounded decision itself
+/// uses [`admit_context_governed`](crate::admit_context_governed).
 pub fn admit_context_with_learning(
     input: &AdmissionInput,
     presented: PresentedLearning<'_>,
+    reservation: &DownstreamReservation<'_>,
 ) -> Result<AdmissionResult, ContextError> {
     into_admission_result(crate::admit_context_composed(
         input,
         &LearningGovernance::Presented(presented),
-        &DownstreamReservation::NotReserved,
+        reservation,
     ))
 }

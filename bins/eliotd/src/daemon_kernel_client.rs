@@ -2543,6 +2543,100 @@ impl DaemonKernelClient {
         })
     }
 
+    /// Builds the one in-process client a package test can construct.
+    ///
+    /// The production client is launched, handshaken and fence-bound against a
+    /// real Kernel process, so no test outside this module can build one. This
+    /// constructor is the shared test fixture for the composition-root proofs
+    /// that must exercise a real `DaemonKernelClient` value — it carries the
+    /// admitted fence and nothing else: no transport is connected, so every
+    /// exchange it is given fails as an unestablished outcome rather than
+    /// inventing an answer.
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        epoch: eliot_contracts::EpochId,
+        fence: eliot_contracts::StateFence,
+    ) -> Self {
+        let generation = fence.resource_generation;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        Self {
+            launch: GovernorLaunchConfig {
+                instance_id: "test-eliotd".to_owned(),
+                kernel: eliot_governor::KernelGenerationExpectation {
+                    service: "eliot-kernel".to_owned(),
+                    protocol: "test".to_owned(),
+                    artifact_digest: "a".repeat(64),
+                    protected_snapshot_digest: "b".repeat(64),
+                    principal: "test-principal".to_owned(),
+                    generation,
+                    authority_epoch: epoch.clone(),
+                },
+                protected_snapshot_digest: "b".repeat(64),
+            },
+            kernel_binding: crate::KernelLaunchBinding {
+                kernel_pipe_name: r"\\.\pipe\eliot\test".to_owned(),
+                expected_kernel_sid: "S-1-5-18".to_owned(),
+                expected_kernel_session_id: 0,
+                module_generation: generation,
+                authority_epoch: epoch.clone(),
+                state_fence: fence,
+                launch_nonce: "test-nonce".to_owned(),
+                kernel_artifact_sha256: "a".repeat(64),
+                daemon_artifact_sha256: "c".repeat(64),
+            },
+            connection_id: "test-connection".to_owned(),
+            snapshot: KernelGenerationSnapshot {
+                service: "eliot-kernel".to_owned(),
+                protocol: "test".to_owned(),
+                generation,
+                authority_epoch: epoch,
+                artifact_digest: "a".repeat(64),
+                protected_snapshot_digest: "b".repeat(64),
+                principal: "test-principal".to_owned(),
+            },
+            validated_session_binding: Mutex::new(None),
+            shutdown_tx,
+            shutdown_rx,
+        }
+    }
+
+    /// Seeds the retained binding as if a validated handshake had established
+    /// it. Test-only: the production writer stays `connect_transport`.
+    #[cfg(test)]
+    pub(super) fn seed_validated_session_binding_for_test(&self, binding: &str) {
+        if let Ok(mut slot) = self.validated_session_binding.lock() {
+            *slot = Some(binding.to_owned());
+        }
+    }
+
+    /// Mints this connection's canonical Kernel request identity for one
+    /// admitted canonical write whose exact canonical request bytes the caller
+    /// already holds.
+    ///
+    /// This is [`Self::next_identity`] under a name the rest of the composition
+    /// root can call, and it deliberately adds no second rule: the digest input,
+    /// the key labels and the fence binding stay this module's single I5.27
+    /// owner, so two byte-identical presentations of one operation derive the
+    /// same `request_id`, `idempotency_key` and `cancellation_id` while a
+    /// changed payload derives a different one.
+    ///
+    /// The caller supplies `canonical_request` — the exact bytes it is about to
+    /// present — and `operation`, the closed semantic command kind it executes.
+    /// Nothing here reads a graph, a recovered snapshot or a diagnostic row.
+    pub(super) fn canonical_write_identity(
+        &self,
+        operation: &str,
+        scope: &str,
+        canonical_request: &serde_json::Value,
+    ) -> Result<RequestIdentity, KernelPortError> {
+        self.next_identity(&CanonicalKernelRequest {
+            operation,
+            scope,
+            request: canonical_request,
+        })
+        .map_err(kernel_port_error)
+    }
+
     fn blocking<T, F>(future: F) -> Result<T, KernelPortError>
     where
         T: Send + 'static,
@@ -3633,10 +3727,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-    use eliot_governor::{
-        GovernorLaunchConfig, KernelGenerationExpectation, KernelGenerationSnapshot,
-        KernelPortError,
-    };
+    use eliot_governor::KernelPortError;
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
     };
@@ -3649,7 +3740,6 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use crate::KernelLaunchBinding;
     use crate::forward_admitted_local_read;
     use crate::kernel_context_read_client::KernelContextReadClient;
 
@@ -3752,49 +3842,10 @@ mod tests {
     }
 
     fn test_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
-        let epoch = test_epoch(1)?;
-        let generation =
-            ResourceGeneration::new(1).map_err(|error| format!("generation: {error}"))?;
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        Ok(DaemonKernelClient {
-            launch: GovernorLaunchConfig {
-                instance_id: "test-eliotd".to_owned(),
-                kernel: KernelGenerationExpectation {
-                    service: "eliot-kernel".to_owned(),
-                    protocol: "test".to_owned(),
-                    artifact_digest: "a".repeat(64),
-                    protected_snapshot_digest: "b".repeat(64),
-                    principal: "test-principal".to_owned(),
-                    generation,
-                    authority_epoch: epoch.clone(),
-                },
-                protected_snapshot_digest: "b".repeat(64),
-            },
-            kernel_binding: KernelLaunchBinding {
-                kernel_pipe_name: r"\\.\pipe\eliot\test".to_owned(),
-                expected_kernel_sid: "S-1-5-18".to_owned(),
-                expected_kernel_session_id: 0,
-                module_generation: generation,
-                authority_epoch: epoch.clone(),
-                state_fence: fence.clone(),
-                launch_nonce: "test-nonce".to_owned(),
-                kernel_artifact_sha256: "a".repeat(64),
-                daemon_artifact_sha256: "c".repeat(64),
-            },
-            connection_id: "test-connection".to_owned(),
-            snapshot: KernelGenerationSnapshot {
-                service: "eliot-kernel".to_owned(),
-                protocol: "test".to_owned(),
-                generation,
-                authority_epoch: epoch,
-                artifact_digest: "a".repeat(64),
-                protected_snapshot_digest: "b".repeat(64),
-                principal: "test-principal".to_owned(),
-            },
-            validated_session_binding: Mutex::new(None),
-            shutdown_tx: shutdown_tx.clone(),
-            shutdown_rx: shutdown_rx.clone(),
-        })
+        Ok(DaemonKernelClient::new_for_test(
+            test_epoch(1)?,
+            fence.clone(),
+        ))
     }
 
     /// Minimal in-test evidence table. It stores captured subjects in capture

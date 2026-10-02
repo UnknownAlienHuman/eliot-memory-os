@@ -31,14 +31,16 @@ use crate::current_unix_ms;
 use crate::health_projection::{HealthProjectionCell, evaluate_interval_health};
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::host_identity_observation::{
-    ApprovedRecoveryPolicy, BoundedChallengeWait, ChallengeAttemptOutcome, ChallengeUncertainty,
-    HostObservation, HostResponsiveness, MAX_CHALLENGE_WAIT_SECS,
+    ApprovedRecoveryPolicy, ApprovedRegistrationReadback, BoundedChallengeWait,
+    ChallengeAttemptOutcome, ChallengeUncertainty, HostObservation, HostResponsiveness,
+    MAX_CHALLENGE_WAIT_SECS,
 };
 use crate::host_recovery::{
     AuditCorrelation, AuditEventKind, BoundaryEvidence, DualAuditRecord,
     EXISTING_SCM_ADAPTER_GUARANTEE, RecoveryFence, RecoveryOperation, RecoveryScope,
     RecoveryTarget, begin_recovery_operation, bounded_responsiveness, fence_recovery,
-    read_recovery_budget, read_recovery_operation, record_recovery_audit, record_recovery_budget,
+    identity_digest, read_recovery_budget, read_recovery_operation, record_recovery_audit,
+    record_recovery_budget,
 };
 use crate::kernel_gap_reason;
 use crate::observation_coverage::{
@@ -1115,16 +1117,58 @@ fn bind_recovery_target(
     None
 }
 
-/// Fresh boundary-evidence seam (#1757 step 4, STITCH).
+/// Fresh boundary-evidence seam (#1757 step 4).
 ///
-/// The fence revalidates approved registration, runtime identity, and
-/// expected generation against a readback taken at the boundary itself, never
-/// against the challenge-time observation. The registration-comparison and
-/// generation readbacks have no production reader on this contour yet, so no
-/// evidence is produced here. Returns `None` until they land; the fence is
-/// never reached without them.
-fn read_boundary_evidence(_target: &RecoveryTarget) -> Option<BoundaryEvidence> {
-    None
+/// The fence revalidates approved registration, runtime identity, and expected
+/// generation against a readback taken at the boundary itself, never against the
+/// challenge-time observation, and it compares each observed value by content
+/// with the values the operation recorded (`host_recovery::revalidate_boundary`).
+///
+/// The approved-registration and runtime-identity legs ARE plumbed here. Both
+/// come from ONE fresh read-only SCM query issued by the live observation
+/// source this composition was given, not from anything the caller claimed and
+/// not from the challenge-time observation: `HostObservationSource::
+/// observe_approved_registration` delegates to
+/// `HostIdentityMonitor::observe_approved_registration`, which re-queries
+/// `host_identity_observation::read_host_registration_runtime` against the
+/// installer approval the source retains. Only a `Matching` readback yields a
+/// handle, and that handle is the approval's own recorded SCM configuration
+/// digest, so a readback over a substituted registration yields nothing at all
+/// rather than the approved value.
+///
+/// The expected-generation leg still has NO owner on this contour, so
+/// `generation` stays `None`: nothing here attributes a live Host process to an
+/// approved generation. `HostIdentityMonitor`'s `sensor_binding` is the
+/// installer-selected generation the Watchdog itself holds, so feeding it back
+/// here would compare the Watchdog's own copy with itself; the Host composition
+/// lane must expose a real readback (`CompleteKernelControl` already records
+/// `kernel_generation`). That absence is not silently defaulted: it is what
+/// `revalidate_boundary` refuses as `BoundaryRefusal::GenerationUnavailable`,
+/// and the same refusal now names the registration leg it did reach.
+fn read_boundary_evidence(host: &dyn HostObservationSource) -> BoundaryEvidence {
+    let readback = host.observe_approved_registration();
+    let identity = readback
+        .as_ref()
+        .and_then(ApprovedRegistrationReadback::identity)
+        .and_then(|identity| match identity_digest(identity) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.recovery_decision_identity_digest_unavailable",
+                    observation = "refused",
+                    reason = %error,
+                    "observed process identity has no coordination digest; the boundary refuses the identity leg"
+                );
+                None
+            }
+        });
+    BoundaryEvidence {
+        observed_registration: readback
+            .as_ref()
+            .map(|readback| readback.registration().clone()),
+        identity_digest: identity,
+        generation: None,
+    }
 }
 
 /// Audit-correlation and sibling-scope seam (#1757 steps 5-6, STITCH).
@@ -1156,7 +1200,9 @@ fn correlate_recovery_attempt(
 /// belong to the Host composition lane. Every input without a production
 /// reader on this contour is an explicit named seam above (STITCH): no
 /// policy, no target, and no challenge attempt is invented, so a pass that
-/// cannot be fully bound journals nothing and refuses effects.
+/// cannot be fully bound journals nothing and refuses effects. The boundary
+/// readback is NOT such an input any more: it issues its own live query and
+/// carries an absent leg as an explicit refusal.
 ///
 /// All journal touches here are bounded local transactions. Nothing waits on
 /// the hung Host: the competing-attempt exclusion is the durable single-key
@@ -1248,15 +1294,7 @@ fn observe_host_recovery_decision(
         );
         return;
     };
-    let Some(evidence) = read_boundary_evidence(&target) else {
-        tracing::debug!(
-            event = "watchdog.recovery_decision_evidence_unavailable",
-            observation = "refused",
-            seam = "STITCH",
-            "no fresh boundary readback on this contour; the fence is never reached without one"
-        );
-        return;
-    };
+    let evidence = read_boundary_evidence(host.as_ref());
     let Some((correlation, scope)) = correlate_recovery_attempt(&policy, &target) else {
         tracing::debug!(
             event = "watchdog.recovery_decision_uncorrelated",
@@ -1712,5 +1750,127 @@ impl WatchdogBackupPort {
             WatchdogSpool::import_backup_isolated(source, destination, active, steps)?;
         crate::watchdog_spool::backup::acceptance_allowed(disposition)?;
         Ok(disposition)
+    }
+}
+
+#[cfg(test)]
+mod boundary_evidence_tests {
+    use eliot_platform::PlatformHandle;
+    use eliot_platform_windows::ProcessIdentity;
+
+    use super::*;
+    use crate::host_recovery::{BoundaryRefusal, revalidate_boundary};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A read-only source that observed the installer-approved registration and
+    /// the runtime identity ONE readback carried.
+    ///
+    /// This fixture stands in for the live SCM query
+    /// `host_identity_observation::approved_registration_readback` performs. It
+    /// supplies observed VALUES, never a verdict about them, so the boundary
+    /// comparison below exercises exactly the comparison production performs.
+    struct ObservedRegistrationHost {
+        readback: Option<ApprovedRegistrationReadback>,
+    }
+
+    impl HostObservationSource for ObservedRegistrationHost {
+        fn observe(&self) -> HostObservation {
+            HostObservation {
+                state: HostObservationState::Running,
+                identity: None,
+            }
+        }
+
+        fn observe_approved_registration(&self) -> Option<ApprovedRegistrationReadback> {
+            self.readback.clone()
+        }
+    }
+
+    fn handle(seed: char) -> Fallible<PlatformHandle> {
+        Ok(PlatformHandle::new(seed.to_string().repeat(32))?)
+    }
+
+    fn process() -> ProcessIdentity {
+        ProcessIdentity {
+            process_id: 4_200,
+            start_time_100ns: 1_000_000,
+            image_path: r"C:\Program Files\Eliot\eliot-host.exe".to_owned(),
+        }
+    }
+
+    /// Positive: the composition supplies the owner-issued approved registration
+    /// the live source reported, and the boundary's own content comparison
+    /// agrees with what the operation recorded against it.
+    ///
+    /// FAILS WITHOUT THIS CHANGE: the seam returned `None`, so no boundary
+    /// evidence existed and neither the approved registration nor the runtime
+    /// identity could reach `revalidate_boundary` at all. The refusal that
+    /// remains is `GenerationUnavailable` — a DIFFERENT leg with no owner on this
+    /// contour — which is what proves the two compared legs actually agreed
+    /// rather than being skipped on the way to the first refusal.
+    #[test]
+    fn boundary_evidence_carries_the_observed_registration_and_identity() -> TestResult {
+        let identity = process();
+        let observed_registration = handle('a')?;
+        let source = ObservedRegistrationHost {
+            readback: Some(ApprovedRegistrationReadback::new(
+                observed_registration.clone(),
+                Some(identity.clone()),
+            )),
+        };
+
+        let evidence = read_boundary_evidence(&source);
+        assert_eq!(
+            evidence.observed_registration,
+            Some(observed_registration.clone())
+        );
+        assert_eq!(evidence.identity_digest, Some(identity_digest(&identity)?));
+        assert_eq!(evidence.generation, None);
+
+        let target = RecoveryTarget::bind(
+            observed_registration,
+            handle('b')?,
+            handle('c')?,
+            handle('d')?,
+            &identity,
+        )?;
+        assert_eq!(
+            revalidate_boundary(&target, &evidence),
+            Err(BoundaryRefusal::GenerationUnavailable)
+        );
+        Ok(())
+    }
+
+    /// Refusal: a source that retained no installer approval compares no
+    /// approved registration, so the evidence carries none and the boundary
+    /// refuses the registration leg BY NAME instead of reading the absence as
+    /// agreement.
+    ///
+    /// FAILS WITHOUT THIS CHANGE: the seam returned `None` and the pass stopped
+    /// before `fence_recovery`, so `BoundaryRefusal::RegistrationUnavailable` had
+    /// no production path that could reach it. The `None` readback here is the
+    /// same state a live `Mismatched`/`Absent`/`Unknown` readback produces, since
+    /// `approved_registration_readback` yields no evidence for those.
+    #[test]
+    fn boundary_evidence_refuses_when_no_approved_registration_was_compared() -> TestResult {
+        let source = ObservedRegistrationHost { readback: None };
+        let evidence = read_boundary_evidence(&source);
+        assert_eq!(evidence.observed_registration, None);
+        assert_eq!(evidence.identity_digest, None);
+
+        let target = RecoveryTarget::bind(
+            handle('a')?,
+            handle('b')?,
+            handle('c')?,
+            handle('d')?,
+            &process(),
+        )?;
+        assert_eq!(
+            revalidate_boundary(&target, &evidence),
+            Err(BoundaryRefusal::RegistrationUnavailable)
+        );
+        Ok(())
     }
 }

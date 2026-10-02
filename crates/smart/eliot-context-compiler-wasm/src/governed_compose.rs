@@ -11,7 +11,8 @@
 //!   another task)
 //! → retrieve_governed (overlay liveness, backlog backing, cross-task
 //!   carryover)
-//! → admit_context_with_learning (ticket re-verification + per-mark screen + admit)
+//! → admit_context_with_learning (ticket re-verification + per-mark screen +
+//!   admit, under this composition's declared `NotReserved` arm)
 //! → assemble_active_view_with_learning (delivery re-verification + project)
 //! → GovernedCompilation (retrieval decision + admission + optional view)
 //! ```
@@ -32,7 +33,7 @@
 //! is gated with `#[cfg(not(target_arch = "wasm32"))]` at the crate root.
 
 use crate::conversion::{GuestRequest, GuestResponse, validate_response_shape};
-use eliot_context_admission::admit_context_with_learning;
+use eliot_context_admission::{DownstreamReservation, admit_context_with_learning};
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
     assemble_active_view_with_learning,
@@ -115,6 +116,10 @@ fn same_cross_task_carryover(
 /// sides. `input` is the caller-built ordinary admission input the produced
 /// atom joins.
 ///
+/// No owner-issued downstream reservation accompanies this composition, so the
+/// admission below declares `DownstreamReservation::NotReserved` explicitly
+/// rather than leaving the callee to assume it.
+///
 /// The wall clock is sourced LIVE from the host owner clock
 /// ([`OffsetDateTime::now_utc`]) inside this function: any
 /// caller-supplied `now_unix_secs` in `presented` is ignored, so requester
@@ -179,8 +184,15 @@ where
     .map_err(ComposeError::Retrieval)?;
     input.candidates.candidates.push(produced);
     input.learning_tickets.push(presented.ticket.clone());
+    // No owner-issued downstream reservation accompanies this composition:
+    // `compose_governed_compilation` takes no headroom request or result, and
+    // neither `LearningProduction` nor `PresentedLearning` has a headroom
+    // field, so there is no owner evidence here to declare. The call DECLARES
+    // `NotReserved`, and the composed decision then reports
+    // `HeadroomCheck::NotReserved` instead of reading as a granted reservation.
     let admission =
-        admit_context_with_learning(&input, presented).map_err(ComposeError::Admission)?;
+        admit_context_with_learning(&input, presented, &DownstreamReservation::NotReserved)
+            .map_err(ComposeError::Admission)?;
     let view = match &admission.outcome {
         ContextOutcome::Complete(set) => Some(
             assemble_active_view_with_learning(set, recipe, quality, policy, measure, presented)

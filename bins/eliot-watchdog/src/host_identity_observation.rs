@@ -54,6 +54,53 @@ impl HostObservation {
     }
 }
 
+/// What ONE fresh live readback of the approved Host registration proved.
+///
+/// This is an observation record, not an assertion: the registration handle is
+/// reported only when the live SCM readback returned `Matching`, which is the
+/// platform adapter's exact comparison of the live service configuration
+/// against the installer approval this source retains. A configuration that
+/// does not match reports nothing at all, because an unproven registration is
+/// never an observed one.
+///
+/// The handle-bound process identity comes from the SAME readback, so the
+/// approved registration and the runtime identity are never two separately
+/// sampled values that could disagree about which Host they describe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedRegistrationReadback {
+    registration: PlatformHandle,
+    identity: Option<ProcessIdentity>,
+}
+
+impl ApprovedRegistrationReadback {
+    /// Records what one readback proved.
+    ///
+    /// This is the only way to build the record, and it takes the observed
+    /// values themselves rather than a verdict about them: a source that
+    /// compared no approved registration has no record to build.
+    #[must_use]
+    pub fn new(registration: PlatformHandle, identity: Option<ProcessIdentity>) -> Self {
+        Self {
+            registration,
+            identity,
+        }
+    }
+
+    /// The installer-approved registration this readback compared the live SCM
+    /// configuration against.
+    #[must_use]
+    pub fn registration(&self) -> &PlatformHandle {
+        &self.registration
+    }
+
+    /// The handle-bound process identity the same readback carried, when the
+    /// observed service state exposed one.
+    #[must_use]
+    pub fn identity(&self) -> Option<&ProcessIdentity> {
+        self.identity.as_ref()
+    }
+}
+
 /// Process-identity state machine used by the Watchdog's read-only Host sensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostObservationState {
@@ -157,6 +204,22 @@ impl HostIdentityMonitor {
     #[must_use]
     pub fn canonical_identity(&self) -> Option<&ProcessIdentity> {
         self.canonical.as_ref()
+    }
+
+    /// Reads the approved Host registration back from live SCM at this instant
+    /// and reports exactly what that one readback proved.
+    ///
+    /// The readback is taken HERE, not reused from an earlier liveness
+    /// observation: a recovery boundary compares the approved registration
+    /// against the value the operation recorded when the challenge was issued,
+    /// and that comparison is only meaningful over a readback of its own.
+    ///
+    /// This performs no lifecycle effect: it is the same read-only
+    /// [`read_host_registration_runtime`] the liveness sensor already uses.
+    #[must_use]
+    pub(super) fn observe_approved_registration(&self) -> Option<ApprovedRegistrationReadback> {
+        let approved = self.expected_registration.as_ref()?;
+        approved_registration_readback(approved, read_host_registration_runtime(approved))
     }
 
     /// Clears the prior process identity after a fresh lease has been
@@ -407,6 +470,19 @@ pub trait HostObservationSource: Send + Sync + 'static {
     /// verified a fresh supervision lease. The default is deliberately a
     /// no-op for test/read-only sources.
     fn rebaseline_after_verified_lease(&self, _lease: &VerifiedSupervisionLease) {}
+
+    /// Reads the installer-approved Host registration back from live SCM and
+    /// reports what that one readback proved.
+    ///
+    /// A recovery boundary must revalidate the approved registration against
+    /// the live system by CONTENT, and this is the only read-only route to
+    /// that value on this contour. The default is deliberately `None` for
+    /// test/read-only sources that retain no installer approval: a source that
+    /// compared no approved registration offers no registration evidence, which
+    /// the boundary reads as an explicit refusal and never as agreement.
+    fn observe_approved_registration(&self) -> Option<ApprovedRegistrationReadback> {
+        None
+    }
 }
 
 /// Production observation source backed by the canonical `EliotHost` SCM
@@ -513,6 +589,42 @@ impl HostObservationSource for LiveHostObservationSource {
             monitor.rebaseline();
         }
     }
+
+    fn observe_approved_registration(&self) -> Option<ApprovedRegistrationReadback> {
+        self.monitor
+            .lock()
+            .ok()
+            .and_then(|monitor| monitor.observe_approved_registration())
+    }
+}
+
+/// Maps one live SCM readback onto the approved-registration evidence that
+/// readback actually proved.
+///
+/// The content handle is the approved registration's own identity, taken from
+/// the request `ApprovedHostRegistration` retains. That request is what
+/// `InstallerServiceRegistrationApproval::service_registration_request`
+/// reconstructed FROM the approval after
+/// `InstallerServiceRegistrationApproval::validate`, and it refuses any
+/// approval whose request does not reproduce the approval's recorded
+/// `configuration_digest`; so this handle is that recorded digest, not a fresh
+/// judgement about the live system and not a caller claim. It is offered only
+/// when the live readback says the approved registration is still what SCM has.
+///
+/// `Mismatched`, `Absent` and `Unknown` yield no evidence at all. Reporting the
+/// approved handle for a readback that did not match would be indistinguishable
+/// from reporting it for one that did.
+#[must_use]
+pub(super) fn approved_registration_readback(
+    approved: &ApprovedHostRegistration,
+    runtime: WatchdogRuntimeReadback,
+) -> Option<ApprovedRegistrationReadback> {
+    let WatchdogRuntimeReadback::Matching { process, .. } = runtime else {
+        return None;
+    };
+    let registration =
+        PlatformHandle::new(approved.request.expected_configuration_digest()).ok()?;
+    Some(ApprovedRegistrationReadback::new(registration, process))
 }
 
 pub(super) fn read_host_registration_runtime(
@@ -816,6 +928,7 @@ impl HostObservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::installer_approval_fixture;
 
     #[test]
     fn transient_service_states_are_not_terminal_absence() {
@@ -847,5 +960,89 @@ mod tests {
             classify_runtime_state_without_identity(WatchdogRuntimeState::Absent),
             HostObservationState::AbsentOrStopped
         );
+    }
+
+    /// One installer-approved Host registration, built through the same owner
+    /// projection production uses, so the retained request is a real approval
+    /// reconstruction rather than a hand-made value.
+    fn approved_registration(registration_nonce: &str) -> ApprovedHostRegistration {
+        let (approval, _request) = installer_approval_fixture(
+            eliot_installation::InstallerServiceRole::Host,
+            registration_nonce,
+        );
+        ApprovedHostRegistration::from_approval(&approval)
+            .unwrap_or_else(|error| panic!("approved Host registration fixture: {error}"))
+    }
+
+    /// One live readback that reports the approved registration matching and
+    /// carrying a handle-bound process identity.
+    fn matching_readback() -> WatchdogRuntimeReadback {
+        WatchdogRuntimeReadback::Matching {
+            state: WatchdogRuntimeState::Running,
+            process: Some(ProcessIdentity {
+                process_id: 4_200,
+                start_time_100ns: 1_000_000,
+                image_path: r"C:\Program Files\Eliot\eliot-host.exe".to_owned(),
+            }),
+            checkpoint: 0,
+            wait_hint_ms: 0,
+        }
+    }
+
+    /// Positive: a readback over the approved registration carries THAT
+    /// approval's own recorded configuration digest and the identity the same
+    /// readback observed.
+    ///
+    /// FAILS WITHOUT THIS CHANGE: there was no mapping at all, so no
+    /// composition could obtain an approved-registration value from a live
+    /// readback and the boundary compared nothing. The second approval in the
+    /// same test pins the other half: the handle identifies the SPECIFIC
+    /// approval, so a readback over one installer approval can never satisfy a
+    /// boundary comparing a different one.
+    #[test]
+    fn matching_readback_carries_the_approved_registration_and_observed_identity() {
+        let approved = approved_registration(&"a".repeat(64));
+        let readback = approved_registration_readback(&approved, matching_readback())
+            .unwrap_or_else(|| panic!("matching readback proves the approved registration"));
+        assert_eq!(
+            readback.registration().as_str(),
+            approved.request.expected_configuration_digest()
+        );
+        assert_eq!(
+            readback.identity().map(|identity| identity.process_id),
+            Some(4_200)
+        );
+
+        let other = approved_registration(&"c".repeat(64));
+        assert_ne!(
+            approved_registration_readback(&approved, matching_readback())
+                .map(|readback| readback.registration().clone()),
+            approved_registration_readback(&other, matching_readback())
+                .map(|readback| readback.registration().clone()),
+            "a readback over one installer approval must not satisfy the other"
+        );
+    }
+
+    /// Refusal: a readback that did NOT match the approved registration yields
+    /// no evidence at all, so the approved value can never be presented as
+    /// agreement with a substituted registration.
+    ///
+    /// FAILS WITHOUT THIS CHANGE: the mapping did not exist, so there was no
+    /// statement to get wrong; once any caller supplied the approved value
+    /// regardless of the readback, a `Mismatched` live configuration would have
+    /// been indistinguishable from a matching one.
+    #[test]
+    fn non_matching_readback_yields_no_approved_registration_evidence() {
+        let approved = approved_registration(&"a".repeat(64));
+        for runtime in [
+            WatchdogRuntimeReadback::Mismatched,
+            WatchdogRuntimeReadback::Absent,
+            WatchdogRuntimeReadback::Unknown,
+        ] {
+            assert!(
+                approved_registration_readback(&approved, runtime).is_none(),
+                "an unconfirmed readback must carry no approved-registration evidence"
+            );
+        }
     }
 }

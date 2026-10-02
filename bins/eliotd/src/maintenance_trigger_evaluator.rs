@@ -1145,6 +1145,17 @@ fn is_commit_ref_text(value: &str) -> bool {
 pub struct AdmittedMaintenanceRevocation {
     /// Exact revocation request rebuilt from the committed closure bytes.
     request: GrantRevocationRequest,
+    /// The ORIGINAL committed first-phase closure receipt this admission is
+    /// derived from, kept verbatim.
+    ///
+    /// The Governor second-phase-only resume entry consumes committed closure
+    /// bytes, not a re-derivation of them, and the daemon holds no ORS to read
+    /// them again from. Carrying the owner's own bytes here is therefore what
+    /// lets the resume be driven from the far side of the transport without a
+    /// second closure read, a second decoder, or a re-derived membership. The
+    /// composition revalidates these exact bytes with the closure's own
+    /// `validate()` before it reads an obligation out of them.
+    committed_closure: GrantClosureReceipt,
     /// Immutable first-phase closure operation identity, as committed. A
     /// [`GrantRevocationRequest`] carries no operation-identity coordinate of
     /// its own, so the identity travels beside the request and is what the
@@ -1257,6 +1268,7 @@ impl AdmittedMaintenanceRevocation {
                 snapshot_id,
                 binding: closure.authority.clone(),
             },
+            committed_closure: closure.clone(),
             closure_operation_id: closure.operation_id.clone(),
             graph_revision: closure.declaration.grant_graph_revision,
         })
@@ -1266,6 +1278,13 @@ impl AdmittedMaintenanceRevocation {
     #[must_use]
     pub const fn request(&self) -> &GrantRevocationRequest {
         &self.request
+    }
+
+    /// Returns the ORIGINAL committed first-phase closure receipt this
+    /// admission was derived from.
+    #[must_use]
+    pub const fn committed_closure(&self) -> &GrantClosureReceipt {
+        &self.committed_closure
     }
 
     /// Returns the immutable first-phase closure operation identity, as

@@ -77,17 +77,18 @@
       },
       {
         "path": "crates/smart/eliot-context-admission/tests/learning_gate_1869.rs",
-        "bytes": 22404,
-        "sha256": "b18e498b7171ba1fcf71ae2a54c67d7190068ac6f739143a3dae720726d016ad",
-        "test_attributes": 6,
+        "bytes": 77562,
+        "sha256": "e920431ebfc97a89920852f8006dabf72d0f0f3f88d20ce8a9a6d376c5446a81",
+        "test_attributes": 16,
         "inline_cfg_test": false,
         "test_only_module": false,
         "classes": [
+          "edge_profile",
           "fault_restart_replay"
         ]
       }
     ],
-    "test_attribute_count": 74
+    "test_attribute_count": 84
   },
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [],
@@ -105,7 +106,9 @@
         "context assembly"
       ]
     },
-    "edge_profile_tests": []
+    "edge_profile_tests": [
+      "crates/smart/eliot-context-admission/tests/learning_gate_1869.rs"
+    ]
   },
   "fault_restart_replay_cases": {
     "declared_failure_behavior": {
@@ -140,8 +143,8 @@
   },
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
-    "test_attribute_count": 74,
-    "test_stu": 42805,
+    "test_attribute_count": 84,
+    "test_stu": 61191,
     "nonzero": true
   },
   "bound_contract_digest": "37f1ce4ac2ebf341",
@@ -161,7 +164,7 @@
       },
       "package_manifest": {
         "path": "crates/smart/eliot-context-admission/Cargo.toml",
-        "sha256": "37f637348e701395583ad33219b9e0ce28e499314bedc2fdfd9a6b5747490843"
+        "sha256": "9d59fb92ef43fffcbf7e203e3ee4cff83904c10bee450c6cd6a83b775e04bc30"
       },
       "module_manifest": {
         "path": "crates/smart/eliot-context-admission/module.toml",
@@ -175,20 +178,20 @@
       },
       "physical_source_inventory": {
         "path_count": 8,
-        "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
+        "sha256": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 8,
-        "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
+        "sha256": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "8f1ff74cc8c71ba19b3da8a60e0e95c805d3f6d429bded0a05920032842d6e5b",
+  "artifact_digest": "3d399c10246425c9ead3d2f85e61c5926812ffbb58a0908ae51297a1ec10d70a",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "a4bf13d66dbc6b17"
