@@ -322,6 +322,15 @@ pub(crate) fn append_authenticated_kernel_readiness_with_heartbeat<B: JournalBac
         },
         &expected,
     )?;
-    host_readiness_append_observe("host.readiness evidence appended");
+    // This tail records THIS call's appended evidence, so it is truthful only
+    // for a NEW durable commit. When the owner returned `Replayed`, this call
+    // read back the original committed observation and created no new evidence
+    // (I14.20 `RECONCILING` cannot create a new effect; case 11);
+    // `observe_readiness_append_outcome` above already named that replay
+    // distinctly, so announcing an append here would collapse the readback into
+    // another durable append.
+    if receipt.disposition() == AppendDisposition::Applied {
+        host_readiness_append_observe("host.readiness evidence appended");
+    }
     Ok((receipt, supervision))
 }
