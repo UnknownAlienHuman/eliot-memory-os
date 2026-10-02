@@ -1,0 +1,15 @@
+[package]
+name = "eliot-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "eliot-host"
+path = "src/main.rs"
+
+[dependencies]
+tracing = "0.1"
