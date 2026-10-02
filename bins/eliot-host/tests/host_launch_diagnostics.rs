@@ -614,9 +614,11 @@ fn launch_06_store_before_kernel() {
         );
     });
     assert!(text.contains("host.store-launch store-live observed"));
-    assert!(text.contains(
-        "host.kernel-launch kernel-launched observed; activation evidence unavailable"
-    ));
+    assert!(
+        text.contains(
+            "host.kernel-launch kernel-launched observed; activation evidence unavailable"
+        )
+    );
 }
 
 // WORK_UNIT_CASE: 978/7

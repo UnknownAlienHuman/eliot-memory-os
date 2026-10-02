@@ -226,7 +226,7 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
     ] {
         assert!(
             rollback.contains(&format!("\"{label}\"")),
-            "rollback owner must still name {label:?}"
+            "rollback owner must still name the positive label {label:?}"
         );
     }
     let unknown = emit(|| {
@@ -303,10 +303,7 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
     // `observe_host_request` renders the frozen phase under the `phase` key;
     // `stage` is the `host.entrypoint_stage` key and is never projected here,
     // so the pin follows the field production actually writes.
-    assert!(
-        committed.contains("phase=shutdown_drain"),
-        "got: {committed}"
-    );
+    assert!(committed.contains("phase=shutdown_drain"), "got: {committed}");
     assert!(
         !committed.contains("host.phase-b"),
         "a projection record carries no rollback contour detail: {committed}"
