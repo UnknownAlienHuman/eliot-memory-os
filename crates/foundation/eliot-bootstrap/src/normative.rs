@@ -90,6 +90,17 @@ pub enum NormativePairReceiptError {
 pub fn parse_normative_pair_receipt(
     bytes: &[u8],
 ) -> Result<NormativePair, NormativePairReceiptError> {
+    parse_normative_pair_receipt_with_key(bytes).map(|(pair, _)| pair)
+}
+
+/// Parse the accepted receipt and return its validated, originally recorded pair key.
+///
+/// The parser validates receipt structure and the external pair-key binding;
+/// it does not read shards and does not establish document authenticity,
+/// currentness, or runtime support.
+pub fn parse_normative_pair_receipt_with_key(
+    bytes: &[u8],
+) -> Result<(NormativePair, String), NormativePairReceiptError> {
     if bytes.len() > MAX_RECEIPT_BYTES {
         return Err(NormativePairReceiptError::InputTooLarge);
     }
@@ -97,10 +108,13 @@ pub fn parse_normative_pair_receipt(
     let receipt: NormativePairReceipt =
         toml::from_str(text).map_err(|error| NormativePairReceiptError::Toml(error.to_string()))?;
     validate_receipt(&receipt)?;
-    Ok(NormativePair {
-        architecture_sha256: receipt.architecture_sha256,
-        implementation_sha256: receipt.implementation_sha256,
-    })
+    Ok((
+        NormativePair {
+            architecture_sha256: receipt.architecture_sha256,
+            implementation_sha256: receipt.implementation_sha256,
+        },
+        receipt.pair_key,
+    ))
 }
 
 fn validate_receipt(receipt: &NormativePairReceipt) -> Result<(), NormativePairReceiptError> {
@@ -270,4 +284,44 @@ fn validate_pair_key(receipt: &NormativePairReceipt) -> Result<(), NormativePair
         return Err(NormativePairReceiptError::PairKeyMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NormativePairReceipt, NormativePairReceiptError, parse_normative_pair_receipt_with_key,
+    };
+
+    #[test]
+    fn parse_normative_pair_receipt_with_key_returns_original_pair_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let receipt = include_str!("../../../../docs/normative-pair.toml");
+        let original_receipt: NormativePairReceipt = toml::from_str(receipt)?;
+
+        let (_, pair_key) = parse_normative_pair_receipt_with_key(receipt.as_bytes())?;
+
+        assert_eq!(pair_key, original_receipt.pair_key);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_normative_pair_receipt_with_key_rejects_corrupt_recorded_pair_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut receipt = include_str!("../../../../docs/normative-pair.toml").to_owned();
+        let pair_key_start = receipt
+            .find("pair_key = \"sha256:")
+            .ok_or("normative-pair.toml is missing its recorded pair_key field")?
+            + "pair_key = \"sha256:".len();
+        let key_byte = receipt.as_bytes()[pair_key_start];
+        receipt.replace_range(
+            pair_key_start..=pair_key_start,
+            if key_byte == b'0' { "1" } else { "0" },
+        );
+
+        assert!(matches!(
+            parse_normative_pair_receipt_with_key(receipt.as_bytes()),
+            Err(NormativePairReceiptError::PairKeyMismatch)
+        ));
+        Ok(())
+    }
 }

@@ -52,14 +52,14 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
-use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdError, TestdTerminalCompletionNotice, TestdVerifierDispatchBinding,
-    verification_receipt_sha256,
+    TestJob, TestdError, TestdTerminalCompletionNotice, TestdTerminalPublication,
+    TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,15 +71,83 @@ use serde::{Deserialize, Serialize};
 pub const TESTD_ADMISSION_OPERATION: &str = "eliot.kernel.testd-admission";
 /// Wire revision admitted by this client.
 pub const TESTD_ADMISSION_OPERATION_VERSION: u16 = 1;
-/// Authenticated receipt-publication operation on the same TestD Kernel
+/// Authenticated receipt-publication operation on the same `TestD` Kernel
 /// session used for admission.
 pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str = "eliot.kernel.testd-terminal-completion";
-/// Version of the TestD terminal-completion wire.
+/// Version of the `TestD` terminal-completion wire.
 pub const TESTD_TERMINAL_COMPLETION_OPERATION_VERSION: u16 = 1;
 /// Advertisement for the testd admission operation: inert until the dispatch
 /// slice lands. Testd fails closed with `KERNEL_ADMISSION_REQUIRED` while
 /// this is `false`.
 pub const TESTD_ADMISSION_ADVERTISED: bool = false;
+
+/// Validates the exact committed canonical write receipt shared by fresh
+/// publication and terminal replay readback.
+pub(crate) fn validate_committed_verifier_write_receipt(
+    receipt: &WriteReceipt,
+    expected_operation: &str,
+    expected_idempotency_key: &str,
+    expected_state_fence: &StateFence,
+) -> Result<(), TestdIpcError> {
+    receipt
+        .validate()
+        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != expected_operation
+        || receipt.idempotency_key != expected_idempotency_key
+        || receipt.state_fence != *expected_state_fence
+    {
+        return Err(TestdIpcError::Contract(
+            "terminal receipt is not the exact committed verifier WriteReceipt".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads and validates the original committed receipt retained by `TestD`.
+/// Missing and pending publications remain typed errors; worker terminal
+/// state alone never proves the public publisher completed.
+pub(crate) fn read_committed_terminal_write_receipt(
+    publication: Option<&TestdTerminalPublication>,
+    original_receipt_sha256: &str,
+    expected_operation: &str,
+    expected_idempotency_key: &str,
+    expected_state_fence: &StateFence,
+) -> Result<WriteReceipt, TestdIpcError> {
+    let publication = publication.ok_or_else(|| {
+        TestdIpcError::Contract("terminal replay has no original committed publication".to_owned())
+    })?;
+    if publication.receipt_sha256 != original_receipt_sha256 {
+        return Err(TestdIpcError::Contract(
+            "terminal publication does not bind the original verification receipt".to_owned(),
+        ));
+    }
+    let committed_receipt_json = publication.committed_receipt_json.as_ref().ok_or_else(|| {
+        TestdIpcError::Contract(
+            "terminal replay is pending the original committed WriteReceipt".to_owned(),
+        )
+    })?;
+    let receipt: WriteReceipt = serde_json::from_str(committed_receipt_json)
+        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    let value = serde_json::to_value(&receipt)
+        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    let canonical =
+        canonical_json_bytes(&value).map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    let canonical =
+        String::from_utf8(canonical).map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+    if canonical.as_str() != committed_receipt_json.as_str() {
+        return Err(TestdIpcError::Contract(
+            "stored terminal WriteReceipt is not canonical JSON".to_owned(),
+        ));
+    }
+    validate_committed_verifier_write_receipt(
+        &receipt,
+        expected_operation,
+        expected_idempotency_key,
+        expected_state_fence,
+    )?;
+    Ok(receipt)
+}
 
 /// Returns whether Kernel currently advertises the testd admission
 /// operation.
@@ -98,7 +166,7 @@ pub fn route_testd_admission(wire_id: &str, wire_version: u16) -> bool {
     wire_id == TESTD_ADMISSION_OPERATION && wire_version == TESTD_ADMISSION_OPERATION_VERSION
 }
 
-/// Closed TestD terminal notification. Its payload contains only the durable
+/// Closed `TestD` terminal notification. Its payload contains only the durable
 /// job identity and the digest of the immutable finish receipt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -653,7 +721,7 @@ impl KernelTestdIpcClient {
 
     /// Sends the immutable terminal receipt reference through the existing
     /// authenticated Kernel session and waits for the daemon's committed
-    /// canonical WriteReceipt. Pending replies never map to success.
+    /// canonical `WriteReceipt`. Pending replies never map to success.
     pub fn publish_terminal_completion(
         &mut self,
         notice: &TestdTerminalCompletionNotice,
@@ -729,25 +797,18 @@ impl KernelTestdIpcClient {
                                 .to_owned(),
                         ));
                     }
-                    receipt
-                        .validate()
-                        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
                     let expected_operation = format!("{}/verifier-execution", binding.operation_id);
                     let expected_idempotency =
                         format!("{}:verifier-execution", identity.idempotency_key);
-                    if receipt.status != WriteReceiptStatus::Committed
-                        || receipt.operation_id.as_str() != expected_operation
-                        || receipt.idempotency_key != expected_idempotency
-                        || receipt.state_fence != identity.request.state_fence
-                    {
-                        return Err(TestdIpcError::Contract(
-                            "Kernel terminal response lacks the exact committed verifier WriteReceipt"
-                                .to_owned(),
-                        ));
-                    }
+                    validate_committed_verifier_write_receipt(
+                        &receipt,
+                        &expected_operation,
+                        &expected_idempotency,
+                        &identity.request.state_fence,
+                    )?;
                     return Ok(receipt);
                 }
-                _ => {
+                TestdTerminalCompletionResponse::Pending { .. } => {
                     return Err(TestdIpcError::Contract(
                         "Kernel terminal-completion response is not bound to the request"
                             .to_owned(),
@@ -1278,7 +1339,7 @@ where
 )]
 mod tests {
     use super::*;
-    use eliot_contracts::EpochLineageId;
+    use eliot_contracts::{EpochLineageId, ErrorCode};
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1295,6 +1356,110 @@ mod tests {
 
     fn digest(byte: u8) -> String {
         (0..32).map(|_| format!("{byte:02x}")).collect()
+    }
+
+    fn store_write_receipt_fixture() -> Result<WriteReceipt, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_str(include_str!(
+            "../../../crates/kernel/eliot-kernel-service/tests/data/reserved-write/receipt.json"
+        ))?)
+    }
+
+    fn canonical_write_receipt_json(
+        receipt: &WriteReceipt,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let value = serde_json::to_value(receipt)?;
+        let canonical = canonical_json_bytes(&value)?;
+        Ok(String::from_utf8(canonical)?)
+    }
+
+    #[test]
+    fn terminal_replay_reads_exact_original_committed_write_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let receipt = store_write_receipt_fixture()?;
+        let verification_digest = digest(b'v');
+        let publication = TestdTerminalPublication {
+            receipt_sha256: verification_digest.clone(),
+            committed_receipt_json: Some(canonical_write_receipt_json(&receipt)?),
+        };
+
+        let readback = read_committed_terminal_write_receipt(
+            Some(&publication),
+            &verification_digest,
+            receipt.operation_id.as_str(),
+            &receipt.idempotency_key,
+            &receipt.state_fence,
+        )?;
+
+        assert_eq!(readback, receipt);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_replay_refuses_foreign_receipt_identity_fence_status_and_pending()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let receipt = store_write_receipt_fixture()?;
+        let expected_operation = receipt.operation_id.as_str();
+        let expected_idempotency = receipt.idempotency_key.as_str();
+        let expected_fence = &receipt.state_fence;
+        assert!(
+            validate_committed_verifier_write_receipt(
+                &receipt,
+                "foreign-verifier-operation",
+                expected_idempotency,
+                expected_fence,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_committed_verifier_write_receipt(
+                &receipt,
+                expected_operation,
+                "foreign-verifier-idempotency",
+                expected_fence,
+            )
+            .is_err()
+        );
+        let mut foreign_fence = expected_fence.clone();
+        foreign_fence.authority_epoch = test_epoch(2);
+        assert!(
+            validate_committed_verifier_write_receipt(
+                &receipt,
+                expected_operation,
+                expected_idempotency,
+                &foreign_fence,
+            )
+            .is_err()
+        );
+
+        let mut refused = receipt.clone();
+        refused.status = WriteReceiptStatus::Rejected;
+        refused.error_code = Some(ErrorCode::Unavailable);
+        assert!(
+            validate_committed_verifier_write_receipt(
+                &refused,
+                expected_operation,
+                expected_idempotency,
+                expected_fence,
+            )
+            .is_err()
+        );
+
+        let verification_digest = digest(b'v');
+        let pending = TestdTerminalPublication {
+            receipt_sha256: verification_digest.clone(),
+            committed_receipt_json: None,
+        };
+        assert!(
+            read_committed_terminal_write_receipt(
+                Some(&pending),
+                &verification_digest,
+                expected_operation,
+                expected_idempotency,
+                expected_fence,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     fn test_invocation() -> InstrumentInvocation {

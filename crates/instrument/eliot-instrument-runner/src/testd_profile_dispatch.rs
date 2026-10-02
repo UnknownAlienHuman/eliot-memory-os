@@ -33,6 +33,8 @@
 //! runs through the governed `ProcessExecutor` contour owned by issue #20/#100,
 //! and evaluation still belongs to `eliot-verifier`.
 
+use eliot_contracts::ContractId;
+use eliot_instrument_api::InstrumentKind;
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT;
 use eliot_testd_core::{TESTD_LIST_PROFILE, TESTD_PRODUCTIVE_PROFILE, TESTD_SCOPED_PROFILE};
 use thiserror::Error;
@@ -166,6 +168,35 @@ pub enum TestdDispatchError {
         /// The instrument contract the profile dispatches.
         instrument_contract: &'static str,
     },
+    /// A recorded instrument contract failed its typed constructor.
+    #[error(transparent)]
+    Contract(#[from] eliot_contracts::ContractError),
+}
+
+/// Composes one productive Testd profile with the current provider registry.
+///
+/// The profile name is resolved through the closed dispatch table before the
+/// existing registry decision closure checks ownership, freshness, platform
+/// support, and Testd admission. An admitted but nonproductive Testd profile
+/// has no table entry and cannot reach that closure.
+///
+/// # Errors
+///
+/// Returns [`TestdDispatchError::UndispatchableProfile`] when Testd does not
+/// dispatch the profile productively, or [`TestdDispatchError::Contract`] if
+/// the recorded contract identity fails its typed constructor.
+pub fn compose_testd_profile_dispatch(
+    registry: &ProviderRegistry,
+    profile: &str,
+    inputs: &crate::AvailabilityInputs<'_>,
+) -> Result<crate::ProviderDispatch, TestdDispatchError> {
+    let instrument = ContractId::new(instrument_contract_for_testd_profile(profile)?)?;
+    Ok(crate::compose_provider_dispatch(
+        registry,
+        &instrument,
+        InstrumentKind::Test,
+        inputs,
+    ))
 }
 
 /// Verifies the recorded dispatch table against Testd's own admission surface
@@ -266,4 +297,123 @@ fn verify_disposition_profiles(registry: &ProviderRegistry) -> Result<(), TestdD
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::InvalidationSet;
+    use crate::{AvailabilityInputs, ProviderDisposition};
+
+    fn fingerprints() -> InvalidationSet {
+        InvalidationSet {
+            source: "source".to_owned(),
+            lock: "lock".to_owned(),
+            toolchain: "toolchain".to_owned(),
+            env: "env".to_owned(),
+            exe: "exe".to_owned(),
+            profile: "profile".to_owned(),
+            parser: "parser".to_owned(),
+        }
+    }
+
+    fn ready_registry(
+        fingerprints: &InvalidationSet,
+    ) -> Result<ProviderRegistry, crate::RegistryError> {
+        ProviderRegistry::ready(7, "normative".to_owned(), fingerprints)
+    }
+
+    fn inputs(fingerprints: &InvalidationSet) -> AvailabilityInputs<'_> {
+        AvailabilityInputs {
+            generation: 7,
+            normative_pair_digest: "normative",
+            fingerprints,
+            platform: crate::host_platform(),
+        }
+    }
+
+    #[test]
+    fn productive_testd_profiles_dispatch_through_the_ready_registry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fingerprints = fingerprints();
+        let registry = ready_registry(&fingerprints)?;
+        let inputs = inputs(&fingerprints);
+
+        for profile in [
+            TESTD_PRODUCTIVE_PROFILE,
+            TESTD_LIST_PROFILE,
+            TESTD_SCOPED_PROFILE,
+        ] {
+            let dispatch = compose_testd_profile_dispatch(&registry, profile, &inputs)?;
+            assert!(dispatch.is_dispatchable(), "{profile}");
+            assert_eq!(
+                dispatch.entry().map(|entry| entry.instrument.as_str()),
+                Some(NEXTEST_INSTRUMENT)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_testd_profile_is_undispatchable() -> Result<(), crate::RegistryError> {
+        let fingerprints = fingerprints();
+        let registry = ready_registry(&fingerprints)?;
+        let inputs = inputs(&fingerprints);
+
+        assert!(matches!(
+            compose_testd_profile_dispatch(&registry, "unknown", &inputs),
+            Err(TestdDispatchError::UndispatchableProfile { profile }) if profile == "unknown"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn harmless_cargo_test_probe_is_undispatchable() -> Result<(), crate::RegistryError> {
+        let fingerprints = fingerprints();
+        let registry = ready_registry(&fingerprints)?;
+        let inputs = inputs(&fingerprints);
+
+        assert!(matches!(
+            compose_testd_profile_dispatch(
+                &registry,
+                eliot_testd_core::TESTD_ADMITTED_PROFILE,
+                &inputs,
+            ),
+            Err(TestdDispatchError::UndispatchableProfile { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_testd_profile_mapping_keeps_its_typed_disposition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fingerprints = fingerprints();
+        let registry = ready_registry(&fingerprints)?;
+        let mut inputs = inputs(&fingerprints);
+        inputs.generation += 1;
+
+        let dispatch =
+            compose_testd_profile_dispatch(&registry, TESTD_PRODUCTIVE_PROFILE, &inputs)?;
+        assert!(matches!(
+            dispatch.disposition(),
+            ProviderDisposition::Stale { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_testd_profile_mapping_keeps_its_typed_disposition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fingerprints = fingerprints();
+        let registry = ProviderRegistry::build(Vec::new(), 7, "normative".to_owned())?;
+        let inputs = inputs(&fingerprints);
+
+        let dispatch =
+            compose_testd_profile_dispatch(&registry, TESTD_PRODUCTIVE_PROFILE, &inputs)?;
+        assert!(matches!(
+            dispatch.disposition(),
+            ProviderDisposition::Unmapped
+        ));
+        Ok(())
+    }
 }
