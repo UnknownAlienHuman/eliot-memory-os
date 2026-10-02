@@ -1113,12 +1113,19 @@ pub(crate) fn decode_source_message(
 /// supplied (best-effort or explicit replay, never a fabricated durable
 /// cursor).
 ///
-/// The returned pair feeds
+/// The returned pair is shaped for
 /// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`
-/// directly: the receipt equals the envelope's embedded normalization receipt
+/// intake, and the structural precondition for that intake holds here: the
+/// receipt equals the envelope's embedded normalization receipt
 /// (`envelope.normalization == receipt`), both carry
 /// [`eliot_agent_api::ProofCeiling::Observation`] only, and no new store,
 /// durable sink, or Kernel authority is created here.
+///
+/// This crate holds no dependency on `eliot-agent-coordinator` and contains no
+/// call to `observe_provider_event`: it is a private validator reached through
+/// [`normalize_acp_event`] by the ACP producers in this crate. The intake edge
+/// itself is owned by the coordinator-facing caller and is not established
+/// here (issue #369 A4).
 fn validate_acp_event_input(input: &AcpHostEventInput<'_>) -> Result<(), AcpAdapterError> {
     if input.sequence == 0 {
         return Err(AcpAdapterError::InvalidInput("sequence"));
@@ -1866,13 +1873,24 @@ pub struct AcpWireResultIds {
 ///   `assemble_candidate_result` to `UnknownOutcome` with its recovery handle;
 /// - `Request` is an inbound call and never a result: rejected.
 ///
-/// The translated result feeds
-/// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
-/// intake only, never Finish authority).
+/// The translated result is shaped for
+/// `eliot-agent-coordinator::AgentCoordinator::submit_result` intake (candidate
+/// only, never Finish authority). This crate holds no dependency on
+/// `eliot-agent-coordinator` and contains no such call, so the intake edge is
+/// owned by the coordinator-facing caller and is not established here
+/// (issue #369 A4).
 ///
-/// LIVE CALLER (issues #228 W2/W5, #2641 W4/AUD3): [`AcpWire::receive_result`]
-/// is the in-crate production caller: it feeds one real received ACP message
-/// with its admitted wire identities. End-to-end hookup from the
+/// PRODUCTION CHAIN (issues #228 W2/W5, #2641 W4/AUD3), all non-test:
+/// [`AcpWire::receive_result`] reads one real received ACP message from a
+/// caller-owned transport and calls this function, which drains it through
+/// [`AcpResultEnvelope::assemble_candidate_result`] /
+/// [`AcpResultEnvelope::into_agent_result`]; those build the single
+/// provider-neutral [`PhysicalRouteObservationReceipt`] and enforce it with
+/// `validate_against(binding, admission)`.
+///
+/// The head of that chain, [`AcpWire::receive_result`], currently has no caller
+/// in this workspace: `eliot-agent-acp` is depended on by no crate, so no
+/// compiled binary links this conversion. End-to-end hookup from the
 /// native-worker provider-runtime driver (which owns the transport and the
 /// receiving-owner identities) is still BLOCKED-BY that driver slice.
 /// Forbidden: a synthetic or test-only message to manufacture a caller.

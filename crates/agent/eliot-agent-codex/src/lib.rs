@@ -2203,9 +2203,15 @@ pub fn assemble_candidate_result(
 /// [`translate_result`] (`validate_against`). A non-terminal envelope, an
 /// incomplete stream, or a linkage mismatch fails closed; success maps to
 /// candidate-only `Partial` exactly as [`translate_result`] defines, never
-/// Finish authority. The normalized pair feeds
-/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event`, and
-/// the translated result feeds `AgentCoordinator::submit_result`.
+/// Finish authority.
+///
+/// The normalized pair and the translated result are shaped for
+/// `eliot-agent-coordinator::AgentCoordinator::observe_provider_event` and
+/// `AgentCoordinator::submit_result` intake. This crate's only coordinator
+/// dependency is the model-catalogue type (`ModelCatalogueSnapshot`,
+/// `ModelControlError`); it contains no `AgentCoordinator` call, so both
+/// intake edges are owned by the coordinator-facing caller and are not
+/// established here (issue #369 A4).
 #[derive(Debug)]
 pub struct CodexTurnResultDrain<'a> {
     /// Drained terminal wire notification (must be a notification, not a
