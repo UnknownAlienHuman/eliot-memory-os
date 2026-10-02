@@ -1979,6 +1979,72 @@ mod host_lifecycle_boundary_table_tests {
         .expect("test host epoch must be constructible")
     }
 
+    /// A COMPLETE readiness contour: the Store proof fence, the supervision
+    /// lease, the ORS receipt, and the Watchdog publication digests are all
+    /// present, which is the shape the real owner presents after an
+    /// authenticated journal append
+    /// (`HostComposition::persist_fresh_authenticated_readiness`). A contour
+    /// built this way is what the gate can genuinely grant a lease for, so a
+    /// test that uses one exercises the real grant/unknown arms rather than a
+    /// degraded stand-in that would change which arm runs.
+    #[cfg(windows)]
+    fn complete_readiness_contour(
+        label: &str,
+    ) -> super::readiness_gate::ReadinessContourIdentity {
+        use super::readiness_gate::ReadinessContourIdentity;
+        let handle = |suffix: &str| {
+            PlatformHandle::new(format!("{label}-{suffix}")).expect("contour handle must be valid")
+        };
+        ReadinessContourIdentity {
+            approved_generation: handle("generation"),
+            approved_kernel_artifact: handle("kernel-artifact"),
+            approved_store_artifact: handle("store-artifact"),
+            approved_config: handle("config"),
+            active_kernel_record_checksum: handle("kernel-checksum"),
+            candidate_binding_digest: handle("candidate-binding"),
+            store_requirement_digest: handle("store-requirement"),
+            store_proof_fence: Some(handle("store-proof-fence")),
+            supervision_lease_id: Some(handle("supervision-lease")),
+            supervision_ors_receipt_digest: Some(handle("ors-receipt")),
+            watchdog_publication_digest: Some(handle("watchdog-publication")),
+        }
+    }
+
+    /// What the authenticated step of the readiness seam may return: the
+    /// journaled contour on success, or the typed error that decides the kind.
+    #[cfg(windows)]
+    type ContourProbe = Result<super::readiness_gate::ReadinessContourIdentity, super::HostError>;
+
+    /// What one `reconcile_authenticated_readiness` walk actually did through the
+    /// real gate seam: how many times the authenticated journal step ran, the
+    /// disposition it returned, and the failure kind the gate retained.
+    #[cfg(windows)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ReconcileWalk {
+        probes: u32,
+        disposition: super::HostBranchDisposition,
+        failure: Option<super::ReadinessFailureKind>,
+    }
+
+    #[cfg(windows)]
+    fn reconcile_walk(
+        gate: &mut super::readiness_gate::HostReadinessGate,
+        contour: ContourProbe,
+        now: std::time::Instant,
+        mut outcome: impl FnMut() -> ContourProbe,
+    ) -> ReconcileWalk {
+        let mut probes = 0_u32;
+        let disposition = super::reconcile_authenticated_readiness(gate, contour, now, || {
+            probes += 1;
+            outcome()
+        });
+        ReconcileWalk {
+            probes,
+            disposition,
+            failure: gate.last_failure(),
+        }
+    }
+
     fn lifecycle_fixture() -> serde_json::Value {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/host_lifecycle_diagnostics.json");
@@ -3726,33 +3792,100 @@ mod host_lifecycle_boundary_table_tests {
             super::ReadinessFailureKind::ProbeRejected,
             "a refused probe must stay distinct from an unknown outcome"
         );
-        use super::readiness_gate::{HostReadinessGate, ReadinessCadence};
+        assert_ne!(
+            super::ReadinessFailureKind::ContourUnavailable,
+            super::ReadinessFailureKind::DeliveryUnknown,
+            "an absent contour and an unknown delivery are distinct kinds"
+        );
+
+        // The real gate seam, on a contour that WAS presented and authenticated:
+        // the possible state change happens in the journal step the gate calls
+        // for a due probe, so that is where the unknown delivery is recorded.
+        use super::readiness_gate::{HostReadinessGate, ReadinessCadence, ReadinessGateAction};
+        let now = std::time::Instant::now();
+        let presented = complete_readiness_contour("891-case-13");
+        let mut proof_gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        assert!(
+            proof_gate.grant(presented.clone(), now),
+            "the presented contour must be complete enough to earn a lease"
+        );
         let mut gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
-        let mut probes = 0_u32;
-        let disposition = super::reconcile_authenticated_readiness(
-            &mut gate,
+        let possible_change = reconcile_walk(&mut gate, Ok(presented.clone()), now, || {
             Err(super::HostError::RecoveryRequired(
                 "restart may have taken effect".to_owned(),
-            )),
-            std::time::Instant::now(),
-            || -> Result<super::readiness_gate::ReadinessContourIdentity, super::HostError> {
-                probes += 1;
-                Err(super::HostError::Stopped)
-            },
+            ))
+        });
+        assert_eq!(
+            possible_change.probes, 1,
+            "a presented contour must reach the authenticated journal step exactly once"
         );
         assert_eq!(
-            probes, 0,
-            "a possible state change must not re-probe as a retry"
-        );
-        assert_eq!(
-            disposition,
+            possible_change.disposition,
             super::HostBranchDisposition::ReadinessDegraded,
             "an unknown outcome degrades, never becomes healthy"
         );
         assert_eq!(
-            gate.last_failure(),
+            possible_change.failure,
             Some(super::ReadinessFailureKind::DeliveryUnknown),
             "the gate must retain the typed unknown kind for the retry"
+        );
+        assert!(
+            matches!(
+                gate.action(Some(&presented), now),
+                ReadinessGateAction::RetryPending(super::ReadinessFailureKind::DeliveryUnknown)
+            ),
+            "the retained typed unknown kind is exactly what the pending retry carries"
+        );
+        assert!(
+            !matches!(
+                gate.action(Some(&presented), now),
+                ReadinessGateAction::PreserveAuthenticatedHealth
+            ),
+            "an unknown delivery must never leave a health-preserving lease"
+        );
+        // The typed unknown is retained, not re-probed: the same contour inside
+        // the retry window is refused before any second journal attempt.
+        let deferred = reconcile_walk(&mut gate, Ok(presented.clone()), now, || {
+            Err(super::HostError::Stopped)
+        });
+        assert_eq!(
+            deferred.probes, possible_change.probes,
+            "a pending unknown must not re-probe as a retry"
+        );
+        assert_eq!(
+            deferred.disposition,
+            super::HostBranchDisposition::ReadinessDegraded,
+            "a pending retry stays degraded, never becomes healthy"
+        );
+        assert_eq!(
+            deferred.failure,
+            Some(super::ReadinessFailureKind::DeliveryUnknown),
+            "the typed unknown kind survives a pending retry"
+        );
+
+        // An unavailable contour is its OWN case, exercised deliberately here:
+        // it is refused before any authentication, so it is never recorded as a
+        // delivery that may have taken effect.
+        let mut unavailable_gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
+        let unavailable = reconcile_walk(
+            &mut unavailable_gate,
+            Err(super::HostError::Stopped),
+            now,
+            || Ok(presented.clone()),
+        );
+        assert_eq!(
+            unavailable.probes, 0,
+            "an unavailable contour never authenticates or journals anything"
+        );
+        assert_eq!(
+            unavailable.disposition,
+            super::HostBranchDisposition::ReadinessDegraded,
+            "an unavailable contour degrades, never becomes healthy"
+        );
+        assert_eq!(
+            unavailable.failure,
+            Some(super::ReadinessFailureKind::ContourUnavailable),
+            "an absent contour is its own typed kind, never an unknown delivery"
         );
 
         // The emitted vocabulary stays on the unknown side of the boundary.
