@@ -125,13 +125,13 @@ commands = [
   "python scripts/verify-excluded-dispositions-1811.py",
   "python scripts/migration_inventory_1860.py --check",
   "git diff --check",
-  "python scripts/verify-no-retired-package-residue.py",
 ]
 executed = [
   "python scripts/audit-architecture-boundaries.py: exit 1 with pre-existing hard violations in bins/eliotd and bins/eliot-native-worker runtime-root direct dependencies; no finding names this package or #1193.",
   "python scripts/verify-excluded-dispositions-1811.py: PASS rows=9.",
   "python scripts/migration_inventory_1860.py --check: exit 1 on the pre-existing excluded-scope premise (9 standalone rows against the 13-wide audit premise recorded in 2026); unchanged by this work unit.",
   "Residue search for the retired package name: zero remaining hits; only the two record facts in this work unit that must name the retired path (retirement commit evidence and retired_path) remain.",
+  "External audit comment 5934166062 re-verification (2026-10-02): repository-wide git grep for the retired package name returns this record's own retired_path line only; Cargo.toml, Cargo.lock, config/architecture-boundaries.toml, docs/code-navigation/PACKAGE_DOCS_INDEX.md and PROTOTYPE_DOCS_INDEX.md return zero matches; write-source, assemble-package, integrate-package, finish-parent, ClaimRegistry, PackageAssemblyLease and ControllerAttempt have zero call sites, so no D-02 effect was relocated under another name; D-02:plan-v4 and the literal opencode-go/deepseek-v4-flash route appear only here, while the bare deepseek-v4-flash model literal remains only in the live #361/#874 OpenCode adapter; the dangling `python scripts/verify-no-retired-package-residue.py` entry was removed from [verification] commands because no such script exists in the tree; no cargo command was executed by this writer.",
 ]
 edge_proof = "Current work-unit and swarm flows run with the deleted package unavailable; there is no retained legacy-import fixture because deletion retained no D-02 material."
 product_proof = "Issues #681, #1126 and #11 remain open."

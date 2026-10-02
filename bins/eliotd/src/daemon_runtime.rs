@@ -4860,6 +4860,205 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
+/// Typed refusal of [`submit_replace_preference_policy_candidate`].
+///
+/// `Invalid` and the fence-`Stale` land before any store access; `Conflict`,
+/// predecessor-`Stale`, and `Owner` surface from the settings owner before
+/// any commit, so the retained document is untouched on every refusal path.
+/// No refusal mints authority and none reports success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubmitReplacePreferencePolicyError {
+    /// The sealed-candidate gate failed (`"sealed-candidate"`: digest
+    /// closure, capability-scope binding, or `candidate_only` ceiling) or
+    /// the command is not a `ReplacePreferencePolicy` candidate
+    /// (`"command-kind"`). No store access performed.
+    Invalid(&'static str),
+    /// The live fence moved under the candidate's pinned fence
+    /// (`"live-fence"`, checked before any store access), or the retained
+    /// predecessor moved under the candidate anchor (`"predecessor"`,
+    /// including the same-predecessor/different-replacement conflict
+    /// loser, decided atomically inside the owner transaction).
+    Stale(&'static str),
+    /// The replacement's stable identity conflicts with the retained
+    /// predecessor (`"account-scope"` / `"policy-id"`): scope and policy
+    /// ID cannot change under replacement. Detected before any commit.
+    Conflict(&'static str),
+    /// Any other settings-owner refusal, carried unchanged: unavailable
+    /// backend, corrupt/oversized/legacy store, or a structurally invalid
+    /// replacement.
+    Owner(eliot_host_state::ModelPreferenceStoreError),
+}
+
+impl std::fmt::Display for SubmitReplacePreferencePolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(detail) => write!(
+                f,
+                "replace-preference-policy submit refused: invalid {detail}"
+            ),
+            Self::Stale(detail) => {
+                write!(
+                    f,
+                    "replace-preference-policy submit refused: stale {detail}"
+                )
+            }
+            Self::Conflict(detail) => write!(
+                f,
+                "replace-preference-policy submit refused: conflicting {detail}"
+            ),
+            Self::Owner(error) => write!(
+                f,
+                "replace-preference-policy submit refused by settings owner: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubmitReplacePreferencePolicyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Owner(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<eliot_host_state::ModelPreferenceStoreError> for SubmitReplacePreferencePolicyError {
+    fn from(error: eliot_host_state::ModelPreferenceStoreError) -> Self {
+        match error {
+            eliot_host_state::ModelPreferenceStoreError::Stale => Self::Stale("predecessor"),
+            eliot_host_state::ModelPreferenceStoreError::ScopeMismatch => {
+                Self::Conflict("account-scope")
+            }
+            eliot_host_state::ModelPreferenceStoreError::PolicyIdMismatch => {
+                Self::Conflict("policy-id")
+            }
+            other => Self::Owner(other),
+        }
+    }
+}
+
+/// Live submit leg for one sealed Human model-preference replacement
+/// (issue #485, audit 5872395796; production caller for CHECK
+/// R1-contract-prerequisite and CHECK R4-publication-receipt).
+///
+/// Exchange contract (fixed): the input is the sealed candidate triple
+/// (`expected_policy_id`, `expected_policy_revision`,
+/// `expected_policy_digest`) plus the full replacement policy of one
+/// authenticated `SwarmCommandKind::ReplacePreferencePolicy` candidate
+/// (`ControlBoard::swarm_command_candidate` over
+/// `OperatorAction::ReplaceSwarmPolicy`, compiled by
+/// `compile_replace_policy_candidate`); the producer is this daemon submit
+/// leg; the triple and the replacement cross end to end equal — carried
+/// verbatim, never re-derived, and no caller-supplied digest is ever
+/// retained because the owner recomputes every digest it stores; the clock
+/// is the live fence read at submit (`live_fence`, taken from the admitted
+/// Kernel fence under a short borrow at the call site, never cached); the
+/// output is the owner's `(ModelPreferenceCasOutcome,
+/// ModelPreferencePublicationReceipt)` pair for A-02/A-08 readback;
+/// refusals are typed `Stale`/`Conflict`/`Invalid`, every submit-leg
+/// refusal lands before any store access, and every owner refusal aborts
+/// before any commit.
+///
+/// Sequence (the single owner seam, shared with the
+/// `eliotd::capability_admission::publish_replace_preference_policy_candidate`
+/// publisher, which this leg calls below: sealed-candidate gate,
+/// live-fence liveness, then the publisher's open, fresh load,
+/// anchor-pin, atomic CAS, and receipt readback). `Committed` carries the newly committed
+/// store revision with the prior revision/digest link recorded in the
+/// receipt; `Replayed` names the unchanged retained revision. On `Stale`
+/// the caller reloads, re-pins against a recompiled candidate, and
+/// retries; the atomic recheck inside the owner transaction is what makes
+/// the retry converge. A missing receipt after a successful CAS names a
+/// store that no longer retains the committed document and surfaces as
+/// unavailable instead of an invented receipt.
+///
+/// This leg mints no authority: role/capability admission for the
+/// submitting principal stays with the candidate leg (the sealed digest
+/// covers the predecessor triple and the replacement, and the
+/// `candidate_only` ceiling is rechecked here), and it performs no provider
+/// call, no catalogue refresh, and owns no settings database beyond the one
+/// configured store path it is given.
+pub fn submit_replace_preference_policy_candidate(
+    store_path: &std::path::Path,
+    candidate: &eliot_agent_coordinator::SwarmCommandCandidate,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<
+    (
+        eliot_host_state::ModelPreferenceCasOutcome,
+        eliot_host_state::ModelPreferencePublicationReceipt,
+    ),
+    SubmitReplacePreferencePolicyError,
+> {
+    candidate
+        .validate()
+        .map_err(|_| SubmitReplacePreferencePolicyError::Invalid("sealed-candidate"))?;
+    let eliot_agent_coordinator::SwarmCommandKind::ReplacePreferencePolicy {
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+        policy,
+    } = &candidate.kind
+    else {
+        return Err(SubmitReplacePreferencePolicyError::Invalid("command-kind"));
+    };
+    if !eliot_contracts::fences_match_exact(&candidate.view_fence, live_fence) {
+        return Err(SubmitReplacePreferencePolicyError::Stale("live-fence"));
+    }
+    eliotd::capability_admission::publish_replace_preference_policy_candidate(
+        store_path,
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+        policy,
+    )
+    .map_err(SubmitReplacePreferencePolicyError::from)
+}
+
+/// Daemon execution/intake seam for one sealed Human model-preference
+/// replacement (issue #485, audit 5872395796; versioned intake `v1`).
+///
+/// This is the genuine live caller of
+/// [`submit_replace_preference_policy_candidate`]: it binds the sealed
+/// candidate the authenticated `ControlBoard` edge produced to the live
+/// daemon context — the configured store path from
+/// [`eliotd::DaemonComposition::model_preference_store_path`] and the live
+/// fence from [`eliotd::DaemonComposition::governor_kernel_fence`], read here
+/// at the call under a short borrow and never cached — and routes the sealed
+/// triple plus replacement into the submit leg with typed refusals.
+///
+/// The three inputs are never fabricated here: the candidate arrives sealed
+/// from `ControlBoard::swarm_command_candidate` (role/capability admission and
+/// the `candidate_only` ceiling stay with that leg and are rechecked by the
+/// submit leg), the store path is the one configured path under the existing
+/// settings owner, and the fence is the admitted Kernel fence the composition
+/// stands on. On `Stale` the caller reloads, re-pins against a recompiled
+/// candidate, and retries; every refusal lands before any commit.
+///
+/// This seam mints no authority, performs no provider call or catalogue
+/// refresh, and owns no settings database beyond the configured store path it
+/// is given. Role/capability admission for the submitting principal stays with
+/// the candidate leg. The wire trigger that presents sealed candidates to this
+/// seam (operator swarm-command execution dispatch) is a later slice: no
+/// Kernel admission gate admits such a pair today (see the four-gate analysis
+/// at `run_local_read_poll`), so this seam takes the sealed candidate as its
+/// parameter rather than inventing one, and no second store or caller-supplied
+/// digest is retained.
+pub fn route_sealed_replace_preference_policy_candidate(
+    composition: &DaemonComposition,
+    candidate: &eliot_agent_coordinator::SwarmCommandCandidate,
+) -> Result<
+    (
+        eliot_host_state::ModelPreferenceCasOutcome,
+        eliot_host_state::ModelPreferencePublicationReceipt,
+    ),
+    SubmitReplacePreferencePolicyError,
+> {
+    let store_path = composition.model_preference_store_path();
+    let live_fence = composition.governor_kernel_fence();
+    submit_replace_preference_policy_candidate(&store_path, candidate, &live_fence)
+}
+
 /// What one settled observe poll step produced (issue #2565).
 ///
 /// `Deferred` is the honest steady state while the Governor observation
@@ -8268,5 +8467,303 @@ mod tests {
         assert_eq!(result.result_sha256, original_sha);
         assert!(result.resolved_binding().is_none());
         result.validate_against(&ticket).expect("valid binding");
+    }
+
+    /// Issue #485 R1/R4 production-caller proof (audit 5872395796).
+    ///
+    /// Every case below enters the one production entry point
+    /// [`crate::submit_replace_preference_policy_candidate`]: sealed candidate
+    /// -> live-fence liveness -> settings-owner open/load/anchor/CAS ->
+    /// receipt readback. Nothing here calls the store directly except the
+    /// genesis fixture (the first publication has no predecessor triple for a
+    /// candidate to anchor on, so it is minted by the owner's own genesis
+    /// expectation) and the read-only assertions.
+    mod model_preference_publication {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU64;
+        use std::path::{Path, PathBuf};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use eliot_agent_contracts::{
+            BillingClass, HumanModelPreferencePolicy, MODEL_PREFERENCE_SCHEMA_VERSION, ModelRole,
+            ModelSelector, RoleModelPreference, preference_policy_digest,
+        };
+        use eliot_agent_coordinator::{
+            ReplacePreferencePolicyRequest, SwarmCommandCallerBinding, SwarmCommandCandidate,
+            SwarmCommandKind, compile_replace_policy_candidate,
+        };
+        use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+        use eliot_host_state::{
+            ModelPreferenceCasOutcome, ModelPreferencePublication, ModelPreferenceStore,
+            PreferenceCasExpected,
+        };
+
+        use crate::{
+            SubmitReplacePreferencePolicyError, submit_replace_preference_policy_candidate,
+        };
+
+        const ACCOUNT_SCOPE: &str = "operator@eliot.local";
+        const POLICY_ID: &str = "human-model-preference";
+        const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const VIEW_REVISION: &str = "view-revision-485";
+        const NOW_UNIX_MS: u64 = 1_700_000_000_000;
+
+        /// One isolated absolute store path under a fresh temporary directory.
+        /// The parent directory exists (the owner never creates parents) and
+        /// the store file itself does not, exactly as at first publication.
+        struct PreferenceStore {
+            root: PathBuf,
+            path: PathBuf,
+        }
+
+        impl Drop for PreferenceStore {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        fn preference_store(label: &str) -> PreferenceStore {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "eliotd-485-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("test store root must be creatable");
+            let path = root.join("model-preferences.redb");
+            PreferenceStore { root, path }
+        }
+
+        fn policy(revision: &str, preferred_model: &str) -> HumanModelPreferencePolicy {
+            HumanModelPreferencePolicy {
+                schema_version: MODEL_PREFERENCE_SCHEMA_VERSION.to_owned(),
+                policy_id: POLICY_ID.to_owned(),
+                revision: revision.to_owned(),
+                account_scope: ACCOUNT_SCOPE.to_owned(),
+                roles: vec![RoleModelPreference {
+                    role: ModelRole::Worker,
+                    preferred: vec![ModelSelector {
+                        host_family: Some("windows".to_owned()),
+                        provider_id: None,
+                        model_id: Some(preferred_model.to_owned()),
+                        model_family: None,
+                    }],
+                    denied: Vec::new(),
+                    allowed_billing: BTreeSet::from([BillingClass::SubscriptionIncluded]),
+                    allow_paid_fallback: false,
+                    allow_degraded_routes: false,
+                    minimum_context_window: 32_000,
+                    maximum_cost_class: 2,
+                    maximum_latency_class: 2,
+                    required_capabilities: BTreeSet::new(),
+                }],
+            }
+        }
+
+        fn live_fence(sequence: u64) -> StateFence {
+            let epoch = EpochId::new(
+                EpochLineageId::new(LINEAGE).expect("valid lineage"),
+                NonZeroU64::new(sequence).expect("nonzero epoch sequence"),
+            )
+            .expect("valid epoch");
+            StateFence::new(epoch, ResourceGeneration::new(1).expect("valid generation"))
+        }
+
+        fn seed_genesis(store: &Path, initial: &HumanModelPreferencePolicy) {
+            let owner = ModelPreferenceStore::open(store).expect("owner opens the store path");
+            let outcome = owner
+                .compare_and_swap_model_preferences(&PreferenceCasExpected::genesis(), initial)
+                .expect("genesis publication must commit");
+            assert_eq!(outcome.store_revision(), 1);
+        }
+
+        fn replace_candidate(
+            command_id: &str,
+            current: &HumanModelPreferencePolicy,
+            replacement: &HumanModelPreferencePolicy,
+            fence: &StateFence,
+        ) -> SwarmCommandCandidate {
+            let binding = SwarmCommandCallerBinding {
+                command_id: command_id.to_owned(),
+                capability_present: true,
+                capability_scope: ACCOUNT_SCOPE.to_owned(),
+                view_revision: VIEW_REVISION.to_owned(),
+                expected_view_revision: VIEW_REVISION.to_owned(),
+                view_fence: fence.clone(),
+                expected_view_fence: fence.clone(),
+                now_unix_ms: NOW_UNIX_MS,
+            };
+            let request = ReplacePreferencePolicyRequest {
+                binding,
+                account_scope: ACCOUNT_SCOPE.to_owned(),
+                current_policy: current.clone(),
+                policy: replacement.clone(),
+                expected_policy_revision: current.revision.clone(),
+                expected_policy_digest: preference_policy_digest(current)
+                    .expect("current policy digest"),
+            };
+            compile_replace_policy_candidate(&request).expect("replace candidate must compile")
+        }
+
+        fn retained_publication(store: &Path) -> ModelPreferencePublication {
+            ModelPreferenceStore::open(store)
+                .expect("owner opens the store path")
+                .load_model_preferences()
+                .expect("retained load must succeed")
+                .expect("the store must retain a committed publication")
+        }
+
+        /// CHECK R1-contract-prerequisite, named case "Move preference policy
+        /// contract to public contract owner." The schema the product persists
+        /// is the public contract's own value, and the digest the owner retains
+        /// is the contract owner's canonicalization of that exact content.
+        #[test]
+        #[allow(
+            clippy::expect_used,
+            reason = "485 caller proof: deterministic fixture construction only"
+        )]
+        fn r1_public_contract_policy_is_what_the_product_persists() {
+            let store = preference_store("r1");
+            let first = policy("rev-1", "model-worker-a");
+            let replacement = policy("rev-2", "model-worker-b");
+            seed_genesis(&store.path, &first);
+            let fence = live_fence(1);
+            let candidate = replace_candidate("command-r1", &first, &replacement, &fence);
+
+            let (outcome, _receipt) =
+                submit_replace_preference_policy_candidate(&store.path, &candidate, &fence)
+                    .expect("the production submit leg must publish the replacement");
+            assert_eq!(outcome.store_revision(), 2);
+
+            let retained = retained_publication(&store.path);
+            assert_eq!(retained.policy, replacement);
+            assert_eq!(
+                retained.policy_digest,
+                preference_policy_digest(&replacement).expect("contract digest")
+            );
+            retained
+                .policy
+                .validate()
+                .expect("the retained policy validates under the contract owner");
+        }
+
+        /// CHECK R4-publication-receipt, named case "Receipt reconstructible
+        /// from retained committed document." A freshly opened owner handle
+        /// rebuilds the byte-identical receipt from the retained document
+        /// after the publishing handle is gone.
+        #[test]
+        #[allow(
+            clippy::expect_used,
+            reason = "485 caller proof: deterministic fixture construction only"
+        )]
+        fn r4_publication_receipt_reconstructs_from_the_retained_document() {
+            let store = preference_store("r4");
+            let first = policy("rev-1", "model-worker-a");
+            let replacement = policy("rev-2", "model-worker-b");
+            seed_genesis(&store.path, &first);
+            let fence = live_fence(1);
+            let candidate = replace_candidate("command-r4", &first, &replacement, &fence);
+
+            let (outcome, receipt) =
+                submit_replace_preference_policy_candidate(&store.path, &candidate, &fence)
+                    .expect("the production submit leg must publish the replacement");
+            assert_eq!(outcome.store_revision(), 2);
+
+            let restarted = ModelPreferenceStore::open(&store.path)
+                .expect("owner reopens the store path after restart")
+                .read_publication_receipt()
+                .expect("receipt readback must succeed")
+                .expect("the committed document must still be retained");
+            assert_eq!(restarted, receipt);
+            assert_eq!(receipt.store_revision, 2);
+            assert_eq!(receipt.policy_id, POLICY_ID);
+            assert_eq!(receipt.policy_revision, replacement.revision);
+            assert_eq!(receipt.prior_store_revision, 1);
+            assert_eq!(
+                receipt.prior_policy_digest,
+                preference_policy_digest(&first).expect("contract digest")
+            );
+            assert_eq!(
+                receipt.policy_digest,
+                preference_policy_digest(&replacement).expect("contract digest")
+            );
+        }
+
+        /// Positive: a preference persists against the exact current revision.
+        /// The anchor names the ORIGINAL recorded identity of the retained
+        /// publication, read fresh from the owner, and the commit advances the
+        /// store revision by one with the prior revision/digest link.
+        #[test]
+        #[allow(
+            clippy::expect_used,
+            reason = "485 caller proof: deterministic fixture construction only"
+        )]
+        fn preference_persists_against_the_exact_current_revision() {
+            let store = preference_store("exact");
+            let first = policy("rev-1", "model-worker-a");
+            let replacement = policy("rev-2", "model-worker-b");
+            seed_genesis(&store.path, &first);
+            let fence = live_fence(1);
+
+            let current = retained_publication(&store.path);
+            assert_eq!(current.store_revision, 1);
+            let candidate =
+                replace_candidate("command-exact", &current.policy, &replacement, &fence);
+            let SwarmCommandKind::ReplacePreferencePolicy {
+                expected_policy_revision,
+                expected_policy_digest,
+                ..
+            } = &candidate.kind
+            else {
+                panic!("the compiled candidate must be a replace-preference command");
+            };
+            assert_eq!(expected_policy_revision, &current.policy.revision);
+            assert_eq!(expected_policy_digest, &current.policy_digest);
+
+            let (outcome, receipt) =
+                submit_replace_preference_policy_candidate(&store.path, &candidate, &fence)
+                    .expect("the exact current revision must publish");
+            assert_eq!(
+                outcome,
+                ModelPreferenceCasOutcome::Committed { store_revision: 2 }
+            );
+            assert_eq!(receipt.store_revision, 2);
+            assert_eq!(receipt.prior_store_revision, current.store_revision);
+            assert_eq!(receipt.prior_policy_digest, current.policy_digest);
+            assert_eq!(retained_publication(&store.path).policy, replacement);
+        }
+
+        /// Refusal: a stale anchor refuses with the existing typed stale
+        /// outcome and leaves the newer retained document untouched.
+        #[test]
+        #[allow(
+            clippy::expect_used,
+            reason = "485 caller proof: deterministic fixture construction only"
+        )]
+        fn stale_preference_candidate_refuses_without_overwriting() {
+            let store = preference_store("stale");
+            let first = policy("rev-1", "model-worker-a");
+            let second = policy("rev-2", "model-worker-b");
+            let third = policy("rev-3", "model-worker-c");
+            seed_genesis(&store.path, &first);
+            let fence = live_fence(1);
+
+            let advance = replace_candidate("command-advance", &first, &second, &fence);
+            submit_replace_preference_policy_candidate(&store.path, &advance, &fence)
+                .expect("the first replacement must publish");
+
+            let stale = replace_candidate("command-stale", &first, &third, &fence);
+            let refusal = submit_replace_preference_policy_candidate(&store.path, &stale, &fence)
+                .expect_err("a stale predecessor anchor must refuse");
+            assert_eq!(
+                refusal,
+                SubmitReplacePreferencePolicyError::Stale("predecessor")
+            );
+
+            let retained = retained_publication(&store.path);
+            assert_eq!(retained.store_revision, 2);
+            assert_eq!(retained.policy, second);
+        }
     }
 }

@@ -26,9 +26,19 @@
 //! publication receipt from the retained committed document via
 //! [`ModelPreferenceStore::read_publication_receipt`]; R5 wires the #484
 //! candidate-side CAS anchor to this owner recheck via
-//! [`PreferenceCasExpected::from_candidate_anchor`]. No production publisher
-//! calls this store yet on purpose: the daemon/publication wiring is STITCH
-//! and must arrive with its own review.
+//! [`PreferenceCasExpected::from_candidate_anchor`].
+//!
+//! Production caller: the daemon submit leg
+//! (`bins/eliotd/src/daemon_runtime.rs::submit_replace_preference_policy_candidate`)
+//! reaches every operation here through the settings-owner publisher
+//! (`bins/eliotd/src/capability_admission.rs::publish_replace_preference_policy_candidate`):
+//! [`ModelPreferenceStore::load_model_preferences`] (fresh predecessor
+//! re-read), [`PreferenceCasExpected::from_candidate_anchor`] (candidate triple
+//! pinned against that fresh load),
+//! [`ModelPreferenceStore::compare_and_swap_model_preferences`] (atomic
+//! predecessor recheck inside the committing write transaction), and
+//! [`ModelPreferenceStore::read_publication_receipt`] (immutable receipt
+//! rebuilt from the retained committed document).
 //!
 //! Callers (CHECK R1, audit 5872395796): the policy schema lives at
 //! `crates/agent/eliot-agent-contracts/src/model_preference.rs`
