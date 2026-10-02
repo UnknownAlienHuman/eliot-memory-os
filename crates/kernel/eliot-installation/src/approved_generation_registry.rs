@@ -3869,12 +3869,39 @@ impl ApprovedGenerationRegistry {
             })?;
         // "Never activated" is decided in the DESTINATION's own identity space:
         // the destination installation must not have become one of the
-        // installation identities this authority holds. It is deliberately NOT
-        // also `approved_target_build == active_generation`: the approved target
-        // is a BUILD identity, and the production shape carries the source's own
-        // currently approved build there, so that clause was true for every
-        // prepared destination and made cleanup unreachable — retention without
-        // release.
+        // installation identities this authority holds.
+        //
+        // What was removed here, and why it was not a guarantee being dropped:
+        // the clause `approved_target_build == active_generation` compared the
+        // destination's approved target BUILD against this authority's active
+        // GENERATION. In the production shape both are fields of the SOURCE's
+        // own record -- `admit_prepared_isolated_destination` derives
+        // `approved_target_build` from the approved target row, and the Host
+        // caller nominates the source's active generation as that target -- so
+        // the clause was `a == a`. It was true for EVERY prepared destination
+        // and false for none, which made cleanup unreachable: a destination
+        // could be allocated, retained and materialised but never released.
+        //
+        // The activation question is answered by this clause and by
+        // `Self::validate`. An activated destination is one this authority
+        // holds an `ApprovedGeneration` for, and that row's
+        // `runtime_launch.installation_epoch.installation` IS the destination
+        // identity, so "the destination became real" is decided in the same
+        // identity space the destination is written in. I could not exhibit an
+        // input the deleted clause refused that this one admits, because the
+        // deleted clause never mentioned the destination at all; that is the
+        // honest statement of why this is a repair rather than a dropped
+        // guarantee.
+        //
+        // KNOWN CEILING, not fixed here: this clause can only observe activation
+        // that happened in THIS registry. An isolated destination is created
+        // outside the source installation's own root, under the declared
+        // isolated area, so an activation performed by a DIFFERENT installation
+        // authority would not appear in `self.generations` at all. I could not
+        // establish whether an activation path for such a destination exists
+        // yet; #958 assigns activation to a later dedicated cutover child. If one
+        // lands, this clause needs the destination's own activation record as a
+        // second source before "never activated" is fully decided.
         if self.generations.iter().any(|generation| {
             generation
                 .manifest
@@ -4039,11 +4066,12 @@ impl ApprovedGenerationRegistry {
         // "Never activated" is decided in the DESTINATION's own identity space:
         // the destination installation must not have become one of the
         // installation identities this authority holds. The previous form also
-        // demanded `approved_target_build != active_generation`, but the approved
-        // target is a BUILD identity and the production shape carries the
-        // source's own currently approved build there — so that clause was true
-        // for every prepared destination and no destination could ever be
-        // cleaned up.
+        // demanded `approved_target_build != active_generation`, but both are
+        // fields of the SOURCE's own record in the production shape, so that
+        // clause was `a == a` for every prepared destination and no destination
+        // could ever be cleaned up. The reasoning and the input I could not
+        // construct are set out on the sibling
+        // `forget_prepared_isolated_destination_creation_unchecked`.
         if self.generations.iter().any(|generation| {
             generation
                 .manifest

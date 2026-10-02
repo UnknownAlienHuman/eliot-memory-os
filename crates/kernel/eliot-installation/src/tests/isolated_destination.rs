@@ -83,7 +83,10 @@ fn approved_generation(
         .expect("the portable fixture retains the root it was derived from");
     manifest.generation = test_handle(generation_name);
     manifest.runtime_launch.generation = manifest.generation.clone();
-    manifest.runtime_launch.profile_governed_roots.immutable_binaries = format!(
+    manifest
+        .runtime_launch
+        .profile_governed_roots
+        .immutable_binaries = format!(
         r"{}\target\eliot-dev\{generation_name}",
         portable_root.as_str()
     );
@@ -114,6 +117,16 @@ struct Fixture {
 /// Two approved generations in the owner installation-key form: the active one,
 /// which is the source, and an approved but inactive one, which is an existing
 /// installation a destination must never be.
+///
+/// The two rows carry DIFFERENT installation identities. Whether a production
+/// registry is ever multi-installation is NOT established here: `Redb
+/// InstallationRegistry` is opened per installation Host root and binds the
+/// owner capability to ONE installation, so a single-installation registry is
+/// the likelier production shape. What matters for these proofs is only that
+/// `ApprovedGenerationRegistry::validate` accepts the projection -- it asserts
+/// it below -- and that the destination-identity comparison has a member of the
+/// existing-installation set to fire against. This fixture supplies that; it is
+/// not a claim that production holds two installations at once.
 fn fixture() -> Fixture {
     let source_installation = installation_key("1");
     let other_installation = installation_key("2");
@@ -212,7 +225,11 @@ fn isolation(
             volume_serial_number: 7,
             file_index: 11,
         },
-        destination_installation_root: format!(r"{area}\{}", destination.as_str()),
+        // Derived by the OWNER'S join helper, not by string formatting: this is
+        // the exact function `admit_prepared_isolated_destination` derives the
+        // destination root with, so the fixture cannot disagree with production
+        // about separators. `format!("{}\{}")` would not even parse.
+        destination_installation_root: crate::joined_windows_path(area, destination.as_str()),
         destination_installation_key: destination.clone(),
         source_installation_root: r"C:\ProgramData\Eliot\installations\1".to_owned(),
         source_host_root: r"C:\ProgramData\Eliot\installations\1\host".to_owned(),
@@ -225,10 +242,7 @@ fn isolation(
 }
 
 /// A fully valid admission bound to the fixture's own values.
-fn admission_for(
-    fixture: &Fixture,
-    destination: &PlatformHandle,
-) -> PreparedDestinationAdmission {
+fn admission_for(fixture: &Fixture, destination: &PlatformHandle) -> PreparedDestinationAdmission {
     let target_schema_digest = test_handle(&"a".repeat(64));
     let mut admission = PreparedDestinationAdmission {
         wire: test_handle(PreparedDestinationAdmission::WIRE),
@@ -488,10 +502,9 @@ fn materialised_root_is_recorded_only_against_the_admission_it_realises() {
 
     let mut foreign = materialisation.clone();
     foreign.destination_installation = installation_key("9");
-    foreign.destination_installation_root = format!(
-        "{}\{}",
-        admission.isolation.isolated_area_root,
-        foreign.destination_installation.as_str()
+    foreign.destination_installation_root = crate::joined_windows_path(
+        admission.isolation.isolated_area_root.as_str(),
+        foreign.destination_installation.as_str(),
     );
     foreign.materialisation_digest = must(foreign.computed_digest());
     must(foreign.validate());

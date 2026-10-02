@@ -832,11 +832,19 @@ impl ProposedRestorationRequirements {
 /// Three of these fields exist to be COMPARED, and each has a named consumer:
 ///
 /// - [`Self::source_active_generation`] is compared by
-///   [`crate::RedbInstallationRegistry::record_prepared_isolated_destination`]
+///   [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`]
 ///   against the source installation authority's OWN current active generation.
 ///   An admission bound to a generation the source has since moved on from is
 ///   refused as [`crate::InstallationError::IdentityConflict`], which is what
 ///   stops a stale configuration snapshot from being bound as current.
+///
+///   The named consumer is the CREATION entry point rather than
+///   `record_prepared_isolated_destination` because that is the one production
+///   reaches: it delegates to
+///   `record_prepared_isolated_destination_unchecked`, which is where the
+///   comparison lives. The admission-only wrapper is a real function that
+///   performs the same comparison, but nothing outside this crate calls it, so
+///   naming it here would name a consumer no reader is served by.
 /// - [`Self::source_installation_root`] and [`Self::source_host_root`] are
 ///   re-compared by [`prove_isolated_destination_root`] at materialise time:
 ///   the destination is re-proved DISJOINT from the recorded source root, so a
@@ -866,7 +874,7 @@ pub struct IsolationEvidence {
     /// Active generation the source installation authority currently holds.
     ///
     /// Compared against the authority's own current active generation by
-    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination`];
+    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`];
     /// a mismatch is refused rather than recorded.
     pub source_active_generation: PlatformHandle,
     /// The owner's own no-follow observation of the destination leaf at
@@ -2653,9 +2661,7 @@ mod tests {
              outside every installation contour"
         );
         assert_eq!(
-            classified(&format!(
-                r"{area}\\{installation_key}"
-            )),
+            classified(&format!(r"{area}\\{installation_key}")),
             InstallationHostRootClass::Unowned,
             "the derived destination leaf under the area is likewise outside every installation \
              contour, which is what makes it a legal destination at all"
@@ -2759,7 +2765,10 @@ mod tests {
             "the declared root is the profile-root-derived installations area"
         );
         assert!(
-            system.installation_root.as_str().starts_with(declared.as_str())
+            system
+                .installation_root
+                .as_str()
+                .starts_with(declared.as_str())
                 && system.installation_root.as_str() != declared.as_str(),
             "the declared area strictly CONTAINS this installation root rather than being it"
         );
@@ -2858,5 +2867,6 @@ mod tests {
 
     /// A per-process sequence so two concurrent fixture roots never collide.
     #[cfg(windows)]
-    static NEXT_UNIQUE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static NEXT_UNIQUE_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 }
