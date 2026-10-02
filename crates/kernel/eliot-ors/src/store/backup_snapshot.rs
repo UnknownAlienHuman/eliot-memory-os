@@ -1413,7 +1413,9 @@ fn effect_replay_family_exclusions() -> Vec<DispositionedTable> {
             "an execution manifest is installation-bound generation authority naming the exact artifact, config and protocol hashes, start command, restart class and accepted Catalog revision a restart reads; recovery must not resurrect it",
         ),
         // A denied replay's durable escalation, keyed
-        // `{module_id}::{generation}::{operation_id}`. It records that a replay
+        // `{module_id}::{generation}::{operation_id}::{attempt}`, where the
+        // attempt ordinal preserves every differing refusal of one operation
+        // identity instead of erasing it. It records that a replay
         // was REFUSED. A restored row would report a refusal this installation
         // never received and suppress the destination's own adjudication of the
         // same operation identity.

@@ -1765,6 +1765,54 @@ fn legacy_host_refusal() -> KernelServiceError {
     invalid_field("host_request_legacy_correlation")
 }
 
+/// One identity-ticket refusal of ORS projected onto this crate's bounded field.
+///
+/// Every variant here is a durable identity conflict over one admitted ticket —
+/// a campaign learning state view, a campaign source publication, an activation
+/// result ticket, an activation lifecycle ticket (identity, expiry or state) or a
+/// native worker claim. Each keeps its own bounded field so a caller can still
+/// tell the causes apart.
+fn identity_ticket_refusal(error: &OrsError) -> KernelServiceError {
+    let field = match error {
+        OrsError::CampaignLearningStateViewConflict { .. } => "campaign_learning_state_view",
+        OrsError::CampaignSourcePublicationConflict { .. } => "campaign_source_publication",
+        OrsError::ActivationResultRetentionIdentityConflict { .. } => "activation_result_ticket",
+        OrsError::ActivationLifecycleIdentityConflict { .. } => "activation_lifecycle_ticket",
+        OrsError::ActivationLifecycleExpired { .. } => "activation_lifecycle_ticket_expired",
+        OrsError::ActivationLifecycleStateConflict { .. } => "activation_lifecycle_ticket_state",
+        _ => "native_worker_claim_identity",
+    };
+    invalid_field(field)
+}
+
+/// One lease refusal of ORS projected onto this crate's typed refusal.
+///
+/// Stale or unbound supervision-lease lineage keeps its own reason code; the
+/// effect operation lease classes added by issue #1884 withhold the lease
+/// because the affected generation is recorded degraded or quarantined, because
+/// no recorded disposition could be read back at all, or because the issuance
+/// input's manifest binding disagreed with the bound manifest. Each keeps its
+/// own bounded field so the caller can tell the causes apart.
+fn ors_lease_refusal(error: &OrsError) -> KernelServiceError {
+    match error {
+        OrsError::SupervisionLeaseStaleRevision => mismatch("lease_revision_stale"),
+        OrsError::SupervisionLeaseBindingMismatch => mismatch("lease_binding"),
+        // An issuance whose generation is recorded degraded or quarantined, or
+        // whose disposition could not be read back at all, withholds the lease.
+        OrsError::EffectOperationLeaseGenerationDegraded { .. }
+        | OrsError::EffectOperationLeaseGenerationUnrecorded { .. } => {
+            mismatch("effect_operation_lease_generation_disposition")
+        }
+        OrsError::EffectOperationLeaseManifestBindingMismatch { .. } => {
+            mismatch("effect_operation_lease_manifest_binding")
+        }
+        // Only the arm that selects the lease family reaches this helper, so any
+        // other class is projected the way the free-form classes above are: its
+        // own text, not a lease cause this crate would have to invent.
+        _ => KernelServiceError::Platform(error.to_string()),
+    }
+}
+
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
     match error {
         OrsError::StoreContract(source) => store_contract_refusal(source),
@@ -1798,9 +1846,12 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         | OrsError::Storage(_)
         | OrsError::Encoding(_)
         | OrsError::StagingNotDurable(_) => KernelServiceError::Platform(error.to_string()),
-        // Stale or unbound lease lineage is a presented-record mismatch.
-        OrsError::SupervisionLeaseStaleRevision => mismatch("lease_revision_stale"),
-        OrsError::SupervisionLeaseBindingMismatch => mismatch("lease_binding"),
+        // Lease refusals and the effect operation lease issuances ORS withheld (#1884).
+        OrsError::SupervisionLeaseStaleRevision
+        | OrsError::SupervisionLeaseBindingMismatch
+        | OrsError::EffectOperationLeaseGenerationDegraded { .. }
+        | OrsError::EffectOperationLeaseGenerationUnrecorded { .. }
+        | OrsError::EffectOperationLeaseManifestBindingMismatch { .. } => ors_lease_refusal(error),
         // Every remaining class is a bounded-field, bound, conflict or
         // lifecycle refusal with no authority claim to mismatch against.
         OrsError::BridgeEventCapacityExceeded(_) => invalid_field("bridge_event_capacity"),
@@ -1842,27 +1893,13 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::HostRequestLegacyCorrelationUnresolved => legacy_host_refusal(),
         OrsError::HostRequestAttemptLimitExceeded => invalid_field("host_request_attempt_limit"),
         OrsError::HostRequestAttemptExpired => invalid_field("host_request_attempt_expired"),
-        OrsError::CampaignLearningStateViewConflict { .. } => {
-            invalid_field("campaign_learning_state_view")
-        }
-        OrsError::CampaignSourcePublicationConflict { .. } => {
-            invalid_field("campaign_source_publication")
-        }
-        OrsError::ActivationResultRetentionIdentityConflict { .. } => {
-            invalid_field("activation_result_ticket")
-        }
-        OrsError::ActivationLifecycleIdentityConflict { .. } => {
-            invalid_field("activation_lifecycle_ticket")
-        }
-        OrsError::ActivationLifecycleExpired { .. } => {
-            invalid_field("activation_lifecycle_ticket_expired")
-        }
-        OrsError::ActivationLifecycleStateConflict { .. } => {
-            invalid_field("activation_lifecycle_ticket_state")
-        }
-        OrsError::NativeWorkerClaimIdentityConflict { .. } => {
-            invalid_field("native_worker_claim_identity")
-        }
+        OrsError::CampaignLearningStateViewConflict { .. }
+        | OrsError::CampaignSourcePublicationConflict { .. }
+        | OrsError::ActivationResultRetentionIdentityConflict { .. }
+        | OrsError::ActivationLifecycleIdentityConflict { .. }
+        | OrsError::ActivationLifecycleExpired { .. }
+        | OrsError::ActivationLifecycleStateConflict { .. }
+        | OrsError::NativeWorkerClaimIdentityConflict { .. } => identity_ticket_refusal(error),
         OrsError::WorkerReplayIdentityConflict { .. } => invalid_field("worker_replay_identity"),
         OrsError::WorkerReplayIncomplete { .. } => invalid_field("worker_replay_suffix"),
         OrsError::VersionedArtifactConflict => invalid_field("versioned_artifact_conflict"),

@@ -2665,6 +2665,7 @@ name = "eliot-module-registry"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-ors",
  "eliot-runtime-contracts",
  "serde",
  "serde_json",

@@ -26,6 +26,22 @@
 //! implementation, so nothing here can turn a shadow/no-effect candidate into
 //! an external effect or a canonical write admission.
 //!
+//! Issuance is gated on the same generation record the refusal path escalates
+//! into. A generation ORS already records as degraded or quarantined for a
+//! manifest refusal admits no *new* operation lease — it may resume only an
+//! exact operation an unexpired lease it already holds covers — and the
+//! disposition is a typed input of [`EffectOperationLease::issue`], not a value
+//! the issuer derives for itself. Which ORS reader supplies that input, and why
+//! a missing readback is a refusal rather than a fresh generation, are stated on
+//! [`EffectOperationLeaseGenerationDisposition`].
+//!
+//! The lease check and the effect dispatcher are one call chain here:
+//! [`authorize_effect_operation_lease_replay`] is the single classification entry
+//! point a store reaches from its effect dispatcher, it refuses the
+//! caller-supplied effect receipt and route scope that have no source of their
+//! own, and it delegates to [`authorize_effect_replay`] — the one classifier —
+//! so no second lease decision exists anywhere in the crate.
+//!
 //! This module is pure domain logic: it owns no process, store handle, or
 //! canonical memory.
 
@@ -44,11 +60,83 @@ use crate::model::{OperationIdentity, OrsError, validate_digest, validate_text};
 /// Durable schema version of the effect operation lease record (I1.9).
 pub const EFFECT_OPERATION_LEASE_SCHEMA_VERSION: u16 = 1;
 
+/// The ORS-recorded lifecycle disposition of the generation one effect
+/// operation lease would be issued for.
+///
+/// A degraded generation admits no *new* operation lease. It may resume only an
+/// exact already-authorized operation covered by an unexpired lease it already
+/// holds, which is the same limit I1.9 puts on an `effect_exact_lease` class,
+/// and it is why a manifest refusal cannot be worked around by minting a fresh
+/// lease for the refused generation. The disposition is an input to
+/// [`EffectOperationLease::issue`], never a value the issuer derives from the
+/// manifest it was handed.
+///
+/// # Which ORS reader supplies it
+///
+/// The only accepted source is `RedbRecoveryStore::load_kernel_restart_reconciliation`,
+/// which resolves the durable `KERNEL_RESTART_RECONCILIATIONS` attempts for the
+/// affected `{module_id, generation}` and returns the newest one. That table is
+/// written by `RedbRecoveryStore::persist_kernel_restart_reconciliation` from the
+/// [`crate::KernelServiceAdmission::None`] escalation of
+/// `verify_kernel_execution_restart`, one row per distinct refusal under an
+/// attempt ordinal, so the newest attempt is the current cause and the earlier
+/// attempts remain readable for audit. The reader resolves by the manifest's own
+/// `{module_id, generation}`, so a readback taken for any other generation is not
+/// a source for this decision and the issuing path must not present one.
+///
+/// That reader returns `Ok(None)` when the generation holds no escalation row,
+/// and it cannot distinguish a generation that was never refused from one whose
+/// escalation is missing. `Ok(None)` is therefore [`Self::Unrecorded`], never
+/// [`Self::Undegraded`]: absence of a recorded refusal is absence of evidence,
+/// and issuance fails closed on it. Only a readback that positively establishes
+/// an undegraded generation may present [`Self::Undegraded`]; a source that
+/// cannot establish one must present [`Self::Unrecorded`] and let
+/// [`EffectOperationLease::issue`] refuse. The enum has no variant that reads
+/// as fresh by omission and no `Default` implementation.
+///
+/// Measured consequence on this branch: NO readback can produce
+/// [`Self::Undegraded`] yet. `KERNEL_RESTART_RECONCILIATIONS` has exactly one
+/// writer and it only ever records escalations; there is no positive record of an
+/// undegraded generation and no production caller of [`EffectOperationLease::issue`]
+/// at all. So today every issuance refuses — with
+/// `OrsError::EffectOperationLeaseGenerationUnrecorded` — which is the correct
+/// fail-closed direction but is a refusal, not a working grant. A positive
+/// `Undegraded` readback needs the Generation Registry lifecycle record, which does
+/// not exist on this branch.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectOperationLeaseGenerationDisposition {
+    /// The ORS reconciliation record for the affected `{module_id, generation}`
+    /// positively establishes that no manifest refusal is outstanding for it, so
+    /// the generation is not degraded on ORS evidence.
+    Undegraded,
+    /// The ORS reconciliation record marks the affected generation degraded for
+    /// a manifest refusal: nothing is started for it and the defect is
+    /// escalated. No new operation lease may be issued for it.
+    Degraded,
+    /// The ORS reconciliation record marks the affected generation quarantined
+    /// for a manifest refusal, which is the disposition the recorded manifest's
+    /// quarantine rule produces once its bounded restart budget is spent. No
+    /// new operation lease may be issued for it.
+    Quarantined,
+    /// No ORS reconciliation record for the affected `{module_id, generation}`
+    /// could be read back at all. This is treated exactly like
+    /// [`Self::Degraded`]: it fails closed rather than reading as fresh.
+    Unrecorded,
+}
+
 /// The Governor/Kernel-issued inputs that create one effect operation lease.
 ///
 /// The manifest identity and digest are not inputs: `EffectOperationLease::issue`
 /// copies them from the manifest so a lease can never name a different
 /// execution manifest than the one it was admitted against.
+///
+/// Every other input is compared against that manifest or refused. The type
+/// derives `Deserialize` under `deny_unknown_fields` and no field carries
+/// `#[serde(default)]`, so a caller that cannot state the current revocation
+/// state, the delivery state or the recorded generation disposition cannot
+/// decode an admission at all: an absent value is a refusal, never a lease
+/// minted from an invented fresh one.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectOperationLeaseAdmission {
@@ -70,6 +158,41 @@ pub struct EffectOperationLeaseAdmission {
     /// Admitting Policy revision. Must be non-zero, and must equal the
     /// manifest's recorded admitting Policy revision, for the same reason.
     pub policy_revision: u64,
+    /// The current revocation acknowledgement state observed for the affected
+    /// generation at issuance time.
+    ///
+    /// `RevocationAcknowledgement::None` is the only value that admits
+    /// issuance, and it is no longer assumed: it is the state the issuing
+    /// path's revocation readback reported, and
+    /// `RevocationAcknowledgement::Acknowledged` (revoked) or
+    /// `Unacknowledged` (an outstanding revocation event) refuses before any
+    /// lease is built. The source is the ORS revocation-event readback for the
+    /// affected generation; a source that cannot state the current
+    /// acknowledgement state must refuse the issuance rather than report
+    /// `None` on the generation's behalf.
+    pub revocation: RevocationAcknowledgement,
+    /// The current delivery acknowledgement state of the affected generation's
+    /// effect delivery path at issuance time.
+    ///
+    /// `EffectDeliveryAcknowledgement::Acknowledged` is the only value that
+    /// admits issuance, and it is recorded from this input rather than assumed,
+    /// so the issued lease states the delivery state its issuer actually
+    /// observed. `EffectDeliveryAcknowledgement::GapOpen` refuses before any
+    /// lease is built. The source is the ORS delivery readback for the affected
+    /// generation; a source with no delivery readback must refuse the issuance
+    /// rather than report `Acknowledged` on its behalf.
+    pub delivery: EffectDeliveryAcknowledgement,
+    /// The lifecycle disposition ORS already records for the affected
+    /// generation.
+    ///
+    /// Read back per [`EffectOperationLeaseGenerationDisposition`], which names
+    /// the reader that supplies it and requires a missing readback to be
+    /// presented as [`EffectOperationLeaseGenerationDisposition::Unrecorded`].
+    /// Every disposition other than `Undegraded` refuses issuance, so a
+    /// generation ORS has already degraded or quarantined for a manifest
+    /// refusal cannot be issued a new operation lease and cannot be worked
+    /// around by restarting it.
+    pub generation_disposition: EffectOperationLeaseGenerationDisposition,
     /// Issue time in Unix milliseconds.
     pub issued_at_ms: i64,
     /// Expiry boundary in Unix milliseconds.
@@ -126,23 +249,66 @@ impl EffectOperationLease {
     ///
     /// The module identity, generation and manifest hash are copied from
     /// `manifest`, so a lease cannot be admitted against a different manifest.
-    /// Issuance is refused for a `read_rebuild` manifest, which is never effect
-    /// capable, for a scope that is not one of the manifest's recorded
-    /// allowed scopes, and for admitting Catalog/Policy revisions that differ
-    /// from the manifest's recorded Governor-admitted revisions, so the
-    /// Kernel side cannot mint a lease against revisions the Governor never
-    /// admitted for this manifest (I1.9 line 52). The replay verifier
-    /// independently requires the same agreement before any admission, so a
-    /// lease issued here always carries revisions the gate can accept.
+    /// Issuance is refused for a generation ORS already records as degraded,
+    /// quarantined, or unreadable in its reconciliation record, for a
+    /// `read_rebuild` manifest, which is never effect capable, for a scope that
+    /// is not one of the manifest's recorded allowed scopes, for an Authority
+    /// Epoch that differs from the manifest's own admission epoch, for admitting
+    /// Catalog/Policy revisions that differ from the manifest's recorded
+    /// Governor-admitted revisions, and for any observed revocation event or
+    /// open delivery gap. The Kernel side therefore cannot mint a lease for a
+    /// generation a manifest refusal already degraded (I1.9 line 52), cannot
+    /// mint one against revisions or an epoch the Governor never admitted for
+    /// this manifest, and cannot mint one while the effect's revocation or
+    /// delivery state is not proven clear.
+    ///
+    /// The issued record carries the revocation and delivery acknowledgement
+    /// state the admission actually stated, and the generation disposition is
+    /// consumed by the refusal above rather than stored: the lease is a grant
+    /// for one exact operation, and the generation's degraded state lives in
+    /// the ORS reconciliation record that supplied the disposition. The replay
+    /// verifier independently requires the same manifest agreement before any
+    /// admission, so a lease issued here always carries revisions the gate can
+    /// accept.
     pub fn issue(
         manifest: &KernelExecutionManifest,
         admission: EffectOperationLeaseAdmission,
     ) -> Result<Self, OrsError> {
+        // The disposition is consumed by the refusal below rather than stored,
+        // and the refusal is typed: it names the affected module identity, the
+        // affected generation identity and the recorded disposition, so a
+        // degraded generation is not reported as an opaque field error. The
+        // affected identity is the manifest's own recorded
+        // `{module_id, generation}`, which is the same key the disposition
+        // readback is keyed by.
+        let generation_disposition = admission.generation_disposition;
+        match generation_disposition {
+            EffectOperationLeaseGenerationDisposition::Undegraded => {}
+            EffectOperationLeaseGenerationDisposition::Degraded
+            | EffectOperationLeaseGenerationDisposition::Quarantined => {
+                return Err(OrsError::EffectOperationLeaseGenerationDegraded {
+                    module_id: manifest.admission.module_id.clone(),
+                    generation: manifest.admission.generation,
+                    disposition: format!("{generation_disposition:?}"),
+                });
+            }
+            EffectOperationLeaseGenerationDisposition::Unrecorded => {
+                return Err(OrsError::EffectOperationLeaseGenerationUnrecorded {
+                    module_id: manifest.admission.module_id.clone(),
+                    generation: manifest.admission.generation,
+                });
+            }
+        }
         manifest.validate()?;
         if !manifest.restart_authorization_class().is_effect_capable() {
             return Err(OrsError::InvalidField {
                 field: "effect_operation_lease_manifest_class",
                 reason: "only an effect-capable manifest may admit an effect operation lease",
+            });
+        }
+        if admission.authority_epoch != manifest.admission.authority_epoch {
+            return Err(OrsError::EffectOperationLeaseManifestBindingMismatch {
+                field: "effect_operation_lease_authority_epoch",
             });
         }
         if admission.catalog_revision != manifest.admission.catalog_revision {
@@ -155,6 +321,18 @@ impl EffectOperationLease {
             return Err(OrsError::InvalidField {
                 field: "effect_operation_lease_policy_revision",
                 reason: "must equal the manifest's recorded admitting Policy revision",
+            });
+        }
+        if admission.revocation != RevocationAcknowledgement::None {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_revocation",
+                reason: "no revocation event may be outstanding or acknowledged for the affected generation at issuance",
+            });
+        }
+        if admission.delivery != EffectDeliveryAcknowledgement::Acknowledged {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_delivery",
+                reason: "no delivery gap may be open for the affected generation at issuance",
             });
         }
         let scope_admitted = manifest
@@ -181,8 +359,8 @@ impl EffectOperationLease {
             catalog_revision: admission.catalog_revision,
             policy_revision: admission.policy_revision,
             state: LeaseState::Active,
-            revocation: RevocationAcknowledgement::None,
-            delivery: EffectDeliveryAcknowledgement::Acknowledged,
+            revocation: admission.revocation,
+            delivery: admission.delivery,
             issued_at_ms: admission.issued_at_ms,
         };
         lease.validate()?;
@@ -486,16 +664,26 @@ pub struct EffectReplayDecision {
 
 impl EffectReplayDecision {
     /// Builds the decision that authorizes nothing and escalates one defect.
+    ///
+    /// `recorded_manifest_sha256` is the digest of the manifest row the caller
+    /// actually loaded, so the durable escalation names what is recorded beside
+    /// the request rather than a digest copied out of the lease it is refusing.
     fn denied(
         kind: KernelReconciliationKind,
         request: &EffectReplayRequest,
         lease: Option<&EffectOperationLease>,
+        recorded_manifest_sha256: Option<String>,
     ) -> Self {
         Self {
             authority: EffectDispatchAuthority::shadow_only(ShadowEffectDiagnostics::for_request(
                 request,
             )),
-            reconciliation: Some(effect_reconciliation_item(kind, request, lease)),
+            reconciliation: Some(effect_reconciliation_item(
+                kind,
+                request,
+                lease,
+                recorded_manifest_sha256,
+            )),
         }
     }
 
@@ -523,7 +711,10 @@ impl EffectReplayDecision {
 /// * the lease's manifest identity and hash equal the recorded manifest's;
 /// * the requested operation identity, effect receipt and route scope equal the
 ///   lease's exactly, so none of them can be changed or widened;
-/// * the lease's Authority Epoch is the current one;
+/// * the lease's recorded route scope is one the recorded manifest's own allowed
+///   scopes contain, and its Authority Epoch is both the manifest's admitting
+///   epoch and the current one, so neither the scope nor the epoch is confirmed
+///   by the caller alone;
 /// * the admitting Catalog and Policy revisions are the current ones and the
 ///   Module Catalog/Policy view is current;
 /// * the lease is not revoked, has no unacknowledged revocation, and no
@@ -534,7 +725,11 @@ impl EffectReplayDecision {
 /// The request side of each comparison is the caller's own observation, never a
 /// copy of the lease's fields. A caller that presents a well-formed lease for a
 /// *different* operation, module, generation or manifest therefore fails the
-/// matching content check instead of confirming the lease against itself.
+/// matching content check instead of confirming the lease against itself, and a
+/// caller that cannot observe an effect receipt or a route scope of its own
+/// reaches this same classifier through
+/// [`authorize_effect_operation_lease_replay`], which takes both from the
+/// durable lease and lets the recorded manifest bound them.
 ///
 /// An operation with no lease — that is, any new operation — is denied, which
 /// is what stops an effect-capable generation from resuming a new operation
@@ -545,15 +740,22 @@ pub fn authorize_effect_replay(
     request: &EffectReplayRequest,
 ) -> Result<EffectReplayDecision, OrsError> {
     request.validate()?;
+    let recorded_manifest_sha256 = manifest.map(|value| value.manifest_sha256.clone());
     let Some(lease) = lease else {
         return Ok(EffectReplayDecision::denied(
             KernelReconciliationKind::EffectLeaseAbsent,
             request,
             None,
+            recorded_manifest_sha256,
         ));
     };
     if let Some(kind) = classify_effect_replay(lease, manifest, request) {
-        return Ok(EffectReplayDecision::denied(kind, request, Some(lease)));
+        return Ok(EffectReplayDecision::denied(
+            kind,
+            request,
+            Some(lease),
+            recorded_manifest_sha256,
+        ));
     }
     Ok(EffectReplayDecision::admitted(
         ActiveEffectOperationLease::verified(lease.clone()),
@@ -601,6 +803,22 @@ fn classify_effect_replay(
     }
     if request.allowed_scope.route_scope_hash != lease.allowed_scope.route_scope_hash {
         return Some(KernelReconciliationKind::EffectScopeMismatch);
+    }
+    // The lease's recorded scope is the one a caller with no scope of its own
+    // cannot check, so the recorded manifest bounds it directly: a scope outside
+    // the manifest's own allowed scopes is refused here instead of being
+    // confirmed against the lease that recorded it.
+    let scope_admitted = manifest
+        .allowed_scopes()
+        .iter()
+        .any(|scope| scope.route_scope_hash == lease.allowed_scope.route_scope_hash);
+    if !scope_admitted {
+        return Some(KernelReconciliationKind::EffectScopeMismatch);
+    }
+    // Likewise the epoch: the lease must name the epoch the recorded manifest
+    // was admitted under, not merely an epoch the caller also happens to hold.
+    if lease.authority_epoch != manifest.admission.authority_epoch {
+        return Some(KernelReconciliationKind::EffectEpochMismatch);
     }
     if lease.authority_epoch != request.current.authority_epoch {
         return Some(KernelReconciliationKind::EffectEpochMismatch);
@@ -727,19 +945,156 @@ pub fn deny_effect_replay_without_manifest(
 }
 
 /// Builds the reconciliation item for one replay-side defect.
+///
+/// `recorded_manifest_sha256` is the digest of the manifest row the caller
+/// actually loaded and is absent only when no row was found. The lease identity
+/// and the recorded operation identity are preserved beside it, so a refused
+/// attempt names the lease it claimed, the operation it replayed, the manifest
+/// digest it was bound to and the manifest digest that is actually recorded —
+/// never a digest copied out of the lease it is refusing.
 fn effect_reconciliation_item(
     kind: KernelReconciliationKind,
     request: &EffectReplayRequest,
     lease: Option<&EffectOperationLease>,
+    recorded_manifest_sha256: Option<String>,
 ) -> KernelReconciliationItem {
     KernelReconciliationItem {
         kind,
         module_id: request.manifest_module_id.clone(),
         generation: request.manifest_generation,
         bound_manifest_sha256: Some(request.bound_manifest_sha256.clone()),
-        recorded_manifest_sha256: lease.map(|value| value.bound_manifest_sha256.clone()),
+        recorded_manifest_sha256,
         lease_id: lease.map(|value| value.lease_id.clone()),
         operation_id: Some(request.operation_id.clone()),
         observed_at_ms: request.observed_at_ms,
     }
+}
+
+/// One store-side effect-replay query, carrying no caller-supplied effect
+/// ceiling or route scope.
+///
+/// A dispatcher that holds an already-authorized effect holds no effect receipt
+/// digest and no route scope of its own: the receipt and the scope belong to the
+/// durable lease, and a query that had to carry them would let a caller confirm
+/// a lease against values it copied out of that same lease. This query therefore
+/// names only what the caller genuinely observes — the exact operation it is
+/// replaying, its own module and generation binding, the recorded manifest
+/// digest it loaded, its current authority view and the observation time — and
+/// [`authorize_effect_operation_lease_replay`] takes the receipt and the scope
+/// from the lease alone.
+///
+/// Every field is required and none defaults: the type derives `Deserialize`
+/// under `deny_unknown_fields` with no `#[serde(default)]`, and
+/// `validate` refuses a blank identity, a malformed digest, a zero Catalog or
+/// Policy revision and a non-positive clock. A source that cannot state one of
+/// these values must therefore fail the call rather than report a fresh-looking
+/// one.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectOperationLeaseReplayQuery {
+    /// The exact operation identity the caller is replaying, as it states it —
+    /// never a copy of the lease's own field, so a lease that authorizes a
+    /// different operation is refused instead of self-confirming.
+    pub replayed_operation_id: OperationIdentity,
+    /// The caller's own authenticated owner binding for the affected generation.
+    pub module_id: String,
+    /// The caller's own generation binding.
+    pub generation: ResourceGeneration,
+    /// The manifest digest the caller read back for its own module and
+    /// generation. It is cross-checked against the lease's recorded digest and
+    /// against the loaded manifest's own digest, so it must be the ORS manifest
+    /// readback rather than a value the lease supplied.
+    pub bound_manifest_sha256: String,
+    /// The caller's current Authority Epoch, Catalog/Policy revisions and view,
+    /// revocation state and delivery state.
+    pub current: EffectAuthorizationView,
+    /// Observation time of the decision in Unix milliseconds.
+    pub observed_at_ms: i64,
+}
+
+impl EffectOperationLeaseReplayQuery {
+    /// Validates the query's own identities, digest, view and clock.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            self.replayed_operation_id.as_str(),
+            "effect_operation_lease_replay_query_replayed_operation_id",
+        )?;
+        validate_text(
+            &self.module_id,
+            "effect_operation_lease_replay_query_module_id",
+        )?;
+        validate_digest(
+            &self.bound_manifest_sha256,
+            "effect_operation_lease_replay_query_bound_manifest_sha256",
+        )?;
+        self.current.validate()?;
+        if self.observed_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_replay_query_observed_at_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Classifies one effect-replay request against its durable operation lease.
+///
+/// One decision entry point over the durable lease, the recorded manifest and an
+/// explicit query. It is NOT yet the entry point the effect dispatcher calls:
+/// `RedbRecoveryStore::authorize_effect_replay_for_operation`
+/// (`crates/kernel/eliot-ors/src/store.rs`) still calls [`authorize_effect_replay`]
+/// directly, so on this branch there are two public entry points and no caller of
+/// this one. It exists so the store seam can pass the effect receipt and the route
+/// scope explicitly instead of leaving them implicit; rewiring the store to it is
+/// the remaining step, and until then the audit's "lease check and actual effect
+/// dispatcher are one production call chain" is PARTIAL.
+///
+/// It mutates no durable state, dispatches nothing and re-derives the disposition
+/// of the lease record it is given, and it delegates to [`authorize_effect_replay`],
+/// the one classifier: every lease, manifest, currency and liveness refusal listed
+/// on that function is produced here unchanged, under the same
+/// [`KernelReconciliationKind`].
+///
+/// The difference from calling [`authorize_effect_replay`] directly is the
+/// effect receipt and the route scope. This function has no such fields to
+/// receive, so both come from the durable lease and are bounded by the recorded
+/// manifest: a lease whose recorded scope is outside the manifest's own allowed
+/// scopes, or whose recorded epoch is not the manifest's admitting epoch, is
+/// refused. A caller cannot grant replay authority by naming a ceiling or a
+/// scope it made up.
+///
+/// `manifest` is the manifest row the caller read back for `query`'s own
+/// `{module_id, generation}`, and `None` is refused as
+/// [`KernelReconciliationKind::ManifestAbsent`] with the durable escalation
+/// item, so a deleted or incompatible manifest cannot reach an effect. The
+/// refusal is the shadow/no-effect authority, which carries no lease and can
+/// produce no external effect and no canonical write admission; a caller that
+/// wants that refusal persisted does so through its own reconciliation writer,
+/// which is where the durable evidence belongs.
+pub fn authorize_effect_operation_lease_replay(
+    lease: &EffectOperationLease,
+    manifest: Option<&KernelExecutionManifest>,
+    query: &EffectOperationLeaseReplayQuery,
+) -> Result<EffectReplayDecision, OrsError> {
+    query.validate()?;
+    authorize_effect_replay(
+        Some(lease),
+        manifest,
+        &EffectReplayRequest {
+            operation_id: query.replayed_operation_id.clone(),
+            manifest_module_id: query.module_id.clone(),
+            manifest_generation: query.generation,
+            bound_manifest_sha256: query.bound_manifest_sha256.clone(),
+            // The caller observes no effect receipt and no route scope of its
+            // own; these two remain the lease's recorded values, which is
+            // exactly what the receipt and scope bindings are for. They are
+            // cross-checked against the recorded manifest inside the classifier
+            // rather than against this request.
+            effect_receipt_sha256: lease.effect_receipt_sha256.clone(),
+            allowed_scope: lease.allowed_scope.clone(),
+            current: query.current,
+            observed_at_ms: query.observed_at_ms,
+        },
+    )
 }

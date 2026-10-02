@@ -615,16 +615,55 @@ fn observe_effect_replay_reconciliations(
                 "durable effect reconciliation has no operation identity",
             )
         })?;
-        let expected_key = format!(
+        // #1884 W1.5: this family appends like the manifest-side restart family,
+        // so one operation identity owns a `{prefix}{attempt:020}` series and the
+        // first cause a denial was recorded under is never overwritten by a later
+        // one. The census assertion is not weakened by that: the typed owner
+        // identity is still re-derived from the DECODED item alone, and no key
+        // shape outside this one series' two forms is accepted.
+        //
+        // The pre-append shape is the same series' attempt 0 and is accepted as
+        // such: rows written before #1884 W1.5 are keyed
+        // `{module_id}::{generation:020}::{operation_id}` with no trailing `::`
+        // and no ordinal, and this family DOES have production writers on `main`
+        // (`authorize_effect_replay_for_operation` and
+        // `deny_effect_replay_without_lease`), so such rows exist on installed
+        // databases. Rejecting them would make the Store-stop census fail with an
+        // integrity error on a healthy installed store. The legacy key is
+        // recognised only as that exact typed identity — a key that merely starts
+        // with the module or operation component is still refused — so the
+        // assertion keeps binding the key to the DECODED item.
+        let series_prefix = format!(
             "{}::{:020}::{}",
             RedbRecoveryStore::encode_key_component(&item.module_id),
             item.generation.value(),
             RedbRecoveryStore::encode_key_component(operation_id.as_str()),
         );
-        if key.value() != expected_key {
+        let attempt = match key.value().strip_prefix(series_prefix.as_str()) {
+            // Pre-append row: the exact series key with no ordinal at all, i.e.
+            // attempt 0 of this same series.
+            Some("") => "",
+            // Appended row: `::` then the decimal attempt ordinal.
+            Some(rest) => match rest.strip_prefix("::") {
+                Some(ordinal) => ordinal,
+                None => {
+                    return Err(integrity(
+                        "store_stop_effect_reconciliation",
+                        "reconciliation key does not match its typed owner identity",
+                    ));
+                }
+            },
+            None => {
+                return Err(integrity(
+                    "store_stop_effect_reconciliation",
+                    "reconciliation key does not match its typed owner identity",
+                ));
+            }
+        };
+        if !attempt.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(integrity(
                 "store_stop_effect_reconciliation",
-                "reconciliation key does not match its typed owner identity",
+                "reconciliation key does not end in a decimal attempt ordinal",
             ));
         }
         builder.observe("effect_replay_reconciliations", key.value(), value.value());

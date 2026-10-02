@@ -28,6 +28,37 @@
 //!   evidence and the recorded restart budget have all been checked. It is the
 //!   only value a launch, replay or cutover consumer may treat as
 //!   manifest-bound authority.
+//! * [`GovernorGenerationAdmissionSeal`] replaces free-text admission receipt
+//!   evidence. It is a typed, versioned projection of one Governor Module
+//!   Catalog admission: canonical operation/idempotency identity, module and
+//!   generation, the exact accepted Catalog revision, the exact Policy revision,
+//!   the owner's recorded accepted-manifest digest, the State Fence identity,
+//!   the lifecycle admission disposition and the Governor's canonical digest
+//!   over exactly those fields. Receipt text, non-zero revisions and
+//!   caller-supplied scopes are not authority, so `AdmittedModuleGeneration::validate`
+//!   and `KernelExecutionManifest::validate` refuse a manifest whose seal is
+//!   absent, belongs to another module/generation, was issued for another
+//!   Catalog/Policy revision, carries no State Fence or no admission
+//!   disposition, or whose canonical digest does not recompute. The recorded
+//!   accepted-manifest digest is provenance bound by that canonical owner
+//!   digest; it is not compared against this record's own `manifest_sha256`,
+//!   which covers the seal itself. The immutable row is where that digest is
+//!   compared (see `governor_admission_seal_defect`).
+//!
+//!   What the seal still does not establish is that the Governor issued it: the
+//!   canonical digest is `pub` because the owner adapter lives in another crate,
+//!   so a dependent crate can seal fields it chose itself. The seal binds the
+//!   admission and makes any later edit of it a refusal; proving the issuer needs
+//!   the Governor accept path and a canonical owner readback of the receipt,
+//!   which do not exist on this branch.
+//! * Normal-effect service is never opened by a general restart alone.
+//!   `RestartAuthorizationClass::admits_normal_effect_service` requires a
+//!   current Module Catalog/Policy view for *both* effect-capable classes, so a
+//!   stale or unavailable view caps a general restart at
+//!   [`KernelServiceAdmission::ShadowDiagnosticsOnly`]. The only remaining
+//!   effect authority is `verify_exact_effect_replay`, which requires an
+//!   unexpired active [`crate::EffectOperationLease`] identity supplied by the
+//!   caller and authorizes that one exact leased operation only.
 //!
 //! `eliot-ors` has no dependency on `eliot-module-registry`, so the
 //! `restart_authorization_class` vocabulary is declared here rather than
@@ -42,8 +73,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::cutover_ownership::{CapabilityRouteScope, StateMigrationDecision};
+use crate::effect_operation_lease::{
+    ActiveEffectOperationLease, EffectAuthorizationView, EffectOperationLease, EffectReplayRequest,
+    authorize_effect_replay,
+};
 use crate::model::{
-    OpaqueLabel, OperationIdentity, OrsError, sha256_hex, validate_digest, validate_text,
+    OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot, sha256_hex, validate_digest,
+    validate_text,
 };
 use crate::versioned_artifact::CompatibilityEvidence;
 
@@ -54,8 +90,12 @@ pub const KERNEL_EXECUTION_MANIFEST_SCHEMA_VERSION: u16 = 1;
 ///
 /// The three values are the I1.9 vocabulary and they are not interchangeable:
 /// `read_rebuild` is never effect capable, `effect_exact_lease` is effect
-/// capable without needing a fresh Catalog view for the restart itself, and
-/// `current_catalog_required` refuses whenever the current view is not current.
+/// capable but may resume only exact already-authorized operations covered by
+/// an unexpired operation lease, and `current_catalog_required` names a
+/// generation whose restart authorization itself is conditioned on a current
+/// Module Catalog/Policy view. Neither effect-capable value lets a *general*
+/// restart open normal-effect service without that view; the difference between
+/// them is what the view is required for, not whether it is required.
 #[derive(
     Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -93,12 +133,21 @@ impl RestartAuthorizationClass {
 
     /// Whether the class admits normal-effect service for the observed current
     /// Module Catalog/Policy view.
+    ///
+    /// Both effect-capable classes require a current view here, so a stale or
+    /// unavailable view can never open a general `EffectService`. An
+    /// `effect_exact_lease` generation keeps its exact leased operations
+    /// replayable without a general restart, but only through
+    /// [`verify_exact_effect_replay`], which demands an unexpired active
+    /// operation lease identity; that path is not reachable from this
+    /// predicate.
     #[must_use]
     pub const fn admits_normal_effect_service(self, catalog_view: CatalogPolicyView) -> bool {
         match self {
             Self::ReadRebuild => false,
-            Self::EffectExactLease => true,
-            Self::CurrentCatalogRequired => matches!(catalog_view, CatalogPolicyView::Current),
+            Self::EffectExactLease | Self::CurrentCatalogRequired => {
+                matches!(catalog_view, CatalogPolicyView::Current)
+            }
         }
     }
 }
@@ -294,18 +343,354 @@ impl KernelLaunchBinding {
     }
 }
 
+/// Durable schema version of the sealed Governor generation admission
+/// projection (I1.9).
+pub const GOVERNOR_GENERATION_ADMISSION_SEAL_VERSION: u16 = 1;
+
+/// Lifecycle disposition the Governor Module Catalog recorded for one
+/// generation admission (I1.9).
+///
+/// Only `Admitted` is an admission. Anything else is a recorded refusal, so a
+/// manifest cannot be built from a generation the Catalog declined.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAdmissionDisposition {
+    /// The Catalog admitted this generation for this module at the sealed
+    /// Catalog revision.
+    Admitted,
+    /// The Catalog recorded this generation without admitting it.
+    Withheld,
+}
+
+/// The owner-provided admission facts one seal is computed from.
+///
+/// The Governor Module Catalog owner fills this in from its own
+/// `GenerationAdmission`, computes the canonical digest over exactly these
+/// fields with [`GovernorGenerationAdmissionSeal::canonical_sha256`], and passes
+/// the result as `owner_canonical_sha256`. Nothing here is optional and nothing
+/// is defaulted: a value the owner cannot state is not admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernorGenerationAdmissionSealParts {
+    /// Canonical operation identity the Catalog admission was issued under.
+    pub operation_id: OperationIdentity,
+    /// Canonical idempotency key of that same admission operation.
+    pub idempotency_key: String,
+    /// Admitted module identity.
+    pub module_id: String,
+    /// Admitted generation identity.
+    pub generation: ResourceGeneration,
+    /// Exact accepted Module Catalog revision.
+    pub catalog_revision: u64,
+    /// Exact Policy revision that was current at admission.
+    pub policy_revision: u64,
+    /// The Module Catalog owner's recorded accepted-execution-manifest digest.
+    ///
+    /// It is copied here by the owner adapter and never recomputed on the ORS
+    /// side. It is provenance, and it is part of the seal's canonical owner
+    /// digest; it is not compared against a Generation Registry manifest's own
+    /// `manifest_sha256`, because that digest covers this very seal.
+    pub accepted_manifest_sha256: String,
+    /// Exact canonical State Fence identity the admission was issued under.
+    pub state_fence: StateFenceSnapshot,
+    /// Lifecycle disposition the Catalog recorded.
+    pub lifecycle_disposition: LifecycleAdmissionDisposition,
+    /// Canonical versioned digest the Governor computed over the fields above.
+    pub owner_canonical_sha256: String,
+}
+
+#[derive(Serialize)]
+struct GovernorGenerationAdmissionSealCore<'a> {
+    seal_version: u16,
+    operation_id: &'a OperationIdentity,
+    idempotency_key: &'a str,
+    module_id: &'a str,
+    generation: ResourceGeneration,
+    catalog_revision: u64,
+    policy_revision: u64,
+    accepted_manifest_sha256: &'a str,
+    state_fence: &'a StateFenceSnapshot,
+    lifecycle_disposition: LifecycleAdmissionDisposition,
+}
+
+/// Typed, sealed and versioned Governor Module Catalog admission.
+///
+/// This is the only evidence `AdmittedModuleGeneration` accepts in place of
+/// receipt text. Every field is one fact the Governor Module Catalog owner
+/// states, and `seal_version` plus `owner_canonical_sha256` bind the whole set
+/// to one canonical versioned digest, so a Kernel/ORS caller cannot assemble an
+/// admission out of a non-blank string, a non-zero revision and a scope it
+/// picked itself.
+///
+/// The fields are private and the only constructor is [`Self::seal`], which
+/// recomputes the canonical digest over the seal's own fields and refuses
+/// anything whose recorded `owner_canonical_sha256` differs from it. A seal that
+/// arrives through `Deserialize` is checked the same way before use, because
+/// `AdmittedModuleGeneration::validate` and
+/// `KernelExecutionManifest::validate` both verify the recorded
+/// `owner_canonical_sha256` instead of trusting it.
+///
+/// The seal binds the admission; it does not prove who issued it.
+/// [`Self::seal`] and [`Self::canonical_sha256`] are `pub` because the owner
+/// adapter that issues a seal lives in another crate, so the constructor cannot
+/// be closed to the Governor alone. Proving the issuer needs the Governor accept
+/// path and a canonical owner readback of the receipt, neither of which exists
+/// on this branch; see [`Self::defect`] for exactly what is and is not
+/// established.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernorGenerationAdmissionSeal {
+    /// Durable schema version of this sealed projection.
+    seal_version: u16,
+    /// Canonical operation identity the admission was issued under.
+    operation_id: OperationIdentity,
+    /// Canonical idempotency key of that same admission operation.
+    idempotency_key: String,
+    /// Admitted module identity.
+    module_id: String,
+    /// Admitted generation identity.
+    generation: ResourceGeneration,
+    /// Exact accepted Module Catalog revision.
+    catalog_revision: u64,
+    /// Exact Policy revision that was current at admission.
+    policy_revision: u64,
+    /// The Module Catalog owner's recorded accepted-execution-manifest digest.
+    accepted_manifest_sha256: String,
+    /// Exact canonical State Fence identity the admission was issued under.
+    state_fence: StateFenceSnapshot,
+    /// Lifecycle disposition the Catalog recorded.
+    lifecycle_disposition: LifecycleAdmissionDisposition,
+    /// Canonical versioned digest the Governor computed over the fields above.
+    owner_canonical_sha256: String,
+}
+
+impl GovernorGenerationAdmissionSeal {
+    /// The one canonical digest both sides compute over the sealed fields.
+    ///
+    /// The Governor owner adapter computes it before sealing and this module
+    /// recomputes it on every validation, so a seal whose fields no longer hash
+    /// to its own recorded digest is refused. This is a BINDING of the sealed
+    /// values, not an issuer proof: the function is `pub` because the owner
+    /// adapter lives in another crate, so any dependent crate can compute the
+    /// same digest over fields it chose. See [`Self::defect`].
+    pub fn canonical_sha256(
+        parts: &GovernorGenerationAdmissionSealParts,
+    ) -> Result<String, OrsError> {
+        let core = GovernorGenerationAdmissionSealCore {
+            seal_version: GOVERNOR_GENERATION_ADMISSION_SEAL_VERSION,
+            operation_id: &parts.operation_id,
+            idempotency_key: &parts.idempotency_key,
+            module_id: &parts.module_id,
+            generation: parts.generation,
+            catalog_revision: parts.catalog_revision,
+            policy_revision: parts.policy_revision,
+            accepted_manifest_sha256: &parts.accepted_manifest_sha256,
+            state_fence: &parts.state_fence,
+            lifecycle_disposition: parts.lifecycle_disposition,
+        };
+        let bytes =
+            canonical_json_bytes(&core).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Seals one Governor-issued admission.
+    ///
+    /// The seal is refused unless every typed field is well formed and the
+    /// supplied owner digest equals the canonical digest recomputed here, so a
+    /// caller that invents a receipt text, reuses another generation's identity
+    /// or restates any sealed field without the owner's digest is rejected
+    /// before any ORS mutation can observe the record.
+    pub fn seal(parts: GovernorGenerationAdmissionSealParts) -> Result<Self, OrsError> {
+        let seal = Self {
+            seal_version: GOVERNOR_GENERATION_ADMISSION_SEAL_VERSION,
+            operation_id: parts.operation_id,
+            idempotency_key: parts.idempotency_key,
+            module_id: parts.module_id,
+            generation: parts.generation,
+            catalog_revision: parts.catalog_revision,
+            policy_revision: parts.policy_revision,
+            accepted_manifest_sha256: parts.accepted_manifest_sha256,
+            state_fence: parts.state_fence,
+            lifecycle_disposition: parts.lifecycle_disposition,
+            owner_canonical_sha256: parts.owner_canonical_sha256,
+        };
+        if let Some(kind) = seal.defect() {
+            return Err(seal_refusal(kind));
+        }
+        Ok(seal)
+    }
+
+    /// The canonical operation identity the admission was issued under.
+    pub const fn operation_id(&self) -> &OperationIdentity {
+        &self.operation_id
+    }
+
+    /// The admitted module identity.
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    /// The admitted generation identity.
+    pub const fn generation(&self) -> ResourceGeneration {
+        self.generation
+    }
+
+    /// The exact accepted Module Catalog revision.
+    pub const fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    /// The exact Policy revision that was current at admission.
+    pub const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    /// The Module Catalog owner's recorded accepted-execution-manifest digest,
+    /// copied in by the owner adapter and never recomputed here.
+    pub fn accepted_manifest_sha256(&self) -> &str {
+        &self.accepted_manifest_sha256
+    }
+
+    /// The exact canonical State Fence identity of the admission.
+    pub const fn state_fence(&self) -> &StateFenceSnapshot {
+        &self.state_fence
+    }
+
+    /// The lifecycle disposition the Catalog recorded.
+    pub const fn lifecycle_disposition(&self) -> LifecycleAdmissionDisposition {
+        self.lifecycle_disposition
+    }
+
+    /// The first defect that makes this seal unusable as authority, if any.
+    ///
+    /// Every check reads this seal's own recorded fields, and the last one
+    /// compares the recorded `owner_canonical_sha256` against the canonical
+    /// digest recomputed over those same fields, so a seal whose fields were
+    /// edited after sealing is refused.
+    ///
+    /// What this does NOT establish is that the Governor issued the seal.
+    /// `canonical_sha256` and `seal` are `pub` because the Governor owner
+    /// adapter lives in another crate
+    /// (`eliot_module_registry::seal_generation_admission`), so any crate that
+    /// depends on `eliot-ors` can compute a matching digest over fields it
+    /// chose itself. The seal therefore BINDS an admission to exact module,
+    /// generation, Catalog/Policy revisions, State Fence, lifecycle disposition
+    /// and owner-recorded accepted-manifest digest, and makes any edit of those
+    /// fields a refusal; it is not a proof of issuer. Issuer proof requires the
+    /// Governor accept path and the canonical owner readback, which do not exist
+    /// yet: `GenerationAdmission` and `CatalogMutation::AcceptGeneration` have no
+    /// producers and `ModuleCatalog::apply_mutation` refuses every admission.
+    fn defect(&self) -> Option<KernelReconciliationKind> {
+        if self.seal_version != GOVERNOR_GENERATION_ADMISSION_SEAL_VERSION
+            || self.owner_canonical_sha256.trim().is_empty()
+            || self.catalog_revision == 0
+            || self.policy_revision == 0
+        {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealAbsent);
+        }
+        if !matches!(
+            self.lifecycle_disposition,
+            LifecycleAdmissionDisposition::Admitted
+        ) {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealWithheld);
+        }
+        if validate_text(&self.module_id, "governor_admission_seal_module_id").is_err()
+            || validate_text(
+                &self.idempotency_key,
+                "governor_admission_seal_idempotency_key",
+            )
+            .is_err()
+            || validate_text(
+                self.operation_id.as_str(),
+                "governor_admission_seal_operation_id",
+            )
+            .is_err()
+            || validate_digest(
+                &self.accepted_manifest_sha256,
+                "governor_admission_seal_accepted_manifest_sha256",
+            )
+            .is_err()
+        {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealMalformed);
+        }
+        if self.state_fence.validate().is_err() {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealStateFenceAbsent);
+        }
+        match self.canonical_sha256_over_recorded_fields() {
+            Ok(recomputed) if recomputed == self.owner_canonical_sha256 => {}
+            Ok(_) => {
+                return Some(KernelReconciliationKind::GovernorAdmissionSealOwnerDigestMismatch);
+            }
+            Err(_) => return Some(KernelReconciliationKind::GovernorAdmissionSealMalformed),
+        }
+        None
+    }
+
+    /// The first defect that makes this seal unusable for the record it is
+    /// carried on, if any.
+    fn record_binding_defect(
+        &self,
+        module_id: &str,
+        generation: ResourceGeneration,
+        catalog_revision: u64,
+        policy_revision: u64,
+    ) -> Option<KernelReconciliationKind> {
+        if let Some(kind) = self.defect() {
+            return Some(kind);
+        }
+        if self.module_id != module_id || self.generation != generation {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealIdentityMismatch);
+        }
+        if self.catalog_revision != catalog_revision || self.policy_revision != policy_revision {
+            return Some(KernelReconciliationKind::GovernorAdmissionSealRevisionMismatch);
+        }
+        None
+    }
+
+    /// Recomputes the canonical digest over this seal's own recorded fields.
+    fn canonical_sha256_over_recorded_fields(&self) -> Result<String, OrsError> {
+        let core = GovernorGenerationAdmissionSealCore {
+            seal_version: self.seal_version,
+            operation_id: &self.operation_id,
+            idempotency_key: &self.idempotency_key,
+            module_id: &self.module_id,
+            generation: self.generation,
+            catalog_revision: self.catalog_revision,
+            policy_revision: self.policy_revision,
+            accepted_manifest_sha256: &self.accepted_manifest_sha256,
+            state_fence: &self.state_fence,
+            lifecycle_disposition: self.lifecycle_disposition,
+        };
+        let bytes =
+            canonical_json_bytes(&core).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
 /// The Governor-issued Module Catalog admission that authorizes one manifest.
 ///
 /// This is the only input `KernelExecutionManifest::admit` accepts. The
-/// accepted Module Catalog revision, the Policy revision, the
-/// lifecycle/admission receipt identity, the admitted effect ceiling and the
-/// admitted route scopes are recorded here, so a manifest cannot claim a
-/// ceiling or a scope the Catalog did not admit for it.
+/// accepted Module Catalog revision, the Policy revision and the sealed
+/// lifecycle/admission projection are recorded here and are bound to each other
+/// by [`Self::validate`].
 ///
-/// `admission_receipt` is a plain `String` rather than an `OpaqueLabel` on
-/// purpose: a receipt-less manifest has to stay representable so that
-/// `verify_kernel_execution_restart` can detect it and mark the affected
-/// generation degraded, instead of the record simply failing to decode.
+/// Scope truth, stated exactly: `admitted_allowed_scopes` and
+/// `admitted_effect_ceiling` are `pub` fields of this struct and are NOT covered
+/// by `governor_admission_seal`, which carries no scope and no ceiling. They are
+/// therefore bounds this record states, not bounds the seal proves; a caller that
+/// supplies them states its own. [`crate::KernelExecutionManifest::check_admitted_bounds`]
+/// is what refuses a projection whose ceiling or scopes exceed them, so the two
+/// are consistent with each other and neither is proof against the caller. Binding
+/// the admitted ceiling and scopes to the Governor's own record is part of the
+/// same open item as issuer proof (see [`GovernorGenerationAdmissionSeal::defect`]).
+///
+/// `governor_admission_seal` is a typed, sealed, versioned projection rather
+/// than receipt text: receipt text and non-zero revisions are not authority.
+/// `validate` refuses a seal that is absent, belongs to another module or
+/// generation, was issued for other Catalog/Policy revisions, carries no State
+/// Fence identity or no admission disposition, or whose recorded owner digest
+/// does not equal the canonical digest recomputed over its own fields.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedModuleGeneration {
@@ -319,8 +704,9 @@ pub struct AdmittedModuleGeneration {
     pub catalog_revision: u64,
     /// Policy revision that was current at admission. Must be non-zero.
     pub policy_revision: u64,
-    /// Governor-issued lifecycle/admission receipt identity.
-    pub admission_receipt: String,
+    /// Sealed Governor Module Catalog lifecycle/admission projection for this
+    /// exact module, generation, revision pair and manifest digest.
+    pub governor_admission_seal: GovernorGenerationAdmissionSeal,
     /// Restart authorization class the Catalog admitted.
     pub restart_authorization_class: RestartAuthorizationClass,
     /// Effect ceiling the Catalog admitted. The manifest may not exceed it.
@@ -331,7 +717,8 @@ pub struct AdmittedModuleGeneration {
 }
 
 impl AdmittedModuleGeneration {
-    /// Validates the admitted identity, revisions, receipt and route scopes.
+    /// Validates the admitted identity, revisions, sealed admission projection
+    /// and route scopes.
     fn validate(&self) -> Result<(), OrsError> {
         validate_text(&self.module_id, "kernel_execution_manifest_module_id")?;
         if self.catalog_revision == 0 {
@@ -346,10 +733,14 @@ impl AdmittedModuleGeneration {
                 reason: "must be greater than zero",
             });
         }
-        validate_text(
-            &self.admission_receipt,
-            "kernel_execution_manifest_admission_receipt",
-        )?;
+        if let Some(kind) = self.governor_admission_seal.record_binding_defect(
+            &self.module_id,
+            self.generation,
+            self.catalog_revision,
+            self.policy_revision,
+        ) {
+            return Err(seal_refusal(kind));
+        }
         validate_unique_scopes(
             &self.admitted_allowed_scopes,
             "kernel_execution_manifest_admitted_allowed_scopes",
@@ -438,13 +829,13 @@ struct KernelExecutionManifestCore<'a> {
 /// health/readiness contract, the restart budget and quarantine rule, the
 /// `restart_authorization_class`, the authority/effect ceiling and allowed
 /// scopes, the checkpoint/state-class behavior, and the accepted Module
-/// Catalog revision with its lifecycle/admission receipt.
+/// Catalog revision with its sealed lifecycle/admission projection.
 ///
 /// `admit` is the only validating construction path, and a hand-built record
 /// is refused by `validate` unless `manifest_sha256` recomputes over the
-/// recorded schema version, admission and projection. The type declares no
-/// update, widen or re-authorize method, so a changed field cannot be accepted
-/// silently.
+/// recorded schema version, admission and projection and the sealed Governor
+/// admission names exactly this manifest. The type declares no update, widen or
+/// re-authorize method, so a changed field cannot be accepted silently.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelExecutionManifest {
@@ -461,10 +852,13 @@ pub struct KernelExecutionManifest {
 impl KernelExecutionManifest {
     /// Copies one Governor-admitted generation into the Generation Registry.
     ///
-    /// This is the only validating construction path. It refuses a projection
-    /// whose effect ceiling exceeds
-    /// `admission.admitted_effect_ceiling`, a projection whose allowed scopes
-    /// are not a subset of `admission.admitted_allowed_scopes`, and an
+    /// This is the only validating construction path. It refuses an admission
+    /// whose sealed Governor projection does not stand for exactly this module,
+    /// generation and Catalog/Policy revision pair and whose recorded canonical
+    /// owner digest does not recompute over its own fields (see
+    /// [`GovernorGenerationAdmissionSeal`]), a projection whose effect ceiling
+    /// exceeds `admission.admitted_effect_ceiling`, a projection whose allowed
+    /// scopes are not a subset of `admission.admitted_allowed_scopes`, and an
     /// effect-capable class with no allowed scope at all, so neither creation
     /// nor scope widening can be performed from the Kernel side alone.
     pub fn admit(
@@ -486,14 +880,15 @@ impl KernelExecutionManifest {
         Ok(bound)
     }
 
-    /// Whether the recorded manifest carries a Governor admission receipt, a
-    /// non-zero accepted Module Catalog revision and a non-zero Policy revision.
+    /// Whether the recorded manifest carries an intact sealed Governor admission
+    /// projection, a non-zero accepted Module Catalog revision and a non-zero
+    /// Policy revision.
     ///
     /// A manifest that does not is receipt-less: it was never admitted, so it
     /// cannot authorize a restart.
     #[must_use]
     pub fn has_governor_admission(&self) -> bool {
-        !self.admission.admission_receipt.trim().is_empty()
+        self.admission.governor_admission_seal.defect().is_none()
             && self.admission.catalog_revision != 0
             && self.admission.policy_revision != 0
     }
@@ -520,7 +915,8 @@ impl KernelExecutionManifest {
         &self.projection.allowed_scopes
     }
 
-    /// Validates the record shape, the admitted bounds and the bound digest.
+    /// Validates the record shape, the admitted bounds, the sealed Governor
+    /// admission and the bound digest.
     pub fn validate(&self) -> Result<(), OrsError> {
         if self.schema_version != KERNEL_EXECUTION_MANIFEST_SCHEMA_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.schema_version));
@@ -606,6 +1002,71 @@ fn validate_unique_scopes(
         }
     }
     Ok(())
+}
+
+/// The typed refusal one sealed Governor admission defect produces.
+///
+/// The disposition stays a [`KernelReconciliationKind`] so the same defect is
+/// visible as a durable reconciliation item, and the failure stays an
+/// [`OrsError::IntegrityProblem`] rather than an untyped string.
+fn seal_refusal(kind: KernelReconciliationKind) -> OrsError {
+    OrsError::IntegrityProblem {
+        record_type: "kernel_execution_manifest_governor_admission_seal",
+        reason: seal_refusal_reason(kind).to_owned(),
+    }
+}
+
+/// The durable reason recorded for one sealed Governor admission defect.
+const fn seal_refusal_reason(kind: KernelReconciliationKind) -> &'static str {
+    match kind {
+        KernelReconciliationKind::GovernorAdmissionSealAbsent => {
+            "no sealed Governor admission projection is recorded"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealWithheld => {
+            "the recorded lifecycle disposition is not an admission"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealMalformed => {
+            "the recorded sealed admission does not satisfy its own typed shape"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealIdentityMismatch => {
+            "the sealed admission names a different module or generation"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealRevisionMismatch => {
+            "the sealed admission was issued for a different Catalog or Policy revision"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealStateFenceAbsent => {
+            "the sealed admission carries no State Fence identity"
+        }
+        KernelReconciliationKind::GovernorAdmissionSealOwnerDigestMismatch => {
+            "the sealed admission carries a Governor canonical digest that does not recompute"
+        }
+        _ => "the recorded manifest is not admitted by the Governor Module Catalog",
+    }
+}
+
+/// The first defect that makes the manifest's sealed Governor admission
+/// unusable as authority, if any.
+///
+/// `accepted_manifest_sha256` is deliberately not compared here. It is the
+/// Module Catalog owner's recorded accepted-execution-manifest digest, copied
+/// into the seal by the owner adapter and never recomputed on this side, and it
+/// is already covered by the seal's own canonical owner digest. This record's
+/// `manifest_sha256` covers the seal itself, so an in-record equality between
+/// the two would require a digest to equal itself and could never hold. The
+/// digest comparison happens at the immutable row instead: a re-persist of the
+/// same `{module_id, generation}` whose recorded accepted digest differs is
+/// refused as an identity conflict and writes nothing
+/// (`RedbRecoveryStore::persist_admitted_kernel_execution_manifest`).
+fn governor_admission_seal_defect(
+    manifest: &KernelExecutionManifest,
+) -> Option<KernelReconciliationKind> {
+    let seal = &manifest.admission.governor_admission_seal;
+    seal.record_binding_defect(
+        &manifest.admission.module_id,
+        manifest.admission.generation,
+        manifest.admission.catalog_revision,
+        manifest.admission.policy_revision,
+    )
 }
 
 /// The exact request whose authorization must be bound to one manifest.
@@ -779,8 +1240,8 @@ pub enum KernelServiceAdmission {
     ReadRebuildService(BoundKernelExecutionManifest),
     /// Normal effect-capable service under the exact recorded binding. Effect
     /// dispatch stays gated on an unexpired
-    /// [`crate::EffectOperationLease`](crate::EffectOperationLease); the binding
-    /// itself authorizes no effect.
+    /// [`crate::EffectOperationLease`](crate::EffectOperationLease) verified by
+    /// [`verify_exact_effect_replay`]; the binding itself authorizes no effect.
     EffectService(BoundKernelExecutionManifest),
 }
 
@@ -801,7 +1262,7 @@ pub enum KernelReconciliationKind {
     /// A revocation event was acknowledged, so the recorded manifest is revoked.
     ManifestRevoked,
     /// The recorded manifest carries no accepted Catalog/Policy revision or no
-    /// lifecycle/admission receipt.
+    /// sealed lifecycle/admission projection.
     ManifestReceiptless,
     /// The recorded manifest belongs to a different Authority Epoch.
     ManifestForeignEpoch,
@@ -845,6 +1306,30 @@ pub enum KernelReconciliationKind {
     EffectLeaseNotActive,
     /// A delivery gap is open for the replayed effect.
     EffectDeliveryGapOpen,
+    /// The recorded manifest carries no sealed Governor admission projection,
+    /// so no Governor-issued admission exists for it at all.
+    GovernorAdmissionSealAbsent,
+    /// The recorded seal's lifecycle disposition is not an admission.
+    GovernorAdmissionSealWithheld,
+    /// The recorded seal does not satisfy its own typed shape.
+    GovernorAdmissionSealMalformed,
+    /// The recorded seal names a different module or generation than the
+    /// manifest it is carried on.
+    GovernorAdmissionSealIdentityMismatch,
+    /// The recorded seal was issued for a different accepted Module Catalog
+    /// revision or Policy revision than the manifest records.
+    GovernorAdmissionSealRevisionMismatch,
+    /// The recorded seal carries no State Fence identity.
+    GovernorAdmissionSealStateFenceAbsent,
+    /// The recorded seal's Governor canonical digest does not equal the digest
+    /// recomputed over the seal's own fields.
+    GovernorAdmissionSealOwnerDigestMismatch,
+    /// The exact-effect replay supplied no effect operation lease identity, so
+    /// it names no unexpired active lease and is a new operation.
+    EffectLeaseIdentityAbsent,
+    /// The supplied effect operation lease record is not the lease the replay
+    /// claims.
+    EffectLeaseIdentityMismatch,
 }
 
 /// One durable operational item to persist rather than discard.
@@ -954,14 +1439,17 @@ impl KernelRestartDecision {
 ///
 /// The order of the checks is load bearing and produces these dispositions:
 ///
-/// * No manifest, a receipt-less manifest, a manifest that fails its own
-///   shape, one bound to a different identity, digest or Authority Epoch, a
-///   candidate that is not the exact recorded launch binding, a candidate that
-///   fails I1.12 compatibility evidence, an acknowledged revocation, or an
-///   exhausted recorded restart budget all return
-///   [`KernelServiceAdmission::None`] with one reconciliation item. The
+/// * No manifest, a manifest whose sealed Governor admission is unusable (an
+///   absent, withheld, malformed, foreign-identity, foreign-revision,
+///   fence-less, foreign-digest or non-recomputing seal), a receipt-less
+///   manifest, a manifest
+///   that fails its own shape, one bound to a different identity, digest or
+///   Authority Epoch, a candidate that is not the exact recorded launch
+///   binding, a candidate that fails I1.12 compatibility evidence, an
+///   acknowledged revocation, or an exhausted recorded restart budget all
+///   return [`KernelServiceAdmission::None`] with one reconciliation item. The
 ///   affected generation is therefore never restarted into normal-effect
-///   service on a missing, stale, incompatible, revoked or receipt-less
+///   service on a missing, stale, incompatible, revoked or unadmitted
 ///   manifest.
 /// * An effect-capable class whose current Module Catalog/Policy view is not
 ///   current, whose revocation event is unacknowledged, or whose delivery path
@@ -973,10 +1461,13 @@ impl KernelRestartDecision {
 ///   budget.
 /// * Everything else returns [`KernelServiceAdmission::ReadRebuildService`] for
 ///   a `read_rebuild` manifest and [`KernelServiceAdmission::EffectService`] for
-///   an effect-capable one, carrying the sealed exact recorded binding. A
-///   `current_catalog_required` manifest only reaches
-///   `EffectService` while the view is current, so it refuses whenever the view
-///   is stale or unavailable.
+///   an effect-capable one, carrying the sealed exact recorded binding. Both
+///   effect-capable classes reach `EffectService` only while the view is
+///   current, so a stale or unavailable Module Catalog/Policy view caps a
+///   general restart at `ShadowDiagnosticsOnly` for either of them. An
+///   `effect_exact_lease` generation under such a view keeps only its exact
+///   already-authorized operations, and only through
+///   [`verify_exact_effect_replay`].
 ///
 /// Both admitted variants carry a sealed [`BoundKernelExecutionManifest`], whose
 /// `launch_binding`, `resource_limits`, `restart_budget`,
@@ -1049,9 +1540,17 @@ pub fn verify_kernel_execution_restart(
 }
 
 /// The first defect that makes the recorded manifest unusable at all.
+///
+/// A sealed Governor admission defect is reported under its own typed kind, so
+/// an invented receipt and a receipt issued for another module, generation or
+/// Catalog/Policy revision are each visible as the defect they are rather than
+/// as one undifferentiated invalid record.
 fn manifest_structural_defect(
     manifest: &KernelExecutionManifest,
 ) -> Option<KernelReconciliationKind> {
+    if let Some(kind) = governor_admission_seal_defect(manifest) {
+        return Some(kind);
+    }
     if !manifest.has_governor_admission() {
         return Some(KernelReconciliationKind::ManifestReceiptless);
     }
@@ -1095,10 +1594,11 @@ fn manifest_blocking_defect(
 /// class in the observed view.
 ///
 /// `RestartAuthorizationClass::admits_normal_effect_service` is the single
-/// place the class distinction is applied: a `current_catalog_required` class
-/// fails it whenever the view is not current, while an `effect_exact_lease`
-/// class passes it. This function is only reached for an effect-capable class,
-/// so a `read_rebuild` class never sees a Catalog/Policy freshness condition.
+/// place the class distinction is applied: both effect-capable classes fail it
+/// whenever the view is not current, so a stale or unavailable Module
+/// Catalog/Policy view can never open a general `EffectService`. This function
+/// is only reached for an effect-capable class, so a `read_rebuild` class never
+/// sees a Catalog/Policy freshness condition.
 const fn effect_admission_defect(
     class: RestartAuthorizationClass,
     catalog_view: CatalogPolicyView,
@@ -1138,6 +1638,287 @@ fn manifest_reconciliation_item(
         recorded_manifest_sha256: recorded_manifest_sha256.map(str::to_owned),
         lease_id: None,
         operation_id: None,
+        observed_at_ms: request.observed_at_ms,
+    }
+}
+
+/// The exact already-authorized effect operation one replay may resume.
+///
+/// It is a separate request from [`KernelExecutionRestartRequest`] because a
+/// general restart carries no operation identity, no effect receipt, no route
+/// scope and no lease identity: it can only ever start a whole generation. An
+/// effect-capable generation whose Module Catalog/Policy freshness is lost may
+/// therefore not resume a *new* operation through it, and resumes only through
+/// this request, which names the one exact operation and the one exact
+/// unexpired active lease that already authorized it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelExactEffectReplayRequest {
+    /// The one exact operation identity the replay claims.
+    pub operation_id: OperationIdentity,
+    /// The effect operation lease identity the caller supplies as the unexpired
+    /// active lease that authorized it.
+    pub lease_id: OperationIdentity,
+    /// Module identity the replay is bound to.
+    pub module_id: String,
+    /// Generation identity the replay is bound to.
+    pub generation: ResourceGeneration,
+    /// The manifest digest the replay is bound to.
+    pub bound_manifest_sha256: String,
+    /// Digest of the exact already-authorized effect being replayed.
+    pub effect_receipt_sha256: String,
+    /// The exact route scope the replay claims. It cannot exceed the lease's.
+    pub allowed_scope: CapabilityRouteScope,
+    /// Authority Epoch the replay is claimed under.
+    pub authority_epoch: AuthorityEpoch,
+    /// Current accepted Module Catalog revision.
+    pub current_catalog_revision: u64,
+    /// Current Policy revision.
+    pub current_policy_revision: u64,
+    /// Availability of the current Module Catalog/Policy view.
+    pub catalog_view: CatalogPolicyView,
+    /// Acknowledgement state of the latest revocation event.
+    pub revocation: RevocationAcknowledgement,
+    /// Acknowledgement state of the delivery path.
+    pub delivery: EffectDeliveryAcknowledgement,
+    /// Observation time of the decision in Unix milliseconds.
+    pub observed_at_ms: i64,
+}
+
+impl KernelExactEffectReplayRequest {
+    /// Validates the request's own identities, digest, scope, revisions and
+    /// clock.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(
+            self.operation_id.as_str(),
+            "kernel_exact_effect_replay_operation_id",
+        )?;
+        validate_text(
+            self.lease_id.as_str(),
+            "kernel_exact_effect_replay_lease_id",
+        )?;
+        validate_text(&self.module_id, "kernel_exact_effect_replay_module_id")?;
+        validate_digest(
+            &self.bound_manifest_sha256,
+            "kernel_exact_effect_replay_bound_manifest_sha256",
+        )?;
+        validate_digest(
+            &self.effect_receipt_sha256,
+            "kernel_exact_effect_replay_effect_receipt_sha256",
+        )?;
+        self.allowed_scope.validate()?;
+        if self.current_catalog_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "kernel_exact_effect_replay_current_catalog_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.current_policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "kernel_exact_effect_replay_current_policy_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.observed_at_ms <= 0 {
+            return Err(OrsError::InvalidField {
+                field: "kernel_exact_effect_replay_observed_at_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One exact-effect replay decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KernelExactEffectReplayDecision {
+    /// The bounded replay authority the caller may act on. It is present only
+    /// for the one exact leased operation, and it is the sealed
+    /// [`ActiveEffectOperationLease`] itself, so no caller can assemble it.
+    pub authorized_lease: Option<ActiveEffectOperationLease>,
+    /// Preserved evidence for the decision.
+    pub evidence: KernelRestartEvidence,
+    /// Operational items to persist. Empty only for the one admitted exact
+    /// replay; every refusal carries at least one item, so a denied attempt
+    /// cannot be discarded.
+    pub reconciliation: Vec<KernelReconciliationItem>,
+}
+
+/// Authorizes one exact already-authorized effect operation against its lease.
+///
+/// This is the one path an effect-capable generation uses after a general
+/// restart could not open normal-effect service. It mutates no durable state,
+/// dispatches nothing, and authorizes exactly one operation or nothing at all.
+///
+/// The caller must supply the lease identity together with the durable
+/// [`EffectOperationLease`] record it read. That record is not rebuilt,
+/// defaulted or recomputed here: its expiry, lifecycle state, revocation
+/// acknowledgement and delivery acknowledgement are read from the record
+/// itself, and no lease store or lease clock is introduced on this side. Every
+/// refusal below is durable and typed:
+///
+/// * no lease record at all is
+///   [`KernelReconciliationKind::EffectLeaseIdentityAbsent`], so the replay
+///   names no unexpired active lease and is a new operation;
+/// * a lease record that is not the claimed one is
+///   [`KernelReconciliationKind::EffectLeaseIdentityMismatch`];
+/// * a lease that fails its own shape is
+///   [`KernelReconciliationKind::EffectLeaseInvalid`];
+/// * a lease bound to another manifest module, generation or manifest digest
+///   is [`KernelReconciliationKind::EffectManifestMismatch`], and a lease
+///   issued under another Authority Epoch is
+///   [`KernelReconciliationKind::EffectEpochMismatch`];
+/// * the request-side operation identity, effect receipt, route scope,
+///   manifest binding and current revocation/delivery state, the lease's own
+///   expiry, active state, revocation and delivery state, and the currency of
+///   the Module Catalog/Policy view are all verified by
+///   [`authorize_effect_replay`], the single canonical lease gate, and its
+///   typed refusal — including
+///   [`KernelReconciliationKind::EffectLeaseExpired`] and
+///   [`KernelReconciliationKind::EffectCatalogPolicyStale`] — is carried
+///   through unchanged rather than re-implemented here.
+///
+/// An admitted decision carries the sealed lease of that one operation and no
+/// general-effect authority, so a stale or unavailable Module Catalog/Policy
+/// view can never open a new operation.
+pub fn verify_exact_effect_replay(
+    manifest: Option<&KernelExecutionManifest>,
+    lease: Option<&EffectOperationLease>,
+    request: &KernelExactEffectReplayRequest,
+) -> Result<KernelExactEffectReplayDecision, OrsError> {
+    request.validate()?;
+    let evidence = KernelRestartEvidence {
+        module_id: request.module_id.clone(),
+        generation: request.generation,
+        bound_manifest_sha256: request.bound_manifest_sha256.clone(),
+        recorded_manifest_sha256: manifest.map(|value| value.manifest_sha256.clone()),
+        restart_authorization_class: manifest
+            .map(KernelExecutionManifest::restart_authorization_class),
+    };
+    let Some(lease) = lease else {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::EffectLeaseIdentityAbsent,
+            request,
+            None,
+        ));
+    };
+    if lease.lease_id != request.lease_id {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::EffectLeaseIdentityMismatch,
+            request,
+            Some(lease),
+        ));
+    }
+    if lease.validate().is_err() {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::EffectLeaseInvalid,
+            request,
+            Some(lease),
+        ));
+    }
+    let Some(manifest) = manifest else {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::ManifestAbsent,
+            request,
+            Some(lease),
+        ));
+    };
+    if manifest.validate().is_err() {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::ManifestInvalid,
+            request,
+            Some(lease),
+        ));
+    }
+    if lease.manifest_module_id != manifest.admission.module_id
+        || lease.manifest_generation != manifest.admission.generation
+        || lease.bound_manifest_sha256 != manifest.manifest_sha256
+    {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::EffectManifestMismatch,
+            request,
+            Some(lease),
+        ));
+    }
+    if lease.authority_epoch != manifest.admission.authority_epoch {
+        return Ok(deny_exact_effect_replay(
+            evidence,
+            KernelReconciliationKind::EffectEpochMismatch,
+            request,
+            Some(lease),
+        ));
+    }
+    // Every request-side value the canonical gate compares is the caller's own
+    // observation, never a copy of the lease's own field.
+    let decision = authorize_effect_replay(
+        Some(lease),
+        Some(manifest),
+        &EffectReplayRequest {
+            operation_id: request.operation_id.clone(),
+            manifest_module_id: request.module_id.clone(),
+            manifest_generation: request.generation,
+            bound_manifest_sha256: request.bound_manifest_sha256.clone(),
+            effect_receipt_sha256: request.effect_receipt_sha256.clone(),
+            allowed_scope: request.allowed_scope.clone(),
+            current: EffectAuthorizationView {
+                authority_epoch: request.authority_epoch,
+                catalog_revision: request.current_catalog_revision,
+                policy_revision: request.current_policy_revision,
+                catalog_view: request.catalog_view,
+                revocation: request.revocation,
+                delivery: request.delivery,
+            },
+            observed_at_ms: request.observed_at_ms,
+        },
+    )?;
+    let authorized_lease = decision.authority.authorized_lease().cloned();
+    // The gate always pairs a denial with exactly one durable reconciliation
+    // item and an admission with none, so the decision is carried through
+    // without adding or dropping evidence here.
+    let reconciliation = decision.reconciliation.into_iter().collect();
+    Ok(KernelExactEffectReplayDecision {
+        authorized_lease,
+        evidence,
+        reconciliation,
+    })
+}
+
+/// Builds the denied exact-effect replay decision, which authorizes nothing.
+fn deny_exact_effect_replay(
+    evidence: KernelRestartEvidence,
+    kind: KernelReconciliationKind,
+    request: &KernelExactEffectReplayRequest,
+    lease: Option<&EffectOperationLease>,
+) -> KernelExactEffectReplayDecision {
+    KernelExactEffectReplayDecision {
+        authorized_lease: None,
+        evidence,
+        reconciliation: vec![exact_effect_replay_reconciliation_item(
+            kind, request, lease,
+        )],
+    }
+}
+
+/// Builds the reconciliation item for one exact-effect replay refusal.
+fn exact_effect_replay_reconciliation_item(
+    kind: KernelReconciliationKind,
+    request: &KernelExactEffectReplayRequest,
+    lease: Option<&EffectOperationLease>,
+) -> KernelReconciliationItem {
+    KernelReconciliationItem {
+        kind,
+        module_id: request.module_id.clone(),
+        generation: request.generation,
+        bound_manifest_sha256: Some(request.bound_manifest_sha256.clone()),
+        recorded_manifest_sha256: lease.map(|value| value.bound_manifest_sha256.clone()),
+        lease_id: Some(request.lease_id.clone()),
+        operation_id: Some(request.operation_id.clone()),
         observed_at_ms: request.observed_at_ms,
     }
 }
