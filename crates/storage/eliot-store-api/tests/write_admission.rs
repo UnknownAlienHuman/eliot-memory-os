@@ -2,11 +2,11 @@
 //!
 //! Pure in-crate proofs only: a closed versioned projection carries mapped
 //! ORS reservation evidence across the Kernel-to-Store boundary as shape
-//! only, bound by two recomputed canonical digests. Fifteen cases (`990/1`
-//! through `990/13`, `990/15`, `990/16`; `990/14` retired with the removed
-//! Store-client reserved-write entry point) cover the owner mapping, round
-//! trip, every rejection family, ordinary-apply compatibility, legacy
-//! compatibility, and the exported-interface authority guard. No reservation, wire, commit, or
+//! only, bound by two recomputed canonical digests. Sixteen cases (`990/1`
+//! through `990/16`) cover the owner mapping, round trip, every rejection
+//! family, unsupported-client refusal without an ordinary-apply fallback,
+//! ordinary-apply compatibility, legacy compatibility, and the
+//! exported-interface authority guard. No reservation, wire, commit, or
 //! concurrent execution is established by these types. Slice #991 activates
 //! the reserved-write wire variant and client entry point with an explicit
 //! unsupported backend; the authority guard below now pins the declared-but-
@@ -1061,6 +1061,38 @@ fn canonical_token_or_transition_mutation_invalidates_the_binding() {
         head.validate(),
         Err(StoreError::TransitionDigestMismatch { .. })
     ));
+}
+
+// WORK_UNIT_CASE: 990/14
+#[test]
+fn unsupported_default_refuses_reserved_write_without_apply_fallback_or_effect() {
+    let client = StubClient::new();
+    assert_eq!(
+        client.apply_call_count(),
+        0,
+        "the ordinary-write effect counter starts empty"
+    );
+    let request = valid_request();
+    assert!(
+        request.validate().is_ok(),
+        "exercise the unsupported path with a valid reserved-write request"
+    );
+
+    // StubClient inherits CanonicalStoreClient's real default method. Its
+    // apply_prepared counter records any fallback into ordinary unreserved
+    // Apply, including an attempted effect whose receipt is then discarded.
+    let error = block_on(client.apply_reserved_write(request))
+        .expect_err("the unsupported default must return its typed refusal");
+    assert_eq!(
+        error,
+        eliot_store_api::ReservedWriteUnsupported::REFUSAL.into_error(),
+        "the inherited default preserves the exact unsupported refusal"
+    );
+    assert_eq!(
+        client.apply_call_count(),
+        0,
+        "unsupported reserved write must perform no unreserved apply or write effect"
+    );
 }
 
 struct StubClient {
