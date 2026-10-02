@@ -415,7 +415,7 @@ pub async fn project_state_projection<C: CanonicalReadClient>(
         &scope,
         task_id.as_deref(),
         projection,
-        observed_heads,
+        &observed_heads,
     )
 }
 
@@ -496,7 +496,7 @@ fn state_projection_result_body(
     scope: &ScopeId,
     task_id: Option<&str>,
     projection: serde_json::Map<String, Value>,
-    observed_heads: Vec<RevisionHead>,
+    observed_heads: &[RevisionHead],
 ) -> Result<HostRequestResultBody, StateProjectionError> {
     let request_id = envelope.identity.request_id.as_str().to_owned();
     let idempotency_key = envelope.identity.idempotency_key.clone();
@@ -510,7 +510,7 @@ fn state_projection_result_body(
     );
     // Derived BEFORE the response consumes the heads, so the lineage names the
     // same observed closure the content publishes.
-    let source_revisions = observed_source_revisions(&observed_heads);
+    let source_revisions = observed_source_revisions(observed_heads);
     let response = json!({
         "request_id": request_id,
         "idempotency_key": idempotency_key,
@@ -706,6 +706,52 @@ fn state_projection_context(
         .validate()
         .map_err(|error| StateProjectionError::ResponseProjection(error.to_string()))?;
     Ok(context)
+}
+
+/// Builds one closed selector map from the catalogue-declared selectors only.
+fn named_parameters(entries: &[(&str, String)]) -> Result<NamedParameters, StateProjectionError> {
+    NamedParameters::from_map(
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), Value::String(value.clone())))
+            .collect(),
+    )
+    .map_err(|error| StateProjectionError::ResponseProjection(error.to_string()))
+}
+
+/// Producer-side preflight for one submitted `eliot.state` result (issue #1739 W5).
+///
+/// The same rule the Kernel's state gate owns
+/// (`bins/eliot-kernel/src/host_request_route/state_projection.rs::check_state_result_receipt`),
+/// applied on this side of the transport so a body this daemon cannot honestly
+/// claim is never put on the wire. It only ever refuses, and it refuses exactly
+/// what the Kernel refuses:
+///
+/// 1. No lineage at all. The state answer is produced by a semantic owner
+///    flight, so its lineage is the producer's owner receipt bound to the exact
+///    result digest by `HostRequestResultBody::validate`. A receiptless body
+///    names no owner, could never complete the operation as its retained
+///    outcome, and must not be sent as if it could.
+/// 2. The canonical write-receipt class. A state answer is a bounded read of
+///    already-retained owner state (I01-08 read path), so presenting it as an
+///    admitted canonical record would launder a read into a write.
+///
+/// Pure: validation performs no IO by construction. Called by
+/// `crate::DaemonKernelClient::submit_local_state_result_async` before the
+/// result leg touches the transport, so the Kernel's gate stays the authority
+/// and this one only ever refuses earlier.
+pub fn check_state_result_receipt(
+    body: &HostRequestResultBody,
+) -> Result<(), StateProjectionError> {
+    if body.lineage.is_none() {
+        return Err(StateProjectionError::MissingOwnerReceipt);
+    }
+    if body.lineage.as_ref().is_some_and(|lineage| {
+        lineage.result_class == HostRequestResultClass::CanonicalWriteReceipt
+    }) {
+        return Err(StateProjectionError::LaunderedCanonicalWriteClass);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -970,6 +1016,48 @@ mod state_projection_tests {
         }
     }
 
+    /// Asserts the owner's receipt on `body`: present, binding the exact result
+    /// bytes, in the READ class, with no semantic receipt, and naming both the
+    /// fence the owner read under and the scope head it actually observed.
+    fn assert_owner_receipt_binds_the_read(
+        body: &HostRequestResultBody,
+        envelope: &HostRequestEnvelope,
+    ) {
+        let lineage = body
+            .lineage
+            .as_ref()
+            .expect("the owner receipt must ride the result");
+        assert_eq!(
+            lineage.output_digest, body.result_digest,
+            "the receipt binds the exact result bytes"
+        );
+        assert_eq!(
+            lineage.result_class,
+            HostRequestResultClass::ExistingEvidenceRead,
+            "a state answer is a read of already-retained owner state"
+        );
+        assert_eq!(
+            lineage.semantic_receipt_ref, None,
+            "a read projection carries no semantic receipt"
+        );
+        assert_eq!(
+            lineage.source_state_fence.as_ref(),
+            Some(&envelope.state_fence),
+            "the receipt names the fence the owner read under"
+        );
+        let revisions = lineage
+            .source_revisions
+            .as_ref()
+            .expect("the observed scope head is the causal join");
+        assert!(
+            revisions
+                .iter()
+                .any(|revision| revision.key == format!("scope:{TEST_SCOPE}")
+                    && revision.revision == 3),
+            "the receipt names the scope head the owner observed, not one the daemon invented"
+        );
+    }
+
     /// Positive case (#1739 W5): a real claimed State pair, served by the real
     /// production owner invocation over a real store-backed read client, produces
     /// a receipt-bound result body that validates for submission and reads back
@@ -1023,39 +1111,7 @@ mod state_projection_tests {
         // The owner's receipt is present, binds the exact result bytes, and is the
         // READ class: a bounded read of already-retained owner state, with no
         // semantic receipt.
-        let lineage = body
-            .lineage
-            .as_ref()
-            .expect("the owner receipt must ride the result");
-        assert_eq!(
-            lineage.output_digest, body.result_digest,
-            "the receipt binds the exact result bytes"
-        );
-        assert_eq!(
-            lineage.result_class,
-            HostRequestResultClass::ExistingEvidenceRead,
-            "a state answer is a read of already-retained owner state"
-        );
-        assert_eq!(
-            lineage.semantic_receipt_ref, None,
-            "a read projection carries no semantic receipt"
-        );
-        assert_eq!(
-            lineage.source_state_fence.as_ref(),
-            Some(&envelope.state_fence),
-            "the receipt names the fence the owner read under"
-        );
-        let revisions = lineage
-            .source_revisions
-            .as_ref()
-            .expect("the observed scope head is the causal join");
-        assert!(
-            revisions
-                .iter()
-                .any(|revision| revision.key == format!("scope:{TEST_SCOPE}")
-                    && revision.revision == 3),
-            "the receipt names the scope head the owner observed, not one the daemon invented"
-        );
+        assert_owner_receipt_binds_the_read(&body, &envelope);
         check_state_result_receipt(&body).map_err(|error| {
             format!("the owner result must pass the receipt preflight: {error}")
         })?;
@@ -1198,50 +1254,4 @@ mod state_projection_tests {
         ));
         Ok(())
     }
-}
-
-/// Builds one closed selector map from the catalogue-declared selectors only.
-fn named_parameters(entries: &[(&str, String)]) -> Result<NamedParameters, StateProjectionError> {
-    NamedParameters::from_map(
-        entries
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), Value::String(value.clone())))
-            .collect(),
-    )
-    .map_err(|error| StateProjectionError::ResponseProjection(error.to_string()))
-}
-
-/// Producer-side preflight for one submitted `eliot.state` result (issue #1739 W5).
-///
-/// The same rule the Kernel's state gate owns
-/// (`bins/eliot-kernel/src/host_request_route/state_projection.rs::check_state_result_receipt`),
-/// applied on this side of the transport so a body this daemon cannot honestly
-/// claim is never put on the wire. It only ever refuses, and it refuses exactly
-/// what the Kernel refuses:
-///
-/// 1. No lineage at all. The state answer is produced by a semantic owner
-///    flight, so its lineage is the producer's owner receipt bound to the exact
-///    result digest by `HostRequestResultBody::validate`. A receiptless body
-///    names no owner, could never complete the operation as its retained
-///    outcome, and must not be sent as if it could.
-/// 2. The canonical write-receipt class. A state answer is a bounded read of
-///    already-retained owner state (I01-08 read path), so presenting it as an
-///    admitted canonical record would launder a read into a write.
-///
-/// Pure: validation performs no IO by construction. Called by
-/// `crate::DaemonKernelClient::submit_local_state_result_async` before the
-/// result leg touches the transport, so the Kernel's gate stays the authority
-/// and this one only ever refuses earlier.
-pub fn check_state_result_receipt(
-    body: &HostRequestResultBody,
-) -> Result<(), StateProjectionError> {
-    if body.lineage.is_none() {
-        return Err(StateProjectionError::MissingOwnerReceipt);
-    }
-    if body.lineage.as_ref().is_some_and(|lineage| {
-        lineage.result_class == HostRequestResultClass::CanonicalWriteReceipt
-    }) {
-        return Err(StateProjectionError::LaunderedCanonicalWriteClass);
-    }
-    Ok(())
 }

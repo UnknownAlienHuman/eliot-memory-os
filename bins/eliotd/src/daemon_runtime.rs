@@ -5309,7 +5309,7 @@ fn state_projection_outcome_name(outcome: &StateProjectionPollOutcome) -> &'stat
 /// silently discarded. A stale capability is never retried: the step settles and
 /// the next tick claims the current generation anew.
 async fn run_state_projection_poll(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
 ) -> Result<StateProjectionPollOutcome, String> {
     let _span = tracing::info_span!("eliotd.state_projection_poll").entered();
     let pair = kernel
