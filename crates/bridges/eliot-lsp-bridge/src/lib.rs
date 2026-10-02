@@ -2261,24 +2261,45 @@ fn finalize_scip_with_cache_mode(
     };
     if let Some(cache) = cache {
         let target = candidate.reference();
-        let config_hash = config.config_hash();
-        let consulted = match cache {
+        match cache {
             ScipCacheUse::Unbound(cache) => {
-                cache.reuse_or_derive(index_bytes, &config_hash, operation, &target, |index| {
-                    project_cached_items(index, operation)
-                })
+                let config_hash = config.config_hash();
+                match cache.reuse_or_derive(
+                    index_bytes,
+                    &config_hash,
+                    operation,
+                    &target,
+                    |index| project_cached_items(index, operation),
+                ) {
+                    Ok(cached) => {
+                        return wrap_cached_items(operation, cached.items, ok_receipt());
+                    }
+                    Err(error) => {
+                        let receipt = parse_failed(&error);
+                        return empty_scip_result(operation, receipt);
+                    }
+                }
             }
             ScipCacheUse::Invocation(cache, invocation) => {
-                cache.reuse_or_derive_for_invocation(index_bytes, invocation, &target, |index| {
-                    project_cached_items(index, operation)
-                })
-            }
-        };
-        match consulted {
-            Ok(cached) => return wrap_cached_items(operation, cached.items, ok_receipt()),
-            Err(error) => {
-                let receipt = parse_failed(&error);
-                return empty_scip_result(operation, receipt);
+                match cache.try_reuse_or_derive_for_invocation(
+                    index_bytes,
+                    invocation,
+                    &target,
+                    |index| project_cached_items(index, operation),
+                ) {
+                    Ok(Some(cached)) => {
+                        return wrap_cached_items(operation, cached.items, ok_receipt());
+                    }
+                    // A failed live source/root identity measurement disables
+                    // only cache consultation. Continue through the original
+                    // uncached decoder below so the derived optimization
+                    // cannot turn otherwise valid output into a parse failure.
+                    Ok(None) => {}
+                    Err(error) => {
+                        let receipt = parse_failed(&error);
+                        return empty_scip_result(operation, receipt);
+                    }
+                }
             }
         }
     }
@@ -2790,10 +2811,40 @@ impl std::error::Error for LspProcessOwnerError {
 pub type LspProcessOwnerFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, LspProcessOwnerError>> + Send + 'a>>;
 
+/// Complete process streams read back from the original Kernel owner.
+///
+/// `None` means no separate full-byte readback was returned. The bridge may
+/// use a complete inline preview directly; a truncated preview remains
+/// incomplete evidence and cannot be promoted into a current result. Bytes
+/// returned here are accepted only when their exact length and digest match
+/// the corresponding `ProcessStreamEvidence`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LspProcessStreamReadback {
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+}
+
+impl LspProcessStreamReadback {
+    /// Packages exact original-owner stdout/stderr bytes when available.
+    #[must_use]
+    pub fn new(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>) -> Self {
+        Self { stdout, stderr }
+    }
+
+    fn bytes(&self, kind: ProcessStreamKind) -> Option<&[u8]> {
+        match kind {
+            ProcessStreamKind::Stdout => self.stdout.as_deref(),
+            ProcessStreamKind::Stderr => self.stderr.as_deref(),
+        }
+    }
+}
+
 /// Capability over the original session-bound Kernel process owner.
 ///
-/// Start accepts only an already owner-created admission. Reconciliation is
-/// always keyed from the original non-Clone bridge launch handle.
+/// Start accepts only an already owner-created admission. Reconciliation and
+/// complete stream readback are always keyed from the original non-Clone
+/// bridge launch handle; serialized or fabricated process evidence cannot
+/// supply replacement output bytes.
 pub trait LspProcessOwnerPort: Send + Sync {
     /// Starts one exact admitted process request through the original Kernel.
     fn start(
@@ -2803,6 +2854,18 @@ pub trait LspProcessOwnerPort: Send + Sync {
 
     /// Reconciles one operation through the same session-bound owner.
     fn reconcile(&self, operation_id: OperationId) -> LspProcessOwnerFuture<'_, ProcessEvidence>;
+
+    /// Reads complete stdout/stderr bytes through the original process owner.
+    ///
+    /// The bridge verifies every returned stream against the full digest and
+    /// byte count in `evidence`. If a stream's inline preview is truncated and
+    /// this owner cannot retrieve the complete bytes, it must return `None`;
+    /// the retained observation will stay incomplete/stale.
+    fn read_streams<'a>(
+        &'a self,
+        process_start: &'a ProcessStartReceipt,
+        evidence: &'a ProcessEvidence,
+    ) -> LspProcessOwnerFuture<'a, LspProcessStreamReadback>;
 }
 
 /// Proof-bound Current path over original Kernel process and Git owners.
@@ -3471,7 +3534,12 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             .await
             .map_err(BridgeError::ProcessOwner)?;
         validate_process_owner_readback(&started, &process_evidence)?;
-        let raw_outputs = capture_live_raw_outputs(&started, &process_evidence)?;
+        let stream_readback = self
+            .process_owner
+            .read_streams(&started.process_start, &process_evidence)
+            .await
+            .map_err(BridgeError::ProcessOwner)?;
+        let raw_outputs = capture_live_raw_outputs(&started, &process_evidence, &stream_readback)?;
         let mut retained = {
             let mut cache = self.scip_cache.as_ref().and_then(|cache| cache.lock().ok());
             Self::retain_result(
@@ -4615,6 +4683,7 @@ fn live_capture_projection(
 fn capture_live_raw_outputs(
     started: &LspStartedInvocation,
     process_evidence: &ProcessEvidence,
+    stream_readback: &LspProcessStreamReadback,
 ) -> Result<Vec<LspRawOutput>, BridgeError> {
     if !matches!(
         process_evidence.view().lifecycle(),
@@ -4630,29 +4699,67 @@ fn capture_live_raw_outputs(
             ProcessStreamKind::Stdout => process_evidence.stdout(),
             ProcessStreamKind::Stderr => process_evidence.stderr(),
         };
-        if let Some(stream) = stream {
-            if stream.stream() != stream_kind
-                || stream.preview().representation() != StreamPreviewRepresentation::TransportBytes
-            {
+        let owner_bytes = stream_readback.bytes(stream_kind);
+        let Some(stream) = stream else {
+            if owner_bytes.is_some() {
                 return Err(BridgeError::InconsistentBinding(
-                    "process stream readback is not exact transport evidence".to_owned(),
+                    "original process owner returned bytes for a stream absent from its evidence"
+                        .to_owned(),
                 ));
             }
-            let bytes = stream.preview().bytes().to_vec();
-            if bytes.len() > MAX_TOOL_OUTPUT_BYTES {
-                return Err(BridgeError::OutputTooLarge);
-            }
-            let kind = match stream_kind {
-                ProcessStreamKind::Stdout => LspRawOutputKind::Stdout,
-                ProcessStreamKind::Stderr => LspRawOutputKind::Stderr,
-            };
-            outputs.push(live_raw_output(
-                started,
-                kind,
-                bytes,
-                stream.preview().is_truncated(),
-            )?);
+            continue;
+        };
+        if stream.stream() != stream_kind
+            || stream.preview().representation() != StreamPreviewRepresentation::TransportBytes
+        {
+            return Err(BridgeError::InconsistentBinding(
+                "process stream readback is not exact transport evidence".to_owned(),
+            ));
         }
+        let preview = stream.preview().bytes();
+        let (bytes, truncated) = if let Some(owner_bytes) = owner_bytes {
+            let owner_length = u64::try_from(owner_bytes.len()).map_err(|_| {
+                BridgeError::InconsistentBinding(
+                    "original process stream length does not fit its evidence".to_owned(),
+                )
+            })?;
+            if owner_length != stream.observed_bytes()
+                || sha256_hex(owner_bytes) != stream.observed_sha256()
+                || !owner_bytes.starts_with(preview)
+                || (!stream.preview().is_truncated() && owner_bytes != preview)
+            {
+                return Err(BridgeError::InconsistentBinding(
+                    "original process stream bytes differ from the reconciled full identity or prefix"
+                        .to_owned(),
+                ));
+            }
+            if owner_bytes.len() > MAX_TOOL_OUTPUT_BYTES {
+                (preview.to_vec(), true)
+            } else {
+                (owner_bytes.to_vec(), false)
+            }
+        } else if stream.preview().is_truncated() {
+            (preview.to_vec(), true)
+        } else {
+            let preview_length = u64::try_from(preview.len()).map_err(|_| {
+                BridgeError::InconsistentBinding(
+                    "original process preview length does not fit its evidence".to_owned(),
+                )
+            })?;
+            if preview_length != stream.observed_bytes()
+                || sha256_hex(preview) != stream.observed_sha256()
+            {
+                return Err(BridgeError::InconsistentBinding(
+                    "complete process preview differs from the reconciled full identity".to_owned(),
+                ));
+            }
+            (preview.to_vec(), false)
+        };
+        let kind = match stream_kind {
+            ProcessStreamKind::Stdout => LspRawOutputKind::Stdout,
+            ProcessStreamKind::Stderr => LspRawOutputKind::Stderr,
+        };
+        outputs.push(live_raw_output(started, kind, bytes, truncated)?);
     }
 
     let is_scip = is_scip_operation(&started.operation);
@@ -4664,70 +4771,16 @@ fn capture_live_raw_outputs(
             .scip_output_owner
             .as_ref()
             .ok_or(BridgeError::ScipArtifactNotInvocationOwned)?;
-        let source =
-            owner
-                .trusted_source_bundle()
-                .map_err(|error| BridgeError::SidecarUnreadable {
-                    detail: error.to_string(),
-                })?;
-        let observed_before = source
-            .observe()
-            .map_err(|error| BridgeError::SidecarUnreadable {
-                detail: error.to_string(),
-            })?;
         let process_succeeded = process_succeeded(
             process_evidence_completed(process_evidence),
             process_evidence_exit_code(process_evidence),
         );
-        if observed_before.files.is_empty() && !process_succeeded {
-            return Ok(outputs);
-        }
-        if observed_before.files.len() != 1
-            || observed_before.files[0].relative_path != LSP_SCIP_SIDECAR_FILE_NAME
-        {
+        let Some(bytes) = capture_owned_scip_sidecar(owner)? else {
+            if !process_succeeded {
+                return Ok(outputs);
+            }
             return Err(BridgeError::ScipArtifactNotInvocationOwned);
-        }
-        if observed_before.files[0].size > MAX_SCIP_SIDECAR_BYTES {
-            return Err(BridgeError::OutputTooLarge);
-        }
-
-        // Pin the exact emitted file before trusting it. The file lease denies
-        // write/delete sharing; two directory observations must agree with
-        // that retained identity and digest, so a pathname replacement
-        // between enumeration and open cannot be captured as this invocation.
-        let sidecar = source
-            .retain_file(LSP_SCIP_SIDECAR_FILE_NAME)
-            .map_err(|error| BridgeError::SidecarUnreadable {
-                detail: error.to_string(),
-            })?;
-        let observed_while_pinned =
-            source
-                .observe()
-                .map_err(|error| BridgeError::SidecarUnreadable {
-                    detail: error.to_string(),
-                })?;
-        if observed_while_pinned != observed_before
-            || observed_while_pinned.files.len() != 1
-            || observed_while_pinned.files[0].identity != sidecar.identity()
-            || observed_while_pinned.files[0].size != sidecar.size()
-            || observed_while_pinned.files[0].sha256 != sidecar.sha256()
-        {
-            return Err(BridgeError::ScipArtifactNotInvocationOwned);
-        }
-        let bytes = sidecar
-            .read_bounded(MAX_SCIP_SIDECAR_BYTES)
-            .map_err(|error| BridgeError::SidecarUnreadable {
-                detail: error.to_string(),
-            })?;
-        let observed_after_read =
-            source
-                .observe()
-                .map_err(|error| BridgeError::SidecarUnreadable {
-                    detail: error.to_string(),
-                })?;
-        if observed_after_read != observed_while_pinned {
-            return Err(BridgeError::ScipArtifactNotInvocationOwned);
-        }
+        };
         outputs.push(live_raw_output(
             started,
             LspRawOutputKind::ScipSidecar,
@@ -4736,6 +4789,77 @@ fn capture_live_raw_outputs(
         )?);
     }
     Ok(outputs)
+}
+
+/// Reads the one exact sidecar under the live invocation-owned directory
+/// handle. Empty means no output was emitted; every non-empty different file
+/// set is a refusal. The file lease and before/after owner observations bind
+/// the bytes to one measured object for this readback.
+fn capture_owned_scip_sidecar(
+    owner: &OwnedDirectoryPublication,
+) -> Result<Option<Vec<u8>>, BridgeError> {
+    let source = owner
+        .trusted_source_bundle()
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    let observed_before = source
+        .observe()
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    if observed_before.files.is_empty() {
+        return Ok(None);
+    }
+    if observed_before.files.len() != 1
+        || observed_before.files[0].relative_path != LSP_SCIP_SIDECAR_FILE_NAME
+    {
+        return Err(BridgeError::ScipArtifactNotInvocationOwned);
+    }
+    if observed_before.files[0].size > MAX_SCIP_SIDECAR_BYTES {
+        return Err(BridgeError::OutputTooLarge);
+    }
+
+    // Pin the exact emitted file before trusting it. The file lease denies
+    // write/delete sharing; two directory observations must agree with that
+    // retained identity and digest, so a pathname replacement between
+    // enumeration and open cannot be captured as this invocation.
+    let sidecar = source
+        .retain_file(LSP_SCIP_SIDECAR_FILE_NAME)
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    let observed_while_pinned =
+        source
+            .observe()
+            .map_err(|error| BridgeError::SidecarUnreadable {
+                detail: error.to_string(),
+            })?;
+    if observed_while_pinned != observed_before
+        || observed_while_pinned.files.len() != 1
+        || observed_while_pinned.files[0].identity != sidecar.identity()
+        || observed_while_pinned.files[0].size != sidecar.size()
+        || observed_while_pinned.files[0].sha256 != sidecar.sha256()
+    {
+        return Err(BridgeError::ScipArtifactNotInvocationOwned);
+    }
+    let bytes = sidecar
+        .read_bounded(MAX_SCIP_SIDECAR_BYTES)
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    let observed_after_read = source
+        .observe()
+        .map_err(|error| BridgeError::SidecarUnreadable {
+            detail: error.to_string(),
+        })?;
+    if observed_after_read != observed_while_pinned
+        || u64::try_from(bytes.len()).ok() != Some(sidecar.size())
+        || sha256_hex(&bytes) != sidecar.sha256()
+    {
+        return Err(BridgeError::ScipArtifactNotInvocationOwned);
+    }
+    Ok(Some(bytes))
 }
 
 fn live_raw_output(
@@ -5718,10 +5842,15 @@ mod tests {
 
     use super::*;
     use std::fmt::Write as _;
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const VERSION_LINE: &str = "rust-analyzer 1.97.1 (8bab26f4 2026-07-14)\n";
 
     const DIAGNOSTICS_SAMPLE: &str = "0/1 0% processing C:\\Temp\\ra-probe\\src\\main.rs\r\nat crate ra_probe, file C:\\Temp\\ra-probe\\src\\main.rs: Error RustcHardError(\"E0308\") from LineCol { line: 1, col: 17 } to LineCol { line: 1, col: 23 }: expected i32, found &'static str\r\ndiagnostic scan complete\r\n";
+
+    #[cfg(windows)]
+    static NEXT_SIDECAR_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     fn test_config() -> AnalyzerConfig {
         AnalyzerConfig {
@@ -5853,6 +5982,129 @@ mod tests {
             scip_output_path: Some("C:/Temp/ra-probe/index.scip".to_owned()),
             ..test_config()
         }
+    }
+
+    #[cfg(windows)]
+    fn sidecar_fixture_owner() -> OwnedDirectoryPublication {
+        let sequence = NEXT_SIDECAR_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let destination = std::env::temp_dir().join(format!(
+            "eliot-lsp-sidecar-owner-{}-{sequence}",
+            std::process::id()
+        ));
+        OwnedDirectoryPublication::create(&destination)
+            .expect("original directory owner retains a fresh sidecar root")
+    }
+
+    #[cfg(windows)]
+    fn sidecar_config_for(owner: &OwnedDirectoryPublication) -> AnalyzerConfig {
+        AnalyzerConfig {
+            scip_output_path: Some(
+                owner
+                    .temporary_path()
+                    .join(LSP_SCIP_SIDECAR_FILE_NAME)
+                    .to_str()
+                    .expect("owned sidecar path is UTF-8")
+                    .to_owned(),
+            ),
+            ..test_config()
+        }
+    }
+
+    #[cfg(windows)]
+    fn retire_sidecar_fixture_owner(owner: OwnedDirectoryPublication) {
+        let observed = eliot_platform_windows::observe_owned_directory_exact(
+            owner.temporary_path(),
+            &[LSP_SCIP_SIDECAR_FILE_NAME],
+            16 * 1024 * 1024,
+        )
+        .expect("original retirement owner measures the exact sidecar fixture");
+        assert_eq!(observed.directory_identity, owner.temporary_identity());
+        let expected = observed.retirement_precondition();
+        assert!(matches!(
+            owner
+                .retire_unpublished_tree(&expected)
+                .expect("original publication owner retires the exact measured fixture"),
+            eliot_platform_windows::OwnedDirectoryRetirementOutcome::Retired
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invocation_owned_scip_sidecar_readback_matches_original_file_handle_facts() {
+        let owner = sidecar_fixture_owner();
+        let operation = SemanticOperation::Definitions {
+            symbol: "sym".to_owned(),
+        };
+        let candidate = test_candidate();
+        let config = sidecar_config_for(&owner);
+        let command = LspCommand::scip(&config, &candidate).expect("SCIP command validates");
+        validate_invocation_sidecar(&command, &config, &operation, Some(&owner))
+            .expect("fresh operation-owned output root is empty before launch");
+
+        let exact_bytes = b"owned-sidecar-readback";
+        let sidecar_path = owner.temporary_path().join(LSP_SCIP_SIDECAR_FILE_NAME);
+        std::fs::write(&sidecar_path, exact_bytes)
+            .expect("simulated analyzer emits into the owner-chosen path");
+        let source = owner
+            .trusted_source_bundle()
+            .expect("original directory owner supplies trusted file observation");
+        let before = source
+            .observe()
+            .expect("original source bundle measures the emitted sidecar");
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(before.files[0].relative_path, LSP_SCIP_SIDECAR_FILE_NAME);
+
+        let readback = capture_owned_scip_sidecar(&owner)
+            .expect("production readback accepts the exact operation-owned file")
+            .expect("the analyzer emitted a sidecar");
+        let after = source
+            .observe()
+            .expect("original source bundle remeasures the retained sidecar");
+        assert_eq!(readback, exact_bytes);
+        assert_eq!(before, after);
+        assert_eq!(
+            sha256_hex(&readback),
+            before.files[0].sha256,
+            "the physical readback digest equals the original owner's measured file digest"
+        );
+        assert_eq!(readback.len() as u64, before.files[0].size);
+        assert_eq!(before.files[0].identity, after.files[0].identity);
+        drop(source);
+        retire_sidecar_fixture_owner(owner);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invocation_sidecar_preflight_refuses_a_nonempty_original_owner_root() {
+        let owner = sidecar_fixture_owner();
+        let config = sidecar_config_for(&owner);
+        let operation = SemanticOperation::Definitions {
+            symbol: "sym".to_owned(),
+        };
+        let candidate = test_candidate();
+        let command = LspCommand::scip(&config, &candidate).expect("SCIP command validates");
+        let stale_path = owner.temporary_path().join(LSP_SCIP_SIDECAR_FILE_NAME);
+        std::fs::write(&stale_path, b"old invocation output")
+            .expect("fixture writes a real stale sidecar under the owner root");
+        let source = owner
+            .trusted_source_bundle()
+            .expect("original owner retains the pre-existing sidecar root");
+        let observed = source
+            .observe()
+            .expect("original owner measures the pre-existing sidecar");
+        assert_eq!(observed.files.len(), 1);
+        assert_eq!(observed.files[0].relative_path, LSP_SCIP_SIDECAR_FILE_NAME);
+        assert_eq!(
+            observed.files[0].sha256,
+            sha256_hex(b"old invocation output")
+        );
+
+        assert!(matches!(
+            validate_invocation_sidecar(&command, &config, &operation, Some(&owner)),
+            Err(BridgeError::ScipArtifactNotInvocationOwned)
+        ));
+        drop(source);
+        retire_sidecar_fixture_owner(owner);
     }
 
     /// A lone continuation byte is a truncated varint, so the SCIP decoder

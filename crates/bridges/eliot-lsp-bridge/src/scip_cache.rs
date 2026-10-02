@@ -287,6 +287,33 @@ impl ScipProjectionCache {
         )
     }
 
+    /// Optional cache path used by retained normalization. An unavailable
+    /// source/root measurement disables only this derived optimization; the
+    /// caller then performs the same uncached decode and projection. Once a
+    /// complete identity exists, actual decode/projection errors still return
+    /// as semantic failures.
+    pub(crate) fn try_reuse_or_derive_for_invocation(
+        &mut self,
+        index_bytes: &[u8],
+        invocation: &LspStartedInvocation,
+        target_identity: &str,
+        project: impl FnOnce(&ScipIndex) -> Result<CachedScipItems, BridgeError>,
+    ) -> Result<Option<CachedProjection>, BridgeError> {
+        let Ok(overrides) = invocation_cache_identity(invocation) else {
+            return Ok(None);
+        };
+        let memo_key_digest = overrides.config_digest.clone();
+        self.reuse_or_derive_with_identity(
+            index_bytes,
+            target_identity,
+            &overrides.source_digest,
+            &memo_key_digest,
+            Some(overrides),
+            project,
+        )
+        .map(Some)
+    }
+
     fn reuse_or_derive_with_identity(
         &mut self,
         index_bytes: &[u8],

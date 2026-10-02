@@ -39,9 +39,10 @@ use std::path::{Path, PathBuf};
 
 use crate::package_staging;
 use crate::{
-    FileIdentity, OwnedSecurityDescriptor, PackageStagingError, TrustedSourceBundle,
-    file_identity_from_handle, final_windows_path_from_handle, validate_package_relative_path,
-    windows_paths_equal,
+    FileIdentity, OwnedDirectoryRetirementError, OwnedDirectoryRetirementOutcome,
+    OwnedDirectoryRetirementPrecondition, OwnedSecurityDescriptor, PackageStagingError,
+    TrustedSourceBundle, file_identity_from_handle, final_windows_path_from_handle,
+    retire_owned_directory_exact, validate_package_relative_path, windows_paths_equal,
 };
 
 #[path = "directory_publication_models.rs"]
@@ -300,6 +301,61 @@ impl OwnedDirectoryPublication {
         {
             let _ = (self, precommit_temporary_identity);
             Err(DirectoryPublicationError::UnsupportedPlatform)
+        }
+    }
+
+    /// Retires this exact unpublished directory after comparing its complete
+    /// file set to the supplied owner observation.
+    ///
+    /// This is a bounded cleanup path for callers that staged files in the
+    /// temporary directory but chose not to publish it. The expected root
+    /// identity must be the one retained by this publication owner; the
+    /// existing exact-retirement owner then rechecks every child identity and
+    /// digest before issuing delete dispositions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal before deletion when the live publication root or
+    /// exact child set differs from the supplied observation. Any uncertainty
+    /// after the first deletion is represented as `CommittedUnknown`.
+    pub fn retire_unpublished_tree(
+        mut self,
+        expected: &OwnedDirectoryRetirementPrecondition,
+    ) -> Result<OwnedDirectoryRetirementOutcome, OwnedDirectoryRetirementError> {
+        #[cfg(windows)]
+        {
+            if self.committed || expected.directory_identity != self.initial_temporary_identity {
+                return Err(OwnedDirectoryRetirementError::IdentityMismatch);
+            }
+            let handle = self
+                .temporary_handle
+                .as_ref()
+                .ok_or(OwnedDirectoryRetirementError::IdentityMismatch)?;
+            let actual_path = final_windows_path_from_handle(handle)
+                .map_err(|_| OwnedDirectoryRetirementError::IdentityMismatch)?;
+            let actual_identity = file_identity_from_handle(handle)
+                .map_err(|_| OwnedDirectoryRetirementError::IdentityMismatch)?;
+            if !windows_paths_equal(&actual_path, &self.temporary)
+                || actual_identity != expected.directory_identity
+            {
+                return Err(OwnedDirectoryRetirementError::IdentityMismatch);
+            }
+            verify_directory_publication_contour(&self.contour)
+                .map_err(|_| OwnedDirectoryRetirementError::IdentityMismatch)?;
+
+            // The publication's no-delete-sharing root handle is the original
+            // identity authority above. Drop only that duplicate after its
+            // exact identity is checked; the retirement owner receives the
+            // same root and full child precondition before any deletion.
+            drop(self.temporary_handle.take());
+            let outcome = retire_owned_directory_exact(&self.temporary, expected)?;
+            self.committed = true;
+            Ok(outcome)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, expected);
+            Err(OwnedDirectoryRetirementError::UnsupportedPlatform)
         }
     }
 }
