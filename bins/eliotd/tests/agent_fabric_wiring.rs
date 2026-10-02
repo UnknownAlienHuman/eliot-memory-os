@@ -2637,13 +2637,19 @@ fn fully_claimed_unchanged_proposal_is_admitted() -> TestResult {
 }
 
 // WORK_UNIT_CASE: 1702/A1 — a revision binding a digest that is no longer the
-// frozen definition is refused, and the refusal NAMES THE WORK GRAPH that the
-// substituted digest stands for. This is the production path's only reachable
-// refusal for the work graph, objective, acceptance, ceilings and stop
-// conditions: a coordinator present carries none of those five on the execution
-// record, so it re-expresses them the only way it can — by binding a different
-// `definition_digest` — and `check_execution_update` names the digest change as
-// the work graph it is.
+// frozen definition is refused. A coordinator present carries none of the work
+// graph, objective, acceptance, ceilings or stop conditions on the execution
+// record, so a semantic rewrite can only reach them by re-authoring the
+// execution onto a different `definition_digest`. That is refused as a BROKEN
+// OWNERSHIP JOIN rather than as a work-graph drift:
+// `check_semantic_execution_update` hands `check_execution_update` the STORED
+// execution, definition and admission, so the presented revision never enters
+// those comparisons and `SemanticDrift("update.work_graph_digest")` cannot be
+// the refusal. The guard returns Ok here, and the refusal that actually fires is
+// `check_owner_join`'s execution-binding check run against the PRESENTED
+// revision — `BrokenOwnershipLink("execution binding")`. The rewrite is
+// stopped either way; the assertion pins the refusal that really happens rather
+// than the one this path would need a different entry point to produce.
 #[test]
 fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_typed() -> TestResult {
     let route = test_route()?;
@@ -2687,17 +2693,26 @@ fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_type
         2,
     )?;
 
-    assert_semantic_drift(
-        world.fabric.record_semantic_execution(
-            rewritten_execution,
-            SWARM_COORDINATOR,
-            1,
-            &commit.revision,
-            &commit.receipt,
-        ),
-        "update.work_graph_digest",
-        "foreign definition digest",
-    )?;
+    match world.fabric.record_semantic_execution(
+        rewritten_execution,
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    ) {
+        Err(FabricError::BrokenOwnershipLink(refused)) => {
+            assert_eq!(
+                refused, "execution binding",
+                "a foreign digest must refuse as the broken execution binding it is"
+            );
+        }
+        other => {
+            return Err(format!(
+                "foreign definition digest must refuse the broken execution binding, got {other:?}"
+            )
+            .into());
+        }
+    }
 
     // Refused is refused: the previously current revision is still exactly what
     // this fabric holds, and nothing was recorded as an update.

@@ -1372,14 +1372,31 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
 /// against the stored execution's wave and the frozen root.
 ///
 /// The other four live on the frozen `SwarmPlanDefinition` this revision
-/// binds, which is the admission's own definition: the update path has already
-/// fetched that definition by the presented revision's own `definition_id`,
-/// and the guard independently refuses a presented revision whose
-/// `definition_digest` is no longer this one (`check_execution_update`'s
-/// execution-binding check), so a digest that names other semantics never
-/// reaches this derivation. Naming the frozen content verbatim therefore
-/// claims EXACTLY what the revision is running under — it asserts no new
-/// value, and takes no position the guard does not already own.
+/// binds, which is the admission's own definition. Naming that frozen content
+/// verbatim is NOT an independent claim of it, and this is worth stating
+/// exactly, because the difference decides which refusal a rewrite actually
+/// meets: [`check_semantic_execution_update`] resolves the STORED execution,
+/// definition and admission by identity and hands those — never the presented
+/// revision — to [`check_execution_update`], whose work-graph, objective,
+/// acceptance, ceilings and stop-conditions arms each compare a claim taken
+/// from one stored record against the same stored record. On this path those
+/// four `SemanticDrift` arms are therefore tautological and cannot refuse, and
+/// `SemanticDrift("update.work_graph_digest")` is unreachable here.
+///
+/// What refuses a semantic rewrite is the ownership join the PRESENTED
+/// revision still owes once the guard returns:
+/// [`AgentFabric::record_semantic_execution`] re-runs [`check_owner_join`]
+/// against the presented revision, so a revision re-authored onto a different
+/// `definition_digest` fails the execution-BINDING check with
+/// `BrokenOwnershipLink("execution binding")` — a broken join, not a work-graph
+/// drift. [`check_execution_update`] carries the same binding condition
+/// (`eliot-agent-contracts/src/lib.rs:2125-2130`), but it is handed the stored
+/// revision, so the two records agree there by construction.
+///
+/// `wave` and `root_context_revision` are the only two dimensions a coordinator
+/// revision really carries, and they are the two that stay comparable: the wave
+/// against the stored revision's wave and the root against both the frozen root
+/// and the stored revision's root.
 ///
 /// This is a derivation, not a comparison. Every field-vs-frozen decision is
 /// made once, by the contract owner, inside
