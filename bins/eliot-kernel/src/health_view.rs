@@ -39,6 +39,75 @@ fn observe_health(event: &'static str, outcome: &'static str) {
     );
 }
 
+/// Confirms that a retained local-read capability was the exact attempt the
+/// verified audit chain dispatched for this request. The capability's local
+/// fencing generation is historical queue evidence; it is never compared to
+/// the current session or ORS claim lease generation.
+fn original_local_read_attempt_was_dispatched(
+    records: &[super::kernel_audit::AuditRecord],
+    operation_id: &str,
+    trace_id: &str,
+    state_fence: &eliot_protocol::StateFence,
+    connection_id: &str,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    work_scope_id: Option<&str>,
+    attempt: &eliot_protocol::LocalReadAttempt,
+    before_sequence: u64,
+) -> bool {
+    records.iter().any(|record| {
+        let body = &record.event_body;
+        let authorization = body.get("operation_authorization");
+        record.kind == super::kernel_audit::AuditEventKind::DISPATCH_DAEMON_CLAIM
+            && record.seq < before_sequence
+            && record.lineage.operation_id.as_deref() == Some(operation_id)
+            && record.lineage.trace_id.as_deref() == Some(trace_id)
+            && record.lineage.state_fence.as_ref() == Some(state_fence)
+            && record.lineage.adapter_instance.as_deref() == Some(connection_id)
+            && record.lineage.session_id.as_deref() == session_id
+            && record.lineage.task_id.as_deref() == task_id
+            && record.lineage.work_scope.as_deref() == work_scope_id
+            && record.lineage.attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+            && record.lineage.environment_lease.as_deref() == Some(attempt.attempt_id.as_str())
+            && record.lineage.route_receipt_requested.as_deref() == Some("eliot.query")
+            && body.get("lane").and_then(serde_json::Value::as_str) == Some("query")
+            && body.get("attempt_id").and_then(serde_json::Value::as_str)
+                == Some(attempt.attempt_id.as_str())
+            && body
+                .get("fencing_generation")
+                .and_then(serde_json::Value::as_u64)
+                == Some(attempt.fencing_generation)
+            && body.get("scope_id").and_then(serde_json::Value::as_str)
+                == Some(attempt.scope_id.as_str())
+            && body.get("facet_method").and_then(serde_json::Value::as_str)
+                == Some(attempt.facet_method.as_str())
+            && body
+                .get("transport_authentication")
+                .and_then(serde_json::Value::as_str)
+                == Some("observed_at_dispatch_boundary")
+            && authorization
+                .and_then(|value| value.get("status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("admitted_for_dispatch")
+            && authorization
+                .and_then(|value| value.get("attempt_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt.attempt_id.as_str())
+            && authorization
+                .and_then(|value| value.get("fencing_generation"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(attempt.fencing_generation)
+            && authorization
+                .and_then(|value| value.get("scope_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt.scope_id.as_str())
+            && authorization
+                .and_then(|value| value.get("facet_method"))
+                .and_then(serde_json::Value::as_str)
+                == Some(attempt.facet_method.as_str())
+    })
+}
+
 /// Reads only an already-sealed degraded trace when an original retained
 /// source is absent. It never reconstructs or replaces that source.
 fn degraded_trace_replay_without_source(
@@ -51,6 +120,34 @@ fn degraded_trace_replay_without_source(
     use super::trace_manifest::TraceFinish;
 
     let missing = |slot: &str| manifest.missing_parts.iter().any(|part| part == slot);
+    let owner_state = format!("{:?}", owner_record.state);
+    let owner_authority_epoch =
+        crate::kernel_audit::authority_epoch_text(&owner_record.authority_epoch);
+    let owner_generation = owner_record.generation.to_string();
+    let owner_claim_lease = owner_record
+        .attempt
+        .as_ref()
+        .map(|attempt| attempt.attempt_id.as_str());
+    let owner_claim_fencing = owner_record
+        .attempt
+        .as_ref()
+        .map(|attempt| attempt.fencing_generation);
+    let claim_lease_is_bound = match (
+        manifest.lease_attempt_id.as_deref(),
+        owner_claim_lease,
+        manifest.fencing_generation,
+        owner_claim_fencing,
+    ) {
+        (Some(manifest_id), Some(owner_id), Some(manifest_fence), Some(owner_fence)) => {
+            manifest_id == owner_id && manifest_fence == owner_fence
+        }
+        (None, None, None, None) => true,
+        (manifest_id, owner_id, manifest_fence, owner_fence) => {
+            missing("lease")
+                && manifest_id.is_none_or(|id| Some(id) == owner_id)
+                && manifest_fence.is_none_or(|fence| Some(fence) == owner_fence)
+        }
+    };
     if manifest.finish != TraceFinish::DegradedNoProof
         || !is_lower_sha256(request_digest)
         || manifest.operation_id != operation_id
@@ -72,23 +169,53 @@ fn degraded_trace_replay_without_source(
         || manifest.task_id.as_deref() != owner_record.task_ref.as_ref().map(|value| value.as_str())
         || manifest.work_scope_id.as_deref()
             != owner_record.scope_ref.as_ref().map(|value| value.as_str())
-        || manifest.durable_state.as_deref() != Some(format!("{:?}", owner_record.state).as_str())
-        || manifest.authority_epoch.as_deref()
-            != Some(
-                crate::kernel_audit::authority_epoch_text(&owner_record.authority_epoch).as_str(),
-            )
-        || manifest.module_generation.as_deref()
-            != Some(owner_record.generation.to_string().as_str())
-        || manifest.payload_digest.as_deref() != Some(owner_record.payload_digest.as_str())
-        || manifest.action_contract_ref.as_deref()
-            != owner_record
-                .payload_schema_id
-                .as_ref()
-                .map(|value| value.as_str())
+        || manifest
+            .durable_state
+            .as_deref()
+            .is_some_and(|state| state != owner_state)
+        || manifest.durable_state.is_none() && !missing("result_receipt")
+        || manifest
+            .authority_epoch
+            .as_deref()
+            .is_some_and(|epoch| epoch != owner_authority_epoch)
+        || manifest.authority_epoch.is_none() && !missing("state_fence")
+        || manifest
+            .module_generation
+            .as_deref()
+            .is_some_and(|generation| generation != owner_generation)
+        || manifest.module_generation.is_none() && !missing("state_fence")
+        || manifest
+            .payload_digest
+            .as_deref()
+            .is_some_and(|digest| digest != owner_record.payload_digest)
+        || manifest.payload_digest.is_none() && !missing("action_contract")
+        || manifest
+            .action_contract_ref
+            .as_deref()
+            .is_some_and(|schema| {
+                owner_record
+                    .payload_schema_id
+                    .as_ref()
+                    .map(|value| value.as_str())
+                    != Some(schema)
+            })
+        || manifest.action_contract_ref.is_none() && !missing("action_contract")
+        || owner_record.admitted_state_fence.is_none()
         || manifest
             .state_fence
             .as_ref()
             .is_some_and(|fence| owner_record.admitted_state_fence.as_ref() != Some(fence))
+        || manifest.state_fence.is_none() && !missing("state_fence")
+        || manifest.policy_snapshot.as_deref().is_some_and(|snapshot| {
+            owner_record
+                .admitted_state_fence
+                .as_ref()
+                .and_then(|fence| fence.policy_revision)
+                .map(|revision| revision.value().to_string())
+                .as_deref()
+                != Some(snapshot)
+        })
+        || manifest.policy_snapshot.is_none() && !missing("policy_snapshot")
         || owner_record
             .admitted_state_fence
             .as_ref()
@@ -99,16 +226,7 @@ fn degraded_trace_replay_without_source(
                     .as_deref()
                     != Some(owner_record.fence_digest.as_str())
             })
-        || owner_record
-            .attempt
-            .as_ref()
-            .map(|attempt| attempt.attempt_id.as_str())
-            != manifest.lease_attempt_id.as_deref()
-        || owner_record
-            .attempt
-            .as_ref()
-            .map(|attempt| attempt.fencing_generation)
-            != manifest.fencing_generation
+        || !claim_lease_is_bound
     {
         return None;
     }
@@ -148,8 +266,12 @@ fn degraded_trace_replay_without_source(
     {
         return None;
     }
-    if manifest.result_digest.as_deref() != owner_record.result_digest.as_deref()
-        || manifest.result_bytes_retained != result_response.is_some()
+    if manifest
+        .result_digest
+        .as_deref()
+        .is_some_and(|digest| owner_record.result_digest.as_deref() != Some(digest))
+        || manifest.result_digest.is_none() && !missing("result_receipt")
+        || manifest.result_bytes_retained != result_response.is_some() && !missing("result_receipt")
     {
         return None;
     }
@@ -253,7 +375,20 @@ fn degraded_trace_replay_without_source(
                 .ok()?;
             let mut body = receipt.clone();
             body.as_object_mut()?.remove("receipt_digest");
-            object.len() == 9
+            [
+                "kind",
+                "operation_id",
+                "request_digest",
+                "result_digest",
+                "invoked_operation",
+                "named_operation",
+                "state_fence",
+                "route_facts",
+                "receipt_digest",
+            ]
+            .into_iter()
+            .all(|key| object.contains_key(key))
+                && object.len() == 9
                 && is_lower_sha256(digest)
                 && digest == receipt_digest
                 && canonical_json_bytes(&body)
@@ -334,6 +469,21 @@ fn degraded_trace_replay_without_source(
         .map(|session| session.as_str())
         .or_else(|| owner_record.scope_ref.as_ref().map(|scope| scope.as_str()))
         .unwrap_or(owner_record.connection_ref.as_str());
+    let attempt_before_sequence = manifest
+        .result_binding_receipt
+        .as_ref()
+        .map(|record| record.seq)
+        .or_else(|| {
+            records
+                .iter()
+                .rev()
+                .find(|record| {
+                    record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
+                        && record.lineage.operation_id.as_deref() == Some(operation_id)
+                })
+                .map(|record| record.seq)
+        })?;
+    let owner_state_fence = owner_record.admitted_state_fence.as_ref()?;
     let owner_local_attempt = evidence.and_then(|value| value.local_read_attempt.as_ref());
     let decoded_local_attempt = match owner_local_attempt {
         Some(value) => {
@@ -349,6 +499,21 @@ fn degraded_trace_replay_without_source(
                 || !attempt
                     .authority_epoch
                     .is_same_authority(&owner_record.authority_epoch)
+                || !original_local_read_attempt_was_dispatched(
+                    records,
+                    operation_id,
+                    owner_record.request_id.as_str(),
+                    owner_state_fence,
+                    owner_record.connection_ref.as_str(),
+                    owner_record
+                        .session_ref
+                        .as_ref()
+                        .map(|value| value.as_str()),
+                    owner_record.task_ref.as_ref().map(|value| value.as_str()),
+                    owner_record.scope_ref.as_ref().map(|value| value.as_str()),
+                    &attempt,
+                    attempt_before_sequence,
+                )
             {
                 return None;
             }
@@ -680,7 +845,20 @@ impl KernelComposition {
         };
         let owner_source_missing = owner_record.admitted_input_bytes.is_none()
             || owner_record.payload_body.is_none()
-            || owner_record.result_response.is_none();
+            || owner_record.result_response.is_none()
+            || manifest.state_fence.is_none()
+            || manifest.payload_digest.is_none()
+            || manifest.result_digest.is_none()
+            || manifest.durable_state.is_none()
+            || manifest.action_contract_ref.is_none()
+            || owner_record.attempt.is_some() && manifest.lease_attempt_id.is_none()
+            || owner_record.attempt.is_some() && manifest.fencing_generation.is_none()
+            || owner_record
+                .admitted_state_fence
+                .as_ref()
+                .is_some_and(|fence| {
+                    fence.policy_revision.is_some() && manifest.policy_snapshot.is_none()
+                });
         if owner_source_missing {
             return degraded_trace_replay_without_source(
                 &records,
@@ -1010,6 +1188,37 @@ impl KernelComposition {
                         .any(|part| part == "actual_route")
             }
         };
+        let local_read_attempt_dispatch_is_original =
+            decoded_local_read_attempt.as_ref().is_none_or(|attempt| {
+                let before_sequence = manifest
+                    .result_binding_receipt
+                    .as_ref()
+                    .map(|record| record.seq)
+                    .or_else(|| {
+                        records
+                            .iter()
+                            .rev()
+                            .find(|record| {
+                                record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
+                                    && record.lineage.operation_id.as_deref() == Some(operation_id)
+                            })
+                            .map(|record| record.seq)
+                    });
+                before_sequence.is_some_and(|sequence| {
+                    original_local_read_attempt_was_dispatched(
+                        &records,
+                        operation_id,
+                        owner_envelope.identity.request_id.as_str(),
+                        &owner_envelope.state_fence,
+                        owner_envelope.connection_id.as_str(),
+                        owner_envelope.identity.session_id.as_deref(),
+                        owner_envelope.identity.task_id.as_deref(),
+                        owner_envelope.identity.work_scope_id.as_deref(),
+                        attempt,
+                        sequence,
+                    )
+                })
+            });
         let owner_local_read_attempt_is_bound =
             decoded_local_read_attempt.as_ref().is_none_or(|attempt| {
                 let expected_scope = owner_envelope
@@ -1047,6 +1256,7 @@ impl KernelComposition {
                     && attempt
                         .authority_epoch
                         .is_same_authority(&owner_envelope.state_fence.authority_epoch)
+                    && local_read_attempt_dispatch_is_original
             });
         let owner_activation_binding_is_bound = decoded_activation_resolution_result
             .as_ref()
