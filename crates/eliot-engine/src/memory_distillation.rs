@@ -25,7 +25,9 @@ use time::OffsetDateTime;
 #[path = "context_cost_measurement.rs"]
 mod context_cost_measurement;
 
-use context_cost_measurement::{canonical_context_cost_from_payload, checked_context_cost_add};
+use context_cost_measurement::{
+    canonical_context_cost_observation, checked_context_cost_add,
+};
 
 pub const MEMORY_DISTILLATION_RULESET_VERSION: &str = "eliot-c4-distillation-v1";
 const MEMORY_DISTILLATION_NORMALIZATION_TOKEN_LIMIT: usize = 12;
@@ -620,13 +622,37 @@ fn apply_utility_signal(
             // lifecycle action instead of typed evidence. Overflow is now the
             // same typed `ContextError::Overflow` refusal this file's byte path
             // already returns, and it propagates out of
-            // `derive_utility_ledger` to the caller. An overflow that was never
-            // a real measurement therefore never reaches the entry at all, and
-            // the `> 512` threshold can only ever see a sum of admitted STU.
-            if let Some(value) = canonical_context_cost_from_payload(payload) {
-                entry.context_cost_tokens =
-                    checked_context_cost_add(entry.context_cost_tokens, value)
-                        .map_err(EngineError::ContextMeasurement)?;
+            // `derive_utility_ledger` to the caller.
+            //
+            // AUD4 repair 5, the ADMISSION route. Closing the reader was not
+            // enough while every admitted number was still funnelled into the
+            // scalar that `deterministic_item_finding` and `vitality_from_ledger`
+            // compare with `> 512`. What crosses that threshold is established
+            // from the payload's own fields, not from the field's name: the
+            // admitted status must be `CONSERVATIVE_STU` and `actual_tokens`
+            // must be exactly null, so the number is ALWAYS an unvalidated
+            // STU. Observed tokens cannot reach this field at all, and unknown is
+            // `None`. The owner groups `ConservativeStu` with `Unknown` and
+            // `Unavailable` in `SerializedContextMeasurement::proves_fit`
+            // (`crates/smart/eliot-context-contracts/src/measurement.rs:189-191`)
+            // and refuses to let any of them decide fit, so an STU is not a
+            // capacity-deciding observation.
+            //
+            // Therefore only a `proven` observation - a real route-tokenizer
+            // count bound to these bytes - may enter `context_cost_tokens`. An
+            // unproven STU is still read as evidence, but it is not admitted into
+            // the scalar the threshold reads, so it cannot become a cost large
+            // enough to demote a memory. This is what makes the `> 512` comparison
+            // consult the proven status instead of the raw number: the field it
+            // reads is populated only by a bound measurement. `512` is NOT
+            // retuned and the scalar is NOT renamed; both are `eliot-types`
+            // declarations this lane does not own.
+            if let Some(observation) = canonical_context_cost_observation(payload) {
+                if observation.proven {
+                    entry.context_cost_tokens =
+                        checked_context_cost_add(entry.context_cost_tokens, observation.value)
+                            .map_err(EngineError::ContextMeasurement)?;
+                }
             }
         }
         MemoryUtilitySignalKind::MaintenanceCost => {}
@@ -973,6 +999,13 @@ fn payload_string(value: &Value, key: &str) -> Option<String> {
 // has to account for every key it is given. An absent or mismatched payload
 // yields `None` (unknown), never zero, one, or a legacy bare estimate, and a
 // stale legacy `estimated_tokens` value is never decoded as current tokens.
+//
+// The admitted number is NOT a bare `u64` any more. `canonical_context_cost_observation`
+// returns a `ContextCostObservation` carrying `value` together with `proven`,
+// and `apply_utility_signal` admits only a `proven` observation into
+// `context_cost_tokens`, which is what closes the ADMISSION route into
+// `deterministic_item_finding` and `vitality_from_ledger`. See that module's
+// header for the full argument and for the residual bound-measurement gap.
 
 /// Canonical #704 covering-ESTIMATE byte length for one measured corpus unit
 /// count.
