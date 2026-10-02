@@ -43,8 +43,7 @@ use eliotd::{
     FabricAdmission, FabricError, FabricPorts, FabricSnapshot, GovernorCapabilityAdmission,
     ModelRegistryPort, PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements,
     SwarmControlPort, SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config,
-    plan_candidate, prereq_ports,
-    semantic_revision_store::SEMANTIC_REVISION_DIR,
+    plan_candidate, prereq_ports, semantic_revision_store::SEMANTIC_REVISION_DIR,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -2035,7 +2034,9 @@ fn durable_swarm_commit<T: serde::Serialize>(
         },
         owner_id: owner_id.to_owned(),
         revision,
-        expected_predecessor: revision.checked_sub(1).filter(|predecessor| *predecessor > 0),
+        expected_predecessor: revision
+            .checked_sub(1)
+            .filter(|predecessor| *predecessor > 0),
         content_digest,
         record_json: String::from_utf8(bytes)
             .map_err(|error| format!("canonical record bytes are not utf-8: {error}"))?,
@@ -2122,12 +2123,8 @@ impl SwarmStateRoot {
         // and the lease has a real parent to resolve. `Drop` removes the whole
         // tree, so the directory is torn down with the root.
         let revision_dir = root.join(SEMANTIC_REVISION_DIR);
-        std::fs::create_dir_all(&revision_dir).map_err(|error| {
-            format!(
-                "revision directory {}: {error}",
-                revision_dir.display()
-            )
-        })?;
+        std::fs::create_dir_all(&revision_dir)
+            .map_err(|error| format!("revision directory {}: {error}", revision_dir.display()))?;
         let override_root = eliot_platform_windows::test_support::override_protected_root(&root);
         Ok(Self {
             root,

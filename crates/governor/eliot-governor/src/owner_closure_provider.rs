@@ -2555,12 +2555,7 @@ mod owner_closure_provider_tests {
         let graph = GrantGraph::from_grants(
             [
                 grant_entry(fence, "grant:origin", None, &["op.read", "op.write"]),
-                grant_entry(
-                    fence,
-                    "grant:child",
-                    Some("grant:origin"),
-                    &["op.read"],
-                ),
+                grant_entry(fence, "grant:child", Some("grant:origin"), &["op.read"]),
             ],
             7,
         )
