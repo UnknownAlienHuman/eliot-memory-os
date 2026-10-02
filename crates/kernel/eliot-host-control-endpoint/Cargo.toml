@@ -21,7 +21,9 @@ eliot-protocol.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+eliot-contracts.workspace = true
 eliot-platform.workspace = true
+eliot-receipts.workspace = true
 serde_json.workspace = true
 
 [lints]
