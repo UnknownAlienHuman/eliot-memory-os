@@ -87,6 +87,30 @@ where
     Ok(value)
 }
 
+/// # An effect-bearing member is required on the wire (#938, defect 2)
+///
+/// Removing `#[serde(default)]` alone does NOT make an `Option<T>` member
+/// required. Serde's missing-member fallback (`serde::private::de::missing_field`,
+/// used by the derive when no `deserialize_with` is set) decodes an ABSENT member
+/// as `None` whenever the field type is `Option<T>`. That is a silent default —
+/// exactly what Appendix P forbids — and it would let a historical record that
+/// omits its effect binding decode into a record that merely looks like an
+/// effect record carrying an explicit `null`.
+///
+/// Supplying a `deserialize_with` function changes the missing-member path:
+/// serde then reports a "missing field" naming that member, instead of
+/// substituting `None`. An explicit `null` still reaches this function as a
+/// PRESENT value and decodes
+/// to `None`, so `null` remains the one admitted spelling of "does not apply"
+/// (I5.16) and the two cases stay distinguishable at decode.
+fn deserialize_required_member<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// # Effect-bearing safety records carry no silent wire default (#938, audit
 /// comment 5917060171, defect 2)
 ///
@@ -129,16 +153,23 @@ pub struct BackupManifest {
     pub surreal_export_status: String,
     /// Required on the wire. `null` records that this backup sealed no logical
     /// source endpoint; a consumer must treat that as `unknown`, never as proof
-    /// that a restore target is isolated from the backup source.
+    /// that a restore target is isolated from the backup source. Omitting the
+    /// member is refused at decode (see `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub surreal_source_endpoint: Option<String>,
     /// Required on the wire. `null` records that the logical source sealed no
-    /// storage root (I5.16 explicit `None`, not an omission).
+    /// storage root (I5.16 explicit `None`, not an omission). Omitting the member
+    /// is refused at decode (see `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub surreal_source_storage_ref: Option<PathRef>,
     pub control_wal_snapshot_ref: Option<String>,
     pub blob_manifest_ref: String,
     /// Required on the wire. A completed (`dry_run == false`) backup must carry
     /// the payload root it actually copied; `null` is only the recorded absence
     /// for a planned backup, never a silent default for a completed one.
+    /// Omitting the member is refused at decode (see
+    /// `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub blob_payload_root: Option<PathRef>,
     pub blob_payloads: Vec<BackupBlobEntry>,
     pub report_manifest_ref: Option<String>,
@@ -227,15 +258,22 @@ pub struct RestorePlan {
     pub target_data_root: PathRef,
     pub restore_mode: RestoreMode,
     /// Required on the wire. `null` records that this plan was sealed without a
-    /// logical target endpoint; a consumer must treat that as `unknown`.
+    /// logical target endpoint; a consumer must treat that as `unknown`. Omitting
+    /// the member is refused at decode (see `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub target_endpoint: Option<String>,
     /// Required on the wire. `null` records that the plan was sealed without a
     /// logical target storage root (I5.16 explicit `None`, not an omission).
+    /// Omitting the member is refused at decode (see
+    /// `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub target_storage_ref: Option<PathRef>,
     /// Required on the wire. `null` records that the owner sealed no exact
     /// action binding for this plan. A plan without that binding is explicit
     /// `unknown` about its effect identity (I5.27), so it can never authorize
-    /// an effect on the strength of the record alone.
+    /// an effect on the strength of the record alone. Omitting the member is refused
+    /// at decode (see `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub exact_action_hash: Option<String>,
     pub checks: Vec<RestoreCheck>,
     pub created_at: OffsetDateTime,
@@ -274,7 +312,9 @@ pub struct RestoreReceipt {
     /// success/effect status is not admissible without this binding, and a
     /// dry-run receipt never stands for an executed restore: the consuming owner
     /// refuses both before any effect, comparing against the originally recorded
-    /// value rather than a recomputed substitute.
+    /// value rather than a recomputed substitute. Omitting the member is refused
+    /// at decode (see `deserialize_required_member`).
+    #[serde(deserialize_with = "deserialize_required_member")]
     pub exact_action_hash: Option<String>,
     pub dry_run: bool,
     pub started_at: OffsetDateTime,
@@ -730,7 +770,7 @@ mod tests {
         RestoreStatus,
     };
     use crate::SCHEMA_VERSION;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// `OffsetDateTime` decodes from `time`'s tuple encoding: this crate's
     /// `time` build keeps `serde-human-readable` disabled, so the wire form of
@@ -800,17 +840,48 @@ mod tests {
         })
     }
 
-    fn without(value: &Value, field: &str) -> Value {
+    /// The same record with exactly one member removed, returned by value so
+    /// every call site hands an owned `Value` to `serde_json::from_value`
+    /// (which takes `Value`, not `&Value`).
+    ///
+    /// The removal is checked rather than assumed: a misspelled member name
+    /// would otherwise leave the fixture untouched and the caller's refusal
+    /// would be attributed to the wrong cause.
+    fn without(value: Value, field: &str) -> Value {
         let mut object = value.as_object().expect("object").clone();
-        object.remove(field);
+        assert!(
+            object.remove(field).is_some(),
+            "the fixture must actually carry a `{field}` member to remove"
+        );
         Value::Object(object)
+    }
+
+    /// Assert that `value` decodes as `T` only while it still carries `field`:
+    /// the untouched fixture must decode, and the fixture missing exactly that
+    /// one member must be refused by an error naming THAT member. Pinning the
+    /// error text is what isolates the cause — a bare `is_err()` would also pass
+    /// if some unrelated required member were absent from the fixture.
+    fn assert_field_is_required<T>(value: Value, field: &str)
+    where
+        T: serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        serde_json::from_value::<T>(value.clone())
+            .unwrap_or_else(|error| panic!("the complete fixture must decode: {error}"));
+
+        let error = serde_json::from_value::<T>(without(value, field))
+            .expect_err("an omitted effect-bearing member must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("missing field `{field}`")),
+            "the refusal must name the absent member `{field}`, got: {message}"
+        );
     }
 
     /// Positive case: a current owner-written record with every effect field
     /// present (explicit `null` included) decodes.
     #[test]
-    fn owner_written_safety_records_with_explicit_effect_fields_decode(
-    ) -> Result<(), serde_json::Error> {
+    fn owner_written_safety_records_with_explicit_effect_fields_decode()
+    -> Result<(), serde_json::Error> {
         let manifest: BackupManifest = serde_json::from_value(manifest_value())?;
         assert_eq!(manifest.backup_kind, BackupKind::LogicalExport);
         assert_eq!(
@@ -834,8 +905,10 @@ mod tests {
         Ok(())
     }
 
-    /// Refusal case: an omitted effect-bearing field is refused at decode, so
-    /// no historical form can silently become a completed effect record.
+    /// Refusal case: an omitted effect-bearing member is refused at decode, so
+    /// no historical form can silently become a completed effect record. Each
+    /// case isolates its own member: the complete fixture decodes, and the
+    /// refusal names the member that was removed.
     #[test]
     fn omitted_effect_bearing_safety_fields_are_refused_at_decode() {
         for field in [
@@ -843,31 +916,19 @@ mod tests {
             "surreal_source_storage_ref",
             "blob_payload_root",
         ] {
-            assert!(
-                serde_json::from_value::<BackupManifest>(&without(&manifest_value(), field))
-                    .is_err(),
-                "BackupManifest must refuse an omitted {field}"
-            );
+            assert_field_is_required::<BackupManifest>(manifest_value(), field);
         }
         for field in ["target_endpoint", "target_storage_ref", "exact_action_hash"] {
-            assert!(
-                serde_json::from_value::<RestorePlan>(&without(&plan_value(), field)).is_err(),
-                "RestorePlan must refuse an omitted {field}"
-            );
+            assert_field_is_required::<RestorePlan>(plan_value(), field);
         }
-        assert!(serde_json::from_value::<RestoreReceipt>(&without(
-            &receipt_value(),
-            "exact_action_hash"
-        ))
-        .is_err());
+        assert_field_is_required::<RestoreReceipt>(receipt_value(), "exact_action_hash");
     }
 
     /// Refusal case: an explicit `null` is the recorded absence, never a
     /// successful effect record — the value decodes as `None` so a consumer
     /// sees explicit unknown rather than a completed restore.
     #[test]
-    fn explicit_null_effect_fields_decode_as_recorded_absence(
-    ) -> Result<(), serde_json::Error> {
+    fn explicit_null_effect_fields_decode_as_recorded_absence() -> Result<(), serde_json::Error> {
         let mut value = receipt_value();
         value["exact_action_hash"] = Value::Null;
         let receipt: RestoreReceipt = serde_json::from_value(value)?;
@@ -888,13 +949,21 @@ mod tests {
 
     /// Refusal case: the pinned current schema version admits no other
     /// version, so there is no historical wire form whose omitted effect
-    /// fields would need a versioned compatibility owner.
+    /// fields would need a versioned compatibility owner. The refusal is pinned
+    /// to the version check itself, so it cannot be satisfied by an unrelated
+    /// decode failure.
     #[test]
     fn no_other_schema_version_is_admitted_for_effect_bearing_manifests() {
         for version in ["0", "2", "", "1.0"] {
             let mut value = manifest_value();
             value["schema_version"] = Value::String(version.to_owned());
-            assert!(serde_json::from_value::<BackupManifest>(&value).is_err());
+            let error = serde_json::from_value::<BackupManifest>(value)
+                .expect_err("a misselected schema_version must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains("unsupported backup manifest schema_version"),
+                "the refusal must come from the schema_version pin, got: {message}"
+            );
         }
     }
 

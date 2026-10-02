@@ -2448,7 +2448,9 @@ fn validate_owner_issued_restore_receipt(
     let receipt = &report.receipt;
     let plan = &report.plan;
     if plan.restore_mode == RestoreMode::VerifyOnly {
-        return Err(refuse("the retained plan is verify-only and seals no restore effect"));
+        return Err(refuse(
+            "the retained plan is verify-only and seals no restore effect",
+        ));
     }
     // (a) A success/effect status cannot carry a missing action binding.
     let sealed_action_hash = match plan.exact_action_hash.as_deref() {
@@ -2477,7 +2479,9 @@ fn validate_owner_issued_restore_receipt(
     if !same_path(Path::new(&plan.target_data_root), target)
         || !same_path(Path::new(&receipt.target_data_root), target)
     {
-        return Err(refuse("the retained receipt restores a different data root"));
+        return Err(refuse(
+            "the retained receipt restores a different data root",
+        ));
     }
     // (b) A dry-run receipt cannot stand for an executed restore.
     if receipt.dry_run {
@@ -3028,10 +3032,11 @@ mod security_tests {
 
 #[cfg(test)]
 mod restore_owner_issuance_tests {
-    use super::{validate_owner_issued_restore_receipt, RestoreService};
+    use super::{RestoreService, validate_owner_issued_restore_receipt};
     use crate::error::EngineError;
     use eliot_types::{
-        RestoreCheck, RestoreMode, RestorePlan, RestoreReceipt, RestoreReport, RestoreStatus, WriteId,
+        RestoreCheck, RestoreMode, RestorePlan, RestoreReceipt, RestoreReport, RestoreStatus,
+        WriteId,
     };
     use std::path::{Path, PathBuf};
     use time::OffsetDateTime;
@@ -3083,7 +3088,9 @@ mod restore_owner_issuance_tests {
     #[test]
     fn owner_issued_restore_receipt_authorizes_its_own_rollback_target() {
         let target = PathBuf::from("isolated-restored-root");
-        assert!(validate_owner_issued_restore_receipt(&owner_issued_report(&target), &target).is_ok());
+        assert!(
+            validate_owner_issued_restore_receipt(&owner_issued_report(&target), &target).is_ok()
+        );
     }
 
     #[test]
@@ -3174,9 +3181,11 @@ mod restore_owner_issuance_tests {
         report.receipt.dry_run = true;
         write_restore_evidence(&target, &report)?;
 
-        assert!(RestoreService::new(&root)
-            .rollback_isolated(&target, true, "", false)
-            .is_err());
+        assert!(
+            RestoreService::new(&root)
+                .rollback_isolated(&target, true, "", false)
+                .is_err()
+        );
         assert!(
             target.exists(),
             "a refused rollback must not quarantine the target"
@@ -3188,9 +3197,11 @@ mod restore_owner_issuance_tests {
     #[test]
     fn rollback_refuses_a_target_without_owner_evidence() -> Result<(), EngineError> {
         let (base, root, target) = test_case("rollback-no-evidence")?;
-        assert!(RestoreService::new(&root)
-            .rollback_isolated(&target, true, "", false)
-            .is_err());
+        assert!(
+            RestoreService::new(&root)
+                .rollback_isolated(&target, true, "", false)
+                .is_err()
+        );
         assert!(target.exists());
         let _ = std::fs::remove_dir_all(base);
         Ok(())
