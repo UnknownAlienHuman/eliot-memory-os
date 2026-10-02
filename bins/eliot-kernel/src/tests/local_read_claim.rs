@@ -55,6 +55,16 @@ fn query_envelope(
 /// `capability` is the closed capability the admitted tool name must match, so
 /// the query and `eliot.state` forms are the same admitted shape with the two
 /// different admission owners rather than two hand-rolled envelopes.
+///
+/// The invocation carries the same explicit host-correlation projection a real
+/// host adapter projects: the opaque `Request`-domain occurrence whose exact
+/// text is also the `request_id`, derived exactly as the production envelope
+/// builders derive it (see
+/// `kernel_host_request_client.rs::build_restore_envelope`). Both the protocol
+/// and ORS owners require `projection.occurrence_text() == request_id`, so
+/// the `request_id` is taken from the projection's own `occurrence_text()`
+/// rather than written independently — the same round-trip the real producer
+/// relies on.
 fn read_envelope(
     fence: &StateFence,
     deadline_unix_ms: u64,
@@ -62,14 +72,21 @@ fn read_envelope(
     tool_digest: &str,
     capability: &str,
 ) -> HostRequestEnvelope {
+    let correlation_projection = eliot_contracts::HostCorrelationProjection::Opaque {
+        domain: eliot_contracts::HostCorrelationDomain::Request,
+        occurrence: request_id.to_owned(),
+    };
     HostRequestEnvelope {
         wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
         wire_version: HostRequestEnvelope::CONTRACT_VERSION,
         kind: HostRequestKind::Invocation,
         connection_id: "conn-test-1".to_owned(),
         identity: HostRequestIdentity {
-            request_id: eliot_contracts::RequestId::new(request_id).expect("valid request id"),
-            correlation_projection: None,
+            request_id: eliot_contracts::RequestId::new(
+                correlation_projection.occurrence_text(),
+            )
+            .expect("valid request id"),
+            correlation_projection: Some(correlation_projection),
             idempotency_key: format!("{request_id}:invoke"),
             cancellation_id: format!("{request_id}:invoke:cancel"),
             parent_operation_id: None,
