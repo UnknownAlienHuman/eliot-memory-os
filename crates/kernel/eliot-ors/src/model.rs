@@ -7674,11 +7674,34 @@ fn validate_local_read_actual_route_receipt(
             "actual-route receipt must retain the selected operation",
         ));
     }
-    if !object.get("state_fence").is_some_and(Value::is_object)
-        || !object.get("route_facts").is_some_and(Value::is_object)
+    let receipt_fence = object
+        .get("state_fence")
+        .cloned()
+        .ok_or_else(|| invalid_receipt("actual-route receipt must retain its response fence"))
+        .and_then(|value| {
+            serde_json::from_value::<StateFence>(value)
+                .map_err(|_| invalid_receipt("actual-route response fence is malformed"))
+        })?;
+    receipt_fence
+        .validate()
+        .map_err(|_| invalid_receipt("actual-route response fence is invalid"))?;
+    let receipt_fence_bytes = canonical_json_bytes(&receipt_fence)
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    if receipt_fence.authority_epoch != owner.authority_epoch
+        || receipt_fence.resource_generation.value() != owner.generation
+        || sha256_hex(&receipt_fence_bytes) != owner.fence_digest
+        || owner
+            .admitted_state_fence
+            .as_ref()
+            .is_some_and(|fence| fence != &receipt_fence)
     {
         return Err(invalid_receipt(
-            "actual-route receipt must retain its response fence and route facts",
+            "actual-route response fence does not match the original admitted fence",
+        ));
+    }
+    if !object.get("route_facts").is_some_and(Value::is_object) {
+        return Err(invalid_receipt(
+            "actual-route receipt must retain its route facts",
         ));
     }
     let mut unsigned = object.clone();
@@ -7830,7 +7853,9 @@ fn validate_activation_resolution_result(
         "host_request_effect_evidence_activation_result_sha256",
     )?;
     let mut unsigned = object.clone();
-    let _ = unsigned.remove("result_sha256");
+    // Match AgentActivationResolutionResult::canonical_unsigned_bytes: the
+    // digest slot remains present and is cleared to the empty string.
+    unsigned.insert("result_sha256".to_owned(), Value::String(String::new()));
     let canonical = canonical_json_bytes(&Value::Object(unsigned))
         .map_err(|error| OrsError::Encoding(error.to_string()))?;
     if sha256_hex(&canonical) != result_digest {
@@ -7849,8 +7874,7 @@ fn validate_activation_resolution_result(
     result_fence
         .validate()
         .map_err(|_| invalid_result("activation result ticket fence is invalid"))?;
-    if owner.admitted_state_fence.as_ref().is_some_and(|fence| fence != &result_fence)
-        || result_fence.authority_epoch != owner.authority_epoch
+    if result_fence.authority_epoch != owner.authority_epoch
         || result_fence.resource_generation.value() != owner.generation
     {
         return Err(invalid_result(
@@ -7897,6 +7921,20 @@ fn validate_activation_resolution_result(
         {
             return Err(invalid_result(
                 "resolved activation binding does not match the retained owner identity",
+            ));
+        }
+    }
+    if let Some(task_revision) = owner
+        .admitted_state_fence
+        .as_ref()
+        .and_then(|fence| fence.task_revision)
+    {
+        let expected_task_revision = task_revision.value().to_string();
+        if binding.get("task_revision").and_then(Value::as_str)
+            != Some(expected_task_revision.as_str())
+        {
+            return Err(invalid_result(
+                "resolved activation task revision does not match the admitted owner fence",
             ));
         }
     }

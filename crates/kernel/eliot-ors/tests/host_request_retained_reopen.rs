@@ -6,7 +6,8 @@
 use std::num::NonZeroU64;
 
 use eliot_contracts::{
-    EpochId, EpochLineageId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskRevision, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_ors::{
     CONTRACT_VERSION, HostRequestEffectEvidence, HostRequestKind, HostRequestRecord,
@@ -95,7 +96,9 @@ fn requested_record(
         connection_ref: label("conn-1838-retained-reopen"),
         session_ref: Some(label("session-1838-retained-reopen")),
         task_ref: Some(label("task-1838-retained-reopen")),
-        scope_ref: Some(label("scope-1838-retained-reopen")),
+        // The normal local-read query owner has no explicit work scope. Its
+        // original LocalReadAttempt uses the protocol's session fallback.
+        scope_ref: None,
         capability_ref: label("eliot.query"),
         fence_digest,
         admitted_state_fence: Some(state_fence.clone()),
@@ -126,7 +129,7 @@ fn local_read_attempt(
         "attempt_id": "local-read-attempt-1838",
         "fencing_generation": 2,
         "session_id": "session-1838-retained-reopen",
-        "authority_epoch": serde_json::to_value(state_fence.authority_epoch)
+        "authority_epoch": serde_json::to_value(&state_fence.authority_epoch)
             .expect("epoch serializes"),
         "scope_id": scope_id,
         "facet_method": "eliot.query",
@@ -157,12 +160,18 @@ fn actual_route_receipt(
 }
 
 fn activation_resolution_result(state_fence: &StateFence) -> Value {
+    // Activation tickets predate the resolved task revision. The admitted
+    // local-read envelope carries that exact revision and is checked against
+    // the resolved binding, while the original ticket fence keeps its own
+    // original task_revision absence.
+    let mut ticket_state_fence = state_fence.clone();
+    ticket_state_fence.task_revision = None;
     let mut result = json!({
         "wire_id": "eliot.protocol.agent-activation-resolution-result",
         "wire_version": 3,
         "ticket_id": "activation-ticket-1838",
         "ticket_sha256": "c".repeat(64),
-        "ticket_state_fence": serde_json::to_value(state_fence).expect("fence serializes"),
+        "ticket_state_fence": serde_json::to_value(ticket_state_fence).expect("fence serializes"),
         "cancellation_id": "req-1838-retained-reopen:invoke:cancel",
         "resolved_at_unix_ms": 10,
         "disposition": {
@@ -201,12 +210,13 @@ fn temp_path() -> std::path::PathBuf {
 #[test]
 fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refused() {
     let path = temp_path();
-    let original_fence = fence(7);
+    let mut original_fence = fence(7);
+    original_fence.task_revision = Some(TaskRevision::new(3).expect("valid task revision"));
     let payload = json!({"tool": "GetEvidencePack", "subject": "evidence-1838"});
     let input_bytes = admitted_input_bytes(
         &original_fence,
         &payload,
-        Some("scope-1838-retained-reopen"),
+        None,
     );
     let request_digest = sha256_hex(&input_bytes);
     let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
@@ -238,7 +248,7 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         local_read_attempt: Some(local_read_attempt(
             &operation_id,
             &original_fence,
-            "scope-1838-retained-reopen",
+            "session-1838-retained-reopen",
         )),
         activation_resolution_result: Some(activation_resolution_result(&original_fence)),
         invoked_operation: Some("local_read".to_owned()),
@@ -420,7 +430,12 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         .actual_route_receipt
         .clone()
         .expect("original actual-route receipt remains retained");
-    substituted_receipt["route_facts"] = json!({"selected_endpoint": "substituted"});
+    substituted_receipt["state_fence"] =
+        serde_json::to_value(fence(8)).expect("substituted fence serializes");
+    substituted_receipt["receipt_digest"] = Value::String(String::new());
+    let substituted_route_digest = digest(&substituted_receipt);
+    substituted_receipt["receipt_digest"] = Value::String(substituted_route_digest.clone());
+    substituted_evidence.actual_route = Some(substituted_route_digest);
     substituted_evidence.actual_route_receipt = Some(substituted_receipt);
     substituted_receipt_row.result_evidence = Some(substituted_evidence);
     assert!(matches!(
@@ -454,8 +469,11 @@ fn original_fence_and_retained_bytes_survive_reopen_and_changed_identity_is_refu
         .activation_resolution_result
         .clone()
         .expect("original activation result remains retained");
-    substituted_activation_result["disposition"]["binding"]["principal_id"] =
-        Value::String("substituted-principal".to_owned());
+    substituted_activation_result["disposition"]["binding"]["task_revision"] =
+        Value::String("4".to_owned());
+    substituted_activation_result["result_sha256"] = Value::String(String::new());
+    substituted_activation_result["result_sha256"] =
+        Value::String(digest(&substituted_activation_result));
     substituted_activation_evidence.activation_resolution_result = Some(substituted_activation_result);
     substituted_activation_row.result_evidence = Some(substituted_activation_evidence);
     assert!(matches!(
@@ -494,7 +512,7 @@ fn historical_missing_fence_stays_missing_after_exact_retry_and_reopen() {
     let input_bytes = admitted_input_bytes(
         &original_fence,
         &payload,
-        Some("scope-1838-retained-reopen"),
+        None,
     );
     let request_digest = sha256_hex(&input_bytes);
     let operation_id = OperationIdentity::new(format!("hostreq:{request_digest}"))
