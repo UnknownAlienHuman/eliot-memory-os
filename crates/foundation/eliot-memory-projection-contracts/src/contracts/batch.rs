@@ -277,7 +277,7 @@ impl MemoryProjectionBatch {
     /// scope. Checking only task/scope/session admitted exactly such a record
     /// whenever its own projection fence happened to be compatible, which is the
     /// wrong-scope-record-inside-a-valid-batch case this batch exists to refuse,
-    /// and it contradicted the frozen `MemoryProjectionBatch` denominator_note,
+    /// and it contradicted the frozen `MemoryProjectionBatch` `denominator_note`,
     /// which requires the record binding to *equal* the batch binding.
     ///
     /// The record's **projection fence** is the fence it was actually read
