@@ -54,13 +54,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile, host_request_operation_id,
+    AgentActivationResultReconcile, HostRequestEnvelope, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -83,8 +84,9 @@ use eliotd::{
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
-    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
+    ObserveSubmitOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -2192,7 +2194,7 @@ fn start_tick_work(
     flight: &mut ActivationFlight,
 ) {
     maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
-    maybe_start_observe_poll(kernel, observe_flight);
+    maybe_start_observe_poll(kernel, composition, observe_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
     maybe_start_watchdog_export_drain(kernel, composition, watchdog_export_drain_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
@@ -4862,15 +4864,18 @@ async fn submit_local_read_result_idempotent(
 
 /// What one settled observe poll step produced (issue #2565).
 ///
-/// `Deferred` is the honest steady state while the Governor observation
-/// owner has no connected admission: the pair retired, the durable record
-/// `Routed`, no effect produced. `Settled` means the record already closed.
-/// `Expired` is the expected claim/defer race; `StaleAttempt` quarantines a
-/// superseded capability (the next claim mints the current generation anew).
-/// Every outcome idles until the next tick; only a step failure fails the
-/// daemon closed.
+/// `Captured` is the connected `Observation` suboperation: the observation
+/// owner admitted the record and the Kernel persisted the retained result.
+/// `Deferred` is the honest steady state for the other four suboperations,
+/// whose owner admissions are still unconnected: the pair retired, the durable
+/// record `Routed`, no effect produced. `Settled` means the record already
+/// closed. `Expired` is the expected claim/defer race; `StaleAttempt`
+/// quarantines a superseded capability (the next claim mints the current
+/// generation anew). Every outcome idles until the next tick; only a step
+/// failure fails the daemon closed.
 enum ObservePollOutcome {
     IdleBackoff,
+    Captured,
     Deferred,
     Settled,
     Expired,
@@ -4930,18 +4935,26 @@ fn decide_observe_tick(flight: &ObserveFlight) -> ObserveTickDecision {
 
 fn start_observe_poll(
     kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = ObserveCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move { ObserveCompletion::Settled(run_observe_poll(&kernel_clone).await) })
+    let composition_clone = Arc::clone(composition);
+    Box::pin(async move {
+        ObserveCompletion::Settled(run_observe_poll(&kernel_clone, &composition_clone).await)
+    })
 }
 
 /// Starts the observe poll step when its flight is idle. Checked on the same
 /// tick as the other pollers so the observe queue stays live while an
 /// activation or a local read is in flight.
-fn maybe_start_observe_poll(kernel: &Arc<DaemonKernelClient>, flight: &mut ObserveFlight) {
+fn maybe_start_observe_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut ObserveFlight,
+) {
     if decide_observe_tick(flight) == ObserveTickDecision::StartPoll {
         *flight = ObserveFlight::InFlight(ObserveFlightState {
-            future: start_observe_poll(kernel),
+            future: start_observe_poll(kernel, composition),
         });
     }
 }
@@ -4986,6 +4999,7 @@ fn settle_observe_completion(
 fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
     match outcome {
         ObservePollOutcome::IdleBackoff => "idle_backoff",
+        ObservePollOutcome::Captured => "captured",
         ObservePollOutcome::Deferred => "deferred",
         ObservePollOutcome::Settled => "settled",
         ObservePollOutcome::Expired => "expired",
@@ -4994,15 +5008,18 @@ fn observe_outcome_name(outcome: &ObservePollOutcome) -> &'static str {
 }
 
 /// Runs one observe poll step: `semantic_observe_claim` (pair plus fenced
-/// attempt capability, or null meaning backoff), then
-/// [`serve_admitted_observe`] for the admitted pair under that attempt, then
+/// attempt capability, or null meaning backoff), then [`serve_admitted_observe`]
+/// for the admitted pair under that attempt, then either the observation-owner
+/// capture (for the connected `Observation` suboperation) or
 /// `semantic_observe_deferred` with the served deferral (deferred, settled,
-/// the expected expiry race, or the stale-attempt quarantine). Exact
-/// replays stay idempotent by Kernel contract. Any step failure fails the
-/// daemon closed — a claimed pair that cannot serve or defer is never
-/// silently discarded. A stale capability is never retried: the step settles
-/// and the next tick claims the current generation anew.
-async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, String> {
+/// the expected expiry race, or the stale-attempt quarantine). Exact replays
+/// stay idempotent by Kernel contract. Any step failure fails the daemon
+/// closed. A stale capability is never retried: the step settles and the next
+/// tick claims the current generation anew.
+async fn run_observe_poll(
+    kernel: &DaemonKernelClient,
+    composition: &SharedComposition,
+) -> Result<ObserveStep, String> {
     // #740: receipt span over the claim/serve/defer poll step. Pair
     // presence and defer outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.observe_poll").entered();
@@ -5030,6 +5047,60 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
         residual_owner: Some(deferral.residual_owner),
         resume: Some(deferral.resume),
     };
+    // The `Observation` suboperation executes through the single observation
+    // owner; the other four still have no connected owner admission and defer
+    // exactly as before. The observation owner borrows the composition, so the
+    // capture runs inside that borrow's scope; every other leg below runs with
+    // no guard held.
+    if eliotd::observe_suboperation_executes(deferral.suboperation) {
+        // The commit is one bounded owner call under the borrow, mirroring how
+        // the Kernel-backed read client is built per operation.
+        let capture = {
+            let guard = composition.lock().await;
+            let owner = guard
+                .observation_reconciliation()
+                .map_err(|error| format!("daemon observe owner borrow: {error}"))?;
+            eliotd::capture_admitted_observation(&owner, &envelope, &tool, &attempt)
+                .await
+                .map_err(|error| format!("daemon observe capture: {error}"))?
+        };
+        // A terminal non-committed receipt is a refusal, not a capture: the
+        // observation was not admitted, so the pair defers rather than
+        // reporting an effect that never happened.
+        if capture.receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
+            let outcome = match defer_observe_pair_idempotent(
+                kernel,
+                &operation_id,
+                &request_digest,
+                &attempt,
+            )
+            .await?
+            {
+                ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
+                ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
+                ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
+                ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+            };
+            return Ok(step(outcome));
+        }
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.observe_observation_captured",
+            record_id = %capture.record_id,
+            request_digest = %capture.request_digest,
+            operation_id = %capture.receipt.operation_id,
+            // A no-task capture is a cold candidate, stated as such: this is a
+            // capture, not a task-authority claim.
+            task_bound = capture.task_bound,
+        );
+        let outcome =
+            match submit_observe_result_idempotent(kernel, &envelope, &attempt, &capture).await? {
+                ObserveSubmitOutcome::Accepted => ObservePollOutcome::Captured,
+                ObserveSubmitOutcome::Expired => ObservePollOutcome::Expired,
+                ObserveSubmitOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+            };
+        return Ok(step(outcome));
+    }
     let outcome =
         match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
             .await?
@@ -5040,6 +5111,93 @@ async fn run_observe_poll(kernel: &DaemonKernelClient) -> Result<ObserveStep, St
             ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
         };
     Ok(step(outcome))
+}
+
+/// Submits the retained result of one captured observation, retrying once
+/// with the byte-identical body when the first submit fails.
+///
+/// The body is a pure function of the capture receipt, so the retry is the
+/// same exact-replay the Kernel submit leg already makes idempotent: it
+/// persists once and replays, never duplicates. Only transport failures retry;
+/// `Expired` and `StaleAttempt` are settled outcomes, so a quarantined
+/// capability is never resubmitted.
+async fn submit_observe_result_idempotent(
+    kernel: &DaemonKernelClient,
+    envelope: &HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+    capture: &eliotd::ObserveObservationCapture,
+) -> Result<ObserveSubmitOutcome, String> {
+    let body = observe_capture_result_body(envelope, attempt, capture)?;
+    match kernel.submit_observe_result_async(&body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_observe_result_async(&body)
+            .await
+            .map_err(|error| format!("Kernel observe result: {first_error}; retry: {error}")),
+    }
+}
+
+/// Builds the retained result body answering one captured observation.
+///
+/// The response carries only the capture's own store-issued identities. It
+/// asserts no utility, no task authority and no promotion: a captured
+/// observation is a candidate the observation owner now holds, and the caller
+/// learns exactly which record and receipt admitted it.
+fn observe_capture_result_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+    capture: &eliotd::ObserveObservationCapture,
+) -> Result<eliot_protocol::HostRequestResultBody, String> {
+    let response = serde_json::json!({
+        "capture": {
+            "record_id": capture.record_id,
+            "request_digest": capture.request_digest,
+            "receipt_operation_id": capture.receipt.operation_id.as_str(),
+            "receipt_commit_id": capture.receipt.commit_id.as_ref().map(|id| id.as_str()),
+            "transition_class": capture.receipt.transition_class,
+            "status": capture.receipt.status,
+            "task_bound": capture.task_bound,
+        },
+    });
+    let response_bytes = canonical_json_bytes(&response)
+        .map_err(|error| format!("daemon observe capture response canonicalization: {error}"))?;
+    let result_digest = sha256_hex(&response_bytes);
+    let body = eliot_protocol::HostRequestResultBody {
+        wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: result_digest.clone(),
+        response,
+        // A captured observation is candidate content this daemon just
+        // committed through the observation owner; it is not itself a stored
+        // canonical transition, and it carries no semantic receipt. Source
+        // revisions stay `None`: the observation's own fence is on its record,
+        // and naming it here would claim a source revision this leg did not
+        // read. Unknown, not clean.
+        lineage: Some(eliot_protocol::HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: Some(crate::SERVICE_NAME.to_owned()),
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::NewCandidate,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
+        attempt: Some(attempt.clone()),
+        evidence: None,
+    };
+    body.validate()
+        .map_err(|error| format!("daemon observe capture result body: {error}"))?;
+    Ok(body)
 }
 
 /// Defers one served observe pair, retrying once with byte-identical
