@@ -587,7 +587,7 @@ impl AgentActivationOwnerBundle {
             }
             owner.validate_for_fence(expected)?;
         }
-        validate_recovery_packet_size(self)
+        validate_recovery_packet_size(&serde_json::json!({ "owner_records": self }))
     }
 }
 

@@ -114,7 +114,7 @@ use crate::{
     CONTRACT_NAME, CONTRACT_VERSION, ContractVersion, EffectClass, GENESIS_MANIFEST_NAME,
     NamedMutationOperation, NamedOperationManifest, NamedReadOperation, NamedReadRequest,
     OperationManifestDigest, OperationManifestSpec, PAYLOAD_AUTHORITY_VERSION, PreparedTransition,
-    StoreError, TransitionClass, MAX_RECOVERY_PACKET_BYTES, canonical_json_bytes, sha256_hex,
+    StoreError, TransitionClass, canonical_json_bytes, sha256_hex,
 };
 
 /// Operation identity kind carried by each manifest entry.
@@ -194,12 +194,6 @@ pub const READ_TIMEOUT_MS: u32 = 30_000;
 /// staying fail-closed far below unbounded input. All other mutations
 /// keep [`READ_MAX_INPUT_BYTES`].
 pub const BULK_MUTATION_MAX_INPUT_BYTES: u32 = 2_097_152;
-
-/// One four-owner activation bundle is independently capped by
-/// `MAX_RECOVERY_PACKET_BYTES`; this small margin covers its named-operation
-/// parameter envelope in the manifest input bound.
-pub const AGENT_ACTIVATION_OWNER_MAX_INPUT_BYTES: u32 =
-    MAX_RECOVERY_PACKET_BYTES as u32 + 4_096;
 
 /// Maximum evidence records one `GetEvidencePack` read may return.
 ///
@@ -548,7 +542,9 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
         operation: NamedMutationOperation::ApplyAgentActivationOwners,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
-        max_input_bytes: AGENT_ACTIVATION_OWNER_MAX_INPUT_BYTES,
+        // The closed owner bundle validates the complete parameter packet
+        // against the existing recovery packet bound, also advertised here.
+        max_input_bytes: READ_MAX_OUTPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordFinishEvidence,
