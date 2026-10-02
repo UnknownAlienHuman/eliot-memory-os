@@ -31,9 +31,9 @@
 //! only the execution-unit constructor reaches.
 
 use eliot_agent_acp::{
-    AcpFrameCodec, CoverageManifestRun, DurableHostEventJournal, ExecutionUnitDisclosure,
-    ExecutionUnitDriverEvent, ExecutionUnitFrame, ExecutionUnitRunError, IngestError, ProducerError,
-    run_ingest_for_fingerprint,
+    AcpFrameCodec, CoverageManifestPlan, CoverageManifestRun, DurableHostEventJournal,
+    ExecutionUnitDisclosure, ExecutionUnitDriverEvent, ExecutionUnitFrame, ExecutionUnitRunError,
+    IngestError, ProducerError, run_ingest_for_fingerprint,
 };
 use eliot_agent_api::{
     AdmittedRouteReceipt, AssistantDeltaObservation, AttemptId, CONTRACT_VERSION,
