@@ -527,25 +527,36 @@ pub enum DescendantsCaptureErrorKind {
 // the "decoded but invalid" state that `validate` exists to exclude, so the
 // bytes are read through the private wire mirror below and the public value is
 // only ever produced after a full `validate()`.
+//
+// Every field of both bodies is private, so the two validating constructors
+// `DescendantsAtRootExit::captured` / `::failed` and the manual `Deserialize`
+// below are the only ways to obtain either value, from any crate. An external
+// struct literal could spell an invalid body — an unsorted descendant list, a
+// `root_pid` of zero, an oversized `detail` — which `validate` and
+// `reap_completeness` would then fail closed on, but it would still have been
+// *constructible*. Private fields make it literally un-constructible rather
+// than merely detectable. Reading is served by the total accessors below, which
+// re-validate nothing: a value that exists is a value that already passed the
+// one existing validator.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitCaptured {
-    pub schema_version: String,
-    pub root_pid: u32,
-    pub root_exit_code: Option<i32>,
-    pub capture_elapsed_ms: u64,
-    pub descendants: Vec<DescendantProcessSnapshot>,
+    schema_version: String,
+    root_pid: u32,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    descendants: Vec<DescendantProcessSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitFailed {
-    pub schema_version: String,
-    pub root_pid: Option<u32>,
-    pub root_exit_code: Option<i32>,
-    pub capture_elapsed_ms: u64,
-    pub error_kind: DescendantsCaptureErrorKind,
-    pub detail: String,
+    schema_version: String,
+    root_pid: Option<u32>,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    error_kind: DescendantsCaptureErrorKind,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
@@ -788,6 +799,37 @@ impl DescendantsAtRootExit {
             Self::Captured(captured) => Some(&captured.descendants),
             Self::Failed(_) => None,
         }
+    }
+}
+
+impl DescendantsAtRootExitCaptured {
+    /// Root process PID this capture describes.
+    ///
+    /// Total: the value exists only after `captured` or `validate` accepted a
+    /// non-zero PID, so this never has to report an absence.
+    #[must_use]
+    pub fn root_pid(&self) -> u32 {
+        self.root_pid
+    }
+
+    /// The captured descendant list, already pid-sorted and duplicate-free.
+    #[must_use]
+    pub fn descendants(&self) -> &[DescendantProcessSnapshot] {
+        &self.descendants
+    }
+}
+
+impl DescendantsAtRootExitFailed {
+    /// Why the capture failed. Typed across every layer that reads it.
+    #[must_use]
+    pub fn error_kind(&self) -> DescendantsCaptureErrorKind {
+        self.error_kind
+    }
+
+    /// Bounded detail of the failure.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 }
 
