@@ -2142,6 +2142,119 @@ mod host_lifecycle_boundary_table_tests {
     }
 
     #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/2
+    #[test]
+    fn case_2_service_start_request_is_not_a_started_result() {
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+
+        // The frozen contract: a start request and its result are separate
+        // rows, with separate events and separate owner state.
+        let bounds = [
+            row(super::BOUNDARY_OPEN_REQUESTED),
+            row(super::BOUNDARY_OPEN_ADMITTED),
+            row(super::BOUNDARY_START_REQUESTED),
+            row(super::BOUNDARY_START_STARTED),
+        ];
+        assert_eq!(
+            bounds.iter().map(|bound| bound.name).collect::<Vec<_>>(),
+            ["open.requested", "open.admitted", "start.requested", "start.started"]
+        );
+        let ready_event = row(super::BOUNDARY_READINESS_PROOF_READY).event;
+        for bound in bounds {
+            assert_eq!(bound.test, "891/case-2", "{} must name this case", bound.name);
+            assert_ne!(bound.event, ready_event, "{} must never claim ready", bound.name);
+        }
+        assert_ne!(bounds[0].event, bounds[1].event, "a request is not an admission");
+        assert_ne!(bounds[2].event, bounds[3].event, "a request is not a started result");
+        assert_ne!(bounds[0].owner_state, bounds[1].owner_state, "a request owns no evidence");
+        assert_ne!(bounds[2].owner_state, bounds[3].owner_state, "a request owns no contour");
+
+        // The real open owner: `HostComposition::open` records the request
+        // before any admission work, and an open that never reaches durable
+        // evidence records its own terminal instead of the admitted row.
+        let tag = super::fresh_identity("root").unwrap();
+        let root = std::env::temp_dir().join(format!("eliot-host-891-case-2-{}", tag.as_str()));
+        std::fs::create_dir_all(&root).expect("case root must be creatable");
+        let mut opened_result = None;
+        let opened = capture_records(|| {
+            opened_result = Some(super::HostComposition::open(super::HostLaunchOptions {
+                config_descriptor_path: root.join("credentials.json"),
+                config_descriptor_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
+                installation: PlatformHandle::new(format!("891-case-2-{}", tag.as_str())).unwrap(),
+                transaction_plan_generation: 1,
+                host_state_root: root.clone(),
+                registration_nonce: None,
+            }));
+        });
+        let refused = opened_result.expect("the real open must have returned").err();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(refused.is_some(), "an empty approved registry admits nothing");
+        assert_eq!(detail_order(&opened).first(), Some(&bounds[0].event), "request leads");
+        assert_eq!(occurrences(&opened, bounds[0].event), 1, "one request record");
+        assert!(!opened.contains(bounds[1].event), "no evidence, no admitted");
+        assert!(!opened.contains(bounds[2].event), "a refused open starts nothing");
+        assert!(!opened.contains(bounds[3].event), "a refused open starts nothing");
+        assert!(!opened.contains(ready_event), "a refused open is never ready");
+        assert!(!opened.contains("semantically_ready"), "no ready evidence claim");
+        assert!(!opened.contains("process_started"), "no ownership claim");
+
+        // The real start owner: the Store-before-Kernel sequence records the
+        // launch request before the work and its result only after the work
+        // returns Ok, so a launch that never starts has no result record.
+        let mut kernel_launches = 0_u32;
+        let mut store_cleaned = false;
+        let launched = capture_records(|| {
+            let outcome = super::launch_store_then_kernel(
+                || Ok("891-case-2-store"),
+                |_store| Ok(()),
+                || {
+                    kernel_launches += 1;
+                    Err::<&str, _>(super::HostError::ProcessContour("891-case-2".to_owned()))
+                },
+                |_store| {
+                    store_cleaned = true;
+                    Ok(())
+                },
+            );
+            assert!(matches!(outcome, Err(super::StoreKernelLaunchError::Kernel { .. })));
+        });
+        assert!(kernel_launches == 1 && store_cleaned, "the real launch ran and cleaned up");
+        assert!(launched.contains("host.kernel-launch requested"), "the request is recorded");
+        assert!(!launched.contains("kernel-ready observed"), "a failed launch has no result");
+        assert!(!launched.contains(bounds[2].event), "the sequence owns no start request");
+        assert!(!launched.contains(bounds[3].event), "the sequence owns no started result");
+        assert!(!launched.contains("semantically_ready"), "started is not ready");
+        assert!(!launched.contains("process_started"), "no ownership claim");
+
+        // The service-start result belongs to an observed process start: at
+        // the real sink gate no request-side evidence admits a start record.
+        for evidence in [
+            HostRequestEvidence::Observed,
+            HostRequestEvidence::Admitted,
+            HostRequestEvidence::SemanticallyReady,
+            HostRequestEvidence::Cancelled,
+            HostRequestEvidence::Failed,
+            HostRequestEvidence::Unknown,
+        ] {
+            let claimed = AdmittedEvent::ServiceStart.is_admitted_by(evidence);
+            assert!(!claimed, "request-side evidence {} claims no start", evidence.as_str());
+        }
+        let observed = HostRequestEvidence::ProcessStarted;
+        assert!(
+            AdmittedEvent::ServiceStart.is_admitted_by(observed),
+            "only an observed process start admits the result"
+        );
+
+        // The rendered start request carries its own identity and nothing else.
+        let request_only = capture_records(|| {
+            super::host_lifecycle_observe_requested(super::BOUNDARY_START_REQUESTED);
+        });
+        assert_eq!(detail_order(&request_only), vec![bounds[2].event], "request detail only");
+        assert!(!request_only.contains(bounds[3].event), "a request renders no result");
+    }
+
+    #[cfg(windows)]
     // WORK_UNIT_CASE: 891/3
     #[test]
     fn case_3_startup_ready_requires_actual_readiness_evidence() {
