@@ -2206,14 +2206,10 @@ mod host_lifecycle_boundary_table_tests {
     }
 
     #[cfg(windows)]
-    // WORK_UNIT_CASE: 891/2
-    #[test]
-    fn case_2_service_start_request_is_not_a_started_result() {
-        use super::host_diagnostics::HostRequestEvidence;
-        use super::windows_event_log::AdmittedEvent;
-
-        // The frozen contract: a start request and its result are separate
-        // rows, with separate events and separate owner state.
+    /// Case 2 frozen table rows: the four distinct open/start request and result
+    /// boundaries, with the exact distinctness the case proves. No row claims a
+    /// readiness result, and request and result never share an event or owner.
+    fn case_2_open_start_bounds() -> [&'static super::HostLifecycleBoundary; 4] {
         let bounds = [
             row(super::BOUNDARY_OPEN_REQUESTED),
             row(super::BOUNDARY_OPEN_ADMITTED),
@@ -2258,10 +2254,43 @@ mod host_lifecycle_boundary_table_tests {
             bounds[2].owner_state, bounds[3].owner_state,
             "a request owns no contour"
         );
+        bounds
+    }
 
-        // The real open owner: `HostComposition::open` records the request
-        // before any admission work, and an open that never reaches durable
-        // evidence records its own terminal instead of the admitted row.
+    #[cfg(windows)]
+    /// Case 2 sink-gate proof: the service-start result belongs to an observed
+    /// process start, so no request-side evidence admits a start record.
+    fn case_2_service_start_admission_contour() {
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+
+        for evidence in [
+            HostRequestEvidence::Observed,
+            HostRequestEvidence::Admitted,
+            HostRequestEvidence::SemanticallyReady,
+            HostRequestEvidence::Cancelled,
+            HostRequestEvidence::Failed,
+            HostRequestEvidence::Unknown,
+        ] {
+            let claimed = AdmittedEvent::ServiceStart.is_admitted_by(evidence);
+            assert!(
+                !claimed,
+                "request-side evidence {} claims no start",
+                evidence.as_str()
+            );
+        }
+        let observed = HostRequestEvidence::ProcessStarted;
+        assert!(
+            AdmittedEvent::ServiceStart.is_admitted_by(observed),
+            "only an observed process start admits the result"
+        );
+    }
+
+    #[cfg(windows)]
+    /// Case 2 real open owner: `HostComposition::open` records the request
+    /// before any admission work, and an open that never reaches durable
+    /// evidence returns its own typed refusal instead of the admitted row.
+    fn case_2_refused_open_records() -> String {
         let tag = super::fresh_identity("root").unwrap();
         let root = std::env::temp_dir().join(format!("eliot-host-891-case-2-{}", tag.as_str()));
         std::fs::create_dir_all(&root).expect("case root must be creatable");
@@ -2284,6 +2313,22 @@ mod host_lifecycle_boundary_table_tests {
             refused.is_some(),
             "an empty approved registry admits nothing"
         );
+        opened
+    }
+
+    #[cfg(windows)]
+    // WORK_UNIT_CASE: 891/2
+    #[test]
+    fn case_2_service_start_request_is_not_a_started_result() {
+        // The frozen contract: a start request and its result are separate
+        // rows, with separate events and separate owner state.
+        let bounds = case_2_open_start_bounds();
+        let ready_event = row(super::BOUNDARY_READINESS_PROOF_READY).event;
+
+        // The real open owner: `HostComposition::open` records the request
+        // before any admission work, and an open that never reaches durable
+        // evidence records its own terminal instead of the admitted row.
+        let opened = case_2_refused_open_records();
         assert_eq!(
             detail_order(&opened).first(),
             Some(&bounds[0].event),
@@ -2367,26 +2412,7 @@ mod host_lifecycle_boundary_table_tests {
 
         // The service-start result belongs to an observed process start: at
         // the real sink gate no request-side evidence admits a start record.
-        for evidence in [
-            HostRequestEvidence::Observed,
-            HostRequestEvidence::Admitted,
-            HostRequestEvidence::SemanticallyReady,
-            HostRequestEvidence::Cancelled,
-            HostRequestEvidence::Failed,
-            HostRequestEvidence::Unknown,
-        ] {
-            let claimed = AdmittedEvent::ServiceStart.is_admitted_by(evidence);
-            assert!(
-                !claimed,
-                "request-side evidence {} claims no start",
-                evidence.as_str()
-            );
-        }
-        let observed = HostRequestEvidence::ProcessStarted;
-        assert!(
-            AdmittedEvent::ServiceStart.is_admitted_by(observed),
-            "only an observed process start admits the result"
-        );
+        case_2_service_start_admission_contour();
 
         // The rendered start request carries its own identity and nothing else.
         let request_only = capture_records(|| {
@@ -2736,6 +2762,16 @@ mod host_lifecycle_boundary_table_tests {
     // WORK_UNIT_CASE: 891/6
     #[test]
     fn case_6_stop_request_pending_stopped_are_distinct() {
+        // The real single-terminal mechanism, driven through a real nested
+        // `?` propagation: the inner stop phase fails and its error propagates
+        // out of the outer operation, which owns the only armed guard. Exactly
+        // one terminal is emitted, carrying the outer operation's frozen code,
+        // and the inner phase's own boundary observations stay non-terminal.
+        fn nested_stop_phase() -> Result<(), super::HostError> {
+            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
+            Err(super::HostError::Stopped)
+        }
+
         // The frozen contract: stop requested, cancellation requested, drain
         // requested, drain draining, drain commit, and the two stopped rows are
         // seven distinct boundaries, none of which is the stop terminal.
@@ -2764,18 +2800,9 @@ mod host_lifecycle_boundary_table_tests {
             );
         }
 
-        // The real single-terminal mechanism, driven through a real nested
-        // `?` propagation: the inner stop phase fails and its error propagates
-        // out of the outer operation, which owns the only armed guard. Exactly
-        // one terminal is emitted, carrying the outer operation's frozen code,
-        // and the inner phase's own boundary observations stay non-terminal.
-        fn nested_stop_phase() -> Result<(), super::HostError> {
-            super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
-            Err(super::HostError::Stopped)
-        }
         let refused = capture_records(|| {
             super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_REQUESTED);
-            let mut guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
+            let _guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
             let outcome: Result<(), super::HostError> = (|| {
                 super::host_lifecycle_observe_drain(super::BOUNDARY_DRAIN_REQUESTED);
                 nested_stop_phase()
@@ -3529,6 +3556,9 @@ mod host_lifecycle_boundary_table_tests {
         reason = "case 12 keeps the durable cancellation contour, the reducer refusals it forces, and the emitted vocabulary in one deterministic walk"
     )]
     fn case_12_requested_and_terminal_cancellation_are_distinct() {
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+
         // The frozen contract: cancellation requested, stop requested, stop
         // terminal, drained, and stopped are five distinct rows.
         let cancellation = row(super::BOUNDARY_STOP_CANCELLATION_REQUESTED);
@@ -3666,8 +3696,6 @@ mod host_lifecycle_boundary_table_tests {
 
         // The facade seam: a proven-no-effect cancellation is not a completed
         // stop, so the Event Log never receives one for it.
-        use super::host_diagnostics::HostRequestEvidence;
-        use super::windows_event_log::AdmittedEvent;
         assert!(
             !AdmittedEvent::ServiceStop.is_admitted_by(HostRequestEvidence::Cancelled),
             "a cancelled request must never be recorded as a completed stop"
@@ -3706,6 +3734,8 @@ mod host_lifecycle_boundary_table_tests {
         reason = "case 13 keeps the durable pending intent, its typed unknown classifications, and the emitted vocabulary in one deterministic walk"
     )]
     fn case_13_timeout_and_possible_state_change_stay_unknown() {
+        use super::readiness_gate::{HostReadinessGate, ReadinessCadence, ReadinessGateAction};
+
         // The frozen contract: a pending restart intent has its own row, and it
         // is neither the readback replay nor the completion.
         let pending = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
@@ -3799,7 +3829,6 @@ mod host_lifecycle_boundary_table_tests {
         // The real gate seam, on a contour that WAS presented and authenticated:
         // the possible state change happens in the journal step the gate calls
         // for a due probe, so that is where the unknown delivery is recorded.
-        use super::readiness_gate::{HostReadinessGate, ReadinessCadence, ReadinessGateAction};
         let now = std::time::Instant::now();
         let presented = complete_readiness_contour("891-case-13");
         let mut proof_gate = HostReadinessGate::with_cadence(ReadinessCadence::default());
@@ -3916,6 +3945,34 @@ mod host_lifecycle_boundary_table_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Case 14 fixture: the wire restart request and the durable Kernel restart
+    /// receipt whose rebind the durable owner must refuse as a rollback.
+    fn case_14_restart_request_and_receipt(
+    ) -> (super::HostRuntimeControlRequest, super::HostKernelRestartReceipt) {
+        let restart = super::HostRuntimeControlRequest::new(
+            super::HostRuntimeControlOperation::RestartKernel,
+            PlatformHandle::new("891-case-14-restart").unwrap(),
+        )
+        .unwrap();
+        restart.validate().unwrap();
+        let mut receipt = super::HostKernelRestartReceipt {
+            mutation_digest: restart.mutation_digest.clone(),
+            request_digest: restart.request_digest.clone(),
+            old_kernel_generation: PlatformHandle::new("1".repeat(64)).unwrap(),
+            new_kernel_generation: PlatformHandle::new("2".repeat(64)).unwrap(),
+            store_fence: PlatformHandle::new("3".repeat(64)).unwrap(),
+            activation_receipt_digest: PlatformHandle::new("4".repeat(64)).unwrap(),
+            ready_receipt_digest: PlatformHandle::new("5".repeat(64)).unwrap(),
+            receipt_digest: PlatformHandle::new("6".repeat(64)).unwrap(),
+        };
+        receipt.receipt_digest = receipt.computed_digest().unwrap();
+        assert!(
+            super::rebind_runtime_restart_receipt(&receipt, &restart).is_err(),
+            "the durable owner must refuse a restart commit read back as a rollback"
+        );
+        (restart, receipt)
+    }
+
     // WORK_UNIT_CASE: 891/14
     #[cfg(windows)]
     #[test]
@@ -3945,31 +4002,11 @@ mod host_lifecycle_boundary_table_tests {
         // its own digest recomputation sits behind that refusal. Three
         // fallible frames propagate through `?`; only the outermost guard owns
         // a terminal.
-        let restart = super::HostRuntimeControlRequest::new(
-            super::HostRuntimeControlOperation::RestartKernel,
-            PlatformHandle::new("891-case-14-restart").unwrap(),
-        )
-        .unwrap();
-        restart.validate().unwrap();
-        let mut receipt = super::HostKernelRestartReceipt {
-            mutation_digest: restart.mutation_digest.clone(),
-            request_digest: restart.request_digest.clone(),
-            old_kernel_generation: PlatformHandle::new("1".repeat(64)).unwrap(),
-            new_kernel_generation: PlatformHandle::new("2".repeat(64)).unwrap(),
-            store_fence: PlatformHandle::new("3".repeat(64)).unwrap(),
-            activation_receipt_digest: PlatformHandle::new("4".repeat(64)).unwrap(),
-            ready_receipt_digest: PlatformHandle::new("5".repeat(64)).unwrap(),
-            receipt_digest: PlatformHandle::new("6".repeat(64)).unwrap(),
-        };
-        receipt.receipt_digest = receipt.computed_digest().unwrap();
-        assert!(
-            super::rebind_runtime_restart_receipt(&receipt, &restart).is_err(),
-            "the durable owner must refuse a restart commit read back as a rollback"
-        );
+        let (restart, receipt) = case_14_restart_request_and_receipt();
 
         let emitted = capture_records(|| {
             super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
-            let mut guard =
+            let _guard =
                 super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
             let outcome: Result<(), super::HostError> = (|| {
                 super::host_lifecycle_observe_scm(
@@ -4180,6 +4217,9 @@ mod host_lifecycle_boundary_table_tests {
     #[cfg(windows)]
     #[test]
     fn case_16_typed_reason_and_recovery_codes_without_free_text_status() {
+        const CREDENTIAL_CANARY: &str = "891-case-16-credential-canary";
+        const DB_CANARY: &str = "891-case-16-db-canary";
+
         // The frozen contract: the terminal rows carry typed codes, so the
         // machine status is a discriminant and never a rendered message.
         let terminal = row(super::BOUNDARY_STOP_TERMINAL);
@@ -4193,8 +4233,6 @@ mod host_lifecycle_boundary_table_tests {
         // The real owner: the facade projects only the `HostError` discriminant
         // as the reason code, so a payload-bearing error renders its kind and
         // nothing of its text.
-        const CREDENTIAL_CANARY: &str = "891-case-16-credential-canary";
-        const DB_CANARY: &str = "891-case-16-db-canary";
         let census = super::HostError::StoreCensusIo(std::io::Error::other(DB_CANARY));
         let refused = super::HostError::ProcessContour(format!(
             "store credential {CREDENTIAL_CANARY} refused"
@@ -4282,6 +4320,9 @@ mod host_lifecycle_boundary_table_tests {
         reason = "case 17 keeps the fenced and unfenced launch constructors, their missing evidence, and the emitted vocabulary in one deterministic walk"
     )]
     fn case_17_missing_evidence_suppresses_a_false_success_event() {
+        use super::host_diagnostics::HostRequestEvidence;
+        use super::windows_event_log::AdmittedEvent;
+
         // The frozen contract: the fenced rows exist precisely because the
         // fenced startup contour has no launch evidence to report.
         let fenced_requested = row(super::BOUNDARY_JOBS_FENCED_REQUESTED);
@@ -4373,8 +4414,6 @@ mod host_lifecycle_boundary_table_tests {
         // The facade seam: an admitted-but-unproven request never becomes an
         // Event Log start record, so a suppressed success event stays
         // suppressed all the way to the typed sink gate.
-        use super::host_diagnostics::HostRequestEvidence;
-        use super::windows_event_log::AdmittedEvent;
         assert!(
             !AdmittedEvent::ServiceStart.is_admitted_by(HostRequestEvidence::Admitted),
             "an admitted request alone must never admit a start record"
@@ -4596,6 +4635,10 @@ mod host_lifecycle_boundary_table_tests {
         reason = "case 19 keeps the launch-environment projection, its reserved-key replacement, and the rendered canary audit in one deterministic walk"
     )]
     fn case_19_credential_env_and_db_canaries_are_absent() {
+        const ENV_CANARY: &str = "891-case-19-env-canary";
+        const CREDENTIAL_CANARY: &str = "891-case-19-credential-canary";
+        const DB_CANARY: &str = "891-case-19-db-canary";
+
         // The frozen contract: the launch rows carry owner identities only, so
         // no environment or credential material has a vocabulary to reach.
         assert_eq!(
@@ -4603,10 +4646,6 @@ mod host_lifecycle_boundary_table_tests {
             "HostInstallationEpoch/fenced identity",
             "the admitted row must record an owner identity, never ambient state"
         );
-
-        const ENV_CANARY: &str = "891-case-19-env-canary";
-        const CREDENTIAL_CANARY: &str = "891-case-19-credential-canary";
-        const DB_CANARY: &str = "891-case-19-db-canary";
 
         // The real owner: the launch-environment projection scrubs every
         // reserved key from the ambient environment and rebinds it to the
@@ -4722,6 +4761,10 @@ mod host_lifecycle_boundary_table_tests {
         reason = "case 20 keeps the SCM cause classification, its bounded detail, and the rendered SCM/user/source audit in one deterministic walk"
     )]
     fn case_20_scm_source_and_user_canaries_are_absent() {
+        const SERVICE_CANARY: &str = "891-case-20-scm-canary-service";
+        const USER_CANARY: &str = "891-case-20-user-canary";
+        const COMMAND_CANARY: &str = "891-case-20-command-canary";
+
         // The frozen contract: the SCM rows carry the operation and its
         // identities, never a registration payload or an account.
         assert_eq!(
@@ -4729,10 +4772,6 @@ mod host_lifecycle_boundary_table_tests {
             "owner lease activation capability",
             "the SCM row must record an owner capability, never SCM payload data"
         );
-
-        const SERVICE_CANARY: &str = "891-case-20-scm-canary-service";
-        const USER_CANARY: &str = "891-case-20-user-canary";
-        const COMMAND_CANARY: &str = "891-case-20-command-canary";
 
         // The real owner: the SCM classifier answers with one of three closed
         // typed causes and a bounded detail, whatever the inspection reports.
@@ -13054,6 +13093,33 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    /// Watchdog admission proof: the SCM selector source and the installer
+    /// approval must both be bound to the immutable manifest launch, in this
+    /// exact order, before any Watchdog process work is attempted.
+    fn verify_watchdog_scm_admission(
+        launch: &RuntimeLaunchDescriptor,
+        scm_launch: &RuntimeLaunchDescriptor,
+        approval: &InstallerServiceRegistrationApproval,
+    ) -> Result<(), HostError> {
+        if scm_launch.generation != launch.generation
+            || scm_launch.authority_descriptor_path != launch.authority_descriptor_path
+            || scm_launch.watchdog_executable_path != launch.watchdog_executable_path
+        {
+            return Err(HostError::RecoveryRequired(
+                "Watchdog SCM selector source is not the immutable manifest launch".to_owned(),
+            ));
+        }
+        if approval.role() != InstallerServiceRole::Watchdog
+            || approval.generation() != &launch.generation
+        {
+            return Err(HostError::ProcessContour(
+                "Watchdog SCM approval is not bound to the requested generation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     fn start_watchdog(
         &mut self,
         phase_b: &HostPhaseBMaterialization,
@@ -13073,21 +13139,7 @@ impl HostComposition {
             ));
         }
         let launch = &phase_b.launch;
-        if scm_launch.generation != launch.generation
-            || scm_launch.authority_descriptor_path != launch.authority_descriptor_path
-            || scm_launch.watchdog_executable_path != launch.watchdog_executable_path
-        {
-            return Err(HostError::RecoveryRequired(
-                "Watchdog SCM selector source is not the immutable manifest launch".to_owned(),
-            ));
-        }
-        if approval.role() != InstallerServiceRole::Watchdog
-            || approval.generation() != &launch.generation
-        {
-            return Err(HostError::ProcessContour(
-                "Watchdog SCM approval is not bound to the requested generation".to_owned(),
-            ));
-        }
+        Self::verify_watchdog_scm_admission(launch, scm_launch, approval)?;
         let image = PathBuf::from(launch.watchdog_executable_path.as_str());
         let portable_root = if launch.profile == InstallationProfile::PortableDev {
             Some(
@@ -13225,17 +13277,19 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn reconcile_watchdog_start_bound(
-        &mut self,
-        registration: ServiceRegistrationRequest,
-        platform_root: PathBuf,
-        heartbeat_state_root: PathBuf,
+    /// Abort-boundary carrier proof: a pending Watchdog start is only
+    /// reconciled against the exact registration, roots and admission state its
+    /// own carrier recorded.
+    fn verify_watchdog_start_carrier(
+        carrier: Option<&WatchdogStartRecoveryCarrier>,
+        registration: &ServiceRegistrationRequest,
+        platform_root: &Path,
+        heartbeat_state_root: &Path,
     ) -> Result<(), HostError> {
-        let carrier = self.watchdog_start_recovery.clone();
-        if let Some(carrier) = carrier.as_ref() {
-            if carrier.registration != registration
-                || !windows_paths_equal(&carrier.platform_root, &platform_root)
-                || !windows_paths_equal(&carrier.heartbeat_state_root, &heartbeat_state_root)
+        if let Some(carrier) = carrier {
+            if carrier.registration != *registration
+                || !windows_paths_equal(&carrier.platform_root, platform_root)
+                || !windows_paths_equal(&carrier.heartbeat_state_root, heartbeat_state_root)
             {
                 return Err(HostError::RecoveryRequired(
                     "Watchdog recovery carrier is not bound to the pending launch".to_owned(),
@@ -13248,11 +13302,112 @@ impl HostComposition {
                 ));
             }
         }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Abort artifact reconciliation: the operation-bound start carrier owns
+    /// the exact artifacts to remove; an uncarried abort must find none.
+    fn reconcile_watchdog_start_artifacts(
+        &mut self,
+        carrier: Option<&WatchdogStartRecoveryCarrier>,
+        heartbeat_state_root: &Path,
+        stopped_process: Option<(u32, u64)>,
+    ) -> Result<(), HostError> {
+        if let Some(carrier) = carrier {
+            watchdog_heartbeat::remove_start_artifacts_exact(
+                heartbeat_state_root,
+                &carrier.issued_descriptor,
+                stopped_process,
+            )?;
+            self.watchdog_start_recovery = None;
+        } else {
+            watchdog_heartbeat::require_no_start_artifacts(heartbeat_state_root)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Heartbeat rendezvous peer proof: the running Watchdog incarnation must
+    /// be the exact pair the issued descriptor and its start carrier name.
+    fn verify_watchdog_heartbeat_peer(
+        current: &watchdog_heartbeat::HeartbeatTransportDescriptor,
+        issued: &watchdog_heartbeat::HeartbeatTransportDescriptor,
+        process_id: u32,
+        start_time_100ns: u64,
+    ) -> Result<(), HostError> {
+        if current.pipe_name != issued.pipe_name
+            || current.host_challenge_nonce != issued.host_challenge_nonce
+            || current.service_instance_guid != issued.service_instance_guid
+            || current.installation_id != issued.installation_id
+            || current.transaction_plan_generation != issued.transaction_plan_generation
+            || current.watchdog_incarnation_pid != process_id
+            || current.watchdog_incarnation_start_100ns != start_time_100ns
+        {
+            return Err(HostError::RecoveryRequired(
+                "Running Watchdog is not the exact heartbeat-bound start peer".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    /// Running-Watchdog peer proof: the rendezvous descriptor currently on
+    /// disk must be the exact pair the issued descriptor and the handle-bound
+    /// process identity name.
+    fn require_watchdog_running_peer(
+        heartbeat_state_root: &Path,
+        issued: &watchdog_heartbeat::HeartbeatTransportDescriptor,
+        process_id: u32,
+        start_time_100ns: u64,
+    ) -> Result<(), HostError> {
+        let current = watchdog_heartbeat::HeartbeatTransportDescriptor::load(heartbeat_state_root)?
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "Running Watchdog has no heartbeat descriptor for rollback binding".to_owned(),
+                )
+            })?;
+        Self::verify_watchdog_heartbeat_peer(&current, issued, process_id, start_time_100ns)
+    }
+
+    #[cfg(windows)]
+    /// Abort completion proof: a proven stop must read back as the exact
+    /// stopped/no-process state before any artifact reconciliation.
+    fn require_watchdog_stopped_readback(
+        platform: &WindowsPlatform,
+        registration: &ServiceRegistrationRequest,
+    ) -> Result<(), HostError> {
+        match platform.inspect_service_registration_runtime(registration) {
+            ServiceRegistrationRuntimeInspection::Matching { observation }
+                if observation.is_stopped() && observation.process().is_none() => {}
+            _ => {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog stop lacks exact stopped/no-process readback".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn reconcile_watchdog_start_bound(
+        &mut self,
+        registration: &ServiceRegistrationRequest,
+        platform_root: PathBuf,
+        heartbeat_state_root: &Path,
+    ) -> Result<(), HostError> {
+        let carrier = self.watchdog_start_recovery.clone();
+        Self::verify_watchdog_start_carrier(
+            carrier.as_ref(),
+            registration,
+            &platform_root,
+            heartbeat_state_root,
+        )?;
 
         let platform = WindowsPlatform::new(platform_root)
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let mut stopped_process = None;
-        match platform.inspect_service_registration_runtime(&registration) {
+        match platform.inspect_service_registration_runtime(registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_stopped() && observation.process().is_none() => {}
             ServiceRegistrationRuntimeInspection::Matching { observation }
@@ -13274,31 +13429,12 @@ impl HostComposition {
                         "Watchdog Running state has no handle-bound process identity".to_owned(),
                     )
                 })?;
-                let current_descriptor =
-                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?
-                        .ok_or_else(|| {
-                            HostError::RecoveryRequired(
-                                "Running Watchdog has no heartbeat descriptor for rollback binding"
-                                    .to_owned(),
-                            )
-                        })?;
-                if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
-                    || current_descriptor.host_challenge_nonce
-                        != carrier.issued_descriptor.host_challenge_nonce
-                    || current_descriptor.service_instance_guid
-                        != carrier.issued_descriptor.service_instance_guid
-                    || current_descriptor.installation_id
-                        != carrier.issued_descriptor.installation_id
-                    || current_descriptor.transaction_plan_generation
-                        != carrier.issued_descriptor.transaction_plan_generation
-                    || current_descriptor.watchdog_incarnation_pid != process.process_id
-                    || current_descriptor.watchdog_incarnation_start_100ns
-                        != process.start_time_100ns
-                {
-                    return Err(HostError::RecoveryRequired(
-                        "Running Watchdog is not the exact heartbeat-bound start peer".to_owned(),
-                    ));
-                }
+                Self::require_watchdog_running_peer(
+                    heartbeat_state_root,
+                    &carrier.issued_descriptor,
+                    process.process_id,
+                    process.start_time_100ns,
+                )?;
                 let runtime_identity_digest =
                     observation.runtime_identity_digest().ok_or_else(|| {
                         HostError::RecoveryRequired(
@@ -13346,27 +13482,14 @@ impl HostComposition {
         }
 
         if stopped_process.is_some() {
-            match platform.inspect_service_registration_runtime(&registration) {
-                ServiceRegistrationRuntimeInspection::Matching { observation }
-                    if observation.is_stopped() && observation.process().is_none() => {}
-                _ => {
-                    return Err(HostError::RecoveryRequired(
-                        "Watchdog stop lacks exact stopped/no-process readback".to_owned(),
-                    ));
-                }
-            }
+            Self::require_watchdog_stopped_readback(&platform, registration)?;
         }
 
-        if let Some(carrier) = carrier.as_ref() {
-            watchdog_heartbeat::remove_start_artifacts_exact(
-                &heartbeat_state_root,
-                &carrier.issued_descriptor,
-                stopped_process,
-            )?;
-            self.watchdog_start_recovery = None;
-        } else {
-            watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;
-        }
+        self.reconcile_watchdog_start_artifacts(
+            carrier.as_ref(),
+            heartbeat_state_root,
+            stopped_process,
+        )?;
         Ok(())
     }
 
@@ -13387,7 +13510,11 @@ impl HostComposition {
         else {
             return Ok(());
         };
-        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
+        self.reconcile_watchdog_start_bound(
+            &registration,
+            platform_root,
+            &heartbeat_state_root,
+        )
     }
 
     #[cfg(windows)]
@@ -15179,6 +15306,71 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
+    /// Fresh-readiness activation fence: a late Store recovery result is not
+    /// proof that Host supervision recovered. The exact current activation
+    /// generation is required before any fresh positive readiness observation
+    /// is appended; the generation may attempt the proof while `Active`, or
+    /// while `Draining` with a pre-commit `Cancelled` drain awaiting
+    /// revalidation (I1.5 requires a pre-linearization observable-use trigger to
+    /// return the same generation to `ACTIVE` after readiness revalidation, and
+    /// that revalidation is this exact authenticated proof - never the
+    /// cancellation itself). Every other state (Starting, DegradedRecovery,
+    /// missing, unreadable, committed, or still `Draining` behind a live drain)
+    /// remains a visible recovery boundary.
+    ///
+    /// Returns `false` after recording the cause-specific gate failure, so the
+    /// caller answers degraded exactly as it did inline.
+    fn require_current_activation_for_readiness(&mut self, now: std::time::Instant) -> bool {
+        let snapshot = match self.journal.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                self.readiness_gate.fail(
+                    None,
+                    readiness_failure_kind(&HostError::Journal(error)),
+                    now,
+                );
+                return false;
+            }
+        };
+        let Some(activation) = snapshot.activation.as_ref() else {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::OwnerLeaseRecovery(
+                    "activation record is absent".to_owned(),
+                )),
+                now,
+            );
+            return false;
+        };
+        // I1.5 drain-cancel resume: `note_observable_use` appends
+        // `Drain(Cancelled)` while leaving the activation `Draining`, and
+        // only `resume_cancelled_drain` - fed by the `Healthy` this proof
+        // produces on the live SCM tick - moves it back to `Active`. The
+        // `Cancelled` record plus the absent `DrainCommitRecord` prove the
+        // linearization point has not passed, so this attempt is the
+        // norm-mandated revalidation, not a second admission.
+        let cancelled_drain_awaits_revalidation = Self::cancelled_drain_awaits_revalidation(
+            activation,
+            snapshot.drain.as_ref(),
+            snapshot.drain_commit.as_ref(),
+        );
+        if activation.fence.activation_generation != self.activation_generation
+            || !(activation.state == ActivationState::Active || cancelled_drain_awaits_revalidation)
+        {
+            self.readiness_gate.fail(
+                None,
+                readiness_failure_kind(&HostError::RecoveryRequired(
+                "fresh readiness requires the exact current Active Host activation or its pre-commit cancelled drain"
+                .to_owned(),
+            )),
+                now,
+            );
+            return false;
+        }
+        true
+    }
+
+    #[cfg(windows)]
     fn reconcile_branch_readiness_at(
         &mut self,
         generation: &PlatformHandle,
@@ -15220,64 +15412,13 @@ impl HostComposition {
             }
             return disposition;
         }
+
         // A late Store recovery result is not proof that Host supervision
-        // recovered.  Require the exact current activation generation before
-        // any fresh positive readiness observation is appended. The generation
-        // may attempt the proof while `Active`, or while `Draining` with a
-        // pre-commit `Cancelled` drain awaiting revalidation: I1.5 requires a
-        // pre-linearization observable-use trigger to return the same
-        // generation to `ACTIVE` after readiness revalidation, and that
-        // revalidation is this exact authenticated proof — never the
-        // cancellation itself. Every other state (Starting,
-        // DegradedRecovery, missing, unreadable, committed, or still
-        // `Draining` behind a live drain) remains a visible recovery
-        // boundary, and the proof below is unchanged: a complete contour
-        // under the exact generation fence, a fresh Watchdog observation,
-        // and the gate grant.
-        let snapshot = match self.journal.snapshot() {
-            Ok(state) => state,
-            Err(error) => {
-                self.readiness_gate.fail(
-                    None,
-                    readiness_failure_kind(&HostError::Journal(error)),
-                    now,
-                );
-                return HostBranchDisposition::ReadinessDegraded;
-            }
-        };
-        let Some(activation) = snapshot.activation.as_ref() else {
-            self.readiness_gate.fail(
-                None,
-                readiness_failure_kind(&HostError::OwnerLeaseRecovery(
-                    "activation record is absent".to_owned(),
-                )),
-                now,
-            );
-            return HostBranchDisposition::ReadinessDegraded;
-        };
-        // I1.5 drain-cancel resume: `note_observable_use` appends
-        // `Drain(Cancelled)` while leaving the activation `Draining`, and
-        // only `resume_cancelled_drain` — fed by the `Healthy` this proof
-        // produces on the live SCM tick — moves it back to `Active`. The
-        // `Cancelled` record plus the absent `DrainCommitRecord` prove the
-        // linearization point has not passed, so this attempt is the
-        // norm-mandated revalidation, not a second admission.
-        let cancelled_drain_awaits_revalidation = Self::cancelled_drain_awaits_revalidation(
-            activation,
-            snapshot.drain.as_ref(),
-            snapshot.drain_commit.as_ref(),
-        );
-        if activation.fence.activation_generation != self.activation_generation
-            || !(activation.state == ActivationState::Active || cancelled_drain_awaits_revalidation)
-        {
-            self.readiness_gate.fail(
-                None,
-                readiness_failure_kind(&HostError::RecoveryRequired(
-                    "fresh readiness requires the exact current Active Host activation or its pre-commit cancelled drain"
-                        .to_owned(),
-                )),
-                now,
-            );
+        // recovered.  The exact current activation generation is required
+        // before any fresh positive readiness observation is appended, and the
+        // proof below is unchanged: a complete contour under the exact
+        // generation fence, a fresh Watchdog observation, and the gate grant.
+        if !self.require_current_activation_for_readiness(now) {
             return HostBranchDisposition::ReadinessDegraded;
         }
         host_lifecycle_observe_requested(BOUNDARY_READINESS_REQUESTED_PROOF);
@@ -16038,7 +16179,11 @@ impl HostComposition {
         else {
             return Ok(());
         };
-        self.reconcile_watchdog_start_bound(registration, platform_root, heartbeat_state_root)
+        self.reconcile_watchdog_start_bound(
+            &registration,
+            platform_root,
+            &heartbeat_state_root,
+        )
     }
 
     #[cfg(windows)]
