@@ -274,10 +274,12 @@ where
 /// Builds the admission receipt for one committed effect decision.
 ///
 /// The owner-state bindings come from the live attach fence the decision was
-/// admitted under, never reconstructed from the record, and the receipt
-/// reports the stored record whenever this operation identity already holds
-/// one so the handler performs its content comparison against what was
-/// actually persisted.
+/// admitted under, never reconstructed from the record. `stored` is the record
+/// the owner already held for this operation identity, and it is supplied only
+/// when the route proved that by answering `Duplicate` for these exact bytes;
+/// a freshly written decision passes `None`. The receipt's `replayed` flag and
+/// `duplicate` disposition are therefore both derived from that same proof, so
+/// the handler never reconciles a first evaluation against itself.
 fn decision_receipt(
     stream_id: String,
     event_id: String,
@@ -323,10 +325,23 @@ fn disposition_text(disposition: EventDisposition) -> &'static str {
     }
 }
 
+/// Maps one route failure onto the admission's typed refusal.
+///
+/// [`BridgeError::InvalidEventDisposition`] carrying
+/// [`EventDisposition::Conflict`] is the route's **determined** changed-content
+/// refusal, not a transport problem: the owner compared this exact envelope's
+/// canonical bytes against the stored row it holds and they differ. It is the
+/// only `BridgeError` whose meaning is a decision rather than an inability, so
+/// it keeps its own typed class here instead of being flattened into
+/// `Unavailable`. Every other route failure stays `Unavailable` unless the
+/// owner named a fence.
 fn bridge_failure(error: &BridgeError) -> HostEventAdmissionFailure {
     match error {
         BridgeError::StaleAuthority | BridgeError::ExternalAttachReconciliationRequired => {
             HostEventAdmissionFailure::Fenced
+        }
+        BridgeError::InvalidEventDisposition(EventDisposition::Conflict) => {
+            HostEventAdmissionFailure::Conflict
         }
         _ => HostEventAdmissionFailure::Unavailable,
     }
@@ -456,12 +471,14 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                         HostEventAdmissionFailure::Fenced,
                     ));
                 }
-                if matches!(disposition, EventDisposition::Conflict) {
-                    // The stored digest is deliberately not exposed to a
-                    // conflicting presenter; the caller reconciles by
-                    // replaying its original bytes under the same identity.
-                    return Err(HostEventAdmissionError::conflict(String::new()));
-                }
+                // A `Conflict` disposition never reaches here: the core route
+                // converts it to `BridgeError::InvalidEventDisposition` before
+                // it builds a status, so `bridge_failure` on the
+                // `forward_event` line above already carries that determined
+                // refusal through as `HostEventAdmissionFailure::Conflict`. The
+                // stored digest is never exposed to a conflicting presenter; it
+                // reconciles by replaying its original bytes under the same
+                // identity.
                 if !matches!(
                     phase,
                     AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
@@ -575,13 +592,13 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionFailure::Unavailable,
             ));
         };
-        if matches!(disposition, EventDisposition::Conflict) {
-            // The same decision identity already holds different content. The
-            // stored record is deliberately not disclosed to a conflicting
-            // presenter; reconciliation replays the presenter's own original
-            // content under the same identity.
-            return Err(HostEventAdmissionError::conflict(String::new()));
-        }
+        // Same-identity/different-content never reaches this arm either: the
+        // core route turns `Conflict` into
+        // `BridgeError::InvalidEventDisposition` before it builds a status, so
+        // the determined refusal is already carried by the `bridge_failure`
+        // mapping on the line above. The stored record is deliberately not
+        // disclosed to a conflicting presenter; it reconciles by replaying its
+        // own original content under the same identity.
         if !matches!(
             phase,
             AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
@@ -590,26 +607,37 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionFailure::Unavailable,
             ));
         }
-        // The owner's durable record is the authority on both outcomes.
+        // The owner's durable row is the authority on this outcome, and the
+        // `Duplicate` answer is what proves it.
         //
-        // `Conflict` above is the determined changed-content refusal. A
-        // `Duplicate` here is the opposite proof: the route compares the stored
-        // row's envelope digest, sequence, producer, generation, authority
-        // epoch and privacy legs against these exact presented bytes and
-        // answers `Duplicate` only when they all agree, so the presented record
-        // *is* the durable record. That is what reconciles a retry whose
-        // response was lost across a bridge restart: one durable event, one
-        // durable decision, no second write, and the handler compares the
-        // presented content against the record the owner actually holds rather
+        // The route compares the stored row's envelope digest, sequence,
+        // producer, generation, authority epoch and privacy legs against these
+        // exact presented bytes and answers `Duplicate` only when every one of
+        // them agrees; any difference is the determined conflict carried by
+        // `bridge_failure`. So on `Duplicate` the presented record *is* the
+        // record the owner holds, byte for byte - which is precisely what
+        // reconciles a retry whose response was lost across a bridge restart.
+        // One durable event, one durable decision, no second write, and the
+        // handler reconciles against the record the owner actually holds rather
         // than against this process's cache.
-        self.committed_decisions
-            .insert(event_id.clone(), record.clone());
+        let replayed = matches!(disposition, EventDisposition::Duplicate);
+        // A fresh write proves no replay happened, so it reports no replayed
+        // decision. Returning the just-written record here would make the
+        // handler reconcile a first evaluation against itself and report
+        // `replayed: true` for a decision that was never replayed.
+        let replayed_decision = if replayed {
+            self.committed_decisions
+                .insert(event_id.clone(), record.clone());
+            Some(record.clone())
+        } else {
+            None
+        };
         Ok(decision_receipt(
             stream_id,
             event_id,
             epoch,
             &fence,
-            Some(record.clone()),
+            replayed_decision,
         ))
     }
 
@@ -854,4 +882,54 @@ where
         stop,
         active_generation,
     )))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A refusal case for the determined same-identity/changed-content answer:
+    /// the route's conflict must stay a conflict, never degrade into the
+    /// retryable `Unavailable` class that would answer 503 and invite the
+    /// client to resubmit content the owner already refused.
+    #[test]
+    fn route_conflict_stays_a_determined_conflict() {
+        let failure = bridge_failure(&BridgeError::InvalidEventDisposition(
+            EventDisposition::Conflict,
+        ));
+        assert_eq!(failure, HostEventAdmissionFailure::Conflict);
+        let rejection = HostEventAdmissionError::of(failure).reject();
+        assert_eq!(rejection.status, 409);
+        assert_eq!(rejection.reason_code, "IDENTITY_CONFLICT");
+    }
+
+    /// The positive case: a fence named by the owner keeps its own typed class,
+    /// and an ordinary route failure is still `Unavailable`, so this one change
+    /// widens no other mapping into a conflict.
+    #[test]
+    fn only_the_determined_conflict_becomes_a_conflict() {
+        for fenced in [
+            BridgeError::StaleAuthority,
+            BridgeError::ExternalAttachReconciliationRequired,
+        ] {
+            assert_eq!(
+                bridge_failure(&fenced),
+                HostEventAdmissionFailure::Fenced,
+                "an owner-named fence must not be reclassified as a conflict"
+            );
+        }
+        for unavailable in [
+            BridgeError::NotAttached,
+            BridgeError::AckIdentityMismatch,
+            BridgeError::MissingDurableAck,
+            BridgeError::InvalidEventDisposition(EventDisposition::Rejected),
+        ] {
+            assert_eq!(
+                bridge_failure(&unavailable),
+                HostEventAdmissionFailure::Unavailable,
+                "only a determined conflict may become a conflict"
+            );
+        }
+    }
 }
