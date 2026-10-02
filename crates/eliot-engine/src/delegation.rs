@@ -1803,6 +1803,585 @@ mod provider_call_ledger_reconciliation_tests {
         })
     }
 
+    /// Raw-byte fixtures for the durable provider-call ledger boundary.
+    ///
+    /// Every document below is text, never a `serde_json::Value`. A `Value`
+    /// fixture is already the collapsed projection of the document, so it cannot
+    /// carry a duplicate member, an unknown member spelling or a truncation at
+    /// all: those are lexical facts that only the raw bytes carry, and they are
+    /// the facts this boundary exists to refuse.
+    const RAW_CAMPAIGN: &str = "provider-call-ledger-raw-campaign";
+    const RAW_RESERVATION_ID: &str = "provider-call-reservation-raw-1";
+
+    /// The one budget of the admitted ledger, as raw text.
+    ///
+    /// Every counter in it is re-derivable from [`RAW_RESERVATION`]: one
+    /// reserved slot, no dispatched slot, no terminal slot, one consumed call of
+    /// a ceiling of two, and the next free slot index is 2.
+    const RAW_BUDGET: &str = r#"{"campaign_id":"provider-call-ledger-raw-campaign","schema_version":"provider-call-campaign-v1","max_calls":2,"next_slot_index":2,"reserved_slots":1,"dispatched_slots":0,"terminal_slots":0,"remaining_calls":1,"revision":1,"closed":false,"updated_at":"2026-10-01T00:00:00Z"}"#;
+
+    /// The one reserved, not yet dispatched reservation of the admitted ledger,
+    /// as raw text.
+    const RAW_RESERVATION: &str = r#"{"reservation_id":"provider-call-reservation-raw-1","campaign_id":"provider-call-ledger-raw-campaign","task_id":"00000000-0000-7000-8000-000000000001","provider":"antigravity","idempotency_key":"provider-call-idempotency-raw-1","slot_index":1,"budget_revision":1,"gate_decision_ref":"gate-decision-raw-1","state":"reserved","reserved_at":"2026-10-01T00:00:00Z","dispatch_started_at":null,"external_invocation_ref":null,"review_ref":null,"terminal_at":null,"consumes_budget":true,"release_or_failure_reason":null}"#;
+
+    /// A second reservation of the same campaign whose only collision with
+    /// [`RAW_RESERVATION`] is its `reservation_id`. Its idempotency key, slot
+    /// index and task are distinct, so a refusal of the pair is provably about
+    /// the duplicated reservation identity and nothing else.
+    const RAW_SECOND_RESERVATION: &str = r#"{"reservation_id":"provider-call-reservation-raw-1","campaign_id":"provider-call-ledger-raw-campaign","task_id":"00000000-0000-7000-8000-000000000002","provider":"antigravity","idempotency_key":"provider-call-idempotency-raw-2","slot_index":2,"budget_revision":1,"gate_decision_ref":"gate-decision-raw-2","state":"reserved","reserved_at":"2026-10-01T00:00:00Z","dispatch_started_at":null,"external_invocation_ref":null,"review_ref":null,"terminal_at":null,"consumes_budget":true,"release_or_failure_reason":null}"#;
+
+    fn ledger_failure(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::other(message))
+    }
+
+    /// Splice one raw lexical fact into an assembled document.
+    ///
+    /// An absent segment is refused rather than ignored, because a silently
+    /// unspliced fixture would quietly turn a negative case into a positive one
+    /// and the whole case would then pass for the wrong reason.
+    fn splice(raw: String, segment: &str, replacement: &str) -> String {
+        assert!(
+            raw.contains(segment),
+            "unknown raw document segment {segment}"
+        );
+        raw.replacen(segment, replacement, 1)
+    }
+
+    /// One raw ledger document assembled from the raw segments above.
+    fn raw_ledger(budget_fields: &[(&str, &str)], reservations: &[&str]) -> String {
+        let mut budget = String::from(RAW_BUDGET);
+        for (segment, replacement) in budget_fields {
+            assert!(budget.contains(segment), "unknown raw budget segment {segment}");
+            budget = budget.replacen(segment, replacement, 1);
+        }
+        format!(
+            r#"{{"budgets":[{budget}],"reservations":[{}]}}"#,
+            reservations.join(",")
+        )
+    }
+
+    /// One raw reservation assembled from the raw segment above.
+    fn raw_reservation(fields: &[(&str, &str)]) -> String {
+        let mut reservation = String::from(RAW_RESERVATION);
+        for (segment, replacement) in fields {
+            assert!(
+                reservation.contains(segment),
+                "unknown raw reservation segment {segment}"
+            );
+            reservation = reservation.replacen(segment, replacement, 1);
+        }
+        reservation
+    }
+
+    /// The exact refusal the one strict DTO produces for these raw bytes.
+    fn decode_refusal(raw: &str) -> TestResult<String> {
+        match serde_json::from_str::<ProviderCallLedger>(raw) {
+            Ok(_) => Err(ledger_failure(
+                "the raw document decoded into trusted provider call ledger state".to_owned(),
+            )),
+            Err(refusal) => Ok(refusal.to_string()),
+        }
+    }
+
+    /// The exact refusal the one validator produces for a decodable document.
+    ///
+    /// Reaching the validator at all proves the strict decoder admitted the
+    /// bytes, so the refusal below is the ledger relation that refused them and
+    /// not a lexical defect.
+    fn validation_refusal(raw: &str) -> TestResult<String> {
+        let ledger: ProviderCallLedger = serde_json::from_str(raw)?;
+        match validate_provider_call_ledger(&ledger) {
+            Ok(()) => Err(ledger_failure(
+                "the raw document validated as complete provider call ledger state".to_owned(),
+            )),
+            Err(refusal) => Ok(refusal.to_string()),
+        }
+    }
+
+    fn raw_ledger_root(tag: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("eliot-936-ledger-raw-{tag}-{}", TaskId::new_v7()))
+    }
+
+    /// The typed unknown refusal a caller-visible ledger read must produce.
+    fn provider_call_unknown_refusal(
+        outcome: Result<ProviderCallLedger, EngineError>,
+    ) -> TestResult<String> {
+        match outcome {
+            Err(EngineError::ProviderCallLedgerUnknown(refusal)) => Ok(refusal),
+            other => Err(ledger_failure(format!(
+                "a corrupt ledger must refuse as unknown, never answer: {other:?}"
+            ))),
+        }
+    }
+
+    /// One raw current-candidate file, refused through both the private loader
+    /// the mutating funnel uses and the public snapshot.
+    ///
+    /// The bounded faults are read from the typed refusal itself rather than
+    /// from its rendering, so a case can name the rule that fired and not merely
+    /// that something refused. The original bytes are compared afterwards
+    /// because a refused candidate must survive the refusal intact.
+    fn blocked_by_raw_ledger(
+        tag: &str,
+        raw: &str,
+    ) -> TestResult<Vec<(ProviderCallLedgerCandidate, &'static str)>> {
+        let root = raw_ledger_root(tag);
+        let owner = ProviderCallReservationOwner::new(&root);
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime)?;
+        let ledger_path = runtime.join("provider-call-ledger.json");
+        fs::write(&ledger_path, raw)?;
+        let loaded = load_provider_call_ledger(&ledger_path);
+        let published = owner.snapshot();
+        let preserved = fs::read(&ledger_path)?;
+        fs::remove_dir_all(&root)?;
+        let faults = match loaded {
+            Ok(_) => {
+                return Err(ledger_failure(
+                    "the raw candidate was admitted as current provider call ledger state".to_owned(),
+                ));
+            }
+            Err(unknown) => unknown
+                .faults
+                .iter()
+                .map(|entry| (entry.candidate, entry.fault.code()))
+                .collect(),
+        };
+        let refusal = provider_call_unknown_refusal(published)?;
+        for (candidate, fault) in &faults {
+            assert!(
+                refusal.contains(&format!("{}={}", candidate.code(), fault)),
+                "the refusal must name the candidate role and its bounded fault: {refusal}"
+            );
+        }
+        assert_eq!(
+            preserved,
+            raw.as_bytes(),
+            "a refused candidate must keep its original bytes"
+        );
+        Ok(faults)
+    }
+
+    /// WORK_UNIT_CASE: 936/5 — an unknown member is refused by name at the
+    /// envelope and inside a reservation, before any trusted ledger exists.
+    #[test]
+    fn unknown_ledger_members_refuse_by_name_at_both_levels() -> TestResult {
+        let outer = splice(
+            raw_ledger(&[], &[RAW_RESERVATION]),
+            r#","reservations":["#,
+            r#","ledger_authority":"granted","reservations":["#,
+        );
+        let nested = splice(
+            raw_ledger(&[], &[RAW_RESERVATION]),
+            r#""state":"reserved""#,
+            r#""state":"reserved","authority":"granted""#,
+        );
+        for (tag, raw, member) in [
+            ("unknown-outer", &outer, "ledger_authority"),
+            ("unknown-nested", &nested, "authority"),
+        ] {
+            let refusal = decode_refusal(raw)?;
+            assert!(
+                refusal.contains("unknown field"),
+                "an unknown member must be refused as unknown, not by an unrelated \
+                 failure anywhere in the record: {refusal}"
+            );
+            assert!(
+                refusal.contains(member),
+                "the refusal must name the unknown member {member}: {refusal}"
+            );
+            assert_eq!(
+                blocked_by_raw_ledger(tag, raw)?,
+                vec![(ProviderCallLedgerCandidate::Current, "malformed")]
+            );
+        }
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 936/6 — a duplicated member is refused by name at the
+    /// budget and inside a reservation, even when both copies carry the same
+    /// value, because a duplicate is a lexical fact no field-value check sees.
+    #[test]
+    fn duplicate_ledger_members_refuse_by_name_at_both_levels() -> TestResult {
+        let budget = splice(
+            raw_ledger(&[], &[RAW_RESERVATION]),
+            r#""max_calls":2"#,
+            r#""schema_version":"provider-call-campaign-v1","max_calls":2"#,
+        );
+        let reservation = raw_ledger(
+            &[],
+            &[&raw_reservation(&[(
+                r#""slot_index":1"#,
+                r#""slot_index":1,"slot_index":2"#,
+            )])],
+        );
+        for (tag, raw, field) in [
+            ("duplicate-budget", &budget, "schema_version"),
+            ("duplicate-reservation-field", &reservation, "slot_index"),
+        ] {
+            let refusal = decode_refusal(raw)?;
+            assert!(
+                refusal.contains("duplicate field"),
+                "a duplicated member must be refused as a duplicate, not by an \
+                 unrelated failure anywhere in the record: {refusal}"
+            );
+            assert!(
+                refusal.contains(&format!("`{field}`")),
+                "the refusal must name the duplicated field {field}: {refusal}"
+            );
+            assert_eq!(
+                blocked_by_raw_ledger(tag, raw)?,
+                vec![(ProviderCallLedgerCandidate::Current, "malformed")]
+            );
+        }
+        Ok(())
+    }
+
+    /// A truncated document is refused as the truncation it is, not read as an
+    /// absent or empty ledger.
+    #[test]
+    fn a_truncated_ledger_document_refuses_without_becoming_empty() -> TestResult {
+        let admitted = raw_ledger(&[], &[RAW_RESERVATION]);
+        let truncated = &admitted[..admitted.len() / 2];
+        assert!(
+            admitted.starts_with(truncated) && truncated.len() < admitted.len(),
+            "the refused bytes must be a strict prefix of an admitted ledger, so \
+             truncation is the only defect present"
+        );
+        let refusal = decode_refusal(truncated)?;
+        assert!(
+            refusal.contains("line 1 column"),
+            "a truncated single-line document must be refused for where the \
+             document stops, not by an unrelated failure: {refusal}"
+        );
+        assert_eq!(
+            blocked_by_raw_ledger("truncated", truncated)?,
+            vec![(ProviderCallLedgerCandidate::Current, "malformed")]
+        );
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 936/7 — an empty protected reservation identity refuses
+    /// by field name at the decoder, so `mark_dispatching("")` can never find
+    /// and mutate a record a tampered file planted under that identity.
+    #[test]
+    fn an_empty_reservation_identity_refuses_by_field_name() -> TestResult {
+        let raw = raw_ledger(
+            &[],
+            &[&raw_reservation(&[(
+                r#""reservation_id":"provider-call-reservation-raw-1""#,
+                r#""reservation_id":"""#,
+            )])],
+        );
+        let refusal = decode_refusal(&raw)?;
+        assert!(
+            refusal.contains("empty protected identifier"),
+            "a spelled-out empty reservation identity must be refused for being \
+             empty, not by an unrelated failure: {refusal}"
+        );
+        assert!(
+            refusal.contains("reservation_id"),
+            "the refusal must name the offending field: {refusal}"
+        );
+        assert_eq!(
+            blocked_by_raw_ledger("empty-reservation-id", &raw)?,
+            vec![(ProviderCallLedgerCandidate::Current, "malformed")]
+        );
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 936/8 — a foreign campaign schema version refuses
+    /// without guessing which version it is, and the refusal never echoes the
+    /// version it refused.
+    #[test]
+    fn a_foreign_campaign_schema_version_refuses_naming_the_owned_one() -> TestResult {
+        for (tag, foreign) in [
+            ("schema-v2", "provider-call-campaign-v2"),
+            ("schema-renamed", "provider-call-ledger-v1"),
+        ] {
+            let raw = raw_ledger(
+                &[(
+                    r#""schema_version":"provider-call-campaign-v1""#,
+                    &format!(r#""schema_version":"{foreign}""#),
+                )],
+                &[RAW_RESERVATION],
+            );
+            let refusal = decode_refusal(&raw)?;
+            assert!(
+                refusal.contains("unsupported provider call schema version"),
+                "a foreign schema version must be refused as unsupported, not by \
+                 an unrelated failure: {refusal}"
+            );
+            assert!(
+                refusal.contains(PROVIDER_CALL_CAMPAIGN_SCHEMA_VERSION),
+                "the refusal must name the version this build owns: {refusal}"
+            );
+            assert!(
+                !refusal.contains(foreign),
+                "the refusal must not echo the foreign version onto a surface: {refusal}"
+            );
+            assert_eq!(
+                blocked_by_raw_ledger(tag, &raw)?,
+                vec![(ProviderCallLedgerCandidate::Current, "malformed")]
+            );
+        }
+        Ok(())
+    }
+
+    /// A duplicated reservation identity refuses even though every other
+    /// relation of the pair — idempotency key, slot index, budget binding,
+    /// counters — is intact and would otherwise validate.
+    #[test]
+    fn a_duplicated_reservation_identity_refuses_by_field_name() -> TestResult {
+        let raw = raw_ledger(
+            &[
+                (r#""next_slot_index":2"#, r#""next_slot_index":3"#),
+                (r#""reserved_slots":1"#, r#""reserved_slots":2"#),
+                (r#""remaining_calls":1"#, r#""remaining_calls":0"#),
+            ],
+            &[RAW_RESERVATION, RAW_SECOND_RESERVATION],
+        );
+        assert_eq!(
+            validation_refusal(&raw)?,
+            "write rejected: provider call reservation identity is not unique",
+            "the duplicated reservation identity must be the rule that refuses"
+        );
+        assert_eq!(
+            blocked_by_raw_ledger("duplicate-reservation-identity", &raw)?,
+            vec![(ProviderCallLedgerCandidate::Current, "invalid")]
+        );
+        Ok(())
+    }
+
+    /// A reservation bound to no existing campaign refuses, and the budget is
+    /// written so the document would otherwise validate: the orphan binding is
+    /// provably the only defect it carries.
+    #[test]
+    fn an_orphan_reservation_refuses_by_field_name() -> TestResult {
+        let orphan = raw_reservation(&[(
+            r#""campaign_id":"provider-call-ledger-raw-campaign""#,
+            r#""campaign_id":"provider-call-ledger-absent-campaign""#,
+        )]);
+        let raw = raw_ledger(
+            &[
+                (r#""next_slot_index":2"#, r#""next_slot_index":1"#),
+                (r#""reserved_slots":1"#, r#""reserved_slots":0"#),
+                (r#""remaining_calls":1"#, r#""remaining_calls":2"#),
+            ],
+            &[&orphan],
+        );
+        assert_eq!(
+            validation_refusal(&raw)?,
+            "write rejected: provider call reservation references no existing campaign",
+            "the missing campaign binding must be the rule that refuses"
+        );
+        assert_eq!(
+            blocked_by_raw_ledger("orphan-reservation", &raw)?,
+            vec![(ProviderCallLedgerCandidate::Current, "invalid")]
+        );
+        Ok(())
+    }
+
+    /// A stored counter edited upward to unblock one more provider call refuses,
+    /// because the counters are re-derived from the reservations rather than
+    /// range-checked against themselves.
+    #[test]
+    fn a_tampered_budget_counter_refuses_by_field_name() -> TestResult {
+        let raw = raw_ledger(
+            &[(
+                r#""remaining_calls":1"#,
+                r#""remaining_calls":2"#,
+            )],
+            &[RAW_RESERVATION],
+        );
+        assert_eq!(
+            validation_refusal(&raw)?,
+            "write rejected: provider call budget counters are not recomputed from their reservations",
+            "the tampered counter must be the rule that refuses"
+        );
+        assert_eq!(
+            blocked_by_raw_ledger("tampered-counter", &raw)?,
+            vec![(ProviderCallLedgerCandidate::Current, "invalid")]
+        );
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 936/15 — when every candidate is corrupt the loader
+    /// refuses with one typed unknown disposition, and the refusal preserves
+    /// the corrupt evidence byte-for-byte without producing a default ledger.
+    #[test]
+    fn every_corrupt_candidate_refuses_and_preserves_its_bytes() -> TestResult {
+        let root = raw_ledger_root("all-corrupt");
+        let owner = ProviderCallReservationOwner::new(&root);
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime)?;
+        let ledger_path = runtime.join("provider-call-ledger.json");
+        let admitted = raw_ledger(&[], &[RAW_RESERVATION]);
+        let candidates = [
+            (
+                ProviderCallLedgerCandidate::Current,
+                admitted[..admitted.len() / 2].to_owned(),
+            ),
+            (
+                ProviderCallLedgerCandidate::Staged,
+                splice(
+                    raw_ledger(&[], &[RAW_RESERVATION]),
+                    r#""max_calls":2"#,
+                    r#""max_calls":2,"max_calls":2"#,
+                ),
+            ),
+            (
+                ProviderCallLedgerCandidate::Backup,
+                raw_ledger(
+                    &[(
+                        r#""remaining_calls":1"#,
+                        r#""remaining_calls":2"#,
+                    )],
+                    &[RAW_RESERVATION],
+                ),
+            ),
+        ];
+        for (candidate, raw) in &candidates {
+            fs::write(candidate.path(&ledger_path), raw.as_bytes())?;
+        }
+
+        let faults = match load_provider_call_ledger(&ledger_path) {
+            Ok(_) => {
+                return Err(ledger_failure(
+                    "three corrupt candidates decoded into current state".to_owned(),
+                ));
+            }
+            Err(unknown) => unknown
+                .faults
+                .iter()
+                .map(|entry| (entry.candidate, entry.fault.code()))
+                .collect::<Vec<_>>(),
+        };
+        // Every candidate role is enumerated with its own bounded fault: none is
+        // skipped, and a decodable-but-invalid ledger is not reported as the
+        // same thing as bytes the decoder rejects.
+        assert_eq!(
+            faults,
+            vec![
+                (ProviderCallLedgerCandidate::Current, "malformed"),
+                (ProviderCallLedgerCandidate::Staged, "malformed"),
+                (ProviderCallLedgerCandidate::Backup, "invalid"),
+            ]
+        );
+
+        let refusal = provider_call_unknown_refusal(owner.snapshot())?;
+        for (candidate, fault) in &faults {
+            assert!(
+                refusal.contains(&format!("{}={}", candidate.code(), fault)),
+                "the published refusal must name every refused candidate: {refusal}"
+            );
+        }
+        assert!(
+            !refusal.contains(RAW_CAMPAIGN) && !refusal.contains(RAW_RESERVATION_ID),
+            "the refusal must carry bounded codes only, never ledger contents: {refusal}"
+        );
+        // The read-only projection and the single write funnel both refuse too,
+        // so a reader cannot observe an empty budget the writer would refuse.
+        provider_call_unknown_refusal(owner.snapshot_read_only())?;
+        provider_call_unknown_refusal(owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: RAW_CAMPAIGN.to_owned(),
+            max_calls: 1,
+            closed: false,
+        }))?;
+
+        // Evidence preservation: no candidate byte moved, and no default or
+        // empty ledger was produced anywhere in the runtime area.
+        for (candidate, raw) in &candidates {
+            assert_eq!(
+                fs::read(candidate.path(&ledger_path))?,
+                raw.as_bytes(),
+                "{candidate:?} must survive the refusal byte-for-byte"
+            );
+        }
+        let mut names = fs::read_dir(&runtime)?
+            .map(|entry| {
+                entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "provider-call-ledger.json",
+                "provider-call-ledger.json.bak",
+                "provider-call-ledger.json.lock",
+                "provider-call-ledger.json.next",
+            ],
+            "the runtime area must hold only the preserved candidates and the lock"
+        );
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    /// The positive case: the legitimate ledger these refusals are derived from
+    /// is admitted as trusted state, through the same decoder and validator, and
+    /// a reader and a writer both trust it.
+    #[test]
+    fn a_legitimate_raw_ledger_is_admitted_as_trusted_state() -> TestResult {
+        let root = raw_ledger_root("admitted");
+        let owner = ProviderCallReservationOwner::new(&root);
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime)?;
+        let ledger_path = runtime.join("provider-call-ledger.json");
+        let raw = raw_ledger(&[], &[RAW_RESERVATION]);
+        fs::write(&ledger_path, raw.as_bytes())?;
+
+        let admitted: ProviderCallLedger = serde_json::from_str(&raw)?;
+        validate_provider_call_ledger(&admitted)?;
+        assert_eq!(fs::read(&ledger_path)?, raw.as_bytes());
+
+        let snapshot = owner.snapshot()?;
+        assert_eq!(snapshot.budgets.len(), 1);
+        assert_eq!(snapshot.budgets[0].campaign_id, RAW_CAMPAIGN);
+        assert_eq!(
+            snapshot.budgets[0].schema_version,
+            PROVIDER_CALL_CAMPAIGN_SCHEMA_VERSION
+        );
+        assert_eq!(snapshot.budgets[0].remaining_calls, 1);
+        assert_eq!(snapshot.reservations.len(), 1);
+        assert_eq!(snapshot.reservations[0].reservation_id, RAW_RESERVATION_ID);
+        assert_eq!(
+            snapshot.reservations[0].state,
+            ProviderCallReservationState::Reserved
+        );
+        assert_eq!(snapshot.reservations[0].slot_index, 1);
+
+        // The admitted record is real state, not a decoded decoration: the
+        // campaign it names is found, and reserving against it spends the one
+        // remaining call its counters actually proved.
+        let budget = owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: RAW_CAMPAIGN.to_owned(),
+            max_calls: 2,
+            closed: false,
+        })?;
+        assert_eq!(budget.max_calls, 2);
+        assert_eq!(budget.reserved_slots, 1);
+        let ProviderCallReservationDecision::Reserved(reservation) = owner.reserve(
+            ProviderCallReservationRequest {
+                campaign_id: RAW_CAMPAIGN.to_owned(),
+                task_id: TaskId::new_v7(),
+                provider: PROVIDER_ID.to_owned(),
+                idempotency_key: "provider-call-idempotency-raw-admitted".to_owned(),
+                gate_decision_ref: "gate-decision-raw-admitted".to_owned(),
+            },
+        )?
+        else {
+            return Err(ledger_failure(
+                "the admitted campaign must admit a new reservation".to_owned(),
+            ));
+        };
+        assert_eq!(reservation.slot_index, 2);
+        assert_eq!(owner.snapshot()?.budgets[0].remaining_calls, 0);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
     #[test]
     fn explicit_disposition_admits_the_operator_record_and_unblocks() -> TestResult {
         let BlockedLedger {
