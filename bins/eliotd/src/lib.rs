@@ -228,8 +228,8 @@ pub use cue_activation_route::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
-    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationReconcileError, ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome,
+    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
