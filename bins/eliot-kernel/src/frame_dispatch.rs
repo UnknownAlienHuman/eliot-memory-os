@@ -27,7 +27,9 @@ use super::daemon_request_dispatch::{
     STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
 };
 use super::dreamer_job_dispatch::is_dreamer_operation;
-use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
+use super::front_door_session::{
+    DOCTOR_MODULE_ID, NATIVE_MODULE_ID, TESTD_MODULE_ID, WATCHDOG_MODULE_ID,
+};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
 };
@@ -53,6 +55,7 @@ use eliot_kernel_core::{
     RouteScope, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
 };
 use eliot_observability_runtime::{ModuleIdentity, WorkClass, WorkTerminationOutcome};
+use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
 #[cfg(windows)]
 use eliot_runtime_contracts::{LeaseState, SupervisionLeaseVerifier};
@@ -865,6 +868,31 @@ impl KernelComposition {
         // control routes even when a peer presents a valid frame envelope.
         if session.module_generation.module_id.as_str() == USER_BROKER_MODULE_ID {
             return self.dispatch_user_broker_frame(session, frame);
+        }
+
+        // I7.2/I7.3, I11.8, issue #4600: the operator request-identity issuance
+        // request behind the public `eliot ui` / `eliot controlboard status`
+        // entries. A `Request`/`Execute` frame cannot carry this request,
+        // because that form requires the very identity it is asking for; the
+        // control lane is the only request form that carries none. It is
+        // refused for every reserved service role, each of which owns a
+        // different matrix (the User Broker above, the agent bridge, `eliotd`,
+        // Doctor, TestD, the native worker and the Watchdog below). Every
+        // other control-lane frame is unchanged and still fences.
+        if frame.kind == FrameKind::Control
+            && frame.message_type == MessageType::Challenge
+            && !matches!(
+                session.module_generation.module_id.as_str(),
+                AGENT_BRIDGE_MODULE_ID
+                    | USER_BROKER_MODULE_ID
+                    | ACTIVE_DAEMON_CALLER
+                    | DOCTOR_MODULE_ID
+                    | TESTD_MODULE_ID
+                    | NATIVE_MODULE_ID
+                    | WATCHDOG_MODULE_ID
+            )
+        {
+            return self.dispatch_operator_request_identity(session, frame);
         }
 
         if frame.kind == FrameKind::Heartbeat && frame.message_type == MessageType::Health {

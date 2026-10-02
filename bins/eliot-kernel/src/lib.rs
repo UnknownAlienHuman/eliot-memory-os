@@ -353,6 +353,7 @@ mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
 pub mod notify_operation_identity;
+pub mod operator_request_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;
 mod request_dispatch;
@@ -755,6 +756,13 @@ pub struct KernelComposition {
     /// opaque and can never be used to reconstruct this live state.
     user_broker_registration_authority:
         user_broker_registration_authority::UserBrokerRegistrationAuthority,
+    /// I7.2/I7.3/I11.8 (issue #4600): bounded process-local reuse evidence for
+    /// the per-operation operator request identities this composition issues to
+    /// the public operator CLI entries. It exists so an exact retry replays one
+    /// identity instead of minting a second launch, and so one operation's
+    /// identity can never be replayed for another. It is not a durable
+    /// authority record and grants nothing on its own.
+    operator_request_identities: operator_request_identity::OperatorIdentityLedger,
     /// Retained owner-side WASM join table (#2786 step 3): the single
     /// cross-call registry of published delivery-bound joins. The
     /// dispatch operation merges each published bundle here and admits
