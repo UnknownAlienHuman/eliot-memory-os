@@ -1,6 +1,9 @@
 """Focused tests for the context measurement inventory oracle (issue #866)."""
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
+import json
 import re
 import shutil
 import sys
@@ -31,31 +34,98 @@ def _snapshot(root: Path) -> dict[str, bytes]:
     return state
 
 
+def _declared_sync_inputs() -> list[str]:
+    """Every file a default-denominator `sync` reads, per the generator's own tables.
+
+    Derived from the product rather than restated here so the temp-tree tests
+    stage exactly what the real `sync`/`check` path demands. `build_inventory`
+    loads the DENOMINATOR_CASES scan roots, the EXCLUSION_CASES scan inputs and
+    (through `_build_consumer_worksets`) each consumer's declared test paths and
+    routed required reading; `load_owner_map` additionally requires the frozen
+    owner map itself.
+    """
+    rels: set[str] = {rel for _ref, _owner, rel, _sig in oracle.DENOMINATOR_CASES}
+    rels |= {rel for _ref, rel, _needle, _reason in oracle.EXCLUSION_CASES}
+    for owner in oracle.CONSUMER_SEAMS:
+        rels |= set(oracle.CONSUMER_TEST_PATHS[owner])
+        rels |= set(oracle.CONSUMER_ROUTED_READING[owner])
+    rels.add(oracle.OWNER_MAP_PATH.as_posix())
+    return sorted(rels)
+
+
+def _check_verdict(root: Path) -> tuple[int, str, str]:
+    """Run `cmd_check` and return its (exit code, typed code, status) triple.
+
+    The oracle reports a typed disposition, not a bare non-zero exit, so the
+    tests below assert the exact code that fired rather than only "not zero".
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = oracle.cmd_check(root)
+    report = json.loads(buf.getvalue())
+    return int(rc), str(report["code"]), str(report["status"])
+
+
 class TestContextMeasurementInventory(unittest.TestCase):
     def test_header_closed_versioned_31(self) -> None:
+        # This test was written against rule revision 866.1, whose denominator was
+        # only the 31 frozen BASELINE_CASES and whose classification set held 10
+        # values. Revisions 866.2 and 866.3 legitimately moved past that shape:
+        #   - 866.2 (commit 088494c53) widened the denominator to the real
+        #     per-consumer source seams, adding CONSUMER_SEAM_CASES and
+        #     UNRESOLVED_CASES on top of the unchanged 31-case BASELINE_CASES,
+        #     and added 5 classifications -> 15;
+        #   - 866.3 added the remainder of the current rule set.
+        # The 866.1 numbers were therefore stale expectations, not a product
+        # regression: `build_inventory` now emits EXPECTED_DENOMINATOR_COUNT
+        # (72) candidates over EXPECTED_BASELINE_COUNT (31) preserved baseline
+        # rows, and every one of this test's other, still-valid properties --
+        # the three hex64 digests, the closed unique classification set, the
+        # absence of the forbidden #785 owner, the sorted owner allocations and
+        # their sum equalling the candidate count -- are kept below and are now
+        # derived from the generator's own constants instead of hard-coded
+        # literals, so a future revision cannot silently re-stale them.
         inv = _live()
         h = inv["header"]
-        self.assertEqual(h["schema"], "eliot.context-measurement-inventory.v1")
-        self.assertEqual(h["rule_revision"], "866.1")
+        self.assertEqual(h["schema"], oracle.SCHEMA)
+        self.assertEqual(h["schema"], "eliot.context-measurement-inventory.v2")
+        self.assertEqual(h["rule_revision"], oracle.RULE_REVISION)
         self.assertRegex(str(h["source_sha"]), r"\A[0-9a-f]{64}\Z")
         self.assertRegex(str(h["rule_digest"]), r"\A[0-9a-f]{64}\Z")
         self.assertRegex(str(h["owner_digest"]), r"\A[0-9a-f]{64}\Z")
-        self.assertEqual(h["candidate_count"], 31)
-        self.assertEqual(h["classified_count"], 31)
-        self.assertEqual(len(inv["rows"]), 31)
-        self.assertEqual(len(h["classifications"]), 10)
-        self.assertEqual(len(set(h["classifications"])), 10)
+        # Denominator is the full declared case set, not just the baseline.
+        self.assertEqual(len(oracle.DENOMINATOR_CASES), oracle.EXPECTED_DENOMINATOR_COUNT)
+        self.assertEqual(len(oracle.BASELINE_CASES), oracle.EXPECTED_BASELINE_COUNT)
+        self.assertEqual(h["candidate_count"], oracle.EXPECTED_DENOMINATOR_COUNT)
+        self.assertEqual(h["classified_count"], oracle.EXPECTED_DENOMINATOR_COUNT)
+        self.assertEqual(len(inv["rows"]), oracle.EXPECTED_DENOMINATOR_COUNT)
+        # The closed classification set grew from 866.1's 10 values.
+        self.assertEqual(len(h["classifications"]), len(oracle.CLASSIFICATIONS))
+        self.assertEqual(len(set(h["classifications"])), len(oracle.CLASSIFICATIONS))
+        self.assertEqual(set(h["classifications"]), set(oracle.CLASSIFICATIONS))
         alloc = [str(x) for x in h["owner_allocations"]]  # type: ignore[union-attr]
         self.assertNotIn("#785", "".join(alloc))
-        self.assertEqual(sum(int(x.split(":")[1]) for x in alloc), 31)
+        self.assertEqual(sum(int(x.split(":")[1]) for x in alloc), oracle.EXPECTED_DENOMINATOR_COUNT)
         self.assertEqual(sorted(alloc), alloc)
+        # The 866.1 allocation set (#704:9 #783:8 #878:6 #880:8 = 31) no longer
+        # holds; the current closed allocation is the declared one.
+        self.assertEqual(
+            alloc,
+            sorted(f"{owner}:{count}" for owner, count in oracle.EXPECTED_OWNER_ALLOCATIONS),
+        )
         self.assertRegex(str(inv["inventory_digest"]), r"\A[0-9a-f]{64}\Z")
 
     def test_rows_closed_and_bound(self) -> None:
         inv = _live()
         by_ref = {str(r["case_ref"]): r for r in inv["rows"]}
         for row in inv["rows"]:
-            self.assertTrue(oracle.REQUIRED_ROW_KEYS.issubset(row.keys()), row.get("id"))
+            # The 866.1 generator exported this closed set as
+            # `REQUIRED_ROW_KEYS`; revision 866.2 renamed it to `ROW_KEYS`
+            # (commit 088494c53). The rename is the only change: the rows are
+            # still required to carry the closed key set. The assertion is
+            # therefore re-derived against the current symbol, not weakened --
+            # it still demands every declared key on every row.
+            self.assertTrue(oracle.ROW_KEYS.issubset(row.keys()), row.get("id"))
             self.assertIn(row["classification"], tuple(oracle.CLASSIFICATIONS))
             self.assertRegex(str(row["row_digest"]), r"\A[0-9a-f]{64}\Z")
             self.assertRegex(str(row["source_sha256"]), r"\A[0-9a-f]{64}\Z")
@@ -85,7 +155,21 @@ class TestContextMeasurementInventory(unittest.TestCase):
             self.assertEqual(first, oracle._emit_toml(_live()), "shuffled-free rebuild stays identical")
         with tempfile.TemporaryDirectory() as td:
             troot = Path(td).resolve()
-            for _ref, _own, rel, _sig in oracle.DENOMINATOR_CASES:
+            # The old test staged a tree holding only the DENOMINATOR_CASES scan
+            # roots. A default-denominator `sync` reads every declared input,
+            # not just those, and rule revision 866.2 widened that input set, so
+            # the staged tree was missing 22 declared files and `cmd_sync`
+            # correctly failed closed with SOURCE_NOT_REGULAR_FILE on the first
+            # one it needed (crates/eliot-app/src/cognitive_field_runner.rs, an
+            # EXCLUSION_CASE scan input). The product is right to demand the
+            # whole declared input set; the test was staging an incomplete tree.
+            # Stage the set the generator itself declares so the real sync/check
+            # path runs instead of dying on the first absent input.
+            declared_inputs = _declared_sync_inputs()
+            self.assertEqual(len(declared_inputs), len(set(declared_inputs)))
+            scan_roots = {rel for _ref, _owner, rel, _sig in oracle.DENOMINATOR_CASES}
+            self.assertTrue(scan_roots < set(declared_inputs), "sync reads more than the scan roots")
+            for rel in declared_inputs:
                 src, dst = ROOT / rel, troot / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(src.read_bytes())
@@ -94,15 +178,44 @@ class TestContextMeasurementInventory(unittest.TestCase):
             before = target.read_bytes()
             self.assertEqual(oracle.cmd_sync(troot, "unittest-sync"), 0)
             self.assertEqual(target.read_bytes(), before, "repeated sync stays byte-identical")
-            self.assertEqual(oracle.cmd_check(troot), 0)
+            # `check` certifies a COMPLETE denominator. The frozen denominator
+            # still declares UNRESOLVED_CASES -- rows outside every declared
+            # seam whose owner is "unresolved" -- so coverage_disposition is
+            # INCOMPLETE and `check` refuses to certify: it reports
+            # UNRESOLVED_ROWS_BLOCK_COMPLETE_DENOMINATOR with status "blocked"
+            # and exit 2. Exit 0 would require a zero-unresolved denominator the
+            # current rule set does not produce, so the test asserts the real
+            # documented contract AND pins the cause, rather than dropping the
+            # assertion: the block must name the unresolved rows, the stored
+            # header must agree with it, and every declared consumer workset
+            # must itself be dispatch-ready, proving the ONLY thing standing
+            # between this artifact and certification is the unallocated rows.
+            stored = oracle._parse_toml(target.read_bytes(), source=oracle.OWNED_TOML.as_posix())
+            self.assertEqual(stored["header"]["owner_map_status"], "SUPPLIED")
+            self.assertEqual(stored["header"]["coverage_disposition"], "INCOMPLETE")
+            unresolved_expected = dict(oracle.EXPECTED_OWNER_ALLOCATIONS)[oracle.UNRESOLVED_OWNER]
+            self.assertEqual(stored["header"]["unresolved_count"], unresolved_expected)
+            self.assertEqual(
+                _check_verdict(troot),
+                (2, "UNRESOLVED_ROWS_BLOCK_COMPLETE_DENOMINATOR", "blocked"),
+            )
+            self.assertEqual(
+                [ws for ws in stored["consumer_worksets"] if not ws["dispatch_ready"]], []
+            )
+            # A scanned-source edit is drift, reported as such, not as a block.
             with open(troot / "crates/smart/eliot-context-measurement/src/stu.rs", "ab") as fh:
                 fh.write(b"\n// touch\n")
-            self.assertNotEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(_check_verdict(troot), (1, "STALE_ARTIFACT", "stale"))
             oracle.cmd_sync(troot, "unittest-sync")
-            self.assertEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(
+                _check_verdict(troot),
+                (2, "UNRESOLVED_ROWS_BLOCK_COMPLETE_DENOMINATOR", "blocked"),
+                "re-sync re-derives the artifact, so only the unresolved rows remain",
+            )
+            # A hand-edited classification is a malformed artifact, not drift.
             tampered = target.read_text(encoding="utf-8").replace("exact-utf8-envelope", "test-only", 1)
             target.write_text(tampered, encoding="utf-8")
-            self.assertNotEqual(oracle.cmd_check(troot), 0)
+            self.assertEqual(_check_verdict(troot), (2, "CLASSIFICATION_NOT_CLOSED", "error"))
 
     def test_fail_closed_no_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
