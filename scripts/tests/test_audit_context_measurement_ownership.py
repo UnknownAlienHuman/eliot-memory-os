@@ -1983,11 +1983,16 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         # A row that is owned, non-unrelated and NOT accompanied by any measured
         # canonical-reach proof is NOT reported as a reconciled consumer. Audit
         # defect 5: "do not treat 'owned' as proof of canonical migration".
+        # ``path`` is one of #866's frozen ROW_KEYS and the reach proof is scoped
+        # to the row's OWN path, so the row names the site its proof was measured
+        # at: a proof about the owner somewhere else would not carry this row.
+        _residual_path = "crates/smart/eliot-context-assembly/src/measurement.rs"
         residual = {
             "owner": "#783",
             "status": "owned",
             "classification": "exact-utf8-envelope",
             "write_scope": "read-only",
+            "path": _residual_path,
         }
         self.assertEqual(
             oracle._derive_baseline_disposition(residual),
@@ -2001,12 +2006,13 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
                     "#783": {
                         "kind": "canonical-port-call",
                         "port_symbol": oracle.CANONICAL_MEASUREMENT_PORT,
-                        "call_sites": ["crates/smart/eliot-context-assembly/src/lib.rs:1"],
+                        "call_sites": [f"{_residual_path}:1"],
                     }
                 },
             ),
             "canonical-owner-consumer",
-            "the same row IS canonical once a measured canonical-reach proof exists",
+            "the same row IS canonical once a measured canonical-reach proof exists "
+            "at its own path",
         )
         self.assertNotEqual(
             oracle._derive_baseline_disposition(residual),
@@ -2371,6 +2377,17 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         case: removal of the old formula cannot erase its underlying
         requirement. The tally arithmetic ``reconciled + lost == 31`` is
         asserted on the returned counts.
+
+        The SECOND limb -- "missing consumer evidence ... prevents family
+        completion" -- is proved by the SAME derivation the production
+        reconciliation runs, over the REAL ``_dependency_evidence`` measured
+        against a real tree. The proof lookup is scoped to the row's OWN path, so
+        an owner that is proven at one path proves nothing at another: the same
+        row, same owner, same classification and status, is ``explicit-
+        unresolved`` off the proven path and ``canonical-owner-consumer`` on it.
+        An owner absent from the proof map entirely is likewise unproven, and the
+        owner of record is held to the same rule -- its reach is proved by its
+        definition site, so only rows AT a definition site may be canonical.
         """
         with _tree() as tree:
             tree.copy_producer()
@@ -2393,6 +2410,166 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
                 sum(result.baseline_dispositions.values()),
                 31,
                 "the disposition tally must cover the whole frozen denominator",
+            )
+
+            # --- "missing consumer evidence" limb, on the REAL evidence. -----
+            #
+            # The proof map is built by the real ``_dependency_evidence`` over
+            # this tree's real measured rows, then a ``canonical-port-call``
+            # proof is assembled for ONE consumer from the accepted production
+            # shape -- exactly the shape :func:`evaluate` emits -- naming the
+            # paths it was actually measured at. No value is invented: the
+            # proven path is one the tree really copied and really measured.
+            producer = oracle.load_producer(tree.root)
+            proven_path = _SEAM_REL
+            seam_owner = "#783"
+            tree.add_manifest("crates/fixture-consumer/Cargo.toml", _CONSUMER_MANIFEST)
+            tree.add_fixture("dep_canonical_positive.rs", rel=proven_path)
+            measured = oracle._dependency_evidence(
+                tree.root, producer, _dependency_rows(proven_path, seam_owner)
+            )
+            self.assertEqual(
+                set(measured),
+                {"cargo_dependencies", "calls", "bindings", "accepted_sites"},
+                "the measured dependency evidence is the four per-path structures",
+            )
+            self.assertEqual(
+                sorted(measured["cargo_dependencies"][seam_owner]),
+                [proven_path],
+                "the real measurement scopes the consumer to its own seam path",
+            )
+            self.assertTrue(
+                measured["accepted_sites"][seam_owner][proven_path],
+                "the real measurement finds a bound production call at the seam path",
+            )
+            proofs = {
+                seam_owner: {
+                    "kind": "canonical-port-call",
+                    "port_symbol": oracle.CANONICAL_MEASUREMENT_PORT,
+                    "call_sites": [
+                        f"{proven_path}:{site['span_start']}"
+                        for site in measured["accepted_sites"][seam_owner][proven_path]
+                    ],
+                }
+            }
+            unproven_path = "crates/fixture-consumer/src/other_seam.rs"
+
+            # The SAME row, the SAME owner, at the proven path -> canonical.
+            on_path = _row("880/1", owner=seam_owner, path=proven_path)
+            self.assertEqual(
+                oracle._derive_baseline_disposition(on_path, proofs),
+                "canonical-owner-consumer",
+                "a row at the path its owner's proof was measured at IS canonical",
+            )
+            self.assertTrue(
+                oracle._canonical_reach_proven(seam_owner, proven_path, proofs)[0],
+                "the proof is read at the row's own path",
+            )
+
+            # The SAME row moved to a path with no accepted site of its own ->
+            # NOT canonical. This is the defect: the proof lookup is per PATH,
+            # so an owner proven somewhere else proves nothing here.
+            off_path = _row("880/1", owner=seam_owner, path=unproven_path)
+            self.assertEqual(
+                oracle._derive_baseline_disposition(off_path, proofs),
+                "explicit-unresolved",
+                "an owner proven at another path must not make this row canonical; "
+                "the evidence must be about this site",
+            )
+            _reached, reason = oracle._canonical_reach_proven(
+                seam_owner, unproven_path, proofs
+            )
+            self.assertIn(
+                unproven_path,
+                reason,
+                "the unproven reason must name the row's own path",
+            )
+            self.assertIn(
+                proven_path,
+                reason,
+                "the unproven reason must name where the proof WAS measured",
+            )
+
+            # An owner absent from the map is still NOT proven: absence of a
+            # complaint is not evidence.
+            self.assertEqual(
+                oracle._derive_baseline_disposition(on_path, {}),
+                "explicit-unresolved",
+                "an owner absent from the measured proofs asserts no migration",
+            )
+            self.assertEqual(
+                oracle._derive_baseline_disposition(
+                    on_path, {"#880": proofs[seam_owner]}
+                ),
+                "explicit-unresolved",
+                "another owner's proof must never satisfy this row's owner",
+            )
+
+            # The owner of record has no closed dependency contract; its reach
+            # is proved by its definition SITE, which is at a path. It is held
+            # to exactly the same rule.
+            owner_proof = {
+                "#704": {
+                    "kind": "canonical-port-owner",
+                    "port_symbol": oracle.CANONICAL_MEASUREMENT_PORT,
+                    "definition_proved_by": "canonical-owner",
+                    "definition_paths": [proven_path],
+                }
+            }
+            owner_row = _row("704/1", owner="#704")
+            self.assertEqual(
+                oracle._derive_baseline_disposition(
+                    dict(owner_row, path=proven_path), owner_proof
+                ),
+                "canonical-owner-consumer",
+                "the owner's row at its own definition site is canonical",
+            )
+            self.assertEqual(
+                oracle._derive_baseline_disposition(
+                    dict(owner_row, path=unproven_path), owner_proof
+                ),
+                "explicit-unresolved",
+                "the owner of record is not proved by a definition site elsewhere in "
+                "its own crate",
+            )
+            # And in the real run, every proof names at least one measured path,
+            # and every row the real reconciliation called canonical sits at a
+            # path its OWN owner's proof was measured at. That is the production
+            # invariant, asserted on the returned result rather than on a map
+            # this test built.
+            for owner, proof in result.dependency_proofs.items():
+                self.assertTrue(
+                    oracle._reach_scope(proof),
+                    f"proof for {owner} names no measured path, so it proves nothing "
+                    "at any path",
+                )
+            producer_tree = oracle.load_producer(tree.root)
+            live_rows = producer_tree._parse_toml(
+                tree.read_inventory_bytes(), source=_INVENTORY_REL
+            )["rows"]
+            canonical = [
+                str(row["case_ref"])
+                for case_ref, _owner in oracle.EXPECTED_BASELINE_ROWS
+                for row in live_rows
+                if str(row["case_ref"]) == case_ref
+                and oracle._derive_baseline_disposition(
+                    row, result.dependency_proofs
+                )
+                == "canonical-owner-consumer"
+            ]
+            for case_ref in canonical:
+                row = next(r for r in live_rows if str(r["case_ref"]) == case_ref)
+                self.assertTrue(
+                    oracle._canonical_reach_proven(
+                        str(row["owner"]), str(row["path"]), result.dependency_proofs
+                    )[0],
+                    f"{case_ref} was reported canonical at {row['path']} but its own "
+                    "path carries no proof",
+                )
+            self.assertTrue(
+                canonical,
+                "at least one baseline row must reconcile as a canonical consumer, "
+                "or the canonical bucket has silently emptied",
             )
 
         # Now erase one frozen requirement.

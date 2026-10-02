@@ -2799,10 +2799,21 @@ def evaluate(root: Path) -> OwnershipResult:
             # single-definition-site proof above (``canonical-owner``), so the
             # dependency conjuncts do not apply to it and a self-dependency is
             # never demanded.
+            #
+            # The DEFINED AT paths travel in the proof because that is where the
+            # proof actually lives: the owner of record has no closed dependency
+            # contract and no self-dependency, so its canonical reach is proved
+            # by its definition site -- and a definition site is at a path.
+            # Collapsing that to a bare owner key is what let a #704 row at a
+            # path with no definition site read as canonical; keeping the
+            # measured paths makes the same single-definition-site fact askable
+            # per row. No new measurement and no widened rule: these are exactly
+            # the ``owner_sites`` paths measured a few lines above.
             proven[owner] = {
                 "kind": "canonical-port-owner",
                 "port_symbol": contract.port_symbol,
                 "definition_proved_by": "canonical-owner",
+                "definition_paths": sorted({str(site["path"]) for site in owner_sites}),
             }
             continue
         owner_cargo = dependency["cargo_dependencies"].get(owner, {})
@@ -2838,12 +2849,21 @@ def evaluate(root: Path) -> OwnershipResult:
             # is not evidence and is named as such.
             adapter = _adapter_record(owner)
             if adapter is not None:
+                # ``cargo_dependency`` is the measured per-path scope this proof is
+                # claimed at: the paths whose authoritative Cargo metadata declared
+                # the adapter's package, out of exactly the paths the dependency
+                # check measured for this owner. A closed adapter record names one
+                # implementation of #704's port for one owner, so it has to be
+                # read against a path rather than inherited by one.
                 proven[owner] = {
                     "kind": "approved-adapter",
                     "identity": adapter["identity"],
                     "version": adapter["version"],
                     "expires": adapter["expires"],
                     "implements_port": adapter["implements_port"],
+                    "cargo_dependency": sorted(
+                        rel for rel, (flag, _why) in owner_cargo.items() if flag
+                    ),
                 }
                 continue
             # The dependency IS declared. What is missing is a bound production
@@ -3119,9 +3139,11 @@ def _proof_escalation(
 
 
 def _canonical_reach_proven(
-    owner: str, dependency_proofs: Mapping[str, Mapping[str, Any]] | None
+    owner: str,
+    path: str,
+    dependency_proofs: Mapping[str, Mapping[str, Any]] | None,
 ) -> tuple[bool, str]:
-    """Is this owner's canonical measurement reach actually PROVEN for this run?
+    """Is this owner's canonical measurement reach PROVEN **at this path**?
 
     Returns ``(proven, reason)``. ``reason`` names the measured conjunct that
     decided it, so a row that falls to ``explicit-unresolved`` can say *why*
@@ -3138,6 +3160,20 @@ def _canonical_reach_proven(
     accepted as proof: a consumer whose rows are all ``read-only`` has no
     writable seam for the dependency check to have run over, so it produces no
     finding and no proof either. Absence of a complaint is not evidence.
+
+    PATH-SCOPED, NOT OWNER-SCOPED. The audit's concern is per ROW: the evidence
+    must be about *this site*, not about *this owner somewhere*. So the lookup is
+    answered against the row's OWN ``path``, out of the per-path scope each proof
+    record carries (see :func:`_reach_scope`). A ``canonical-port-call`` proof is
+    proved only at a path it actually called the port at; an
+    ``approved-adapter`` proof is proved only at a path the adapter's measured
+    Cargo metadata actually declared it at; a ``canonical-port-owner`` proof is
+    proved only at a path the canonical entry point is actually DEFINED at.
+    Every one of those is a fact this run already measured at a named path, so
+    scoping the lookup widens no rule and invents no field. Before this was
+    path-scoped, a row at one path inherited another path's proof from the same
+    owner -- a row whose own site carried no measurement evidence at all was
+    reported as a canonical consumer.
     """
     if not dependency_proofs:
         return (False, "no consumer dependency proof was measured for this run")
@@ -3148,9 +3184,57 @@ def _canonical_reach_proven(
             f"owner {owner} has no entry in the measured consumer dependency proofs",
         )
     kind = str(proof.get("kind", ""))
-    if kind in CANONICAL_REACH_KINDS:
-        return (True, f"owner {owner} holds a measured {kind} proof")
-    return (False, f"owner {owner} has no proven canonical reach (measured kind {kind!r})")
+    if kind not in CANONICAL_REACH_KINDS:
+        return (False, f"owner {owner} has no proven canonical reach (measured kind {kind!r})")
+    measured_at = _reach_scope(proof)
+    if path in measured_at:
+        return (
+            True,
+            f"owner {owner} holds a measured {kind} proof at this row's own path {path}",
+        )
+    return (
+        False,
+        f"owner {owner} holds a {kind} proof measured only at {sorted(measured_at)}, which "
+        f"does not include this row's own path {path}; a proof about the owner somewhere "
+        f"else is not evidence about this site",
+    )
+
+
+def _reach_scope(proof: Mapping[str, Any]) -> set[str]:
+    """The paths at which one ``dependency_proofs`` record is actually proven.
+
+    Every proof kind names its own proven paths, measured this run, and the
+    reader below is the single place that maps a kind onto that vocabulary. A
+    record that names no proven path proves nothing at any path.
+
+    ``canonical-port-call``
+        the paths of the accepted, bound production call sites this run measured.
+    ``approved-adapter``
+        the paths whose authoritative Cargo metadata declared the adapter's
+        package, restricted to the paths it was measured for. A closed adapter
+        record is itself owner-scoped by construction -- it names one
+        implementation of #704's port for one owner -- and this is where that is
+        made a per-path claim instead of an inherited one.
+    ``canonical-port-owner``
+        the paths at which the canonical measurement entry point is actually
+        DEFINED, as measured by :func:`_measurement_owner_sites`. The owner of
+        record has no closed dependency contract and no self-dependency: its
+        reach is proved by its definition site, and a definition site is at a
+        path. So this is not a widening of #704's proof -- it is the same
+        measured fact, asked per row instead of asked once.
+    """
+    kind = str(proof.get("kind", ""))
+    if kind == "canonical-port-call":
+        return {
+            str(str(site).rsplit(":", 1)[0])
+            for site in proof.get("call_sites", [])
+            if isinstance(site, str) and ":" in site
+        }
+    if kind == "canonical-port-owner":
+        return {str(p) for p in proof.get("definition_paths", [])}
+    if kind == "approved-adapter":
+        return {str(p) for p in proof.get("cargo_dependency", [])}
+    return set()
 
 
 def _derive_baseline_disposition(
@@ -3170,8 +3254,9 @@ def _derive_baseline_disposition(
     The derivation is now evidence-bearing in two independent, measured directions:
 
     * the row's OWN closed fields, re-read from #866's frozen ``ROW_KEYS``; and
-    * the OWNER-level canonical dependency proof measured this run from live
-      source by :func:`_dependency_evidence`.
+    * the canonical dependency proof measured this run from live source by
+      :func:`_dependency_evidence`, asked about the row's OWN ``path`` -- so the
+      evidence is about *this site*, not about *this owner somewhere*.
 
     No new row field is used and none is invented: every input below is one of
     the 22 keys #866 already freezes at
@@ -3195,13 +3280,14 @@ def _derive_baseline_disposition(
         so no consumer migration is owed for it.
     ``canonical-owner-consumer`` (third arm)
         REQUIRES BOTH: the row is a live *production* measurement site, AND its
-        owner holds a measured canonical-reach proof. Both halves are evidence:
-        ``item_scope`` is the producer's own ``_scope_of`` verdict on the enclosing
-        item, so a ``test-only`` row is not a consumer; and the reach proof is
-        measured from the consumer's Cargo metadata and its masked production call
-        site, not read off the row. A live legacy formula whose owner has no proven
-        dependency falls past this arm to ``explicit-unresolved`` -- it is never
-        counted as a migrated consumer.
+        owner holds a measured canonical-reach proof **at this row's own path**.
+        Both halves are evidence: ``item_scope`` is the producer's own ``_scope_of``
+        verdict on the enclosing item, so a ``test-only`` row is not a consumer;
+        and the reach proof is measured from the consumer's Cargo metadata and its
+        masked production call site, not read off the row. A live legacy formula
+        whose owner has no proven dependency falls past this arm to
+        ``explicit-unresolved`` -- it is never counted as a migrated consumer, and
+        neither is a site whose owner is proved only somewhere else.
     ``explicit-unresolved`` (fourth arm)
         Everything else, i.e. the row cannot demonstrate a canonical migration:
         a live site the producer still classes as an unvalidated local ratio (the
@@ -3240,10 +3326,16 @@ def _derive_baseline_disposition(
     if classification in _LIVE_LEGACY_CLASSIFICATIONS:
         return "explicit-unresolved"
 
-    # Arm 3 -- canonical consumer, but ONLY on proven evidence. A test-only site
-    # is not a consumer, and an unproven owner is not a migrated one.
+    # Arm 3 -- canonical consumer, but ONLY on proven evidence AT THIS SITE. A
+    # test-only site is not a consumer, an unproven owner is not a migrated one,
+    # and an owner's proven reach at some OTHER path is not a proof about this
+    # row's own path.
     if str(row.get("item_scope", "production")) != "test":
-        proven, _reason = _canonical_reach_proven(owner, dependency_proofs)
+        # ``path`` is one of #866's frozen ``ROW_KEYS``, so every row reaching
+        # here carries it and it is read directly rather than defaulted: a row
+        # that did not name its own site could not be judged as a site at all,
+        # and defaulting one in would put a proof on a path nobody measured.
+        proven, _reason = _canonical_reach_proven(owner, str(row["path"]), dependency_proofs)
         if proven:
             return "canonical-owner-consumer"
 
@@ -3355,7 +3447,9 @@ def _baseline_findings(
         # attributed but whose consumer evidence is absent -- and never for an
         # arm-1 row, which is already reported as INVENTORY_INCOMPLETE.
         if disposition == "explicit-unresolved" and actual_owner == expected_owner:
-            _proven, reach_reason = _canonical_reach_proven(actual_owner, dependency_proofs)
+            _proven, reach_reason = _canonical_reach_proven(
+                actual_owner, str(row["path"]), dependency_proofs
+            )
             if not _proven:
                 add(
                     "CONSUMER_EVIDENCE_MISSING",
@@ -3560,12 +3654,14 @@ def render_text(result: OwnershipResult) -> str:
         elif kind == "canonical-port-owner":
             lines.append(
                 f"  dependency[{owner}]   = canonical-port-owner "
-                f"{proof.get('port_symbol')} proved by {proof.get('definition_proved_by')}"
+                f"{proof.get('port_symbol')} proved by {proof.get('definition_proved_by')} "
+                f"defined at {sorted(_reach_scope(proof))}"
             )
         else:
             lines.append(
                 f"  dependency[{owner}]   = {kind} "
-                f"{proof.get('port_symbol')} at {proof.get('call_sites')}"
+                f"{proof.get('port_symbol')} at {sorted(_reach_scope(proof))} "
+                f"(call sites {proof.get('call_sites')})"
             )
     lines.append(f"  findings             = {result.finding_count}")
     for finding in result.findings:
@@ -3845,6 +3941,11 @@ def run_self_test() -> int:
             "call_sites": ["crates/smart/eliot-context-assembly/src/measurement.rs:23"],
         }
     }
+    # The paths every row below is judged at. The reach proof is measured at
+    # ``_reach_path``; a row at any other path of the same owner must NOT inherit
+    # it, because the audit's concern is the site, not the owner.
+    _reach_path = "crates/smart/eliot-context-assembly/src/measurement.rs"
+    _other_path = "crates/eliot-engine/src/skill_curator.rs"
     # (1) The defect itself: owned, attributed, but the row's OWN evidence says
     # the site is still an unvalidated local byte ratio -- the old formula.
     _live_legacy = {
@@ -3853,6 +3954,7 @@ def run_self_test() -> int:
         "classification": "token_estimate_without_tokenizer",
         "write_scope": "read-only",
         "item_scope": "production",
+        "path": _reach_path,
     }
     assert _derive_baseline_disposition(_live_legacy, _proven_call) == "explicit-unresolved", (
         "an owned row whose own evidence says the site is still an unvalidated local ratio "
@@ -3862,15 +3964,16 @@ def run_self_test() -> int:
     # (2) The SAME row after a real migration: canonical classification + proof.
     _genuine = dict(_live_legacy, classification="exact-utf8-envelope")
     assert _derive_baseline_disposition(_genuine, _proven_call) == "canonical-owner-consumer", (
-        "a migrated row whose owner holds a MEASURED canonical dependency is still canonical"
+        "a migrated row whose owner holds a MEASURED canonical dependency AT THIS PATH is "
+        "still canonical"
     )
     # (3) Genuine classification but NO proven dependency: the evidence is absent.
     assert _derive_baseline_disposition(_genuine, {}) == "explicit-unresolved", (
         "an owned row with no measured consumer dependency proof must not assert a migration"
     )
-    assert _derive_baseline_disposition(_genuine, {"#783": {"kind": "missing"}}) == (
-        "explicit-unresolved"
-    ), "an owner whose measured kind is not a canonical reach kind proves nothing"
+    assert _derive_baseline_disposition(
+        _genuine, {"#783": {"kind": "missing"}}
+    ) == "explicit-unresolved", "an owner whose measured kind is not a canonical reach kind proves nothing"
     # An owner absent from the map entirely (its rows were all read-only, so the
     # dependency check never ran over it) is NOT proven. Absence of a complaint
     # is not evidence.
@@ -3881,12 +3984,45 @@ def run_self_test() -> int:
     assert _derive_baseline_disposition(
         dict(_genuine, item_scope="test"), _proven_call
     ) == "explicit-unresolved", "a test-only row is not a consumer seam"
-    # (5) The declared-but-underived disposition is still never returned, by any
-    # of the five reachable shapes.
+    # (5) PATH-SCOPED, not owner-scoped: the very same row, same owner, same
+    # classification and status, moved to a DIFFERENT path of that owner. The
+    # owner's proof was measured at ``_reach_path`` only, so this row's own site
+    # carries no evidence and must stay unresolved.
+    _off_path = dict(_genuine, path=_other_path)
+    assert _derive_baseline_disposition(_off_path, _proven_call) == "explicit-unresolved", (
+        "a proof about the owner at one path is not a proof about this row's own path"
+    )
+    assert _derive_baseline_disposition(_genuine, _proven_call) == "canonical-owner-consumer", (
+        "the same owner at the proven path is still canonical -- scoping must not invert it"
+    )
+    # The owner of record is proved by its DEFINITION SITE, which is at a path.
+    _owner_proof = {
+        "#704": {
+            "kind": "canonical-port-owner",
+            "port_symbol": CANONICAL_MEASUREMENT_PORT,
+            "definition_proved_by": "canonical-owner",
+            "definition_paths": ["crates/smart/eliot-context-measurement/src/stu.rs"],
+        }
+    }
+    _owner_row = dict(_genuine, owner="#704")
+    assert _derive_baseline_disposition(
+        dict(_owner_row, path="crates/smart/eliot-context-measurement/src/stu.rs"),
+        _owner_proof,
+    ) == "canonical-owner-consumer", "the owner's own definition-site row is canonical"
+    assert _derive_baseline_disposition(
+        dict(_owner_row, path="crates/smart/eliot-context-measurement/src/receipt.rs"),
+        _owner_proof,
+    ) == "explicit-unresolved", (
+        "an owner-of-record row at a path with no definition site is not proved by the "
+        "definition site elsewhere in the same crate"
+    )
+    # (6) The declared-but-underived disposition is still never returned, by any
+    # of the reachable shapes.
     _shapes = (
         (_live_legacy, _proven_call),
         (_genuine, _proven_call),
         (_genuine, {}),
+        (_off_path, _proven_call),
         (dict(_genuine, item_scope="test"), _proven_call),
         (dict(_genuine, status="unresolved"), _proven_call),
         (dict(_genuine, classification="unrelated_byte_or_character_metric"), _proven_call),
@@ -3897,7 +4033,7 @@ def run_self_test() -> int:
             "exact-versioned-legacy-adapter stays declared but unreachable (ContractChallenge "
             "against #866); no admissible row may derive it"
         )
-    # (6) Mutual exclusivity: no row receives two dispositions. The function
+    # (7) Mutual exclusivity: no row receives two dispositions. The function
     # returns exactly one string, so exclusivity is asserted structurally -- the
     # three distinct shapes give three DISTINCT values, and the two shapes that
     # share a value share it because they fail the SAME predicate.
@@ -3918,11 +4054,21 @@ def run_self_test() -> int:
         "approved-adapter",
     }
     assert not set(LEGACY_FORMULA_CLASSIFICATIONS) & set(CANONICAL_REACH_KINDS)
-    # _canonical_reach_proven reports the deciding conjunct, never a bare bool.
-    _ok, _why = _canonical_reach_proven("#783", _proven_call)
+    # _canonical_reach_proven reports the deciding conjunct, never a bare bool,
+    # and never proves a row outside the path its proof was measured at.
+    _ok, _why = _canonical_reach_proven("#783", _reach_path, _proven_call)
     assert _ok is True and "canonical-port-call" in _why
-    _ok2, why2 = _canonical_reach_proven("#783", {})
+    _ok_off, why_off = _canonical_reach_proven("#783", _other_path, _proven_call)
+    assert _ok_off is False and _other_path in why_off and _reach_path in why_off, (
+        "the unproven path's reason must name both the path asked about and the path the "
+        "proof was actually measured at"
+    )
+    _ok2, why2 = _canonical_reach_proven("#783", _reach_path, {})
     assert _ok2 is False and why2
+    # A proof record that names no proven path proves nothing anywhere.
+    assert _canonical_reach_proven("#783", _reach_path, {"#783": {"kind": "canonical-port-call"}})[
+        0
+    ] is False, "a proof carrying no measured path is not a proof at any path"
 
     print("PASS: audit_context_measurement_ownership self-tests completed successfully")
     return 0
