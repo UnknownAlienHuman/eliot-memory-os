@@ -68,6 +68,74 @@ fn store_build_error_code(error: &KernelBuildError) -> &'static str {
     }
 }
 
+/// I1.12 admission for the store-bridge process boundary.
+///
+/// It runs on the SAME composition seam that already refuses a store
+/// bootstrap the durable `canonical_store` route owner does not name, and it
+/// refuses BEFORE a `KernelStoreGateway` is constructed, attached or retained,
+/// so an incompatible store generation never becomes the live canonical
+/// connection. The envelope and the durable state come from the one producer
+/// in `compatibility_gate`, so this boundary cannot drift into a second
+/// spelling of the comparison.
+///
+/// The Host-approved `HostStoreBootstrapRequirement` is what this boundary
+/// admits: its `store_generation` and its State Fence Authority Epoch are the
+/// store-bridge generation identity the rest of this function already matches
+/// against the live route. Persisting the accepted verdict under the same
+/// `store_bridge` module id and the Host-approved artifact hash is what makes
+/// the generation a real rollback target: `generation_recovery`'s
+/// `admit_generation_rollback` re-reads exactly this record on restart, so
+/// "previously launched" is replaced by "recorded compatible with current
+/// durable formats and epoch lineage". A generation whose evidence was never
+/// recorded is refused by that gate rather than admitted by it.
+///
+/// `admit_generation_activation` derives the candidate and the durable state
+/// from the same admission tuple, so the epoch field here is decided by the
+/// route/requirement equality already proven above it; what this call adds at
+/// this boundary is fail-closed envelope construction and the durable verdict.
+/// The rollback gate is where a recorded verdict is re-compared against the
+/// state the Kernel runs under NOW.
+#[cfg(windows)]
+fn admit_store_bridge_compatibility(
+    ors: &eliot_ors::RedbRecoveryStore,
+    requirement: &HostStoreBootstrapRequirement,
+) -> Result<(), KernelBuildError> {
+    let activation = super::compatibility_gate::admit_generation_activation(
+        requirement.store_generation,
+        requirement.authority_epoch(),
+        i64::try_from(super::unix_ms()).unwrap_or(i64::MAX),
+    )
+    .map_err(|mismatch| {
+        // F-LOG-KERNEL-2 (#899): the observation carries the stable mismatch
+        // field label only, never a digest, epoch tuple, path or descriptor
+        // material. The reason reaches the caller through the typed
+        // `KernelBuildError::Core`, which owns no compatibility variant, so it
+        // is rendered exactly as the canonical-store writer admission above
+        // renders its own typed refusal rather than as a second error scheme.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            &format!(
+                "kernel.store.connect_rejected:compatibility:{}",
+                mismatch.field()
+            ),
+        );
+        KernelBuildError::Core(mismatch.to_string())
+    })?;
+    super::compatibility_gate::persist_generation_compatibility(
+        ors,
+        STORE_BRIDGE_ROUTE,
+        requirement.approved_artifact_hash.as_str(),
+        &activation,
+    )
+    .map_err(|reason| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.connect_rejected:compatibility_evidence",
+        );
+        KernelBuildError::Core(reason)
+    })
+}
+
 #[cfg(windows)]
 pub(crate) fn attach_then_retain_canonical_store<'a, T, Attach>(
     gateway: Arc<T>,
@@ -481,6 +549,9 @@ impl KernelComposition {
                 admission.durable_owner_generation.value()
             ),
         );
+        // I1.12 / #1968: this process boundary is gated on the full versioned
+        // envelope before a gateway is built, attached or retained.
+        admit_store_bridge_compatibility(&self.generation_gateway.ors, &requirement)?;
         let gateway = Arc::new(KernelStoreGateway::new(
             self.service.clone(),
             Arc::new(client),
