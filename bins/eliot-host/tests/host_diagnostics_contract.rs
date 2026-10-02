@@ -269,6 +269,81 @@ fn host_diagnostics_entrypoint_observation_matches_contract_fixture() {
     }
 }
 
+/// Drives the real production delivery seam and asserts the disposition it
+/// actually emits for one admitted record.
+///
+/// On Windows this performs a real OS Event Log insertion through #984's
+/// landed safe port, so the answer is either an OS acceptance or a typed OS
+/// refusal; off Windows the port is honestly typed-unavailable. Every other
+/// answer is a fixture defect, never an accepted outcome. The four states the
+/// caller must keep apart are a real accepted delivery, an unavailable source
+/// (typed `Err`), an OS refusal (typed `Err` with a bounded code), and the
+/// registered-source or degraded Application profiles, which production never
+/// produces and therefore never reports as what it delivered.
+fn assert_real_delivery_disposition(event: AdmittedEvent, record: &EventLogRecord) {
+    match report_event(record) {
+        Ok(delivery) => {
+            assert!(
+                cfg!(windows),
+                "non-Windows must never report Event Log success"
+            );
+            // #984's `EventLogSourceAvailability` carries `Unknown` as
+            // its only variant and `report_event` matches it without a
+            // wildcard, so a real OS acceptance can only ever report the
+            // registration-unknown arm. The registered-source profile is
+            // documented-unreachable until a platform receipt proves an
+            // installed source, because handle acquisition is never
+            // equated with installed message resources; the former
+            // `RegisteredSourceAccepted` assertion pinned an arm
+            // production cannot construct.
+            assert!(
+                matches!(
+                    delivery,
+                    EventLogDelivery::OsAcceptedRegistrationUnknown { .. }
+                ),
+                "wired delivery must report registration-unknown acceptance, got: {delivery:?}"
+            );
+            // Production's own disposition name for that acceptance. A real
+            // delivery therefore stays distinct from the registered-source
+            // and degraded Application profiles (which name themselves
+            // differently and are never produced here) and from the
+            // unavailable source, which is a typed `Err` rather than this
+            // `Ok` disposition at all.
+            assert_eq!(
+                delivery.as_str(),
+                "os_accepted_registration_unknown",
+                "accepted delivery must name its own disposition exactly"
+            );
+            assert_eq!(
+                delivery.event(),
+                event,
+                "accepted delivery must correlate to the submitted event"
+            );
+        }
+        Err(WindowsEventLogError::EventLogUnavailable) => {
+            assert!(
+                !cfg!(windows),
+                "Windows must attempt the OS port, not answer unavailable"
+            );
+        }
+        Err(
+            WindowsEventLogError::SourceUnavailable { .. }
+            | WindowsEventLogError::ReportRefused { .. },
+        ) => {
+            assert!(
+                cfg!(windows),
+                "OS refusal outcomes exist only where the port was attempted"
+            );
+        }
+        Err(WindowsEventLogError::InvalidRecord) => {
+            panic!("bounded redacted fixture insertion must validate")
+        }
+        Err(WindowsEventLogError::QueueFull | WindowsEventLogError::Closed) => {
+            panic!("direct report never touches the admission queue")
+        }
+    }
+}
+
 // WORK_UNIT_CASE: 889/15
 // WORK_UNIT_CASE: 889/16
 // WORK_UNIT_CASE: 889/17
@@ -316,44 +391,7 @@ fn windows_event_log_wrapper_reports_through_the_safe_port() {
         // honestly unavailable. The caller's Host result is untouched either
         // way (Ok stays Ok around the call).
         let host_result: Result<(), &'static str> = Ok(());
-        match report_event(&record) {
-            Ok(delivery) => {
-                assert!(
-                    cfg!(windows),
-                    "non-Windows must never report Event Log success"
-                );
-                assert!(
-                    matches!(delivery, EventLogDelivery::RegisteredSourceAccepted { .. }),
-                    "wired delivery must use the registered-source profile, got: {delivery:?}"
-                );
-                assert_eq!(
-                    delivery.event(),
-                    event,
-                    "accepted delivery must correlate to the submitted event"
-                );
-            }
-            Err(WindowsEventLogError::EventLogUnavailable) => {
-                assert!(
-                    !cfg!(windows),
-                    "Windows must attempt the OS port, not answer unavailable"
-                );
-            }
-            Err(
-                WindowsEventLogError::SourceUnavailable { .. }
-                | WindowsEventLogError::ReportRefused { .. },
-            ) => {
-                assert!(
-                    cfg!(windows),
-                    "OS refusal outcomes exist only where the port was attempted"
-                );
-            }
-            Err(WindowsEventLogError::InvalidRecord) => {
-                panic!("bounded redacted fixture insertion must validate")
-            }
-            Err(WindowsEventLogError::QueueFull | WindowsEventLogError::Closed) => {
-                panic!("direct report never touches the admission queue")
-            }
-        }
+        assert_real_delivery_disposition(event, &record);
         assert!(
             host_result.is_ok(),
             "sink outcome must not change Host result"
@@ -501,10 +539,10 @@ fn tracing_never_corrupts_console_stdout_framing() {
 // WORK_UNIT_CASE: 889/19
 #[test]
 fn host_reference_failure_and_registration_are_singular() {
-    // Exactly one current `main.rs` reference failure uses the facade, and
+    // Each current `main.rs` reference failure uses the facade, and
     // the library registration is exactly the two new modules: no lifecycle
     // instrumentation here (that is #891's), no FFI in Host. (Cases 889/1
-    // inventory, 889/19 single reference failure.)
+    // inventory, 889/19 single reference failure per typed terminal code.)
     let lib = manifest_source("src/lib.rs");
     assert_eq!(
         lib.matches("pub mod host_diagnostics;").count(),
@@ -523,18 +561,39 @@ fn host_reference_failure_and_registration_are_singular() {
         1,
         "main must install diagnostics exactly once"
     );
+    // Landed production owns one reference-failure terminal per typed code,
+    // not one per file: the console path (HOST-0) and the SCM-dispatcher
+    // process-entry boundary each emit exactly one terminal, and the two
+    // typed codes are distinct (asserted in
+    // `host_diagnostics_install_is_singly_owned`), so neither site can
+    // cross-claim the other's terminal. The former single-file count of one
+    // `observe_terminal_error` no longer describes landed production; what
+    // must still hold is that no typed code is emitted from two sites.
     assert_eq!(
-        main.matches("observe_terminal_error").count(),
+        main.matches("host_diagnostics::observe_terminal_error(")
+            .count(),
+        2,
+        "main must keep exactly one reference failure emitter per typed terminal code"
+    );
+    assert_eq!(
+        main.matches("host_diagnostics::HOST_TERMINAL_CODE_CONSOLE_FAILED")
+            .count(),
         1,
-        "main must keep exactly one reference failure for HOST-0"
+        "the console terminal must have exactly one main.rs reference failure site"
+    );
+    assert_eq!(
+        main.matches("host_diagnostics::HOST_TERMINAL_CODE_DISPATCHER_FAILED")
+            .count(),
+        1,
+        "the dispatcher terminal must have exactly one main.rs reference failure site"
     );
     assert!(
         main.contains("HOST_TERMINAL_CODE_CONSOLE_FAILED"),
         "the single reference failure must use the frozen console code"
     );
 
-    // No Event Log FFI is acquired inside Host; the seam stays typed and
-    // absent until #984 lands.
+    // No Event Log FFI is acquired inside Host; the wrapper stays a typed
+    // seam over #984's landed safe port, which owns the only FFI.
     for (name, contents) in [
         (
             "host_diagnostics.rs",

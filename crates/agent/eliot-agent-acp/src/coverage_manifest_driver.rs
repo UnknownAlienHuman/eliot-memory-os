@@ -142,6 +142,12 @@ pub struct FingerprintIngestRunOutcome {
 ///
 /// A declared event on a stream outside `run.stream_ids` is refused before any
 /// mutation, because the drive below would never deliver it.
+///
+/// After the manifest run, the retained denominator is verified to still bind
+/// the run fingerprint and the pinned allowed-manifest revision: a retained
+/// manifest for another fingerprint or revision fails closed with
+/// [`IngestError::InvalidInput`] and never reaches evidence assembly as a
+/// bound outcome.
 pub fn run_ingest_for_fingerprint(
     owner: &mut DurableHostEventJournal,
     run: &CoverageManifestRun<'_>,
@@ -154,6 +160,16 @@ pub fn run_ingest_for_fingerprint(
         observed.push(drive_reconnect_observed(owner, stream_id, &mut deliver)?);
     }
     let manifest = run_coverage_manifest(owner, run)?;
+    if manifest.manifest.fingerprint != *run.plan.fingerprint {
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
+            "coverage_manifest.fingerprint",
+        )));
+    }
+    if manifest.manifest.allowed_manifest_digest != run.manifest_digest {
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
+            "coverage_manifest.allowed_manifest_digest",
+        )));
+    }
     Ok(FingerprintIngestRunOutcome {
         produced,
         observed,

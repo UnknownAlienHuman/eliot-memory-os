@@ -598,16 +598,248 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     );
 }
 
+/// Immutable nonsecret operation correlation carried by one terminal record
+/// (F-LOG-HOST-2, #893 D1).
+///
+/// This is the typed terminal projection binding a terminal failure to the
+/// operation whose subordinate phases already carry the identities: the
+/// owner-issued transaction, effect, and request handles rendered by the
+/// subordinate records as the exact shared `tx`/`effect`/`req` fields
+/// (`ActivationObservation`, `PhaseBObservation`, `CredentialObservation`).
+/// Two interleaved operations ending in the same frozen terminal code stay
+/// distinguishable through these shared fields, never through record order
+/// (I13.11: timeline **and** correlation, not adjacency inference).
+///
+/// Immutable by construction: built once at the operation boundary from
+/// handles the semantic owner already produced, retained unchanged by the
+/// terminal guard, and rendered on the single terminal emission. It is never
+/// a dedup cache (no global state, no second evaluation), never a lifecycle
+/// (I14.20: diagnostics project owner states, never a second lifecycle), and
+/// never secret-bearing: callers must pass only the nonsecret
+/// digest/handle identities, never credential values, paths, payloads, or
+/// arbitrary error text (I15.4). Absent identities stay explicitly missing,
+/// never guessed or order-inferred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostTerminalCorrelation {
+    transaction: Option<BoundedField>,
+    effect: Option<BoundedField>,
+    request: Option<BoundedField>,
+}
+
+impl HostTerminalCorrelation {
+    /// Binds the owner-issued operation identities this terminal record is
+    /// about: the transaction, effect, and request handles the subordinate
+    /// records of the same operation already carry. Each handle is bounded
+    /// with truncation honesty. Pass only handles the owner already
+    /// produced at the guard-arming site; nothing is probed, looked up, or
+    /// synthesized here.
+    #[must_use]
+    pub fn bound(transaction: &str, effect: &str, request: &str) -> Self {
+        Self {
+            transaction: Some(bound_field(transaction)),
+            effect: Some(bound_field(effect)),
+            request: Some(bound_field(request)),
+        }
+    }
+
+    /// Binds whichever of the three operation identities the OWNER INPUT TYPE
+    /// at this boundary actually carries, and leaves every slot it does not
+    /// carry explicitly missing (#893).
+    ///
+    /// [`Self::bound`] requires all three handles, which is right where the
+    /// owner issues all three but cannot express the case where the owner's own
+    /// input type holds fewer: it forces the caller to either drop a handle it
+    /// honestly holds (the empty-guard arming this closes) or synthesize a value
+    /// the owner never issued (the fabrication this record exists to prevent).
+    /// A `None` slot renders through the SAME explicit missing disposition
+    /// [`Self::unavailable`] renders for it — the `tx_missing` / `effect_missing`
+    /// / `req_missing` flags — so a partial binding invents no new vocabulary,
+    /// no new flag, and no derived, defaulted, recomputed or empty-string value
+    /// standing in for an identity.
+    ///
+    /// `None` is a statement about the owner's input type, not about a failure:
+    /// pass `None` only for a slot that handle did not exist at this boundary
+    /// because that owner never issued one. NEVER pass `None` for a handle the
+    /// caller holds but did not bother to pass — that is exactly how a missing
+    /// identity turns back into an unbindable guard arming.
+    ///
+    /// [`Self::is_available`] is deliberately left requiring all three, so it
+    /// keeps its existing meaning ("the full `tx`/`effect`/`req` triple is
+    /// present") and no existing constructor renders differently. A partial
+    /// binding therefore renders `correlation_available = false` alongside its
+    /// precise per-slot `*_missing` flags: `correlation_available` never
+    /// over-claims, and the per-slot flags are the granularity that says which
+    /// single identity IS bound. Bounding and truncation honesty are unchanged:
+    /// each `Some` value goes through the same shared [`bound_field`].
+    #[must_use]
+    pub fn partially_bound(
+        transaction: Option<&str>,
+        effect: Option<&str>,
+        request: Option<&str>,
+    ) -> Self {
+        Self {
+            transaction: transaction.map(bound_field),
+            effect: effect.map(bound_field),
+            request: request.map(bound_field),
+        }
+    }
+
+    /// Explicitly uncorrelated: no operation identity exists yet at this
+    /// boundary (pre-subject failure, e.g. a malformed request that never
+    /// yielded a transaction). The terminal record then says correlation is
+    /// unavailable instead of relying on stage order.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            transaction: None,
+            effect: None,
+            request: None,
+        }
+    }
+
+    /// Whether this projection binds an operation identity. Readers must
+    /// check this (or the per-slot `*_missing` flags on the record) before
+    /// treating any slot value as meaningful.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.transaction.is_some() && self.effect.is_some() && self.request.is_some()
+    }
+}
+
 /// Records the single terminal error boundary with its exact typed code.
 ///
 /// One underlying failed operation yields exactly one terminal record here;
-/// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is bounded defensively; the HOST-0 reference call
-/// site passes [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
+/// lower-phase entrypoint observations carry the operation identities but
+/// are not duplicate failure claims, and there is no dedup cache. The code
+/// is bounded defensively; the HOST-0 reference call site passes
+/// [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
 /// `HostStopCode::ConsoleFailed` without duplicating its lifecycle ownership
 /// (I07.20, I14.20). Terminal receipt framing (capsule, SCM status, console
 /// exit code) is untouched and still owns the process exit.
+///
+/// Pre-subject failures carry no operation identity yet, so this spells the
+/// terminal explicitly uncorrelated
+/// ([`HostTerminalCorrelation::unavailable`]); correlation is never inferred
+/// from record order. Where the failing operation's identity exists, call
+/// [`observe_terminal_error_with_correlation`] instead so the terminal and
+/// its subordinate records share the exact `tx`/`effect`/`req` token.
 pub fn observe_terminal_error(code: &str) {
+    observe_terminal_error_with_correlation(code, &HostTerminalCorrelation::unavailable());
+}
+
+/// Records the single terminal error boundary with its exact typed code and
+/// the immutable operation correlation.
+///
+/// Observation only: the code and the correlation were already decided or
+/// produced by their owners before this call. Emits exactly one
+/// `host.terminal_error` record — never a second terminal — carrying the
+/// same `tx`/`effect`/`req` field spellings the subordinate records use, so
+/// interleaved operations sharing one frozen code remain distinguishable.
+/// An unavailable correlation renders every slot explicitly missing with
+/// `correlation_available = false`. All macro arguments are precomputed pure
+/// values, so a disabled event evaluates no extra effectful operation.
+pub fn observe_terminal_error_with_correlation(code: &str, correlation: &HostTerminalCorrelation) {
+    let bounded = bound_field(code);
+    let transaction = correlation.transaction.as_ref();
+    let effect = correlation.effect.as_ref();
+    let request = correlation.request.as_ref();
+    tracing::error!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.terminal_error",
+        code = bounded.text(),
+        code_bytes = bounded.original_bytes(),
+        code_truncated = bounded.truncated(),
+        correlation_available = correlation.is_available(),
+        tx = transaction.map_or("", BoundedField::text),
+        tx_bytes = transaction.map_or(0, BoundedField::original_bytes),
+        tx_truncated = transaction.is_some_and(BoundedField::truncated),
+        tx_missing = transaction.is_none(),
+        effect = effect.map_or("", BoundedField::text),
+        effect_bytes = effect.map_or(0, BoundedField::original_bytes),
+        effect_truncated = effect.is_some_and(BoundedField::truncated),
+        effect_missing = effect.is_none(),
+        req = request.map_or("", BoundedField::text),
+        req_bytes = request.map_or(0, BoundedField::original_bytes),
+        req_truncated = request.is_some_and(BoundedField::truncated),
+        req_missing = request.is_none(),
+        "host terminal error"
+    );
+}
+
+/// Immutable nonsecret runtime-control request identity carried by one terminal
+/// record (F-LOG-HOST-2, #893 D2/D3).
+///
+/// The second, distinct typed terminal projection, for the boundaries whose
+/// semantic owner is the runtime-control *request* rather than a Phase-B /
+/// activation transaction: `HostComposition::handle_store_recovery_request`,
+/// `reconcile_store_recovery_request`, `handle_kernel_restart_request`, and
+/// `reconcile_kernel_restart_request`. The owner-issued identity of that
+/// subject is exactly `(request.request_id, request.mutation_digest,
+/// request.request_digest)`, and the subordinate records of the same operation
+/// already render it as the `req_id`/`mutation`/`req` keys
+/// (`StoreRecoveryObservation::for_request` / `for_receipt` in
+/// `host_composition_store_recovery.rs`).
+///
+/// This is deliberately NOT a re-spelling of [`HostTerminalCorrelation`]. That
+/// projection's three slots are named for what the Phase-B and activation
+/// owner actually issued — a transaction id, a materialization effect id, and a
+/// request digest — and its `tx`/`effect` field names are that vocabulary.
+/// A recovery or restart request has no transaction and no materialization
+/// effect, so filling those slots here would assert an identity the owner never
+/// issued, and rendering it under the field names `tx`/`effect` would claim a
+/// join to activation records that have nothing to do with this operation. The
+/// slot names here are the request's own `req_id`/`mutation`/`req` spellings,
+/// so the terminal and its subordinate records are joined by an exact shared
+/// field rather than by position or by record order (I13.11: timeline **and**
+/// correlation, not adjacency inference).
+///
+/// Every slot is required, not optional: `HostRuntimeControlRequest` carries
+/// all three handles unconditionally, so absence is unrepresentable here and no
+/// `*_missing` flag or unavailable variant is needed. Nothing is probed,
+/// looked up, synthesized, hashed, or cached — the values are the exact
+/// nonsecret handles the authenticated pipe already delivered. It is never a
+/// dedup ledger, never a second lifecycle (I14.20), and never secret-bearing:
+/// no credential value, payload, path, or arbitrary error text (I15.4). It
+/// uses the same [`BoundedField`] bounding as every other field in this
+/// facade, so there is no second bounding scheme.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostRequestIdentityCorrelation {
+    request_id: BoundedField,
+    mutation: BoundedField,
+    request: BoundedField,
+}
+
+impl HostRequestIdentityCorrelation {
+    /// Binds the request identity this terminal record is about: the exact
+    /// request id, mutation digest, and request digest the semantic owner
+    /// already holds for the live runtime-control request, rendered under the
+    /// same `req_id`/`mutation`/`req` keys its subordinate records use. Each
+    /// handle is bounded with truncation honesty by the shared
+    /// [`bound_field`].
+    #[must_use]
+    pub fn bound(request_id: &str, mutation: &str, request: &str) -> Self {
+        Self {
+            request_id: bound_field(request_id),
+            mutation: bound_field(mutation),
+            request: bound_field(request),
+        }
+    }
+}
+
+/// Records the single terminal error boundary of a runtime-control request
+/// together with that request's immutable identity.
+///
+/// Emits exactly one `host.terminal_error` record — never a second terminal,
+/// never a dedup ledger — carrying the same `req_id`/`mutation`/`req` field
+/// spellings [`observe_entrypoint_with_detail`] renders for the subordinate
+/// phases of that request, so two interleaved runtime-control requests ending
+/// in the same frozen code stay distinguishable by a shared field. All macro
+/// arguments are precomputed pure values, so a disabled event evaluates no
+/// extra effectful operation.
+pub fn observe_terminal_error_with_request_identity(
+    code: &str,
+    correlation: &HostRequestIdentityCorrelation,
+) {
     let bounded = bound_field(code);
     tracing::error!(
         target: HOST_DIAGNOSTICS_TARGET,
@@ -615,6 +847,15 @@ pub fn observe_terminal_error(code: &str) {
         code = bounded.text(),
         code_bytes = bounded.original_bytes(),
         code_truncated = bounded.truncated(),
+        req_id = correlation.request_id.text(),
+        req_id_bytes = correlation.request_id.original_bytes(),
+        req_id_truncated = correlation.request_id.truncated(),
+        mutation = correlation.mutation.text(),
+        mutation_bytes = correlation.mutation.original_bytes(),
+        mutation_truncated = correlation.mutation.truncated(),
+        req = correlation.request.text(),
+        req_bytes = correlation.request.original_bytes(),
+        req_truncated = correlation.request.truncated(),
         "host terminal error"
     );
 }
@@ -778,6 +1019,17 @@ const fn project_host_error_reason(error: &HostError) -> &'static str {
 /// text, zero, false) in a slot field are meaningless unless that flag
 /// reads false. Readers must check the flag first. Only actual owner
 /// state held at the construction site may support a positive assertion.
+///
+/// One slot additionally binds the runtime-control REQUEST identity through
+/// the SAME [`HostRequestIdentityCorrelation`] the terminal emission of that
+/// request's failure already carries, so the `host.request` record and the
+/// `host.terminal_error` record of one runtime-control operation are joined
+/// by exact `req_id`/`mutation`/`req` field equality rather than by stage
+/// order or adjacency (I13.11). It is a stored copy of that one projection —
+/// not a recomputation, not a digest, and not a second identity scheme — so a
+/// reader can never see the two records disagree about the owner-issued
+/// handles. A projection built where no runtime-control request is in hand
+/// leaves the slot explicitly missing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostRequestProjection {
     evidence: HostRequestEvidence,
@@ -791,6 +1043,7 @@ pub struct HostRequestProjection {
     reason: Option<&'static str>,
     receipt_sequence: Option<u64>,
     receipt_exit: Option<i32>,
+    request_identity: Option<HostRequestIdentityCorrelation>,
 }
 
 impl HostRequestProjection {
@@ -879,6 +1132,7 @@ impl HostRequestProjection {
             reason: None,
             receipt_sequence: None,
             receipt_exit: None,
+            request_identity: None,
         }
     }
 
@@ -911,6 +1165,32 @@ impl HostRequestProjection {
     #[must_use]
     pub const fn with_process(mut self, process_id: u32) -> Self {
         self.process = Some(process_id);
+        self
+    }
+
+    /// Attaches the runtime-control request identity this record is about,
+    /// taken from the very same [`HostRequestIdentityCorrelation`] the
+    /// terminal emission of that request's failure carries.
+    ///
+    /// This is the log-to-log half of the kernel-restart correlation
+    /// (F-LOG-HOST-2, #893 D3): the `host.request` record emitted here and the
+    /// `host.terminal_error` record emitted for the same operation then carry
+    /// identical `req_id`/`mutation`/`req` values, so a reader joins them by
+    /// field equality, never by stage order or adjacency (I13.11: timeline
+    /// **and** correlation).
+    ///
+    /// Pass the projection the request's owner already built — nothing is
+    /// probed, hashed, synthesized, cached, or re-derived here, so the two
+    /// records cannot disagree about the owner-issued handles. It inherits that
+    /// projection's bounding ([`bound_field`], the one scheme in this facade)
+    /// and its nonsecret scope: three opaque request handles, never a
+    /// credential value, payload, path, connection string, nonce, or arbitrary
+    /// error text (I15.4). A projection built where no runtime-control request
+    /// is in hand simply omits this call and the slot renders explicitly
+    /// missing.
+    #[must_use]
+    pub fn with_request_identity(mut self, correlation: &HostRequestIdentityCorrelation) -> Self {
+        self.request_identity = Some(correlation.clone());
         self
     }
 
@@ -954,6 +1234,7 @@ impl HostRequestProjection {
 pub fn observe_host_request(projection: &HostRequestProjection) {
     publish_projected_event_log_record(projection);
     let installation = projection.installation.as_ref();
+    let request_identity = projection.request_identity.as_ref();
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
         event = "host.request",
@@ -980,6 +1261,23 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
         receipt_sequence_missing = projection.receipt_sequence.is_none(),
         receipt_exit = projection.receipt_exit.unwrap_or(0),
         receipt_exit_missing = projection.receipt_exit.is_none(),
+        // The runtime-control request identity, rendered under the exact
+        // `req_id`/`mutation`/`req` keys the single terminal record of the same
+        // operation carries, so the two records join by field equality rather
+        // than by stage order or adjacency (F-LOG-HOST-2, #893 D3; I13.11).
+        // Same bounding, same values: no recomputation, no second scheme.
+        req_id = request_identity.map_or("", |c| c.request_id.text()),
+        req_id_bytes = request_identity.map_or(0, |c| c.request_id.original_bytes()),
+        req_id_truncated = request_identity.is_some_and(|c| c.request_id.truncated()),
+        req_id_missing = request_identity.is_none(),
+        mutation = request_identity.map_or("", |c| c.mutation.text()),
+        mutation_bytes = request_identity.map_or(0, |c| c.mutation.original_bytes()),
+        mutation_truncated = request_identity.is_some_and(|c| c.mutation.truncated()),
+        mutation_missing = request_identity.is_none(),
+        req = request_identity.map_or("", |c| c.request.text()),
+        req_bytes = request_identity.map_or(0, |c| c.request.original_bytes()),
+        req_truncated = request_identity.is_some_and(|c| c.request.truncated()),
+        req_missing = request_identity.is_none(),
         "host request projection"
     );
 }

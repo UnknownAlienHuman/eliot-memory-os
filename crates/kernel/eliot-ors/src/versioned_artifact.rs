@@ -163,6 +163,16 @@ impl CompatibilityRefusal {
 /// adds the exact [`CompatibilityRefusal`], so the evidence survives the
 /// refusal instead of being replaced by it.
 ///
+/// Issue #1968 adds one more, and it is the only field on this record whose two
+/// operands do not both come from the same binary: the Store API
+/// operation-manifest catalogue digest the store PROCESS presented at the live
+/// handshake, recorded only after the receiver confirmed it against the digest
+/// its own compiled `eliot_store_api` produces. Without it the one genuinely
+/// independent comparison on the store-bridge seam was verified once, live, and
+/// a later rollback re-verified only the envelope fields — the acceptance's
+/// "previously launched" gap. See [`Self::record_store_api_contract_set`] and
+/// [`Self::store_api_contract_set_digest`].
+///
 /// ORS stores and shape-validates only. Compatibility is decided once, by the
 /// Kernel-owned `admit_handshake`/`admit_rollback`; this record never
 /// re-decides it, and its migration-class and capability text carry no
@@ -188,6 +198,24 @@ pub struct CompatibilityEvidence {
     admitted_protocol_version: Option<u32>,
     admitted_canonical_format_version: Option<u32>,
     refusal: Option<CompatibilityRefusal>,
+    /// The Store API operation-manifest catalogue digest the STORE PROCESS
+    /// presented at the live handshake, recorded only after the receiver
+    /// confirmed it against the digest its OWN compiled `eliot_store_api`
+    /// produces (issue #1968).
+    ///
+    /// It is the peer's operand, not the receiver's: the receiver recomputes its
+    /// own on the rollback path and compares, so this field is never the
+    /// receiver's expected value stored beside its own check.
+    ///
+    /// `None` is the honest absence, and it is NOT agreement. A row written
+    /// before this field existed, and a boundary that crossed no store at all,
+    /// both read `None`, and the Kernel-owned rollback gate decides which of
+    /// those two it is against durable state that does hold a receiver-held
+    /// expectation. `#[serde(default)]` keeps such a row readable instead of
+    /// refusing to deserialize it; the refusal is raised by the comparison, not
+    /// smuggled into the decoder.
+    #[serde(default)]
+    store_api_contract_set_digest: Option<String>,
 }
 
 #[allow(
@@ -223,6 +251,7 @@ impl CompatibilityEvidence {
         admitted_protocol_version: Option<u32>,
         admitted_canonical_format_version: Option<u32>,
         refusal: Option<CompatibilityRefusal>,
+        store_api_contract_set_digest: Option<String>,
     ) -> Result<Self, OrsError> {
         let evidence = Self {
             envelope_version,
@@ -242,9 +271,49 @@ impl CompatibilityEvidence {
             admitted_protocol_version,
             admitted_canonical_format_version,
             refusal,
+            store_api_contract_set_digest,
         };
         evidence.validate()?;
         Ok(evidence)
+    }
+
+    /// Binds the digest a STORE PROCESS presented onto this verdict, after the
+    /// receiver confirmed it against its own compiled Store API catalogue.
+    ///
+    /// The caller passes the value the peer presented, never the receiver's
+    /// expected value: storing the expectation here would make the later
+    /// rollback comparison a value against itself. This ORS record does not
+    /// decide compatibility and never recomputes the digest; it stores the
+    /// operand that was compared, so a later rollback re-verifies the ORIGINAL
+    /// recorded value rather than a fresh one.
+    ///
+    /// Fails closed on a verdict that records a refusal, because a refused
+    /// candidate was never admitted and has nothing to record agreement about.
+    pub fn record_store_api_contract_set(
+        &mut self,
+        presented_store_api_contract_set_digest: &str,
+    ) -> Result<(), OrsError> {
+        if self.refusal.is_some() {
+            return Err(OrsError::IncompatibleArtifact);
+        }
+        validate_digest(
+            presented_store_api_contract_set_digest,
+            "compatibility_store_api_contract_set_digest",
+        )?;
+        self.store_api_contract_set_digest =
+            Some(presented_store_api_contract_set_digest.to_owned());
+        Ok(())
+    }
+
+    /// Returns the Store API catalogue digest the store process presented and
+    /// the receiver confirmed, when this generation crossed a store boundary.
+    ///
+    /// `None` means no confirmed store claim was recorded. It does not mean the
+    /// store agreed: the Kernel-owned rollback gate refuses an absent value
+    /// wherever durable state holds a receiver-held expectation.
+    #[must_use]
+    pub fn store_api_contract_set_digest(&self) -> Option<&str> {
+        self.store_api_contract_set_digest.as_deref()
     }
 
     /// Returns the envelope revision this verdict was produced by.
@@ -444,6 +513,9 @@ impl CompatibilityEvidence {
         }
         if let Some(refusal) = &self.refusal {
             refusal.validate()?;
+        }
+        if let Some(store_digest) = &self.store_api_contract_set_digest {
+            validate_digest(store_digest, "compatibility_store_api_contract_set_digest")?;
         }
         Ok(())
     }

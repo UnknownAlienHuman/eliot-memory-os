@@ -345,6 +345,56 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
             ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue))
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
 
+        # The same package is admitted only through an explicit typed
+        # decomposition: finite disjoint ownership whose scopes really are
+        # disjoint. The declaration is verified, never trusted.
+        core = c.PackageIdentity("eliot-core")
+        disjoint = ch.PackageSharingEdge(
+            package=core, issues=(d1.issue, d2.issue), kind=ch.PackageSharingKind.DISJOINT)
+        cat = ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue), package_sharing=(disjoint,))
+        self.assertEqual(len(cat.rows), 2)
+
+        d_overlap = make_desc(852, "D-WU-PKG-B", 22, package="eliot-core",
+                              source_roots=("crates/core/a.rs/b.rs",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r1, make_row(d_overlap)], (d1.issue, d_overlap.issue),
+                                     package_sharing=(disjoint,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
+        # An edge for another package never covers this pair.
+        other = ch.PackageSharingEdge(
+            package=c.PackageIdentity("eliot-other"), issues=(d1.issue, d2.issue),
+            kind=ch.PackageSharingKind.DISJOINT)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([r1, r2], (d1.issue, d2.issue), package_sharing=(other,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
+        # Serialized sharing needs the typed order fact and exactly one typed
+        # integration owner; the order alone, or the owner alone, stays rejected.
+        s1 = make_desc(851, "D-WU-PKG-A", 20, package="eliot-core", source_roots=("crates/core",))
+        s2 = make_desc(852, "D-WU-PKG-B", 22, package="eliot-core", source_roots=("crates/core",))
+        ser_r1, ser_r2 = make_row(s1), make_row(s2, prerequisites=(s1.issue,))
+        serialized = ch.PackageSharingEdge(
+            package=core, issues=(s1.issue, s2.issue), kind=ch.PackageSharingKind.SERIALIZED)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([ser_r1, ser_r2], (s1.issue, s2.issue),
+                                     package_sharing=(serialized,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
+        owner = ch.IntegrationOwnerProfile(owners=(ch.IntegrationOwnerEntry(s1.issue, s1.unit),))
+        cat = ch.materialize_catalogue([ser_r1, ser_r2], (s1.issue, s2.issue),
+                                       integration_owners=owner, package_sharing=(serialized,))
+        self.assertEqual(len(cat.rows), 2)
+
+        # Two typed integration owners on one pair is not "one integration owner".
+        two_owners = ch.IntegrationOwnerProfile(owners=(
+            ch.IntegrationOwnerEntry(s1.issue, s1.unit),
+            ch.IntegrationOwnerEntry(s2.issue, s2.unit)))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([ser_r1, ser_r2], (s1.issue, s2.issue),
+                                     integration_owners=two_owners, package_sharing=(serialized,))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP)
+
     # WORK_UNIT_CASE: 852/12
     def test_valid_distinct_same_order_tracks(self):
         d1 = make_desc(851, "D-WU-TRACK-A", 20, package="eliot-track-a", source_roots=("crates/track-a/src/lib.rs",))
@@ -483,6 +533,26 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
         with self.assertRaises(ch.CohortError) as ctx:
             ch.materialize_catalogue([make_row(d_other)], (d_other.issue,), integration_owners=profile)
         self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
+
+        # The role is the exact (issue, unit) pair and nothing else: unit
+        # identity is not catalogue-unique among non-active rows, so a lookup
+        # by unit alone must not exist and must not answer for another issue.
+        self.assertIs(profile.role_of(d_int.unit, d_int.issue), ch.OwnerRole.INTEGRATION_OWNER)
+        self.assertIs(profile.role_of(d_other.unit, d_other.issue), ch.OwnerRole.LEAF)
+        self.assertFalse(ch.is_integration_owner(d_other.unit, d_other.issue, profile=profile))
+        with self.assertRaises(TypeError):
+            profile.role_of(d_int.unit)  # type: ignore[call-arg]
+
+        # A declared owner entry is exactly typed: a mistyped half is rejected
+        # instead of silently comparing unequal and dropping the authority.
+        for bad in (("837", d_int.unit), (d_int.issue, "D-WU-FINAL")):
+            with self.assertRaises(ch.CohortError) as ctx:
+                ch.IntegrationOwnerEntry(*bad)
+            self.assertEqual(ctx.exception.problem, ch.CohortProblem.MALFORMED_FIELD)
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.IntegrationOwnerProfile(owners=(ch.IntegrationOwnerEntry(d_int.issue, d_int.unit),
+                                               ch.IntegrationOwnerEntry(d_int.issue, d_int.unit)))
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.DUPLICATE_UNIT)
 
     # WORK_UNIT_CASE: 852/24
     def test_arbitrary_command_url_env_rejected_through_runner(self):

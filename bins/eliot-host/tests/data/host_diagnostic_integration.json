@@ -1,0 +1,53 @@
+{
+  "case": "985/W4",
+  "objective": "actual cross-child forced failure produces one terminal event and unchanged return/receipt/cleanup; actual isolated Event Log start delivery distinct from fake, unavailable, or degraded source",
+  "seam": {
+    "executable": "the real eliot-host process this integration target launches from the cargo target directory",
+    "forced_failure": "the SystemService launch shape really enters run_as_scm_service and really calls StartServiceCtrlDispatcherW; the SCM refuses with the documented console case, production records the supported console_fallback boundary, and open_host then refuses the empty registry this isolated run owns, so the child ends at the open_failed boundary with the single console terminal main owns",
+    "capture": "the child's own stderr tracing sink as the child wrote it, the child's stdout console-protocol frame, the bounded host_start_failure receipt the child wrote into this test's own state root or child temp directory, and a real wevtutil query of the Windows Application log for the delivered Event Log record"
+  },
+  "forced_failure": {
+    "terminal_event": "host.terminal_error",
+    "terminal_code": "console_failed",
+    "open_failed_detail": "open_failed",
+    "console_fallback_detail": "console_fallback",
+    "request_event": "host.request",
+    "request_phase": "console_loop",
+    "request_evidence": "failed",
+    "request_operation": "service_start",
+    "shutdown_event": "host.event_log_producer_shutdown",
+    "outstanding_delivery": "unknown",
+    "correlation_available": "false",
+    "correlation_missing": ["tx_missing", "effect_missing", "req_missing"]
+  },
+  "receipt": {
+    "record_type": "host_start_failure",
+    "failure_class": "console_failed",
+    "win32_exit_code": 1066,
+    "service_specific_exit_code": 13
+  },
+  "event_log": {
+    "source": "EliotHost",
+    "start_event_id": 100,
+    "start_severity": "information",
+    "start_operation": "service_start",
+    "start_phase": "startup",
+    "start_evidence": "process_started",
+    "admission_event": "host.event_log_admission",
+    "delivered_arm": "os_accepted_registration_unknown",
+    "unreachable_arms": ["registered_source_accepted", "degraded_application_accepted"],
+    "unavailable_name": "event_log_unavailable",
+    "pre_ffi_rejection_name": "invalid_record",
+    "readback_channel": "Application",
+    "readback_provider": "EliotHost",
+    "readback_information_level": 4
+  },
+  "main_terminal_drift": {
+    "callee_name_mentions": 3,
+    "emission_sites": 2,
+    "console_terminal_code": "console_failed",
+    "dispatcher_terminal_code": "dispatcher_failed",
+    "note": "observe_terminal_error is not a singleton in main.rs: the string occurs at the two real emission sites plus once in the production comment that explains the uncorrelated console terminal. The occurrence count of a callee name is therefore not the terminal-singularity invariant; the exact set of (owning function, typed terminal code) pairs is, and it is what this oracle asserts."
+  },
+  "ceiling": "The two children prove the forced-failure case across the real Windows SCM service boundary. The Event Log start delivery is executed through the same synchronous production function the bounded producer worker calls (windows_event_log::report_event, reached through report_admitted_event) so the outcome is not a race with the worker's asynchronous shutdown; the child's own asynchronous start delivery cannot be read back deterministically because shutdown_event_log_producer joins no worker and process exit discards queued work, so the child's leg is asserted only as far as its own admission record and that boundary is named here."
+}

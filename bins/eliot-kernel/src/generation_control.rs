@@ -24,6 +24,17 @@
 //! generation rollback that a forward-repair requirement closed, and the
 //! caller-supplied `migration` claim is never written first.
 //!
+//! The same "before the write, not after it" rule holds for the `I1.12`
+//! candidate verdict on that ingress. `apply_generation_cutover` refuses an
+//! incompatible candidate before any route move or epoch change, but it reads a
+//! committed record, so on its own it would run after this file's ORS write; the
+//! missing-row path therefore asks the very same gate about the candidate
+//! generation and Authority Epoch its row would carry before
+//! `commit_canonical_store_cutover_ownership` stages and commits anything, and a
+//! refused candidate leaves no committed `CUTOVER_OWNERSHIP` row naming it. The
+//! fields that verdict can actually refuse at this ingress are stated where they
+//! are produced, in `compatibility_gate`.
+//!
 //! Architecture: A5.4 Time и State Fence; A13.2 Kernel и failure domains; A13.3 Module supervision и Doctor; ARCH-AUTH-01; ARCH-RES-03; ARCH-RES-04
 //! Implementation: I4.5 Generation vector and State Fence; I5.6 Admission and staging; I14.14 Module hot replacement; I14.15 Daemon hot replacement; I14.16 Kernel and Host update; I14.21 Unknown commit recovery
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::generation_route_snapshot` and `KernelComposition::apply_generation_cutover` plus inseparable fencing with zero external users; no new crate.
@@ -31,12 +42,15 @@
 
 use super::KernelComposition;
 use super::kernel_audit::AuditEventDraft;
+use super::unix_ms;
 use eliot_contracts::{
     AuthorityEpoch, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
-use eliot_kernel_core::{CutoverDecision, GenerationRoute, GenerationRouter, RouteScope};
+use eliot_kernel_core::{
+    CutoverDecision, GenerationRoute, GenerationRouter, MismatchField, RouteScope,
+};
 use eliot_kernel_service::{
-    IrreversibleStorageEffect, KernelServiceError, StorageReplacement,
+    IrreversibleStorageEffect, KernelService, KernelServiceError, StorageReplacement,
     StorageReplacementCutoverReceipt, StorageReplacementStage, StorageReplacementTransfer,
 };
 use eliot_ors::{
@@ -494,6 +508,44 @@ fn generation_cutover_terminal_code(error: &KernelServiceError) -> &'static str 
     }
 }
 
+/// Projects one refusal this ingress decided BEFORE the semantic gateway was
+/// reached onto the authenticated cutover reply.
+///
+/// The gateway owns the one terminal for a cutover it actually runs. A frame
+/// refused here never reaches it, so this projection is what keeps such a frame
+/// observable: the gateway's own observation pair and its single terminal
+/// diagnostic are emitted here for exactly one attempt, one rejection and one
+/// terminal, never two, and the stable terminal code comes from the same mapper
+/// the failed live swap uses ([`generation_cutover_terminal_code`]).
+///
+/// No receipt rides along, and the reply asserts no cutover evidence this
+/// ingress does not hold: both callers refuse while no row exists to re-derive
+/// one from, so `cutover_receipt` is `None` and "requested", "refused" and
+/// "committed" stay three distinct answers on the real control-plane path.
+fn pre_gateway_refusal_outcome(
+    request: &GenerationCutoverRequest,
+    error: KernelServiceError,
+) -> GenerationCutoverOutcome {
+    observe_generation_cutover(
+        "kernel.generation.cutover_requested",
+        "attempt",
+        request.cutover_id.as_str(),
+    );
+    observe_generation_cutover(
+        "kernel.generation.cutover_failed",
+        "rejected",
+        request.cutover_id.as_str(),
+    );
+    super::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(&error));
+    GenerationCutoverOutcome {
+        version: 1,
+        cutover_id: request.cutover_id.clone(),
+        terminal_code: Some(generation_cutover_terminal_code(&error)),
+        state_fence: request.state_fence.clone(),
+        cutover_receipt: None,
+    }
+}
+
 /// Projects one refusal from the durable-migration rollback gate onto the
 /// authenticated cutover reply, and returns every other refusal unchanged.
 ///
@@ -509,19 +561,14 @@ fn generation_cutover_terminal_code(error: &KernelServiceError) -> &'static str 
 /// "requested", "refused" and "committed" three distinct answers on the real
 /// control-plane path.
 ///
-/// The observation pair and the single terminal diagnostic are the gateway's own
-/// (`kernel.generation.cutover_requested` / `kernel.generation.cutover_failed`
-/// plus one `observe_terminal_error`), emitted here because this frame is
-/// refused BEFORE the gateway is reached: exactly one attempt, one rejection and
-/// one terminal for the failed cutover, never two. Only the validated request's
-/// own cutover identity is logged — never a route, epoch, generation or fence —
-/// and no error payload crosses the reply (I15.4, I07.20).
+/// The observation pair and the single terminal diagnostic are emitted by
+/// [`pre_gateway_refusal_outcome`], because this frame is refused BEFORE the
+/// gateway is reached: exactly one attempt, one rejection and one terminal for
+/// the failed cutover, never two.
 ///
-/// No receipt rides along. The no-row admission path refuses before the
-/// coordinator re-derives one from a durable row, and the existing-row path
-/// carries `None` by the outcome's own contract because that request presented
-/// no completion, so the reply never asserts cutover evidence this ingress does
-/// not hold.
+/// No receipt rides along. This path refuses before the coordinator re-derives
+/// one from a durable row, so the reply never asserts cutover evidence this
+/// ingress does not hold.
 ///
 /// The closed reply shape gains nothing for this refusal: the forward-repair
 /// state is carried on the wire by the stable terminal code the mapper already
@@ -539,24 +586,7 @@ fn rollback_refusal_outcome(
     if !matches!(&error, KernelServiceError::GenerationFenced) {
         return Err(error);
     }
-    observe_generation_cutover(
-        "kernel.generation.cutover_requested",
-        "attempt",
-        request.cutover_id.as_str(),
-    );
-    observe_generation_cutover(
-        "kernel.generation.cutover_failed",
-        "rejected",
-        request.cutover_id.as_str(),
-    );
-    super::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(&error));
-    Ok(GenerationCutoverOutcome {
-        version: 1,
-        cutover_id: request.cutover_id.clone(),
-        terminal_code: Some(generation_cutover_terminal_code(&error)),
-        state_fence: request.state_fence.clone(),
-        cutover_receipt: None,
-    })
+    Ok(pre_gateway_refusal_outcome(request, error))
 }
 
 #[derive(Clone, Copy)]
@@ -621,6 +651,72 @@ fn classify_generation_cutover_live_endpoint(
 enum GenerationCutoverInnerFailure {
     Gateway(String),
     Refused(KernelServiceError),
+}
+
+/// I1.12 candidate-activation gate for one candidate generation and the
+/// Authority Epoch it would run under.
+///
+/// The candidate is judged against the durable compatibility state the Kernel is
+/// running under NOW - not against evidence remembered from a previous process -
+/// and the candidate generation plus that epoch are what the accepted evidence is
+/// bound to.
+///
+/// It takes the generation and the epoch as values instead of a
+/// [`CutoverDecision`] so that ONE gate serves both callers that hold them: the
+/// inner sequence that applies an already-committed decision, and the ingress
+/// that has to refuse an uncommitted candidate before it writes anything. There
+/// is no second producer of this verdict.
+///
+/// ## What this gate refuses here, and what it cannot
+///
+/// The lineage check is a comparison against the LIVE service epoch, so a
+/// candidate Authority Epoch minted by another lineage is refused here and
+/// reported as `authority_epoch`. That refusal is reachable where a caller
+/// supplies the candidate epoch: through
+/// [`KernelComposition::apply_generation_cutover`], which any caller can drive
+/// with its own decision. On the authenticated ingress below, the candidate
+/// epoch's lineage is re-attached from that same live epoch (issue #64), so this
+/// half is satisfied by construction there - see
+/// [`KernelComposition::admit_uncommitted_cutover_candidate`]. The remaining
+/// I1.12 fields cannot disagree at either caller: the candidate envelope and the
+/// durable state are BOTH produced by the one envelope producer in
+/// `compatibility_gate` out of this build's own protocol, contract-set,
+/// canonical-format, architecture, seal and migration identity, so a
+/// canonical-format, sealed normative-pair or migration-class incompatibility
+/// only becomes observable once a candidate presents an envelope issued by its
+/// own artifact owner. That ceiling, and the one refusal this gate genuinely
+/// produces, are stated in `compatibility_gate`'s module documentation; this
+/// function is not evidence of more than it can refuse.
+fn admit_cutover_candidate(
+    service: &KernelService,
+    candidate_generation: ResourceGeneration,
+    candidate_epoch: &EpochId,
+) -> Result<(), KernelServiceError> {
+    let refusal = |mismatch: &eliot_kernel_core::CompatibilityMismatch| {
+        KernelServiceError::HandshakeMismatch {
+            field: mismatch.field().label(),
+        }
+    };
+    // A cutover never mints a lineage (I14.14): the new Authority Epoch is the
+    // issued direct child of the live one, so a candidate epoch from any other
+    // lineage is refused before the durable state it would be judged against is
+    // even built. This is the epoch-lineage half of the I1.12 boundary.
+    if candidate_epoch.lineage_id != service.authority_epoch().lineage_id {
+        return Err(refusal(&eliot_kernel_core::CompatibilityMismatch::new(
+            MismatchField::AuthorityEpoch,
+            "candidate authority epoch lineage is not the live durable lineage",
+        )));
+    }
+    let activation = super::compatibility_gate::admit_generation_activation(
+        candidate_generation,
+        candidate_epoch,
+        i64::try_from(unix_ms()).unwrap_or(i64::MAX),
+    )
+    .map_err(|mismatch| refusal(&mismatch))?;
+    activation
+        .require_admitted()
+        .map(|_| ())
+        .map_err(|mismatch| refusal(mismatch))
 }
 
 impl ServiceFenceObservation {
@@ -870,6 +966,18 @@ impl KernelComposition {
                     GenerationCutoverInnerFailure::Gateway("service lock poisoned".to_owned())
                 })?;
 
+                // I1.12: refuse an incompatible candidate generation BEFORE
+                // any ORS write, route move or epoch change. See
+                // `admit_cutover_candidate`; a refusal is a refusal of the
+                // frame, not a gateway failure, so nothing is poisoned here.
+                if let Err(error) = admit_cutover_candidate(
+                    &service,
+                    decision.new_generation(),
+                    decision.new_epoch(),
+                ) {
+                    return Err(GenerationCutoverInnerFailure::Refused(error));
+                }
+
                 // I14.14: the authenticated production path reaches this point
                 // after loading the committed ORS decision. The read-only
                 // classification distinguishes exact replay from stale state.
@@ -991,6 +1099,21 @@ impl KernelComposition {
     ///   daemon boundary fences every error identically, so an unprojected
     ///   refusal would reach the wire indistinguishable from a malformed request
     ///   and would carry no stable code and no observation.
+    /// - the `I1.12` candidate verdict gates the SWITCH on both admission paths,
+    ///   and on the path that writes it runs BEFORE the write. The only path that
+    ///   produces a row is the missing-row path below, and it asks
+    ///   [`KernelComposition::admit_uncommitted_cutover_candidate`] about the
+    ///   candidate generation and the Authority Epoch that row would carry before
+    ///   `commit_canonical_store_cutover_ownership` stages and commits it. A
+    ///   refused candidate therefore leaves NO committed `CUTOVER_OWNERSHIP` row
+    ///   naming its generation and epoch, which is what "refused before
+    ///   activation" means on this ingress; the post-commit gate inside
+    ///   [`KernelComposition::apply_generation_cutover`] then decides the same
+    ///   candidate again for the already-committed-row path and as the post-commit
+    ///   re-check. It is the same gate and the same tuple on both, so the earlier
+    ///   consultation is never laxer; what the verdict can refuse from the values
+    ///   a caller supplies, and the ceiling of the fields it compares, are stated
+    ///   in `compatibility_gate`.
     ///
     /// ## The one cutover this ingress commits
     ///
@@ -1066,6 +1189,18 @@ impl KernelComposition {
                         field: "generation_cutover.request.cutover_id",
                         reason: "no cutover ownership record is recorded for this cutover",
                     })?;
+            // I1.12: the candidate's compatibility verdict is asked BEFORE this
+            // ingress writes anything. `apply_generation_cutover` re-runs the very
+            // same gate after the commit below, but a row committed here would
+            // name the refused candidate generation and Authority Epoch durably,
+            // so "refused before activation" has to be decided before the write
+            // and not only inside that inner sequence. The verdict is therefore
+            // consulted on both paths of this ingress, and the refusal is
+            // projected on the authenticated reply by
+            // `pre_gateway_refusal_outcome` with this frame's single terminal.
+            if let Err(error) = self.admit_uncommitted_cutover_candidate(replacement) {
+                return Ok(pre_gateway_refusal_outcome(request, error));
+            }
             // Same rule, and it has to run HERE: once this ingress writes the
             // row below, the route is switched from a record whose `migration`
             // this request supplied, so a rollback could be hidden by presenting
@@ -1167,6 +1302,55 @@ impl KernelComposition {
                 })
             }
         }
+    }
+
+    /// Asks the I1.12 candidate gate about a replacement that is NOT in ORS yet.
+    ///
+    /// The candidate generation and the Authority Epoch it would run under are
+    /// exactly the ones the committed row is about to carry: the row's
+    /// `new_generation` is this replacement's candidate generation, its
+    /// `new_epoch` is the claim's own, and the lineage the committed decision is
+    /// built from is the admitted session fence's own lineage (issue #64 - a
+    /// durable row projects scalar epoch sequences and never re-attaches a
+    /// lineage). Asking the gate with that tuple therefore decides the SAME
+    /// candidate the post-commit gate decides, one step earlier: while no
+    /// `CUTOVER_OWNERSHIP` row exists, so a refused candidate leaves nothing
+    /// behind that names its generation and epoch.
+    ///
+    /// It refuses nothing the post-commit gate would admit, and nothing this
+    /// ingress admitted before the ordering fix. Because the candidate epoch's
+    /// lineage is re-attached from the live service epoch here, the lineage half
+    /// of the gate is satisfied by construction on this path exactly as it is on
+    /// the committed path for the same tuple, and the envelope fields beyond it
+    /// cannot disagree on either path because one producer derives both sides (see
+    /// `compatibility_gate`). What this call buys is the ORDERING the acceptance
+    /// criterion names: the verdict is consulted before this ingress writes
+    /// anything, so "refused before activation" no longer depends on the verdict
+    /// being re-checked after a durable row already names the candidate. Nothing is
+    /// staged, committed or published on the way here, and a refusal is a refusal
+    /// of the frame, so no composition state is poisoned.
+    fn admit_uncommitted_cutover_candidate(
+        &self,
+        replacement: &GenerationCutoverReplacement,
+    ) -> Result<(), KernelServiceError> {
+        let claimed_new_epoch = std::num::NonZeroU64::new(replacement.cutover.new_epoch.value())
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "claimed cutover epoch is not representable".to_owned(),
+                )
+            })?;
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))?;
+        let candidate_epoch = EpochId::new(
+            service.authority_epoch().lineage_id.clone(),
+            claimed_new_epoch,
+        )
+        .map_err(|_| {
+            KernelServiceError::Platform("claimed cutover epoch is not representable".to_owned())
+        })?;
+        admit_cutover_candidate(&service, replacement.candidate_generation, &candidate_epoch)
     }
 }
 

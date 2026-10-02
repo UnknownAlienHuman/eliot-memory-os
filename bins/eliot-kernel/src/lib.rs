@@ -63,6 +63,7 @@ mod backup_verify_provenance;
 mod blackboard;
 mod blob_store_controller;
 mod canonical_store_runtime;
+mod compatibility_gate;
 mod composition_bootstrap;
 mod control_plane;
 pub mod coordination_mailbox;
@@ -611,8 +612,9 @@ pub use wasm_runtime_port_grant::{
 use canonical_store_runtime::attach_then_retain_canonical_store;
 #[cfg(windows)]
 pub(crate) use canonical_store_runtime::{
-    is_store_rebind_latest_committed, store_rebind_receipt_from_ors_record,
-    store_rebind_record_is_committed, store_rebind_record_is_pending, store_rebind_record_matches,
+    admit_rebound_store_bridge_compatibility, is_store_rebind_latest_committed,
+    store_rebind_receipt_from_ors_record, store_rebind_record_is_committed,
+    store_rebind_record_is_pending, store_rebind_record_matches,
 };
 #[cfg(all(test, windows))]
 use eliot_ipc::NamedPipeServer;
@@ -2333,6 +2335,20 @@ impl KernelComposition {
                         KernelBuildError::Service(e.to_string())
                     }
                 })?;
+        // I1.12 / #1968: the store bridge handshake is gated here too, through
+        // the ONE admission decision this binary owns, because this is a second
+        // live-gateway installation path — `KernelStoreGateway::new` below plus
+        // `replace_canonical_store` make the connected store the composition's
+        // canonical writer, exactly as `connect_canonical_store` does on the
+        // bootstrap seam. A store built against a different `eliot_store_api`
+        // presents a different contract-set digest and is refused here, before
+        // any gateway is built or installed. No versioned-artifact evidence is
+        // written here: the durable artifact of this transaction stays the
+        // `StoreRebindReplayRecord` alone.
+        admit_rebound_store_bridge_compatibility(
+            &requirement,
+            client.presented_store_api_contract_set_digest(),
+        )?;
         let route_scope = eliot_kernel_core::RouteScope::new(STORE_BRIDGE_ROUTE)
             .map_err(|e| KernelBuildError::Core(e.to_string()))?;
         let routes = self

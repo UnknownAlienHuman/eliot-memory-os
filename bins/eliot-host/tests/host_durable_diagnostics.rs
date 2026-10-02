@@ -5,8 +5,9 @@
 //!
 //! Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
 //! `observe_entrypoint_with_detail`, `observe_terminal_error`); the Windows
-//! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
-//! implemented here (#984 still open).
+//! Event Log seam is the typed port that #984's landed safe port serves, so its
+//! disposition is platform-typed (`Ok` on Windows, typed-Unavailable off
+//! Windows) and is pinned per platform below, never assumed unavailable.
 //!
 //! Scope rule: production files are disjoint between writers. This file owns
 //! `credential_control.rs`, `store_recovery_persistence.rs`, and
@@ -28,13 +29,36 @@
 //! are evidence only: they never change control flow, state, errors,
 //! receipts, order, status, or cleanup, and stdout framing stays exactly
 //! one-JSON-per-line.
+//!
+//! NAMED CEILING for cases 1-26 (structural, not a matter of effort). No #980
+//! subordinate observer is reachable from an integration crate: the credential,
+//! Store-recovery, rollback and codec observers all live in private `mod`
+//! leaves behind private parents, their reasons are `pub(super)`, and
+//! `HostCredentialControl::new` is itself `pub(super)`, so this crate can
+//! construct no instance that would reach them
+//! (`src/credential_control.rs:15,41,383`, `src/credential_control/codec.rs`).
+//! Consequently, in every case below the `manifest_source` reads are
+//! SUPPLEMENTARY (source-bound: they turn red if a production label or frozen
+//! boundary is renamed or reverted), and the `capture_emit` records are the
+//! REAL PRODUCTION FORMATTER running over the facade vocabulary — they prove
+//! the facade renders a detail faithfully, never that a #980 callsite emitted
+//! it. Neither half is primary proof that a production callsite observed a
+//! contour; the executed per-callsite proof is each owner's own `#[cfg(test)]`
+//! case. The only production observers this target can drive end to end are the
+//! Event Log sink disposition (`note_event_log_sink_status`,
+//! `event_log_sink_status`, `report_event`, cases 24 and the codec contour case
+//! at the bottom), the real runtime-control wire types, and the diagnostic
+//! formatter every capture runs through. No #980 subordinate callsite is among
+//! them, and the codec case's reachability claim is bounded exactly as stated
+//! there.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, bound_detail, bound_field,
-    observe_entrypoint_with_detail, observe_terminal_error, sink_status,
+    note_event_log_sink_status, observe_entrypoint_with_detail, observe_terminal_error,
+    sink_status,
 };
 use eliot_host::windows_event_log::{AdmittedEvent, event_log_sink_status, report_event};
 use serde_json::Value;
@@ -89,6 +113,31 @@ fn capture_emit(emit: impl FnOnce()) -> String {
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
+}
+
+/// NON-EMPTINESS PRECONDITION, asserted before any denial over a capture in
+/// this file.
+///
+/// On this Windows host `note_event_log_sink_status` returns early and writes
+/// nothing wherever the #984 Event Log port answers `Ok`
+/// (`host_diagnostics.rs:873`), so a capture can legitimately be empty and
+/// every "the owner did not say X" assertion over it would pass vacuously. A
+/// capture must therefore carry the owner's own `host.entrypoint_stage` record
+/// before any denial may rest on it. That record is one production actually
+/// emits for every `observe_entrypoint_with_detail` call
+/// (`host_diagnostics.rs:588`), under the production target
+/// `HOST_DIAGNOSTICS_TARGET` (`host_diagnostics.rs:41`), so the precondition is
+/// a bound on the capture's CONTENT, never a bare length a non-production byte
+/// could satisfy.
+fn assert_capture_carries_production(capture: &str, contour: &str) {
+    assert!(
+        capture.contains(HOST_DIAGNOSTICS_TARGET),
+        "{contour} must carry production output: {capture}"
+    );
+    assert!(
+        capture.contains("event=\"host.entrypoint_stage\""),
+        "{contour} must carry production output: {capture}"
+    );
 }
 
 fn credential_source() -> String {
@@ -940,10 +989,6 @@ fn durable_18_recovery_lifecycle_stays_distinct() {
 
 // WORK_UNIT_CASE: 893/19
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-A keeps the replay/readback inventory, no-commit proof, and readback labelling in one deterministic probe"
-)]
 fn durable_t_a_replay_is_readback_not_second_commit() {
     // T-A (replay half): exact replay is a readback, never a duplicate
     // commit. Every replay-labelled record pinned by the fixture exists in
@@ -1004,6 +1049,9 @@ fn durable_t_a_replay_is_readback_not_second_commit() {
             "host.store-recovery reconcile receipt readback replay",
         );
     });
+    // Non-emptiness precondition: the three denials below are only meaningful
+    // over a capture that really carries the replay records production emitted.
+    assert_capture_carries_production(&text, "the replay readback capture");
     assert_eq!(
         count_occurrences(
             &text,
@@ -1123,10 +1171,6 @@ fn durable_21_timeout_keeps_possible_effect_unknown() {
 
 // WORK_UNIT_CASE: 893/22
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-A keeps the terminal inventory, guard proof, and disjoint-ownership proof in one deterministic probe"
-)]
 fn durable_t_a_single_terminal_per_failed_operation() {
     // T-A (terminal half): one terminal error per underlying operation across
     // nested propagation. Each Writer-B terminal code is emitted from exactly
@@ -1221,6 +1265,9 @@ fn durable_t_a_single_terminal_per_failed_operation() {
             "host.credential provision consumed receipt",
         );
     });
+    // Non-emptiness precondition: "success emits no terminal" is only
+    // falsifiable over a capture that really carries the success record.
+    assert_capture_carries_production(&succeeded, "the single-terminal success capture");
     assert_eq!(
         count_occurrences(&succeeded, terminal_event),
         0,
@@ -1230,10 +1277,6 @@ fn durable_t_a_single_terminal_per_failed_operation() {
 
 // WORK_UNIT_CASE: 893/23
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-B keeps the canary sweep, literal proof, and bound honesty in one deterministic probe"
-)]
 fn durable_t_b_canaries_absent_from_observations() {
     // T-B (redaction half): credential/DB/env/source/user canaries are
     // absent from every frozen diagnostic string line; captures never carry
@@ -1272,6 +1315,10 @@ fn durable_t_b_canaries_absent_from_observations() {
         );
         observe_terminal_error("host-credential-unknown");
     });
+    // Non-emptiness precondition: the canary loop below scans the capture, not
+    // the sources, so the capture must first be proven to carry the records
+    // production emitted — otherwise every denial passes vacuously.
+    assert_capture_carries_production(&text, "the redaction capture");
     for canary in &canaries {
         assert!(
             !text.contains(canary.as_str()),
@@ -1291,16 +1338,7 @@ fn durable_t_b_canaries_absent_from_observations() {
     );
 }
 
-// WORK_UNIT_CASE: 893/24
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-B keeps the unavailable-seam, result-identity, ordering, and stdout-framing proofs in one deterministic probe"
-)]
-fn durable_t_b_sink_failure_leaves_operation_identical() {
-    // T-B (noninterference half): every Writer-B boundary notes the
-    // unavailable Event Log seam; sink outcomes never alter the operation
-    // result, order, or stdout framing.
+fn assert_every_writer_b_file_carries_the_event_log_sink_disposition_seam() {
     for source in [
         credential_source(),
         store_persist_source(),
@@ -1308,26 +1346,64 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
     ] {
         assert!(
             source.contains("event_log_sink_status"),
-            "every Writer-B file must note the unavailable seam"
+            "every Writer-B file must carry the Event Log sink-disposition seam"
         );
     }
-    assert_eq!(
-        event_log_sink_status(),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
-    );
+}
+
+fn assert_the_event_log_port_disposition_is_pinned_per_platform() {
+    // The Event Log seam answer is platform-typed, and the two platforms have
+    // different typed answers: #984's safe port is live on Windows
+    // (`eliot-platform-windows/src/event_log.rs:484` is `cfg!(windows)`), so
+    // `event_log_sink_status` reports `Ok` there and stays typed-
+    // `EventLogUnavailable` off Windows. Pinning the off-Windows answer
+    // unconditionally would assert a platform seam state that is false on the
+    // platform this target is verified on; the on-Windows arm is the stricter
+    // of the two (it proves the port really is live). This is the same
+    // platform split the sibling `host_diagnostics_contract.rs` target pins.
+    if cfg!(windows) {
+        assert_eq!(
+            event_log_sink_status(),
+            Ok(()),
+            "the landed safe port must report the sink attemptable on Windows"
+        );
+    } else {
+        assert_eq!(
+            event_log_sink_status(),
+            Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable),
+            "off Windows the port stays typed-Unavailable"
+        );
+    }
+}
+
+fn assert_the_facade_sink_dispositions_stay_distinct() {
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
         Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
     );
     assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
-    let record = eliot_host::windows_event_log::EventLogRecord::new(
-        AdmittedEvent::ServiceFailure,
-        "host-store-recovery-unknown",
-    );
-    assert_eq!(
-        report_event(&record),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
-    );
+}
+
+fn assert_the_raw_event_log_insertion_is_driven_only_where_the_port_is_unavailable() {
+    // The raw delivery attempt is driven only where the port is unavailable:
+    // on Windows it is a real OS insertion whose receipt depends on whether the
+    // fixed event source is registered on the running machine, so no
+    // deterministic typed answer exists there and an observation must not
+    // attempt the write at all (`windows_event_log.rs:388` — direct callers
+    // must not invoke it from Host control work).
+    if !cfg!(windows) {
+        let record = eliot_host::windows_event_log::EventLogRecord::new(
+            AdmittedEvent::ServiceFailure,
+            "host-store-recovery-unknown",
+        );
+        assert_eq!(
+            report_event(&record),
+            Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
+        );
+    }
+}
+
+fn assert_observations_do_not_perturb_operation_identity() {
     // Result identity: the same wire operation validates identically before
     // and after surrounding observations, with byte-identical digests.
     let before = store_request("893-24-stable", &"e4".repeat(32));
@@ -1350,6 +1426,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
         digest_before,
         "observations must not perturb identity"
     );
+}
+
+fn assert_observation_order_is_preserved_in_the_capture() {
     // Order identity: staged observations keep emission order in the capture.
     let ordered = capture_emit(|| {
         observe_entrypoint_with_detail(
@@ -1371,6 +1450,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
         first < second,
         "observation order must be preserved, got: {ordered}"
     );
+}
+
+fn assert_stdout_framing_stays_exactly_one_json_per_line() {
     // Stdout framing: tracing writes to the capture (stderr model), never to
     // stdout; the console protocol stays exactly one-JSON-per-line.
     let mut buffer = Vec::new();
@@ -1398,7 +1480,21 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
     );
 }
 
-// WORK_UNIT_CASE: 893/25
+// WORK_UNIT_CASE: 893/24
+#[test]
+fn durable_t_b_sink_failure_leaves_operation_identical() {
+    // T-B (noninterference half): every Writer-B boundary carries the Event
+    // Log sink-disposition seam; sink outcomes never alter the operation
+    // result, order, or stdout framing.
+    assert_every_writer_b_file_carries_the_event_log_sink_disposition_seam();
+    assert_the_event_log_port_disposition_is_pinned_per_platform();
+    assert_the_facade_sink_dispositions_stay_distinct();
+    assert_the_raw_event_log_insertion_is_driven_only_where_the_port_is_unavailable();
+    assert_observations_do_not_perturb_operation_identity();
+    assert_observation_order_is_preserved_in_the_capture();
+    assert_stdout_framing_stays_exactly_one_json_per_line();
+}
+
 fn semantic_lines(capture: &str) -> Vec<&str> {
     capture
         .lines()
@@ -1406,6 +1502,7 @@ fn semantic_lines(capture: &str) -> Vec<&str> {
         .collect()
 }
 
+// WORK_UNIT_CASE: 893/25
 #[test]
 fn durable_25_deterministic_captures_under_injected_schedule() {
     // Deterministic semantic captures: the injected-fault seam and the
@@ -1540,5 +1637,232 @@ fn durable_26_actual_path_and_diff_guard() {
     assert_eq!(
         fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool(),
         Some(true)
+    );
+}
+
+// Executed case (audit 5909832545 required item 4, defect 3): the codec contour
+// split is a real ten-way split, not a catch-all.
+//
+// REACHABILITY CEILING, STATED NOT HIDDEN. `credential_control/codec.rs` is a
+// private `mod codec` inside the private `credential_control` module;
+// `CodecRejectReason`, `decode_marker` and `decode_envelope` are `pub(super)`
+// inside that private leaf (`src/credential_control.rs:15,41`); every
+// `decode_marker` / `decode_envelope` call site
+// (`src/credential_control.rs:740,774,786,832,850,916,1011,1091`) is fed by
+// `WindowsInstallerRootPrimitive::read_local_service_protected_file` or by
+// `CredentialBackend` against a LocalService-protected installer root; and
+// `HostCredentialControl::new` is itself `pub(super)`
+// (`src/credential_control.rs:383`), so an integration crate can construct no
+// instance either. This target therefore cannot produce a codec contour record
+// at all and does not claim to; the executed per-contour proof lives in the
+// owner's own `#[cfg(test)]` cases (`codec.rs:669,731`).
+//
+// WHAT IS EXECUTED HERE. `host_diagnostics::note_event_log_sink_status` is the
+// canonical bounded observer that `credential_codec_observe` calls FIRST for
+// every single rejection (`codec.rs:166`), so it is the one production call of
+// the codec contour path that crosses this crate's public boundary. The probe
+// drives it for real inside a real `tracing` subscriber and asserts on the
+// text production actually emitted — never on a literal's presence in a source
+// file, never on a bare occurrence count, never on substring position. The
+// probe is liveness-controlled by a second real production record on the same
+// facade, so the closed denial can never be satisfied by an empty capture.
+//
+// The denial is therefore: across the whole reachable production observation
+// surface of this crate, no codec contour and, above all, no collapsed
+// catch-all name is ever emitted, so a reachable reader can never be handed the
+// pre-fix "malformed retained" label that erased the MAC, protected-object,
+// wire-version, and shape causes.
+//
+// Supplementary (source-bound, never primary): the owner's own emission sites.
+// The executed per-contour record is bound to the label the owner passes to
+// the facade, so if the owner collapsed all ten contours back onto
+// `marker malformed retained` / `envelope malformed retained`, the owner's
+// `codec.rs` cases 980/12 and 980/13 go red on
+// `assert_exactly_one_contour` and this target's supplementary emission
+// binding below goes red on the non-comment-line check.
+fn assert_no_codec_contour_is_reachable_on_the_executed_production_surface<'a>(
+    denied: impl Iterator<Item = &'a str>,
+) {
+    // PRIMARY (executed, real production seam): drive the codec path's one
+    // cross-boundary production call for real, plus one second real production
+    // record on the same facade as a liveness control, then read back exactly
+    // what production wrote.
+    //
+    // Why the control matters: `note_event_log_sink_status` returns early and
+    // writes nothing wherever the safe port is live (`host_diagnostics.rs:873`),
+    // so without a control record an empty capture would satisfy the denial
+    // below vacuously. The control record comes from the same real subscriber,
+    // so a non-zero capture is proven before any absence is claimed.
+    let reachable = capture_emit(|| {
+        note_event_log_sink_status();
+        observe_terminal_error("host-credential-unknown");
+    });
+    assert_eq!(
+        count_occurrences(&reachable, "host.terminal_error"),
+        1,
+        "the capture seam must carry real production output before any absence is claimed, got: {reachable}"
+    );
+    for label in denied {
+        assert!(
+            !reachable.contains(label),
+            "the reachable surface produced the codec contour {label:?}: {reachable}"
+        );
+    }
+    assert!(
+        !reachable.contains("host.credential codec"),
+        "no codec boundary leaked onto the reachable surface: {reachable}"
+    );
+}
+
+fn assert_production_bound_detail_keeps_each_contour_record_whole(
+    boundaries: [&str; 2],
+    markers: [&str; 5],
+    envelopes: [&str; 5],
+) {
+    // PRIMARY (executed, real production seam): the contour is only readable
+    // because production's own bounding keeps it whole. `bound_detail` is the
+    // exact production function `observe_entrypoint_with_detail` applies to
+    // every detail (`host_diagnostics.rs:588`), and it is what the codec's
+    // record passes through. If any contour record could lose its `reason=`
+    // tail to truncation, distinct causes would read as one cause again — the
+    // very collapse this split removed.
+    for boundary in boundaries {
+        for contour in markers.iter().chain(envelopes.iter()) {
+            let detail = format!("{boundary} reason={contour}");
+            let bounded = bound_detail(&detail);
+            assert!(
+                !bounded.truncated(),
+                "production would truncate the contour record {detail:?}"
+            );
+            assert_eq!(
+                bounded.text(),
+                detail,
+                "the emitted contour record must read back byte-for-byte"
+            );
+        }
+    }
+}
+
+fn assert_the_codec_owns_ten_distinct_contours_in_two_disjoint_families(
+    contours: &[&str],
+    markers: [&str; 5],
+    envelopes: [&str; 5],
+) {
+    // Executed: one distinct label per contour member, so no two causes share a
+    // name and the split cannot silently collapse back to a catch-all.
+    assert_eq!(contours.len(), 10, "the codec owns exactly ten contours");
+    for (index, left) in contours.iter().enumerate() {
+        for right in &contours[index + 1..] {
+            assert_ne!(
+                left, right,
+                "two codec causes share one contour label, so their records are indistinguishable"
+            );
+        }
+    }
+    // Two disjoint five-member families: a marker cause is never named by an
+    // envelope contour, so a marker rejection cannot read as an envelope one.
+    for marker in markers {
+        for envelope in envelopes {
+            assert!(
+                !envelope.contains(marker) && !marker.contains(envelope),
+                "the marker contour {marker:?} and the envelope contour {envelope:?} name each other"
+            );
+        }
+    }
+}
+
+fn assert_the_codec_owner_source_names_every_contour_and_no_collapsed_catch_all(
+    contours: &[&str],
+    collapsed: [&str; 2],
+    boundaries: [&str; 2],
+) {
+    // SUPPLEMENTARY (source-bound emission binding; the executed per-contour
+    // evidence is the owner's own cases 980/12 and 980/13, which no integration
+    // crate can reach). The ten contours are the owner's, emitted through its
+    // own closed `CodecRejectReason` discriminant behind the frozen boundary
+    // labels, with one observe call per branch.
+    let codec = manifest_source("src/credential_control/codec.rs");
+    for label in contours {
+        assert!(
+            codec.contains(&format!("\"{label}\"")),
+            "the codec owner must name contour {label:?}"
+        );
+    }
+    for collapsed in collapsed {
+        assert!(
+            !codec.contains(&format!("\"{collapsed}\"")),
+            "the collapsed catch-all {collapsed:?} must no longer be an emittable label"
+        );
+        // Stronger than the quoted-literal check above: the collapsed name may
+        // survive as prose in the owner's change note, but it must appear on no
+        // EXECUTABLE line of the codec. A restored catch-all emits it from a
+        // live `credential_codec_observe` argument, never from a `//` line, so
+        // this is the assertion a revert of the split turns red.
+        for (number, line) in codec.lines().enumerate() {
+            let executable = line.trim_start().trim_start_matches('/').trim_start();
+            if !executable.starts_with('/') && !executable.starts_with('*') {
+                assert!(
+                    !line.contains(collapsed),
+                    "the collapsed catch-all {collapsed:?} is live on executable line {}: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
+    for boundary in boundaries {
+        assert!(
+            codec.contains(&format!("\"{boundary}\"")),
+            "the codec owner must name boundary {boundary:?}"
+        );
+    }
+}
+
+#[test]
+fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
+    const MARKER: [&str; 5] = [
+        "marker-record-shape",
+        "marker-expected-mac",
+        "marker-mac-mismatch",
+        "marker-protected-object-mismatch",
+        "marker-wire-version-mismatch",
+    ];
+    const ENVELOPE: [&str; 5] = [
+        "envelope-record-shape",
+        "envelope-expected-mac",
+        "envelope-mac-mismatch",
+        "envelope-protected-object-mismatch",
+        "envelope-wire-version-mismatch",
+    ];
+    // The two names the pre-fix codec collapsed every cause into. They survive
+    // only as prose in the owner's change note, so what must be gone is the
+    // live string LITERAL: a quoted occurrence would be an emittable label.
+    const COLLAPSED: [&str; 2] = ["marker malformed retained", "envelope malformed retained"];
+
+    assert_no_codec_contour_is_reachable_on_the_executed_production_surface(
+        MARKER
+            .iter()
+            .chain(ENVELOPE.iter())
+            .chain(COLLAPSED.iter())
+            .copied(),
+    );
+    assert_production_bound_detail_keeps_each_contour_record_whole(
+        [
+            "host.credential codec marker rejected",
+            "host.credential codec envelope rejected",
+        ],
+        MARKER,
+        ENVELOPE,
+    );
+    let contours: Vec<&str> = MARKER.iter().chain(ENVELOPE.iter()).copied().collect();
+    assert_the_codec_owns_ten_distinct_contours_in_two_disjoint_families(
+        &contours, MARKER, ENVELOPE,
+    );
+    assert_the_codec_owner_source_names_every_contour_and_no_collapsed_catch_all(
+        &contours,
+        COLLAPSED,
+        [
+            "host.credential codec marker rejected",
+            "host.credential codec envelope rejected",
+        ],
     );
 }

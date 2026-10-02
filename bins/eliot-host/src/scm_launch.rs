@@ -21,35 +21,72 @@ use super::{HostError, HostLaunchOptions};
 //
 // Through the #889 facade only
 // (`super::host_diagnostics::observe_entrypoint_with_detail`,
-// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
-// (`super::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// `observe_terminal_error`, `bound_field`); the Event Log seam stays
+// typed-Unavailable (`super::windows_event_log::event_log_sink_status`), never
+// implemented here (#984 still open).
+//
+// Identity binding (audit #5910159678 defect 5): this module observes a typed
+// registration inspection and the platform's process/start information, but
+// the shared-facade records used to omit all of it, which made the
+// deterministic fields vacuous — two different SCM readbacks of the same
+// service produced identical records. Every record emitted from a site whose
+// owner already holds an identity now binds it: the canonical service name,
+// the expected configuration digest the request compared against, the
+// installation identity and transaction-plan generation when the caller
+// supplied them, the observed SCM state, the SCM progress checkpoint, and —
+// where the platform has already bound it — the observed process start
+// identity as `pid/creation-time`. The `Matching` observation's own
+// configuration digest is bound next to the requested one so a readback that
+// matched and a readback that was never compared are distinguishable, and the
+// `Unknown` payload's Win32 code, stage, raw state and PID are bound as the
+// platform's own typed diagnostic fields. A slot the owner does not hold reads
+// `unavailable`; nothing is invented.
+//
+// Never-logged (I15.4, I07.20): the registration nonce, image or bootstrap
+// paths, host state roots, process image paths, and the platform's or this
+// module's `Debug` renderings. `HostScmRegistrationCause::detail()` remains
+// the one place the bounded cause text is built, and it feeds the typed error
+// and the start-failure capsule, not a record.
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never service
-// names, digests, paths, PIDs, start-times, nonces, or arbitrary error text —
-// so bounding limits size, not sensitivity (I15.4). Sink outcome never alters
-// result/order/status/cleanup. There is no mutable global dedup cache: one
-// terminal emission per failed SCM bootstrap is enforced by the single
-// outermost guard in `validate_host_scm_bootstrap`; `classify_*` and
-// `resolve_*` correlate by stage order only and never emit a terminal. This
-// mirrors the `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891)
-// without touching it.
+// the semantic owner. Sink outcome never alters result/order/status/cleanup.
+// There is no mutable global dedup cache: one terminal emission per failed SCM
+// bootstrap is enforced by the single outermost guard in
+// `validate_host_scm_bootstrap`; `classify_*` and `resolve_*` emit subordinate
+// records and never a terminal. This mirrors the `HostTerminalGuard` model in
+// `lib.rs` (F-LOG-HOST-1, #891) without touching it.
 fn scm_launch_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
 }
 
-fn scm_launch_observe(detail: &str) {
+fn scm_launch_observe_bound(
+    detail: &str,
+    fields: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'_>,
+    )],
+) {
     scm_launch_note_event_log_unavailable();
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::ScmDispatch,
-        detail,
+        &super::host_job_launch::render_launch_identity(detail, fields),
     );
 }
 
 fn scm_launch_observe_terminal(code: &str) {
     scm_launch_note_event_log_unavailable();
     super::host_diagnostics::observe_terminal_error(code);
+}
+
+/// Renders one already-observed SCM process identity as `pid/creation-time`.
+///
+/// The pair is the platform's own start identity, so a readback that observed
+/// a specific process incarnation is distinguishable from one that only saw a
+/// PID, and from a later process reusing that PID (case 978/5). The value is
+/// read from the observation already in hand; this never opens, queries, or
+/// re-observes a process.
+fn scm_render_process_start_identity(process: &eliot_platform_windows::ProcessIdentity) -> String {
+    format!("{}/{}", process.process_id, process.start_time_100ns)
 }
 
 /// Single-terminal guard for one SCM bootstrap validation.
@@ -233,6 +270,201 @@ pub fn host_scm_unknown_is_transient_pending(detail: &ServiceInspectionUnknownDe
         && detail.current_state() == Some(HOST_SCM_START_PENDING_STATE)
 }
 
+/// Identity slots one `Matching` runtime readback contributes to a record.
+///
+/// The observation already carries the configuration digest SCM actually
+/// admitted, the observed SCM lifecycle state, the progress checkpoint, and —
+/// when SCM reported a live process — that process's exact start identity.
+/// Binding all of them is what makes a record prove a specific incarnation of
+/// the service rather than a phase label, so both `Matching` classification
+/// arms assemble them here and each arm adds only what is genuinely different
+/// about it.
+///
+/// `checkpoint` is `Some` only where the arm binds the SCM progress
+/// checkpoint; an arm that does not observe one passes `None` and the slot is
+/// not rendered at all. `process` is the start identity already rendered by
+/// [`scm_render_process_start_identity`], so the slot borrows the caller's
+/// binding rather than a temporary; an observation SCM reported no live
+/// process for reads `Unavailable`, exactly as before.
+fn scm_matching_observed_fields<'a>(
+    requested: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
+    observed_config_digest: &'a str,
+    state: ServiceState,
+    checkpoint: Option<u64>,
+    process: Option<&'a str>,
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
+    let mut fields = requested.to_vec();
+    fields.push((
+        "observed_config_digest",
+        super::host_job_launch::LaunchIdentityField::Text(observed_config_digest),
+    ));
+    fields.push((
+        "scm_state",
+        super::host_job_launch::LaunchIdentityField::Text(scm_state_name(state)),
+    ));
+    if let Some(checkpoint) = checkpoint {
+        fields.push((
+            "checkpoint",
+            super::host_job_launch::LaunchIdentityField::Number(checkpoint),
+        ));
+    }
+    fields.push((
+        "process",
+        match process {
+            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields
+}
+
+/// Identity slots one typed `Unknown` runtime readback contributes to a
+/// record.
+///
+/// The platform's own typed diagnostic fields for the failing stage are bound:
+/// the preserved Win32 code, the failing stage, the raw `dwCurrentState`, the
+/// observed PID, and whether that state is the transient `START_PENDING`
+/// checkpoint. The PID is recorded as a PID, never as a start identity — this
+/// readback carries no creation time, so the slot cannot claim one — and a
+/// stage, state, or PID the platform could not observe reads `Unavailable`.
+fn scm_unknown_diagnostic_fields<'a>(
+    requested: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
+    detail: &ServiceInspectionUnknownDetail,
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
+    let mut fields = requested.to_vec();
+    fields.push((
+        "win32_error",
+        super::host_job_launch::LaunchIdentityField::Number(u64::from(detail.win32_error())),
+    ));
+    fields.push((
+        "stage",
+        super::host_job_launch::LaunchIdentityField::Text(detail.stage()),
+    ));
+    fields.push((
+        "current_state",
+        match detail.current_state() {
+            Some(state) => super::host_job_launch::LaunchIdentityField::Number(u64::from(state)),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "pid",
+        match detail.process_id() {
+            Some(pid) => super::host_job_launch::LaunchIdentityField::Number(u64::from(pid)),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "transient_pending",
+        super::host_job_launch::LaunchIdentityField::Text(
+            if detail
+                .current_state()
+                .is_some_and(|state| state == HOST_SCM_START_PENDING_STATE)
+            {
+                "pending"
+            } else {
+                "not_pending"
+            },
+        ),
+    ));
+    fields
+}
+
+/// Identity slots one installed-candidate readback request contributes to a
+/// record.
+///
+/// The candidate spec is the identity this readback is about: the candidate
+/// installation identity, its immutable transaction-plan generation, and its
+/// approved config descriptor digest — all three borrowed from the spec the
+/// caller holds, so both the requested record below and the observed record
+/// after the platform read share one binding. The candidate image, descriptor,
+/// state root and platform root are paths and never enter a record.
+fn scm_candidate_identity(
+    spec: &InstalledCandidateSpec,
+) -> [(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'_>,
+); 3] {
+    [
+        (
+            "installation",
+            super::host_job_launch::LaunchIdentityField::Text(spec.installation_id.as_str()),
+        ),
+        (
+            "plan_generation",
+            super::host_job_launch::LaunchIdentityField::Number(spec.transaction_plan_generation),
+        ),
+        (
+            "config_digest",
+            super::host_job_launch::LaunchIdentityField::Text(
+                spec.config_descriptor_digest.as_str(),
+            ),
+        ),
+    ]
+}
+
+/// Identity slots one installed-candidate readback observation contributes to
+/// a record.
+///
+/// Beside the candidate identity its owner already holds, the observed
+/// registration identity and the desired-side manifest presence are bound: the
+/// SCM configuration digest that was actually read back, the class of the
+/// readback outcome, the process start identity when SCM reported one, and
+/// whether an installed manifest was found. The manifest's own artifact
+/// digests stay in the returned readback and never enter a record, and a
+/// readback that reported no live process reads `Unavailable`.
+fn scm_candidate_readback_observed_fields<'a>(
+    identity: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
+    observed_config_digest: &'a str,
+    inspection: &ServiceRegistrationRuntimeInspection,
+    observed_process: Option<&'a str>,
+    manifest_installed: bool,
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
+    let mut fields = identity.to_vec();
+    fields.push((
+        "observed_config_digest",
+        super::host_job_launch::LaunchIdentityField::Text(observed_config_digest),
+    ));
+    fields.push((
+        "inspection",
+        super::host_job_launch::LaunchIdentityField::Text(scm_inspection_class(inspection)),
+    ));
+    fields.push((
+        "process",
+        match observed_process {
+            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    fields.push((
+        "manifest",
+        super::host_job_launch::LaunchIdentityField::Text(if manifest_installed {
+            "installed"
+        } else {
+            "absent"
+        }),
+    ));
+    fields
+}
+
 /// Pure projection from a platform runtime registration inspection to the
 /// typed host-side cause. Returns `None` only for an admissible `Matching`
 /// observation; every other outcome maps to its fail-closed cause, so
@@ -271,31 +503,81 @@ pub fn classify_host_scm_inspection(
     request: &ServiceRegistrationRequest,
     inspection: &ServiceRegistrationRuntimeInspection,
 ) -> Option<HostScmRegistrationCause> {
+    // The identity this classifier's owner already holds: the canonical
+    // service name the request asked about and the expected configuration
+    // digest it compared against. Both are non-secret approved request values.
+    // The accessor returns an owned digest, so it is bound to a named local
+    // here and the identity slots below borrow that binding for the whole
+    // classification rather than a temporary that dies at the end of the
+    // array expression.
+    let expected_configuration_digest = request.expected_configuration_digest();
+    let requested = [
+        (
+            "service",
+            super::host_job_launch::LaunchIdentityField::Text(request.service_name()),
+        ),
+        (
+            "expected_config_digest",
+            super::host_job_launch::LaunchIdentityField::Text(
+                expected_configuration_digest.as_str(),
+            ),
+        ),
+    ];
     // WORK_UNIT_CASE: 978/5 — classification requested; request vs observed
     // process and start-identity vs PID stay distinct below.
-    scm_launch_observe("host.scm-launch classification requested");
+    scm_launch_observe_bound("host.scm-launch classification requested", &requested);
     match inspection {
         ServiceRegistrationRuntimeInspection::Matching { observation }
             if host_runtime_bootstrap_state_is_admissible(observation.state()) =>
         {
+            // The observation is the platform's own readback: it carries the
+            // configuration digest SCM actually admitted, the SCM state, the
+            // progress checkpoint, and — when SCM reported a live process —
+            // that process's exact start identity. Binding all of them is what
+            // makes this record prove a specific incarnation of the service
+            // rather than a phase label.
+            let process = observation.process().map(scm_render_process_start_identity);
+            let fields = scm_matching_observed_fields(
+                &requested,
+                observation.configuration_digest(),
+                observation.state(),
+                Some(u64::from(observation.checkpoint())),
+                process.as_deref(),
+            );
             // WORK_UNIT_CASE: 978/5 — start-identity observed: the admissible
             // service identity + state accepts bootstrap; the ephemeral PID is
             // never identity.
-            scm_launch_observe("host.scm-launch start-identity observed");
+            scm_launch_observe_bound("host.scm-launch start-identity observed", &fields);
             None
         }
-        ServiceRegistrationRuntimeInspection::Matching { .. } => {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => {
+            // The same observed identity is bound here, so an inadmissible
+            // state is distinguishable from the admissible readback of the very
+            // same service and configuration instead of producing the same two
+            // static strings. This arm observes no progress checkpoint, so it
+            // renders no `checkpoint` slot at all.
+            let process = observation.process().map(scm_render_process_start_identity);
+            let fields = scm_matching_observed_fields(
+                &requested,
+                observation.configuration_digest(),
+                observation.state(),
+                None,
+                process.as_deref(),
+            );
             // WORK_UNIT_CASE: 978/5 — admissible start-identity absent; the
             // observed state cannot bootstrap.
-            scm_launch_observe("host.scm-launch start-identity unknown");
+            scm_launch_observe_bound("host.scm-launch start-identity unknown", &fields);
             Some(HostScmRegistrationCause::Unknown {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
         ServiceRegistrationRuntimeInspection::Absent => {
             // WORK_UNIT_CASE: 978/5 — SCM request observed: the canonical
-            // registration request has no observed process.
-            scm_launch_observe("host.scm-launch request observed");
+            // registration request has no observed process. No process, state,
+            // or observed digest exists for an absent registration, so those
+            // slots stay explicitly unavailable rather than filled with the
+            // request's own values.
+            scm_launch_observe_bound("host.scm-launch request observed", &requested);
             Some(HostScmRegistrationCause::Absent {
                 service_name: request.service_name().to_owned(),
                 configuration_digest: request.expected_configuration_digest(),
@@ -303,25 +585,63 @@ pub fn classify_host_scm_inspection(
         }
         ServiceRegistrationRuntimeInspection::Mismatched => {
             // WORK_UNIT_CASE: 978/5 — observed process exists but is not the
-            // requested registration.
-            scm_launch_observe("host.scm-launch process observed");
+            // requested registration. `Mismatched` is a unit variant, so the
+            // platform reports no field-level detail: the observed process
+            // identity is genuinely unavailable here and says so.
+            scm_launch_observe_bound(
+                "host.scm-launch process observed",
+                &[
+                    requested.as_slice(),
+                    [(
+                        "process",
+                        super::host_job_launch::LaunchIdentityField::Unavailable,
+                    )]
+                    .as_slice(),
+                ]
+                .concat(),
+            );
             Some(HostScmRegistrationCause::Mismatched {
                 inspection_debug: format!("{inspection:?}"),
             })
         }
         ServiceRegistrationRuntimeInspection::Unknown { detail } => {
+            // The platform's own typed diagnostic fields for the failing stage
+            // are bound: the preserved Win32 code, the failing stage, the raw
+            // `dwCurrentState`, and the observed PID. The PID is recorded as a
+            // PID, never as a start identity — this readback carries no
+            // creation time, so the slot cannot claim one.
+            let fields = scm_unknown_diagnostic_fields(&requested, detail);
             // WORK_UNIT_CASE: 978/5 — ephemeral PID observation; never
             // promoted into start-identity.
-            scm_launch_observe("host.scm-launch pid observed");
+            scm_launch_observe_bound("host.scm-launch pid observed", &fields);
             // Typed payload carry-over: preserve win32_error/stage/state/pid
             // explicitly via the typed rendering plus Debug verbatim. Both
-            // stay bounded through truncate_host_scm_cause downstream.
-            // SACL is never requested (platform DACL-only); Unknown stays
-            // fail-closed 1066/3.
+            // stay bounded through truncate_host_scm_cause downstream and
+            // reach only the typed error and the start-failure capsule, never a
+            // record. SACL is never requested (platform DACL-only); Unknown
+            // stays fail-closed 1066/3.
             Some(HostScmRegistrationCause::Unknown {
                 inspection_debug: format!("{} | {inspection:?}", detail.detail()),
             })
         }
+    }
+}
+
+/// Stable secret-free name for one observed SCM lifecycle state.
+///
+/// A projection of the owner's typed [`ServiceState`] discriminant only, so a
+/// record names the observed state without rendering the provider's own
+/// `Debug` output. The mapping is exhaustive, so a new state forces this to
+/// stay in sync; it names a state and grants nothing (I14.20).
+fn scm_state_name(state: ServiceState) -> &'static str {
+    match state {
+        ServiceState::Unknown => "unknown",
+        ServiceState::Absent => "absent",
+        ServiceState::Stopped => "stopped",
+        ServiceState::Starting => "starting",
+        ServiceState::Running => "running",
+        ServiceState::Stopping => "stopping",
+        ServiceState::Failed => "failed",
     }
 }
 
@@ -372,10 +692,29 @@ trait HostScmBootstrapProbe {
 fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
     probe: &mut P,
 ) -> ServiceRegistrationRuntimeInspection {
+    // The bounded re-read budget is the identity this site holds before the
+    // loop runs: the total inspections it may issue and the fixed sleep
+    // between them. Binding them distinguishes this re-read loop from any
+    // other, and makes the record state the exact budget that was granted.
+    let budget = [
+        (
+            "max_inspections",
+            super::host_job_launch::LaunchIdentityField::Number(
+                HOST_SCM_TRANSIENT_MAX_INSPECTIONS as u64,
+            ),
+        ),
+        (
+            "retry_sleep_ms",
+            super::host_job_launch::LaunchIdentityField::Number(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS),
+        ),
+    ];
     // WORK_UNIT_CASE: 978/13 — deterministic probe schedule requested; the
     // injected inspection script drives the bounded re-read loop.
-    scm_launch_observe("host.scm-launch probe requested");
+    scm_launch_observe_bound("host.scm-launch probe requested", &budget);
     let mut current = probe.inspect();
+    // Number of inspections actually issued, counted from the loop's own
+    // index; it is a property of the schedule that ran, not a new probe.
+    let mut issued: u64 = 1;
     for _ in 1..HOST_SCM_TRANSIENT_MAX_INSPECTIONS {
         let transient = matches!(
             &current,
@@ -387,11 +726,87 @@ fn resolve_host_scm_inspection_with_probe<P: HostScmBootstrapProbe>(
         }
         probe.sleep_ms(HOST_SCM_TRANSIENT_RETRY_SLEEP_MS);
         current = probe.inspect();
+        issued += 1;
     }
     // WORK_UNIT_CASE: 978/5 — settled PID observation; start-identity
-    // admission stays with the classifier, never invented here.
-    scm_launch_observe("host.scm-launch pid observed");
+    // admission stays with the classifier, never invented here. The record
+    // binds the settled observation's own identity — the configuration digest
+    // SCM admitted and the process start identity when it reported one — plus
+    // how many inspections the schedule actually consumed, so two runs of the
+    // same budget that settled differently stay distinguishable.
+    let mut fields = budget.to_vec();
+    fields.push((
+        "inspections_issued",
+        super::host_job_launch::LaunchIdentityField::Number(issued),
+    ));
+    // The settled inspection's process start identity is rendered once, into a
+    // named local that outlives the branch below, so the identity slot can
+    // borrow it for the whole record instead of a temporary scoped to the
+    // `Matching` arm. It reads the settled readback already in hand and never
+    // queries a process.
+    let settled_process = scm_inspection_process(&current).map(scm_render_process_start_identity);
+    if let ServiceRegistrationRuntimeInspection::Matching { observation } = &current {
+        fields.push((
+            "observed_config_digest",
+            super::host_job_launch::LaunchIdentityField::Text(observation.configuration_digest()),
+        ));
+        fields.push((
+            "scm_state",
+            super::host_job_launch::LaunchIdentityField::Text(scm_state_name(observation.state())),
+        ));
+        fields.push((
+            "process",
+            match settled_process.as_deref() {
+                Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+                None => super::host_job_launch::LaunchIdentityField::Unavailable,
+            },
+        ));
+    } else {
+        fields.push((
+            "observed_config_digest",
+            super::host_job_launch::LaunchIdentityField::Unavailable,
+        ));
+        fields.push((
+            "scm_state",
+            super::host_job_launch::LaunchIdentityField::Text(scm_inspection_class(&current)),
+        ));
+        fields.push((
+            "process",
+            super::host_job_launch::LaunchIdentityField::Unavailable,
+        ));
+    }
+    scm_launch_observe_bound("host.scm-launch pid observed", &fields);
     current
+}
+
+/// Stable secret-free class name for a non-`Matching` inspection outcome.
+///
+/// Names which outcome the readback produced — never the provider's `Debug`
+/// text, which may embed a path. It names an outcome and grants nothing.
+fn scm_inspection_class(inspection: &ServiceRegistrationRuntimeInspection) -> &'static str {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { .. } => "matching",
+        ServiceRegistrationRuntimeInspection::Absent => "absent",
+        ServiceRegistrationRuntimeInspection::Mismatched => "mismatched",
+        ServiceRegistrationRuntimeInspection::Unknown { .. } => "unknown",
+    }
+}
+
+/// The platform-observed process identity carried by one inspection, if any.
+///
+/// Only a `Matching` observation carries the handle-observed process identity;
+/// every other outcome leaves it genuinely absent, and the caller renders that
+/// absence explicitly. This is a pure read of a value already in hand and
+/// never queries SCM or a process.
+fn scm_inspection_process(
+    inspection: &ServiceRegistrationRuntimeInspection,
+) -> Option<&eliot_platform_windows::ProcessIdentity> {
+    match inspection {
+        ServiceRegistrationRuntimeInspection::Matching { observation } => observation.process(),
+        ServiceRegistrationRuntimeInspection::Absent
+        | ServiceRegistrationRuntimeInspection::Mismatched
+        | ServiceRegistrationRuntimeInspection::Unknown { .. } => None,
+    }
 }
 
 /// Production probe: live runtime-contour inspection plus real thread sleep.
@@ -438,11 +853,35 @@ impl HostScmBootstrapProbe for WindowsScmBootstrapProbe<'_> {
 pub fn validate_host_scm_bootstrap(
     launch_options: &HostLaunchOptions,
 ) -> Result<ValidatedHostScmLaunch, HostError> {
+    // The launch options are the identity this site holds on entry: the
+    // installation identity, the immutable transaction-plan generation, and
+    // the approved config descriptor digest. The registration nonce and every
+    // path in these options are never recorded.
+    let identity = [
+        (
+            "installation",
+            super::host_job_launch::LaunchIdentityField::Text(
+                launch_options.installation().as_str(),
+            ),
+        ),
+        (
+            "plan_generation",
+            super::host_job_launch::LaunchIdentityField::Number(
+                launch_options.transaction_plan_generation(),
+            ),
+        ),
+        (
+            "config_digest",
+            super::host_job_launch::LaunchIdentityField::Text(
+                launch_options.config_descriptor_digest().as_str(),
+            ),
+        ),
+    ];
     // WORK_UNIT_CASE: 978/5 — SCM bootstrap requested; the single outermost
     // contour owns the one terminal below (#891 owns nothing here; main.rs
     // ServiceMain projects the stop receipt without its own diagnostics
     // terminal).
-    scm_launch_observe("host.scm-launch requested");
+    scm_launch_observe_bound("host.scm-launch requested", &identity);
     // WORK_UNIT_CASE: 978/10 — one terminal across the SCM nesting:
     // classification and probe correlate by stage order only; only this guard
     // may emit the SCM unknown code.
@@ -489,12 +928,52 @@ pub fn validate_host_scm_bootstrap(
         resolve_host_scm_inspection_with_probe(&mut probe)
     };
     if let Some(cause) = classify_host_scm_inspection(&registration, &inspection) {
+        // The typed cause class is the reason this bootstrap failed, and it is
+        // an owner-defined closed vocabulary (`absent` / `mismatched` /
+        // `unknown`) rather than free text, so it is bound alongside the
+        // installation identity. The cause's own detail string stays with the
+        // typed error and the start-failure capsule.
+        let mut fields = identity.to_vec();
+        fields.push((
+            "reason",
+            super::host_job_launch::LaunchIdentityField::Text(cause.cause()),
+        ));
+        scm_launch_observe_bound("host.scm-launch rejected", &fields);
         return Err(HostError::Platform(cause.detail()));
     }
     scm_terminal.disarm();
+    // The settled inspection is in hand here, so the admitted record binds the
+    // configuration digest SCM actually admitted and the exact process start
+    // identity it reported. The service name and configuration digest of the
+    // validated request are the ones compared against it.
+    let mut fields = identity.to_vec();
+    fields.push((
+        "observed_config_digest",
+        match &inspection {
+            ServiceRegistrationRuntimeInspection::Matching { observation } => {
+                super::host_job_launch::LaunchIdentityField::Text(
+                    observation.configuration_digest(),
+                )
+            }
+            _ => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
+    // The admitted inspection's exact process start identity is rendered into a
+    // named local that outlives the record below, so the identity slot borrows
+    // the binding rather than a temporary that would be dropped at the end of
+    // the push expression.
+    let admitted_process =
+        scm_inspection_process(&inspection).map(scm_render_process_start_identity);
+    fields.push((
+        "process",
+        match admitted_process.as_deref() {
+            Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+            None => super::host_job_launch::LaunchIdentityField::Unavailable,
+        },
+    ));
     // WORK_UNIT_CASE: 978/5 — SCM request admitted against the observed
     // start-identity; exact error propagation above is unchanged.
-    scm_launch_observe("host.scm-launch admitted");
+    scm_launch_observe_bound("host.scm-launch admitted", &fields);
     Ok(ValidatedHostScmLaunch {
         bootstrap,
         registration,
@@ -653,7 +1132,33 @@ pub fn publish_supervision_record_table(
     host_state_root: &Path,
     table: &SupervisionRecordTable,
 ) -> Result<(), HostError> {
-    scm_launch_observe("host.scm-launch supervision record publish requested");
+    // The table is the identity this publication is about: the installation
+    // identity that published it, the Host epoch sequence and lineage it was
+    // published under, and the number of canonical component rows it carries.
+    // The per-row cells (artifact digests, descriptors, roots) stay in the
+    // retained record and are never copied into a diagnostic record.
+    let published = [
+        (
+            "installation",
+            super::host_job_launch::LaunchIdentityField::Text(table.installation.as_str()),
+        ),
+        (
+            "host_epoch_sequence",
+            super::host_job_launch::LaunchIdentityField::Number(table.host_epoch_sequence),
+        ),
+        (
+            "host_lineage",
+            super::host_job_launch::LaunchIdentityField::Text(table.host_lineage.as_str()),
+        ),
+        (
+            "rows",
+            super::host_job_launch::LaunchIdentityField::Number(table.rows.len() as u64),
+        ),
+    ];
+    scm_launch_observe_bound(
+        "host.scm-launch supervision record publish requested",
+        &published,
+    );
     table.validate().map_err(|error| {
         HostError::Platform(format!("supervision record is not publishable: {error}"))
     })?;
@@ -683,7 +1188,10 @@ pub fn publish_supervision_record_table(
     let cleanup = std::fs::remove_file(&tmp);
     let sync_after_cleanup = sync_dir(host_state_root);
     if let Err(publication_error) = publication {
-        scm_launch_observe("host.scm-launch supervision record publication failed");
+        scm_launch_observe_bound(
+            "host.scm-launch supervision record publication failed",
+            &published,
+        );
         return Err(publication_error);
     }
     match cleanup {
@@ -702,7 +1210,16 @@ pub fn publish_supervision_record_table(
             "supervision record readback differs from the published table".to_owned(),
         ));
     }
-    scm_launch_observe("host.scm-launch supervision record published");
+    // The readback matched the published table exactly (`reloaded != *table`
+    // returned above), so the published identity is the confirmed one; the
+    // confirmed row count is bound so two publications of different topologies
+    // stay distinguishable.
+    let mut verified = published.to_vec();
+    verified.push((
+        "verified_rows",
+        super::host_job_launch::LaunchIdentityField::Number(reloaded.rows.len() as u64),
+    ));
+    scm_launch_observe_bound("host.scm-launch supervision record published", &verified);
     Ok(())
 }
 
@@ -845,7 +1362,12 @@ pub struct InstalledCandidateReadback {
 pub fn read_installed_candidate_contour(
     spec: &InstalledCandidateSpec,
 ) -> Result<InstalledCandidateReadback, HostError> {
-    scm_launch_observe("host.scm-launch installed candidate readback requested");
+    // The candidate spec is the identity this readback is about.
+    let identity = scm_candidate_identity(spec);
+    scm_launch_observe_bound(
+        "host.scm-launch installed candidate readback requested",
+        &identity,
+    );
     let bootstrap = ServiceBootstrapArguments::new(
         spec.config_descriptor_path.clone(),
         spec.config_descriptor_digest.clone(),
@@ -908,7 +1430,28 @@ pub fn read_installed_candidate_contour(
                 })
         }
     };
-    scm_launch_observe("host.scm-launch installed candidate readback observed");
+    // The observed registration identity and the desired-side manifest
+    // presence are in hand here, so the record binds the SCM configuration
+    // digest that was actually read back, the class of the readback outcome,
+    // the process start identity when SCM reported one, and whether an
+    // installed manifest was found. The manifest's own artifact digests stay in
+    // the returned readback and never enter a record.
+    // The observed process start identity is rendered into a named local that
+    // outlives the record below, so the identity slot borrows the binding rather
+    // than a temporary that would be dropped at the end of the push expression.
+    let observed_process =
+        scm_inspection_process(&inspection).map(scm_render_process_start_identity);
+    let fields = scm_candidate_readback_observed_fields(
+        &identity,
+        &configuration_digest,
+        &inspection,
+        observed_process.as_deref(),
+        manifest.is_some(),
+    );
+    scm_launch_observe_bound(
+        "host.scm-launch installed candidate readback observed",
+        &fields,
+    );
     Ok(InstalledCandidateReadback {
         service_name,
         configuration_digest,

@@ -11,7 +11,7 @@ title = "Host diagnostic coverage: file/boundary/propagation/test/owner table"
 baseline_commit = "aed215f68f9e34eaff7276440471a33579f4015b"
 baseline_tree = "ead5b35a2d1eae8b43f116d490694155b98e22ba"
 baseline_count = 45
-current_count = 58
+current_count = 60
 ten_child_cases = 182
 
 [[deleted_file]]
@@ -64,6 +64,18 @@ owner = 1967
 note = "Host startup evidence producer"
 
 [[added_file]]
+path = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+created_in = "38a76fca"
+owner = 1953
+note = "I14.16 exclusive-Kernel-ownership evidence for the Host-mediated cutover"
+
+[[added_file]]
+path = "bins/eliot-host/src/user_mode_launcher.rs"
+created_in = "3d9eb4de"
+owner = 1771
+note = "current-user launcher / Task Scheduler registration (UserMode ingress)"
+
+[[added_file]]
 path = "bins/eliot-host/src/introduction_readback.rs"
 created_in = "c18a54ce"
 owner = 961
@@ -106,7 +118,7 @@ note = "#984 consumer seam (typed-unavailable)"
 
 [[file]]
 path = "bins/eliot-host/src/activation_lifecycle.rs"
-sha256 = "da6fc83aadd02a9d4e6f4236a4937c7e200de9f2dbe60fe6e9f32a95788f201d"
+sha256 = "ae08915c5ccbc701d7a6e3e9716f28612501ae350f8ebe30f7e0a20a55a27fed"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -116,7 +128,7 @@ owner = 891
 
 [[file]]
 path = "bins/eliot-host/src/backup_config_projection.rs"
-sha256 = "b0f8db57133413d403e4a4dc2dfb10b7b0b628a934a6782599ab965c78cd6c5a"
+sha256 = "3128f537d1b026b2178366b6e72524b159c515740a4dc1e5a61daa5d1a1e056f"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -126,7 +138,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_cutover.rs"
-sha256 = "ed71ad534890680342f414641ba5a17683e1877fbfa7c7a69bd13b2cde89a415"
+sha256 = "637964b08c9373ce78644aae70d8b70d2796fd838e89380f2e245f1ea1187913"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -136,7 +148,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_preparation.rs"
-sha256 = "20d7df25540244302876865d5f41604119ab22b5463503a9bb832c26436a95fb"
+sha256 = "87ae87174f2fe084ee8931f1a44ee3bf11c778a979f1d152fea0193c9314b59a"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -146,7 +158,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/credential_control.rs"
-sha256 = "cc045df6ba271a82fceb7adff96ed0664e311564762574dfcf54d741a4a4f5ae"
+sha256 = "4737c0b6cc1298a78faec0d3f4173e1d6c55e32ef78fb2d36b3481b7b9034fb2"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -156,7 +168,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/credential_control/codec.rs"
-sha256 = "0e1304429beb9c1552021ba88db1564970845aa31324133b06f5765b293574fa"
+sha256 = "5cee268fbfc34774cf00f738fa13efb94232ec2df74427a988fb9d0e2dfa69a5"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/credential_control.rs"
@@ -166,7 +178,7 @@ owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/host_activation_durable.rs"
-sha256 = "61b1bacd6da2405aad1fda101c48a8757a523d4e69b13f99653877029d5c5b78"
+sha256 = "e5178a5c94968b28c942040855fb0f1cea8c1cdef97ae8df2847957c918c43ba"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -176,7 +188,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_phase_b.rs"
-sha256 = "bb22203b9072922a9a95f079e56c40434dc9704f1c7db19fdcee64086427ff87"
+sha256 = "9e2490d80a981cf86407116f9f2227f3650b6eddd9d99e6c6f9d0943f6b63002"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -186,7 +198,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_store_recovery.rs"
-sha256 = "7ebf0428fe32793bcd2527fafb2e815b9587e2b76806e0359fd960101534dfda"
+sha256 = "a890672790788817e842cc889be4456e71d4a65c05690429f30631c13c27f7a8"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -196,7 +208,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_validation.rs"
-sha256 = "b3372a5f9af3162a43ce6ec39eb186bc05215803a25d049c243b28cb50368262"
+sha256 = "1415eb2524d07bcff8e096eac32a5cdfd8b8d3e8b9b29fdc23b3d04a4716c1cc"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -216,7 +228,7 @@ owner = 982
 
 [[file]]
 path = "bins/eliot-host/src/host_diagnostics.rs"
-sha256 = "3bf37eec18d285c7cf35027d8e5ccf297c9c27db7322d1e7ed03063c11913daf"
+sha256 = "8fad8ceffbe95e03bb3475c9df4944c2d2f52dc788b88f7b43421bdcbe664c79"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -230,23 +242,23 @@ sha256 = "83a212cc0584489eb33830ff558b90cf91b78dcb92aa90f77598a3d850141d95"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5199
+parent_line = 8927
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/host_epoch_reopen.rs"
-sha256 = "d5366e4dc173e90b83a0235903f519ba11d6552f68373767e4d77b5d37acb146"
+sha256 = "a5e21bfe4102cebbfdd402ba93d7cb5c49bf5c04cb396f6616ebaebedb1b97dd"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5190
+parent_line = 8918
 parent_cfg = ""
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/host_job_launch.rs"
-sha256 = "c6384881dadb06a583241fa7d18ae56bd36a0247babc3aea5dcfc6a354dc159c"
+sha256 = "c4190164d04c5a4a77208013f12520161c1b49892591351cf44219ae74d58b68"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -256,7 +268,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/host_launch_options.rs"
-sha256 = "a5ce65613fa19020a06e1a06d8f80d4d1f74de74f8ffd9ff3e7c5cd8772080d2"
+sha256 = "deafe77d015b9e411abac14d0bc7257b1203d9fb1acde26cd59c2bf4e77e3322"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/launch_options.rs"
@@ -266,11 +278,11 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/host_startup_evidence.rs"
-sha256 = "ada0bfdbd846bee76cd0fe8e243b0a8758d641ebd6284c1acd7d7ef6042df614"
+sha256 = "cbe16be94d95934240dd10bfe6b35095f5d05959a4b9bab2c87b6aa56fe0c739"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1845
+parent_line = 5345
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -286,11 +298,11 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/journal_append.rs"
-sha256 = "6a77d16415e83c327d06fdccf476fd18f0e7b100040784fcb51cb4972d85c790"
+sha256 = "5a7dffc60f5cafaffd13466122afb98e106a027001ab453c3e3d6742f9b6cb12"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5156
+parent_line = 8884
 parent_cfg = ""
 owner = 981
 
@@ -316,21 +328,41 @@ exclusion = "test_only"
 
 [[file]]
 path = "bins/eliot-host/src/journal_tests.rs"
-sha256 = "64e20f93d954f3f89cad38225c90318837797e402960bef2b30558bc49c8c1ce"
+sha256 = "3ce31d8c6227349e314212a7ec70bacc88b4e19cf6f0cfb6705e630eb52760cb"
 cfg = "test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10896
+parent_line = 16684
 parent_cfg = "#[cfg(test)]"
 exclusion = "test_only"
 
 [[file]]
-path = "bins/eliot-host/src/kernel_activation_driver.rs"
-sha256 = "0d3f92f103589f029f6a922f4c1f08d2acdf7b716529183ef6babc1b6da89036"
+path = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+sha256 = "1274a21499690da4c933c64cbf41aa272df59e0ea7785133f6703be5fb4343d8"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1840
+parent_line = 5340
+parent_cfg = "#[cfg(windows)]"
+owner = 1953
+
+[[file]]
+path = "bins/eliot-host/src/user_mode_launcher.rs"
+sha256 = "711c07eb58e5897ab84bd59af89fbe32242bfe2b7f3233b9929c361e5c71533b"
+cfg = "windows"
+target = "lib"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 5658
+parent_cfg = "#[cfg(windows)]"
+owner = 1771
+
+[[file]]
+path = "bins/eliot-host/src/kernel_activation_driver.rs"
+sha256 = "e26eb16dc6c22f91ae6b6852e0146e7ecda0a22798c5a7636fc8f2ab6d3fd449"
+cfg = "windows"
+target = "lib"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 5336
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -340,7 +372,7 @@ sha256 = "20655540abf52391be10131e3fc4519e41fff36eae1267b82dbec2b0fa6ef77e"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1847
+parent_line = 5347
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -357,7 +389,7 @@ exclusion_target = "bins/eliot-host/src/launch_artifact_lease.rs"
 
 [[file]]
 path = "bins/eliot-host/src/launch_artifact_lease.rs"
-sha256 = "7b3fd7c19e56cbc6a94303a8508ed26bf64c5dbc02aa483fef6fe742904985f2"
+sha256 = "b34cad39223286cc7922e5a2f39a9e922325ee35ce1affe3e034b6ec3b0a16f5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/launch_artifact.rs"
@@ -367,7 +399,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/launch_descriptor_validation.rs"
-sha256 = "3ffc592ff13a9f3e24af5f309c4c4f03e50c74f97953d7b22f0077d581143252"
+sha256 = "ce6a2bf877636745b9c93683dead7508c1c67f53ef751f4c1cda3115396219d8"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -392,13 +424,13 @@ sha256 = "c9444f75c24aaa4153c3d2d09c08c9a5b34e3db4a5253ded519095ced250c8c0"
 cfg = "test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1708
+parent_line = 5168
 parent_cfg = "#[cfg(test)]"
 exclusion = "test_only"
 
 [[file]]
 path = "bins/eliot-host/src/lease_drain.rs"
-sha256 = "7a83c0d8e25b269e8f9b91bb84d076de38588faefb248788f4ddd51c0c1f8098"
+sha256 = "5d3f0766862fda27466dca6077bcbd45c984472daaf081941cfdcae25506332f"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -408,14 +440,14 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/lib.rs"
-sha256 = "9f2c2ff81e3ec36e2a4952a5e55b38a588f90cd953d2386e4dd2776f89d45244"
+sha256 = "bf8ef9a5929d0dd285ed7df6c15393b1ba224be4c9afa7e43069a43f055c0948"
 cfg = "always"
 target = "lib"
 owner = 891
 
 [[file]]
 path = "bins/eliot-host/src/main.rs"
-sha256 = "66f79bc46357920d2ba99e67c1abf87ef5655117d0911108ec92fa920796b53f"
+sha256 = "afb1c545197412462de2c076efc65f5a2a1206e37a9c9dfb102dc5eb0e9f49c7"
 cfg = "bin"
 target = "bin"
 owner = 982
@@ -426,47 +458,47 @@ sha256 = "8501730bf489b5f3613f214aaf9d4220a647a8adb0b5869d4af783946509c2a6"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1795
+parent_line = 5291
 parent_cfg = ""
 owner = 1780
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_materialization.rs"
-sha256 = "f9aacb6dc9bc0b6c0245e8a08e3c94749fb60e318363c078912dc04104750312"
+sha256 = "a50f74d5c0e4bfe2ef0544fc4ed0329b7933caa297eb0f7c7d956b8fcc1f24bc"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1785
+parent_line = 5281
 parent_cfg = "#[cfg(windows)]"
 owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_materialization/rollback_backup.rs"
-sha256 = "a3b328388080cc4e905985f8cd8e6378d536830108617c080e7a220731ca92d5"
+sha256 = "699af6f2478770f25f44dd87af5d1b0e68882f8c904a413a9217603466a52be7"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/phase_b_materialization.rs"
-parent_line = 30
+parent_line = 31
 parent_cfg = ""
 owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_previous_authority.rs"
-sha256 = "6071bb5c6d9ffd2a42e334188c5acd99a85fff63995d9a2d7615492dfaeb0fb9"
+sha256 = "f0aa3186359854a195f3c360bf3e872724cf047ee9533890b157b9ef9deab2ab"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1777
+parent_line = 5273
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_previous_projection.rs"
-sha256 = "98894f97a1cb691e82b6fb3c4018895d1f987d7c1d9eeba82d26c91b87612e7b"
+sha256 = "25ae335a2693ef9733181ac9561ff2d61cc1fb8f7793ebe0ba1d5d74a0ce618f"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1805
+parent_line = 5301
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
@@ -476,13 +508,13 @@ sha256 = "a01dc364acb704a6f0e59c0a14139cc983f9d7c826b1ef8a1d9a15cd6f189ca5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1766
+parent_line = 5262
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/reactive_context_delivery.rs"
-sha256 = "e64aad1ca530b693e1fd2b936b5d96977d9d2cf6769e357ba65801d0da378c6e"
+sha256 = "4571d9a3a29771b763b7e47cb12f4751b9195e409430a2cc0b98fec5bd436248"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -496,13 +528,13 @@ sha256 = "55dc6a82abdd861c29bbe3b27e9c9c5130eca5302cd23c8ddc2861912e91df71"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 2156
+parent_line = 5656
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/readiness_gate/contract.rs"
-sha256 = "813939092580e5cb0f4230e14a655a6f515f7932841df0c6f1d08ce77cea073d"
+sha256 = "67c119e52f5a9565f451c19ee5dfebec8a2bbd2e7e1f233466f1a26b756874a6"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/readiness_gate.rs"
@@ -512,11 +544,11 @@ owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/runtime_restart_state.rs"
-sha256 = "29e8b98b1017d2462397816e50404bb3b1fea501a8ce003f1756897645a7b3d7"
+sha256 = "e5444187420071a4d96aa79022dd96319b99300437ca14a112b69bac3bad3e9c"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5202
+parent_line = 8930
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
@@ -526,13 +558,13 @@ sha256 = "5e31f80bc04b1b4f2908d84305abe2cae2a02994101f122eca8330d5695ef9c5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/runtime_restart_state.rs"
-parent_line = 12
+parent_line = 13
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/scm_launch.rs"
-sha256 = "abe7342726f25a27e0c44cdc56e2db3275dba5005eff17757e9d5f86df506484"
+sha256 = "468776909600dcc5474f024e2d9492a0607b1ea13c33a6512c1cbf52e3324638"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -542,7 +574,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/store_kernel_launch_sequence.rs"
-sha256 = "17763da3f27d53b0304ed09ee2f826ea5177a61d6b0928dc759e7a5ff7a9af56"
+sha256 = "01e4b0cec4412288f2ecccbcb6ce7bfd8e201600c21105590f88530fd30d82db"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -556,7 +588,7 @@ sha256 = "37223be2684562ca2733b42adaf5c6b87f4168cc3599862a5b9fce0ec8e4ffeb"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5232
+parent_line = 8961
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
@@ -566,17 +598,17 @@ sha256 = "19084819a1e99b590c9dd773a1c83c8401cede854c248a5e7e8c16b357f72b37"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5184
+parent_line = 8912
 parent_cfg = ""
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/store_recovery_persistence.rs"
-sha256 = "185312e1ceb98fc979fec4c057573f744b9fd903c49c8cf28cd1cdd47f65992a"
+sha256 = "e60d9d09629ba501cf1e0c044cc71092a1a23938e8b4b3d8cfb4722d61f82e74"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5215
+parent_line = 8944
 parent_cfg = "#[cfg(windows)]"
 owner = 893
 
@@ -586,7 +618,7 @@ sha256 = "8596fea4847953570275f1f298d64ddf72766576a7f1634a90fa71974f3cf62d"
 cfg = "windows+test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10899
+parent_line = 16687
 parent_cfg = "#[cfg(all(test, windows))]"
 exclusion = "test_only"
 
@@ -596,7 +628,7 @@ sha256 = "dd157772b1ac01b0e66d8c5d4ecc5051df9e6e162b0219ca060622519e7e7bf1"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5030
+parent_line = 8758
 parent_cfg = "#[cfg(windows)]"
 owner = 891
 
@@ -616,7 +648,7 @@ sha256 = "55c806edb037c59e91c088b7c632117d26fd4e68d97f74a30e9597b12a4892d9"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5022
+parent_line = 8750
 parent_cfg = "#[cfg(windows)]"
 owner = 979
 
@@ -636,7 +668,7 @@ sha256 = "3286273abaa64347b758245fc33582447752d98c5de33f14c96e639a9bf1a82d"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5002
+parent_line = 8730
 parent_cfg = "#[cfg(windows)]"
 owner = 979
 
@@ -656,7 +688,7 @@ sha256 = "2ee533570b62702d2bbe367657877d3d272dfb52dd0a2f826d3cb65a144de4cb"
 cfg = "windows+test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10893
+parent_line = 16681
 parent_cfg = "#[cfg(all(test, windows))]"
 exclusion = "test_only"
 
@@ -672,7 +704,7 @@ owner = 979
 
 [[file]]
 path = "bins/eliot-host/src/windows_event_log.rs"
-sha256 = "939e1bdb7d5d2e3ef643ee7ed5278c430b52d17c8e44793d2b42038e392267b0"
+sha256 = "196a64ca07ad0031ea7dc1e75a4ce74ae6f748f87e23bda97c4d4a90836afd73"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -686,31 +718,31 @@ sha256 = "e9fc646dcd19d6d4bf1f252f5b1c6d1508920a9343f067e42b981e0e48ac9ccf"
 
 [[input]]
 path = "bins/eliot-host/tests/host_console_diagnostics.rs"
-sha256 = "02d4ebec55c0879ad2b709b25278bf1015ea550a279d4baa523411723dc23686"
+sha256 = "64df32fbc7912875a9e8456d275de55f0f6f9702b0c3501581a257c877aab5b3"
 
 [[input]]
 path = "bins/eliot-host/tests/host_diagnostics_contract.rs"
-sha256 = "51a56f6f4a47706e2c796c4778f627b24f17d13126cc110dbb4fffd3c24f0f75"
+sha256 = "c828e42dd609344a697e226993c079f64dd130e5316f4bb06c2a70a573494200"
 
 [[input]]
 path = "bins/eliot-host/tests/host_durable_diagnostics.rs"
-sha256 = "82bfc8ba70326c5d78056514127d9c2cad81dea207fcb6ee157a5903fc5badda"
+sha256 = "db92a452d425e9dfa7f126d54cc955eb340bbc9fdd08821a64c9c86161b02499"
 
 [[input]]
 path = "bins/eliot-host/tests/host_journal_diagnostics.rs"
-sha256 = "8f140081621c1b755c4606ad5b0c0a0308da0881eec475d1a5b50f9dd3d68b48"
+sha256 = "88836cc2b359a298424268617c6e3657dd434cd6b5a780f0b153b2613bc38c81"
 
 [[input]]
 path = "bins/eliot-host/tests/host_launch_diagnostics.rs"
-sha256 = "bde8a47b9328da7f7cee6930cf3cd9a84894717f9318a5ab611126ba88673218"
+sha256 = "e3f3990054f582b02d12e876aff053b676bad21750bfbf31415094a7e1e965e1"
 
 [[input]]
 path = "bins/eliot-host/tests/host_lifecycle_diagnostics.rs"
-sha256 = "a37bf4050433c9123ef77d6b09163d953c36c3824da2218520e245b27b93d570"
+sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "3befa09939a5b2860ef39d06e5303c356fec50a0a46e71f50f6dc9df774ed8ad"
+sha256 = "ddb983f2b00327cc0f6678195d8da8fdb20edc22c6048220f55c42f275b1216a"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -734,7 +766,7 @@ sha256 = "f77096c538a0b31a9322c9c781566670dcc8eec3eacc733b618128a5da1f017a"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_lifecycle_diagnostics.json"
-sha256 = "a7f4912a1297d8ce912313453febb8cb2c5df31621f9b20d79a87ea71745fbf9"
+sha256 = "8a3aba564dd60ded15c2c2cb51d59f18c8d98c917bc8e2f467f21ae8ef8654e5"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
@@ -742,7 +774,7 @@ sha256 = "8810026f66cfd0d4bf48b7761dae1d1a7ed0e56c27bc005bbed72fa0186f3064"
 
 [[input]]
 path = "crates/kernel/eliot-platform-windows/src/event_log.rs"
-sha256 = "1da6da86d9d737c6e18cedad30dfc9818a6045e8e9ae902e3f94b42eb39ac041"
+sha256 = "4a69de321b2910025f86274c7680a8798e93ebcf4902e6a87c997a4e231d18c6"
 
 [[input]]
 path = "crates/kernel/eliot-platform-windows/tests/data/event-log/admitted-profile.json"
@@ -761,28 +793,28 @@ detail = "One global subscriber (OnceLock); stderr writer preserves stdout frami
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 122
-end = 132
-digest = "e96f9150d22e0e5fc2a81c34338e51999a347223da3fef5c0792c2fde01b4e8d"
+start = 260
+end = 293
+digest = "323ad7bb79fecc6f4ff561dacfaeb15cd4e1e04b5b4c2b9a0e87e8749c765ce8"
 markers = ["install_host_diagnostics", "try_init", "stderr", "AlreadyOwned"]
 [[boundary.site]]
-start = 103
-end = 108
-digest = "3bd66335a2cb5b09472be30bace183d17ef1b3c4d521a56e8b247e6cbb02a933"
+start = 244
+end = 251
+digest = "98c0f0d10c6311101cea76dbcc1836d3168819094dd7b841ebb915fc46e64b76"
 markers = ["sink_status", "EventLogUnavailable"]
 [[boundary.site]]
-start = 49
-end = 49
+start = 51
+end = 51
 digest = "7025a51f3237e71e9343e22c11aa71a30d401dea2f39ed16cbe69f53bc1d078f"
 markers = ["HOST_TERMINAL_CODE_DISPATCHER_FAILED", "dispatcher_failed"]
 [[boundary.site]]
-start = 53
-end = 53
+start = 55
+end = 55
 digest = "8272b0b3f9defca266812be5da475de5fdedc598d686071ce79a76ff947e5125"
 markers = ["HOST_TERMINAL_CODE_CONSOLE_FAILED", "console_failed"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 297
+line = 408
 text = "let _ = eliot_host::host_diagnostics::install_host_diagnostics();"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_diagnostics_contract.rs"
@@ -798,12 +830,12 @@ operation = "console protocol failed before durable shutdown (HOST-0 reference f
 phase = "console"
 scope = "wired"
 status = "proven"
-detail = "Process entry; sole observe_terminal_error in main.rs (count pinned ==1 by console test)."
+detail = "Process entry; NOT a sole observe_terminal_error. main.rs has exactly two emission sites, one per typed code: HOST_TERMINAL_CODE_CONSOLE_FAILED at main.rs:494 (this boundary's frozen site) and HOST_TERMINAL_CODE_DISPATCHER_FAILED at main.rs:1594 under #[cfg(windows)]. The third main.rs occurrence (main.rs:481) is a comment, not an emission. The invariant that holds is one emitter per typed code, not one emitter per file; the recorded count==1 claim was the false artifact, not main.rs."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 360
-end = 362
+start = 494
+end = 496
 digest = "1d1719049c0bb31628e2e225a8fa48fa8fa3c5f700af6c771aa3871626146dab"
 markers = ["observe_terminal_error", "HOST_TERMINAL_CODE_CONSOLE_FAILED"]
 code = "console_failed"
@@ -829,88 +861,83 @@ detail = "Stage-detail only; dispatcher_failed stays detail (main.rs:336-339), n
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 305
-end = 307
+start = 416
+end = 418
 digest = "38799c1f1512a90e974d07573d97bd90518a47fd3638f8651208b0f509403a9e"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 326
-end = 329
-digest = "6cb7b87d7352bd352e72ee07a6d56615d9be9961d3cce7276bc2091e01a4e879"
+start = 456
+end = 463
+digest = "a456329f64a8c12e5dfed6641a0974e2d9688a238c98ad06672d966cd06f0bb7"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 336
-end = 339
-digest = "97fa96e3827ca95f62fdd574a0b654ee1dfae9afa81edbdd207b604cdbaef631"
-markers = ["observe_entrypoint"]
-[[boundary.site]]
-start = 458
-end = 460
+start = 667
+end = 669
 digest = "cd1335e121de28e6160b2997d8c22d07a6499d2feb538170cf53569ec5093c6f"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 466
-end = 469
+start = 675
+end = 678
 digest = "0f8c3a4ef0cedc5cc91245c5c74b25d4626d27612e61eb4292431397d963077b"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 475
-end = 478
+start = 684
+end = 687
 digest = "2588b8457b02faa5f54fb3675a7b384c4fc42c9de682d15e1c95c475a9cb9c87"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 492
-end = 495
+start = 705
+end = 708
 digest = "3ff4a4e99951a979a0563721abb0c0f4181ed4c8c681489af75d1f4498455eef"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 511
-end = 514
+start = 747
+end = 750
 digest = "86261f02cd8c370911c0fb0ec44a7062a2c4ba8825b7873fe191865b2ce3880f"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 525
-end = 528
+start = 790
+end = 793
 digest = "28faf55270430e44edd2a0ab57a98d741f9a8e6671ce470fe013f1fbdb6d90a6"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 550
-end = 553
+start = 820
+end = 823
 digest = "e26881e0547c789277d9eb45cdb9b51922e5894731d0e704c9ca935c6a1bc305"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 658
-end = 661
+start = 1300
+end = 1303
 digest = "2b4e3731b13ff42d0c8519e5b42c8ad49fb841d788c96b90579da867c62744ee"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 674
-end = 677
-digest = "c694fb2aa9595a9b8b37e9d10a904863f7ad6cdc69e2153afea93d4e9b64d888"
+start = 1384
+end = 1387
+digest = "5da95c233d0bb312c9076bc9329370a48859c4f7fbe27b690970b84f9f686d0c"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 693
-end = 696
-digest = "e6eaf75ef5057c2c3eef832249bd90fa89efdec17c4fccea50b4f5bbfc69c3b4"
+start = 1403
+end = 1406
+digest = "faf6a914ab10fc591a98c6bf0d002d1fca0e499fb1984fde5fcb115b9a951011"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 713
-end = 716
-digest = "e6eaf75ef5057c2c3eef832249bd90fa89efdec17c4fccea50b4f5bbfc69c3b4"
+start = 1423
+end = 1426
+digest = "faf6a914ab10fc591a98c6bf0d002d1fca0e499fb1984fde5fcb115b9a951011"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 738
-end = 741
+start = 1354
+end = 1357
 digest = "f849fbd4852be54c0cc26ee5e65f05ae91cdf708ced57d7dbcf70c45f4bf9db5"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 762
-end = 765
+start = 1453
+end = 1456
 digest = "96f80451dd110ab2fa9c1306ea0aca29ac4c5a9deeed02b66730f22e7a782394"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 816
-end = 819
+start = 1525
+end = 1528
 digest = "39799c6c43786c3f509eee087617cded1ef2cf599c346a53c89898359efb25f3"
 markers = ["observe_entrypoint"]
 terminals = ["B-main-ref-terminal"]
@@ -933,9 +960,9 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 markers = ["HostStopCode::ScmRegisterNull", "HostStopCode::InvalidScmArgvOrBootstrap", "HostStopCode::InvalidRegistration", "HostStopCode::ReporterStartFailed", "HostStopCode::OpenHostFailed", "HostStopCode::ReporterProgressFailed", "HostStopCode::CredentialControlFailed", "HostStopCode::SpawnCredentialFailed", "HostStopCode::RuntimeControlFailed", "HostStopCode::SpawnRuntimeFailed", "HostStopCode::DurableShutdownFailed"]
 [[boundary.absence]]
-start = 933
-end = 1258
-digest = "da941b82be8067d3e306e17009a596163c44847679627f24d82c4dc5b5e7da70"
+start = 1770
+end = 2103
+digest = "e3855e4c61a6389f90682738f114bee2361ade44712fbd09837e95385cb956f4"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_console_diagnostics.rs"
 case = "host_console_boundaries_are_complete_and_singular"
@@ -954,19 +981,19 @@ detail = "Guard code pinned by journal_01 source guard; forced-failure execution
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6337
-end = 6337
+start = 10945
+end = 10945
 digest = "1002f975ee2919ca2ca15e997038ad1548763bee9910897728100e68bd9f737c"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_OPEN_TERMINAL"]
 [[boundary.site]]
-start = 1266
-end = 1266
+start = 1579
+end = 1579
 digest = "f1e49e58064d5f3a6f2a90c17699e8b7a926e20d6f7ba436db11d2ecd58c1797"
 markers = ["BOUNDARY_OPEN_TERMINAL", "boundary_by_event"]
 code = "host-open-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 593
+line = 1044
 text = "HostComposition::open(launch_options)"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_journal_diagnostics.rs"
@@ -986,19 +1013,19 @@ detail = "Guard code occurrence pinned by durable_t_a; execution is TEST-PHASE."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6677
-end = 6677
+start = 11427
+end = 11427
 digest = "1f9ee2a51c8f9229b7e1c56b9d4ba251dc6a1bc157d8663f2094bb68817f5c3f"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_CREDENTIAL_CONTROL_TERMINAL"]
 [[boundary.site]]
-start = 1278
-end = 1279
+start = 1591
+end = 1592
 digest = "720b0e0a3192a53c421eaa99d4c14d782a60614906faf03dc6bffa05f0580dc8"
 markers = ["BOUNDARY_CREDENTIAL_CONTROL_TERMINAL", "boundary_by_event"]
 code = "host-credential-control-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1080
+line = 1905
 text = "let credential_control = match host.credential_control() {"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_durable_diagnostics.rs"
@@ -1019,24 +1046,24 @@ detail = "Two early-return sites, same frozen code; no child test binds the op."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6715
-end = 6715
-digest = "a3d8716e6bd9d8e737f4d4117b6c10ecf35f38efb977bc7bf43457defd0502f1"
+start = 11469
+end = 11472
+digest = "6fe2858b19cd0e7ee94e4460284bdda2302c9afd18f0a327dfb5cb42dd7ad2b4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_TERMINAL"]
 [[boundary.site]]
-start = 6846
-end = 6846
-digest = "55f4997739b66a7861b146fbf3a49db11994c4679ea7b4b76acfdda2cb84673b"
+start = 11608
+end = 11611
+digest = "54eb3c50ee3b8f1b5f527fa02ff4876687977cb95d2873877f5d55fca061f49c"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_TERMINAL"]
 [[boundary.site]]
-start = 1286
-end = 1286
+start = 1599
+end = 1599
 digest = "9b45325c4d6bb42c4fa6876d747c653e687acf67683843375b97e4cfae3a1ae5"
 markers = ["BOUNDARY_PHASE_B_TERMINAL", "boundary_by_event"]
 code = "host-phase-b-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1594
+line = 2700
 text = "host.handle_phase_b_request(&intent, &credential_receipt)"
 
 [[boundary]]
@@ -1053,19 +1080,19 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6959
-end = 6959
-digest = "ee0dbee6ee60fa695bd0bf8254bfc291ecadeb92574d34d6244db93623d00d8d"
+start = 11730
+end = 11733
+digest = "3cb925333c7de339ba3248551d39d8c68c06affa60584801fe88152c0da2469d"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_FINALIZE_TERMINAL"]
 [[boundary.site]]
-start = 1296
-end = 1297
+start = 1609
+end = 1610
 digest = "36178daa0cc81d2d7f2763e32037989cf2162ff83b8fb24de7469a3ca8747385"
 markers = ["BOUNDARY_PHASE_B_FINALIZE_TERMINAL", "boundary_by_event"]
 code = "host-phase-b-finalize-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1602
+line = 2708
 text = "host.finalize_phase_b_request(&intent, &credential_receipt, &receipt)"
 
 [[boundary]]
@@ -1082,24 +1109,24 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6989
-end = 6989
-digest = "b3981933a2e14d47b877268cd53aca8ca6a184f9173402ef8654e26cca064be4"
+start = 11767
+end = 11770
+digest = "769860cceca609a3143d07c6ae6ad56261a65bc01e132ba81f1128a5088bc0cd"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7220
-end = 7220
-digest = "576e87ede89c0747c9f452b7d33880b45fd8d593ef0979c9d6fb9b776b5dfaec"
+start = 12006
+end = 12009
+digest = "3f2ec08f7d9d8f39420a21e259500c45b03050ac47bd25c1889c5cb7e56789ad"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 1302
-end = 1303
+start = 1615
+end = 1616
 digest = "54d037a0e7a85b2144edf1a67180ff485835a9437adcda53c7f0270d1e709ff3"
 markers = ["BOUNDARY_PHASE_B_RECONCILE_TERMINAL", "boundary_by_event"]
 code = "host-phase-b-reconcile-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1597
+line = 2703
 text = "host.reconcile_phase_b_request(&intent, &credential_receipt)"
 
 [[boundary]]
@@ -1116,19 +1143,19 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 7233
-end = 7233
+start = 12022
+end = 12022
 digest = "0064d8f8ff5d15408150ff60a31a91fd1624d59fd3a6a2e78b78814e0a1c3dc7"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_RUNTIME_CONTROL_TERMINAL"]
 [[boundary.site]]
-start = 1312
-end = 1313
+start = 1625
+end = 1626
 digest = "2d7b7fad14a657c4956003b6917be48bd532a84ab572dfdb91a01540dedbd1f8"
 markers = ["BOUNDARY_RUNTIME_CONTROL_TERMINAL", "boundary_by_event"]
 code = "host-runtime-control-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1115
+line = 946
 text = "let runtime_control = match host.runtime_control() {"
 
 [[boundary]]
@@ -1144,24 +1171,24 @@ detail = "T-B drives the real op; SCM receipt vs Unknown distinct."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 7415
-end = 7415
-digest = "0282a2a7398a07a325f5def37b6476ad532c711762d2f6a139cf960eec496802"
+start = 12238
+end = 12241
+digest = "bbb7aeeb29a315d42e77827a002b8b985cdce3a5af1afa86a19c30d88a7e668a"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_TERMINAL"]
 [[boundary.site]]
-start = 7431
-end = 7431
-digest = "9bf1c65496571f1db638a99465ef62f676b7bd7c0d854b8b3aaa731bd42e7110"
+start = 12257
+end = 12260
+digest = "59a7961a60a3b3bf1d9250f4afe0bc48018a5cd238daa6d794ab4e8e05762de2"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_TERMINAL"]
 [[boundary.site]]
-start = 1324
-end = 1325
+start = 1637
+end = 1638
 digest = "cf5e30c83477bb966393ff05cd374fa1fa3caf0fc5fff4b32e5efc1934c56186"
 markers = ["BOUNDARY_KERNEL_RESTART_TERMINAL", "boundary_by_event"]
 code = "host-kernel-restart-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1559
+line = 2604
 text = "host.handle_kernel_restart_request(envelope.request())"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_lifecycle_diagnostics.rs"
@@ -1181,38 +1208,38 @@ detail = "Six early-return sites, one frozen code; T-B pins the op shape. In-tre
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 7458
-end = 7458
-digest = "eca869d2d405ef27d2c370e013f62e54b1ace54b3b3782dd1088559a5f934973"
+start = 12289
+end = 12292
+digest = "9ec413a6b2223cc06e89907c2cc58bb6bb3dc795ad83e8ffede20d8d2e4fb8e3"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7466
-end = 7466
-digest = "eca869d2d405ef27d2c370e013f62e54b1ace54b3b3782dd1088559a5f934973"
+start = 12300
+end = 12303
+digest = "9ec413a6b2223cc06e89907c2cc58bb6bb3dc795ad83e8ffede20d8d2e4fb8e3"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7481
-end = 7481
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12318
+end = 12321
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7493
-end = 7493
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12333
+end = 12336
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7505
-end = 7505
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12348
+end = 12351
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7516
-end = 7516
-digest = "4747a353913c260003213207bea1b751add5fd94eada97bb85a9e936025a69e3"
+start = 12362
+end = 12365
+digest = "bea3d1d7c869e8b9fecda966191acefb9bcdd2b3058a628a4bb817f4c1ef2e4a"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 1346
-end = 1347
+start = 1659
+end = 1660
 digest = "5cc24e55383b4280ed926363c260173361bbe950072935edd178d52502b8b9a7"
 markers = ["BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL", "boundary_by_event"]
 code = "host-kernel-restart-reconcile-unknown"
@@ -1231,18 +1258,18 @@ phase = "start"
 scope = "none"
 status = "incomplete"
 reason = "missing_test_binding"
-detail = "Emitter present; no bound test. INTERACTION: failures already terminally observed by B-leaf-host-job-launch (host-launch-failed at host_job_launch.rs:535) re-emit here as host-start-failed via lib.rs:6949/6763 without disarm (contrast the disarm-before-delegate precedent at host_composition_store_recovery.rs:84-85). TEST-PHASE A8 must rule single-vs-correlated emission."
+detail = "Emitter present; no bound test. INTERACTION RESOLVED (#978, audit 5910159678 defect 2): on the audited path start_approved_contour -> start_manifest_contour -> HostJobBranches::start_approved the leaf guard was removed and the leaf became phase-only, so this contour's guard is the single owner and one failed launch emits exactly one terminal (host-start-failed); the same guard/emitter is wrapped directly (observe_launch_terminal) only on the cutover call sites, which no operation guard encloses. TEST-PHASE A8 must still rule single-vs-correlated emission."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 8480
-end = 8480
+start = 13531
+end = 13531
 digest = "5020942fbb2a5424e04508b39a0357fc249884d7676f220e6ae54f00ddbea88f"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_START_TERMINAL"]
 
 [[boundary.site]]
-start = 1353
-end = 1353
+start = 1666
+end = 1666
 digest = "02295ae7ea72b49db763dd4d35f36c1277e75376624ccd36cc6c19bd448cbab1"
 markers = ["BOUNDARY_START_TERMINAL", "boundary_by_event"]
 code = "host-start-failed"
@@ -1260,14 +1287,14 @@ detail = "Emitter present; no bound test. In-tree invoker unresolved."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 8517
-end = 8517
+start = 13568
+end = 13568
 digest = "f3cd8ac3f9865116ed3d7faa18314dcd36d0f194db3016c30bba4fd7e13dd8c7"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_RESUME_PENDING_TERMINAL"]
 
 [[boundary.site]]
-start = 1357
-end = 1358
+start = 1670
+end = 1671
 digest = "afb86ca28a6cd8312bff04f248182e1e7a53f4f91b8c6bfa934fb82e9760d403"
 markers = ["BOUNDARY_RESUME_PENDING_TERMINAL", "boundary_by_event"]
 code = "host-resume-pending-failed"
@@ -1285,19 +1312,19 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 9089
-end = 9089
+start = 14484
+end = 14484
 digest = "71d4799629b80a4b85d5cbc48b8390bc66f5650915a764f34c79888486936c03"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_LIVENESS_TERMINAL"]
 [[boundary.site]]
-start = 1369
-end = 1370
+start = 1682
+end = 1683
 digest = "8af1486773e0e3677afa738db6ca4dbcc162a59794a9a6672edb06552b4d906f"
 markers = ["BOUNDARY_LIVENESS_TERMINAL", "boundary_by_event"]
 code = "host-liveness-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1649
+line = 2755
 text = "match host.liveness_tick()? {"
 
 [[boundary]]
@@ -1314,19 +1341,19 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 9136
-end = 9136
+start = 14859
+end = 14859
 digest = "75ed02c011bf8f9b6d855e9c98ad21adf602ed23462d2eabe0fdc304bdfd03c8"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 1375
-end = 1376
+start = 1688
+end = 1689
 digest = "dabd5d12015e70038ffeaa411697555a4466caeaf568808ba48114d2e02be992"
 markers = ["BOUNDARY_RECONCILE_TERMINAL", "boundary_by_event"]
 code = "host-reconcile-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1633
+line = 2739
 text = "self.reconcile_approved_contour()"
 
 [[boundary]]
@@ -1342,23 +1369,23 @@ detail = "T-A drives real stop seams: Requested -> Draining -> StoppedClean, sin
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 10515
-end = 10515
+start = 16303
+end = 16303
 digest = "7cbffe76bf14723d0a6644b8ae82c8cf71d748355d99a38a0791b6325c689491"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_STOP_TERMINAL"]
 [[boundary.site]]
-start = 1400
-end = 1400
+start = 1713
+end = 1713
 digest = "fad30e329b65d8d2513a3c195b09e2823420fc1b155c7ab9cb924ebe74cff2fa"
 markers = ["BOUNDARY_STOP_TERMINAL", "boundary_by_event"]
 code = "host-stop-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 670
+line = 1380
 text = "match host.stop() {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 789
+line = 1380
 text = "match host.stop() {"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_lifecycle_diagnostics.rs"
@@ -1375,33 +1402,33 @@ phase = "lifecycle"
 scope = "none"
 status = "incomplete"
 reason = "missing_test_binding"
-detail = "Emitter present; no bound test."
+detail = "Emitter present; no recorded binding in this table. #891 landed case 15 (and 19/21) now call the real lifecycle_context projection and bind its lifecycle-context.requested/admitted rows; the three typed-identity failure arms that own host-lifecycle-context-failed are still not driven, so the boundary stays incomplete here."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 10800
-end = 10800
+start = 16588
+end = 16588
 digest = "e2e2f7ad3cc5f3f5ce1c8e38df2ab06d38b766904fc1ab9e0692c85a0e1e0266"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL"]
 [[boundary.site]]
-start = 10808
-end = 10808
+start = 16596
+end = 16596
 digest = "f8cf66a05099f9c8a05ecf788cbde8f24b03d324c4e8e9c6a7f92799f338e685"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL"]
 [[boundary.site]]
-start = 10812
-end = 10812
+start = 16596
+end = 16596
 digest = "f8cf66a05099f9c8a05ecf788cbde8f24b03d324c4e8e9c6a7f92799f338e685"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL"]
 [[boundary.site]]
-start = 1411
-end = 1412
+start = 1724
+end = 1725
 digest = "0de6a7b71c6148f9e005ecf19e03a24c159cc2b76424b2319b97c6aac2b12fbf"
 markers = ["BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL", "boundary_by_event"]
 code = "host-lifecycle-context-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8664
+line = 14029
 text = "lifecycle_context(&self.host, \"watchdog-start\")?,"
 
 [[boundary]]
@@ -1417,34 +1444,34 @@ detail = "Guard in serve_one (357); direct unknown terminal in handle (267)."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 84
-end = 90
-digest = "99be7375e6832e2ffabbd34de9ca3fe94ec30dfc57af174aad0286fa23c7c733"
+start = 93
+end = 99
+digest = "cd7e1e36777eff509818cdf6ceb6c4f6455fad79e8c7fcd916497aa2002508d9"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 92
-end = 95
-digest = "28bdd08b96a7ff0aa32ab2b82cad5be19b6cd04b86b57d95817eb9b4a6f30a00"
+start = 101
+end = 107
+digest = "a5083d041c06299d38117e40a9fdd7727b6ec7aac4e458b7ae712142eedc0b04"
 markers = ["observe_terminal_error"]
 [[boundary.site]]
-start = 402
-end = 402
-digest = "dfa983632fd4599ef3930333e88b98b488181c094126ec9f31438ab2e0277ff7"
+start = 476
+end = 479
+digest = "8ea5d197b3b085a8ef189a3397646b4656f11b2472032bfdfc1345efa16ccedc"
 markers = ["credential_control_observe_terminal"]
 code = "host-credential-unknown"
 [[boundary.site]]
-start = 504
-end = 504
+start = 583
+end = 583
 digest = "5240c9c384c0ea8817063c4154ff6f0bd66aa03107e4ad95add1bbc84f0f5177"
 markers = ["CredentialTerminalGuard::armed"]
 code = "host-credential-serve-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1279
+line = 2123
 text = ".block_on(control.serve_one(std::time::Duration::from_millis(500)))"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1307
+line = 2123
 text = ".block_on(control.serve_one(std::time::Duration::from_millis(500)))"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_durable_diagnostics.rs"
@@ -1468,31 +1495,31 @@ detail = "Disarm-before-delegate at 84-85 keeps one terminal across handle/recon
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 35
-end = 41
-digest = "21108b8cf716b2a72c5ce5aa878b27f730109a2a3cfbbca9a4ed00d91d104b76"
+start = 44
+end = 50
+digest = "9cb21ffa5db8ea0fc0847c75dc187df5126f8271574287b3b3e98eb66aec649d"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 43
-end = 46
-digest = "e8fe52f23620553ab2bd2f972a16605a846f071296f7ea5b272a25b17d85e942"
+start = 59
+end = 65
+digest = "6db06a2b3e2d35d7a2e0eb91ae5bd0ab083638fe77149e92971f94c1ec4352c2"
 markers = ["observe_terminal_error"]
 [[boundary.site]]
-start = 199
-end = 199
-digest = "b5356052099801ad656829cd6c5d0224b2296246f86048a4f5ab9a810581af7a"
+start = 251
+end = 254
+digest = "582370f20303628a78e4138eff92729007978052e958a26b5e0c23d7cba841bf"
 markers = ["StoreRecoveryTerminalGuard::armed"]
 code = "host-store-recovery-unknown"
 [[boundary.site]]
-start = 766
-end = 766
-digest = "184669bcd50cd01a383cd1c651ade16b6b1fde74232cab28251451ebf1bb257e"
+start = 822
+end = 825
+digest = "d12955fb9920d8a80c6a7a9f2b1aeda92ae11c330171e2d4b3df7e469741d104"
 markers = ["StoreRecoveryTerminalGuard::armed"]
 code = "host-store-recovery-reconcile-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1561
-text = "RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),"
+line = 2607
+text = "host.handle_store_recovery_request(envelope.request())"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_durable_diagnostics.rs"
 case = "durable_01_six_file_denominator"
@@ -1511,28 +1538,28 @@ operation = "approved job launch (store+kernel) terminal"
 phase = "launch"
 scope = "wired"
 status = "proven"
-detail = "Guard in start_approved (517). INTERACTION: errors re-emit at B-lib-start (host-start-failed) via lib.rs:6949/6763; see B-lib-start detail. TEST-PHASE A8 must rule."
+detail = "Guard in observe_launch_terminal at the cutover call sites only; start_approved arms none. INTERACTION RESOLVED (#978, audit 5910159678 defect 2): this leaf emits no terminal, so B-lib-start owns host-start-failed as the single terminal for the audited path; see B-lib-start detail. TEST-PHASE A8 must still rule."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 70
-end = 76
-digest = "c9f8ec5237d89675a7d34f90cd6e85339802e19a2a282b2db72eed6c82eba1ad"
+start = 341
+end = 347
+digest = "96c78d4cb3317a22bca139ed9347d5e364d3eeddb80b046fc50568687664420e"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 79
-end = 82
-digest = "3386275459f218b21458e5249b153426ccc30068e21e18a4373c6b99efa45ad3"
+start = 350
+end = 353
+digest = "1d0c20593ee322c8d7ee94676f890a32569277b5f91546a72c722a7b30f4fe27"
 markers = ["observe_terminal_error"]
 [[boundary.site]]
-start = 726
-end = 726
-digest = "6ee5a56b9338b9b0d0dc4a00d83fb6c2ac2f263a6e4b7ae59b4f2e5b23e44350"
+start = 355
+end = 408
+digest = "518c2d701ff6e51d2100ca496062332feea594c9e3fd83ec0a55458562b5d960"
 markers = ["HostLaunchTerminalGuard::armed"]
 code = "host-launch-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8703
+line = 14078
 text = "if let Err(error) = self.jobs.start_approved("
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_launch_diagnostics.rs"
@@ -1556,24 +1583,24 @@ detail = "Guard in validate_host_scm_bootstrap (430)."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 34
-end = 40
-digest = "13fbba669898c8cc3e41d5b32c83cf890675ebb48e2a7da9c53d3ffe99aaad09"
+start = 62
+end = 74
+digest = "d7832386b40447645e8c95772410dd836a81534da51bb862383ca901244383d2"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 42
-end = 45
+start = 76
+end = 79
 digest = "8f38cf0f10b941dc1ec4cc4d0f098aeb2ccb19e7cd6846431565b82630acf30e"
 markers = ["observe_terminal_error"]
 [[boundary.site]]
-start = 441
-end = 441
+start = 888
+end = 888
 digest = "da6b1941130773beb5367a4b64be156e871447aa8bc07c89deb15f97fbca75f8"
 markers = ["ScmLaunchTerminalGuard::armed"]
 code = "host-scm-launch-unknown"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1018
+line = 1839
 text = "if let Err(error) = eliot_host::validate_host_scm_bootstrap(&launch_options) {"
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_launch_diagnostics.rs"
@@ -1598,26 +1625,26 @@ detail = "Terminal codes designated at the lib.rs HostLifecycleBoundary registry
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 1417
-end = 1418
+start = 1730
+end = 1731
 digest = "f7c769c34e5a36bbd4c1359244cfb872b7064d4dbf376d9b0ecf8ae7c1b2506b"
 markers = ["BOUNDARY_OBSERVABLE_USE_TERMINAL", "boundary_by_event"]
 code = "host-observable-use-failed"
 [[boundary.site]]
-start = 1427
-end = 1428
+start = 1740
+end = 1741
 digest = "fdd1a79707f973c4185ce7ddee9444a4c26a44c41ae9480c17035e3cd7500224"
 markers = ["BOUNDARY_DRAIN_RESUME_TERMINAL", "boundary_by_event"]
 code = "host-drain-resume-failed"
 [[boundary.site]]
-start = 1431
-end = 1432
+start = 1744
+end = 1745
 digest = "d7fac1932574938feea677f39ec525ac21184107e53f2c31db63c4f86fbb3ead"
 markers = ["BOUNDARY_IDLE_DRAIN_TERMINAL", "boundary_by_event"]
 code = "host-idle-drain-begin-failed"
 [[boundary.site]]
-start = 1449
-end = 1450
+start = 1762
+end = 1763
 digest = "811433260c3225870eac44fe6743434ce156d10277d73fac90d105e13a424b25"
 markers = ["BOUNDARY_WAKE_SATISFY_TERMINAL", "boundary_by_event"]
 code = "host-wake-satisfy-failed"
@@ -1635,43 +1662,43 @@ detail = "Seam contract frozen (source EliotHost, ids 100/101/102, bounded queue
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 350
-end = 356
+start = 368
+end = 374
 digest = "f07776dbe1cd3331e2aba75b9a26771f114353d9e493de8bb680199187b9d94a"
 markers = ["event_log_sink_status", "EventLogUnavailable"]
 [[boundary.site]]
-start = 369
-end = 371
+start = 391
+end = 393
 digest = "1b3013a99db7c50afd2759972191020a1c33373d6b6d1f13a6736d3d1e48519c"
 markers = ["report_event", "report_local_event"]
 [[boundary.site]]
-start = 49
-end = 49
+start = 51
+end = 51
 digest = "1684934d2d999bb6a19361e376b37b17ef228de15bb22f01d60c8f36614e6fcb"
 markers = ["EVENT_LOG_SOURCE"]
 [[boundary.site]]
-start = 54
-end = 54
+start = 56
+end = 56
 digest = "8be28c5aa837c0f5f31b2fed9364d306897a8ba8a69bfb74d6e9eaf8c9c0efa1"
 markers = ["EVENT_LOG_MAX_INSERTION_BYTES"]
 [[boundary.site]]
-start = 58
-end = 58
+start = 60
+end = 60
 digest = "00cb687efaa050c5c8254af7aa18c9e1bf349f16afbf44721e9f7b3236571608"
 markers = ["EVENT_LOG_QUEUE_CAPACITY"]
 [[boundary.site]]
-start = 80
-end = 93
+start = 82
+end = 95
 digest = "9f6680eb798074a6581c7c404f357e8068833dd28abe79f8c07b3d60499dc892"
 markers = ["AdmittedEvent"]
 [[boundary.site]]
-start = 95
-end = 124
+start = 97
+end = 126
 digest = "4b97cef4bd1073a885ef41ccaa5d76f316c34a4e75d9a3284551a694fcb7229d"
 markers = ["event_id", "severity"]
 [[boundary.site]]
-start = 514
-end = 520
+start = 545
+end = 551
 digest = "5ca3870f71a11fc732f84c3988df6451e0489e5751f64f0badb83b23147e9225"
 markers = ["shutdown", "unsent"]
 [[boundary.test]]
@@ -1693,8 +1720,8 @@ detail = "Mapping frozen; seam live via #984 port since #889 #3108 but no isolat
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 110
-end = 110
+start = 112
+end = 112
 digest = "93c996c02fe975bee0746f58da633a93da4eb37a8acd1a9d543acd8b667f070b"
 markers = ["ServiceStart", "100"]
 
@@ -1712,8 +1739,8 @@ detail = "Mapping frozen; seam live via #984 port since #889 #3108 but no isolat
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 111
-end = 111
+start = 113
+end = 113
 digest = "bda83ec89cec90d17d1af07f1d304bffb2e8ddf8946b49394025cfb5a7aaec4a"
 markers = ["ServiceStop", "101"]
 
@@ -1731,8 +1758,8 @@ detail = "Mapping frozen; seam live via #984 port since #889 #3108 but no failur
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 112
-end = 112
+start = 114
+end = 114
 digest = "49354d284be732a062db02c8e3c9a06b3b0b496b90fbf7491b7748a9fe1b7a00"
 markers = ["ServiceFailure", "102"]
 
@@ -1750,84 +1777,84 @@ detail = "#983 #3652 armed one HostTerminalGuard per dispatch op (prepare/cutove
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 5960
-end = 5960
+start = 10386
+end = 10386
 digest = "7c33d19321c41e9e143388d1375e5da800da2ce94a86b9f6c50c5a38eef8eb97"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_BACKUP_PREPARE_TERMINAL"]
 [[boundary.site]]
-start = 6051
-end = 6051
+start = 10525
+end = 10525
 digest = "88259a9f9f7508e3b27ce56b10bdfdfa890adf672e8622643d678c90601f3f90"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_BACKUP_CUTOVER_TERMINAL"]
 [[boundary.site]]
-start = 6239
-end = 6239
+start = 10770
+end = 10770
 digest = "10888ef32b5a50504e9f1f4f0587f6fe482f17bae83fecced8754720f8fffbb5"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL"]
 [[boundary.site]]
-start = 6298
-end = 6298
+start = 10874
+end = 10874
 digest = "4acf1d765d7ddb3fe7b3533a54c8fe57cc0a480ca86e1609f35b6d9cdb0f0229"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL"]
 [[boundary.site]]
-start = 1462
-end = 1463
+start = 1789
+end = 1790
 digest = "addafb5c84adec2ee7c2e76e1fca281dd4e87d57d10493f4d2737d864b3e5998"
 markers = ["BOUNDARY_BACKUP_PREPARE_TERMINAL", "boundary_by_event"]
 code = "host-backup-prepare-failed"
 [[boundary.site]]
-start = 1460
-end = 1461
+start = 1787
+end = 1788
 digest = "e3e25b084d946fcb034a36f16bc2f8c977ff9d43d76cedf41682235723e64d17"
 markers = ["BOUNDARY_BACKUP_CUTOVER_TERMINAL", "boundary_by_event"]
 code = "host-backup-cutover-failed"
 [[boundary.site]]
-start = 1464
-end = 1465
+start = 1791
+end = 1792
 digest = "30892145ff51bb709da6336ffbbbc07530008681c0be34e7d559ac59165e57d8"
 markers = ["BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL", "boundary_by_event"]
 code = "host-backup-cutover-disposition-failed"
 [[boundary.site]]
-start = 1466
-end = 1467
+start = 1793
+end = 1794
 digest = "b8ae3e536c447a9e6db06d73d4261e26fb5c4dca88563634b01cbd049db0653e"
 markers = ["BOUNDARY_BACKUP_CUTOVER_RETIRE_TERMINAL", "boundary_by_event"]
 code = "host-backup-cutover-retire-failed"
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5700
-text = "pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>("
+line = 9769
+text = "pub fn prepare_backup_destination("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5744
+line = 9821
 text = "pub fn register_backup_dispatch() -> [("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5817
+line = 10215
 text = "fn validate_backup_dispatch_prepare_routing("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5889
+line = 10304
 text = "pub fn backup_dispatch_needs_cutover_admission("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5916
+line = 10334
 text = "pub fn backup_dispatch_target("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5942
-text = "pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>("
+line = 10367
+text = "pub fn backup_dispatch_prepare("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6027
+line = 10501
 text = "pub fn backup_dispatch_cutover("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6229
+line = 10760
 text = "pub fn backup_dispatch_cutover_disposition("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6282
+line = 10858
 text = "pub fn backup_dispatch_cutover_retire("
 
 [[boundary]]
@@ -1844,12 +1871,12 @@ detail = "Path verified: start_watchdog (8011) errors -> cleanup_launched_contou
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
-start = 8011
-end = 8470
-digest = "afb7c65aad4ec5fedaa5ce8b606f71aef599f838bbdcd5afcd46076f6df3b5a5"
+start = 13057
+end = 13516
+digest = "a211d0d65d34a27771a9db2bc48f547ba3638bd766e3015f39b36ff25d8981fd"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8490
+line = 13541
 text = "self.start_manifest_contour("
 terminals = ["B-lib-start"]
 
@@ -1868,23 +1895,23 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5431
+line = 9206
 text = "fn start_approved_manifest("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5443
+line = 9218
 text = "fn start_approved_manifest_contour<P: ApprovedHostStartupPort>("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 10758
+line = 9206
 text = "fn start_approved_manifest("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6645
+line = 11369
 text = "start_approved_manifest_contour("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 10771
+line = 13541
 text = "self.start_manifest_contour("
 terminals = ["B-lib-open"]
 
@@ -1901,16 +1928,16 @@ detail = "The installer entry cutover_generation keeps its dead-code allowance (
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 8799
-end = 8803
-digest = "2fb953539225ab870b0fc743c4737114a7e2e4a898cce6b99b23e73a68b25d36"
+start = 14189
+end = 14194
+digest = "21e9439e0bb105909f9d0d48c11cc69aefbf758aff1f89b42cb322d149980a3a"
 markers = ["dead_code", "fn cutover_generation"]
 [[boundary.test]]
 file = "bins/eliot-host/src/tests.rs"
 case = "scm_store_late_dead_shared_route_records_intent_before_replacement"
 [[boundary.zeroscan]]
 ident = "cutover_generation"
-allowed = ["bins/eliot-host/src/lib.rs:286", "bins/eliot-host/src/lib.rs:966", "bins/eliot-host/src/lib.rs:8803"]
+allowed = ["bins/eliot-host/src/lib.rs:591", "bins/eliot-host/src/lib.rs:1271", "bins/eliot-host/src/lib.rs:14194"]
 
 [[boundary]]
 id = "B-lib-generation-cutover-live"
@@ -1926,29 +1953,29 @@ detail = "Live since the #961 dispatch: activate_cutover_contour (backup_cutover
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 9007
-end = 9007
+start = 14398
+end = 14398
 digest = "308a847a0ef020fac7d860d38e22927517e596869ecdf9cf3b42ed57deb2a266"
 markers = ["host_lifecycle_observe_requested", "BOUNDARY_CUTOVER_ROLLBACK_REACTIVATED"]
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 4791
+line = 8511
 text = "fn cutover_with_rollback("
 [[boundary.entry]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8907
+line = 14298
 text = "fn cutover_generation_contour("
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_cutover.rs"
-line = 2774
+line = 2916
 text = "let launched = host.cutover_generation_contour("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8830
+line = 14221
 text = "self.cutover_generation_contour("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8933
+line = 14324
 text = "let result = self.jobs.cutover_with_rollback("
 terminals = ["B-lib-backup-contour"]
 
@@ -1965,9 +1992,9 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 55
-end = 61
-digest = "d0b4fd541de816a6fbc72f4a3a859eafbbae35f49d029d8ce3d0b800917897ca"
+start = 162
+end = 175
+digest = "3d9850ecce21fbf969646e76f2fd3e22ea7e46529a546a0346bf51521a2f7709"
 markers = ["observe_entrypoint"]
 terminals = ["B-leaf-credential"]
 [[boundary.test]]
@@ -2019,8 +2046,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 45
-end = 51
+start = 62
+end = 68
 digest = "5f47e8dc04642b3083216456a1ca5e72d8ae49901867d8fd30233f53524472c3"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-phase-b-handle"]
@@ -2046,8 +2073,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 35
-end = 41
+start = 34
+end = 40
 digest = "dec06d195edb4ff6c446092e6ec0ee6deb0052dd3d7e09bc6d80e374744c3bd4"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-phase-b-handle"]
@@ -2073,9 +2100,9 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 80
-end = 86
-digest = "dadf8eaed9d02b4349e3e393129a376ed6777446c5c4f3fce31bb525e4e310b1"
+start = 82
+end = 88
+digest = "d761944b1bc079854ed2cde95d766657650182948699813716167c066861c6e9"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-reconcile"]
 [[boundary.test]]
@@ -2100,8 +2127,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 47
-end = 53
+start = 49
+end = 55
 digest = "cd90f49fa7d11fd27b62a7ed905325f4fc05e0be3335f97330cc401d8fec40af"
 markers = ["observe_entrypoint"]
 terminals = ["B-leaf-host-job-launch"]
@@ -2181,9 +2208,9 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 34
-end = 40
-digest = "41753efacb0af3be485295627d9061bd75e1c67b5fc08daf4a4ff086e1c568bf"
+start = 52
+end = 65
+digest = "824f09be1f04a2c2061d6d9c51d361f50359ff2a3fd5e14794352a838ce9dc1d"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-start"]
 [[boundary.test]]
@@ -2235,8 +2262,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 61
-end = 67
+start = 63
+end = 69
 digest = "9e68d342bc0c306c07b9a61d274b4f720924d091788ba185989cd3489953c6d4"
 markers = ["observe_entrypoint"]
 terminals = ["B-leaf-host-job-launch"]
@@ -2262,8 +2289,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 71
-end = 77
+start = 74
+end = 80
 digest = "39ec41a0b524eea1cebf0edde11437eee58a502309464876a89e9fbf9676f259"
 markers = ["observe_entrypoint"]
 terminals = ["B-leaf-host-job-launch"]
@@ -2289,8 +2316,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 67
-end = 73
+start = 68
+end = 74
 digest = "3d0af2faab1a66399dc60262186a5835ec1efcc906cb4442f92c91bcb37f5c78"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-phase-b-handle"]
@@ -2316,9 +2343,9 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 46
-end = 52
-digest = "8eb8d175b949c05fbd96e47afd75c4ec6acc6dccd47039c07a197eb114ecb0b9"
+start = 286
+end = 310
+digest = "e20079323f32b694f7e8b186696a6bb88acf404f67bb287d5a5ab765494312ac"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-phase-b-handle"]
 [[boundary.test]]
@@ -2338,24 +2365,20 @@ kind = "entrypoint"
 operation = "previous authority phase detail"
 phase = "phase-detail"
 scope = "wired"
-status = "proven"
-detail = "Phase-detail emitter; failures propagate to the designated outer terminal (see terminals). In-file phase callsites; no terminal emitted here (verified)."
+status = "incomplete"
+reason = "missing_test_binding"
+detail = "Phase-detail emitter; failures propagate to the designated outer terminal (see terminals). In-file phase callsites; no terminal emitted here (verified). The frozen helper this boundary recorded, phase_b_previous_authority_observe, is gone: production grew it into phase_b_previous_authority_observe_bound (63-74), which reaches the #889 facade through phase_b_observe_authority and adds the owner-held identity slots. That bound entrypoint is the real site below; the test bindings this boundary previously carried are dropped, because the recorded ones do not exercise this contour."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 43
-end = 49
-digest = "ef16a9e8e2d5273581d5b49dd9585020241c0b82be5e4c529bf6ac3486c10f69"
-markers = ["observe_entrypoint"]
-terminals = ["B-lib-phase-b-handle"]
-[[boundary.test]]
-file = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-case = "projection_01_propagation_single_terminal"
-fixture = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
-[[boundary.test]]
-file = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-case = "projection_02_redaction_noninterference_rollback"
-fixture = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
+start = 62
+end = 74
+digest = "b4d4651802673a1daf2e7c641b3ecd29f6af0ebd04a4674b892b2c98fbfddf3e"
+markers = ["phase_b_observe_authority"]
+[[boundary.caller]]
+file = "bins/eliot-host/src/phase_b_previous_authority.rs"
+line = 129
+text = "phase_b_previous_authority_observe_bound("
 
 [[boundary]]
 id = "B-leaf-prev-proj"
@@ -2451,8 +2474,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 73
-end = 79
+start = 74
+end = 80
 digest = "a79a5ca9691e82521724a0137f9f561657b41a1a681adbefe6d672e06334cb11"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-kernel-restart-handle"]
@@ -2505,8 +2528,8 @@ detail = "Phase-detail emitter; failures propagate to the designated outer termi
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 51
-end = 57
+start = 92
+end = 98
 digest = "72d21c2b250edd679f982f1f71339454c067dc256aeaf0f9ebcbf204a5896d1a"
 markers = ["observe_entrypoint"]
 terminals = ["B-lib-start"]
@@ -2618,20 +2641,20 @@ end = 48
 digest = "88c2089ecab2acfb44fe94d46652fb63ff36ddf3320c32d5923e4912ff078c06"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 479
+line = 688
 text = "write_response(&Response::Error {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 496
+line = 688
 text = "write_response(&Response::Error {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 502
+line = 726
 text = "if !write_response(&Response::Ready {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 549
-text = "if !write_response(&response) {"
+line = 819
+text = "if !write_response(&served_request.response) {"
 terminals = ["B-main-ref-terminal"]
 [[boundary.test]]
 file = "bins/eliot-host/tests/host_console_diagnostics.rs"
@@ -2652,15 +2675,15 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 145
-digest = "813939092580e5cb0f4230e14a655a6f515f7932841df0c6f1d08ce77cea073d"
+end = 153
+digest = "67c119e52f5a9565f451c19ee5dfebec8a2bbd2e7e1f233466f1a26b756874a6"
 [[boundary.caller]]
 file = "bins/eliot-host/src/readiness_gate.rs"
 line = 186
 text = "let failure = readiness_failure_kind(&error);"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 9275
+line = 15024
 text = "readiness_failure_kind(&error),"
 terminals = ["B-lib-reconcile"]
 [[boundary.test]]
@@ -2689,11 +2712,11 @@ end = 138
 digest = "83a212cc0584489eb33830ff558b90cf91b78dcb92aa90f77598a3d850141d95"
 [[boundary.caller]]
 file = "bins/eliot-host/src/runtime_restart_state.rs"
-line = 20
+line = 21
 text = "use super::host_durable_persistence::{sync_dir, write_durable_file};"
 [[boundary.caller]]
 file = "bins/eliot-host/src/runtime_restart_state.rs"
-line = 225
+line = 535
 text = "sync_dir(dir)"
 [[boundary.caller]]
 file = "bins/eliot-host/src/store_recovery_persistence.rs"
@@ -2724,11 +2747,11 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 998
-digest = "ada0bfdbd846bee76cd0fe8e243b0a8758d641ebd6284c1acd7d7ef6042df614"
+end = 1045
+digest = "cbe16be94d95934240dd10bfe6b35095f5d05959a4b9bab2c87b6aa56fe0c739"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 3269
+line = 6938
 text = "Self::send_host_startup_evidence("
 terminals = ["B-leaf-host-job-launch"]
 
@@ -2751,27 +2774,27 @@ end = 3733
 digest = "dd157772b1ac01b0e66d8c5d4ecc5051df9e6e162b0219ca060622519e7e7bf1"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8099
+line = 13145
 text = "let heartbeat_issued = watchdog_heartbeat::HeartbeatTransportDescriptor::issue("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8141
+line = 13187
 text = "watchdog_heartbeat::HeartbeatTransportDescriptor::bind_incarnation_or_heal("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8232
+line = 13278
 text = "watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8315
+line = 13361
 text = "watchdog_heartbeat::remove_start_artifacts_exact("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8322
+line = 13368
 text = "watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 9941
+line = 15729
 text = "let admitted = watchdog_heartbeat::observe_armed_heartbeat_admitted("
 terminals = ["B-lib-start", "B-lib-reconcile"]
 
@@ -2795,7 +2818,7 @@ digest = "0084fc3755cc937dc250715ea9d086950503e9f2c7458902f38a56481e4ffb93"
 markers = ["watchdog_publication_observe", "observe_entrypoint_with_detail"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 9848
+line = 15636
 text = "let publication_is_exact = observe_host_watchdog_publication(&expected_publication_path)"
 
 [[boundary]]
@@ -2845,11 +2868,11 @@ digest = "2ab92631e872b2ea3e9a562fc916a4a01660c3d93558052a6c62cd5b047332bf"
 markers = ["watchdog_start_observe", "observe_entrypoint_with_detail"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8070
+line = 13116
 text = "let registration = approved_service_registration_request("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8160
+line = 13116
 text = "let registration = approved_service_registration_request("
 
 [[boundary]]
@@ -2911,19 +2934,19 @@ detail = "#983 merged: phase/refusal observations via facade-target tracing (hos
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 407
-end = 428
+start = 700
+end = 721
 digest = "40bbf173988ceae6fd77e7ff0c74833d2cdecf5f00065ee7aa3cccefab5a2126"
 markers = ["observe_prepare_progress", "host.backup.prepare_phase"]
 [[boundary.site]]
-start = 432
-end = 455
+start = 725
+end = 748
 digest = "6d1582f40ddeece7d7d347db353031a89a4e2df98e3a208d2aa2a3dda2bcefdc"
 markers = ["note_prepare_error", "host.backup.prepare_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 5729
+line = 9801
 text = "let prepared = sink.prepare(&evidence, request)?;"
 
 [[boundary]]
@@ -2940,25 +2963,25 @@ detail = "#983 merged: phase/refusal observations via facade-target tracing (hos
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 175
-end = 197
+start = 281
+end = 303
 digest = "50f542bdd09fb58c7c32f1d75e947bf3794e2c2719ee8c580440c55e25feb422"
 markers = ["observe_config_progress", "host.backup.config_phase"]
 [[boundary.site]]
-start = 200
-end = 211
-digest = "f084133779bd6edff1671bc23ab2a8ffbde4ba6f2843d95c47a617a4424a1c98"
+start = 321
+end = 333
+digest = "a7b826c8fe20131590f08b515964a32be4134eadce3d56730151a39390deded8"
 markers = ["observe_bind_progress", "host.backup.config_phase"]
 [[boundary.site]]
-start = 215
-end = 230
+start = 337
+end = 352
 digest = "bb854363d8faafb9e2a0cbdf3ba40fb4bd2057b1483b5dcfdc5b138e25f37954"
 markers = ["note_config_error", "host.backup.config_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_preparation.rs"
-line = 2356
-text = "bind_approved_build(&self.approved).map_err(projection_to_preparation)"
+line = 4338
+text = "bind_approved_build("
 
 [[boundary]]
 id = "B-prop-cutover"
@@ -2974,29 +2997,29 @@ detail = "#983 merged: phase/refusal observations via facade-target tracing (hos
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 1469
-end = 1488
-digest = "d7841ca1799c4569ec615a1164094ad7a7fbf4b13d00efae71762a8963246918"
+start = 1543
+end = 1579
+digest = "a7b6bf8f0c23fd7b55c09c9b9c7e588e564e71aecf0759dfa4d754d04a549b07"
 markers = ["observe_cutover_progress", "host.backup.cutover_phase"]
 [[boundary.site]]
-start = 1492
-end = 1505
+start = 1583
+end = 1596
 digest = "3b5840c51e30f98ce1d08510fec2715af07f09a32042005cd26f72e9056d6a4a"
 markers = ["note_cutover_error", "host.backup.cutover_refusal"]
 [[boundary.site]]
-start = 1516
-end = 1527
+start = 1606
+end = 1617
 digest = "5962be33db5ed609ba67966c77dc1bebe0af92211679df61b87b6ac193bfaad9"
 markers = ["note_cutover_read_error", "host.backup.cutover_refusal"]
 terminals = ["B-lib-backup-contour"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6105
+line = 10590
 text = "let (committed, barrier) = execute_cutover("
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 6241
-text = "crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;"
+line = 10803
+text = "let outcome = crate::backup_cutover::read_cutover_disposition("
 
 [[boundary]]
 id = "B-prop-intro-readback"
@@ -3017,7 +3040,7 @@ end = 146
 digest = "6542a4bcf3f3313ea48de47787b6d1939bf1aed9e23526eac4da24cd9964ec7f"
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_cutover.rs"
-line = 2591
+line = 2690
 text = "let live = super::introduction_readback::read_live_introductions("
 
 [[boundary]]
@@ -3035,15 +3058,15 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 605
-digest = "e64aad1ca530b693e1fd2b936b5d96977d9d2cf6769e357ba65801d0da378c6e"
+end = 667
+digest = "4571d9a3a29771b763b7e47cb12f4751b9195e409430a2cc0b98fec5bd436248"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1354
+line = 2198
 text = "let producer = match HostReactiveContextProducer::from_authenticated_source("
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1368
+line = 2212
 text = "return match host.deliver_reactive_context_from_producer(producer) {"
 
 [[boundary]]
@@ -3061,11 +3084,11 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 453
-digest = "7a83c0d8e25b269e8f9b91bb84d076de38588faefb248788f4ddd51c0c1f8098"
+end = 611
+digest = "5d3f0766862fda27466dca6077bcbd45c984472daaf081941cfdcae25506332f"
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_cutover.rs"
-line = 2361
+line = 2456
 text = ".require_generation_retirement_barrier(retirement)"
 
 [[boundary]]
@@ -3082,14 +3105,14 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [boundary.reexport]
 file = "bins/eliot-host/src/lib.rs"
-start = 1796
-end = 1800
+start = 5292
+end = 5296
 digest = "b11efe5bb2d724d9d3c2887a6979d59123f3814f4349e60074957482302cd6b9"
 markers = ["pub use notify_fallback_setup"]
 [boundary.ext_caller]
 file = "bins/eliot/src/main.rs"
-start = 2543
-end = 2611
+start = 2775
+end = 2843
 digest = "94bea49e0a706712bf75eccb2b38598e7a9a3944cb1cbeb039e71f7959fd081a"
 markers = ["NOTIFY_FALLBACK_SETUP_RECOVERY_REQUIRED", "NOTIFY_FALLBACK_SETUP_REJECTED", "NOTIFY_FALLBACK_SETUP_PUBLISHED", "setup_notify_fallback_per_user"]
 
@@ -3108,45 +3131,91 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 terminals = ["B-activation"]
 [[boundary.site]]
-start = 330
-end = 330
+start = 665
+end = 665
 digest = "862c68d1354ae4ef9681dd10dac889452cccbbbf94f7da64850585fd8c6fd3e3"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_OBSERVABLE_USE_TERMINAL"]
 [[boundary.site]]
-start = 442
-end = 442
+start = 795
+end = 795
 digest = "12b44b926f912f8e21519624ceb47eb43769161f3bf9df9e96a55f8b92313fb1"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_DRAIN_RESUME_TERMINAL"]
 [[boundary.site]]
-start = 509
-end = 509
+start = 962
+end = 962
 digest = "10a32bae733bd31431e7a754cdd8871f7bf67bfd08a05767f84368d1a82b7dd3"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_IDLE_DRAIN_TERMINAL"]
 [[boundary.site]]
-start = 875
-end = 875
+start = 1791
+end = 1791
 digest = "2cd475b7deed17374b89589eb83a62069e50d747502e4dccfe4c65a4310bba13"
 markers = ["HostTerminalGuard::armed", "BOUNDARY_WAKE_SATISFY_TERMINAL"]
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1203
-text = "idle_drain.note_observable_use(&mut host, trigger, &evidence);"
+line = 2392
+text = ".note_observable_use(host, *trigger, evidence)"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1760
-text = "match host.note_observable_use(trigger, evidence) {"
+line = 2885
+text = ".note_observable_use(trigger, evidence)"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1823
+line = 3055
 text = "match host.resume_cancelled_drain(disposition) {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1845
+line = 3077
 text = "match host.satisfy_claimed_wakes() {"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
-line = 1891
+line = 3123
 text = "return match host.begin_idle_drain(self.last_census.observation_code()) {"
+
+[[boundary]]
+id = "B-user-mode-launcher"
+file = "bins/eliot-host/src/user_mode_launcher.rs"
+owner = 1771
+kind = "entrypoint"
+operation = "current-user launcher / Task Scheduler registration phase detail (UserMode ingress)"
+phase = "setup"
+scope = "wired"
+status = "incomplete"
+reason = "missing_test_binding"
+detail = "#1771 AUD4 ingress, landed in 3d9eb4de and previously absent from this table. Emits phase detail only through the #889 facade (user_mode_launcher_observe -> observe_entrypoint_with_detail, Startup); it owns no terminal: main.rs:930 treats its HostError as terminal for the supervisor. Real caller main.rs:930. NOT YET PROVEN: no test binding is claimed here and none has been executed against this contour; TEST-PHASE must bind one before this can be proven."
+ceiling_field_bytes = 256
+ceiling_detail_bytes = 1024
+[[boundary.site]]
+start = 85
+end = 92
+digest = "999002591888b4f29eca69964ffdde59d3fa121c62a0690a53cf363a02214568"
+markers = ["observe_entrypoint"]
+terminals = ["B-main-scm-receipts"]
+[[boundary.caller]]
+file = "bins/eliot-host/src/main.rs"
+line = 930
+text = "if let Err(error) = eliot_host::register_user_mode_launcher(&host) {"
+
+[[boundary]]
+id = "B-kernel-owner-exclusivity"
+file = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+owner = 1953
+kind = "propagated"
+operation = "I14.16 exclusive-Kernel-ownership release/hold evidence for the side-by-side cutover"
+phase = "activation"
+scope = "none"
+status = "incomplete"
+reason = "missing_callsite"
+detail = "#1953 I14.16 exclusive-owner evidence, landed in 38a76fca and previously absent from this table. Prove_candidate_owner_held is called by kernel_activation_driver.rs:873 and KernelHandoffReceipt::prove_released/recover_retained by the same driver (656/653); every failure is a typed HostError into that contour, which owns the terminal. The absence span below records that this module emits NO diagnostic of its own. NOT YET PROVEN: no test binding is claimed here; a missing-callsite boundary with no emission cannot be proven by structure alone."
+ceiling_field_bytes = 256
+ceiling_detail_bytes = 1024
+[[boundary.absence]]
+start = 1
+end = 173
+digest = "1274a21499690da4c933c64cbf41aa272df59e0ea7785133f6703be5fb4343d8"
+[[boundary.caller]]
+file = "bins/eliot-host/src/kernel_activation_driver.rs"
+line = 873
+text = "prove_candidate_owner_held(candidate)?;"
 
 [[matrix]]
 n = 1
@@ -3202,14 +3271,14 @@ n = 8
 title = "each failed operation has exactly one emitter + negatives"
 boundaries = ["B-lib-open", "B-lib-credential-control", "B-lib-kernel-restart-handle", "B-lib-stop", "B-leaf-credential", "B-leaf-store-recovery", "B-leaf-host-job-launch", "B-leaf-scm-launch", "B-main-ref-terminal"]
 decidable = "validator"
-note = "Frozen codes + code-uniqueness + count pins. KNOWN INTERACTION: B-lib-start/B-leaf-host-job-launch double emission; TEST-PHASE A8 negative must rule."
+note = "Frozen codes + code-uniqueness + count pins. RESOLVED INTERACTION: B-lib-start/B-leaf-host-job-launch emit one terminal (host-start-failed) because the launch leaf is phase-only; TEST-PHASE A8 negative must rule."
 
 [[matrix]]
 n = 9
 title = "exact operation/installation/process-start/generation/reason tied to owner"
 boundaries = ["B-lib-lifecycle-context", "B-main-scm-receipts"]
 decidable = "validator"
-note = "Identity projection emitter frozen (unbound); receipt codes frozen."
+note = "Identity projection emitter frozen (success path driven by the landed #891 case 15; its terminal arms unbound); receipt codes frozen."
 
 [[matrix]]
 n = 10

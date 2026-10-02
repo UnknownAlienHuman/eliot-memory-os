@@ -74,10 +74,12 @@ pub use introduction_lifecycle::{
     introduction_fence_record_id,
 };
 pub use module::compatibility_handshake::{
-    AcceptedCompatibilityEvidence, CompatibilityEnvelope, CompatibilityMismatch,
-    DurableCompatibilityState, HANDSHAKE_ENVELOPE_VERSION, MismatchField, NORMATIVE_SEAL_DOMAIN,
-    NormativePairReceipt, StateMigrationClass, VersionRange, admit_handshake, admit_rollback,
-    expected_seal_tag, restore_recorded_evidence,
+    AcceptedCompatibilityEvidence, CandidateActivation, CompatibilityEnvelope,
+    CompatibilityMismatch, DurableCompatibilityState, HANDSHAKE_ENVELOPE_VERSION, MismatchField,
+    NORMATIVE_SEAL_DOMAIN, NormativePairReceipt, StateMigrationClass, VersionRange,
+    admit_candidate_activation, admit_handshake, admit_rollback, contract_set_digest,
+    expected_seal_tag, handshake_canonical_format_range, handshake_protocol_range,
+    restore_recorded_evidence,
 };
 pub use module::control_reserve_front_door::{
     AuthorityDecision, CapacityBottleneck, CapacityClass, ControlOperationClass, ControlPermit,

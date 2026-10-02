@@ -407,6 +407,67 @@ impl KernelComposition {
     }
 }
 
+/// The ONE owner of the front-door `ServerHandshakePolicy.config_snapshot`
+/// object this Kernel publishes to every front-door session (issue #1968).
+///
+/// # Why one owner rather than two inline projections
+///
+/// This object had TWO independent builders: the initial projection in
+/// `assemble` here, and the REBUILD in
+/// `generation_recovery::update_handshake_policy_without_observation`, which runs
+/// on every generation cutover and on recovery. Two builders for one object means
+/// a key added at one site is silently EASED at the other, so any field published
+/// on the startup path would vanish after the first cutover. Both sites now call
+/// this function, which is what makes "publish a key" a one-site change.
+///
+/// `generation_recovery` reaches it as
+/// `crate::composition_bootstrap::front_door_config_snapshot`; it is
+/// `pub(crate)` for exactly that reason and is called from both.
+///
+/// # What it deliberately does NOT do
+///
+/// It publishes only the fields the Kernel is the owner of: its service and
+/// protocol identity, the active generation, the complete typed Authority Epoch,
+/// and the artifact plus protected-snapshot digests. It publishes NO I1.12
+/// compatibility field (contract-set digest, canonical format range, Architecture
+/// source digest, sealed receipt or migration class), because doing so is
+/// currently blocked and must not be started here: the whole object is hashed by
+/// `bins/eliot-kernel/src/agent_bridge.rs:495` and by the two front-door
+/// application clients, and those digests are recomputed from six-key literals
+/// outside this write set. See the ceiling recorded on
+/// `bins/eliotd/src/daemon_kernel_client/handshake.rs::UNPRESENTED_HANDSHAKE_FIELDS`.
+///
+/// # The two optional operands
+///
+/// Both digests are `Option` and are OMITTED when absent, never defaulted. That
+/// asymmetry is deliberate and is why this owner takes them as `Option`: the
+/// startup path always has an artifact identity to publish, while the recovery
+/// path only carries one forward when the object it is rebuilding already had it,
+/// and `protected_snapshot_digest` exists only on the daemon-launch path. Filling
+/// either with a placeholder here would ADD a key the object did not have, which
+/// changes the bytes the whole-object digest pin covers. Both are passed as
+/// already-formed JSON values so neither builder re-spells a digest literal.
+pub(crate) fn front_door_config_snapshot(
+    generation: u64,
+    authority_epoch: &eliot_contracts::EpochId,
+    artifact_digest: Option<serde_json::Value>,
+    protected_snapshot_digest: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut snapshot = serde_json::json!({
+        "service": SERVICE_NAME,
+        "protocol": PROTOCOL_VERSION,
+        "generation": generation,
+        "authority_epoch": authority_epoch,
+    });
+    if let Some(artifact_digest) = artifact_digest {
+        snapshot["artifact_digest"] = artifact_digest;
+    }
+    if let Some(protected_snapshot_digest) = protected_snapshot_digest {
+        snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
+    }
+    snapshot
+}
+
 /// Maps one build failure to its stable owner-typed diagnostic code.
 ///
 /// The code is the `KernelBuildError` variant name only; any `String`
@@ -1831,19 +1892,19 @@ impl KernelComposition {
         // `authority_epoch: EpochId` under `deny_unknown_fields`, so a bare
         // number would fail their decode outright. The daemon takes its
         // binding epoch from the launch handshake, never from this key.
-        let mut config_snapshot = serde_json::json!({
-            "service": SERVICE_NAME,
-            "protocol": PROTOCOL_VERSION,
-            "generation": generation.value(),
-            "authority_epoch": canonical_epoch,
-            "artifact_digest": kernel_artifact_sha256
-                .as_deref()
-                .unwrap_or("eliot-kernel-standalone"),
-        });
-        if let Some(launch) = daemon_launch.as_ref() {
-            config_snapshot["protected_snapshot_digest"] =
-                serde_json::Value::String(launch.protected_snapshot_digest.as_str().to_owned());
-        }
+        let config_snapshot = front_door_config_snapshot(
+            generation.value(),
+            &canonical_epoch,
+            Some(serde_json::Value::String(
+                kernel_artifact_sha256
+                    .as_deref()
+                    .unwrap_or("eliot-kernel-standalone")
+                    .to_owned(),
+            )),
+            daemon_launch.as_ref().map(|launch| {
+                serde_json::Value::String(launch.protected_snapshot_digest.as_str().to_owned())
+            }),
+        );
         let front_door_policy = ServerHandshakePolicy {
             protocol_range: eliot_protocol::ProtocolRange {
                 minimum: eliot_protocol::ProtocolVersion::CURRENT,

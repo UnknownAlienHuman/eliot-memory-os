@@ -67,6 +67,20 @@ CASE_ISSUE = 985
 EXIT_CODES = {"COMPLETE": 0, "INCOMPLETE": 2, "STALE": 1}
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+# Production-contour scanners run per line, so they need to recognise the two
+# shapes that are code to the compiler but not a production use: a whole-line
+# comment (already handled by `is_full_comment`) and a body compiled out of
+# production builds. Both exemptions are fail-closed — an unrecognised
+# spelling reports rather than widens the exemption.
+_INLINE_MOD_OPEN = re.compile(r"^\s*(?:pub(?:\([^()]*\))?\s+)?mod\s+[A-Za-z0-9_]+\s*\{")
+# Brace counting ignores literal contents so a brace inside a string, raw
+# string, or char literal cannot drift a block region.
+_LITERAL_SPAN = re.compile(
+    r'r#*"(?:[^"]|"(?!#))*?"#*'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^'\\\n])'",
+    re.S,
+)
 
 
 class Failure(Exception):
@@ -191,6 +205,78 @@ def cfg_name(conds: frozenset[str], target: str) -> str:
     if conds == frozenset({"windows", "test"}):
         return "windows+test"
     raise Failure(f"unsupported cfg combination: {sorted(conds)}")
+
+
+def cfg_attr_requires_test(text: str) -> bool:
+    """True only when a ``#[cfg(...)]`` attribute provably requires ``test``.
+
+    The admitted cfg vocabulary is the one :func:`parse_own_cfg` already owns,
+    so the plain ``#[cfg(test)]`` and the compound ``#[cfg(all(test, windows))]``
+    / ``#[cfg(all(windows, test))]`` forms all resolve to a test-only region
+    while a bare ``#[cfg(windows)]`` does not. Anything outside that vocabulary
+    is NOT test-only: a new, misspelled, or unsupported attribute therefore
+    still reports instead of silently widening the exemption.
+    """
+    try:
+        conds = parse_own_cfg(text)
+    except Failure:
+        return False
+    return "test" in conds
+
+
+def test_only_lines(text: str) -> set[int]:
+    """Line numbers compiled out of production builds by a test-only ``cfg``.
+
+    This is the *inline* companion to the ``exclusion = "test_only"`` mechanism
+    in :func:`check_test_only`. That mechanism exempts a whole separate file
+    whose module edge is ``cfg``-gated; it cannot help a production-owned file
+    (``lib.rs``, a composition module) that holds real production code above a
+    ``#[cfg(test)]`` capture harness in the same file. This function scopes the
+    exemption to the gated item and, for a gated ``mod``, to that module's body
+    only — so a ``tracing`` use in the production code above the harness is
+    still production and is still reported.
+
+    An item's attributes are the maximal run of ``#``-prefixed lines bracketed
+    by balanced ``[]``/``()``, so a gate survives an interleaved multi-line
+    ``#[allow(...)]`` and any other attribute on the same item. The run is
+    cleared at the first following item line, so a gate on one item can never
+    exempt a sibling. Doc-comment and blank lines are transparent to the
+    compiler's attribute/item association and do not break a pending run.
+    Brace depth is counted with literal contents blanked, so a brace inside a
+    string, raw string, or char literal cannot drift a region.
+    """
+    depth = 0
+    stack: list[tuple[int, bool]] = []
+    attrs: list[str] = []
+    attr_depth = 0
+    inside: set[int] = set()
+
+    def bracketed(code: str) -> int:
+        return (
+            code.count("[") - code.count("]")
+            + code.count("(") - code.count(")")
+        )
+
+    for num, line in enumerate(split_lines(text), 1):
+        code = _LITERAL_SPAN.sub(" ", line)
+        stripped = line.strip()
+        if stripped.startswith("#") or (attrs and attr_depth > 0):
+            attrs.append(line)
+            attr_depth += bracketed(code)
+            depth += code.count("{") - code.count("}")
+            continue
+        if is_full_comment(line) or not stripped:
+            continue
+        gated = any(cfg_attr_requires_test(attr) for attr in attrs)
+        attrs, attr_depth = [], 0
+        if _INLINE_MOD_OPEN.match(line):
+            stack.append((depth, gated))
+        if gated or any(test_only for _at_depth, test_only in stack):
+            inside.add(num)
+        depth += code.count("{") - code.count("}")
+        while stack and depth <= stack[-1][0]:
+            stack.pop()
+    return inside
 
 
 def check_files(root: str, table: dict, res: Result) -> tuple[dict[str, dict], dict[str, str]]:
@@ -603,11 +689,27 @@ def check_boundaries(
                 res.stale.append(f"{bid}: install_host_diagnostics singularity lost in main.rs")
             if main_text.count("observe_terminal_error") != 1:
                 res.stale.append(f"{bid}: observe_terminal_error singularity lost in main.rs")
+            # Facade-bypass scan. This is a PRODUCTION-contour check, so it
+            # runs per line and skips only the two things that are not a
+            # production use: a full-line comment (the same `is_full_comment`
+            # exemption the zero-caller scan above already applies — without it
+            # a doc comment describing the seam reads as a bypass), and a line
+            # inside a `cfg`-gated test module (the `CaptureSink` /
+            # `tracing_subscriber::fmt()` harnesses tests use to record what
+            # production emitted). Both exemptions are per line and fail
+            # closed, so a `tracing` use in the production code above such a
+            # harness is still reported at its exact `path.rs:line`.
             for path, text in sorted(texts.items()):
                 if path == FACADE_REL:
                     continue
-                if re.search(r"tracing(::|!|_subscriber)", text):
-                    res.stale.append(f"{bid}: tracing use outside facade: {path}")
+                harness = test_only_lines(text)
+                for num, line in enumerate(split_lines(text), 1):
+                    if is_full_comment(line) or num in harness:
+                        continue
+                    if re.search(r"tracing(::|!|_subscriber)", line):
+                        res.stale.append(
+                            f"{bid}: tracing use outside facade: {path}:{num}"
+                        )
         if kind == "sink":
             for path, text in sorted(texts.items()):
                 for num, line in enumerate(split_lines(text), 1):

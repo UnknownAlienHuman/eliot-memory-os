@@ -274,10 +274,12 @@ fn console_process_exit_code() -> i32 {
 // callsites use entrypoint observations with static nonsecret words only: no
 // argv/env/nonce/credentials, no raw request lines, no error text (I15.4,
 // I07.20). The single HOST-0 terminal record for the console path is
-// preserved verbatim and stays the only terminal emission in this file:
-// lib.rs owns child-failure terminals, so main correlates without re-emitting
-// (single-terminal rule); the SCM-dispatcher failure is likewise a stage
-// detail, keeping stderr/capsule/exit 1066 as its receipt.
+// preserved verbatim; lib.rs owns child-failure terminals, so main correlates
+// without re-emitting (single-terminal rule). The SCM-dispatcher process-entry
+// failure is the one terminal main itself owns, because no lib.rs operation
+// ever ran for it: `fail_scm_dispatcher` emits exactly one facade terminal
+// carrying the typed `HOST_TERMINAL_CODE_DISPATCHER_FAILED` code, and
+// stderr/capsule/exit 1066 remain that failure's unchanged receipt.
 //
 // B1  process bootstrap capture (`PROCESS_BOOTSTRAP.set`, Startup): cached
 //     only; a static outcome word, never launch material. The #889
@@ -286,7 +288,11 @@ fn console_process_exit_code() -> i32 {
 // B3  SCM dispatcher contour (windows-only, ScmDispatch): the `Ok(true)`
 //     service path stays unobserved (SCM owns the process); `Ok(false)`
 //     console fallback vs `Err` dispatcher failure stay distinct, and no
-//     fallback is added where none existed. No projection here.
+//     fallback is added where none existed. The `Err` arm emits the one
+//     terminal main owns (`fail_scm_dispatcher`, typed
+//     `HOST_TERMINAL_CODE_DISPATCHER_FAILED`) plus one bounded #889 request
+//     projection; the old bare `dispatcher_failed` stage detail is gone, so
+//     exactly one terminal names this failure.
 // B4  console terminal exit (HOST-0 reference): preserved verbatim, plus a
 //     typed #889 projection subordinate (INFO, not a second terminal).
 // B5  console launch parse (ConsoleLoop/LaunchConfig): the Error frame plus
@@ -297,20 +303,60 @@ fn console_process_exit_code() -> i32 {
 //     via one clone so the projection keeps installation identity.
 // B7  Ready write (ConsoleLoop): bytes unchanged; the record never upgrades
 //     Ready into durable/global readiness (I01.10).
-// B8  read loop incl. blank/malformed (ConsoleLoop): blank input still skips
-//     silently by design; read failure keeps Error plus terminate.
+// B8  read loop incl. blank/malformed (`run_console_read_loop`, ConsoleLoop):
+//     blank input still skips silently by design; read failure keeps Error
+//     plus terminate and now also fixes the run's primary outcome as failure.
 // B9  dispatch Status/Stop/malformed (ConsoleLoop): response correlation and
 //     terminate flags unchanged; the stop `Err` arm is split
 //     (`Stopped` vs other) with identical responses so cancellation with
 //     proven no-effect stays distinct from failure; no second terminal
-//     for lib-terminal faults. The served request kind is returned for B10.
-// B10 response write failure (ConsoleLoop): the identical break-to-shutdown.
-// B11 EOF (ShutdownDrain): normal drain, not a failure record.
+//     for lib-terminal faults. The served request kind and the
+//     attempted-stop disposition are returned for B10/B12.
+// B10 response write failure (ConsoleLoop): the identical break-to-shutdown,
+//     plus the primary outcome fixed as failure so a clean drain cannot make
+//     an unwritten response a successful run.
+// B11 EOF (ShutdownDrain): normal drain, not a failure record; the primary
+//     outcome stays `Served` and the drain result alone judges it.
 // B12 shutdown/cancellation (`finish_console_shutdown`, ShutdownDrain): the
-//     single `host.stop()` call is preserved; the `Ok`/`Stopped` outcomes
+//     single `host.stop()` call is preserved for every request that has not
+//     already attempted it, and is never repeated for one that has — the
+//     `StopDisposition` from B9 prohibits a second semantic call and so a
+//     second stop terminal for the same request. The `Ok`/`Stopped` outcomes
 //     are distinguished with identical results; drain outcome observed only.
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
-// B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
+// B14 service-entry failures (`service_main`, main-only; these never cross
+//     `lib.rs`). Each is projected through the existing #889 facade at its real
+//     boundary by `observe_service_entry_failure`, so none is hidden. Every
+//     record names the operation (`AdmittedEvent::ServiceFailure`), the phase
+//     (`EntrypointStage::ScmDispatch`), the typed `HostStopCode` discriminant as
+//     the observation label, the typed `HostError` discriminant as the reason
+//     where one is in hand, and the launch identities only from options that
+//     already parsed. The nine `fail_host_service` classes —
+//     `InvalidScmArgvOrBootstrap`, `InvalidRegistration`,
+//     `ReporterStartFailed`, `OpenHostFailed`, `ReporterProgressFailed`,
+//     `CredentialControlFailed`, `SpawnCredentialFailed`,
+//     `RuntimeControlFailed`, `SpawnRuntimeFailed` — are projected inside that
+//     one function, which every one of those arms already calls exactly once;
+//     `ScmRegisterNull` has no SCM handle and so calls the helper at its own
+//     site. No argv, Win32 code, bootstrap text, or error payload crosses.
+//     These are `INFO` subordinate records: the terminal for each failed
+//     operation stays with the owner that already emits it (lib.rs's
+//     `HostTerminalGuard` for `OpenHostFailed`/`CredentialControlFailed`/
+//     `RuntimeControlFailed`/stop, and the SCM status + capsule receipt for the
+//     boundary-only classes), so no failure gains a second terminal and none
+//     loses its receipt.
+// B15 start-failure capsule/stderr/SCM status and the process exit code: the
+//     receipt owners, unchanged. Every observation above is additive on the
+//     #889 facade only; stderr text, capsule content, `dwWin32ExitCode` 1066,
+//     `dwServiceSpecificExitCode`, and the dispatch exit code are byte and
+//     value identical to before, and the console exit code is unchanged on
+//     every path that already reported failure. Three console paths
+//     deliberately are not: a Ready write failure, a read error, and a
+//     response write failure now fix the run as `Failed` even when the drain
+//     succeeded, so they exit 1066 with a `ConsoleFailed` capsule where they
+//     previously returned the drain result and exited 0 with no capsule. The
+//     audit requires a protocol, read, or write failure to stay a failure
+//     even when cleanup succeeded.
 
 /// Reads the admitted profile supervisor switch from the process arguments,
 /// leaving every other launch argument untouched.
@@ -416,47 +462,47 @@ fn main() {
                 },
             );
         }
-        Err(error) => {
-            // F-LOG-HOST-7 B3 (issue #982): dispatcher failure as stage detail
-            // only, so the HOST-0 terminal record below stays singular per the
-            // #889 contract; stderr, capsule, and exit 1066 still own the
-            // terminal receipt with identical text and codes.
-            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
-                "dispatcher_failed",
-            );
-            let detail = format!(
-                "StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})"
-            );
-            let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
-            let cached = captured_bootstrap_snapshot();
-            persist_host_start_failure(
-                HostStopCode::DispatcherFailed,
-                "dispatcher",
-                &detail,
-                cached.as_ref(),
-            );
-            eliot_host::host_diagnostics::shutdown_event_log_reporting();
-            std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
-        }
+        Err(error) => fail_scm_dispatcher(error),
     }
-    let (console_ok, console_options) = run_console();
-    if !console_ok {
+    let console = run_console();
+    // The console run fails when its primary outcome failed or when the
+    // shutdown drain did not complete: a clean drain never repairs a
+    // read/write/protocol failure, so this one receipt stays the only
+    // failure emitter on the console path.
+    if console.failed() {
         // HOST-0 (issue #889): the single reference failure observation.
         // Diagnostics observe only; capsule, stderr, and exit code below
         // still own the terminal receipt. Other sites stay for #891/#982.
+        //
+        // F-LOG-HOST-2 (#893 D1) correlation ceiling at this production
+        // caller: `run_console` returns a collapsed boolean, so by the time
+        // this terminal is emitted main holds no owner-issued transaction,
+        // effect, or request handle for the console run — the operation
+        // subject never reached this frame. `observe_terminal_error`
+        // therefore renders this terminal with correlation explicitly
+        // unavailable (`correlation_available = false`, `tx_missing`,
+        // `effect_missing`, `req_missing`) instead of leaving a reader to infer
+        // the pairing from record order (I13.11: correlation, not adjacency).
+        //
+        // The identities this run DOES own — installation and transaction-plan
+        // generation from the retained launch options — are carried by the
+        // subordinate projection below, and the operation-specific Phase-B and
+        // credential terminals inside lib.rs/`credential_control.rs` bind their
+        // own exact `tx`/`effect`/`req` token. Binding a fabricated or inferred
+        // token here would be worse than an explicit missing field, so this
+        // call stays the uncorrelated facade entry point deliberately.
         eliot_host::host_diagnostics::observe_terminal_error(
             eliot_host::host_diagnostics::HOST_TERMINAL_CODE_CONSOLE_FAILED,
         );
-        // #889 projection: the console run failed. The boolean outcome
-        // collapsed which step and reason failed, so operation, request,
+        // #889 projection: the console run failed. The single collapsed
+        // outcome hides which step and reason failed, so operation, request,
         // and reason stay explicitly missing; subordinate records own the
         // specific attribution. Installation correlates when retained.
         let mut terminal = HostRequestProjection::failed_without_reason(
             eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
         )
         .with_terminal_exit(console_process_exit_code());
-        if let Some(options) = console_options.as_ref() {
+        if let Some(options) = console.launch_options() {
             terminal = terminal.with_launch_options(options);
         }
         observe_host_request(&terminal);
@@ -540,7 +586,82 @@ fn observe_console_ready(host: &HostComposition, options: &HostLaunchOptions) {
     }
 }
 
-fn run_console() -> (bool, Option<HostLaunchOptions>) {
+/// The primary console outcome, kept distinct from the cleanup result.
+///
+/// The console protocol itself decides this: a `Ready` write failure, a
+/// response write failure, or a stdin read failure is a failure even when the
+/// shutdown drain that follows succeeds, because a clean drain proves cleanup
+/// and never repairs the protocol.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ConsoleOutcome {
+    /// The console ran and its own protocol path completed (EOF or a served
+    /// stop request), so only the drain result is left to judge.
+    Served,
+    /// A read/write/protocol failure ended the console run.
+    Failed,
+}
+
+/// One console run: the primary outcome, the drain result, and the retained
+/// launch identity.
+///
+/// `failed` is the single judgement `main` acts on, and it is the conjunction
+/// of the two independent facts rather than either one alone: a protocol
+/// failure stays a failure after a clean drain, and a clean protocol run
+/// still fails when the drain did not complete.
+struct ConsoleRun {
+    /// What the console protocol itself did.
+    primary: ConsoleOutcome,
+    /// What the shutdown drain did: `true` only for a completed drain.
+    drained: bool,
+    /// Retained launch identity for correlation, absent when parsing failed.
+    launch_options: Option<HostLaunchOptions>,
+}
+
+impl ConsoleRun {
+    /// Whether this run owes the single `console_failed` receipt.
+    fn failed(&self) -> bool {
+        self.primary == ConsoleOutcome::Failed || !self.drained
+    }
+
+    /// The retained launch identity, absent only when parsing never admitted
+    /// options for this run.
+    fn launch_options(&self) -> Option<&HostLaunchOptions> {
+        self.launch_options.as_ref()
+    }
+}
+
+/// Whether the semantic [`HostComposition::stop`] for the served request has
+/// already been attempted.
+///
+/// One `Stop` request owns exactly one semantic stop. `dispatch` performs it
+/// and this disposition travels with the served request into the shutdown
+/// path, which therefore never stops the same request a second time and never
+/// arms a second stop terminal for it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StopDisposition {
+    /// No semantic stop ran for the served request, so shutdown owns the one
+    /// drain stop.
+    NotAttempted,
+    /// `dispatch` already performed the semantic stop for this request; a stop
+    /// that failed left the host running, and that failure is already observed
+    /// with its typed reason there, so shutdown must not repeat it.
+    Attempted,
+}
+
+/// One dispatched console request: the response frame plus the loop
+/// disposition the read loop and the shutdown path need.
+struct ConsoleDispatch {
+    /// The frame to write back to the peer.
+    response: Response,
+    /// Whether the read loop ends after this frame.
+    terminate: bool,
+    /// The served request kind, for write-failure correlation.
+    served: Option<HostConsoleRequest>,
+    /// Whether the semantic stop for this request was already attempted.
+    stop: StopDisposition,
+}
+
+fn run_console() -> ConsoleRun {
     // F-LOG-HOST-7 B5 (issue #982): console loop entered; stdout framing below
     // is unchanged.
     eliot_host::host_diagnostics::observe_entrypoint(
@@ -567,7 +688,11 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             write_response(&Response::Error {
                 error: error.to_string(),
             });
-            return (false, None);
+            return ConsoleRun {
+                primary: ConsoleOutcome::Failed,
+                drained: false,
+                launch_options: None,
+            };
         }
     };
     let opened = open_host(launch_options.clone());
@@ -584,7 +709,11 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             write_response(&Response::Error {
                 error: error.to_string(),
             });
-            return (false, Some(launch_options));
+            return ConsoleRun {
+                primary: ConsoleOutcome::Failed,
+                drained: false,
+                launch_options: Some(launch_options),
+            };
         }
     };
     // AUD6: a retained post-commit demand makes this start the demand-start
@@ -598,8 +727,20 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         service: SERVICE_NAME,
         protocol: PROTOCOL_VERSION,
     }) {
-        let drained = finish_console_shutdown(&mut host, "ready response failed", &launch_options);
-        return (drained, Some(launch_options));
+        // F-LOG-HOST-7 B7: the Ready write is a protocol failure, so the
+        // primary outcome is failure whatever the drain below reports. The
+        // drain still runs exactly once and the process still exits failure.
+        let drained = finish_console_shutdown(
+            &mut host,
+            "ready response failed",
+            &launch_options,
+            StopDisposition::NotAttempted,
+        );
+        return ConsoleRun {
+            primary: ConsoleOutcome::Failed,
+            drained,
+            launch_options: Some(launch_options),
+        };
     }
     // F-LOG-HOST-7 B7 (issue #982): Ready bytes unchanged; this record never
     // promotes Ready into durable/global readiness (I01.10).
@@ -608,12 +749,41 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
         "ready_written",
     );
     observe_console_ready(&host, &launch_options);
+    // F-LOG-HOST-7 B8 (issue #982): the read loop's own outcome, tracked
+    // separately from the drain below. Any read/write/protocol failure sets
+    // the primary outcome to `Failed`, and no later drain can clear it.
+    let (primary, stop) = run_console_read_loop(&mut host, &launch_options);
+    // F-LOG-HOST-7 B11 (issue #982): EOF and the served stop request are normal
+    // ends, so the primary outcome stays `Served` and the drain result alone
+    // judges them. The drain runs exactly once, with the served request's
+    // attempted-stop disposition, so one request is never stopped twice.
+    let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options, stop);
+    ConsoleRun {
+        primary,
+        drained,
+        launch_options: Some(launch_options),
+    }
+}
+
+/// The console read loop, returning the protocol's own outcome together with
+/// the attempted-stop disposition of the request that ended the loop.
+///
+/// A read error and an unwritable response both return
+/// [`ConsoleOutcome::Failed`], which is what keeps a clean drain from turning a
+/// failed console run into a successful one. Blank input still skips silently
+/// and malformed input still keeps the loop up, exactly as before.
+fn run_console_read_loop(
+    host: &mut HostComposition,
+    options: &HostLaunchOptions,
+) -> (ConsoleOutcome, StopDisposition) {
+    let mut primary = ConsoleOutcome::Served;
+    let mut stop = StopDisposition::NotAttempted;
     for line in io::stdin().lock().lines() {
-        let (response, terminate, served) = match line {
+        let served_request = match line {
             // Blank input still skips silently by design: not a failure, so
             // intentionally unobserved (keeps the hot path quiet).
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => dispatch(&mut host, &line, &launch_options),
+            Ok(line) => dispatch(host, &line, options),
             Err(error) => {
                 // F-LOG-HOST-7 B8 (issue #982): read failure keeps Error plus
                 // terminate; the raw error text stays out of diagnostics.
@@ -627,21 +797,26 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
                     &HostRequestProjection::failed_without_reason(
                         eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                     )
-                    .with_launch_options(&launch_options),
+                    .with_launch_options(options),
                 );
-                (
-                    Response::Error {
+                // The read failed: the run is a failure regardless of how the
+                // drain below completes.
+                primary = ConsoleOutcome::Failed;
+                ConsoleDispatch {
+                    response: Response::Error {
                         error: error.to_string(),
                     },
-                    true,
-                    None,
-                )
+                    terminate: true,
+                    served: None,
+                    stop: StopDisposition::NotAttempted,
+                }
             }
         };
+        stop = served_request.stop;
         // F-LOG-HOST-7 B10 (issue #982): write failure breaks to the identical
         // shutdown path; the condition is split only to observe it, preserving
         // evaluation order and outcome.
-        if !write_response(&response) {
+        if !write_response(&served_request.response) {
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
                 "response_write_failed",
@@ -650,19 +825,21 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             let mut unwritten = HostRequestProjection::failed_without_reason(
                 eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
             )
-            .with_launch_options(&launch_options);
-            if let Some(kind) = served {
+            .with_launch_options(options);
+            if let Some(kind) = served_request.served {
                 unwritten = unwritten.with_request(kind);
             }
             observe_host_request(&unwritten);
+            // The response never reached the peer, so the console run failed
+            // even if the drain succeeds.
+            primary = ConsoleOutcome::Failed;
             break;
         }
-        if terminate || !host.running() {
+        if served_request.terminate || !host.running() {
             break;
         }
     }
-    let drained = finish_console_shutdown(&mut host, "console input ended", &launch_options);
-    (drained, Some(launch_options))
+    (primary, stop)
 }
 
 /// Runs the one admitted current-user profile supervisor.
@@ -1082,7 +1259,7 @@ fn dispatch(
     host: &mut HostComposition,
     line: &str,
     options: &HostLaunchOptions,
-) -> (Response, bool, Option<HostConsoleRequest>) {
+) -> ConsoleDispatch {
     match serde_json::from_str::<Request>(line) {
         Ok(Request::Status) => {
             // I1.5 (AUD5): admission ahead of serving. The served console
@@ -1094,13 +1271,15 @@ fn dispatch(
             if let Err(error) =
                 admit_console_trigger(host, ActivationTriggerClass::CliRequest, "console-status")
             {
-                return (
-                    Response::Error {
+                return ConsoleDispatch {
+                    response: Response::Error {
                         error: error.to_string(),
                     },
-                    false,
-                    Some(HostConsoleRequest::Status),
-                );
+                    terminate: false,
+                    served: Some(HostConsoleRequest::Status),
+                    // A refused admission never runs the semantic stop.
+                    stop: StopDisposition::NotAttempted,
+                };
             }
             let outcome = host.snapshot();
             observe_status_served(options, &outcome);
@@ -1127,7 +1306,12 @@ fn dispatch(
                     }
                 }
             };
-            (response, false, Some(HostConsoleRequest::Status))
+            ConsoleDispatch {
+                response,
+                terminate: false,
+                served: Some(HostConsoleRequest::Status),
+                stop: StopDisposition::NotAttempted,
+            }
         }
         Ok(Request::Stop) => {
             // Same admission-ahead rule as `Status` above: the operator stop
@@ -1140,80 +1324,29 @@ fn dispatch(
             if let Err(error) =
                 admit_console_trigger(host, ActivationTriggerClass::CliRequest, "console-stop")
             {
-                return (
-                    Response::Error {
+                return ConsoleDispatch {
+                    response: Response::Error {
                         error: error.to_string(),
                     },
-                    false,
-                    Some(HostConsoleRequest::Stop),
-                );
+                    terminate: false,
+                    served: Some(HostConsoleRequest::Stop),
+                    // A refused admission never runs the semantic stop, so
+                    // the console stays up and shutdown still owns the drain.
+                    stop: StopDisposition::NotAttempted,
+                };
             }
-            (
-                match host.stop() {
-                    Ok(()) => {
-                        // F-LOG-HOST-7 B9: accepted stop still terminates the loop;
-                        // the Stopped frame below keeps owning completion.
-                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            "stop_accepted",
-                        );
-                        // #889 projection: the stop effect committed durably.
-                        observe_host_request(
-                            &HostRequestProjection::durable_committed(
-                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            )
-                            .with_request(HostConsoleRequest::Stop)
-                            .with_operation(AdmittedEvent::ServiceStop)
-                            .with_launch_options(options),
-                        );
-                        Response::Stopped
-                    }
-                    Err(error @ HostError::Stopped) => {
-                        // F-LOG-HOST-7 B9: already-stopped stop keeps the exact
-                        // Error response plus terminate; cancellation with
-                        // proven no-effect stays distinct from failure.
-                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            "stop_failed",
-                        );
-                        // #889 projection: admitted stop effected nothing.
-                        observe_host_request(
-                            &HostRequestProjection::cancelled(
-                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            )
-                            .with_request(HostConsoleRequest::Stop)
-                            .with_operation(AdmittedEvent::ServiceStop)
-                            .with_launch_options(options),
-                        );
-                        Response::Error {
-                            error: error.to_string(),
-                        }
-                    }
-                    Err(error) => {
-                        // F-LOG-HOST-7 B9: stop failure correlates only; a
-                        // lib-terminal child failure is not re-emitted here.
-                        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
-                            eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                            "stop_failed",
-                        );
-                        // #889 projection: the stop failed with a typed reason.
-                        observe_host_request(
-                            &HostRequestProjection::failed(
-                                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
-                                &error,
-                            )
-                            .with_request(HostConsoleRequest::Stop)
-                            .with_operation(AdmittedEvent::ServiceStop)
-                            .with_launch_options(options),
-                        );
-                        Response::Error {
-                            error: error.to_string(),
-                        }
-                    }
-                },
-                true,
-                Some(HostConsoleRequest::Stop),
-            )
+            // F-LOG-HOST-7 B9/B12 (issue #982): this is the one semantic
+            // `HostComposition::stop` for the request, and the disposition below
+            // carries it into `finish_console_shutdown` so that a failed stop is
+            // never retried there as a second semantic stop.
+            ConsoleDispatch {
+                response: run_semantic_stop(host, options),
+                terminate: true,
+                served: Some(HostConsoleRequest::Stop),
+                // The semantic stop for this request ran inside the call above,
+                // successfully or not, so shutdown must not perform it again.
+                stop: StopDisposition::Attempted,
+            }
         }
         Err(error) => {
             // F-LOG-HOST-7 B9: malformed input keeps Error plus stay-in-loop;
@@ -1223,13 +1356,87 @@ fn dispatch(
                 "request_malformed",
             );
             observe_malformed_sighted(options);
-            (
-                Response::Error {
+            ConsoleDispatch {
+                response: Response::Error {
                     error: error.to_string(),
                 },
-                false,
-                None,
-            )
+                terminate: false,
+                served: None,
+                stop: StopDisposition::NotAttempted,
+            }
+        }
+    }
+}
+
+/// The one semantic [`HostComposition::stop`] for a served `Stop` request, and
+/// the frame that reports its outcome.
+///
+/// Every `Err` arm returns the identical `Error` response as before, so the
+/// `Stopped` cancellation with proven no-effect stays distinct from a real
+/// failure only in the observed records. The caller carries
+/// [`StopDisposition::Attempted`] out of here, so this call is the request's
+/// only semantic stop and no later drain repeats it.
+fn run_semantic_stop(host: &mut HostComposition, options: &HostLaunchOptions) -> Response {
+    match host.stop() {
+        Ok(()) => {
+            // F-LOG-HOST-7 B9: accepted stop still terminates the loop; the
+            // Stopped frame below keeps owning completion.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "stop_accepted",
+            );
+            // #889 projection: the stop effect committed durably.
+            observe_host_request(
+                &HostRequestProjection::durable_committed(
+                    eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                )
+                .with_request(HostConsoleRequest::Stop)
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            Response::Stopped
+        }
+        Err(error @ HostError::Stopped) => {
+            // F-LOG-HOST-7 B9: already-stopped stop keeps the exact
+            // Error response plus terminate; cancellation with
+            // proven no-effect stays distinct from failure.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "stop_failed",
+            );
+            // #889 projection: admitted stop effected nothing.
+            observe_host_request(
+                &HostRequestProjection::cancelled(
+                    eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                )
+                .with_request(HostConsoleRequest::Stop)
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            Response::Error {
+                error: error.to_string(),
+            }
+        }
+        Err(error) => {
+            // F-LOG-HOST-7 B9: stop failure correlates only; a
+            // lib-terminal child failure is not re-emitted here.
+            eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+                eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                "stop_failed",
+            );
+            // #889 projection: the stop failed with a typed reason.
+            observe_host_request(
+                &HostRequestProjection::failed(
+                    eliot_host::host_diagnostics::EntrypointStage::ConsoleLoop,
+                    &error,
+                )
+                .with_request(HostConsoleRequest::Stop)
+                .with_operation(AdmittedEvent::ServiceStop)
+                .with_launch_options(options),
+            );
+            Response::Error {
+                error: error.to_string(),
+            }
         }
     }
 }
@@ -1238,6 +1445,7 @@ fn finish_console_shutdown(
     host: &mut HostComposition,
     cause: &str,
     options: &HostLaunchOptions,
+    stop: StopDisposition,
 ) -> bool {
     // F-LOG-HOST-7 B11/B12 (issue #982): drain entered; `cause` is one of the
     // two frozen caller literals, so it is safe detail. EOF is a normal drain,
@@ -1268,6 +1476,24 @@ fn finish_console_shutdown(
             .with_launch_options(options),
         );
         return true;
+    }
+    // F-LOG-HOST-7 B12 (issue #982): a running host here means the served
+    // `Stop` request's own semantic `host.stop()` failed. Repeating it here
+    // would arm a second `HostTerminalGuard(BOUNDARY_STOP_TERMINAL)` for the
+    // same request, producing a duplicate `host-stop-failed` terminal and a
+    // second semantic cleanup, so the stop is not repeated. The typed reason
+    // belongs to the dispatch record that already owns it; the drain states
+    // only what it can prove and reports failure because the host is still
+    // running. No callback and no cleanup operation is added or removed.
+    if stop == StopDisposition::Attempted {
+        observe_host_request(
+            &HostRequestProjection::unknown(
+                eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            )
+            .with_operation(AdmittedEvent::ServiceStop)
+            .with_launch_options(options),
+        );
+        return false;
     }
     match host.stop() {
         Ok(()) => {
@@ -1344,6 +1570,96 @@ fn run_as_scm_service() -> Result<bool, u32> {
         }
         Err(error) => Err(error.code()),
     }
+}
+
+/// Fails the process at the SCM-dispatcher process-entry boundary.
+///
+/// This is the one terminal failure `main` owns outright: no lib.rs operation
+/// ever ran for it, so no lib.rs boundary can own it. The #889 facade therefore
+/// carries exactly one terminal record, spelled with the typed
+/// `HOST_TERMINAL_CODE_DISPATCHER_FAILED` code that projects
+/// [`HostStopCode::DispatcherFailed`] (specific 12) without taking over its
+/// lifecycle meaning, plus one bounded #889 request projection naming the same
+/// failure. The bare `dispatcher_failed` stage detail this arm used to emit is
+/// replaced by that typed terminal, never joined by it, so this failed
+/// operation yields exactly one terminal and no second emitter.
+///
+/// Every preserved behavior is unchanged and in the same order: the same
+/// stderr text, the same capsule record, the same Event Log shutdown, and the
+/// same 1066 process exit. The Win32 code stays out of diagnostics; the reason
+/// slot is honestly missing because a Win32 code is not a typed `HostError`
+/// reason.
+#[cfg(windows)]
+fn fail_scm_dispatcher(error: u32) -> ! {
+    eliot_host::host_diagnostics::observe_terminal_error(
+        eliot_host::host_diagnostics::HOST_TERMINAL_CODE_DISPATCHER_FAILED,
+    );
+    let cached = captured_bootstrap_snapshot();
+    // #889 projection: the process never reached service supervision, so this
+    // is an admitted service failure with no typed reason to project.
+    let mut terminal = HostRequestProjection::failed_without_reason(
+        eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+    )
+    .with_operation(AdmittedEvent::ServiceFailure)
+    .with_terminal_exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+    if let Some(options) = cached.as_ref() {
+        terminal = terminal.with_launch_options(options);
+    }
+    observe_host_request(&terminal);
+    let detail =
+        format!("StartServiceCtrlDispatcherW failed with Win32 error {error} (0x{error:08X})");
+    let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
+    persist_host_start_failure(
+        HostStopCode::DispatcherFailed,
+        "dispatcher",
+        &detail,
+        cached.as_ref(),
+    );
+    eliot_host::host_diagnostics::shutdown_event_log_reporting();
+    std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+}
+
+/// Bounded typed #889 projection for one main-owned SCM service-entry
+/// failure, emitted at the boundary that actually detected it.
+///
+/// These boundaries live in `service_main`, in this binary, and never cross
+/// `lib.rs`, so nothing downstream would ever project them: each is projected
+/// here instead. The record carries the admitted operation
+/// (`AdmittedEvent::ServiceFailure`), the phase (`EntrypointStage::ScmDispatch`),
+/// the typed [`HostStopCode`] discriminant as the stage label, and the
+/// installation/generation identities of launch options that already parsed.
+/// Slots with nothing in hand stay explicitly missing rather than guessed.
+///
+/// `error` is the typed [`HostError`] the owner produced where one exists;
+/// where the outcome collapsed it — the reporter thread's `io::Error`, the
+/// reporter progress flag — the reason stays explicitly missing instead of
+/// inventing one from a payload or an arbitrary `Debug` rendering. Nothing
+/// here reads argv, the Win32 code, or any error text (I15.4, I07.20).
+///
+/// This is an `INFO` subordinate record, never a second terminal: the single
+/// terminal per failed operation stays with the owner that already emits it —
+/// lib.rs's `HostTerminalGuard` for the composition failures, and the SCM
+/// status plus capsule receipt for the boundary-only classes.
+#[cfg(windows)]
+fn observe_service_entry_failure(
+    code: HostStopCode,
+    error: Option<&HostError>,
+    launch_options: Option<&HostLaunchOptions>,
+) {
+    eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+        eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
+        code.failure_class(),
+    );
+    let stage = eliot_host::host_diagnostics::EntrypointStage::ScmDispatch;
+    let mut projection = match error {
+        Some(error) => HostRequestProjection::failed(stage, error),
+        None => HostRequestProjection::failed_without_reason(stage),
+    }
+    .with_operation(AdmittedEvent::ServiceFailure);
+    if let Some(options) = launch_options {
+        projection = projection.with_launch_options(options);
+    }
+    observe_host_request(&projection);
 }
 
 #[cfg(windows)]
@@ -1428,11 +1744,17 @@ fn fail_host_service(
     report: &mut eliot_platform_windows::scm_entry::ServiceStatusReport,
     code: HostStopCode,
     error_variant: &str,
+    error: Option<&HostError>,
     detail: &str,
     launch_options: Option<&HostLaunchOptions>,
 ) {
     use eliot_platform_windows::scm_entry::report_service_status;
     use windows_sys::Win32::System::Services::SERVICE_STOPPED;
+    // F-LOG-HOST-7 B14 (issue #982): every arm reaching this function is a
+    // main-owned service-entry failure that never crosses `lib.rs`, so this is
+    // the one site that projects all of them. `INFO` only — the single terminal
+    // for each failed operation stays with the owner that already emits it.
+    observe_service_entry_failure(code, error, launch_options);
     persist_host_start_failure(code, error_variant, detail, launch_options);
     report.current_state = SERVICE_STOPPED;
     report.win32_exit_code = HOST_WIN32_SERVICE_SPECIFIC_ERROR;
@@ -1465,6 +1787,11 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             );
             let _ = writeln!(io::stderr().lock(), "eliot-host: {detail}");
             let cached = captured_bootstrap_snapshot();
+            // F-LOG-HOST-7 B14 (issue #982): this boundary has no SCM handle,
+            // so it cannot go through `fail_host_service`; its typed #889
+            // projection is emitted here. No `HostError` is in hand (only a
+            // Win32 code) and none is invented, so the reason stays missing.
+            observe_service_entry_failure(HostStopCode::ScmRegisterNull, None, cached.as_ref());
             persist_host_start_failure(
                 HostStopCode::ScmRegisterNull,
                 "none",
@@ -1502,6 +1829,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::InvalidScmArgvOrBootstrap,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 cached.as_ref(),
             );
@@ -1516,6 +1844,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             &mut report,
             HostStopCode::InvalidRegistration,
             host_error_variant(&error),
+            Some(&error),
             &detail,
             Some(&launch_options),
         );
@@ -1531,6 +1860,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::ReporterStartFailed,
                 "io",
+                None,
                 &detail,
                 Some(&launch_options),
             );
@@ -1550,6 +1880,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::OpenHostFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1565,6 +1896,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
             &mut report,
             HostStopCode::ReporterProgressFailed,
             "reporter",
+            None,
             detail,
             Some(&capsule_bootstrap),
         );
@@ -1581,6 +1913,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::CredentialControlFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1599,6 +1932,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::SpawnCredentialFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1616,6 +1950,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::RuntimeControlFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -1634,6 +1969,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 &mut report,
                 HostStopCode::SpawnRuntimeFailed,
                 host_error_variant(&error),
+                Some(&error),
                 &detail,
                 Some(&capsule_bootstrap),
             );
@@ -3289,5 +3625,243 @@ mod process_bootstrap_tests {
             std::iter::once(OsString::from(SERVICE_NAME)).chain(process_args);
         assert!(HostLaunchOptions::validate_service_main_argv(callback_with_process_args).is_err());
         Ok(())
+    }
+}
+
+/// #982 executable proof for the console obligations the `run_console`
+/// integration target cannot reach.
+///
+/// `run_console` opens a real `HostComposition` before it reaches any of these
+/// decisions, and that open requires an installed protected Host root, an
+/// approved generation and a live store — none of which any in-repo fixture
+/// creates (`HostComposition::open` on an empty registry refuses, which is
+/// exactly what `bins/eliot-host/src/lib.rs`'s own inline proof asserts). So
+/// this module drives the decisions `run_console` actually makes, through the
+/// real production types and the real production function, rather than
+/// re-describing them: `ConsoleRun::failed` is the single judgement `main`
+/// acts on, and `persist_host_start_failure` plus `console_process_exit_code`
+/// are the receipt and exit it owes when that judgement is failure.
+///
+/// No expected diagnostic record is hand-built and no facade call manufactures
+/// the record under test: every assertion below reads what production produced.
+#[cfg(test)]
+mod console_primary_outcome_tests {
+    use super::*;
+
+    /// The two independent facts of one console run, as `run_console` returns
+    /// them: what the console protocol itself did, and what the shutdown drain
+    /// that followed it did. `launch_options` is absent here because these
+    /// cases judge the outcome, which is exactly what a retained launch
+    /// identity never changes.
+    fn console_run(primary: ConsoleOutcome, drained: bool) -> ConsoleRun {
+        ConsoleRun {
+            primary,
+            drained,
+            launch_options: None,
+        }
+    }
+
+    /// #982 obligation: a stdin read failure is a failure even when the drain
+    /// that follows it succeeded. The read loop's `Err` arm is the production
+    /// site that fixes the primary outcome as `Failed`, and a clean drain
+    /// proves cleanup only, so the run still owes the console receipt. The
+    /// control row is the same completed drain after a clean read loop, which
+    /// is what the defect collapsed these two into.
+    #[test]
+    fn read_failure_is_not_repaired_by_a_successful_drain() {
+        assert!(
+            console_run(ConsoleOutcome::Failed, true).failed(),
+            "a read failure must stay a failure after a clean drain"
+        );
+        assert!(
+            !console_run(ConsoleOutcome::Served, true).failed(),
+            "a clean protocol run with a completed drain is a success"
+        );
+    }
+
+    /// #982 obligation: an unwritten response is a failure even when the drain
+    /// succeeded, and the drain result is irrelevant to it in either
+    /// direction. `run_console_read_loop`'s `response_write_failed` branch is
+    /// the production site that fixes this primary outcome.
+    #[test]
+    fn unwritten_response_is_not_repaired_by_a_successful_drain() {
+        assert!(
+            console_run(ConsoleOutcome::Failed, true).failed(),
+            "an unwritten response must stay a failure after a clean drain"
+        );
+        assert!(
+            console_run(ConsoleOutcome::Failed, false).failed(),
+            "the drain result must never clear a protocol failure"
+        );
+    }
+
+    /// #982 obligation: a clean EOF is a success. The read loop leaves the
+    /// primary outcome `Served` when stdin ends without a read error, and the
+    /// completed drain alone then judges the run. A drain that did not complete
+    /// is the one independent fact that still fails this run.
+    #[test]
+    fn clean_eof_is_a_successful_console_run() {
+        assert!(
+            !console_run(ConsoleOutcome::Served, true).failed(),
+            "a clean EOF with a completed drain owes no failure receipt"
+        );
+        assert!(
+            console_run(ConsoleOutcome::Served, false).failed(),
+            "a clean protocol run still fails when the drain did not complete"
+        );
+    }
+
+    /// The whole domain of `ConsoleRun::failed`: each of its two independent
+    /// inputs decides the run on its own, so neither may ever be ignored. This
+    /// is the exact conjunction `main` acts on, and it is the property the
+    /// primary-outcome/cleanup split exists to keep.
+    #[test]
+    fn every_console_outcome_and_drain_pair_is_judged_by_the_conjunction() {
+        // Each row names the production path that produces exactly that pair:
+        // a clean read loop with a completed drain (clean EOF or a served stop
+        // request), the same loop whose drain did not complete, and the two
+        // protocol failures (stdin read error, unwritten response) with each
+        // drain result.
+        let judged: [(&str, ConsoleOutcome, bool, bool); 4] = [
+            (
+                "clean EOF, completed drain",
+                ConsoleOutcome::Served,
+                true,
+                false,
+            ),
+            (
+                "clean protocol run, incomplete drain",
+                ConsoleOutcome::Served,
+                false,
+                true,
+            ),
+            (
+                "protocol failure, completed drain",
+                ConsoleOutcome::Failed,
+                true,
+                true,
+            ),
+            (
+                "protocol failure, incomplete drain",
+                ConsoleOutcome::Failed,
+                false,
+                true,
+            ),
+        ];
+        for (path, primary, drained, expected) in judged {
+            assert_eq!(
+                console_run(primary, drained).failed(),
+                expected,
+                "{path} is judged as a failure={expected}"
+            );
+        }
+    }
+
+    /// #982 obligation: the `Ready` frame carries the owner's service and
+    /// protocol constants and nothing else. `run_console` writes it from the
+    /// same `SERVICE_NAME`/`PROTOCOL_VERSION` pair the composition root is
+    /// bound to, and the frame carries none of the `State` frame's
+    /// liveness/dependency fields — so a `Ready` frame can never be read as
+    /// the durable or global readiness the record beside it observes
+    /// (I01.10).
+    #[test]
+    fn ready_frame_carries_only_the_owner_service_and_protocol() {
+        let frame = serde_json::to_value(Response::Ready {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+        })
+        .unwrap_or_else(|error| panic!("the Ready frame must serialize: {error}"));
+        let object = frame
+            .as_object()
+            .unwrap_or_else(|| panic!("the Ready frame must be a JSON object"));
+        assert_eq!(frame["status"], "ready");
+        assert_eq!(frame["service"], SERVICE_NAME);
+        assert_eq!(frame["protocol"], PROTOCOL_VERSION);
+        for readiness_field in ["running", "active_process", "managed_dependencies"] {
+            assert!(
+                !object.contains_key(readiness_field),
+                "Ready must not carry the State frame's {readiness_field} field"
+            );
+        }
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["protocol", "service", "status"]);
+    }
+
+    /// #982 obligations 2-4 close on the receipt they owe: the bounded
+    /// start-failure capsule `main` persists for a failed console run, and the
+    /// process exit it then terminates with. Both are read back from what
+    /// production wrote into this test's own isolated state root, and the
+    /// registration nonce the same options carry is proven absent from it.
+    #[test]
+    fn failed_console_run_owes_the_typed_console_failed_receipt_and_exit() {
+        let root =
+            std::env::temp_dir().join(format!("eliot-host-console-outcome-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("fixture root: {error}"));
+        let options = console_test_options(&root);
+        let nonce = options
+            .registration_nonce()
+            .unwrap_or_else(|| panic!("fixture nonce"))
+            .as_str()
+            .to_owned();
+        persist_host_start_failure(
+            HostStopCode::ConsoleFailed,
+            "console",
+            "console protocol failed before durable shutdown",
+            Some(&options),
+        );
+        let stored = std::fs::read_to_string(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("capsule readback: {error}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stored).unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+        assert_eq!(parsed["record_type"], "host_start_failure");
+        assert_eq!(parsed["service"], SERVICE_NAME);
+        assert_eq!(parsed["failure_class"], "console_failed");
+        assert_eq!(parsed["service_specific_exit_code"], 13);
+        assert_eq!(parsed["win32_exit_code"], 1066);
+        assert_eq!(
+            parsed["detail"],
+            "console protocol failed before durable shutdown"
+        );
+        assert_eq!(parsed["installation_id"], options.installation().as_str());
+        assert_eq!(
+            parsed["tx_plan_generation"],
+            options.transaction_plan_generation()
+        );
+        assert!(
+            !stored.contains(&nonce),
+            "the registration nonce must never reach the console receipt"
+        );
+        assert!(stored.len() <= HOST_START_FAILURE_CAPSULE_MAX_BYTES);
+        #[cfg(windows)]
+        assert_eq!(console_process_exit_code(), HOST_CONSOLE_PROCESS_EXIT_CODE);
+        #[cfg(not(windows))]
+        assert_eq!(console_process_exit_code(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parses the same ten-argument system-service launch shape `main`
+    /// captures, bound to this test's own state root.
+    fn console_test_options(state_root: &std::path::Path) -> HostLaunchOptions {
+        let args = vec![
+            std::ffi::OsString::from("--config-descriptor"),
+            std::ffi::OsString::from(
+                state_root
+                    .join("eliot-authority.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            std::ffi::OsString::from("--config-descriptor-sha256"),
+            std::ffi::OsString::from("a".repeat(64)),
+            std::ffi::OsString::from("--installation-id"),
+            std::ffi::OsString::from("installation-host-console-outcome-test"),
+            std::ffi::OsString::from("--tx-plan-generation"),
+            std::ffi::OsString::from("7"),
+            std::ffi::OsString::from("--host-state-root"),
+            std::ffi::OsString::from(state_root.to_string_lossy().into_owned()),
+            std::ffi::OsString::from("--registration-nonce"),
+            std::ffi::OsString::from("b".repeat(64)),
+        ];
+        parse_process_bootstrap(args).unwrap_or_else(|error| panic!("test launch options: {error}"))
     }
 }

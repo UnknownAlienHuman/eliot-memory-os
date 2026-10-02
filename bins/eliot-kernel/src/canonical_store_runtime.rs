@@ -42,7 +42,7 @@ use super::StoreBootstrapHandoff;
 #[cfg(windows)]
 use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
-use eliot_kernel_core::RouteScope;
+use eliot_kernel_core::{CandidateActivation, CompatibilityMismatch, MismatchField, RouteScope};
 #[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
@@ -65,6 +65,327 @@ fn store_build_error_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
         KernelBuildError::Principal(_) => "PRINCIPAL",
+    }
+}
+
+/// I1.12 admission for the store-bridge process boundary on the bootstrap seam.
+///
+/// It decides through [`decide_store_bridge_compatibility`] — the one place a
+/// store bridge is admitted, which the rebind seam also reaches — and records the
+/// accepted verdict for the generation this seam activates.
+///
+/// It runs on the SAME composition seam that already refuses a store
+/// bootstrap the durable `canonical_store` route owner does not name, and it
+/// refuses BEFORE a `KernelStoreGateway` is constructed, attached or retained,
+/// so an incompatible store generation never becomes the live canonical
+/// connection. The envelope and the durable state come from the one producer
+/// in `compatibility_gate`, so this boundary cannot drift into a second
+/// spelling of the comparison.
+///
+/// The Host-approved `HostStoreBootstrapRequirement` is what this boundary
+/// admits: its `store_generation` and its State Fence Authority Epoch are the
+/// store-bridge generation identity the rest of this function already matches
+/// against the live route. Persisting the accepted verdict under the same
+/// `store_bridge` module id and the Host-approved artifact hash is what makes
+/// the generation a real rollback target: `generation_recovery`'s
+/// `admit_generation_rollback` re-reads exactly this record on restart, so
+/// "previously launched" is replaced by "recorded compatible with current
+/// durable formats and epoch lineage". A generation whose evidence was never
+/// recorded is refused by that gate rather than admitted by it.
+///
+/// `admit_generation_activation` derives the candidate and the durable state
+/// from the same admission tuple, so the epoch field here is decided by the
+/// route/requirement equality already proven above it; what this call adds at
+/// this boundary is fail-closed envelope construction and the durable verdict.
+/// The rollback gate is where a recorded verdict is re-compared against the
+/// state the Kernel runs under NOW.
+///
+/// The Store API contract set is the one I1.12 field at this boundary whose two
+/// operands do NOT both come from this binary. See the comment on the
+/// comparison below. Its CONFIRMED value is the one field this seam records on
+/// the durable verdict, because it is the one field a later rollback would
+/// otherwise have to take on trust: every other field is a constant of this
+/// build and re-derives from the row alone, while this one compares a row against
+/// the receiver's own compiled `eliot_store_api`.
+#[cfg(windows)]
+fn admit_store_bridge_compatibility(
+    ors: &eliot_ors::RedbRecoveryStore,
+    requirement: &HostStoreBootstrapRequirement,
+    presented_store_api_contract_set_digest: Option<&str>,
+) -> Result<(), KernelBuildError> {
+    let StoreBridgeAdmission {
+        activation,
+        confirmed_store_api_contract_set_digest,
+    } = decide_store_bridge_compatibility(requirement, presented_store_api_contract_set_digest)?;
+    // Issue #1968: the digest the STORE presented, not the Kernel's expectation.
+    // `decide_store_bridge_compatibility` compared the two and returns the
+    // peer's operand, so what is persisted is a value that was independently
+    // checked rather than a copy of what this Kernel would have produced.
+    // `generation_recovery::admit_generation_rollback` then re-verifies that
+    // recorded value against this Kernel's own compiled `eliot_store_api`
+    // instead of inheriting the one-time live result.
+    let activation = activation
+        .record_store_api_contract_set(confirmed_store_api_contract_set_digest)
+        .map_err(|mismatch| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.connect_rejected:compatibility_evidence",
+            );
+            KernelBuildError::Core(mismatch.to_string())
+        })?;
+    super::compatibility_gate::persist_generation_compatibility(
+        ors,
+        STORE_BRIDGE_ROUTE,
+        requirement.approved_artifact_hash.as_str(),
+        &activation,
+    )
+    .map_err(|reason| {
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.connect_rejected:compatibility_evidence",
+        );
+        KernelBuildError::Core(reason)
+    })
+}
+
+/// I1.12 admission for the store-rebind process boundary, and the second live
+/// path that installs a `KernelStoreGateway` as the composition's canonical
+/// writer ([`KernelComposition::rebind_store`] replaces the gateway instead of
+/// attaching a new one).
+///
+/// It runs the SAME decision as the bootstrap seam — [`decide_store_bridge_compatibility`],
+/// the one place a store bridge is admitted — so a store whose Store API contract
+/// set this Kernel's own compiled `eliot_store_api` does not produce is refused
+/// here too, and cannot become the live canonical writer through a rebind
+/// instead of through a bootstrap.
+///
+/// It deliberately records NO versioned-artifact evidence. The rebind transaction's
+/// durable artifact is a `StoreRebindReplayRecord` and nothing else, and this
+/// seam does not change that: the rebind requirement is proved equal to the
+/// immutable bootstrap descriptor, so the accepted verdict for that generation is
+/// already durable from its bootstrap. Persisting here would write a second,
+/// rebind-shaped claim about a generation whose recorded verdict belongs to its
+/// bootstrap seam.
+#[cfg(windows)]
+pub(crate) fn admit_rebound_store_bridge_compatibility(
+    requirement: &HostStoreBootstrapRequirement,
+    presented_store_api_contract_set_digest: Option<&str>,
+) -> Result<(), KernelBuildError> {
+    // The activation the ONE decision admitted is bound here exactly as the
+    // bootstrap seam binds it, so this path cannot return `Ok` for an activation
+    // the shared decision refused. Discarding it would be a fail-open asymmetry
+    // on the very seam whose contract says it "runs the SAME decision".
+    let StoreBridgeAdmission {
+        activation,
+        confirmed_store_api_contract_set_digest,
+    } = decide_store_bridge_compatibility(requirement, presented_store_api_contract_set_digest)?;
+    activation
+        .record_store_api_contract_set(confirmed_store_api_contract_set_digest)
+        .map(|_| ())
+        .map_err(|mismatch| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.rebind_rejected:compatibility_evidence",
+            );
+            KernelBuildError::Core(mismatch.to_string())
+        })
+}
+
+/// The admitted store-bridge verdict together with the peer operand that admitted
+/// it.
+///
+/// Both halves travel together on purpose: the digest is the value the STORE
+/// PROCESS presented, so the seam that persists the verdict can record a peer
+/// operand instead of the Kernel's own expectation, which would make the later
+/// rollback comparison a value against itself.
+#[cfg(windows)]
+struct StoreBridgeAdmission<'a> {
+    /// The activation the durable verdict is projected from.
+    activation: CandidateActivation,
+    /// The store-presented digest, already confirmed against this Kernel's own
+    /// compiled Store API catalogue. Borrowed from the caller's presented value,
+    /// never from `admit_store_api_contract_set`'s expected side.
+    confirmed_store_api_contract_set_digest: &'a str,
+}
+
+/// The one decision that admits a store bridge process boundary.
+///
+/// Both live gateway installation paths — bootstrap and rebind — reach this
+/// function and no other spelling of this comparison exists in this binary, so a
+/// mismatch cannot be detected on one path and ignored on the other.
+///
+/// It returns the admitted activation instead of recording it, because the
+/// durable verdict belongs to the boundary that owns a generation's activation
+/// evidence (the bootstrap seam) and not to the rebind transaction.
+#[cfg(windows)]
+fn decide_store_bridge_compatibility<'digest>(
+    requirement: &HostStoreBootstrapRequirement,
+    presented_store_api_contract_set_digest: Option<&'digest str>,
+) -> Result<StoreBridgeAdmission<'digest>, KernelBuildError> {
+    // I1.12 contract-set digest, compared against a value the Kernel HELD.
+    let confirmed_store_api_contract_set_digest =
+        match admit_store_api_contract_set(presented_store_api_contract_set_digest) {
+            Ok(presented) => presented,
+            Err(mismatch) => {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::StoreBootstrap,
+                    &format!(
+                        "kernel.store.connect_rejected:compatibility:{}",
+                        mismatch.field()
+                    ),
+                );
+                // Refused BEFORE any accepted evidence is recorded for this store
+                // bridge generation, so `generation_recovery::admit_generation_rollback`
+                // keeps refusing it as a rollback target.
+                //
+                // The confirmed digest is deliberately NOT recorded on this path:
+                // there is nothing to record it onto, because no accepted evidence
+                // exists for this generation. A confirmed store that fails the
+                // envelope gate afterwards is refused here, and the refusal is what
+                // is durable.
+                return Err(KernelBuildError::Core(mismatch.to_string()));
+            }
+        };
+    let activation = super::compatibility_gate::admit_generation_activation(
+        requirement.store_generation,
+        requirement.authority_epoch(),
+        i64::try_from(super::unix_ms()).unwrap_or(i64::MAX),
+    )
+    .map_err(|mismatch| {
+        // F-LOG-KERNEL-2 (#899): the observation carries the stable mismatch
+        // field label only, never a digest, epoch tuple, path or descriptor
+        // material. The reason reaches the caller through the typed
+        // `KernelBuildError::Core`, which owns no compatibility variant, so it
+        // is rendered exactly as the canonical-store writer admission above
+        // renders its own typed refusal rather than as a second error scheme.
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            &format!(
+                "kernel.store.connect_rejected:compatibility:{}",
+                mismatch.field()
+            ),
+        );
+        KernelBuildError::Core(mismatch.to_string())
+    })?;
+    Ok(StoreBridgeAdmission {
+        activation,
+        confirmed_store_api_contract_set_digest,
+    })
+}
+
+/// The store-bridge comparison whose two operands do not both come from this
+/// binary, and the whole comparison that decides it.
+///
+/// This is NOT the envelope's `contract_set_digest` field, which is the digest
+/// over four public contract identities and is compared against durable state at
+/// `admit_handshake`. It is the digest of the operation-manifest catalogue the
+/// `eliot_store_api` compiled into each process generates, and it is reported as
+/// [`MismatchField::StoreApiContractSet`] so a refusal names the comparison that
+/// actually fired.
+///
+/// `admit_generation_activation` builds the candidate envelope and the durable
+/// state from THIS build's own identity, so every value IT compares is a
+/// constant against itself and it cannot observe a peer whose contracts differ.
+/// The Store API catalogue can be observed, because the store process presents
+/// the digest of the catalogue produced by the `eliot_store_api` compiled INTO
+/// the store, while [`decide_store_bridge_compatibility`] compares it against the
+/// digest produced here by the same two functions from the `eliot_store_api`
+/// compiled INTO the Kernel. Neither side receives the value from the other, so
+/// the two operands are independent: a store binary built against a different
+/// `eliot_store_api` disagrees here, and the disagreement is not reachable by
+/// echoing anything.
+///
+/// Absence is refused, not defaulted. An absent field is not a store that
+/// agreed; it is a store that never made the claim this field exists to make,
+/// and admitting it would be admitting "previously launched".
+///
+/// A build that cannot compute its own value fails closed as
+/// [`MismatchField::EnvelopeVersion`], the same refusal
+/// `compatibility_gate` uses for a boundary that could not build the envelope it
+/// compares.
+#[cfg(windows)]
+fn admit_store_api_contract_set(
+    presented_store_api_contract_set_digest: Option<&str>,
+) -> Result<&str, CompatibilityMismatch> {
+    let expected =
+        eliot_kernel_service::kernel_store_api_contract_set_digest().map_err(|error| {
+            CompatibilityMismatch::new(MismatchField::EnvelopeVersion, error.to_string())
+        })?;
+    // The PEER's operand is what is returned, not `expected`. Returning the
+    // receiver's own value here would hand the caller something to persist that
+    // is a copy of the Kernel's expectation, and a durable row holding the
+    // expectation beside the check it is checked against verifies nothing. The
+    // two are equal here by the comparison just made; keeping them distinct in
+    // the value's provenance is what keeps the later rollback comparison a
+    // comparison.
+    match presented_store_api_contract_set_digest {
+        Some(presented) if presented == expected => Ok(presented),
+        _ => Err(CompatibilityMismatch::new(
+            MismatchField::StoreApiContractSet,
+            "the store presented no Store API contract-set digest, or one this Kernel's own \
+             compiled store API does not produce",
+        )),
+    }
+}
+
+/// Acceptance proof for the store-bridge contract-set refusal (issue #1968).
+///
+/// It pins the two properties the check exists for. First, the value the Kernel
+/// holds is reproducible and is the digest of the WHOLE catalogue. Second,
+/// anything a differently built store could present — the absent field, or the
+/// digest of a single catalogue entry, which is the different domain the store
+/// already used to present — is refused with the exact I1.12 field. That second
+/// operand is deliberately NOT a value copied from the Kernel, so this proof
+/// fails if the comparison ever degenerates into the Kernel comparing its own
+/// value with itself.
+#[cfg(all(test, windows))]
+mod store_api_contract_set_tests {
+    use eliot_kernel_core::MismatchField;
+
+    use super::admit_store_api_contract_set;
+
+    #[test]
+    fn store_bridge_contract_set_admits_only_the_kernels_own_catalogue() {
+        let kernel_digest = eliot_kernel_service::kernel_store_api_contract_set_digest()
+            .expect("the Kernel's own set digest computes");
+        let entries = eliot_store_api::generated_operation_manifests()
+            .expect("the Kernel's own catalogue generates");
+        assert_eq!(
+            kernel_digest,
+            eliot_store_api::operation_manifest_set_digest(&entries)
+                .expect("set digest computes")
+                .as_str(),
+            "the compared value must be the whole catalogue, recomputed the same way"
+        );
+        assert!(admit_store_api_contract_set(Some(kernel_digest.as_str())).is_ok());
+
+        let genesis_digest = eliot_store_api::genesis_manifest()
+            .expect("genesis manifest is generated")
+            .digest;
+        assert_ne!(
+            genesis_digest.as_str(),
+            kernel_digest.as_str(),
+            "one catalogue entry must not be the same value as the set"
+        );
+        let refusal = admit_store_api_contract_set(Some(genesis_digest.as_str()))
+            .expect_err("a single-entry digest is a different contract set");
+        assert_eq!(
+            refusal.field().label(),
+            MismatchField::StoreApiContractSet.label()
+        );
+        assert_ne!(
+            MismatchField::StoreApiContractSet.label(),
+            MismatchField::ContractSetDigest.label(),
+            "the store-catalogue refusal must not borrow the envelope's own \
+             contract_set_digest label, which names a different comparison"
+        );
+
+        let refusal =
+            admit_store_api_contract_set(None).expect_err("an absent field is not agreement");
+        assert_eq!(
+            refusal.field().label(),
+            MismatchField::StoreApiContractSet.label()
+        );
     }
 }
 
@@ -481,6 +802,15 @@ impl KernelComposition {
                 admission.durable_owner_generation.value()
             ),
         );
+        // I1.12 / #1968: this process boundary is gated on the full versioned
+        // envelope before a gateway is built, attached or retained, and the
+        // envelope is admitted only after the store's own Store API contract
+        // set matched the one this Kernel compiled.
+        admit_store_bridge_compatibility(
+            &self.generation_gateway.ors,
+            &requirement,
+            client.presented_store_api_contract_set_digest(),
+        )?;
         let gateway = Arc::new(KernelStoreGateway::new(
             self.service.clone(),
             Arc::new(client),

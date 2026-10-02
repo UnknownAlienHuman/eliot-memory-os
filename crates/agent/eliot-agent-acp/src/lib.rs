@@ -30,6 +30,10 @@ pub use execution_unit_driver::{
     ExecutionUnitDisclosure, ExecutionUnitDriverEvent, ExecutionUnitRunError,
     ProducedExecutionUnitEvent, produce_execution_unit_events,
 };
+mod fingerprint_coverage_run;
+pub use fingerprint_coverage_run::{
+    CoverageManifestDeclarations, FingerprintCoverageRun, run_fingerprint_coverage_denominator,
+};
 mod host_event_producer;
 pub use host_event_producer::{
     ExecutionUnitFrame, ProduceOutcome, ProducerError, ProducerFrame, produce_allowed,

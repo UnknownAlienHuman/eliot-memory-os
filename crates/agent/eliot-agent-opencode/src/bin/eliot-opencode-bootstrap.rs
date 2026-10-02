@@ -4,11 +4,11 @@ use eliot_agent_api::{
 };
 use eliot_agent_opencode::{
     AdmittedAttemptCandidate, AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth,
-    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRouteAdmission,
-    OpenCodeRouteRole, OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
-    classify_sealed_candidate, opencode_adapter_contract, opencode_pilot_observation,
+    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeBridgeDeclaration,
+    OpenCodeClient, OpenCodeRouteAdmission, OpenCodeRouteRole, OpenCodeRunError, OpenCodeRunPolicy,
+    ReadOnlyRunRequest, RunStatus, classify_sealed_candidate, opencode_pilot_observation,
     opencode_pilot_observation_with_fallback, opencode_pilot_probe_evidence,
-    redact_route_diagnostics, select_opencode_route, validate_opencode_adapter_contract,
+    redact_route_diagnostics, select_opencode_route, validate_opencode_declaration,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use secrecy::SecretString;
@@ -69,6 +69,14 @@ struct AdmittedEnvelope {
     /// bounded implementation, read-only scouting, and broad coverage are
     /// selectable; the bootstrap's read-only plan-agent attempt is scouting.
     selection_role: OpenCodeRouteRole,
+    /// Issue #1797 A1/W5: the owner-issued I6.5 declaration for the installed
+    /// `OpenCode` adapter generation, presented by composition. It is never
+    /// derived from the other envelope fields: the adapter owner issues it for
+    /// the route generation and authority epoch it admitted, and the gate
+    /// refuses a declaration naming another route generation, another epoch,
+    /// another adapter artifact revision, or any field edited after issuance.
+    /// See `eliot_agent_opencode::bridge_contract`.
+    declaration: OpenCodeBridgeDeclaration,
 }
 
 #[derive(Debug)]
@@ -419,16 +427,19 @@ fn gate_route_admission(
 
 /// I6.5 bridge-contract gate (issue #1797), run before the underlying call.
 ///
-/// The declaration is built from the exact route the admitted execution
-/// binding carries and re-validated against that same route, so a declaration
-/// built for another route can never be presented as this run's contract. A
-/// refusal is a typed `CliError::Run`; no request, no run, nothing sealed.
-fn gate_bridge_contract(route: &RouteFingerprint, password: &str) -> Result<(), CliError> {
-    let contract = opencode_adapter_contract(route)
-        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
-    validate_opencode_adapter_contract(&contract, route)
-        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))?;
-    Ok(())
+/// The declaration arrives in the admission envelope from the adapter owner; it
+/// is never derived from the route or fence it is checked against, so this is
+/// the one gate on this path whose outcome depends on a value the bootstrap
+/// cannot reconstruct from the attempt it is judging. A refusal is a typed
+/// `CliError::Run`; no request, no run, nothing sealed.
+fn gate_bridge_contract(
+    declaration: &OpenCodeBridgeDeclaration,
+    route: &RouteFingerprint,
+    current_fence: &StateFence,
+    password: &str,
+) -> Result<(), CliError> {
+    validate_opencode_declaration(declaration, route, current_fence)
+        .map_err(|error| CliError::Run(sanitize_error(&error.to_string(), password)))
 }
 
 /// Runs one bounded read-only pilot attempt and emits the six mandated
@@ -558,7 +569,12 @@ async fn run_admitted(args: AdmittedCliArgs) -> Result<(), CliError> {
         envelope.selection_role,
         &password,
     )?;
-    gate_bridge_contract(&envelope.binding.route, &password)?;
+    gate_bridge_contract(
+        &envelope.declaration,
+        &envelope.binding.route,
+        &envelope.current_fence,
+        &password,
+    )?;
     let admitted = AdmittedOpenCodeAttempt::new(
         Some(envelope.admission),
         envelope.binding,

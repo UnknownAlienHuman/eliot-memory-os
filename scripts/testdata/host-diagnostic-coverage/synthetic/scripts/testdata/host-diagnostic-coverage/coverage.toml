@@ -1,0 +1,533 @@
+# Synthetic Host diagnostic coverage table (issue #985 validator fixture).
+#
+# Frozen test input for scripts/tests/test_host_diagnostic_coverage.py.
+# It is NOT the reviewed production table: that one is
+# scripts/testdata/host-diagnostic-coverage/coverage.toml and the validator
+# reads it from its fixed path. This file is exercised only through a
+# temporary root the tests materialize, never as live repository status.
+# Schema: eliot.host-diagnostic-coverage.v1. Line numbers are 1-based; spans inclusive.
+
+schema = "eliot.host-diagnostic-coverage.v1"
+issue = 985
+
+[reconciliation]
+baseline_count = 10
+current_count = 10
+
+[[input]]
+path = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+sha256 = "d5cec75b17abb5dc07a642d9db4ae8a5210c6bc8f173c38c390bf51014bf9767"
+
+[[input]]
+path = "bins/eliot-host/Cargo.toml"
+sha256 = "1e043ed2455f8ab794c801a1e883871996387396a22db072354adc3858fc174a"
+
+[[file]]
+path = "bins/eliot-host/src/lib.rs"
+owner = 891
+cfg = "always"
+sha256 = "d473bf5b1374e8e25d1aea6565acbf96efe9ade2c48128c887a9fab6792b8ef6"
+
+[[file]]
+path = "bins/eliot-host/src/main.rs"
+owner = 982
+cfg = "bin"
+sha256 = "c9dae9df52206ff9d52946f3c4ef92c37997e2132b30c6a4622267bc3864ea06"
+
+[[file]]
+path = "bins/eliot-host/src/host_diagnostics.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 8
+parent_cfg = ""
+owner = 889
+cfg = "always"
+sha256 = "937769f9f177443f724734c317a53c8982fc198421cb7a8d34c5581293a2d248"
+
+[[file]]
+path = "bins/eliot-host/src/host_launch_artifact.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 9
+parent_cfg = ""
+exclusion = "facade"
+exclusion_target = "bins/eliot-host/src/host_launch_options.rs"
+cfg = "always"
+sha256 = "d9eebbe646ce93f32d36f15e8e3681f79df1d2eb6d8460d04d4075040becb8a6"
+
+[[file]]
+path = "bins/eliot-host/src/host_launch_options.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 10
+parent_cfg = ""
+owner = 978
+cfg = "always"
+sha256 = "2d7a46d6e2e69cd7035be03cceac8d2b18e9390f7caa5df994c119cb3cf4c5c3"
+
+[[file]]
+path = "bins/eliot-host/src/host_console.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 7
+parent_cfg = ""
+owner = 982
+cfg = "always"
+sha256 = "9dc35c09ee012f135afcf83e420c23ef3c2d920d746d56e8313ff647ce98bcf0"
+
+[[file]]
+path = "bins/eliot-host/src/host_receipt.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 11
+parent_cfg = ""
+owner = 891
+cfg = "always"
+sha256 = "1f6d5492bd56d0babc4b1c34560fa537071335b4167e597004a9575974319c4a"
+
+[[file]]
+path = "bins/eliot-host/src/host_recovery.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 12
+parent_cfg = ""
+owner = 981
+cfg = "always"
+sha256 = "122b153207641b2111e78c5766404bab7ecde0afa9e47cca0a28f9685b189469"
+
+[[file]]
+path = "bins/eliot-host/src/host_sink.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 13
+parent_cfg = ""
+owner = 984
+cfg = "always"
+sha256 = "f0bd1a995b389198a46c76586646a1d16db6f1b97765029caa1d5db8c521286b"
+
+[[file]]
+path = "bins/eliot-host/src/host_launch_options_tests.rs"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 16
+parent_cfg = "#[cfg(test)]"
+exclusion = "test_only"
+cfg = "test"
+sha256 = "22596ff8bb426a0f30cbba11ef282a38f7dff7ccf0e905fcee6d3eded94df948"
+
+# ---------------------------------------------------------------- boundaries
+[[boundary]]
+id = "S-facade-singleton"
+kind = "singleton"
+phase = "subscriber"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_diagnostics.rs"
+owner = 889
+operation = "single workspace tracing facade and one process subscriber"
+detail = "one OnceLock subscriber installed by the binary contour only"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 27
+end = 29
+digest = "dbdb19c6fde3fd7f870c1af4ef844bb636ac3ad16ff947126dbe33df12f6d496"
+markers = ["install_host_diagnostics"]
+
+[[boundary.caller]]
+file = "bins/eliot-host/src/main.rs"
+line = 9
+text = "eliot_host::host_diagnostics::install_host_diagnostics();"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "facade_singleton_bound"
+
+[[boundary]]
+id = "S-facade-entrypoint"
+kind = "entrypoint"
+phase = "stage"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_diagnostics.rs"
+owner = 889
+operation = "non-terminal entrypoint stage record"
+detail = "stage record carries no terminal code"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 32
+end = 34
+digest = "824bc4d0fb4cae92cb352afc1faf893d8cbc5c156f3fd907bf9cf2027ed9afa9"
+markers = ["observe_entrypoint"]
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "no_cross_claim_bound"
+
+[[boundary]]
+id = "S-console-terminal"
+kind = "terminal"
+phase = "stop"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/main.rs"
+owner = 982
+operation = "console request rejection terminal"
+detail = "stop seam spans Requested, Draining and StoppedClean"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 14
+end = 16
+digest = "b7955617e5772e439e5cb05d332ae48266bcde8ceb8d63088089a65b1b5cf54f"
+markers = ["observe_terminal_error", "HOST_TERMINAL_CODE_CONSOLE_FAILED"]
+code = "console_failed"
+
+[[boundary.caller]]
+file = "bins/eliot-host/src/main.rs"
+line = 11
+text = "match admit_console_request(&request) {"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "activation_drain_stop_bound"
+
+[[boundary]]
+id = "S-launch-start-request"
+kind = "terminal"
+phase = "start_request"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_launch_options.rs"
+owner = 978
+operation = "typed launch request rejection"
+detail = "the launch owner types the rejection once"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 10
+end = 10
+digest = "909b1644227699b05b98d5339428a3575c90c02d24d0350bc4465bcdccce870d"
+markers = ["HOST_TERMINAL_CODE_START_REQUEST"]
+code = "start_request_failed"
+
+[[boundary.caller]]
+file = "bins/eliot-host/src/host_recovery.rs"
+line = 10
+text = "reject_installation(raw)?;"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "start_request_result_bound"
+
+[[boundary]]
+id = "S-lib-start-result"
+kind = "terminal"
+phase = "start_result"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/lib.rs"
+owner = 891
+operation = "start contour terminal result"
+detail = "the lib contour reports its own start result"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 49
+end = 49
+digest = "e0ca9180959845268b8898cc07681dd52e2c5b60d49d7b81648b135266ec9b7c"
+markers = ["HOST_TERMINAL_CODE_START_RESULT"]
+code = "start_result_failed"
+
+[[boundary.caller]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+line = 13
+text = "let _ = eliot_host::start_contour(\"installation-1\");"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "start_request_result_bound"
+
+[[boundary]]
+id = "S-console-entry"
+kind = "entrypoint"
+phase = "activation"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_console.rs"
+owner = 982
+operation = "console request admission stage"
+detail = "activation stage is distinct from every terminal phase"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 10
+end = 10
+digest = "6ccd184a8dc6ca4c3a63f7f848f2516cf81d95a18d7acd237b71c6a82db6cdf0"
+markers = ["observe_entrypoint"]
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "activation_drain_stop_bound"
+
+[[boundary]]
+id = "S-receipt-owned"
+kind = "receipt_owned"
+phase = "receipt"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_receipt.rs"
+owner = 891
+operation = "SCM receipt correlation projection"
+detail = "process and generation identity only"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+markers = ["process_id", "generation", "scm_receipt"]
+
+[[boundary.site]]
+start = 16
+end = 20
+digest = "06d864d14baeac05f155b69e9a5e6836c2de61a3633a6c0b6fc1e4846c4fba62"
+markers = ["observe_host_request", "scm_receipt"]
+
+[[boundary.absence]]
+start = 22
+end = 25
+digest = "b2692ce74ec81a0b9398493409e1609a1139abfcecc120c50ea096b389960a05"
+
+[[boundary.caller]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+line = 23
+text = "eliot_host::host_receipt::record_receipt(&receipt);"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "scm_receipt_bound"
+
+[[boundary]]
+id = "S-recovery-propagated"
+kind = "propagated"
+phase = "recovery"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_recovery.rs"
+owner = 981
+operation = "recovery helper propagation into the launch terminal"
+detail = "frozen forced-failure seams: test_fault and ELIOT_HOST_SYNC_FAULT"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+terminals = ["S-launch-start-request"]
+
+[[boundary.site]]
+start = 9
+end = 12
+digest = "88661112748d72967b1a193a6ecd29e19a481eefcb248dff75dbc795462373f5"
+markers = ["reject_installation"]
+
+[[boundary.absence]]
+start = 6
+end = 7
+digest = "0610e1c0291f65708bbd9068be0f15868756bcf283ee4054a910d8ee4a20e17f"
+
+[[boundary.caller]]
+file = "bins/eliot-host/src/host_recovery.rs"
+line = 10
+text = "reject_installation(raw)?;"
+
+[[boundary.caller]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+line = 41
+text = "assert!(eliot_host::host_recovery::recover_installation(\"\").is_err());"
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "recovery_propagation_bound"
+
+[[boundary]]
+id = "S-sink-start-delivery"
+kind = "sink"
+phase = "sink"
+scope = "structural"
+status = "incomplete"
+reason = "host_seam_unavailable"
+file = "bins/eliot-host/src/host_sink.rs"
+owner = 984
+operation = "Event Log start delivery"
+detail = "mapping only: the fixture has no reachable delivery seam"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 23
+end = 28
+digest = "59b6d3bb8300e4d97d697ec6017001a5443796b1a440d9554305b92da642b275"
+markers = ["mapping", "event_id"]
+
+[[boundary]]
+id = "S-sink-stop-delivery"
+kind = "sink"
+phase = "sink"
+scope = "structural"
+status = "incomplete"
+reason = "host_seam_unavailable"
+file = "bins/eliot-host/src/host_sink.rs"
+owner = 984
+operation = "Event Log stop delivery identity"
+detail = "mapping only: the fixture has no reachable delivery seam"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 45
+end = 51
+digest = "6e8c23be7a5c76ea6d52411ca1a5d1a3c77cafaf26f57440b53d61db8e054e33"
+markers = ["try_admit", "EVENT_LOG_QUEUE_CAPACITY"]
+
+[[boundary]]
+id = "S-sink-failure-seam"
+kind = "sink"
+phase = "sink"
+scope = "wired"
+status = "proven"
+file = "bins/eliot-host/src/host_sink.rs"
+owner = 984
+operation = "bounded admission accounting under sink state"
+detail = "the queue bound is structural, not delivery"
+ceiling_field_bytes = 96
+ceiling_detail_bytes = 192
+
+[[boundary.site]]
+start = 10
+end = 13
+digest = "b516c13368d39b879a936cdd08d42043f03ad555d328023bbb8c42e4663a76b5"
+markers = ["EVENT_LOG_QUEUE_CAPACITY", "EVENT_LOG_SOURCE"]
+
+[[boundary.test]]
+file = "bins/eliot-host/tests/host_synthetic_diagnostics.rs"
+case = "sink_failure_seam_bound"
+
+# ------------------------------------------------------------------- matrix
+[[matrix]]
+n = 1
+decidable = "validator"
+title = "one workspace tracing facade and no missing/duplicate current owner"
+note = "the facade is the only tracing owner of the synthetic tree"
+boundaries = ["S-facade-singleton"]
+
+[[matrix]]
+n = 2
+decidable = "validator"
+title = "one shared facade/process subscriber with an exact cfg/source/new-file denominator"
+note = "one OnceLock subscriber; the file denominator is exact"
+boundaries = ["S-facade-singleton"]
+
+[[matrix]]
+n = 3
+decidable = "validator"
+title = "start request/result events have real source/test binding"
+note = "request and result phases are distinct with marked sites"
+boundaries = ["S-launch-start-request", "S-lib-start-result"]
+
+[[matrix]]
+n = 4
+decidable = "validator"
+title = "SCM receipt correlation without protected payload"
+note = "receipt correlation carries no protected payload span"
+boundaries = ["S-receipt-owned", "S-lib-start-result", "S-console-terminal"]
+
+[[matrix]]
+n = 5
+decidable = "validator"
+title = "activation/drain/stop phase evidence distinct"
+note = "activation and stop phases never share a boundary"
+boundaries = ["S-console-entry", "S-lib-start-result", "S-console-terminal"]
+
+[[matrix]]
+n = 6
+decidable = "validator"
+title = "all managed launch/restart/rollback paths including extracted files covered"
+note = "launch and restart contours reach a terminal boundary"
+boundaries = ["S-lib-start-result", "S-console-entry"]
+
+[[matrix]]
+n = 7
+decidable = "validator"
+title = "recovery and helper-to-terminal-boundary propagation complete"
+note = "the helper pins its caller and its terminal target"
+boundaries = ["S-recovery-propagated", "S-launch-start-request"]
+
+[[matrix]]
+n = 8
+decidable = "validator"
+title = "each required terminal failed operation has exactly one emitter"
+note = "three terminal codes, each designated once"
+boundaries = ["S-launch-start-request", "S-lib-start-result", "S-console-terminal"]
+
+[[matrix]]
+n = 9
+decidable = "validator"
+title = "exact operation/installation/process-start/generation/reason tied to owner evidence"
+note = "operation identity is tied to the owner receipt"
+boundaries = ["S-receipt-owned", "S-console-terminal"]
+
+[[matrix]]
+n = 10
+decidable = "validator_partial"
+title = "no positive event before actual owning state/receipt"
+note = "ordering is TEST-PHASE; structural absence is proven here"
+boundaries = ["S-console-entry", "S-receipt-owned"]
+
+[[matrix]]
+n = 11
+decidable = "validator"
+title = "request/start/ready/failed/cancelled/unknown cannot cross-claim"
+note = "receipt and subscriber vocabularies stay phase-distinct"
+boundaries = ["S-receipt-owned", "S-facade-singleton"]
+
+[[matrix]]
+n = 12
+decidable = "validator"
+title = "actual cross-child forced failure produces one terminal event and unchanged return/receipt/cleanup"
+note = "frozen forced-failure seams named by the case contract: test_fault and ELIOT_HOST_SYNC_FAULT"
+boundaries = ["S-recovery-propagated", "S-lib-start-result"]
+
+[[matrix]]
+n = 13
+decidable = "validator"
+title = "actual isolated Event Log start delivery, distinct from fake/unavailable/degraded source"
+note = "delivery stays honestly incomplete: no reachable seam"
+boundaries = ["S-sink-start-delivery"]
+
+[[matrix]]
+n = 14
+decidable = "validator"
+title = "actual Event Log stop delivery identity"
+note = "delivery stays honestly incomplete: no reachable seam"
+boundaries = ["S-sink-stop-delivery"]
+
+[[matrix]]
+n = 15
+decidable = "validator"
+title = "actual Event Log failure when stdout unavailable, without protocol corruption or false abort/drain proof"
+note = "one honest incomplete delivery plus one proven structural seam"
+boundaries = ["S-sink-start-delivery", "S-sink-failure-seam"]
+
+[[matrix]]
+n = 16
+decidable = "validator"
+title = "credential/token/env/database canaries absent from every sink"
+note = "canary sweeps stay TEST-PHASE; emitter sites are marked"
+boundaries = ["S-console-entry", "S-console-terminal"]
+
+[[matrix]]
+n = 17
+decidable = "validator"
+title = "source/user/argv/path/nonce canaries absent from every sink"
+note = "canary sweeps stay TEST-PHASE; emitter sites are marked"
+boundaries = ["S-console-entry", "S-facade-entrypoint"]
+
+[[matrix]]
+n = 18
+decidable = "validator"
+title = "source/assignment/test mutation, incomplete union, malformed table, missing execution or unknown delivery/cleanup cannot pass"
+note = "mutation, incomplete union and malformed tables must fail closed"
+boundaries = ["S-facade-singleton"]
