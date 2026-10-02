@@ -180,7 +180,8 @@ pub(crate) fn issue_admission_receipt(
             state_fence: fence.clone(),
         },
         authority: AuthorityBinding {
-            authority_id: ContractId::new(BACKUP_VERIFY_ADMISSION_AUTHORITY).map_err(|_| refuse())?,
+            authority_id: ContractId::new(BACKUP_VERIFY_ADMISSION_AUTHORITY)
+                .map_err(|_| refuse())?,
             // The LIVE authenticated principal, not a payload claim (A12.2).
             authority_owner: principal.to_owned(),
             authority_epoch: fence.authority_epoch.clone(),
@@ -273,8 +274,7 @@ mod tests {
 
     use eliot_contracts::{
         ArtifactId, ClockReading, ContractIdentity, ContractVersion, EpochId, EpochLineageId,
-        ProductId, RequestId, RequestMetadata, ResourceGeneration, SessionId, SourceId,
-        sha256_hex,
+        ProductId, RequestId, RequestMetadata, ResourceGeneration, SessionId, SourceId, sha256_hex,
     };
     use eliot_protocol::RequestIdentity;
     use eliot_protocol::backup::{
@@ -295,11 +295,17 @@ mod tests {
     }
 
     fn fence_at(sequence: u64) -> StateFence {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical lineage");
-        let epoch = EpochId::new(lineage, NonZeroU64::new(sequence).expect("non-zero sequence"))
-            .expect("valid epoch");
-        StateFence::new(epoch, ResourceGeneration::new(sequence).expect("non-zero generation"))
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("canonical lineage");
+        let epoch = EpochId::new(
+            lineage,
+            NonZeroU64::new(sequence).expect("non-zero sequence"),
+        )
+        .expect("valid epoch");
+        StateFence::new(
+            epoch,
+            ResourceGeneration::new(sequence).expect("non-zero generation"),
+        )
     }
 
     fn contract(name: &str) -> ContractIdentity {

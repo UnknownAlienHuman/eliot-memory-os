@@ -3355,7 +3355,10 @@ impl KernelComposition {
             } => (bundle_raw, successor),
             AdmittedVerifyBundle::Protocol { request } => {
                 return Ok(answer_verify_protocol_arm(
-                    session, &caller, &request, idempotency_key,
+                    session,
+                    &caller,
+                    &request,
+                    idempotency_key,
                 ));
             }
         };
