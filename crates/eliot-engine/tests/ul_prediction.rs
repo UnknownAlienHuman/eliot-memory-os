@@ -1,3 +1,4 @@
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::{
     CalibrationService, blast_fraction_milli, blast_score, calibration_trend,
     diagnostic_expectation_matches, normalize_diagnostic_signature,
@@ -6,7 +7,6 @@ use eliot_engine::{
 use eliot_types::{
     CalibrationTrend, DiagnosticExpectation, PredictionConfidence, PredictionExpectation,
     PredictionRecord, PredictionResolution, ProjectId, SessionId, TaskId, VerificationResult,
-    ul_token_estimate,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -128,7 +128,18 @@ fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> 
         "[STALE ...]",
     ];
     assert!(required.iter().all(|line| body.contains(line)));
-    assert!(ul_token_estimate(body) <= 500);
+    // #783: the budget is now counted in canonical source token units, so the
+    // old `/4` number no longer describes the same envelope. The contract this
+    // assertion is protecting is a BYTE envelope, not a unit count, and the
+    // retired `ceil(bytes / 4) <= 500` admitted exactly `4 * 500 - 3 == 1997`
+    // bytes. Restating that same envelope in canonical units gives
+    // `ceil(1997 / 3) == 666`, and 666 admits `3 * 666 == 1998` bytes, so the
+    // one-byte slack the old form also had is preserved rather than tightened
+    // or invented. The shared body is 1901 bytes, i.e. 634 canonical units, so
+    // it sits inside the envelope exactly as it did before the ratio change;
+    // the literal was re-derived, not relaxed.
+    const SKILL_BODY_MAX_UNITS: u32 = 666;
+    assert!(ul_token_estimate(body)? <= SKILL_BODY_MAX_UNITS);
 
     let catalog = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio/catalog.rs"))?;
     let descriptions = [
@@ -140,7 +151,12 @@ fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> 
     ];
     for description in descriptions {
         assert!(catalog.contains(description));
-        assert!(ul_token_estimate(description) <= 90);
+        // #783: this 90-unit budget is a reaffirmed description contract (see
+        // `test(ul): align recall description budget contract`, 64bc5a28a), not
+        // a ratio artifact, so the literal is unchanged. The widest of the five
+        // is 243 bytes: 81 canonical units, which still fits under 90. It was
+        // re-derived, not copied, and it holds with 9 units to spare.
+        assert!(ul_token_estimate(description)? <= 90);
     }
     Ok(())
 }

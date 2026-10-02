@@ -7,7 +7,6 @@ use eliot_types::{
     PyramidTargetKind, SubsystemCapsule, SystemMap, TaskId, UlArtifactDirtyState, UlDependencyKind,
     UlDependencyRef, UlDirtyReason, UlExamAnswer, UlExamGrade, UlExamQuestion, UlExamQuestionKind,
     UlExamRecord, UlReasoningRequest, UlReasoningRoute, WriteId, normalize_observed_path,
-    ul_token_estimate,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -17,6 +16,8 @@ use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use super::measurement::ul_token_estimate;
 
 pub const UL_EXAM_MAX_SUBSYSTEMS: usize = 5;
 pub const UL_EXAM_INPUT_BYTES: usize = 4_096;
@@ -173,21 +174,23 @@ impl UlExamService {
         );
         let outcome = invoke_reasoner_once(runner, &request).await?;
         let answers = match outcome {
-            UlReasoningOutcome::Completed(answers)
-                if ul_token_estimate(&serde_json::to_string(&answers)?)
-                    <= UL_EXAM_OUTPUT_TOKEN_UNITS =>
-            {
-                answers
-            }
-            UlReasoningOutcome::Completed(_) => {
-                return self
-                    .write_skipped(
-                        project_id,
-                        route,
-                        "skipped_invalid_output",
-                        "host output exceeded 800 token units",
-                    )
-                    .await;
+            // The canonical STU is measured on the candidate answers before
+            // the arm is selected, so a measurement refusal propagates to the
+            // caller instead of reading as a bounded host output.
+            UlReasoningOutcome::Completed(answers) => {
+                let measured = ul_token_estimate(&serde_json::to_string(&answers)?)?;
+                if measured <= UL_EXAM_OUTPUT_TOKEN_UNITS {
+                    answers
+                } else {
+                    return self
+                        .write_skipped(
+                            project_id,
+                            route,
+                            "skipped_invalid_output",
+                            "host output exceeded 800 token units",
+                        )
+                        .await;
+                }
             }
             UlReasoningOutcome::Unavailable(reason) => {
                 return self

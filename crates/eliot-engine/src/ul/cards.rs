@@ -1,13 +1,15 @@
 use crate::EngineError;
 use eliot_types::{
     CoChangeEdge, CueBinding, CueMatchMode, CueStrength, DependencyManifest, FileDependency,
-    HotspotScore, LegacyCueKindV1, ModuleCard, ProjectId, normalize_bindings, ul_token_estimate,
+    HotspotScore, LegacyCueKindV1, ModuleCard, ProjectId, normalize_bindings,
 };
 use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+
+use super::measurement::ul_token_estimate;
 
 const MAX_CARDS_PER_SEGMENT: usize = 5;
 const MAX_CO_CHANGE_PARTNERS: usize = 3;
@@ -242,7 +244,7 @@ fn bounded_body(
             &visible_failures,
             verifier,
         );
-        if ul_token_estimate(&body) <= MAX_CARD_TOKEN_UNITS {
+        if ul_token_estimate(&body)? <= MAX_CARD_TOKEN_UNITS {
             return Ok(body);
         }
         if visible_failures.pop().is_some() {

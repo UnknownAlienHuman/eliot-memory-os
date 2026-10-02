@@ -3,7 +3,7 @@ use eliot_types::{
     CapsuleBuild, CapsuleFreshness, CoChangeEdge, ConceptNode, CueBinding, CueMatchMode,
     CueStrength, DependencyManifest, FileDependency, HotspotScore, LegacyCueKindV1, ModuleCard,
     ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, SystemFlow,
-    SystemMap, inspect_text_encoding, normalize_bindings, path_matches_boundary, ul_token_estimate,
+    SystemMap, inspect_text_encoding, normalize_bindings, path_matches_boundary,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use super::measurement::ul_token_estimate;
 
 const CAPSULE_LIMIT: u32 = 500;
 const MAP_LIMIT: u32 = 600;
@@ -141,7 +143,7 @@ impl PyramidBuilder {
                 &verifiers,
                 &dependencies,
             );
-            if ul_token_estimate(&rendered) <= CAPSULE_LIMIT {
+            if ul_token_estimate(&rendered)? <= CAPSULE_LIMIT {
                 break rendered;
             }
             if decisions.len() > 1 {
@@ -220,6 +222,7 @@ impl PyramidBuilder {
             cue_bindings: concept.cue_bindings.clone(),
             source_refs,
         };
+        let token_estimate = ul_token_estimate(&artifact.body_md)?;
         let build = promoted_build(
             build_id,
             concept.project_id,
@@ -227,7 +230,7 @@ impl PyramidBuilder {
             capsule_id,
             inputs_hash,
             CAPSULE_LIMIT,
-            ul_token_estimate(&artifact.body_md),
+            token_estimate,
             previous_build_id,
             CAPSULE_HEADERS,
         );
@@ -315,7 +318,7 @@ impl PyramidBuilder {
             .collect::<Vec<_>>();
         let body_md = loop {
             let rendered = render_system_map(&sorted_concepts, &flow_edges);
-            if ul_token_estimate(&rendered) <= MAP_LIMIT {
+            if ul_token_estimate(&rendered)? <= MAP_LIMIT {
                 break rendered;
             }
             if flow_edges.pop().is_none() {
@@ -370,6 +373,7 @@ impl PyramidBuilder {
             build_id: build_id.clone(),
             cue_bindings,
         };
+        let token_estimate = ul_token_estimate(&artifact.body_md)?;
         let build = promoted_build(
             build_id,
             project_id,
@@ -377,7 +381,7 @@ impl PyramidBuilder {
             map_id,
             inputs_hash,
             MAP_LIMIT,
-            ul_token_estimate(&artifact.body_md),
+            token_estimate,
             previous_build_id,
             MAP_HEADERS,
         );
@@ -409,7 +413,7 @@ impl PyramidBuilder {
         vocabulary.truncate(10);
         let body_md = loop {
             let rendered = render_charter(&what, &invariants, &non_goals, &vocabulary);
-            if ul_token_estimate(&rendered) <= CHARTER_LIMIT {
+            if ul_token_estimate(&rendered)? <= CHARTER_LIMIT {
                 break rendered;
             }
             if vocabulary.len() > 1 {
@@ -471,6 +475,7 @@ impl PyramidBuilder {
             build_id: build_id.clone(),
             cue_bindings: target_cues(project_name)?,
         };
+        let token_estimate = ul_token_estimate(&artifact.body_md)?;
         let build = promoted_build(
             build_id,
             project_id,
@@ -478,7 +483,7 @@ impl PyramidBuilder {
             charter_id,
             inputs_hash,
             CHARTER_LIMIT,
-            ul_token_estimate(&artifact.body_md),
+            token_estimate,
             previous_build_id,
             CHARTER_HEADERS,
         );
@@ -822,7 +827,7 @@ fn validate_body(
         }
         previous = Some(position);
     }
-    if ul_token_estimate(body) > budget {
+    if ul_token_estimate(body)? > budget {
         return rejected_budget("pyramid artifact", budget, body);
     }
     Ok(headers
@@ -1033,9 +1038,9 @@ fn deterministic_id(prefix: &str, parts: &[&str]) -> String {
 }
 
 fn rejected_budget<T>(kind: &str, limit: u32, body: &str) -> Result<T, EngineError> {
+    let actual = ul_token_estimate(body)?;
     Err(EngineError::WriteRejected(format!(
-        "{kind} exceeds {limit} token units after deterministic trimming (actual {})",
-        ul_token_estimate(body)
+        "{kind} exceeds {limit} token units after deterministic trimming (actual {actual})"
     )))
 }
 

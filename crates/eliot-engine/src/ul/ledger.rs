@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use super::measurement::ul_token_estimate_for_bytes;
+
 #[derive(Clone, Debug)]
 pub struct UlToolMeasurement {
     pub project_id: ProjectId,
@@ -49,17 +51,15 @@ pub struct UlLedgerAccumulator {
 }
 
 impl UlLedgerAccumulator {
-    #[must_use]
-    pub fn record(&mut self, measurement: &UlToolMeasurement) -> UlLedgerDelta {
+    pub fn record(&mut self, measurement: &UlToolMeasurement) -> Result<UlLedgerDelta, EngineError> {
         self.record_with_assignment(measurement, None)
     }
 
-    #[must_use]
     pub fn record_with_assignment(
         &mut self,
         measurement: &UlToolMeasurement,
         assignment: Option<&UlTaskExperimentAssignment>,
-    ) -> UlLedgerDelta {
+    ) -> Result<UlLedgerDelta, EngineError> {
         let key = (
             measurement.project_id,
             measurement.session_id,
@@ -79,11 +79,16 @@ impl UlLedgerAccumulator {
         if count_exploration {
             delta.read_tool_input_bytes = measurement.input_bytes;
             delta.read_tool_output_bytes = measurement.output_bytes;
-            delta.exploration_tokens = measurement
-                .input_bytes
-                .saturating_add(measurement.output_bytes)
-                .saturating_add(3)
-                / 4;
+            // #704's normative `STU(bytes) = ceil(bytes / 3)`, reached through
+            // the one UL estimator. This used to be a local
+            // `(input + output + 3) / 4`, a second byte-to-token ratio whose
+            // smaller value understated exploration cost against the canonical
+            // one on every input (#783).
+            delta.exploration_tokens = u64::from(ul_token_estimate_for_bytes(
+                measurement
+                    .input_bytes
+                    .saturating_add(measurement.output_bytes),
+            )?);
         }
         if let Some(assignment) = assignment {
             delta.task_class_key = assignment.task_class.key();
@@ -130,7 +135,7 @@ impl UlLedgerAccumulator {
                 },
             );
         }
-        delta
+        Ok(delta)
     }
 
     fn restore(&mut self, project_id: ProjectId, session_id: SessionId, receipt: InjectionReceipt) {
@@ -200,7 +205,7 @@ impl UlLedgerService {
                 .sessions
                 .lock()
                 .map_err(|_| ledger_lock_error("sessions"))?;
-            sessions.record_with_assignment(&measurement, assignment)
+            sessions.record_with_assignment(&measurement, assignment)?
         };
         let mut delta = delta;
         if let Some(assignment) = assignment
@@ -254,19 +259,15 @@ impl UlLedgerService {
             )
             .await?;
         let receipt_count = u32::try_from(receipts.len()).unwrap_or(u32::MAX);
-        Ok((
-            Self::use_report(project_id, &ledgers, receipt_count),
-            ledgers,
-            receipt_count,
-        ))
+        let report = Self::use_report(project_id, &ledgers, receipt_count)?;
+        Ok((report, ledgers, receipt_count))
     }
 
-    #[must_use]
     pub fn use_report(
         project_id: ProjectId,
         ledgers: &[UlTaskLedger],
         injected_items: u32,
-    ) -> UlUseReport {
+    ) -> Result<UlUseReport, EngineError> {
         let injected_tokens = ledgers.iter().map(|ledger| ledger.injected_tokens).sum();
         let exploration_bytes = ledgers
             .iter()
@@ -283,11 +284,13 @@ impl UlLedgerService {
             count.saturating_add(ledger.expanded_injected_handles)
         });
         let denominator = f64::from(injected_items);
-        UlUseReport {
+        Ok(UlUseReport {
             project_id,
             tasks: u32::try_from(ledgers.len()).unwrap_or(u32::MAX),
             injected_tokens,
-            exploration_tokens: exploration_bytes.saturating_add(3) / 4,
+            // The same canonical estimator as the per-call delta above; this
+            // was the second local `(bytes + 3) / 4` copy (#783).
+            exploration_tokens: u64::from(ul_token_estimate_for_bytes(exploration_bytes)?),
             acknowledged_fraction: if injected_items == 0 {
                 0.0
             } else {
@@ -298,7 +301,7 @@ impl UlLedgerService {
             } else {
                 f64::from(expanded) / denominator
             },
-        }
+        })
     }
 
     async fn hydrate(

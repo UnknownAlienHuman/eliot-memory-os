@@ -3,12 +3,14 @@ use eliot_store::CanonicalStore;
 use eliot_types::{
     CognitiveProjectionReadState, CueIndexRow, CueRecordSource, CueStrength, CurrentStateRequest,
     LegacyCueKindV1, MemoryRevision, ObservedCue, ProjectId, ReadConsistencyMode, cue_row_id,
-    normalize_binding, normalize_path, normalize_symbol, ul_token_estimate,
+    normalize_binding, normalize_path, normalize_symbol,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+
+use super::measurement::ul_token_estimate;
 
 const MAX_FIRED_MEMORIES: usize = 8;
 
@@ -390,7 +392,7 @@ fn rows_for_source(
                 strength: binding.strength,
                 negative_memory: source.negative_memory,
                 lifecycle: source.lifecycle.clone(),
-                token_estimate: ul_token_estimate(&source.preview_text),
+                token_estimate: ul_token_estimate(&source.preview_text)?,
             })
         })
         .collect()

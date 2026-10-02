@@ -1,3 +1,4 @@
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::{
     CapsuleEvidence, ConceptSeedResult, GitMiningArtifacts, OnboardingService, PyramidBuilder,
     capsule_freshness, render_capsule,
@@ -5,7 +6,6 @@ use eliot_engine::{
 use eliot_types::{
     CapsuleFreshness, CoChangeEdge, ConceptKind, ConceptNode, CueBinding, CueMatchMode,
     CueStrength, HotspotScore, LegacyCueKindV1, ManifestPackage, MiningRun, ProjectId,
-    ul_token_estimate,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,7 @@ fn t06_capsule_has_fixed_sections_and_budget() -> TestResult {
         .collect::<Result<Vec<_>, _>>()?;
 
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(ul_token_estimate(&first.artifact.body_md) <= 500);
+    assert!(ul_token_estimate(&first.artifact.body_md)? <= 500);
     assert_eq!(first, second);
     assert_eq!(
         first.artifact.dependency_manifest.file_deps[0].path,
@@ -150,8 +150,8 @@ fn t06_charter_and_map_are_bounded() -> TestResult {
         None,
     )?;
 
-    assert!(ul_token_estimate(&map.artifact.body_md) <= 600);
-    assert!(ul_token_estimate(&charter.artifact.body_md) <= 200);
+    assert!(ul_token_estimate(&map.artifact.body_md)? <= 600);
+    assert!(ul_token_estimate(&charter.artifact.body_md)? <= 200);
     assert_eq!(map, map_again);
     assert_eq!(charter, charter_again);
     assert!(map.artifact.body_md.starts_with("SYSTEMS\n"));

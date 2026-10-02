@@ -206,7 +206,7 @@ files = ["crates/eliot-app/src/mcp_stdio/verification.rs", "crates/eliot-app/src
 final_disposition = "legacy-preserved"
 disposition_evidence = "the transitional alias is no longer part of the recorded public type surface; every retained name is explicit Legacy and every retained meaning has a named migration"
 pub_types = ["CueBinding", "CueBindingError", "CueBindingPage", "CueIndexRow", "CueMatchMode", "CueRecordSource", "CueStrength", "LegacyCueKindV1", "LegacyCueKindV1MigrationDescriptor"]
-pub_fns = ["as_str", "cue_binding_page_id", "cue_binding_page_set_hash", "cue_row_id", "normalize_binding", "normalize_binding_pages", "normalize_bindings", "ul_token_estimate"]
+pub_fns = ["as_str", "cue_binding_page_id", "cue_binding_page_set_hash", "cue_row_id", "normalize_binding", "normalize_binding_pages", "normalize_bindings"]
 pub_consts = ["CUE_BINDING_PAGE_SCHEMA_VERSION_V1", "CUE_BINDING_PAGE_SCHEMA_VERSION_V2", "MAX_CUE_BINDINGS_PER_PAGE", "MAX_CUE_BINDING_PAGE_BYTES"]
 
 [schema_changes]

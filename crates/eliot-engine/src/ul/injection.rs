@@ -1,4 +1,5 @@
 use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_freshness};
+use super::measurement::ul_token_estimate;
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
@@ -6,7 +7,7 @@ use eliot_types::{
     LegacyCueKindV1, OBSERVABILITY_SCHEMA_VERSION, ObservabilityKind, ObservabilityWriteEnvelope,
     ObservabilityWriteStatus, ObservedCue, PendingInjectionItem, ProjectCharter, ProjectId,
     SessionId, SubsystemCapsule, SystemMap, TaskId, UlFiredBlock, UlFiredItem, UlInjectionMode,
-    WriteId, ul_token_estimate,
+    WriteId,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -221,12 +222,12 @@ impl InjectionPlanner {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?
-                .map_or(0, |serialized| ul_token_estimate(&serialized));
+                .map_or(Ok(0), |serialized| ul_token_estimate(&serialized))?;
             if payload_units > MAX_PAYLOAD_UNITS {
                 payload = None;
             }
             let payload_units = if payload.is_some() { payload_units } else { 0 };
-            let token_cost = ul_token_estimate(&line).saturating_add(payload_units);
+            let token_cost = ul_token_estimate(&line)?.saturating_add(payload_units);
             if selected.len() >= MAX_ITEMS
                 || total_units.saturating_add(token_cost) > MAX_TOTAL_UNITS
             {
@@ -427,7 +428,7 @@ impl InjectionPlanner {
             }
             .to_owned(),
             fired_cues: Vec::new(),
-            token_cost: ul_token_estimate(&String::from_utf8_lossy(&serialized)),
+            token_cost: ul_token_estimate(&String::from_utf8_lossy(&serialized))?,
             source_fingerprint,
             outcome: "delivered".to_owned(),
             policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
@@ -484,7 +485,7 @@ impl InjectionPlanner {
             }),
         );
         let content_units =
-            ul_token_estimate(&charter_body).saturating_add(ul_token_estimate(&map_body));
+            ul_token_estimate(&charter_body)?.saturating_add(ul_token_estimate(&map_body)?);
         let over_budget = content_units > 1_200 || effective_mode == UlInjectionMode::HandlesOnly;
         let charter_delivery = if over_budget {
             json!({"ref": charter_ref})
@@ -635,7 +636,7 @@ fn boot_receipt(
         item_ref: item_ref.to_owned(),
         render_form: render_form.to_owned(),
         fired_cues: Vec::new(),
-        token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes)),
+        token_cost: ul_token_estimate(&String::from_utf8_lossy(&rendered_bytes))?,
         source_fingerprint,
         outcome: "delivered".to_owned(),
         policy_reason: (effective_mode == UlInjectionMode::HandlesOnly)
@@ -755,7 +756,7 @@ fn activation_items(
                 fired_cues: Vec::new(),
                 negative_memory: source.negative_memory,
                 invariant,
-                token_estimate: ul_token_estimate(&source.preview_text),
+                token_estimate: ul_token_estimate(&source.preview_text)?,
                 activation_trace_ref: Some(format!("activation:{}", trace.trace_id)),
                 activation_score_milli: Some(activated.score_milli),
             });

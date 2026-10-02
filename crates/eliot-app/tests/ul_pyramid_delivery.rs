@@ -1,6 +1,7 @@
 #[path = "support/ul_t04.rs"]
 mod support;
 
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::{
     CalibrationService, CapsuleEvidence, MetacognitionService, PyramidBuilder, resolve_prediction,
 };
@@ -11,7 +12,7 @@ use eliot_types::{
     PredictionResolution, ProjectCharter, ProjectId, PyramidBuildStatus, PyramidTargetKind,
     RelationInput, RelationType, SemanticCommand, SessionId, SubsystemCapsule, SystemMap,
     TaintClass, TaskId, UlArtifact, UlArtifactBatchRecordCommand, VerificationResult, Visibility,
-    WriteId, ul_token_estimate,
+    WriteId,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -69,7 +70,7 @@ fn t06_boot_delivers_charter_map_once() -> TestResult {
         first["ul_boot"]["system_map"]["body_md"]
             .as_str()
             .unwrap_or_default()
-    ));
+    ))?;
 
     assert_eq!(first["ul_boot"]["status"], "ready");
     assert!(boot_units <= 1_200);
@@ -364,13 +365,13 @@ fn h7_inconclusive_predictions_and_handle_boot_receipts_are_truthful() -> TestRe
         assert_eq!(receipt.render_form, "handle");
         assert_eq!(
             receipt.token_cost,
-            ul_token_estimate(&String::from_utf8_lossy(&rendered))
+            ul_token_estimate(&String::from_utf8_lossy(&rendered))?
         );
         assert_eq!(
             receipt.source_fingerprint,
             blake3::hash(&rendered).to_hex().to_string()
         );
-        assert!(receipt.token_cost < ul_token_estimate(full_body));
+        assert!(receipt.token_cost < ul_token_estimate(full_body)?);
     }
     Ok(())
 }
@@ -506,7 +507,7 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
             PyramidTargetKind::SubsystemCapsule,
             capsule_id.clone(),
             500,
-            ul_token_estimate(&capsule.body_md),
+            ul_token_estimate(&capsule.body_md)?,
         );
         prepared.seed(&ul_command(
             project_id,
@@ -540,7 +541,7 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
         PyramidTargetKind::SystemMap,
         map.map_id.clone(),
         600,
-        ul_token_estimate(&map.body_md),
+        ul_token_estimate(&map.body_md)?,
     );
     prepared.seed(&ul_command(
         project_id,
@@ -568,7 +569,7 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
         PyramidTargetKind::ProjectCharter,
         charter.charter_id.clone(),
         200,
-        ul_token_estimate(&charter.body_md),
+        ul_token_estimate(&charter.body_md)?,
     );
     prepared.seed(&ul_command(
         project_id,
@@ -616,7 +617,7 @@ fn seed_boot_artifacts(
                 PyramidTargetKind::SystemMap,
                 map.map_id,
                 10_000,
-                ul_token_estimate(map_body),
+                ul_token_estimate(map_body)?,
             )),
         ],
         Vec::new(),
@@ -631,7 +632,7 @@ fn seed_boot_artifacts(
                 PyramidTargetKind::ProjectCharter,
                 charter.charter_id,
                 10_000,
-                ul_token_estimate(charter_body),
+                ul_token_estimate(charter_body)?,
             )),
         ],
         Vec::new(),

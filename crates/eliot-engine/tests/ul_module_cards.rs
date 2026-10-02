@@ -1,5 +1,6 @@
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::ModuleCardService;
-use eliot_types::{CoChangeEdge, HotspotScore, ProjectId, ul_token_estimate};
+use eliot_types::{CoChangeEdge, HotspotScore, ProjectId};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -65,7 +66,7 @@ fn t05_module_card_is_deterministic_and_bounded() -> TestResult {
 
     assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?);
     assert_eq!(first_card.body_md, second[0].body_md);
-    assert!(ul_token_estimate(&first_card.body_md) <= 200);
+    assert!(ul_token_estimate(&first_card.body_md)? <= 200);
     assert_eq!(first_card.verifier, "cargo test -p demo");
     let sections = [
         "PURPOSE:",

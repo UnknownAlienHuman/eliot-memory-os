@@ -1,8 +1,9 @@
+use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::{CueIndexService, ObservedCue};
 use eliot_store::CanonicalStore;
 use eliot_types::{
     CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, CueMatchMode, CueStrength,
-    GovernorConfig, LegacyCueKindV1, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
+    GovernorConfig, LegacyCueKindV1, MemoryRevision, ProjectId, cue_row_id,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,7 +56,7 @@ async fn t03_firing_order_and_cap() -> TestResult {
             strength,
             negative,
             "active",
-        );
+        )?;
         harness
             .store
             .replace_cue_rows(project, record_ref, &[row])
@@ -120,7 +121,7 @@ async fn t03_rebuild_after_restart_is_identical() -> TestResult {
                 CueStrength::Primary,
                 false,
                 "active",
-            )],
+            )?],
         )
         .await?;
 
@@ -156,7 +157,7 @@ async fn t03_no_cross_project_or_stale_leak() -> TestResult {
                     CueStrength::Primary,
                     false,
                     lifecycle,
-                )],
+                )?],
             )
             .await?;
     }
@@ -172,7 +173,7 @@ async fn t03_no_cross_project_or_stale_leak() -> TestResult {
                 CueStrength::Primary,
                 false,
                 "active",
-            )],
+            )?],
         )
         .await?;
 
@@ -208,8 +209,8 @@ fn row(
     strength: CueStrength,
     negative_memory: bool,
     lifecycle: &str,
-) -> CueIndexRow {
-    CueIndexRow {
+) -> TestResult<CueIndexRow> {
+    Ok(CueIndexRow {
         row_id: cue_row_id(
             project_id,
             LegacyCueKindV1::FilePath,
@@ -226,8 +227,8 @@ fn row(
         strength,
         negative_memory,
         lifecycle: lifecycle.to_owned(),
-        token_estimate: ul_token_estimate(record_ref),
-    }
+        token_estimate: ul_token_estimate(record_ref)?,
+    })
 }
 
 fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {

@@ -8,6 +8,7 @@ pub mod exam;
 pub mod injection;
 pub mod ledger;
 pub mod maintenance;
+pub mod measurement;
 pub mod metacog;
 pub mod mining;
 pub mod onboarding;
@@ -40,6 +41,7 @@ pub use ledger::{
     UlLedgerAccumulator, UlLedgerService, UlToolMeasurement, is_mutation_tool, is_read_class_tool,
 };
 pub use maintenance::UlMaintenanceService;
+pub use measurement::{ul_token_estimate, ul_token_estimate_for_bytes};
 pub use metacog::MetacognitionService;
 pub use mining::{
     GitMiningArtifacts, GitMiningService, GitMiningStatus, UlArtifactWriteReport,

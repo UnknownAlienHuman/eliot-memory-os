@@ -3,13 +3,15 @@ use crate::{EngineError, WriteAdmissionService, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{
     CapsuleBuild, PyramidBuildStatus, PyramidTargetKind, SubsystemCapsule, TaskId, UlArtifact,
-    UlReasoningRequest, UlReasoningRoute, ul_token_estimate,
+    UlReasoningRequest, UlReasoningRoute,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::future::Future;
 use std::pin::Pin;
 use uuid::Uuid;
+
+use super::measurement::ul_token_estimate;
 
 pub const UL_REFINEMENT_INPUT_BYTES: usize = 4_096;
 pub const UL_REFINEMENT_OUTPUT_TOKEN_UNITS: u32 = 120;
@@ -315,8 +317,7 @@ pub fn refine_capsule_prose(
             inputs_hash,
             anchor_validation: anchor_refs,
             budget_limit: UL_REFINEMENT_OUTPUT_TOKEN_UNITS,
-            token_estimate: ul_token_estimate(&candidate.purpose)
-                .saturating_add(ul_token_estimate(&candidate.boundaries)),
+            token_estimate: refined_output_units(&candidate)?,
             status: PyramidBuildStatus::Promoted,
             previous_build_id: Some(capsule.build_id.clone()),
         },
@@ -327,6 +328,17 @@ pub fn refine_capsule_prose(
     })
 }
 
+/// Canonical STU of a refined candidate's two prose fields.
+///
+/// Both halves are measured with the one UL estimator and summed with
+/// `saturating_add`, so the recorded `token_estimate` and the budget check in
+/// [`validate_refinement_candidate`] are the same number. The refusal is
+/// returned rather than degraded to a saturated count.
+fn refined_output_units(candidate: &UlRefinedProse) -> Result<u32, EngineError> {
+    Ok(ul_token_estimate(&candidate.purpose)?
+        .saturating_add(ul_token_estimate(&candidate.boundaries)?))
+}
+
 pub fn validate_refinement_candidate(
     output: &str,
     anchors: &[UlRefinementAnchor],
@@ -335,10 +347,13 @@ pub fn validate_refinement_candidate(
     if candidate.purpose.trim().is_empty() || candidate.boundaries.trim().is_empty() {
         return None;
     }
-    if ul_token_estimate(&candidate.purpose)
-        .saturating_add(ul_token_estimate(&candidate.boundaries))
-        > UL_REFINEMENT_OUTPUT_TOKEN_UNITS
-    {
+    // A measurement refusal is not a passing candidate: an unmeasurable
+    // output cannot be shown to fit the budget, so it fails closed into the
+    // deterministic fallback rather than being admitted on an unknown size.
+    let Ok(measured) = refined_output_units(&candidate) else {
+        return None;
+    };
+    if measured > UL_REFINEMENT_OUTPUT_TOKEN_UNITS {
         return None;
     }
     let allowed = anchors

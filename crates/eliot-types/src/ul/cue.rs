@@ -603,11 +603,14 @@ pub fn cue_row_id(
     format!("cue:{}", &digest[..32])
 }
 
-#[must_use]
-#[allow(clippy::manual_div_ceil)] // Task 03 fixes this exact conservative estimate formula.
-pub fn ul_token_estimate(text: &str) -> u32 {
-    (u32::try_from(text.len()).unwrap_or(u32::MAX) + 3) / 4
-}
+// `ul_token_estimate` used to live here as a local `(len + 3) / 4`. That ratio
+// is a second estimator beside the normative `STU(bytes) = ceil(bytes / 3)`
+// owned solely by #704 in `eliot-context-measurement`, and the two disagree on
+// real inputs, so the value that gates UL packet and pyramid budgets was not the
+// canonical one. `eliot-types` is a contract hub with minimal dependencies and
+// cannot depend on #704's crate, so the estimator now lives in
+// `eliot_engine::ul::measurement`, which already declares that dependency and
+// calls #704's `stu_for_bytes` directly. See #783.
 
 #[cfg(test)]
 mod tests {

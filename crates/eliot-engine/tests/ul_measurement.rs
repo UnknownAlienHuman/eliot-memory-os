@@ -1,4 +1,4 @@
-use eliot_engine::{
+﻿use eliot_engine::{
     MetacognitionService, UlLedgerAccumulator, UlLedgerService, UlToolMeasurement,
     evaluate_task08_readiness, field_validation_manifest_path, load_field_validation_manifest,
     summarize_field_evidence,
@@ -16,7 +16,7 @@ use std::fs;
 use std::path::Path;
 
 #[test]
-fn u9_3_exploration_token_rounding_is_exact() {
+fn u9_3_exploration_token_rounding_is_exact() -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
     let session_id = SessionId::new_v7();
@@ -46,22 +46,26 @@ fn u9_3_exploration_token_rounding_is_exact() {
             vec![receipt(session_id, task_id, "claim:u9-3", 9)],
         ),
         Some(&assignment),
-    );
+    )?;
 
     assert_eq!(delta.read_tool_input_bytes, 9);
     assert_eq!(delta.read_tool_output_bytes, 12);
-    assert_eq!(delta.exploration_tokens, 6);
+    // 21 measured bytes is the canonical `ceil(21 / 3)` = 7 source token
+    // units. The retired local `(21 + 3) / 4` would have reported 6 and
+    // understated exploration cost against the one owner (#783).
+    assert_eq!(delta.exploration_tokens, 7);
     assert_eq!(delta.injected_tokens, 9);
-    let baseline = UlLedgerService::matched_control_baseline(&[4, 6, 8]);
-    assert_eq!(baseline, Some(6));
+    let baseline = UlLedgerService::matched_control_baseline(&[7, 9, 8]);
+    assert_eq!(baseline, Some(8));
     assert_eq!(
         UlLedgerService::net_token_delta(delta.injected_tokens, baseline.unwrap_or_default()),
-        3
+        1
     );
+    Ok(())
 }
 
 #[test]
-fn t07_ledger_counts_bytes_and_injections() {
+fn t07_ledger_counts_bytes_and_injections() -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
     let session_id = SessionId::new_v7();
@@ -78,7 +82,7 @@ fn t07_ledger_counts_bytes_and_injections() {
             receipt(session_id, task_id, "claim:one", 7),
             receipt(session_id, task_id, "claim:two", 9),
         ],
-    ));
+    ))?;
     let mutation = accumulator.record(&measurement(
         project_id,
         task_id,
@@ -88,7 +92,7 @@ fn t07_ledger_counts_bytes_and_injections() {
         100,
         120,
         vec![receipt(session_id, task_id, "claim:three", 3)],
-    ));
+    ))?;
     let after_mutation = accumulator.record(&measurement(
         project_id,
         task_id,
@@ -98,20 +102,24 @@ fn t07_ledger_counts_bytes_and_injections() {
         200,
         240,
         Vec::new(),
-    ));
+    ))?;
     let ledger = ledger_from_deltas(project_id, task_id, &[read, mutation, after_mutation]);
-    let report = UlLedgerService::use_report(project_id, std::slice::from_ref(&ledger), 3);
+    let report = UlLedgerService::use_report(project_id, std::slice::from_ref(&ledger), 3)?;
 
     assert_eq!(ledger.read_tool_input_bytes, 40);
     assert_eq!(ledger.read_tool_output_bytes, 84);
     assert_eq!(ledger.injected_tokens, 19);
     assert!(ledger.first_mutation_seen);
-    assert_eq!(report.exploration_tokens, 31);
+    // Only the read before the first mutation counts, so the report measures
+    // 40 + 84 = 124 observed bytes: canonical `ceil(124 / 3)` = 42, where the
+    // retired local `ceil(124 / 4)` would have reported 31 (#783).
+    assert_eq!(report.exploration_tokens, 42);
     assert_eq!(report.injected_tokens, 19);
+    Ok(())
 }
 
 #[test]
-fn t07_ack_and_expand_metrics_are_honest() {
+fn t07_ack_and_expand_metrics_are_honest() -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let task_id = TaskId::new_v7();
     let session_id = SessionId::new_v7();
@@ -130,7 +138,7 @@ fn t07_ack_and_expand_metrics_are_honest() {
                 .iter()
                 .map(|handle| receipt(session_id, task_id, handle, 5))
                 .collect(),
-        )),
+        ))?,
     ];
     for (tool, arguments) in [
         (
@@ -175,13 +183,14 @@ fn t07_ack_and_expand_metrics_are_honest() {
             0,
             0,
             Vec::new(),
-        )));
+        ))?);
     }
     let ledger = ledger_from_deltas(project_id, task_id, &deltas);
 
     assert_eq!(ledger.acknowledged_items, 2);
     assert_eq!(ledger.expanded_injected_handles, 1);
     assert_eq!(ledger.injected_tokens, 20);
+    Ok(())
 }
 
 #[test]

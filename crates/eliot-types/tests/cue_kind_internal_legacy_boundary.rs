@@ -1186,9 +1186,70 @@ fn case_20_no_normalization_binding_index_or_activation_algorithm_change() -> Te
         }
     }
     assert_eq!(tag(LegacyCueKindV1::Concept), "concept");
+    // #783: this used to assert `eliot_types::ul_token_estimate("hello world")
+    // == 11_u32.div_ceil(4)`, i.e. 3. That expectation encoded the retired
+    // estimator's ratio of one unit per FOUR bytes, and that was the defect:
+    // the canonical Source Token Unit owner is #704's
+    // `STU(bytes) = ceil(bytes / 3)` in
+    // `crates/smart/eliot-context-measurement/src/stu.rs`, and 11 bytes is 4
+    // units there, not 3.
+    //
+    // `eliot-types` cannot link that owner: it is the contract hub the engine
+    // depends on, and `case_11_no_upward_smart_dependency` additionally forbids
+    // a `smart` dependency here. So this oracle pins the canonical divisor and
+    // its exact value against the owner's own source, rather than restating a
+    // ratio locally. `strip_code` is this file's existing comment/string
+    // masker, so a `//` inside a string or a doc comment cannot satisfy or
+    // defeat the check.
+    let canonical = strip_code(&read_workspace(
+        "crates/smart/eliot-context-measurement/src/stu.rs",
+    )?);
+    // The owner's implementation is the checked `(len + 2) / 3` rounding form.
+    assert!(
+        canonical.contains("checked_add(2)"),
+        "#704 owner lost its checked ceil-by-three rounding: {canonical}"
+    );
+    assert!(
+        canonical.contains("plus_two / 3"),
+        "#704 owner no longer divides the byte length by three: {canonical}"
+    );
+    // The value the retired assertion used to expect, re-derived: the exact
+    // canonical estimate of the same 11-byte payload is 4, so an `eliot-types`
+    // oracle that still expected 3 was asserting a number no owner produces.
+    const HELLO_WORLD_BYTES: u64 = 11;
+    const HELLO_WORLD_CANONICAL_UNITS: u64 = 4;
     assert_eq!(
-        eliot_types::ul_token_estimate("hello world"),
-        11_u32.div_ceil(4)
+        (HELLO_WORLD_BYTES + 2) / 3,
+        HELLO_WORLD_CANONICAL_UNITS,
+        "the canonical estimate of an 11-byte payload changed"
+    );
+    assert_ne!(
+        HELLO_WORLD_CANONICAL_UNITS,
+        u64::from(11_u32.div_ceil(4)),
+        "the retired /4 expectation is back; it encoded the retired estimator"
+    );
+    // No byte/4 ratio and no character count may coexist with the owner.
+    assert!(
+        !canonical.contains("/ 4") && !canonical.contains("/4"),
+        "a byte/4 ratio reappeared in the canonical STU owner: {canonical}"
+    );
+    // And the estimator that replaced the eliot-types symbol restates no ratio
+    // at all: it delegates, so the division still lives in exactly one crate.
+    // Only its production half is scanned, because its test module names the
+    // retired expression on purpose, as a negative control that would otherwise
+    // look like a live second estimator.
+    let estimator_source = read_workspace("crates/eliot-engine/src/ul/measurement.rs")?;
+    let (estimator_production, _estimator_tests) = estimator_source
+        .split_once("#[cfg(test)]")
+        .ok_or_else(|| boxed(std::io::Error::other("the UL estimator has no test module")))?;
+    let estimator = strip_code(estimator_production);
+    assert!(
+        estimator.contains("stu_for_bytes"),
+        "the UL estimator no longer calls the canonical owner"
+    );
+    assert!(
+        !estimator.contains("div_ceil(4)") && !estimator.contains("/ 4"),
+        "the UL estimator restates a competing ratio: {estimator}"
     );
     let fixture = read_fixture()?;
     let receipt: InjectionReceipt = serde_json::from_value(

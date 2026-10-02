@@ -1,13 +1,14 @@
 #[path = "support/ul_t04.rs"]
 mod support;
 
+use eliot_engine::ul::ul_token_estimate;
 use eliot_types::{
     AgentId, CapsuleBuild, ClaimCardInput, ClaimId, CommandContext, ConceptKind, ConceptNode,
     CueBinding, CueMatchMode, CueStrength, DependencyManifest, EpistemicStatus, InjectionReceipt,
     LegacyCueKindV1, LifecycleStatus, ObservabilityKind, ProjectId, PyramidBuildStatus,
     PyramidTargetKind, RelationInput, RelationType, SemanticCommand, SubsystemCapsule, TaintClass,
     TaskId, UlArtifact, UlArtifactBatchRecordCommand, UlInjectionMode, UlTaskClassPolicy,
-    Visibility, WriteId, ul_token_estimate,
+    Visibility, WriteId,
 };
 use serde_json::{Value, json};
 use support::{Harness, PreparedHarness, TestResult, rerun_with_credential_gate, test_guard};
@@ -937,7 +938,7 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
         inputs_hash: "b".repeat(64),
         anchor_validation: vec!["test:ok".to_owned()],
         budget_limit: 1_200,
-        token_estimate: ul_token_estimate(&capsule.body_md),
+        token_estimate: ul_token_estimate(&capsule.body_md)?,
         status: PyramidBuildStatus::Promoted,
         previous_build_id: None,
     };
