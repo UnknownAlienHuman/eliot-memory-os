@@ -265,6 +265,118 @@ impl<'a> ActivationRecordIdentity<'a> {
     }
 }
 
+/// Identity slots one readiness request contributes to a record.
+///
+/// This is the only owner-evidence path in the whole Host launch slice that
+/// may claim readiness, so the request record states the exact identities the
+/// evidence will be checked against: the candidate's activation identity, the
+/// Kernel authority epoch, and the ready receipt's activation and operation
+/// identities, beside the base slots and the candidate Job binding the driver
+/// holds. A request record is not a readiness claim; the readiness record that
+/// follows is bound to the validated permit, activation receipt, and ready
+/// receipt.
+///
+/// Every value is a handle the caller already holds. A slot the driver does not
+/// hold reads `Unavailable`; nothing is invented.
+#[cfg(windows)]
+fn kernel_activation_readiness_requested_fields<'a>(
+    identity: &'a ActivationRecordIdentity<'a>,
+    candidate: &'a HostKernelCandidateBinding,
+    ready: &'a KernelReadyReceipt,
+) -> ActivationIdentityFields<'a> {
+    let mut fields = identity.with_candidate();
+    fields.push((
+        "candidate_activation",
+        super::host_job_launch::LaunchIdentityField::Text(candidate.activation_id.as_str()),
+    ));
+    fields.push((
+        "authority_epoch",
+        super::host_job_launch::LaunchIdentityField::Number(
+            candidate.kernel_epoch.sequence.get(),
+        ),
+    ));
+    fields.push((
+        "ready_receipt_activation",
+        super::host_job_launch::LaunchIdentityField::Text(ready.activation_id.as_str()),
+    ));
+    fields.push((
+        "ready_receipt_operation",
+        super::host_job_launch::LaunchIdentityField::Text(
+            ready.activation_operation_id.as_str(),
+        ),
+    ));
+    fields
+}
+
+/// Identity slots one readiness/activation observation contributes to a record.
+///
+/// Everything bound here is held at that point: the committed `Active`
+/// append's journal transaction identity and sequence, the permit's operation
+/// id and authority epoch, the activation receipt's operation id and journal
+/// transaction identity, the ready receipt's activation id, operation id and
+/// process, and the count of readiness evidence references it carried. The
+/// activation nonce digest and the evidence reference handles themselves stay
+/// with the journal record.
+#[cfg(windows)]
+fn kernel_activation_readiness_observed_fields<'a>(
+    identity: &'a ActivationRecordIdentity<'a>,
+    active_receipt: &'a AppendReceipt,
+    permit: &'a KernelActivationPermit,
+    activation_receipt: &'a KernelActivationReceipt,
+    ready: &'a KernelReadyReceipt,
+) -> ActivationIdentityFields<'a> {
+    let mut fields = identity.with_journal_and_candidate(active_receipt);
+    fields.push((
+        "permit_operation",
+        super::host_job_launch::LaunchIdentityField::Text(permit.operation_id.as_str()),
+    ));
+    fields.push((
+        "authority_epoch",
+        super::host_job_launch::LaunchIdentityField::Number(
+            permit.authority_epoch.sequence.get(),
+        ),
+    ));
+    fields.push((
+        "resource_generation",
+        super::host_job_launch::LaunchIdentityField::Number(permit.generation.value()),
+    ));
+    fields.push((
+        "receipt_operation",
+        super::host_job_launch::LaunchIdentityField::Text(activation_receipt.operation_id.as_str()),
+    ));
+    fields.push((
+        "receipt_journal_transaction",
+        super::host_job_launch::LaunchIdentityField::Text(
+            activation_receipt.journal_transaction_id.as_str(),
+        ),
+    ));
+    fields.push((
+        "receipt_journal_sequence",
+        super::host_job_launch::LaunchIdentityField::Number(
+            activation_receipt.journal_sequence,
+        ),
+    ));
+    fields.push((
+        "ready_activation",
+        super::host_job_launch::LaunchIdentityField::Text(ready.activation_id.as_str()),
+    ));
+    fields.push((
+        "ready_operation",
+        super::host_job_launch::LaunchIdentityField::Text(
+            ready.activation_operation_id.as_str(),
+        ),
+    ));
+    fields.push((
+        "ready_process",
+        super::host_job_launch::LaunchIdentityField::Text(ready.process.process_id.as_str()),
+    ));
+    fields.push((
+        "ready_evidence_count",
+        super::host_job_launch::LaunchIdentityField::Number(ready.evidence_refs.len() as u64),
+    ));
+    fields
+}
+
 /// Stable secret-free name for one activation state.
 ///
 /// A projection of the owner's typed [`KernelActivationState`] discriminant
@@ -758,39 +870,11 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // alone.
         kernel_activation_observe_bound(
             "host.kernel-activation readiness requested",
-            &[
-                ActivationRecordIdentity::new(&self.current)
-                    .with_candidate()
-                    .as_slice(),
-                [
-                    (
-                        "candidate_activation",
-                        super::host_job_launch::LaunchIdentityField::Text(
-                            candidate.activation_id.as_str(),
-                        ),
-                    ),
-                    (
-                        "authority_epoch",
-                        super::host_job_launch::LaunchIdentityField::Number(
-                            candidate.kernel_epoch.sequence.get(),
-                        ),
-                    ),
-                    (
-                        "ready_receipt_activation",
-                        super::host_job_launch::LaunchIdentityField::Text(
-                            ready.activation_id.as_str(),
-                        ),
-                    ),
-                    (
-                        "ready_receipt_operation",
-                        super::host_job_launch::LaunchIdentityField::Text(
-                            ready.activation_operation_id.as_str(),
-                        ),
-                    ),
-                ]
-                .as_slice(),
-            ]
-            .concat(),
+            &kernel_activation_readiness_requested_fields(
+                &ActivationRecordIdentity::new(&self.current),
+                candidate,
+                ready,
+            ),
         );
         // I14.16 step 7/8: the candidate must hold exclusive ownership of its
         // own contour before Host publishes it. This runs before the permit,
@@ -837,66 +921,13 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // a temporary that would be dropped at the end of this `let`. The slots
         // and their order are otherwise exactly what the record already binds.
         let identity = ActivationRecordIdentity::new(&self.current);
-        let evidence_fields = [
-            identity.with_journal_and_candidate(&active_receipt),
-            vec![
-                (
-                    "permit_operation",
-                    super::host_job_launch::LaunchIdentityField::Text(permit.operation_id.as_str()),
-                ),
-                (
-                    "authority_epoch",
-                    super::host_job_launch::LaunchIdentityField::Number(
-                        permit.authority_epoch.sequence.get(),
-                    ),
-                ),
-                (
-                    "resource_generation",
-                    super::host_job_launch::LaunchIdentityField::Number(permit.generation.value()),
-                ),
-                (
-                    "receipt_operation",
-                    super::host_job_launch::LaunchIdentityField::Text(
-                        activation_receipt.operation_id.as_str(),
-                    ),
-                ),
-                (
-                    "receipt_journal_transaction",
-                    super::host_job_launch::LaunchIdentityField::Text(
-                        activation_receipt.journal_transaction_id.as_str(),
-                    ),
-                ),
-                (
-                    "receipt_journal_sequence",
-                    super::host_job_launch::LaunchIdentityField::Number(
-                        activation_receipt.journal_sequence,
-                    ),
-                ),
-                (
-                    "ready_activation",
-                    super::host_job_launch::LaunchIdentityField::Text(ready.activation_id.as_str()),
-                ),
-                (
-                    "ready_operation",
-                    super::host_job_launch::LaunchIdentityField::Text(
-                        ready.activation_operation_id.as_str(),
-                    ),
-                ),
-                (
-                    "ready_process",
-                    super::host_job_launch::LaunchIdentityField::Text(
-                        ready.process.process_id.as_str(),
-                    ),
-                ),
-                (
-                    "ready_evidence_count",
-                    super::host_job_launch::LaunchIdentityField::Number(
-                        ready.evidence_refs.len() as u64
-                    ),
-                ),
-            ],
-        ]
-        .concat();
+        let evidence_fields = kernel_activation_readiness_observed_fields(
+            &identity,
+            &active_receipt,
+            &permit,
+            activation_receipt,
+            ready,
+        );
         // WORK_UNIT_CASE: 978/7 — activation observed distinctly from nonce/
         // handshake/auth; WORK_UNIT_CASE: 978/8 — readiness observed only on
         // exact owner evidence above, exact errors propagate unchanged.
