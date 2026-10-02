@@ -242,3 +242,150 @@ fn check_residual_markers(contract: &toml::Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CELL_CONTRACT, CONTRACT_DECLARED_BY, ELIOTD_MANIFEST, cell_declaration_guard,
+        manifest_cells, manifest_owners,
+    };
+
+    /// The real baked pair the production guard reads.
+    const REAL_MANIFEST: &str = ELIOTD_MANIFEST;
+    const REAL_CONTRACT: &str = CELL_CONTRACT;
+
+    /// The real declaration block, parsed the way the guard parses it.
+    fn real_eliot_metadata() -> toml::Value {
+        let manifest: toml::Value = toml::from_str(REAL_MANIFEST)
+            .unwrap_or_else(|error| panic!("the real eliotd manifest must parse: {error}"));
+        manifest
+            .get("package")
+            .and_then(|package| package.get("metadata"))
+            .and_then(|metadata| metadata.get("eliot"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the real eliotd manifest carries [package.metadata.eliot]"))
+    }
+
+    /// The real contract projection, parsed the way the guard parses it.
+    fn real_contract() -> toml::Value {
+        toml::from_str(REAL_CONTRACT)
+            .unwrap_or_else(|error| panic!("the real cell contract must parse: {error}"))
+    }
+
+    /// Replace the first occurrence of `from` in REAL baked text with `to`.
+    ///
+    /// `cell_declaration_guard` reads compile-time `include_str!` bytes with
+    /// no arguments, so an arm is driven by mutating that exact text once and
+    /// handing the result to the production stage the guard calls. `from`
+    /// must occur in the real file: a drifting anchor panics loudly instead
+    /// of quietly passing a hand-written fixture no real file ever produced.
+    fn replace_once(text: &str, from: &str, to: &str) -> String {
+        let Some(at) = text.find(from) else {
+            panic!("mutation anchor is absent from the baked text: {from}");
+        };
+        let mut mutated = String::with_capacity(text.len() + to.len());
+        mutated.push_str(&text[..at]);
+        mutated.push_str(to);
+        mutated.push_str(&text[at + from.len()..]);
+        mutated
+    }
+
+    /// Parse one mutation of the real manifest and run the real cell reader.
+    fn cells_of_mutated_manifest(from: &str, to: &str) -> Result<Vec<String>, String> {
+        let mutated: toml::Value = toml::from_str(&replace_once(REAL_MANIFEST, from, to))
+            .unwrap_or_else(|error| panic!("the mutated manifest must still parse: {error}"));
+        let eliot = mutated
+            .get("package")
+            .and_then(|package| package.get("metadata"))
+            .and_then(|metadata| metadata.get("eliot"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the mutated manifest must still declare the cells"));
+        manifest_cells(&eliot)
+    }
+
+    /// Parse one mutation of the real manifest and run the real owner reader.
+    fn owners_of_mutated_manifest(from: &str, to: &str) -> Result<Vec<(String, String)>, String> {
+        let mutated: toml::Value = toml::from_str(&replace_once(REAL_MANIFEST, from, to))
+            .unwrap_or_else(|error| panic!("the mutated manifest must still parse: {error}"));
+        let eliot = mutated
+            .get("package")
+            .and_then(|package| package.get("metadata"))
+            .and_then(|metadata| metadata.get("eliot"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the mutated manifest must still declare the cells"));
+        let cells = manifest_cells(&eliot)?;
+        manifest_owners(&eliot, &cells)
+    }
+
+    /// The real declared cells and their real owners, as the guard reads them.
+    fn real_declaration() -> (Vec<String>, Vec<(String, String)>) {
+        let eliot = real_eliot_metadata();
+        let cells = manifest_cells(&eliot)
+            .unwrap_or_else(|reason| panic!("the real declaration must name its cells: {reason}"));
+        let owners = manifest_owners(&eliot, &cells).unwrap_or_else(|reason| {
+            panic!("the real declaration must name one owner per cell: {reason}")
+        });
+        (cells, owners)
+    }
+
+    #[test]
+    fn real_generated_declarations_satisfy_the_facade_guard() {
+        // The positive case is the shipped one: the real eliotd declaration
+        // and its real contract projection agree, one owner per declared cell
+        // with no owner shared, and the contract still declares the
+        // executable-registry residual instead of claiming #13's registry.
+        assert_eq!(
+            cell_declaration_guard(),
+            Ok(()),
+            "the committed declaration/contract pair must satisfy the facade guard"
+        );
+
+        let (cells, owners) = real_declaration();
+        assert_eq!(
+            cells.len(),
+            8,
+            "the real eliotd declaration names its eight daemon cells"
+        );
+        assert_eq!(
+            owners.len(),
+            cells.len(),
+            "every declared cell carries exactly one mutable-state owner row"
+        );
+
+        // Every projected row points back at the canonical source instead of
+        // duplicating it, and each names the owner's manifest row.
+        let projected = real_contract()
+            .get("declared_functional_cell")
+            .and_then(toml::Value::as_array)
+            .unwrap_or_else(|| panic!("the real contract carries its projection rows"))
+            .iter()
+            .map(|row| {
+                let cell = row.get("cell").and_then(toml::Value::as_str);
+                let owner = row.get("mutable_state_owner").and_then(toml::Value::as_str);
+                let declared_by = row.get("declared_by").and_then(toml::Value::as_str);
+                (cell, owner, declared_by)
+            })
+            .collect::<Vec<(Option<&str>, Option<&str>, Option<&str>)>>();
+        assert_eq!(
+            projected.len(),
+            cells.len(),
+            "the contract projects one row per declared cell"
+        );
+        for (cell, owner, declared_by) in projected {
+            assert_eq!(
+                declared_by,
+                Some(CONTRACT_DECLARED_BY),
+                "every projected row must point back at the canonical manifest source"
+            );
+            let cell = cell.unwrap_or_else(|| panic!("every projected row names a cell"));
+            let manifest_owner = owners
+                .iter()
+                .find(|(known, _)| known == cell)
+                .map(|(_, owner)| owner.as_str());
+            assert_eq!(
+                owner, manifest_owner,
+                "the projected owner must be the owner's manifest row for {cell}"
+            );
+        }
+    }
+}
