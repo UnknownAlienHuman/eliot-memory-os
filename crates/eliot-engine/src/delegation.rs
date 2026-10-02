@@ -1197,8 +1197,10 @@ fn apply_provider_call_ledger_reconciliation(
     };
     fs::create_dir_all(&quarantine_dir)?;
     let original_bytes = fs::read(recovered_from)?;
-    let admitted_path =
-        quarantine_dir.join(format!("admitted-{}.json", new_id("provider-call-ledger")));
+    let admitted_path = quarantine_dir.join(format!(
+        "admitted-{}.json",
+        eliot_types::WorkLeaseId::new_v7()
+    ));
     fs::write(&admitted_path, &original_bytes)?;
     // The admitted record is proven against the ORIGINAL recorded bytes with
     // the one decoder and the one validator every candidate is held to.
@@ -1206,24 +1208,45 @@ fn apply_provider_call_ledger_reconciliation(
         rejected("the recovered provider call ledger record does not decode and validate")
     })?;
     validate_provider_call_ledger(&ledger)?;
-    // The corrupt evidence moves aside with its bytes intact, so the install
-    // can neither truncate nor overwrite it.
-    let quarantined =
-        displace_provider_call_ledger_candidate(&superseded.path(path), &quarantine_dir, superseded)?;
+    // Every candidate the operator dispositioned as preserved is copied
+    // byte-for-byte and left refused in place.
+    let mut quarantined = Vec::new();
+    for candidate in &refused {
+        if *candidate == superseded {
+            continue;
+        }
+        quarantined.push(preserve_provider_call_ledger_candidate(
+            &candidate.path(path),
+            &quarantine_dir,
+            *candidate,
+        )?);
+    }
+    // The superseded corrupt evidence moves aside with its bytes intact, so the
+    // install can neither truncate nor overwrite it.
+    quarantined.push(displace_provider_call_ledger_candidate(
+        &superseded.path(path),
+        &quarantine_dir,
+        superseded,
+    )?);
+    let displaced = quarantined
+        .last()
+        .ok_or_else(|| rejected("the superseded provider call ledger candidate is not preserved"))?
+        .path
+        .clone();
     if let Err(error) = fs::rename(&admitted_path, path) {
-        let _ = fs::rename(&quarantined.path, superseded.path(path));
+        let _ = fs::rename(&displaced, superseded.path(path));
         return Err(error.into());
     }
     Ok(ProviderCallLedgerReconciliationOutcome {
         admitted: Some(ledger),
-        quarantined: vec![quarantined],
+        quarantined,
         still_unknown: false,
     })
 }
 
 /// The one quarantine file name one preserved candidate gets on one
-/// reconciliation. The bounded identity suffix keeps a later reconciliation
-/// from overwriting an earlier preserved copy.
+/// reconciliation. The identity suffix keeps a later reconciliation from
+/// overwriting an earlier preserved copy.
 fn provider_call_ledger_quarantine_path(
     quarantine_dir: &Path,
     candidate: ProviderCallLedgerCandidate,
@@ -1231,7 +1254,7 @@ fn provider_call_ledger_quarantine_path(
     quarantine_dir.join(format!(
         "{}-{}.corrupt",
         candidate.code(),
-        new_id("provider-call-ledger-quarantine")
+        eliot_types::WorkLeaseId::new_v7()
     ))
 }
 
@@ -1736,14 +1759,23 @@ mod provider_call_ledger_reconciliation_tests {
         }
     }
 
+    fn test_error(message: &'static str) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::other(message))
+    }
+
     /// One owner whose ledger is unknown because every candidate is corrupt,
     /// plus the original bytes an operator holds elsewhere as the record they
     /// would authorize.
-    fn blocked_owner(
-        tag: &str,
-    ) -> TestResult<(PathBuf, ProviderCallReservationOwner, Vec<u8>, PathBuf)> {
+    struct BlockedLedger {
+        root: PathBuf,
+        owner: ProviderCallReservationOwner,
+        recovered: Vec<u8>,
+        ledger_path: PathBuf,
+    }
+
+    fn blocked_owner(tag: &str) -> TestResult<BlockedLedger> {
         let root = std::env::temp_dir()
-            .join(format!("eliot-936-ledger-reconcile-{tag}-{}", new_id("root")));
+            .join(format!("eliot-936-ledger-reconcile-{tag}-{}", TaskId::new_v7()));
         let owner = ProviderCallReservationOwner::new(&root);
         owner.open_campaign(ProviderCallCampaignRequest {
             campaign_id: CAMPAIGN.to_owned(),
@@ -1759,16 +1791,26 @@ mod provider_call_ledger_reconciliation_tests {
             owner.snapshot(),
             Err(EngineError::ProviderCallLedgerUnknown(_))
         ) {
-            return Err(Box::new(std::io::Error::other(
+            return Err(test_error(
                 "a corrupt ledger must refuse before it is reconciled",
-            )));
+            ));
         }
-        Ok((root, owner, recovered, ledger_path))
+        Ok(BlockedLedger {
+            root,
+            owner,
+            recovered,
+            ledger_path,
+        })
     }
 
     #[test]
     fn explicit_disposition_admits_the_operator_record_and_unblocks() -> TestResult {
-        let (root, owner, recovered, ledger_path) = blocked_owner("admit")?;
+        let BlockedLedger {
+            root,
+            owner,
+            recovered,
+            ledger_path,
+        } = blocked_owner("admit")?;
         let operator_copy = root.join("operator-recovered-provider-call-ledger.json");
         fs::write(&operator_copy, &recovered)?;
 
@@ -1800,7 +1842,7 @@ mod provider_call_ledger_reconciliation_tests {
             .quarantined
             .iter()
             .find(|entry| entry.candidate == ProviderCallLedgerCandidate::Current)
-            .ok_or_else(|| std::io::Error::other("the superseded candidate is not preserved"))?;
+            .ok_or_else(|| test_error("the superseded candidate is not preserved"))?;
         assert_eq!(
             fs::read(&superseded.path)?,
             preserved_bytes(ProviderCallLedgerCandidate::Current)
@@ -1835,7 +1877,12 @@ mod provider_call_ledger_reconciliation_tests {
 
     #[test]
     fn absent_ambiguous_or_unauthorised_disposition_refuses_and_keeps_the_bytes() -> TestResult {
-        let (root, owner, _recovered, ledger_path) = blocked_owner("refusal")?;
+        let BlockedLedger {
+            root,
+            owner,
+            recovered: _recovered,
+            ledger_path,
+        } = blocked_owner("refusal")?;
 
         // Absent intent: one refused candidate carries no disposition.
         assert!(
