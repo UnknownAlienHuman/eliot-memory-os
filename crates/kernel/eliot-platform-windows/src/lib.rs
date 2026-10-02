@@ -238,7 +238,13 @@ use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
 /// unsafe stays inside this crate's identity owner; Host calls it under
 /// `#![forbid(unsafe_code)]`.
 pub use process_identity::directory_identity_for_path;
-pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
+#[cfg(windows)]
+pub use process_identity::selected_execution_identity_sid;
+pub use process_identity::{
+    FileIdentity, ProcessIdentity, SYSTEM_SERVICE_EXECUTION_IDENTITY_NAME,
+    USER_MODE_EXECUTION_IDENTITY_NAME, execution_identity_mode_name,
+    is_process_builtin_administrator, select_execution_identity_mode,
+};
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
     process_token_identity, process_token_is_builtin_administrator, same_process_identity,
@@ -248,11 +254,11 @@ pub(crate) use process_identity::{
 #[cfg(windows)]
 pub use process_job::OuterKillDomain;
 pub use process_job::{
-    ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
-    JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
-    RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
-    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    ExecutionIdentityMode, ExistingJobMemberObservation, JobObject, JobObjectIdentity,
+    JobObjectLimits, JobObservationGap, JobProcessHistory, PinnedRuntimeFile, ProcessObservation,
+    RecoverableJobBinding, RecoverableJobObject, RunningExistingJobChild, RunningJobChild,
+    RunningJobObservation, SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild,
+    SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
     TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
     ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
@@ -3190,6 +3196,10 @@ pub fn process_basename_matches(observed: &str, expected: &str) -> bool {
 /// Reports whether any process currently has the exact requested basename.
 /// This helper deliberately does not infer ownership, path, or identity.
 ///
+/// A basename proves that *some* live process carries a file name, never that
+/// a particular file is the one executing. A caller deciding whether one exact
+/// file may be replaced needs [`any_running_process_executing`] instead.
+///
 /// # Errors
 ///
 /// Returns an adapter error for an invalid basename, an unavailable process
@@ -3205,76 +3215,230 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{
-            CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
-        };
-        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-            TH32CS_SNAPPROCESS,
-        };
-        // SAFETY: CreateToolhelp32Snapshot enumerates processes with TH32CS_SNAPPROCESS; flags constant;
-        // return compared against INVALID_HANDLE_VALUE; snapshot closed via CloseHandle on every path;
-        // handle stays on this thread until close.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(last_windows_adapter_error());
-        }
-        let mut entry = PROCESSENTRY32W {
-            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
-                .map_err(|_| WindowsAdapterError::Failed)?,
-            ..Default::default()
-        };
+        // The shared walk owns the snapshot; this observation only names the
+        // file whose name it accepts, and stops at the first such process.
         let mut matched = false;
-        // SAFETY: Process32FirstW receives the live snapshot handle and a writable PROCESSENTRY32W with
-        // dwSize set; entry buffer pinned and outlives the call; snapshot stays open; return selects the
-        // enumeration path.
-        let first = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
-        let mut terminal_error = 0_u32;
-        if first {
-            loop {
-                let length = entry
-                    .szExeFile
-                    .iter()
-                    .position(|unit| *unit == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
-                if process_basename_matches(&name, basename) {
-                    matched = true;
-                    break;
-                }
-                // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
-                // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
-                // dereference.
-                if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
-                    // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
-                    // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
-                    // dereference.
-                    terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                    break;
-                }
+        observe_running_processes(|_process_id, name| {
+            if process_basename_matches(name, basename) {
+                matched = true;
             }
-        } else {
-            // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
-            // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
-            // OwnershipUncertain; no double close and no use after close.
-            terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        }
-        // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
-        // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
-        // OwnershipUncertain; no double close and no use after close.
-        unsafe { CloseHandle(snapshot) };
-        if matched || terminal_error == ERROR_NO_MORE_FILES {
-            Ok(matched)
-        } else {
-            let error_code = i32::try_from(terminal_error).unwrap_or(i32::MAX);
-            let error = std::io::Error::from_raw_os_error(error_code);
-            Err(windows_adapter_from_io(&error))
-        }
+            matched
+        })?;
+        Ok(matched)
     }
     #[cfg(not(windows))]
     {
         let _ = basename;
         Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Reports whether a live process is currently executing **this exact file**.
+///
+/// `I1.6` (`docs/architecture/I01-06-windows-isolation.md:15`) requires that
+/// "versioned binaries are never replaced in place while running". This is the
+/// observation that sentence turns on, and it is the path-exact counterpart of
+/// [`any_running_process_named`]: where that one reports that *some* live
+/// process carries a file name, this one reports whether a live process is
+/// executing the file the caller named. A same-named copy somewhere else on
+/// the machine satisfies a basename match and nothing here.
+///
+/// **Observed.** One live process enumerated by this crate's single process
+/// walk, whose kernel-reported image path equals `executable` as a whole path.
+/// The image path is read with `QueryFullProcessImageNameW` and
+/// `PROCESS_NAME_WIN32` through this crate's existing per-process inspection
+/// (`inspect_process_identity`, crate-private), and it is compared with this
+/// crate's existing whole-path comparison (`same_process_image_path`,
+/// crate-private), which first rejects anything that is not a drive-rooted or
+/// UNC image path and then compares the complete normalized path: `\\?\` prefix
+/// stripped, `/` mapped to `\`, case folded. No directory, prefix, or file-name
+/// component is ever compared on its own.
+///
+/// **Inferred / deliberately not claimed.** Nothing about why that process is
+/// running, who launched it, or whether the bytes on disk now are the bytes it
+/// mapped. The comparison is textual over the path Windows reports, so a copy
+/// launched through a spelling Windows does not report identically (an 8.3
+/// short name, a device path) is not matched and yields `Ok(false)`. A caller
+/// that needs file-identity equality instead of path equality must open the
+/// observed image and compare identities, as the launch path does with
+/// `file_identity`; this observation deliberately does not open the target
+/// file, because a running image is shared-locked and a failed open would be
+/// indistinguishable from the refusal case.
+///
+/// **An unreadable candidate image is never answered as "not running."** Two
+/// different Windows failures produce that situation, and they are decided
+/// differently because they mean different things:
+///
+/// - The candidate left the machine between the snapshot and the image read.
+///   `OpenProcess` then reports `ERROR_INVALID_PARAMETER`, which is the
+///   operating system's own statement that no process carries that id, and a
+///   terminated process holds no image section. The candidate is skipped and
+///   the walk continues. A reused id cannot turn this into a false `Ok`: an id
+///   is unique among live processes, so the process it used to name has
+///   already exited, and whatever now owns it is compared on its own image.
+/// - The candidate is alive and its image path cannot be read, e.g.
+///   `OpenProcess` reports `ERROR_ACCESS_DENIED` for a process owned by another
+///   principal or marked protected. The exact file may be the one that is
+///   executing and this API cannot tell, so the observation refuses with a
+///   typed adapter error instead of answering. Refusing is the correct reading
+///   rather than the merely cautious one: the caller of this API is deciding
+///   whether a versioned binary may be replaced, and a refusal to observe must
+///   not be read as an observation that the target is idle.
+///
+/// # Errors
+///
+/// Returns [`WindowsAdapterError::InvalidInput`] when `executable` is not an
+/// absolute drive-rooted or UNC path — a bare file name is not an observation
+/// this API can make, and answering about one would be the basename check this
+/// function exists to replace. Returns [`WindowsAdapterError::PermissionDenied`]
+/// when a live name-matching candidate's image path cannot be read, an adapter
+/// error when the process snapshot is unavailable or the enumeration fails, and
+/// [`WindowsAdapterError::Unavailable`] on a non-Windows build, where the live
+/// process walk does not exist and no non-running answer is ever synthesized.
+pub fn any_running_process_executing(executable: &Path) -> Result<bool, WindowsAdapterError> {
+    let requested = executable.to_string_lossy().into_owned();
+    if !valid_process_image_path(&requested) {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        // The walk hands over the enumerated file name; only a candidate whose
+        // name matches is opened for its image path, so a name collision
+        // costs one `OpenProcess` and one path comparison, never a full scan
+        // of every process on the machine.
+        let candidate_name = std::path::Path::new(&requested)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let mut matched = false;
+        let mut unreadable: Option<WindowsAdapterError> = None;
+        observe_running_processes(|process_id, name| {
+            if !process_basename_matches(name, candidate_name) {
+                return false;
+            }
+            match inspect_process_identity(process_id) {
+                Ok(identity) => {
+                    if !same_process_image_path(&identity.image_path, &requested) {
+                        return false;
+                    }
+                    matched = true;
+                    true
+                }
+                // A process that left the machine mid-enumeration holds no
+                // image section, so it cannot be the one being replaced; see
+                // the module documentation for why this is not a refusal.
+                Err(error)
+                    if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER.cast_signed()) =>
+                {
+                    false
+                }
+                Err(error) => {
+                    unreadable = Some(windows_adapter_from_io(&error));
+                    true
+                }
+            }
+        })?;
+        if matched {
+            return Ok(true);
+        }
+        // A name-matching candidate whose image could not be read at all is a
+        // refusal, not an answer. Only a completed walk that read every such
+        // candidate's image may report that this exact file is not executing.
+        if let Some(error) = unreadable {
+            return Err(error);
+        }
+        Ok(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = requested;
+        Err(WindowsAdapterError::Unavailable)
+    }
+}
+
+/// Walks one live process snapshot, handing every enumerated process to `visit`
+/// as `(process_id, executable_basename)`, and stops as soon as `visit` returns
+/// `true`.
+///
+/// This is the crate's one process-enumeration walk: [`any_running_process_named`]
+/// and [`any_running_process_executing`] both observe through it, so neither
+/// owns a second snapshot scheme and the `CreateToolhelp32Snapshot` /
+/// `Process32FirstW` / `Process32NextW` sequence exists exactly once. `visit`
+/// only selects a candidate; the caller then reads that candidate's image
+/// through `inspect_process_identity` (crate-private), this crate's one
+/// per-process image read.
+///
+/// # Errors
+///
+/// Returns an adapter error when the process snapshot cannot be taken, or when
+/// the enumeration ends in anything other than the clean `ERROR_NO_MORE_FILES`
+/// end of the list.
+#[cfg(windows)]
+fn observe_running_processes(
+    mut visit: impl FnMut(u32, &str) -> bool,
+) -> Result<(), WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: CreateToolhelp32Snapshot enumerates processes with TH32CS_SNAPPROCESS; flags constant;
+    // return compared against INVALID_HANDLE_VALUE; snapshot closed via CloseHandle on every path;
+    // handle stays on this thread until close.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(last_windows_adapter_error());
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        ..Default::default()
+    };
+    // `0` is this walk's own "the visitor ended the enumeration" marker; the
+    // only other accepted terminal value is the clean end-of-list code.
+    let mut terminal_error = 0_u32;
+    // SAFETY: Process32FirstW receives the live snapshot handle and a writable PROCESSENTRY32W with
+    // dwSize set; entry buffer pinned and outlives the call; snapshot stays open; return selects the
+    // enumeration path.
+    if unsafe { Process32FirstW(snapshot, &raw mut entry) } == 0 {
+        // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+        // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+        // dereference.
+        terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    } else {
+        loop {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+            if visit(entry.th32ProcessID, &name) {
+                break;
+            }
+            // SAFETY: Process32NextW advances the enumeration into the same caller-owned PROCESSENTRY32W
+            // whose dwSize was set for this snapshot; buffer outlives the call; snapshot handle stays open
+            // and is closed exactly once below; return value only selects the loop's exit.
+            if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
+                // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
+                // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
+                // dereference.
+                terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                break;
+            }
+        }
+    }
+    // SAFETY: CloseHandle closes an owned live handle exactly once on this path; handle originated from
+    // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
+    // OwnershipUncertain; no double close and no use after close.
+    unsafe { CloseHandle(snapshot) };
+    if terminal_error == 0 || terminal_error == ERROR_NO_MORE_FILES {
+        Ok(())
+    } else {
+        let error_code = i32::try_from(terminal_error).unwrap_or(i32::MAX);
+        let error = std::io::Error::from_raw_os_error(error_code);
+        Err(windows_adapter_from_io(&error))
     }
 }
 

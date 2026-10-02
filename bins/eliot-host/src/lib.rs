@@ -35,6 +35,15 @@ mod host_composition_validation;
 /// own serialized turns, never a second copy.
 pub mod host_diagnostics;
 mod host_job_launch;
+/// Explicit Host control-pipe principal contour and the EXPLICIT allowed
+/// inherited-environment set of a Host child launch (issue #1888, I1.6
+/// "named pipes use explicit ACLs" and "models and third-party Modules do not
+/// inherit secrets by default").
+///
+/// Registered here in the same delivery that adds `src/host_pipe_acl.rs`; an
+/// unregistered module is not a completion, and without this the Host child
+/// launch below would keep running the denylist it replaces.
+mod host_pipe_acl;
 /// Authenticated Kernel ORS introduction readback for cutover evidence
 /// (issue #961, F-AUR-1).
 #[cfg(windows)]
@@ -1806,8 +1815,8 @@ pub enum HostError {
 
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, PinnedRuntimeFile, ProcessIdentity, RunningJobChild, WindowsAdapterError,
-    observe_named_pipe_peer_process,
+    JobObjectIdentity, OuterKillDomain, PinnedRuntimeFile, ProcessIdentity, RunningJobChild,
+    WindowsAdapterError, observe_named_pipe_peer_process,
 };
 
 // I16.10 (issue #1837): the last entry carries the installer-owned Watchdog
@@ -2176,6 +2185,16 @@ pub(crate) struct HostJobBranches {
     store: Option<RunningJobChild<PlatformHandle>>,
     kernel_identity: JobObjectIdentity,
     store_identity: JobObjectIdentity,
+    /// The Host-owned Watchdog outer kill domain Job Object identity.
+    ///
+    /// `I1.6` requires that "Watchdog and Kernel do not share a child-kill
+    /// domain". The Watchdog is SCM-started rather than Host-spawned, so this
+    /// identity is the durable outer boundary the Watchdog branch is bound to
+    /// and is minted from [`OuterKillDomain::Watchdog`], the owner identity
+    /// that names it. It is a distinct object-manager name from
+    /// `kernel_identity`, so `CreateJobObjectW` cannot hand both branches the
+    /// same kill domain.
+    watchdog_identity: JobObjectIdentity,
     kernel_launch_binding: Option<KernelLaunchBinding>,
     kernel_executable: Option<PathBuf>,
     store_bridge_executable: Option<PathBuf>,
@@ -2560,13 +2579,15 @@ impl HostJobBranches {
         self.agent_bridge_admission = descriptor;
     }
 
-    /// Creates two owner-scoped Job identities.  The actual Job handles are
-    /// created only by the approved suspended launch below; there is no
-    /// unbound PID assignment path.
+    /// Creates three owner-scoped Job identities.  The actual Kernel and Store
+    /// Job handles are created only by the approved suspended launch below;
+    /// there is no unbound PID assignment path.  The Watchdog identity names
+    /// the Watchdog branch's own outer kill domain Job Object, which the
+    /// SCM-started Watchdog branch is bound to and which is never the Kernel's.
     ///
     /// # Errors
     ///
-    /// Returns an error if either owner-scoped Job identity is invalid.
+    /// Returns an error if any owner-scoped Job identity is invalid.
     pub fn new(host: &HostInstallationEpoch) -> Result<Self, WindowsAdapterError> {
         // F-LOG-HOST-1: phase only; the outermost `open` guard owns the single
         // terminal for this contour. Liveness is not readiness here.
@@ -2578,6 +2599,16 @@ impl HostJobBranches {
         );
         let kernel_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?;
         let store_identity = JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?;
+        // I1.6: the Watchdog outer kill domain is a third, distinct Host-owned
+        // Job Object identity. Its name is minted from the owner that defines
+        // it (`OuterKillDomain::Watchdog::host_job_name_prefix`) rather than a
+        // literal here, so the Watchdog branch and the Kernel branch can never
+        // resolve to the same object-manager name and therefore can never share
+        // one child-kill domain.
+        let watchdog_identity = JobObjectIdentity::new(format!(
+            "{}{suffix}",
+            OuterKillDomain::Watchdog.host_job_name_prefix()
+        ))?;
         let kernel_launch_binding = KernelLaunchBinding::observe_current()?;
         host_lifecycle_observe_requested(BOUNDARY_JOBS_ADMITTED);
         Ok(Self {
@@ -2585,6 +2616,7 @@ impl HostJobBranches {
             store: None,
             kernel_identity,
             store_identity,
+            watchdog_identity,
             kernel_launch_binding: Some(kernel_launch_binding),
             kernel_executable: None,
             store_bridge_executable: None,
@@ -2654,6 +2686,13 @@ impl HostJobBranches {
             store: None,
             kernel_identity: JobObjectIdentity::new(format!("Local\\Eliot-Host-Kernel-{suffix}"))?,
             store_identity: JobObjectIdentity::new(format!("Local\\Eliot-Host-Store-{suffix}"))?,
+            // I1.6: same owner-minted third outer kill domain as the admitted
+            // constructor above; the fenced contour still binds the Watchdog
+            // branch to its own domain and never to the Kernel's.
+            watchdog_identity: JobObjectIdentity::new(format!(
+                "{}{suffix}",
+                OuterKillDomain::Watchdog.host_job_name_prefix()
+            ))?,
             kernel_launch_binding: None,
             kernel_executable: None,
             store_bridge_executable: None,
@@ -2701,25 +2740,17 @@ impl HostJobBranches {
     where
         I: IntoIterator<Item = (OsString, OsString)>,
     {
-        let mut environment = ambient
-            .into_iter()
-            .filter(|(key, _)| {
-                let key = key.to_string_lossy();
-                ![
-                    "ELIOT_APPROVED_GENERATION",
-                    "ELIOT_GENERATION_CONFIG_DIGEST",
-                    "ELIOT_APPROVED_ARTIFACT",
-                    "ELIOT_GENERATION_CONFIG_PATH",
-                    "ELIOT_HOST_INSTALLATION",
-                    "ELIOT_HOST_EPOCH",
-                    "ELIOT_ACTIVATION_NONCE",
-                    "ELIOT_JOB_OBJECT_ID",
-                ]
-                .into_iter()
-                .chain(KERNEL_BOOTSTRAP_ENVIRONMENT)
-                .any(|reserved| key.eq_ignore_ascii_case(reserved))
-            })
-            .collect::<Vec<_>>();
+        // Issue #1888 / I1.6 / AUD7: the child's ambient environment is an EXPLICIT
+        // ALLOWED SET, not the parent's environment minus a denylist. The
+        // allow-set (`host_pipe_acl::ALLOWED_INHERITED_ENVIRONMENT`, resolved by
+        // `inherited_environment`) reads exactly the names this Host admits and
+        // reads nothing else, so a name it does not name is absent BY
+        // CONSTRUCTION - it was never read - rather than subtracted after the
+        // child existed. Every value the Host mints for this launch is appended
+        // explicitly below and is never inherited: a bootstrap name or a
+        // provider key in the ambient environment no longer crosses into a
+        // Kernel, Store, or Watchdog child.
+        let mut environment = host_pipe_acl::inherited_environment(ambient);
         environment.extend([
             (
                 OsString::from("ELIOT_APPROVED_GENERATION"),
@@ -5249,6 +5280,17 @@ impl HostJobBranches {
         self.store_identity.name()
     }
 
+    /// Returns the durable mechanics identity of the independent Watchdog
+    /// branch.
+    ///
+    /// `I1.6`: the Watchdog branch's outer kill domain is its own Job Object,
+    /// distinct from the Kernel branch's, so neither launcher can attach a
+    /// child to the other's kill domain.
+    #[must_use]
+    pub fn watchdog_name(&self) -> &str {
+        self.watchdog_identity.name()
+    }
+
     #[must_use]
     pub fn kernel_process(&self) -> Option<&ProcessIdentity> {
         self.kernel.as_ref().map(|child| child.evidence().process())
@@ -5535,6 +5577,16 @@ struct WatchdogStartRecoveryCarrier {
     registration: ServiceRegistrationRequest,
     platform_root: PathBuf,
     heartbeat_state_root: PathBuf,
+    /// The Host-owned Watchdog outer kill domain Job Object identity this
+    /// Watchdog branch start is bound to.
+    ///
+    /// `I1.6` requires that "Watchdog and Kernel do not share a child-kill
+    /// domain". The Watchdog is SCM-started, so this identity is the branch's
+    /// durable outer boundary: it is minted from [`OuterKillDomain::Watchdog`]
+    /// and is a different object-manager name from the Kernel branch's outer
+    /// Job Object, so neither launcher can attach a child to the other's kill
+    /// domain. Reconciliation refuses a carrier bound to another contour.
+    watchdog_job_identity: JobObjectIdentity,
     issued_descriptor: watchdog_heartbeat::HeartbeatTransportDescriptor,
     initial_stopped_without_process: bool,
     descriptor_published: bool,
@@ -9517,10 +9569,26 @@ impl HostComposition {
             heartbeat_bootstrap.installation_id(),
             heartbeat_bootstrap.transaction_plan_generation(),
         )?;
+        // Issue #1888 (I1.6): the Watchdog branch is bound to the Host-owned
+        // Watchdog outer kill domain, which is a Job Object distinct from the
+        // Kernel branch's. Binding the SCM-started branch to its own domain
+        // here is what makes "Watchdog and Kernel do not share a child-kill
+        // domain" an actual Job-topology fact rather than a name: `OuterKillDomain`
+        // resolves a Job Object's owner from its durable name, and the two
+        // branches present different names, so `CreateJobObjectW` can never
+        // hand both branches one kill domain. A name that is not the Watchdog
+        // outer domain refuses this start before SCM is asked to start anything.
+        let watchdog_job_identity = self.jobs.watchdog_identity.clone();
+        if !watchdog_job_identity.is_host_outer_kill_domain_name() {
+            return Err(HostError::ProcessContour(
+                "Watchdog branch is not bound to a Host-owned outer kill domain".to_owned(),
+            ));
+        }
         self.watchdog_start_recovery = Some(WatchdogStartRecoveryCarrier {
             registration: registration.clone(),
             platform_root: PathBuf::from(launch.kernel_work_root.as_str()),
             heartbeat_state_root: heartbeat_state_root.to_path_buf(),
+            watchdog_job_identity,
             issued_descriptor: heartbeat_issued.clone(),
             initial_stopped_without_process,
             // Publishing is an externally visible atomic replacement. Mark
@@ -9618,18 +9686,89 @@ impl HostComposition {
                         .to_owned(),
                 ));
             }
+            // Issue #1888 (I1.6): the carrier must name the Watchdog branch's
+            // own Host-owned outer kill domain. A carrier bound to the Kernel
+            // domain's Job Object would let Watchdog reconciliation stop a
+            // process in the Kernel's kill domain, so it is refused before any
+            // SCM stop is issued.
+            if carrier.watchdog_job_identity != self.jobs.watchdog_identity
+                || !carrier
+                    .watchdog_job_identity
+                    .is_host_outer_kill_domain_name()
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Watchdog start carrier is not bound to the Host-owned Watchdog outer kill domain"
+                        .to_owned(),
+                ));
+            }
         }
 
         let platform = WindowsPlatform::new(platform_root)
             .map_err(|error| HostError::Platform(error.to_string()))?;
-        let mut stopped_process = None;
-        match platform.inspect_service_registration_runtime(&registration) {
+        let stopped_process = self.stop_bound_watchdog_start_peer(
+            &platform,
+            &registration,
+            &heartbeat_state_root,
+            carrier.as_ref(),
+        )?;
+
+        if stopped_process.is_some() {
+            match platform.inspect_service_registration_runtime(&registration) {
+                ServiceRegistrationRuntimeInspection::Matching { observation }
+                    if observation.is_stopped() && observation.process().is_none() => {}
+                _ => {
+                    return Err(HostError::RecoveryRequired(
+                        "Watchdog stop lacks exact stopped/no-process readback".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(carrier) = carrier.as_ref() {
+            watchdog_heartbeat::remove_start_artifacts_exact(
+                &heartbeat_state_root,
+                &carrier.issued_descriptor,
+                stopped_process,
+            )?;
+            self.watchdog_start_recovery = None;
+        } else {
+            watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;
+        }
+        Ok(())
+    }
+
+    /// Stops the exact heartbeat-bound start peer, and only that peer.
+    ///
+    /// Extracted from [`Self::reconcile_watchdog_start_bound`] so the SCM state
+    /// classification and its stop step read on their own. Every refusal below is
+    /// the refusal that call site made, at the same site and with the same
+    /// message: the reconciliation guard has already proved the carrier names the
+    /// Host-owned Watchdog outer kill domain before this step is reached, so
+    /// nothing here widens what a rollback may stop.
+    ///
+    /// `Ok(None)` means nothing was stopped: the registration was already
+    /// exactly stopped with no process, which is the only state that needs no
+    /// post-stop readback. `Ok(Some((pid, start_time)))` is the process this step
+    /// stopped, and every other observed state is refused rather than treated as
+    /// a safe abort boundary.
+    #[cfg(windows)]
+    fn stop_bound_watchdog_start_peer(
+        &self,
+        platform: &WindowsPlatform,
+        registration: &ServiceRegistrationRequest,
+        heartbeat_state_root: &Path,
+        carrier: Option<&WatchdogStartRecoveryCarrier>,
+    ) -> Result<Option<(u32, u64)>, HostError> {
+        match platform.inspect_service_registration_runtime(registration) {
             ServiceRegistrationRuntimeInspection::Matching { observation }
-                if observation.is_stopped() && observation.process().is_none() => {}
+                if observation.is_stopped() && observation.process().is_none() =>
+            {
+                Ok(None)
+            }
             ServiceRegistrationRuntimeInspection::Matching { observation }
                 if observation.is_running() =>
             {
-                let Some(carrier) = carrier.as_ref() else {
+                let Some(carrier) = carrier else {
                     return Err(HostError::RecoveryRequired(
                         "Watchdog is Running without an operation-bound start carrier".to_owned(),
                     ));
@@ -9646,13 +9785,13 @@ impl HostComposition {
                     )
                 })?;
                 let current_descriptor =
-                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(&heartbeat_state_root)?
+                    watchdog_heartbeat::HeartbeatTransportDescriptor::load(heartbeat_state_root)?
                         .ok_or_else(|| {
-                            HostError::RecoveryRequired(
-                                "Running Watchdog has no heartbeat descriptor for rollback binding"
-                                    .to_owned(),
-                            )
-                        })?;
+                        HostError::RecoveryRequired(
+                            "Running Watchdog has no heartbeat descriptor for rollback binding"
+                                .to_owned(),
+                        )
+                    })?;
                 if current_descriptor.pipe_name != carrier.issued_descriptor.pipe_name
                     || current_descriptor.host_challenge_nonce
                         != carrier.issued_descriptor.host_challenge_nonce
@@ -9687,58 +9826,30 @@ impl HostComposition {
                 {
                     ServiceStopOutcome::Stopped { .. }
                     | ServiceStopOutcome::AlreadyStopped { .. } => {
-                        stopped_process = Some((process.process_id, process.start_time_100ns));
+                        Ok(Some((process.process_id, process.start_time_100ns)))
                     }
                     ServiceStopOutcome::AlreadyStopping { .. }
-                    | ServiceStopOutcome::EffectUnknown => {
-                        return Err(HostError::RecoveryRequired(
-                            "Watchdog stop outcome is not durably known".to_owned(),
-                        ));
-                    }
+                    | ServiceStopOutcome::EffectUnknown => Err(HostError::RecoveryRequired(
+                        "Watchdog stop outcome is not durably known".to_owned(),
+                    )),
                 }
             }
             ServiceRegistrationRuntimeInspection::Matching { observation } => {
-                return Err(HostError::RecoveryRequired(format!(
+                Err(HostError::RecoveryRequired(format!(
                     "Watchdog SCM state {:?} is not a safe abort boundary",
                     observation.state()
-                )));
+                )))
             }
-            ServiceRegistrationRuntimeInspection::Absent => {
-                return Err(HostError::RecoveryRequired(
-                    "Watchdog registration is absent during start rollback".to_owned(),
-                ));
-            }
+            ServiceRegistrationRuntimeInspection::Absent => Err(HostError::RecoveryRequired(
+                "Watchdog registration is absent during start rollback".to_owned(),
+            )),
             ServiceRegistrationRuntimeInspection::Mismatched
             | ServiceRegistrationRuntimeInspection::Unknown { .. } => {
-                return Err(HostError::RecoveryRequired(
+                Err(HostError::RecoveryRequired(
                     "Watchdog registration cannot be authoritatively reconciled".to_owned(),
-                ));
+                ))
             }
         }
-
-        if stopped_process.is_some() {
-            match platform.inspect_service_registration_runtime(&registration) {
-                ServiceRegistrationRuntimeInspection::Matching { observation }
-                    if observation.is_stopped() && observation.process().is_none() => {}
-                _ => {
-                    return Err(HostError::RecoveryRequired(
-                        "Watchdog stop lacks exact stopped/no-process readback".to_owned(),
-                    ));
-                }
-            }
-        }
-
-        if let Some(carrier) = carrier.as_ref() {
-            watchdog_heartbeat::remove_start_artifacts_exact(
-                &heartbeat_state_root,
-                &carrier.issued_descriptor,
-                stopped_process,
-            )?;
-            self.watchdog_start_recovery = None;
-        } else {
-            watchdog_heartbeat::require_no_start_artifacts(&heartbeat_state_root)?;
-        }
-        Ok(())
     }
 
     /// Reconciles every Watchdog effect before the first-install registry
@@ -11052,8 +11163,14 @@ impl HostComposition {
                 ),
                 owner: "windows-scm (independent sibling; Host requests start/stop only and owns neither the Job Object nor a kill-on-close handle, I1.2)"
                     .to_owned(),
-                job: "none (Watchdog is never inside a Host Job; a Host crash does not terminate it, I1.2)"
-                    .to_owned(),
+                // Issue #1888 (I1.6): the Watchdog branch is inside the
+                // Host-owned Watchdog outer Job Object, which is a distinct
+                // outer kill domain from the Kernel branch's, so closing the
+                // Kernel outer Job Object cannot kill the Watchdog.
+                job: format!(
+                    "{} (Host-owned Watchdog outer kill domain; distinct from the Kernel outer Job Object, I1.6)",
+                    self.jobs.watchdog_name()
+                ),
                 journal_or_root: format!("watchdog-state-root={}", roots.watchdog_state_root.as_str()),
                 generation: generation.clone(),
                 restart_policy: "independent SCM service policy (installer-owned; separate identity and budget, A13.2)"

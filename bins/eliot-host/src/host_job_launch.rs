@@ -28,9 +28,10 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
-    observe_loopback_tcp_listener_owner,
+    JobObjectIdentity, JobObjectLimits, OuterKillDomain, PinnedRuntimeFile, RunningJobChild,
+    SuspendedJobChild, SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
+    WindowsAdapterError, observe_loopback_tcp_listener_owner,
+    observe_named_pipe_peer_process_in_job, observe_running_eliot_watchdog_process,
     profile_supervision::{
         ProfileRootPaths, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
     },
@@ -616,6 +617,129 @@ pub(super) fn kernel_arguments_with_doctor_anchor(
     Ok(injected)
 }
 
+/// Resolves the Host-owned outer kill domain that owns one presented branch
+/// Job Object name, and refuses the independent Watchdog domain.
+///
+/// `I1.6` states that "Watchdog and Kernel do not share a child-kill domain" and
+/// that "the process tree receives kill-on-close at its outer ownership
+/// boundary". The owner is a total function of the durable name
+/// ([`OuterKillDomain::owns_host_job_name`]), so the branch the Host is about to
+/// create is exactly the domain its name resolves to — this is the direction
+/// decision, not a label check.
+///
+/// The Watchdog domain is refused here for the reason the audit item gives
+/// (`AUD2`, issue #1888): the Watchdog branch is SCM-started and Host/SCM-owned,
+/// so it is never a child of a Host Job launch. A branch launch that resolved
+/// to the Watchdog domain would place the Kernel or Store child inside the
+/// independent Watchdog kill tree, which is the nesting direction
+/// `AUD2` forbids — "Never adopt Watchdog into the Kernel kill tree".
+///
+/// # Errors
+///
+/// Returns [`HostError::ProcessContour`] when the presented name is not a
+/// Host-owned outer kill domain name, or when it is the independent Watchdog
+/// outer kill domain.
+#[cfg(windows)]
+fn branch_outer_kill_domain(identity: &JobObjectIdentity) -> Result<OuterKillDomain, HostError> {
+    let domain = [
+        OuterKillDomain::Kernel,
+        OuterKillDomain::Store,
+        OuterKillDomain::Watchdog,
+    ]
+    .into_iter()
+    .find(|domain| domain.owns_host_job_name(identity.name()))
+    // A per-generation/per-attempt nested Job Object name is not an outer kill
+    // domain at all: `I1.6` puts kill-on-close at the outer ownership boundary,
+    // so a Host branch root may never be a nested name.
+    .ok_or_else(|| {
+        // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+        host_launch_observe("host.launch typed rejection");
+        HostError::ProcessContour(
+            "branch Job Object is not a Host-owned outer kill domain".to_owned(),
+        )
+    })?;
+    if domain == OuterKillDomain::Watchdog {
+        // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+        host_launch_observe("host.launch typed rejection");
+        return Err(HostError::ProcessContour(
+            "a Host branch child may not be created inside the independent Host/SCM Watchdog kill domain"
+                .to_owned(),
+        ));
+    }
+    Ok(domain)
+}
+
+/// Proves on the live kernel that the running SCM Watchdog is NOT inside the
+/// outer kill domain this branch launch just created.
+///
+/// `AUD2` (issue #1888) requires the direction, not the names: "Keep the
+/// independent Host/SCM Watchdog branch; Kernel consumes its Host-issued outer
+/// binding and may create only the delegated nested module/attempt domain.
+/// Never adopt Watchdog into the Kernel kill tree." The guarantee that matters
+/// is that the Watchdog survives closing the Kernel outer Job Object, which is
+/// a statement about live Job membership, not about which name a launcher
+/// presented. Two different prefixes would still describe two objects, so only
+/// the live member list can decide it.
+///
+/// This runs after the outer Job Object has been created and the child has been
+/// assigned to it, while the child is still suspended, and therefore before
+/// [`SuspendedJobChild::resume`]. A refusal here leaves a suspended, assigned,
+/// never-resumed child that the platform's own pre-resume cleanup terminates,
+/// so nothing admitted under the Kernel kill tree is ever running.
+///
+/// The Watchdog's own process is the real observation: `observe_running_eliot_
+/// watchdog_process` reads the live SCM service PID, start time and image
+/// rather than trusting a name. `observe_named_pipe_peer_process_in_job` opens
+/// this exact outer Job Object by name and reads its live member list, so
+/// `Ok` means the Watchdog really is inside the branch kill tree and `Err(..)`
+/// with `IdentityMismatch` means it really is outside it.
+///
+/// A Watchdog that is not running is not contamination: there is no Watchdog
+/// process to be inside any tree, so the affected launch is admitted and the
+/// independent Watchdog/control path is never blocked by this check (issue
+/// #1888 workset item 5). A Job Object that cannot be opened or read at all is
+/// refused instead, because an unreadable membership list proves nothing about
+/// the direction.
+///
+/// # Errors
+///
+/// Returns [`HostError::ProcessContour`] when the live Watchdog process is a
+/// member of this branch's outer Job Object, or when membership could not be
+/// read.
+#[cfg(windows)]
+fn require_watchdog_outside_branch_kill_tree(
+    identity: &JobObjectIdentity,
+    domain: OuterKillDomain,
+) -> Result<(), HostError> {
+    let watchdog = match observe_running_eliot_watchdog_process() {
+        Ok(watchdog) => watchdog,
+        // No live SCM Watchdog process exists, so there is nothing that could
+        // be inside this branch's kill tree. This is a clean absence, not a
+        // degraded read, and it must not block the Kernel/Store launch.
+        Err(_) => {
+            host_launch_observe("host.launch branch kill tree free of Watchdog");
+            return Ok(());
+        }
+    };
+    match observe_named_pipe_peer_process_in_job(identity.name(), watchdog.process_id()) {
+        // The Watchdog really is inside the outer Job Object this launch just
+        // created. Admitting it would put the independent Watchdog branch in the
+        // Kernel/Store kill tree, so the launch is refused before resume.
+        Ok(_) => Err(HostError::ProcessContour(format!(
+            "the running SCM Watchdog process is inside the Host-owned {domain:?} outer kill domain Job Object; the independent Watchdog branch may not be adopted into a Kernel or Store kill tree"
+        ))),
+        // Proven outside: the live member list of this exact Job Object does not
+        // hold the Watchdog PID, so closing this Job Object cannot kill it.
+        Err(WindowsAdapterError::IdentityMismatch) => {
+            host_launch_observe("host.launch branch kill tree free of Watchdog");
+            Ok(())
+        }
+        Err(error) => Err(HostError::ProcessContour(format!(
+            "membership of the Host-owned {domain:?} outer kill domain Job Object could not be read ({error}); the direction between this branch and the independent Watchdog branch is unproven"
+        ))),
+    }
+}
+
 #[cfg(windows)]
 impl HostJobBranches {
     #[allow(
@@ -820,13 +944,13 @@ impl HostJobBranches {
         // `JobObjectLimits::default()` installs no CPU, memory, or process
         // ceiling: this branch root carries no admitted manifest limit, and the
         // launch must not invent one.
-        if !identity.is_host_outer_kill_domain_name() {
-            // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
-            host_launch_observe("host.launch typed rejection");
-            return Err(HostError::ProcessContour(
-                "branch Job Object is not a Host-owned outer kill domain".to_owned(),
-            ));
-        }
+        //
+        // AUD2 (issue #1888): resolving the owner domain here, instead of only
+        // asking whether the name is *some* outer kill domain, is what makes the
+        // direction a decision rather than a label. The independent Watchdog
+        // domain is refused outright, so no Host-spawned branch child — Kernel
+        // or Store — can be created inside the Host/SCM Watchdog kill tree.
+        let outer_kill_domain = branch_outer_kill_domain(identity)?;
         // Issue #1685: the requested approved limits travel through the #1888
         // outer-kill-domain constructor and are bound to the observed enforced
         // limits while still suspended; a divergence rejects the candidate
@@ -843,6 +967,15 @@ impl HostJobBranches {
             host_launch_observe("host.launch typed rejection");
             HostError::ProcessContour(error.to_string())
         })?;
+        // AUD2 (issue #1888), the load-bearing half. Names alone cannot show
+        // that the Watchdog survives this kill tree: the outer Job Object now
+        // exists and holds the still-suspended child, so this reads the live
+        // member list of that exact object and compares it against the live SCM
+        // Watchdog process. A Watchdog found inside is a refusal; a Watchdog
+        // proven outside is the documented guarantee. This runs before
+        // `validate`/`resume`, so nothing is resumed under a kill tree that has
+        // adopted the Watchdog.
+        require_watchdog_outside_branch_kill_tree(identity, outer_kill_domain)?;
         let expected = executable;
         let validated = child
             .validate(|evidence| {
@@ -1706,6 +1839,87 @@ mod approved_path_tests {
         assert!(
             reason.to_lowercase().contains("doctor"),
             "missing-role error must name the doctor role, got: {reason}"
+        );
+    }
+}
+
+/// AUD2 (issue #1888) kill-tree DIRECTION: the branch a Host launch presents
+/// must resolve to its own Host-owned outer kill domain, and the independent
+/// Host/SCM Watchdog domain is never a branch launch target. Names only — no
+/// process is spawned and no Job Object is created; the live direction proof
+/// (`require_watchdog_outside_branch_kill_tree`) reads the real SCM Watchdog
+/// process and the real member list and is exercised on the reachable
+/// `HostJobBranches::launch` path.
+#[cfg(all(test, windows))]
+mod outer_kill_tree_direction_tests {
+    use super::branch_outer_kill_domain;
+    use crate::HostError;
+    use eliot_platform_windows::{JobObjectIdentity, OuterKillDomain};
+
+    const KERNEL_JOB: &str = "Local\\Eliot-Host-Kernel-lineage-7";
+    const STORE_JOB: &str = "Local\\Eliot-Host-Store-lineage-7";
+    const WATCHDOG_JOB: &str = "Local\\Eliot-Host-Watchdog-lineage-7";
+
+    fn identity(name: &str) -> JobObjectIdentity {
+        JobObjectIdentity::new(name.to_owned())
+            .unwrap_or_else(|error| panic!("test Job Object name is invalid: {error}"))
+    }
+
+    fn contour_rejected(result: Result<OuterKillDomain, HostError>, expected: &str) {
+        let Err(HostError::ProcessContour(reason)) = result else {
+            panic!("a refused kill-tree direction was admitted");
+        };
+        assert!(
+            reason.contains(expected),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    /// Positive case: each Host-spawned branch resolves to its OWN outer kill
+    /// domain, and the two branches resolve to different domains. This is the
+    /// `I1.6` fact "Watchdog and Kernel do not share a child-kill domain" as a
+    /// per-launch decision rather than as two literals that happen to differ.
+    #[test]
+    fn admits_each_branch_into_its_own_outer_kill_domain() {
+        let kernel = branch_outer_kill_domain(&identity(KERNEL_JOB));
+        let store = branch_outer_kill_domain(&identity(STORE_JOB));
+        assert_eq!(
+            kernel.unwrap_or_else(|error| panic!("Kernel: {error}")),
+            OuterKillDomain::Kernel
+        );
+        assert_eq!(
+            store.unwrap_or_else(|error| panic!("Store: {error}")),
+            OuterKillDomain::Store
+        );
+        assert_ne!(
+            OuterKillDomain::Kernel,
+            OuterKillDomain::Store,
+            "the Kernel and Store branches must not resolve to one kill domain"
+        );
+    }
+
+    /// Refusal case (clause (c), the nesting direction): a Host branch launch
+    /// that presents the independent Host/SCM Watchdog outer kill domain is
+    /// refused. Admitting it would create the Kernel or Store child INSIDE the
+    /// Watchdog kill tree, so closing the Watchdog Job would kill the Kernel —
+    /// and, for the Kernel launch, the reverse of "Never adopt Watchdog into
+    /// the Kernel kill tree" would be established instead.
+    #[test]
+    fn refuses_the_independent_watchdog_kill_domain() {
+        contour_rejected(
+            branch_outer_kill_domain(&identity(WATCHDOG_JOB)),
+            "may not be created inside the independent Host/SCM Watchdog kill domain",
+        );
+    }
+
+    /// Refusal case: a per-generation/per-attempt nested Job Object name is not
+    /// an outer kill domain, so it can never be a Host branch root. `I1.6` puts
+    /// kill-on-close at the outer ownership boundary.
+    #[test]
+    fn refuses_a_nested_per_attempt_name_as_a_branch_root() {
+        contour_rejected(
+            branch_outer_kill_domain(&identity("Local\\Eliot-P04-1234-9")),
+            "is not a Host-owned outer kill domain",
         );
     }
 }

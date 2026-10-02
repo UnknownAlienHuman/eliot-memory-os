@@ -56,6 +56,7 @@ fn launch_environment(
     Ok(HostJobBranches::environment_from(
         [
             (OsString::from("Path"), OsString::from(r"C:\\Windows")),
+            (OsString::from("SystemRoot"), OsString::from(r"C:\\Windows")),
             (
                 OsString::from("eliot_kernel_control_pipe"),
                 OsString::from("ambient-pipe"),
@@ -95,6 +96,10 @@ fn launch_environment(
             (
                 OsString::from("ELIOT_ACTIVATION_NONCE"),
                 OsString::from("must-not-cross-process-boundary"),
+            ),
+            (
+                OsString::from("ELIOT_MODULE_API_KEY"),
+                OsString::from("third-party-module-secret"),
             ),
         ],
         &host,
@@ -160,14 +165,22 @@ fn kill_on_close_crash_fence_is_operation_specific_and_never_positive_attach() -
 #[test]
 fn store_and_unrelated_child_environment_scrubs_kernel_bootstrap_authority() -> TestResult {
     let environment = launch_environment(None)?;
+    // Issue #1888 / I1.6 / AUD7: the child's environment is an EXPLICIT
+    // ALLOWED SET. `SystemRoot` is named in the Host allow-set and therefore
+    // resolves; `Path` is NOT named, so it is absent because it was never
+    // read — not because it was subtracted after the fact.
     assert_eq!(
-        environment.get("Path").map(String::as_str),
+        environment.get("SystemRoot").map(String::as_str),
         Some(r"C:\\Windows")
     );
+    assert!(!environment.contains_key("Path"));
     for name in KERNEL_BOOTSTRAP_ENVIRONMENT {
         assert!(!environment.keys().any(|key| key.eq_ignore_ascii_case(name)));
     }
     assert!(!environment.contains_key("ELIOT_ACTIVATION_NONCE"));
+    // Default-deny secret inheritance: a secret-like ambient name the allow-set
+    // does not name never reaches a Store or unrelated child.
+    assert!(!environment.contains_key("ELIOT_MODULE_API_KEY"));
     Ok(())
 }
 

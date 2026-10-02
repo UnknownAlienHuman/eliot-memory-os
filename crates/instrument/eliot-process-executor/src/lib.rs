@@ -44,6 +44,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
+use crate::launch_tuple::ValidatedLaunchTuple;
+#[cfg(windows)]
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, RecoverableJobBinding, RunningJobChild,
     RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
@@ -55,6 +57,25 @@ type KernelOuterJobBinding = RecoverableJobBinding;
 #[cfg(not(windows))]
 type KernelOuterJobBinding = ();
 
+/// The outer kill domain one launch must prove before a child exists.
+///
+/// Every production launch carries the exact Host-owned Kernel outer Job
+/// binding its owner retained for that call ([`Self::Proven`]). No production
+/// path can construct anything else, so `start_inner` has no way to reach the
+/// unproven `spawn_named_with_limits` shape (a fresh per-attempt Job with no
+/// proven outer membership) outside a test build. `Unproven` is the test-only
+/// injectable seam: it is not compiled into a non-test build, so the
+/// distinction is structural rather than a runtime flag that some constructor
+/// could switch off (issue #1888 / AUD5: a test-only injectable port must not
+/// become a production escape hatch).
+enum LaunchOuterJobBinding {
+    /// The exact Host Kernel Job binding this launch proved to its owner.
+    Proven(KernelOuterJobBinding),
+    /// Test-only: launch without a proven outer Job membership.
+    #[cfg(test)]
+    Unproven,
+}
+
 /// WASM P-03 process adapter: the owner-blessed A-12 port implementation.
 /// See [`wasm_p03_adapter`] for the authority stance and proof entrypoint.
 pub mod wasm_p03_adapter;
@@ -62,6 +83,12 @@ pub mod wasm_p03_adapter;
 /// Outer Host/OS guardian scenario checks for `ProcessExecutor`
 /// self-changes (I18.31 special case).
 pub mod outer_guardian;
+
+/// Issue #1888 / AUD3: the one validated launch tuple carried through the
+/// executor handoff and re-checked against the live suspended child at the
+/// platform effect boundary, before resume.
+#[cfg(windows)]
+pub mod launch_tuple;
 
 const DEFAULT_CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 const EVIDENCE_PREVIEW_CEILING: usize = 16 * 1024 * 1024;
@@ -1487,10 +1514,22 @@ pub struct ExecutorHealthSummary {
 pub struct WindowsProcessExecutor {
     authority: Arc<dyn DispatchValidationPort>,
     launch_admission: Option<Arc<dyn ProcessLaunchAdmission>>,
-    kernel_outer_binding_required: bool,
     stream_sink: Option<Arc<dyn ProcessStreamSinkClient>>,
     operations: Mutex<BTreeMap<OperationId, Arc<Mutex<Operation>>>>,
     reservations: Mutex<std::collections::BTreeSet<OperationId>>,
+    /// Issue #1888 / AUD4: exact pre-resume refusals, keyed by the SAME
+    /// attempt identity that reserved them.
+    ///
+    /// A pre-resume failure terminates the still-suspended child inside the
+    /// platform layer, so no `Operation` can be built for it (there is no
+    /// `ValidatedDispatch` and no running child to own). Dropping that outcome
+    /// would leave the caller with a bare error and nothing to read back, which
+    /// is exactly the "records nothing observable" shape AUD4 forbids. Each such
+    /// refusal is therefore retained here under the same `OperationId`, so
+    /// `pre_resume_refusal` reports what was terminated-or-unknown and under
+    /// which attempt. Entries are inert once written: no child handle, Job, or
+    /// watcher is owned here, and the record carries no new effect authority.
+    pre_resume: Mutex<BTreeMap<OperationId, PreResumeRefusal>>,
     capture_limit: usize,
 }
 
@@ -1507,24 +1546,190 @@ impl Drop for OperationReservation<'_> {
     }
 }
 
+/// Issue #1888 / AUD4: what a pre-resume refusal left behind, recorded under
+/// the attempt identity that reserved it.
+///
+/// The two recovery classes are different in kind, and this type is where that
+/// difference is kept rather than collapsed into one catch-all:
+/// * pre-resume (`[PreResumeChildOutcome::Terminated]`) — creation and Job
+///   assignment happened, resume did not. The platform terminated and reaped
+///   the still-suspended child, so the child was OBSERVED terminated and no
+///   effect can have happened;
+/// * pre-resume (`[PreResumeChildOutcome::Unknown]`) — the platform could NOT
+///   observe that termination (it returns `WindowsAdapterError::Timeout`). The
+///   child is terminated-or-unknown, and the typed `UnknownOutcome` return
+///   keeps this attempt's record available for reconciliation rather than
+///   releasing it.
+///
+/// A post-resume evidence/persistence failure is NOT represented here: it has
+/// its own `Operation`, already registered, and is projected through
+/// [`QuarantinedOperationRecord::recovery_action`] as possible-effect recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreResumeChildOutcome {
+    /// The still-suspended child was terminated and observed terminated/reaped.
+    Terminated,
+    /// The platform could not observe that the still-suspended child was
+    /// terminated; the attempt is retained for reconciliation.
+    Unknown,
+}
+
+impl PreResumeChildOutcome {
+    /// Stable label naming the observed state of the refused child.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminated => "terminated-observed",
+            Self::Unknown => "terminated-unknown",
+        }
+    }
+}
+
+/// Issue #1888 / AUD4: the caller's own attempt lineage, captured from the
+/// `ProcessRequest` before that request is consumed by the authority port.
+///
+/// These are the identities the caller itself supplied, so a refusal recorded
+/// against them is by construction the SAME attempt that was launched — not a
+/// fresh identity minted for the cleanup.
+struct PreResumeAttemptLineage {
+    operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+}
+
+/// Issue #1888 / AUD4: one retained pre-resume refusal, bound to the SAME
+/// attempt identity that was reserved for the launch.
+///
+/// `Clone` (not `Copy`): the lineage ids are validated opaque contract types
+/// that are `Clone` but deliberately not `Copy`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreResumeRefusal {
+    attempt_operation_id: OperationId,
+    process_tree_id: ProcessTreeId,
+    job_id: JobId,
+    image_id: ImageId,
+    session_id: SessionId,
+    outcome: PreResumeChildOutcome,
+    start_phase: &'static str,
+}
+
+impl PreResumeRefusal {
+    /// Returns the attempt identity this refusal is recorded against.
+    ///
+    /// This is the same `OperationId` the caller passed to `start`, not a
+    /// fresh identity minted for the cleanup: a retry of the same attempt
+    /// finds this record, and a different attempt can never claim it.
+    #[must_use]
+    pub const fn attempt_operation_id(&self) -> &OperationId {
+        &self.attempt_operation_id
+    }
+
+    /// Returns the caller-owned process-tree lineage of the refused attempt.
+    #[must_use]
+    pub const fn process_tree_id(&self) -> &ProcessTreeId {
+        &self.process_tree_id
+    }
+
+    /// Returns the logical Job lineage of the refused attempt.
+    #[must_use]
+    pub const fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    /// Returns the pinned image lineage of the refused attempt.
+    #[must_use]
+    pub const fn image_id(&self) -> &ImageId {
+        &self.image_id
+    }
+
+    /// Returns the session lineage of the refused attempt.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the observed state of the refused child.
+    ///
+    /// `[PreResumeChildOutcome::Terminated]` proves the platform observed the
+    /// still-suspended child terminated; `[PreResumeChildOutcome::Unknown]`
+    /// means it could not, which is why that case keeps the attempt available
+    /// for reconciliation instead of dropping it.
+    #[must_use]
+    pub const fn child_outcome(&self) -> PreResumeChildOutcome {
+        self.outcome
+    }
+
+    /// Returns the stable label for the observed child outcome.
+    #[must_use]
+    pub const fn child_outcome_label(&self) -> &'static str {
+        self.outcome.as_str()
+    }
+
+    /// Returns the start-machine phase reached, which for every pre-resume
+    /// refusal is at or before `AuthorityValidation` and never `Resumed`.
+    #[must_use]
+    pub const fn start_phase(&self) -> &'static str {
+        self.start_phase
+    }
+
+    /// Returns the exact evidence gap that produced this refusal.
+    #[must_use]
+    pub const fn evidence_gap(&self) -> &'static str {
+        PRE_RESUME_EVIDENCE_GAP
+    }
+
+    /// Returns the required recovery action for this attempt.
+    ///
+    /// Pre-resume refusals are effect-free: the child never resumed, so
+    /// recovery is a closed record, not a reconciliation of a possible effect.
+    /// This is deliberately a different value from the post-resume
+    /// possible-effect action reported by
+    /// [`QuarantinedOperationRecord::recovery_action`].
+    #[must_use]
+    pub const fn recovery_action(&self) -> &'static str {
+        PRE_RESUME_RECOVERY
+    }
+}
+
 impl WindowsProcessExecutor {
     /// Starts one Kernel child with the exact current Host Kernel Job binding.
     ///
     /// The binding is per-call and is reopened by the Windows platform layer
     /// before the suspended child is created; no process-wide authority cache
     /// is consulted.
+    ///
+    /// `admitted_limits` is the owner generation's ADMITTED Module Manifest Job
+    /// ceilings (issue #1888 / I1.6), built by the owner through
+    /// [`JobObjectLimits::require_admitted_job_limits`]. They, not the request's
+    /// caller-authored `ResourceLimits`, are the ceilings the Job is installed
+    /// with, so a caller can neither supply nor widen a Job limit here. `None`
+    /// refuses the launch: without admitted ceilings there is no contained Job
+    /// to install, and an unlimited Job is not a contained one.
     #[cfg(windows)]
     pub fn start_with_kernel_outer_job_binding(
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
+        admitted_limits: Option<JobObjectLimits>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, false)
+        self.start_inner(
+            request,
+            sink,
+            LaunchOuterJobBinding::Proven(outer_binding),
+            admitted_limits,
+            None,
+            false,
+        )
     }
 
     /// Starts one Kernel child with the exact one-shot standard-input bytes the
     /// admitted launch carries.
+    ///
+    /// The exact outer Kernel Job binding is required for the launch, exactly
+    /// as in [`Self::start_with_kernel_outer_job_binding`]; a broker-launched
+    /// per-user adapter reaches its own failure domain through that binding and
+    /// never through a launch without one.
     ///
     /// `stdin_payload` is the same material the suspended-launch spec already
     /// models (`SuspendedLaunchSpec::with_stdin`): it is written to the child's
@@ -1538,14 +1743,24 @@ impl WindowsProcessExecutor {
     /// own durable launch request digest before the start boundary.
     ///
     /// `None` is the default for every other caller: the pipe is created,
-    /// never written, and closed, exactly as before.
+    /// never written, and closed.
+    #[cfg(windows)]
     pub fn start_with_stdin(
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
+        outer_binding: RecoverableJobBinding,
+        admitted_limits: Option<JobObjectLimits>,
         stdin_payload: Option<&[u8]>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, stdin_payload, false)
+        self.start_inner(
+            request,
+            sink,
+            LaunchOuterJobBinding::Proven(outer_binding),
+            admitted_limits,
+            stdin_payload,
+            false,
+        )
     }
 
     /// Starts one admitted Kernel child with a retained live standard-input
@@ -1561,8 +1776,16 @@ impl WindowsProcessExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
         outer_binding: RecoverableJobBinding,
+        admitted_limits: Option<JobObjectLimits>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, Some(outer_binding), None, true)
+        self.start_inner(
+            request,
+            sink,
+            LaunchOuterJobBinding::Proven(outer_binding),
+            admitted_limits,
+            None,
+            true,
+        )
     }
 
     /// Queues one complete, already-encoded EBP frame for the exact running
@@ -1612,15 +1835,20 @@ impl WindowsProcessExecutor {
     }
 
     /// Creates one executor around the P-07 authority composition.
+    ///
+    /// Launch on this executor is not weaker than on
+    /// [`Self::new_with_launch_admission`]: every start on every executor
+    /// requires the exact Host Kernel Job binding, so this constructor differs
+    /// only in not retaining a launch-proof seam.
     #[must_use]
     pub fn new(authority: Arc<dyn DispatchValidationPort>) -> Self {
         Self {
             authority,
             launch_admission: None,
-            kernel_outer_binding_required: false,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            pre_resume: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1641,10 +1869,10 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
-            kernel_outer_binding_required: false,
             stream_sink: Some(stream_sink),
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            pre_resume: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1662,10 +1890,10 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: Some(launch_admission),
-            kernel_outer_binding_required: true,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            pre_resume: Mutex::new(BTreeMap::new()),
             capture_limit: DEFAULT_CAPTURE_LIMIT,
         }
     }
@@ -1679,10 +1907,10 @@ impl WindowsProcessExecutor {
         Self {
             authority,
             launch_admission: None,
-            kernel_outer_binding_required: false,
             stream_sink: None,
             operations: Mutex::new(BTreeMap::new()),
             reservations: Mutex::new(std::collections::BTreeSet::new()),
+            pre_resume: Mutex::new(BTreeMap::new()),
             capture_limit: capture_limit.max(1),
         }
     }
@@ -1694,6 +1922,61 @@ impl WindowsProcessExecutor {
             .get(id)
             .cloned()
             .ok_or(ProcessExecutionError::NotFound)
+    }
+
+    /// Issue #1888 / AUD4: retains one pre-resume refusal under the SAME
+    /// attempt identity that reserved it.
+    ///
+    /// Called only from the `start_inner` pre-resume failure route, after the
+    /// platform has already terminated (or failed to observe terminating) the
+    /// still-suspended child. The `OperationId` passed here is the launch's
+    /// own `operation_id` — the identity the caller passed to `start` and the
+    /// one `reserve_operation` holds — so the refusal is filed against the
+    /// attempt that produced it, never a fresh one. The `OperationReservation`
+    /// guard still drops on return and releases the reservation; this record
+    /// is what remains observable.
+    ///
+    /// A poisoned retention lock is deliberately NOT fatal here: the caller is
+    /// already returning a typed failure for the launch, and turning an
+    /// inability to file the record into a different error would obscure the
+    /// real refusal.
+    ///
+    /// The lineage recorded is the CALLER's own request lineage, which is the
+    /// attempt identity. It is captured by the caller before the request is
+    /// consumed by the authority port, so this needs no `ValidatedDispatch` (a
+    /// pre-resume refusal never produces one) and does not clone or re-create
+    /// the request, which is a non-cloneable consuming authority type.
+    fn retain_pre_resume_refusal(
+        &self,
+        attempt: PreResumeAttemptLineage,
+        outcome: PreResumeChildOutcome,
+        start_phase: StartPhase,
+    ) {
+        if let Ok(mut refusals) = self.pre_resume.lock() {
+            refusals.insert(
+                attempt.operation_id.clone(),
+                PreResumeRefusal {
+                    attempt_operation_id: attempt.operation_id,
+                    process_tree_id: attempt.process_tree_id,
+                    job_id: attempt.job_id,
+                    image_id: attempt.image_id,
+                    session_id: attempt.session_id,
+                    outcome,
+                    start_phase: start_phase.as_str(),
+                },
+            );
+        }
+    }
+
+    /// Returns the retained pre-resume refusal for one exact attempt identity.
+    ///
+    /// `None` when that attempt never failed before resume — including when it
+    /// started successfully, when it is a post-resume failure (those live on the
+    /// registered `Operation` and are read through
+    /// [`Self::operation_health_summary`]), or when the identity is unknown.
+    #[must_use]
+    pub fn pre_resume_refusal(&self, id: &OperationId) -> Option<PreResumeRefusal> {
+        self.pre_resume.lock().ok()?.get(id).cloned()
     }
 
     fn reserve_operation(
@@ -2149,7 +2432,8 @@ impl WindowsProcessExecutor {
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
-        outer_binding: Option<KernelOuterJobBinding>,
+        outer_binding: LaunchOuterJobBinding,
+        admitted_limits: Option<JobObjectLimits>,
         stdin_payload: Option<&[u8]>,
         retain_stdin_writer: bool,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
@@ -2157,11 +2441,6 @@ impl WindowsProcessExecutor {
         if retain_stdin_writer && stdin_payload.is_some() {
             return Err(unavailable(
                 "live stdin cannot be combined with one-shot stdin payload bytes",
-            ));
-        }
-        if self.kernel_outer_binding_required && outer_binding.is_none() {
-            return Err(unavailable(
-                "Kernel process start requires the current Host Kernel Job binding",
             ));
         }
         let operation_id = request.operation_id().clone();
@@ -2173,6 +2452,7 @@ impl WindowsProcessExecutor {
                 request,
                 sink,
                 outer_binding,
+                admitted_limits,
                 stdin_payload,
                 retain_stdin_writer,
             );
@@ -2183,9 +2463,29 @@ impl WindowsProcessExecutor {
 
         #[cfg(windows)]
         {
+            // Issue #1888 / I1.6: "models and third-party Modules do not
+            // inherit secrets by default". The refusal below is the default-deny
+            // half and it is unchanged: a projection carrying secret references
+            // is refused before any child exists, and the second refusal keeps
+            // an `Allowlisted` policy from resolving to "inherit whatever
+            // exists" when no grant names an explicit set. What is new is the
+            // OTHER shape of the same rule: the child's environment block below
+            // is assembled from the projection's own `non_secret` map plus, and
+            // only plus, the ambient values that explicit allowed set names. So
+            // inheritance is an allow-set resolved at build time, never a
+            // denylist filtering an already-inherited environment.
             if !request.environment().secret_refs().is_empty() {
                 return Err(unavailable(
                     "secret environment references require an admitted secret projection",
+                ));
+            }
+            if matches!(
+                request.environment().inheritance(),
+                EnvironmentInheritance::Allowlisted
+            ) && request.environment().allowed().is_empty()
+            {
+                return Err(unavailable(
+                    "allowlisted environment inheritance requires an explicit allowed environment set",
                 ));
             }
             // Admission revalidation at spawn (issue #1814): canonicalize
@@ -2204,12 +2504,22 @@ impl WindowsProcessExecutor {
                     "executable digest does not match ProcessRequest",
                 ));
             }
-            let environment = request
+            // The child's environment is BUILT here, from the allow-set, and
+            // handed to `SuspendedLaunchSpec` as the complete block. Nothing
+            // inherits the parent's environment behind this: the block is
+            // exactly the projection's own non-secret map plus, and only plus,
+            // the ambient values the explicit allowed set names. An empty set
+            // contributes nothing, so an ungranted launch's block is the
+            // projection alone.
+            let mut environment = request
                 .environment()
                 .non_secret()
                 .iter()
                 .map(|(name, value)| (name.clone().into(), value.clone().into()))
                 .collect::<Vec<_>>();
+            for (name, value) in inherited_allowed_environment(request.environment())? {
+                environment.push((name.into(), value.into()));
+            }
             let spec = SuspendedLaunchSpec::new(
                 &executable,
                 request.argv().iter().cloned().map(Into::into).collect(),
@@ -2225,17 +2535,23 @@ impl WindowsProcessExecutor {
                     Some(payload) => spec.with_stdin(payload.to_vec()).map_err(unavailable)?,
                 }
             };
-            let active_limit = request
-                .resource_limits()
-                .max_descendants()
-                .checked_add(1)
-                .ok_or_else(|| unavailable("descendant limit overflows Job limit"))?;
-            let limits = JobObjectLimits::new(
-                request.resource_limits().cpu_time_ms(),
-                request.resource_limits().memory_bytes(),
-                Some(active_limit),
-            )
-            .map_err(unavailable)?;
+            // Issue #1888 / I1.6: "CPU, memory, and process limits are set by Module
+            // Manifest". When this launch carries the admitted manifest ceilings
+            // they ARE the Job's ceilings, so the caller's `ResourceLimits`
+            // contributes no Job limit at all: it can neither supply one nor
+            // widen one. `cpu_time_ms` is `None` there, because
+            // `ManifestResourceLimits` records a rate-control percentage rather
+            // than a CPU-time budget, and `JobObjectLimits` has no rate-control
+            // field to carry it.
+            //
+            // A launch with no admitted manifest ceiling has no contained Job
+            // to install, so it is refused rather than admitted as an
+            // unlimited Job.
+            let Some(limits) = admitted_limits else {
+                return Err(unavailable(
+                    "Kernel process launch requires the admitted Module Manifest Job limits",
+                ));
+            };
             let stdout_limit = request.resource_limits().stdout_bytes();
             let stderr_limit = request.resource_limits().stderr_bytes();
             let stdout_requested = stdout_limit > 0;
@@ -2248,6 +2564,45 @@ impl WindowsProcessExecutor {
                 sequence
             ))
             .map_err(unavailable)?;
+            // Issue #1888 / AUD3: bind the six named elements -- operation/attempt,
+            // owner generation, approved executable/config, execution identity,
+            // manifest limits, and exact outer/inner Job bindings -- as ONE
+            // tuple before the child exists, so the platform effect boundary has
+            // a single value to re-check rather than six values that happen to
+            // travel near each other.
+            //
+            // Both arms bind a tuple. The production arm binds the exact outer Job; the
+            // `#[cfg(test)]` seam binds the same elements with element 6a
+            // absent, because that launch provably has no outer Job.
+            // The value itself, not an `Option`: an optional tuple would turn
+            // "no tuple was bound" into a silent skip of the pre-resume check.
+            let launch_tuple = match &outer_binding {
+                LaunchOuterJobBinding::Proven(binding) => ValidatedLaunchTuple::bind(
+                    &request,
+                    &executable,
+                    request.executable_sha256(),
+                    spec.execution_identity(),
+                    limits,
+                    binding.clone(),
+                    job_name.clone(),
+                )
+                .map_err(unavailable)?,
+                // The `#[cfg(test)]` seam has no outer Job to bind, so element
+                // 6a is `None` there; the approved-executable and inner-Job
+                // elements are still bound and still re-checked against the
+                // live child. This arm cannot be compiled into a production
+                // build.
+                #[cfg(test)]
+                LaunchOuterJobBinding::Unproven => ValidatedLaunchTuple::bind_without_outer_job(
+                    &request,
+                    &executable,
+                    request.executable_sha256(),
+                    spec.execution_identity(),
+                    limits,
+                    job_name.clone(),
+                )
+                .map_err(unavailable)?,
+            };
             // Issue #1888: the per-attempt Job Object is nested inside the
             // exact Host-owned Kernel outer Job carried for this call, never a
             // second outer kill domain. The platform reopens that binding and
@@ -2256,21 +2611,27 @@ impl WindowsProcessExecutor {
             // observed assignment, permitted nesting, and outer kill-on-close
             // before launch. The limits above stay exactly the admitted
             // `ResourceLimits`; this call adds no default, cap, or fallback.
-            let child = if let Some(binding) = outer_binding {
-                SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
-                    spec, job_name, limits, binding,
+            let child = match outer_binding {
+                LaunchOuterJobBinding::Proven(binding) => {
+                    SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
+                        spec, job_name, limits, binding,
+                    )
+                    .map_err(|error| match error {
+                        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                        error => unavailable(error),
+                    })?
+                }
+                // The one shape with no proven outer Job membership. It is
+                // gated at compile time, so no production build carries it and
+                // no production call site can name it.
+                #[cfg(test)]
+                LaunchOuterJobBinding::Unproven => SuspendedJobChild::spawn_named_with_limits(
+                    spec, job_name, limits,
                 )
                 .map_err(|error| match error {
                     WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
                     error => unavailable(error),
-                })?
-            } else {
-                SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits).map_err(
-                    |error| match error {
-                        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
-                        error => unavailable(error),
-                    },
-                )?
+                })?,
             };
 
             // Issue-84 start state machine: `SuspendedLaunch` (above) →
@@ -2292,21 +2653,70 @@ impl WindowsProcessExecutor {
             debug_assert_eq!(start_phase, StartPhase::SuspendedLaunch);
             let authority = Arc::clone(&self.authority);
             let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
-            let validated = child
-                .validate(|evidence| {
-                    let observed = suspended_identity(&request, evidence)?;
-                    let executable = evidence.executable_file_identity();
-                    let launch = SuspendedLaunchEvidence::new(
-                        evidence.requested_executable().to_string_lossy(),
-                        executable.volume_serial_number,
-                        executable.file_index,
-                    )?;
-                    if let Some(admission) = &launch_admission {
-                        admission.validate_launch(&request, &observed, &launch)?;
-                    }
-                    authority.validate_and_consume(request, observed)
-                })
-                .map_err(validation_error)?;
+            // Issue #1888 / AUD4: the pre-resume refusal route. `request` is
+            // consumed by the authority port inside the closure below, so the
+            // attempt lineage the refusal records is taken BEFORE that happens.
+            // It is the caller's own identity, so the record is under the SAME
+            // attempt, and it needs no `ValidatedDispatch` (a pre-resume
+            // refusal never produces one). `ProcessRequest` is a non-cloneable
+            // consuming authority type, so only these owned id values are
+            // captured — never a copy of the request itself.
+            let attempt = PreResumeAttemptLineage {
+                operation_id: operation_id.clone(),
+                process_tree_id: request.process_tree_id().clone(),
+                job_id: request.job_id().clone(),
+                image_id: request.image_id().clone(),
+                session_id: request.session_id().clone(),
+            };
+            let validated = match child.validate(|evidence| {
+                // Issue #1888 / AUD3: the platform effect boundary. This
+                // closure runs while the ACTUAL child is still suspended,
+                // on fresh evidence built from its retained kernel handles,
+                // and it is the last point before `resume()` calls
+                // `ResumeThread`. The tuple is re-checked here against that
+                // live observation -- never against its own fields. A
+                // refusal here is a pre-effect refusal: `validate` reports it
+                // as `Rejected`, which terminates and reaps the still suspended
+                // child under this same attempt.
+                launch_tuple
+                    .recheck_before_resume(evidence)
+                    .map_err(unavailable)?;
+                let observed = suspended_identity(&request, evidence)?;
+                let executable = evidence.executable_file_identity();
+                let launch = SuspendedLaunchEvidence::new(
+                    evidence.requested_executable().to_string_lossy(),
+                    executable.volume_serial_number,
+                    executable.file_index,
+                )?;
+                if let Some(admission) = &launch_admission {
+                    admission.validate_launch(&request, &observed, &launch)?;
+                }
+                authority.validate_and_consume(request, observed)
+            }) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    // Issue #1888 / AUD4: a pre-resume failure MUST leave an
+                    // observed terminated-or-unknown child UNDER THE SAME
+                    // ATTEMPT. The platform `validate` above already tried to
+                    // terminate and reap the still-suspended child; the variant
+                    // it returns says whether that termination was OBSERVED
+                    // (`Mechanics`/`Rejected`) or could not be (`UnknownOutcome`,
+                    // which the platform reserves for exactly that case).
+                    //
+                    // The child is gone either way, so the returned error is
+                    // the SAME typed refusal `validation_error` produces —
+                    // this route adds no new refusal reason, it only records
+                    // the already-required observation instead of dropping it.
+                    // The class is read from the SAME value that yields the
+                    // error, so the record can never disagree with the return.
+                    self.retain_pre_resume_refusal(
+                        attempt,
+                        pre_resume_child_outcome(&error),
+                        start_phase,
+                    );
+                    return Err(validation_error(error));
+                }
+            };
             // `AuthorityValidation`: the one-shot permit was consumed against
             // fresh suspended evidence above.
             start_phase = StartPhase::AuthorityValidation;
@@ -2315,10 +2725,39 @@ impl WindowsProcessExecutor {
             // `Resumed`: resume must precede stream-capture ownership — the
             // stdout/stderr read handles live on `RunningJobChild` and can
             // only be taken after `resume()`.
-            let mut running = validated.resume().map_err(|error| match error {
-                WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
-                error => unavailable(error),
-            })?;
+            //
+            // Issue #1888 / AUD4: a `ResumeThread` refusal is still a PRE-RESUME
+            // failure — the child never executed. The platform kills and reaps
+            // the whole Job on this path and returns `Timeout` exactly when it
+            // could not observe that, so the refused child is terminated-or-
+            // unknown here too and is recorded under the SAME attempt. The
+            // returned typed error is unchanged.
+            let mut running = match validated.resume() {
+                Ok(running) => running,
+                Err(error) => {
+                    // The `validate` arm above returns, so `attempt` is still
+                    // owned here on the only path that reaches resume.
+                    self.retain_pre_resume_refusal(
+                        PreResumeAttemptLineage {
+                            operation_id: attempt.operation_id.clone(),
+                            process_tree_id: attempt.process_tree_id.clone(),
+                            job_id: attempt.job_id.clone(),
+                            image_id: attempt.image_id.clone(),
+                            session_id: attempt.session_id.clone(),
+                        },
+                        if matches!(error, WindowsAdapterError::Timeout) {
+                            PreResumeChildOutcome::Unknown
+                        } else {
+                            PreResumeChildOutcome::Terminated
+                        },
+                        start_phase,
+                    );
+                    return Err(match error {
+                        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                        error => unavailable(error),
+                    });
+                }
+            };
             start_phase = StartPhase::Resumed;
             let now = now_ms();
             state.mark_resumed(
@@ -2942,12 +3381,52 @@ impl WindowsProcessExecutor {
 }
 
 impl ProcessExecutor for WindowsProcessExecutor {
+    // The generic [`ProcessExecutor`] contract has no outer-Job-binding
+    // parameter, so there is no binding this method could prove. The required-
+    // binding launch API is [`WindowsProcessExecutor::
+    // start_with_kernel_outer_job_binding`] (and its stdin siblings); every
+    // production Kernel-child caller reaches it with the exact Host Kernel Job
+    // binding its owner retained. Refusing here unconditionally is what makes
+    // the missing-binding case unrepresentable instead of merely unlikely:
+    // issue #1888 forbids restoring the earlier binding-free overload (issue
+    // #1888 / AUD5), and a test-only port is not a production escape hatch.
+    //
+    // The `Unproven` seam exists only so this crate's `#[cfg(test)]` proofs can
+    // exercise the mechanics without a real Host Kernel Job.
+    #[cfg(not(test))]
+    async fn start(
+        &self,
+        _request: ProcessRequest,
+        _sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        Err(unavailable(
+            "Kernel process start requires the current Host Kernel Job binding",
+        ))
+    }
+
+    #[cfg(test)]
     async fn start(
         &self,
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
-        self.start_inner(request, sink, None, None, false)
+        // The crate's `#[cfg(test)]` mechanics proofs have no admitted Module
+        // Manifest to read, so they launch under an explicit test ceiling rather
+        // than a caller-authored one. A ceiling is still mandatory: a launch
+        // never reaches a Job without one.
+        let test_limits =
+            JobObjectLimits::require_admitted_job_limits(Some(1_048_576), Some(1), Some(40))
+                .map_err(|error| {
+                    unavailable(format!("the test Job limits are unusable: {error}"))
+                })?;
+        self.start_inner(
+            request,
+            sink,
+            LaunchOuterJobBinding::Unproven,
+            Some(test_limits),
+            None,
+            false,
+        )
     }
 
     async fn inspect(
@@ -3007,6 +3486,25 @@ fn validation_error<E: std::fmt::Display>(
         SuspendedValidationError::Mechanics(error) => unavailable(error),
         SuspendedValidationError::Rejected(error) => unavailable(error),
         SuspendedValidationError::UnknownOutcome => ProcessExecutionError::UnknownOutcome,
+    }
+}
+
+/// Issue #1888 / AUD4: the observed state of the child a pre-resume refusal
+/// left behind.
+///
+/// The platform layer already tried to terminate and reap the still-suspended
+/// child before returning either `Mechanics` or `Rejected`; it returns
+/// `UnknownOutcome` precisely when it could NOT observe that termination. So
+/// the refusal class follows directly from the variant the platform chose, and
+/// `validation_error` above keeps the same typed error this returns — the class
+/// is recorded alongside, never instead of, the typed failure.
+#[cfg(windows)]
+fn pre_resume_child_outcome<E>(error: &SuspendedValidationError<E>) -> PreResumeChildOutcome {
+    match error {
+        SuspendedValidationError::Mechanics(_) | SuspendedValidationError::Rejected(_) => {
+            PreResumeChildOutcome::Terminated
+        }
+        SuspendedValidationError::UnknownOutcome => PreResumeChildOutcome::Unknown,
     }
 }
 
@@ -3225,8 +3723,30 @@ const WATCHER_EVIDENCE_GAP: &str = "deadline watcher spawn failed";
 const RECEIPT_EVIDENCE_GAP: &str = "start receipt binding invalid";
 #[cfg(windows)]
 const PUBLISH_EVIDENCE_GAP: &str = "start publication failed after resume";
+/// Issue #1888 / AUD4: the pre-resume refusal gap. The child was created and
+/// then terminated/reaped by the platform while it was still suspended, so the
+/// attempt is refused before any effect, but the refusal is still recorded
+/// against the SAME attempt identity rather than dropped.
+#[cfg(windows)]
+const PRE_RESUME_EVIDENCE_GAP: &str =
+    "pre-resume assignment/limit/identity failure; suspended child terminated";
 #[cfg(windows)]
 const RECOVERY_ACTION: &str = "reconcile-or-cleanup explicit disposition; shutdown retains owner";
+/// Recovery class of a pre-resume refusal: the suspended child was terminated
+/// and observed, so no effect can have happened and the attempt is retained
+/// only as a closed record.
+///
+/// The post-resume class is a DIFFERENT path, not a second name for this one:
+/// every post-resume evidence/persistence failure builds a registered
+/// `Operation` and is projected through
+/// [`QuarantinedOperationRecord::recovery_action`], which carries
+/// [`RECOVERY_ACTION`] ("reconcile-or-cleanup explicit disposition; shutdown
+/// retains owner") because the resumed child MAY already have had an effect.
+/// Pre-resume refusals never reach that projection, so this value is what
+/// distinguishes them at readback.
+#[cfg(windows)]
+const PRE_RESUME_RECOVERY: &str =
+    "effect-free pre-resume refusal; suspended child terminated before resume";
 
 #[cfg(windows)]
 fn quarantine_snapshot(
@@ -4589,8 +5109,10 @@ fn is_executable_digest(value: &str) -> bool {
 /// projection.
 ///
 /// The non-secret map iterates in sorted key order, followed by the
-/// inheritance policy and the opaque secret references (provider/key only,
-/// never secret material), hashed to lowercase SHA-256 hex.
+/// inheritance policy, the explicit allowed environment set, and the opaque
+/// secret references (provider/key only, never secret material), hashed to
+/// lowercase SHA-256 hex. The allowed set is included so a granted launch and
+/// an ungranted one can never share one environment identity.
 #[must_use]
 pub fn environment_projection_digest(environment: &EnvironmentProjection) -> String {
     let mut material = String::new();
@@ -4605,6 +5127,16 @@ pub fn environment_projection_digest(environment: &EnvironmentProjection) -> Str
         EnvironmentInheritance::Allowlisted => "allowlisted",
     });
     material.push('\0');
+    for name in environment.allowed().names() {
+        material.push_str(name);
+        material.push('\0');
+    }
+    for grant in environment.allowed().grants() {
+        material.push_str(grant.reference().provider());
+        material.push('\0');
+        material.push_str(grant.reference().key());
+        material.push('\0');
+    }
     for reference in environment.secret_refs() {
         material.push_str(reference.provider());
         material.push('\0');
@@ -4702,6 +5234,38 @@ fn unavailable(error: impl std::fmt::Display) -> ProcessExecutionError {
     ProcessExecutionError::Unavailable(error.to_string())
 }
 
+/// Resolves the ambient values one launch's explicit allowed environment set
+/// names, before the child exists.
+///
+/// Issue #1888 / AUD7: secret inheritance is an explicit allowed environment
+/// set, not a denylist applied after spawn. This is the build-time resolution
+/// half of that: it reads only the names the grant states, and each one only
+/// if the launching process actually carries it, so a name the grant states
+/// but the environment does not have contributes nothing rather than a
+/// synthesised placeholder. Nothing outside the set is read, so the parent's
+/// environment is never materialised and then filtered.
+///
+/// # Errors
+/// Returns `Unavailable` when the resolution fails.
+#[cfg(windows)]
+fn inherited_allowed_environment(
+    environment: &EnvironmentProjection,
+) -> Result<Vec<(String, String)>, ProcessExecutionError> {
+    let mut inherited = Vec::new();
+    for name in environment.allowed().names() {
+        match std::env::var_os(name) {
+            None => {}
+            Some(value) => inherited.push((
+                name.clone(),
+                value
+                    .into_string()
+                    .map_err(|_| unavailable("allowed environment name is not valid Unicode"))?,
+            )),
+        }
+    }
+    Ok(inherited)
+}
+
 /// Maps a per-operation lock loss to that operation's typed `Unavailable`.
 ///
 /// The executor carries no global poison flag: every `Mutex` guard loss is
@@ -4733,13 +5297,14 @@ fn registry_unavailable(what: &'static str) -> ProcessExecutionError {
 mod tests {
     use super::{DispatchValidationPort, WindowsProcessExecutor};
     use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
-        EnvironmentProjection, EvidenceSinkError, FencingToken, Generation, ImageId, JobId,
-        KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence, ProcessEvidenceSink,
-        ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessTreeId,
-        ResourceLimits, SecretRef, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentAllowSet,
+        EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError, FencingToken, Generation,
+        ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidence,
+        ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest,
+        ProcessTreeId, ResourceLimits, SecretRef, SessionId, SuspendedProcessIdentity,
+        ValidatedDispatch,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
@@ -5101,15 +5666,299 @@ mod tests {
         let secret_sink = Arc::new(RecordingSink::default());
         let secret_sink_dyn: Arc<dyn ProcessEvidenceSink> = secret_sink.clone();
         let secret_result = block_on(executor.start(secret_request, secret_sink_dyn));
-        assert!(matches!(
-            secret_result,
-            Err(ProcessExecutionError::Unavailable(_))
-        ));
+        // The existing guard is kept exactly as it was (typed `Unavailable`,
+        // every target), and the error VALUE is now additionally asserted so
+        // this refusal is distinguishable from the sibling
+        // `Allowlisted`-without-an-allow-set refusal, which carries the same
+        // `Unavailable` variant. On Windows the exact string below is the
+        // secret-reference refusal; on a non-Windows target `start_inner`
+        // refuses earlier with the platform-unavailable refusal, so the value
+        // assertion is asserted there too rather than skipped.
+        let Err(ProcessExecutionError::Unavailable(secret_message)) = secret_result else {
+            panic!("a projection carrying secret references must be refused pre-spawn")
+        };
+        if cfg!(windows) {
+            assert_eq!(
+                secret_message,
+                "secret environment references require an admitted secret projection",
+                "the secret-reference refusal must be exact, so the sibling \
+                 Allowlisted-without-an-allow-set refusal cannot satisfy it"
+            );
+        } else {
+            assert_eq!(
+                secret_message,
+                "Windows ProcessExecutor is unavailable on this target"
+            );
+        }
         assert!(matches!(
             block_on(executor.inspect(secret_id)),
             Err(ProcessExecutionError::NotFound)
         ));
         assert_eq!(secret_sink.recorded_len(), 0);
+        Ok(())
+    }
+
+    /// Issue #1888 / I1.6 (default-deny inheritance, no explicit grant): an
+    /// `EnvironmentInheritance::Allowlisted` launch whose allowed set is EMPTY
+    /// must be refused pre-spawn, and that refusal must be the
+    /// Allowlisted-without-a-grant string itself.
+    ///
+    /// The value assertion is the proof, not the variant. This refusal shares
+    /// the `Unavailable` variant with the secret-reference refusal proven by
+    /// `start_rejects_bad_binding_pre_spawn`, so a variant-only test cannot
+    /// tell the two branches apart and would still pass if this branch were
+    /// deleted. Asserting the exact message means: delete this refusal from
+    /// `start_inner` and the request below reaches the executable-digest
+    /// mismatch and the equality fails.
+    ///
+    /// The real executable is used and its real digest is sealed into the
+    /// request, so the digest check that follows this branch cannot be what
+    /// refuses: only this branch can produce this string.
+    #[test]
+    #[cfg(windows)]
+    fn start_rejects_allowlisted_inheritance_without_explicit_allowed_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-1888-empty-allow")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-1888-empty-allow")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        let executor = WindowsProcessExecutor::new(Arc::new(DummyPort));
+        let operation_id = OperationId::new("op-1888-empty-allow")?;
+        // The ungranted shape: the policy asks for allowlisted inheritance but
+        // names no value, so the allowed set is empty and `is_ungranted` holds.
+        let environment = EnvironmentProjection::with_allowed(
+            BTreeMap::new(),
+            Vec::new(),
+            EnvironmentInheritance::Allowlisted,
+            EnvironmentAllowSet::default(),
+        )?;
+        assert!(
+            environment.allowed().is_empty() && environment.is_ungranted(),
+            "the fixture must be the ungranted Allowlisted shape, not a granted one"
+        );
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-1888-empty-allow")?,
+            JobId::new("job-1888-empty-allow")?,
+            ImageId::new("image-1888-empty-allow")?,
+            SessionId::new("session-1888-empty-allow")?,
+            generation,
+            executable,
+            digest,
+            vec!["/c".to_owned(), "echo".to_owned(), "hi".to_owned()],
+            working_directory,
+            environment,
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 4_096, 4_096, 4)?,
+        )?;
+        let permit = authority.issue(
+            &intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1888-empty-allow")?,
+                fence,
+                revisions(),
+                100,
+                10_000,
+                "nonce-1888-empty-allow",
+            )?,
+        )?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        // The inspected object is the typed refusal's MESSAGE, not a spec
+        // struct and not a projected value.
+        let Err(ProcessExecutionError::Unavailable(message)) =
+            block_on(executor.start(request, sink_dyn))
+        else {
+            panic!("Allowlisted inheritance without an explicit allowed set must be refused")
+        };
+        assert_eq!(
+            message,
+            "allowlisted environment inheritance requires an explicit allowed environment set",
+            "the refusal must be the Allowlisted-without-a-grant string exactly, so the \
+             sibling secret-reference refusal cannot satisfy this assertion"
+        );
+        // Refused before any child exists: nothing was registered and nothing
+        // was observed. `DummyPort` would have panicked had the launch reached
+        // the post-spawn authority-validation boundary, so a passing test also
+        // proves no child was created.
+        assert!(matches!(
+            block_on(executor.inspect(operation_id)),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        assert_eq!(sink.recorded_len(), 0);
+        Ok(())
+    }
+
+    /// Issue #1888 / I1.6 (no ambient value without an explicit grant): a real
+    /// child launched through the executor prints its OWN received environment
+    /// block, and this asserts on those printed bytes.
+    ///
+    /// The assertion object is the child's real environment block, read back
+    /// through the executor's own captured stdout. Nothing here inspects a spec
+    /// struct or the projection, so this is the only shape that can prove
+    /// something about inheritance.
+    ///
+    /// Can it fail? Yes, and the counter-example is concrete: `cmd /c set`
+    /// prints exactly the block the child received, so if the executor built
+    /// that block by inheriting the parent and then filtering (the shape I1.6
+    /// forbids), every ambient name the test process really carries would
+    /// appear in the captured bytes and the absence assertion below fails.
+    /// The test therefore requires that this process really carries at least
+    /// one ambient name, and fails loudly rather than passing vacuously when
+    /// the ambient environment is empty.
+    ///
+    /// It cannot plant its own value: `std::env::set_var` is `unsafe` in
+    /// edition 2024 and this crate is `#![forbid(unsafe_code)]`, so the test
+    /// uses the test process's REAL ambient environment as the inheritance
+    /// probe and proves it is present before asserting it is absent downstream.
+    ///
+    /// `cmd` always sets COMSPEC/PATHEXT/PROMPT itself when they are absent, so
+    /// those three are excluded here as not-inherited; every other name in the
+    /// child's block that is also present is inheritance. Names are uppercased
+    /// because Windows environment names are case-insensitive and the child's
+    /// own names are uppercased by the caller.
+    fn ambient_environment_names() -> BTreeSet<String> {
+        std::env::vars_os()
+            .map(|(name, _)| name.to_string_lossy().to_uppercase())
+            .filter(|name| name != "COMSPEC" && name != "PATHEXT" && name != "PROMPT")
+            .collect()
+    }
+
+    /// The permit the ungranted-launch probe needs, and the fence the matching
+    /// validation context must carry.
+    fn issue_child_env_permit(
+        authority: &mut DispatchPermitAuthority,
+        intent: &ProcessIntent,
+        fence: FencingToken,
+    ) -> Result<(eliot_process::DispatchPermit, FencingToken), Box<dyn std::error::Error>> {
+        let permit = authority.issue(
+            intent,
+            PermitIssuance::new(
+                ActionLeaseRef::new("lease-1888-child-env")?,
+                fence.clone(),
+                revisions(),
+                100,
+                10_000,
+                "nonce-1888-child-env",
+            )?,
+        )?;
+        Ok((permit, fence))
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn ungranted_child_environment_carries_no_ambient_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DECLARED: &str = "ELIOT_1888_DECLARED";
+        const DECLARED_VALUE: &str = "eliot-declared-by-projection-0001";
+        let ambient = ambient_environment_names();
+        assert!(
+            !ambient.is_empty(),
+            "this test needs a non-empty ambient environment to prove anything: with an empty \
+             parent environment an inheriting child and a closed child look identical"
+        );
+        assert!(
+            !ambient.contains(DECLARED),
+            "the declared probe name must not already be ambient or the absence proof is vacuous"
+        );
+        let executable = r"C:\Windows\System32\cmd.exe";
+        let digest = super::sha256_file(std::path::Path::new(executable))?;
+        let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
+        let operation_id = OperationId::new("op-1888-child-env")?;
+        let generation = Generation::new(1)?;
+        let fence = FencingToken::new(test_epoch(1), generation, "fence-1888-child-env")?;
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("auth-1888-child-env")?,
+            KernelDispatchKey::from_secret_bytes([0x5a; 32])?,
+        );
+        // The ungranted projection: it declares ONE value of its own, names no
+        // ambient value, and grants nothing.
+        let environment = EnvironmentProjection::new(
+            BTreeMap::from([(DECLARED.to_owned(), DECLARED_VALUE.to_owned())]),
+            Vec::new(),
+            EnvironmentInheritance::None,
+        )?;
+        assert!(
+            environment.is_ungranted(),
+            "the fixture projection must carry no grant at all"
+        );
+        let intent = ProcessIntent::new(
+            operation_id.clone(),
+            ProcessTreeId::new("tree-1888-child-env")?,
+            JobId::new("job-1888-child-env")?,
+            ImageId::new("image-1888-child-env")?,
+            SessionId::new("session-1888-child-env")?,
+            generation,
+            executable,
+            digest,
+            vec!["/c".to_owned(), "set".to_owned()],
+            working_directory,
+            environment,
+            ResourceLimits::new(30_000, Some(10_000), Some(512_000_000), 65_536, 65_536, 4)?,
+        )?;
+        let (permit, validation_fence) =
+            issue_child_env_permit(&mut authority, &intent, fence.clone())?;
+        let request = ProcessRequest::new(intent, permit)?;
+        let context = DispatchValidationContext::new(
+            ClockObservation {
+                valid_time_ms: Some(150),
+                known_time_ms: Some(150),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+            validation_fence,
+            test_epoch(1),
+            revisions(),
+            41,
+        )?;
+        let executor = WindowsProcessExecutor::new(Arc::new(FakePort {
+            authority: Mutex::new(authority),
+            context,
+        }));
+        let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(RecordingSink::default());
+        // A REAL child is launched here. `FakePort` is the real dispatch
+        // authority path, not a stub of the launch: the child is created,
+        // resumed, and its stdout is drained by the executor's own capture.
+        let _receipt = block_on(executor.start(request, sink))?;
+        s04_wait_terminal(&executor, &operation_id)?;
+        let (stdout, _stderr) = executor.captured_output(&operation_id)?;
+        assert!(
+            !stdout.truncated && stdout.complete,
+            "the child's own environment output must be fully captured, got {stdout:?}"
+        );
+        let observed = String::from_utf8_lossy(&stdout.bytes);
+        // The child's ACTUAL environment block, as the child itself read it.
+        let printed_names = observed
+            .split("\r\n")
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+            .map(|name| name.to_uppercase())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !printed_names.is_empty(),
+            "the child must have printed a real environment block, got {observed:?}"
+        );
+        // Every name the child received that this process also carries is
+        // inherited ambient material. An ungranted launch must carry NONE.
+        let inherited = printed_names
+            .intersection(&ambient)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            inherited.is_empty(),
+            "an ungranted child inherited ambient environment names this launch never \
+             granted: {inherited:?} (child block: {observed:?})"
+        );
+        // Half of the criterion is absence; the other half is that the block is
+        // the projection's own, not merely empty.
+        assert!(
+            observed.contains(&format!("{DECLARED}={DECLARED_VALUE}")),
+            "the child must still receive the projection's own declared value: {observed:?}"
+        );
         Ok(())
     }
 
@@ -8506,6 +9355,247 @@ mod tests {
             std::fs::set_permissions(&tool, permissions)?;
             assert!(super::resolve_executable_in_path(&tool.to_string_lossy()).is_none());
         }
+        Ok(())
+    }
+
+    /// Issue #1888 / AUD4: an authority port that refuses the launch, so the
+    /// real `SuspendedJobChild::validate` path runs its pre-resume
+    /// terminate-and-reap cleanup and reports `Rejected`. This produces a GENUINE
+    /// pre-resume refusal against a real suspended child, not a stubbed one.
+    #[cfg(windows)]
+    struct RefusingPort;
+
+    #[cfg(windows)]
+    impl DispatchValidationPort for RefusingPort {
+        fn validate_and_consume(
+            &self,
+            _request: ProcessRequest,
+            _observed: SuspendedProcessIdentity,
+        ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+            Err(ProcessExecutionError::Unavailable(
+                "injected pre-resume authority refusal".to_owned(),
+            ))
+        }
+    }
+
+    /// Issue #1888 / AUD4 (claim b): a pre-resume failure must leave an
+    /// OBSERVED terminated-or-unknown child UNDER THE SAME ATTEMPT.
+    ///
+    /// This is the load-bearing claim and the test proves each part of it
+    /// rather than only that an error came back:
+    /// * the refused child was OBSERVED terminated (or genuinely unknown) —
+    ///   the recorded outcome is a real observation, never a silent drop;
+    /// * the refusal is recorded against the SAME attempt identity the caller
+    ///   passed to `start` (`attempt_operation_id` equals the request's
+    ///   `OperationId`), not a fresh identity;
+    /// * it is a DIFFERENT recovery class from the post-resume one, so the
+    ///   pre-resume record reports the effect-free action while a post-resume
+    ///   failure is reported through the quarantine projection.
+    ///
+    /// A test that only asserted "an error is returned" would pass against the
+    /// broken behaviour, so each of the above is asserted explicitly.
+    #[test]
+    #[cfg(windows)]
+    fn aud4_pre_resume_refusal_is_observed_under_the_same_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (request, operation_id) = aud4_refused_request("aud4-pre-resume")?;
+        // The port refuses in the authority step, which runs AFTER creation +
+        // Job assignment and BEFORE resume, so the real platform pre-resume
+        // terminate-and-reap path runs for a real suspended child.
+        let executor = WindowsProcessExecutor::new(Arc::new(RefusingPort));
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        let start_result = block_on(executor.start(request, sink_dyn));
+
+        // The launch must NOT succeed (it is refused before resume), and it
+        // must carry the typed refusal rather than a fabricated receipt.
+        assert!(
+            start_result.is_err(),
+            "a refusing authority must not produce a receipt"
+        );
+        // No start evidence may be fabricated for the refused attempt.
+        assert_eq!(sink.recorded_len(), 0);
+        // The pre-resume refusal is retained under the SAME attempt identity.
+        let refusal = executor
+            .pre_resume_refusal(&operation_id)
+            .ok_or("pre-resume refusal must be retained under the same attempt")?;
+        assert_eq!(
+            refusal.attempt_operation_id(),
+            &operation_id,
+            "the refusal must be recorded under the SAME attempt, not a fresh identity"
+        );
+        // The child was OBSERVED terminated (or genuinely unknown) — never
+        // silently dropped. The real platform path reaps the suspended child,
+        // so the observed outcome here is `Terminated`.
+        assert_eq!(
+            refusal.child_outcome(),
+            super::PreResumeChildOutcome::Terminated,
+            "the platform observed the suspended child terminated"
+        );
+        assert_eq!(refusal.child_outcome_label(), "terminated-observed");
+        // The phase reached is PRE-resume (never Resumed): the launch stopped
+        // at AuthorityValidation, before the child could execute.
+        assert_ne!(
+            refusal.start_phase(),
+            "resumed",
+            "a pre-resume refusal must never be recorded at the resumed phase"
+        );
+        // Pre-resume is a DIFFERENT recovery class than post-resume: the
+        // refusal reports the effect-free pre-resume action, and it never
+        // surfaces in the post-resume quarantine projection.
+        assert_eq!(refusal.recovery_action(), super::PRE_RESUME_RECOVERY);
+        assert_ne!(
+            refusal.recovery_action(),
+            super::RECOVERY_ACTION,
+            "pre-resume and post-resume must be distinct recovery classes"
+        );
+        // The post-resume projection stays empty: this failure never built a
+        // registered Operation, which is what makes it the pre-resume class.
+        let summary = executor.operation_health_summary();
+        assert!(
+            summary.quarantined_operations.is_empty(),
+            "a pre-resume refusal must not appear in the post-resume quarantine projection"
+        );
+        // The refused attempt never became a registered operation, so an
+        // inspect of that identity is NotFound (reserved for never-registered
+        // identities) rather than a post-resume UnknownOutcome.
+        assert!(matches!(
+            block_on(executor.inspect(operation_id.clone())),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        Ok(())
+    }
+
+    /// Issue #1888 / AUD4: builds one exact request whose launch is destined to
+    /// be refused pre-resume, returning the request and the attempt identity the
+    /// caller passed. The identity is what the refusal must be filed under.
+    #[cfg(windows)]
+    fn aud4_refused_request(
+        tag: &str,
+    ) -> Result<(ProcessRequest, OperationId), Box<dyn std::error::Error>> {
+        let (request, _authority, _fence) = s04_authorized_request(
+            tag,
+            vec!["/c".to_owned(), "exit 0".to_owned()],
+            4_096,
+            4_096,
+            4,
+        )?;
+        let operation_id = request.operation_id().clone();
+        Ok((request, operation_id))
+    }
+
+    /// Issue #1888 / AUD4 (claim b, unknown branch): the two pre-resume
+    /// classes are genuinely distinguished. `pre_resume_child_outcome` maps the
+    /// platform's `UnknownOutcome` (the platform could NOT observe the
+    /// terminated child) to `PreResumeChildOutcome::Unknown`, which is the case
+    /// that must keep the attempt available for reconciliation rather than
+    /// release it. `Mechanics`/`Rejected` (child observed terminated) map to
+    /// `Terminated`. A single catch-all mapping would fail this.
+    #[test]
+    #[cfg(windows)]
+    fn aud4_pre_resume_child_outcome_distinguishes_observed_from_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_platform_windows::SuspendedValidationError;
+        let (request, _authority, _fence) = s04_authorized_request(
+            "aud4-outcome",
+            vec!["/c".to_owned(), "exit 0".to_owned()],
+            4_096,
+            4_096,
+            4,
+        )?;
+        let operation_id = request.operation_id().clone();
+        let process_tree_id = request.process_tree_id().clone();
+        let job_id = request.job_id().clone();
+        let image_id = request.image_id().clone();
+        let session_id = request.session_id().clone();
+        // Mechanics: the platform reaped and observed the suspended child.
+        let mechanics: SuspendedValidationError<&str> =
+            SuspendedValidationError::Mechanics(super::WindowsAdapterError::IdentityMismatch);
+        assert_eq!(
+            super::pre_resume_child_outcome(&mechanics),
+            super::PreResumeChildOutcome::Terminated
+        );
+        // Rejected: the caller-owned policy refused; the child was reaped and
+        // observed terminated, so it is still the effect-free `Terminated` class.
+        let rejected: SuspendedValidationError<&str> =
+            SuspendedValidationError::Rejected("rejected");
+        assert_eq!(
+            super::pre_resume_child_outcome(&rejected),
+            super::PreResumeChildOutcome::Terminated
+        );
+        // UnknownOutcome: the platform could NOT observe the termination. This
+        // is the terminated-or-unknown branch that must retain the attempt.
+        let unknown: SuspendedValidationError<&str> = SuspendedValidationError::UnknownOutcome;
+        assert_eq!(
+            super::pre_resume_child_outcome(&unknown),
+            super::PreResumeChildOutcome::Unknown
+        );
+        // The Unknown class is a distinct value with a distinct label, so the
+        // two pre-resume branches can never be read back as one.
+        let terminated_refusal = super::PreResumeRefusal {
+            attempt_operation_id: operation_id.clone(),
+            process_tree_id: process_tree_id.clone(),
+            job_id: job_id.clone(),
+            image_id: image_id.clone(),
+            session_id: session_id.clone(),
+            outcome: super::PreResumeChildOutcome::Terminated,
+            start_phase: "authority-validation",
+        };
+        // The label and recovery action of the TERMINATED class are read here,
+        // BEFORE `unknown_refusal` borrows the struct field by field: a
+        // `..terminated_refusal` update moves the shared identity fields out of
+        // it, so any later borrow of the whole value would be a borrow of a
+        // partially moved struct (E0382). Taking both values first keeps
+        // `terminated_refusal` whole for the assertions below.
+        let terminated_label = terminated_refusal.child_outcome_label();
+        let terminated_recovery = terminated_refusal.recovery_action();
+        let unknown_refusal = super::PreResumeRefusal {
+            outcome: super::PreResumeChildOutcome::Unknown,
+            ..terminated_refusal
+        };
+        assert_ne!(
+            unknown_refusal.child_outcome_label(),
+            terminated_label,
+            "observed-terminated and unknown must not share one label"
+        );
+        // Both remain the effect-free PRE-resume class, because neither child
+        // ever resumed; the difference is only in whether the termination was
+        // observed, not in the recovery class.
+        assert_eq!(
+            unknown_refusal.recovery_action(),
+            super::PRE_RESUME_RECOVERY
+        );
+        assert_eq!(terminated_recovery, super::PRE_RESUME_RECOVERY);
+        Ok(())
+    }
+
+    /// Issue #1888 / AUD4: the POSITIVE case. A start that never failed before
+    /// resume must leave NO pre-resume refusal behind.
+    ///
+    /// This is the refusal-semantics guard in the other direction: the
+    /// retention must not fire merely because a launch happened, or because some
+    /// OTHER precondition later failed. A check that only fires when some
+    /// unrelated condition fails is not this item, so the healthy path is
+    /// asserted to record nothing.
+    #[test]
+    #[cfg(windows)]
+    fn aud4_successful_start_records_no_pre_resume_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (executor, request, operation_id) = s83_parts(
+            "aud4-positive",
+            vec!["/c".to_owned(), "exit 0".to_owned()],
+            30_000,
+        )?;
+        let sink = Arc::new(RecordingSink::default());
+        let sink_dyn: Arc<dyn ProcessEvidenceSink> = sink.clone();
+        block_on(executor.start(request, sink_dyn))?;
+        // A healthy start leaves the pre-resume retention empty for its own
+        // attempt: nothing failed before resume, so nothing is recorded there.
+        assert_eq!(
+            executor.pre_resume_refusal(&operation_id),
+            None,
+            "a successful start must not record a pre-resume refusal"
+        );
         Ok(())
     }
 }

@@ -32,8 +32,8 @@ use eliot_platform_windows::{
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
     DispatchValidationContext, FencingToken, KernelDispatchKey, OperationId, PermitIssuance,
-    ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
-    ProcessExecutor, ProcessIntent, ProcessRequest, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessIntent, ProcessRequest,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_user_broker_core::{
@@ -676,24 +676,6 @@ impl From<&IssuedOperationIdentity> for DurableIssuedIdentity {
     }
 }
 
-/// Retains observation-only process evidence without granting any additional
-/// authority to the broker or its callers.
-struct BrokerEvidenceSink {
-    records: Arc<Mutex<Vec<ProcessEvidence>>>,
-}
-
-impl ProcessEvidenceSink for BrokerEvidenceSink {
-    fn record(&self, evidence: ProcessEvidence) -> Result<(), eliot_process::EvidenceSinkError> {
-        self.records
-            .lock()
-            .map_err(|_| eliot_process::EvidenceSinkError {
-                message: "broker evidence lock poisoned".to_owned(),
-            })?
-            .push(evidence);
-        Ok(())
-    }
-}
-
 /// Ephemeral broker-owned P-03 authority.  The key is generated in memory at
 /// composition time and never crosses the launch-grant or stdin boundary;
 /// `DispatchPermitAuthority` supplies the one-shot replay fence.
@@ -800,7 +782,6 @@ impl DispatchValidationPort for BrokerDispatchAuthority {
 /// sealed P-03 request over EBP.
 struct PendingProcessStart {
     request: ProcessRequest,
-    stdin_payload: Option<Vec<u8>>,
     caller_request_id: String,
     grant_request_digest: String,
     process_request_digest: String,
@@ -810,13 +791,13 @@ struct LocalProcessPort {
     authority: Arc<BrokerDispatchAuthority>,
     executor: WindowsProcessExecutor,
     runtime: tokio::runtime::Runtime,
-    evidence: Arc<Mutex<Vec<ProcessEvidence>>>,
-    /// Sealed request and the exact one-shot standard-input bytes retained from
-    /// `prepare_start`. The bytes live here, not in the sealed `ProcessRequest`
-    /// (which is Kernel-signed P-03 effect material and must not grow a
-    /// request-content field), and they are read at the start boundary rather
-    /// than accepted again there, so the payload written to the child is the
-    /// payload the durably committed request digest was computed from.
+    /// Sealed request retained from `prepare_start` for the exact start that
+    /// consumes it.
+    ///
+    /// The one-shot standard-input bytes a request carries are bound by
+    /// `request.stdin_payload` inside the durable `request_digest` this entry
+    /// records; this composition refuses the launch below before any child
+    /// exists, so no separate payload copy is retained here.
     pending_requests: BTreeMap<OperationId, PendingProcessStart>,
     identity_issuer: Option<IssuerHandle>,
     last_lineage_recovery_required: Option<bool>,
@@ -837,7 +818,6 @@ impl LocalProcessPort {
             authority,
             executor,
             runtime,
-            evidence: Arc::new(Mutex::new(Vec::new())),
             pending_requests: BTreeMap::new(),
             identity_issuer: None,
             last_lineage_recovery_required: None,
@@ -946,7 +926,7 @@ impl ProcessPort for LocalProcessPort {
         &mut self,
         grant: &LaunchGrant,
         _registration: &RegistrationReceipt,
-        stdin_payload: Option<&str>,
+        _stdin_payload: Option<&str>,
     ) -> Result<String, PortError> {
         let request = self.request_from_grant(grant)?;
         let operation_id = request.operation_id().clone();
@@ -957,7 +937,6 @@ impl ProcessPort for LocalProcessPort {
                 operation_id,
                 PendingProcessStart {
                     request,
-                    stdin_payload: stdin_payload.map(<str>::as_bytes).map(<[u8]>::to_vec),
                     caller_request_id: grant.approved.request_id.clone(),
                     grant_request_digest: grant.request_digest.clone(),
                     process_request_digest: request_digest.clone(),
@@ -989,21 +968,73 @@ impl ProcessPort for LocalProcessPort {
                 "prepared process request digest changed".to_owned(),
             ));
         }
-        let sink = Arc::new(BrokerEvidenceSink {
-            records: self.evidence.clone(),
-        });
-        // The payload is the one retained at preparation, never one supplied at
-        // the start boundary, so the bytes the child reads are the bytes the
-        // durably committed request digest covers. `None` takes the same path
-        // `start_with_stdin` takes with no payload: the pipe is created, never
-        // written, and closed.
-        // `start_with_stdin` is the synchronous physical start, the same driver
-        // the async `ProcessExecutor::start` method reaches, so it is driven on
-        // this single-threaded runtime through `ready` rather than spawned.
-        let start =
-            self.executor
-                .start_with_stdin(pending.request, sink, pending.stdin_payload.as_deref());
-        let result = self.runtime.block_on(std::future::ready(start));
+        // I1.6's user-session section puts this binary in its OWN contour:
+        // "`eliot-user-broker.exe` runs under the interactive user's token, in
+        // its own Job Object and immutable generation", and the bounded repair
+        // for #1888 keeps it there: "Preserve the separate interactive-user/
+        // Broker contour; do not force unrelated launches into Kernel's
+        // domain." A broker child is therefore NOT a Kernel child and must not
+        // be presented with the Host-owned Kernel outer binding.
+        //
+        // It belongs to this process generation's own Job Object: the
+        // `Local\Eliot-UserBroker-Generation-<pid>-<start>` job that
+        // `own_generation_job::create_owned_generation_job` created, admitted
+        // this process, and that admits every child by Windows job-membership
+        // inheritance (`own_generation_job.rs`, "What this contour contains").
+        // That is the documented topology and it is the broker's own.
+        //
+        // The launch tuple that would have to carry that outer binding is
+        // missing at the owner that mints it, and this call site is not that
+        // owner:
+        //
+        // - `eliot_user_broker_core::LaunchGrant` (lib.rs:1126) and the
+        //   `ApprovedLaunch` it holds (lib.rs:775) retain NO Job binding. The
+        //   grant's `job_id` (lib.rs:780) is an opaque Kernel/N4-owned contour
+        //   identity, not a `RecoverableJobBinding`, and no grant field carries
+        //   one; `resource_selection` (lib.rs:1131) is native-resource
+        //   authority, not a Job binding.
+        // - `ApprovedLaunch::resource_limits` (lib.rs:806) is the P-03
+        //   `ResourceLimits` (crates/kernel/eliot-process/src/lib.rs:562:
+        //   wall timeout, stream caps, max descendants) and not the admitted
+        //   Module Manifest Job ceilings that `start_with_stdin` requires
+        //   alongside the binding; a launch without them is refused by the
+        //   executor itself (eliot-process-executor lib.rs:2321-2331).
+        // - `RecoverableJobBinding` (crates/kernel/eliot-platform-windows/src/
+        //   process_job_observation_models.rs:40) has `pub(super)` fields, and
+        //   its only constructor is
+        //   `SuspendedProcessEvidence::recoverable_job_binding` (process_job.rs
+        //   :1737), reachable only from a completed suspended launch. The
+        //   `JobObject` this generation owns (process_job.rs:347) exposes no
+        //   such builder, so its own Job cannot be presented as a binding from
+        //   this crate at all.
+        //
+        // The one executor shape that would admit this child without a
+        // Host-owned outer name is `LaunchOuterJobBinding::Unproven`
+        // (eliot-process-executor lib.rs:69-75), which reaches
+        // `spawn_named_with_limits` (lib.rs:2366). It is `#[cfg(test)]`: it is
+        // not compiled into a production build, and it is not a shim this
+        // call site may widen. Every production launch reaches
+        // `spawn_nested_in_kernel_outer_kill_domain` (process_job.rs:3237),
+        // which requires a `Local\Eliot-Host-Kernel-` outer name
+        // (process_job.rs:3244) and that this launching process is a member of
+        // that exact outer Job (process_job.rs:3251-3255). Passing the Kernel
+        // binding, synthesising such a name, or admitting a child without one
+        // would each put an interactive-user launch inside Kernel's kill
+        // domain, which the documentation forbids in as many words.
+        //
+        // So this launch is refused here, fail-closed, before any child exists.
+        // `map_error` projects the typed `Unavailable` to `PortError::Unavailable`,
+        // and the broker core maps that to the visible provider gap
+        // `BrokerError::PlanGap(RequiredProvider::P03Process)` while keeping
+        // the already-durable pre-effect cursor and its recovery obligation.
+        // This is a visible, honest unavailability, not a launch.
+        let result = Err(ProcessExecutionError::Unavailable(
+            "interactive-user broker launch requires its own per-generation Job \
+             binding and the admitted Module Manifest Job limits; the Kernel \
+             LaunchGrant carries neither, and that contour is not reachable \
+             through the Host-owned Kernel outer-binding launch path"
+                .to_owned(),
+        ));
         self.last_lineage_recovery_required = match &result {
             Ok(_) => Some(self.note_process_effect(
                 &pending.caller_request_id,

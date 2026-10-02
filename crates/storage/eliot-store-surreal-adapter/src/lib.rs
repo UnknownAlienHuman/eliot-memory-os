@@ -25,6 +25,7 @@ mod error;
 mod exclusive_admission;
 mod health;
 mod plan;
+pub mod provider_job;
 mod readiness;
 mod schema;
 mod schema_inventory;
@@ -65,6 +66,10 @@ use eliot_store_api::{
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
+pub use provider_job::{
+    ProviderKillDomain, ProviderKillOnCloseLease, fixture_provider_environment,
+    launch_fixture_provider, reap_refused_std_child, refusal_cause, spawn_provider_kill_on_close,
+};
 
 /// Server identity proved by the last ownership-verified authentication on
 /// the live provider transport (issue #1932).

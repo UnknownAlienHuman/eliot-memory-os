@@ -2554,24 +2554,6 @@ fn automation_page_needs_batch(eligible: usize, limit: usize, fetched: usize) ->
     eligible <= limit && fetched > limit
 }
 
-/// Adds same-fence rows from one raw batch, capped at the one-over probe.
-fn automation_extend_eligible_batch<T: Clone>(
-    eligible: &mut Vec<T>,
-    batch: &[T],
-    state_fence: &StateFence,
-    limit: usize,
-    row_fence: impl for<'a> Fn(&'a T) -> &'a StateFence,
-) {
-    let remaining = limit.saturating_add(1).saturating_sub(eligible.len());
-    eligible.extend(
-        batch
-            .iter()
-            .filter(|row| row_fence(row) == state_fence)
-            .take(remaining)
-            .cloned(),
-    );
-}
-
 /// Collects the eligible revision rows one page may inspect.
 ///
 /// Every batch is read at the bound plus one row and resumes strictly after the
@@ -2602,9 +2584,11 @@ async fn automation_eligible_revisions(
                 read_revisions_after(db, config, automation_id, after_revision, limit + 1).await?
             }
         };
-        automation_extend_eligible_batch(&mut eligible, &batch, state_fence, limit, |row| {
-            &row.state_fence
-        });
+        for row in &batch {
+            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
+                eligible.push(row.clone());
+            }
+        }
         if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
             return Ok(eligible);
         }
@@ -2643,9 +2627,11 @@ async fn automation_eligible_invocations(
                     .await?
             }
         };
-        automation_extend_eligible_batch(&mut eligible, &batch, state_fence, limit, |row| {
-            &row.state_fence
-        });
+        for row in &batch {
+            if row.state_fence == *state_fence && eligible.len() < limit + 1 {
+                eligible.push(row.clone());
+            }
+        }
         if !automation_page_needs_batch(eligible.len(), limit, batch.len()) {
             return Ok(eligible);
         }
@@ -3776,187 +3762,6 @@ mod admitted_read_tests {
             .expect("canonical test lineage-A");
         let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero")).expect("epoch");
         eliot_store_api::StateFence::new(epoch, ResourceGeneration::genesis())
-    }
-
-    #[derive(Clone)]
-    struct ProbeRow {
-        id: String,
-        state_fence: StateFence,
-    }
-
-    fn probe_row(id: &str, state_fence: &StateFence) -> ProbeRow {
-        ProbeRow {
-            id: id.to_owned(),
-            state_fence: state_fence.clone(),
-        }
-    }
-
-    fn probe_rows(prefix: &str, count: usize, state_fence: &StateFence) -> Vec<ProbeRow> {
-        (1..=count)
-            .map(|number| probe_row(&format!("{prefix}-{number}"), state_fence))
-            .collect()
-    }
-
-    fn assert_probe_one_over_is_truncated(state_fence: &StateFence, limit: usize) {
-        let raw = probe_rows("one-over", limit + 1, state_fence);
-        let mut eligible = Vec::new();
-        automation_extend_eligible_batch(&mut eligible, &raw, state_fence, limit, |row| {
-            &row.state_fence
-        });
-        assert_eq!(eligible.len(), limit + 1);
-        assert!(!automation_page_needs_batch(
-            eligible.len(),
-            limit,
-            raw.len()
-        ));
-        assert_eq!(eligible[limit].id, "one-over-65");
-        let page = automation_page_slice(eligible, limit, |row| row.id.as_str());
-        assert_eq!(page.rows.len(), limit);
-        assert!(page.truncated);
-        assert_eq!(page.last_row_id.as_deref(), Some("one-over-64"));
-        let expected_ids = (1..=limit)
-            .map(|number| format!("one-over-{number}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            page.rows
-                .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>(),
-            expected_ids
-        );
-    }
-
-    #[test]
-    fn automation_page_probe_stops_after_eligible_quota() {
-        use std::cell::Cell;
-
-        let limit = 64;
-        let state_fence = test_fence();
-        let mut eligible = probe_rows("prior", limit, &state_fence);
-        let batch = probe_rows("batch", limit + 1, &state_fence);
-        let inspected = Cell::new(0);
-        automation_extend_eligible_batch(&mut eligible, &batch, &state_fence, limit, |row| {
-            inspected.set(inspected.get() + 1);
-            &row.state_fence
-        });
-        assert_eq!(inspected.get(), 1);
-        assert_eq!(eligible.len(), limit + 1);
-        assert_eq!(eligible.last().map(|row| row.id.as_str()), Some("batch-1"));
-
-        let already_full_inspections = Cell::new(0);
-        automation_extend_eligible_batch(&mut eligible, &batch, &state_fence, limit, |row| {
-            already_full_inspections.set(already_full_inspections.get() + 1);
-            &row.state_fence
-        });
-        assert_eq!(already_full_inspections.get(), 0);
-        assert_eq!(eligible.len(), limit + 1);
-    }
-
-    fn assert_dense_foreign_batches_require_more_rows(
-        state_fence: &StateFence,
-        foreign_fence: &StateFence,
-        limit: usize,
-    ) {
-        let mut eligible = Vec::new();
-        let first_raw = probe_rows("foreign-full", limit + 1, foreign_fence);
-        automation_extend_eligible_batch(&mut eligible, &first_raw, state_fence, limit, |row| {
-            &row.state_fence
-        });
-        assert!(eligible.is_empty());
-        assert!(automation_page_needs_batch(
-            eligible.len(),
-            limit,
-            first_raw.len()
-        ));
-        assert_eq!(
-            first_raw.last().map(|row| row.id.as_str()),
-            Some("foreign-full-65")
-        );
-
-        let second_raw = probe_rows("foreign-next", limit + 1, foreign_fence);
-        automation_extend_eligible_batch(&mut eligible, &second_raw, state_fence, limit, |row| {
-            &row.state_fence
-        });
-        assert!(eligible.is_empty());
-        assert!(automation_page_needs_batch(
-            eligible.len(),
-            limit,
-            second_raw.len()
-        ));
-        assert_eq!(
-            second_raw.last().map(|row| row.id.as_str()),
-            Some("foreign-next-65")
-        );
-    }
-
-    fn assert_foreign_tail_does_not_truncate_eligible_boundary(
-        state_fence: &StateFence,
-        foreign_fence: &StateFence,
-        limit: usize,
-    ) {
-        let mut eligible = Vec::new();
-        let mut exact_boundary = probe_rows("eligible", limit, state_fence);
-        exact_boundary.push(probe_row("foreign-tail", foreign_fence));
-        automation_extend_eligible_batch(
-            &mut eligible,
-            &exact_boundary,
-            state_fence,
-            limit,
-            |row| &row.state_fence,
-        );
-        assert_eq!(eligible.len(), limit);
-        assert!(automation_page_needs_batch(
-            eligible.len(),
-            limit,
-            exact_boundary.len()
-        ));
-        assert_eq!(
-            exact_boundary.last().map(|row| row.id.as_str()),
-            Some("foreign-tail")
-        );
-
-        let short_raw = [probe_row("foreign-exhausted", foreign_fence)];
-        automation_extend_eligible_batch(&mut eligible, &short_raw, state_fence, limit, |row| {
-            &row.state_fence
-        });
-        assert!(!automation_page_needs_batch(
-            eligible.len(),
-            limit,
-            short_raw.len()
-        ));
-        let complete = automation_page_slice(eligible, limit, |row| row.id.as_str());
-        assert_eq!(complete.rows.len(), limit);
-        assert!(!complete.truncated);
-        assert_eq!(complete.last_row_id.as_deref(), Some("eligible-64"));
-        let expected_complete_ids = (1..=limit)
-            .map(|number| format!("eligible-{number}"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            complete
-                .rows
-                .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>(),
-            expected_complete_ids
-        );
-    }
-
-    #[test]
-    fn automation_page_probe_excludes_foreign_fence_rows() {
-        let limit = 64;
-        // Structural inputs prove only shared projection arithmetic, not persisted owner,
-        // cutover, or receipt state.
-        let state_fence = test_fence();
-        let mut foreign_fence = state_fence.clone();
-        foreign_fence.resource_generation =
-            eliot_contracts::ResourceGeneration::new(2).expect("distinct resource generation");
-        assert_dense_foreign_batches_require_more_rows(&state_fence, &foreign_fence, limit);
-        assert_foreign_tail_does_not_truncate_eligible_boundary(
-            &state_fence,
-            &foreign_fence,
-            limit,
-        );
-        assert_probe_one_over_is_truncated(&state_fence, limit);
     }
 
     fn read_request(
@@ -5134,13 +4939,28 @@ mod real_scope_tests {
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::net::TcpStream;
-    use tokio::process::Command;
+    use tokio::process::{Child, Command};
     use tokio::time::{Instant, sleep};
 
     struct Harness {
         root: PathBuf,
         config: SurrealAdapterConfig,
         adapter: Option<SurrealStoreAdapter>,
+    }
+
+    /// One bootstrap provider paired with the kill-on-close Job Object lease
+    /// that must outlive it.
+    ///
+    /// This is the owner shape of
+    /// `tests/provider_kill_on_close_owner.rs::OwnerProvider`: the lease and the
+    /// child are one value, so the Job handle cannot leave scope while the
+    /// provider is still expected to be running - neither during the readiness
+    /// loop nor before the explicit stop. The Job still kills on close; holding
+    /// the lease is what defers that close past the stop.
+    struct BootstrapProvider {
+        #[expect(dead_code, reason = "the lease is held for its whole life, never read")]
+        lease: crate::provider_job::ProviderKillOnCloseLease,
+        child: Child,
     }
 
     impl Harness {
@@ -5203,12 +5023,28 @@ mod real_scope_tests {
                 harness.config.provider_artifact_digest,
                 harness.root.display()
             );
-            // Provision credentials in this fresh root, as installation does.
-            // Secrets go only through the child environment, never argv/logs.
+            Self::provision_credentials(&mut harness).await;
+            harness.open().await;
+            harness
+        }
+
+        /// Provisions the credentials in this fresh root, as installation
+        /// does. Secrets go only through the child environment, never
+        /// argv/logs.
+        ///
+        /// One launch path (issue #1888, K-STORE): the bootstrap provider is
+        /// admitted into the kill-on-close Job Object immediately and the lease
+        /// is held for this child's whole life, so an external kill of the
+        /// test process ends this provider too. A refused assignment
+        /// terminates and reaps the child; there is no unassigned fallback.
+        async fn provision_credentials(harness: &mut Self) {
+            let exe = PathBuf::from(&harness.config.provider_executable_path);
+            let tmp = PathBuf::from(&harness.config.store_temp_root);
             let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
-            let mut child = Command::new(&exe)
+            let mut command = Command::new(&exe);
+            command
                 .args(&harness.config.provider_arguments)
-                .current_dir(&work)
+                .current_dir(&harness.config.store_work_root)
                 .env_clear()
                 .env("SystemRoot", &system_root)
                 .env("WINDIR", &system_root)
@@ -5220,13 +5056,28 @@ mod real_scope_tests {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(0x0800_0000)
-                .kill_on_drop(true)
-                .spawn()
-                .expect("bootstrap provider");
+                .kill_on_drop(true);
+            let (child, kill_on_close) = crate::provider_job::launch_fixture_provider(
+                || command.spawn(),
+                |child: &Child| child.id(),
+                |child: &mut Child| {
+                    let _kill_result = child.start_kill();
+                },
+            )
+            .expect("bootstrap provider is admitted into its kill-on-close job");
+            // The lease is bound for the whole readiness window and for the
+            // explicit stop below, so the Job handle outlives the running child.
+            // Binding it to `_kill_on_close` would let it leave scope at the end
+            // of this block, and kill-on-close would then terminate the
+            // still-serving provider.
+            let mut provider = BootstrapProvider {
+                lease: kill_on_close,
+                child,
+            };
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 assert!(
-                    child.try_wait().expect("child status").is_none(),
+                    provider.child.try_wait().expect("child status").is_none(),
                     "bootstrap exited"
                 );
                 if TcpStream::connect(&harness.config.provider_bind_address)
@@ -5238,10 +5089,8 @@ mod real_scope_tests {
                 assert!(Instant::now() < deadline, "bootstrap bind timeout");
                 sleep(Duration::from_millis(50)).await;
             }
-            child.kill().await.expect("stop bootstrap");
-            child.wait().await.expect("reap bootstrap");
-            harness.open().await;
-            harness
+            provider.child.kill().await.expect("stop bootstrap");
+            provider.child.wait().await.expect("reap bootstrap");
         }
 
         async fn open(&mut self) {

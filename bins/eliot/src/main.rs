@@ -50,6 +50,7 @@ use std::{
 };
 use tracing_subscriber::EnvFilter;
 
+mod binary_generation_staging;
 mod bootstrap_draft;
 mod canary_removal_entry;
 mod controlboard_status;

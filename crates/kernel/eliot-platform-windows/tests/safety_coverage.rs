@@ -295,8 +295,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "process_job.rs",
-        sites: 58,
-        blocks: 57,
+        sites: 59,
+        blocks: 58,
         impls: 1,
         externs: 0,
     },

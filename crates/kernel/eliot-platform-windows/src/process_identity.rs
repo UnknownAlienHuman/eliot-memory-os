@@ -32,7 +32,114 @@ use serde::{Deserialize, Serialize};
 
 use crate::WindowsAdapterError;
 use crate::last_windows_adapter_error;
+use crate::process_job::ExecutionIdentityMode;
 use crate::sid_to_string;
+
+/// Declared name of the `I1.6` `system_service` execution identity.
+///
+/// `I1.6` requires that "`system_service` uses a dedicated low-privilege
+/// service identity". The name is the existing installation-profile vocabulary
+/// (`InstallationProfile::SystemService`), and this constant is the one place
+/// in this crate that spells it, so a launch declaration and this selector
+/// cannot drift into two different literals.
+pub const SYSTEM_SERVICE_EXECUTION_IDENTITY_NAME: &str = "system_service";
+
+/// Declared name of the `I1.6` `user_mode` execution identity.
+///
+/// `I1.6` requires that "`user_mode` runs under the current user without
+/// pretending to be an SCM service". The name is the existing
+/// installation-profile vocabulary (`InstallationProfile::UserMode`).
+pub const USER_MODE_EXECUTION_IDENTITY_NAME: &str = "user_mode";
+
+/// Selects the [`ExecutionIdentityMode`] one declared identity name names.
+///
+/// This is the admitted, deterministic selection `W4` asks for. It is a total
+/// function over the two names `I1.6` defines and nothing else: a launch
+/// declares one of them, this maps it to exactly one mode, and the mode is the
+/// value the platform launch path then resolves to a concrete token and
+/// re-checks against the still-suspended child. It is deliberately not a
+/// "best effort" mapping — an unrecognized name is refused rather than
+/// defaulted, because defaulting here would let a launch quietly run under an
+/// identity it never declared, which is the SCM pretence `I1.6` forbids.
+///
+/// `portable_dev` is refused for the same reason and is named here only to be
+/// refused: it is an installation profile, not one of the two execution
+/// identities `I1.6` defines, so there is no `ExecutionIdentityMode` it can
+/// honestly select.
+///
+/// # Errors
+/// Returns `InvalidInput` for any name that is not exactly one of the two
+/// declared execution identities. It never falls back to a default mode.
+pub fn select_execution_identity_mode(
+    name: &str,
+) -> Result<ExecutionIdentityMode, WindowsAdapterError> {
+    match name {
+        SYSTEM_SERVICE_EXECUTION_IDENTITY_NAME => Ok(ExecutionIdentityMode::SystemService),
+        USER_MODE_EXECUTION_IDENTITY_NAME => Ok(ExecutionIdentityMode::UserMode),
+        _ => Err(WindowsAdapterError::InvalidInput),
+    }
+}
+
+/// Returns the exact declared name of the identity this mode selects.
+///
+/// This is the observable, comparable half of the selection: the mode chosen
+/// by [`select_execution_identity_mode`] renders back to the one name `I1.6`
+/// spells, so the identity a launch used is readable and comparable rather
+/// than a branch that happened to be taken. It is the exact inverse of the
+/// selection over the two declared names.
+#[must_use]
+pub fn execution_identity_mode_name(mode: ExecutionIdentityMode) -> &'static str {
+    match mode {
+        ExecutionIdentityMode::SystemService => SYSTEM_SERVICE_EXECUTION_IDENTITY_NAME,
+        ExecutionIdentityMode::UserMode => USER_MODE_EXECUTION_IDENTITY_NAME,
+    }
+}
+
+/// The identity one declared `I1.6` name actually resolves to on this machine.
+///
+/// `I1.6` binds two different principals to the two names, and a selection that
+/// did not prove it had picked a *different* one for each would be two branches
+/// that happen to both reach the caller's own token. This binds the name to the
+/// account SID that identity is required to run under, so the two names are
+/// comparable and are observably distinct: `system_service` is the dedicated
+/// low-privilege service account, and `user_mode` is whatever the current
+/// interactive user is — which is exactly the distinction `I1.6` draws when it
+/// says a `user_mode` launch must run "under the current user without pretending
+/// to be an SCM service".
+///
+/// This is a pure read of the two principals; it opens no token and creates
+/// nothing, so it is available on every target and safe to call from admission.
+/// The launch itself opens the token (`open_dedicated_low_privilege_service_token`
+/// for `system_service`) and re-checks the launched child against it before
+/// resume; this value is what that check is compared against.
+///
+/// # Errors
+/// Returns `IdentityMismatch` when `user_mode` is declared from one of the
+/// built-in service accounts. There is no current *user* there, and returning
+/// the service SID as if it were one is precisely the SCM pretence `I1.6`
+/// forbids, so the launch is refused rather than silently run as the service.
+/// Returns a typed adapter error when a well-known SID cannot be read.
+#[cfg(windows)]
+pub fn selected_execution_identity_sid(name: &str) -> Result<String, WindowsAdapterError> {
+    match select_execution_identity_mode(name)? {
+        // The dedicated low-privilege service identity, named by its own
+        // well-known SID rather than by account text.
+        ExecutionIdentityMode::SystemService => dedicated_low_privilege_service_sid(),
+        // The current user, read from this process's own token. The SID is
+        // whatever the launcher actually is, not an assumed one.
+        ExecutionIdentityMode::UserMode => {
+            // `current_process_sid` is the crate's existing safe read of this
+            // process's own token SID, so this selector introduces no new
+            // handle and no new unsafe site.
+            let sid =
+                crate::current_process_sid().map_err(|_| WindowsAdapterError::IdentityMismatch)?;
+            if is_well_known_service_account_sid(&sid) {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Ok(sid)
+        }
+    }
+}
 
 #[derive(
     Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -172,6 +279,175 @@ pub fn is_process_builtin_administrator() -> Result<bool, WindowsAdapterError> {
     }
 }
 
+/// Token of the dedicated low-privilege service identity `I1.6` requires for
+/// `system_service`.
+///
+/// `I1.6` says `system_service` "uses a dedicated low-privilege service
+/// identity". Both adjectives are load-bearing and both rule out
+/// `LocalSystem` (`S-1-5-18`), which is the identity most "service identity"
+/// code reaches for and which is the opposite of low-privilege: it is a
+/// machine-administrator principal whose token carries the machine's full
+/// authority, so a child launched under it inherits that authority regardless
+/// of the Job Object containment applied around it. The well-known Local Service
+/// account is the dedicated, named, restricted service principal Windows
+/// reserves for exactly this role: it exists only to run a service, it is not an
+/// interactive user, and its token carries none of the user's credentials.
+///
+/// The token is obtained by a service-type logon of that account and is then
+/// re-read through [`token_identity`] and compared against the `S-1-5-19`
+/// well-known SID built by the same `CreateWellKnownSid` mechanism this module
+/// already uses in [`token_is_builtin_administrator`]. A token that is not the
+/// declared account's is discarded rather than returned, so this function can
+/// only ever hand back the identity it documents.
+///
+/// `NetworkService` is deliberately not the choice: `I1.6` binds a
+/// `system_service` contour that does not need outbound network identity, and the
+/// lower-privilege principal is the defensible reading of the same adjective
+/// pair.
+///
+/// # Errors
+/// Returns `Unavailable` when the machine cannot produce this dedicated
+/// service token — the caller must treat that launch as unavailable and must
+/// never fall back to the current process token, because running under the
+/// caller is exactly the pretending `I1.6` forbids. Returns `IdentityMismatch`
+/// when Windows hands back a token that is not the declared account's.
+#[cfg(windows)]
+pub(crate) fn open_dedicated_low_privilege_service_token()
+-> Result<crate::OwnedProcessHandle, WindowsAdapterError> {
+    use crate::OwnedProcessHandle;
+    use crate::nul_terminated_wide;
+    use crate::windows_adapter_from_io;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
+        SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenPrimary,
+    };
+
+    let account = nul_terminated_wide(std::ffi::OsStr::new(LOCAL_SERVICE_ACCOUNT_NAME))
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let domain = nul_terminated_wide(std::ffi::OsStr::new("."))
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let mut source: HANDLE = std::ptr::null_mut();
+    // SAFETY: `account` and `domain` are live NUL-terminated wide strings and
+    // `source` is a valid output pointer. `LOGON32_LOGON_SERVICE` names the
+    // machine service-account logon, which never acquires an interactive user's
+    // credentials, and a null password selects this account's machine-managed
+    // credential.
+    if unsafe {
+        LogonUserW(
+            account.as_ptr(),
+            domain.as_ptr(),
+            std::ptr::null(),
+            LOGON32_LOGON_SERVICE,
+            LOGON32_PROVIDER_DEFAULT,
+            &raw mut source,
+        )
+    } == 0
+    {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let mut primary: HANDLE = std::ptr::null_mut();
+    // SAFETY: `source` is a live token handle just returned by `LogonUserW`,
+    // and `primary` is a valid output pointer. `TokenPrimary` is required by
+    // `CreateProcessAsUserW`, which cannot create from an impersonation token.
+    let duplicated = unsafe {
+        DuplicateTokenEx(
+            source,
+            TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &raw mut primary,
+        )
+    };
+    // SAFETY: `source` is a live owned handle that this scope no longer needs.
+    unsafe { CloseHandle(source) };
+    if duplicated == 0 {
+        return Err(WindowsAdapterError::Unavailable);
+    }
+    let Ok(token) = OwnedProcessHandle::new(primary) else {
+        // SAFETY: `primary` is a live owned handle that `OwnedProcessHandle`
+        // just refused to wrap, so it has no other owner.
+        unsafe { CloseHandle(primary) };
+        return Err(WindowsAdapterError::Unavailable);
+    };
+
+    if token_identity(token.0)?.0 != dedicated_low_privilege_service_sid()? {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(token)
+}
+
+/// Textual SID of the dedicated low-privilege service account this module
+/// selects.
+///
+/// `open_dedicated_low_privilege_service_token` uses this to reject a token that
+/// is not the declared account's before it hands the token to any launcher.
+///
+/// # Errors
+/// Returns a typed adapter error when the well-known SID cannot be built or
+/// stringified.
+#[cfg(windows)]
+fn dedicated_low_privilege_service_sid() -> Result<String, WindowsAdapterError> {
+    well_known_sid_text(windows_sys::Win32::Security::WinLocalServiceSid)
+}
+
+/// Reports whether `sid` is one of Windows' built-in service accounts.
+///
+/// `I1.6` requires `user_mode` to run "under the current user without pretending
+/// to be an SCM service". A launcher that is itself one of these accounts has no
+/// current *user* to run under: a child it creates inherits a machine service
+/// token, so declaring `user_mode` there would be precisely the pretending the
+/// clause forbids. The caller refuses instead.
+#[cfg(windows)]
+pub(crate) fn is_well_known_service_account_sid(sid: &str) -> bool {
+    [
+        windows_sys::Win32::Security::WinLocalSystemSid,
+        windows_sys::Win32::Security::WinLocalServiceSid,
+        windows_sys::Win32::Security::WinNetworkServiceSid,
+    ]
+    .into_iter()
+    .any(|kind| well_known_sid_text(kind).is_ok_and(|text| text == sid))
+}
+
+/// Builds one well-known SID and renders it as text.
+#[cfg(windows)]
+fn well_known_sid_text(
+    kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE,
+) -> Result<String, WindowsAdapterError> {
+    use windows_sys::Win32::Security::{CreateWellKnownSid, SECURITY_MAX_SID_SIZE};
+    let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid_bytes = u32::try_from(sid.len()).map_err(|_| WindowsAdapterError::Failed)?;
+    // SAFETY: `sid` is a live `SECURITY_MAX_SID_SIZE` buffer and `sid_bytes`
+    // carries its exact length.
+    if unsafe {
+        CreateWellKnownSid(
+            kind,
+            std::ptr::null_mut(),
+            sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    // SAFETY: `sid` holds exactly the valid SID bytes `CreateWellKnownSid`
+    // just wrote.
+    sid_to_string(sid.as_ptr().cast_mut().cast())
+}
+
+/// Account name of the dedicated low-privilege service identity.
+#[cfg(windows)]
+const LOCAL_SERVICE_ACCOUNT_NAME: &str = "LocalService";
+
+/// Reads back the user SID and session ID of the token one live process runs
+/// under, so a launch can prove which identity it actually created rather than
+/// asserting one.
+///
+/// # Errors
+/// Returns a typed adapter error when the process token cannot be opened or
+/// queried. `OpenProcessToken` needs `PROCESS_QUERY_LIMITED_INFORMATION` on
+/// the process, which is why every caller passes a handle it already owns.
 #[cfg(windows)]
 pub(crate) fn process_token_identity(
     process: windows_sys::Win32::Foundation::HANDLE,

@@ -3,6 +3,7 @@ use eliot_engine::{
     WriteAdmissionService, WriterActor, WriterConfig,
 };
 use eliot_store::{CanonicalStore, ControlWal};
+use eliot_store_surreal_adapter::ProviderKillOnCloseLease;
 use eliot_types::{
     CoChangeEdge, ConceptNode, ControlWalConfig, CredentialProviderKind, GovernorConfig,
     HotspotScore, MiningRun, ModuleCard, OnboardingTestHook, ProjectCharter, ProjectId,
@@ -361,11 +362,31 @@ impl Drop for Harness {
     }
 }
 
-struct OwnedChild(Option<Child>);
+struct OwnedChild {
+    child: Option<Child>,
+    /// The retained kill-on-close Job Object handle for the provider
+    /// (#1888, K-STORE). It is held beside the child for the provider's whole
+    /// life, never read: dropping it closes the last handle to the Job and is
+    /// what ends the provider when this owner ends. `Drop` order runs
+    /// `OwnedChild::stop` first, so the child is killed and reaped explicitly
+    /// before that close.
+    #[expect(
+        dead_code,
+        reason = "the lease is held for the provider's whole life, never read: dropping it is what ends the provider"
+    )]
+    kill_on_close: ProviderKillOnCloseLease,
+}
 
 impl OwnedChild {
+    fn new(child: Child, kill_on_close: ProviderKillOnCloseLease) -> Self {
+        Self {
+            child: Some(child),
+            kill_on_close,
+        }
+    }
+
     fn stop(&mut self) -> TestResult {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             if child.try_wait()?.is_none() {
                 child.kill()?;
             }
@@ -395,8 +416,17 @@ fn start_surreal(exe: &Path, password: &str) -> TestResult<(OwnedChild, u16)> {
     Err("SurrealDB could not claim a UL-06 test port in 8700-8799".into())
 }
 
+/// Starts the fixture provider through the one job-owned launch path
+/// (#1888, K-STORE).
+///
+/// The spawned child is admitted into a kill-on-close Job Object immediately,
+/// before the provider is used, and the lease travels with it in `OwnedChild`
+/// across this port-probing loop, so a provider abandoned on a port that never
+/// came up still ends with its owner. A refused admission kills and reaps the
+/// child instead of continuing uncontained.
 fn spawn_surreal(exe: &Path, password: &str, port: u16) -> TestResult<OwnedChild> {
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .env("SURREAL_USER", "root")
         .env("SURREAL_PASS", password)
         .arg("start")
@@ -412,9 +442,13 @@ fn spawn_surreal(exe: &Path, password: &str, port: u16) -> TestResult<OwnedChild
         .arg("memory")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    Ok(OwnedChild(Some(child)))
+        .stderr(Stdio::inherit());
+    let (child, kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+        || command.spawn(),
+        |child: &Child| Some(child.id()),
+        eliot_store_surreal_adapter::reap_refused_std_child,
+    )?;
+    Ok(OwnedChild::new(child, kill_on_close))
 }
 
 fn pinned_surreal_exe() -> TestResult<PathBuf> {
@@ -434,7 +468,7 @@ fn wait_for_tcp(surreal: &mut OwnedChild, port: u16, timeout: Duration) -> TestR
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if surreal
-            .0
+            .child
             .as_mut()
             .ok_or("SurrealDB child missing during startup")?
             .try_wait()?
@@ -445,7 +479,7 @@ fn wait_for_tcp(surreal: &mut OwnedChild, port: u16, timeout: Duration) -> TestR
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             std::thread::sleep(Duration::from_millis(50));
             return Ok(surreal
-                .0
+                .child
                 .as_mut()
                 .ok_or("SurrealDB child missing after startup")?
                 .try_wait()?

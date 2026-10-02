@@ -68,7 +68,11 @@
 
 use crate::canonical_store::envelope_with_text_fragments;
 #[cfg(all(test, feature = "live-edge"))]
+use crate::surreal_server::assign_owned_server_to_kill_on_close_job;
+#[cfg(all(test, feature = "live-edge"))]
 use crate::{CanonicalClaimCard, CanonicalStore, CanonicalToolObservation, DbClientSet};
+#[cfg(all(test, feature = "live-edge"))]
+use eliot_platform_windows::JobObject;
 use eliot_types::{
     AgentId, ClaimCardInput, ClaimId, EpistemicStatus, EvidenceAtomInput, EvidenceId,
     FailureFingerprintInput, IdempotencyOptions, LifecycleStatus, LifecycleWriteOptions,
@@ -198,6 +202,22 @@ fn require_live_edge() -> TestResult<String> {
 struct ScratchServer {
     child: Option<Child>,
     storage_dir: PathBuf,
+    /// Sole owning handle of the kill-on-close Job Object this scratch server is
+    /// assigned to (issue #1888, package K-STORE).
+    ///
+    /// `drop`-based cleanup alone cannot end this server when the test process
+    /// is terminated from the outside, because no `Drop` and no
+    /// `kill_on_drop` ever runs in that case. Holding this handle makes the
+    /// scratch provider end with its owner: the kernel evaluates
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` when the value drops, and whenever
+    /// the owning process itself ends for any reason.
+    ///
+    /// `JobObject` is a raw-kernel handle owner and deliberately implements no
+    /// `Debug`, and `ScratchServer` implements no `Debug` either, so nothing
+    /// here can print a live handle. The `Option` is what lets `Drop` release
+    /// the handle explicitly, in the right order, before the data root is
+    /// removed; it is never `None` outside `Drop` itself.
+    kill_on_close_job: Option<JobObject>,
 }
 
 #[cfg(all(test, feature = "live-edge"))]
@@ -213,6 +233,13 @@ impl Drop for ScratchServer {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
+        // The Job handle is released BEFORE the data root is removed, so the
+        // kernel has already terminated every process assigned to it and the
+        // server is no longer holding the rocksdb directory. Dropping the last
+        // handle to a kill-on-close Job terminates its assigned set; this is the
+        // in-process equivalent of the kernel closing it when the test process
+        // itself ends.
+        drop(self.kill_on_close_job.take());
         let _ = std::fs::remove_dir_all(&self.storage_dir);
     }
 }
@@ -255,10 +282,29 @@ fn spawn_scratch(exe: &str, bind: &str, test_tag: &str) -> TestResult<(ScratchSe
         let _ = std::fs::remove_dir_all(&storage_dir);
         format!("failed to spawn scratch surreal ({exe}): {error}")
     })?;
+    // One launch path (issue #1888, K-STORE): the spawned scratch server is
+    // admitted into the same kill-on-close Job Object machinery the supervised
+    // owned server uses (`assign_owned_server_to_kill_on_close_job` in
+    // `crate::surreal_server`), so this fixture defines no second launch path of
+    // its own. The Job is created and the child assigned immediately after
+    // `spawn()` and before the server is used, so there is no window in which a
+    // running scratch provider is uncontained, and the returned handle is held
+    // for the server's whole life. A refused assignment terminates the child
+    // this call already created and returns a typed error: the refused launch
+    // leaves no running server and there is no unassigned fallback.
+    let kill_on_close_job = match assign_owned_server_to_kill_on_close_job(child.id()) {
+        Ok(job) => job,
+        Err(error) => {
+            let _kill_result = child.start_kill();
+            let _ = std::fs::remove_dir_all(&storage_dir);
+            return Err(error.into());
+        }
+    };
     Ok((
         ScratchServer {
             child: Some(child),
             storage_dir,
+            kill_on_close_job: Some(kill_on_close_job),
         },
         password,
     ))

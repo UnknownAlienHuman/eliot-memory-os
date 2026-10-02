@@ -114,7 +114,9 @@ opaque_id!(
 );
 
 /// A reference to a secret provider entry. It never contains the secret.
-#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
     provider: String,
@@ -259,8 +261,191 @@ pub enum EnvironmentInheritance {
     /// The child receives only explicitly supplied values.
     #[default]
     None,
-    /// The executor may merge a platform allowlist, never secrets.
+    /// The child receives only the ambient values this projection's
+    /// [`EnvironmentAllowSet`] names, plus the values it declares itself.
+    ///
+    /// The set is explicit: with no grant there is no set, so this policy is
+    /// refused rather than honoured as "merge whatever the platform has".
     Allowlisted,
+}
+
+/// One explicit grant of one secret to one launch.
+///
+/// The grant is stated as a provider and a key, never as a value, and it
+/// carries no material beyond that pair: the same [`SecretRef`] the projection
+/// already carries, wrapped so the allow-set can hold it in canonical order
+/// and compare two grants by exact provider/key equality. Whether a value is
+/// actually resolved for a granted reference is the owner port's decision at
+/// the effect boundary; nothing in this contract can turn a grant into a
+/// secret.
+///
+/// [`SecretRef`] is documented as "A reference to a secret provider entry. It
+/// never contains the secret", so naming one admits a reference to the
+/// contract, not the secret itself.
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct SecretGrantRef {
+    reference: SecretRef,
+}
+
+impl SecretGrantRef {
+    /// Wraps one provider/key reference as a grant of that provider entry.
+    ///
+    /// # Errors
+    /// Returns `ContractError` when the reference names an empty, oversized,
+    /// or control-character-bearing provider or key.
+    pub fn new(reference: SecretRef) -> Result<Self, ContractError> {
+        validate_opaque_id("secret_provider", reference.provider().to_owned())?;
+        validate_opaque_id("secret_key", reference.key().to_owned())?;
+        Ok(Self { reference })
+    }
+
+    /// Returns the exact provider/key pair this grant names.
+    pub const fn reference(&self) -> &SecretRef {
+        &self.reference
+    }
+}
+
+/// The explicit allowed environment set of one launch.
+///
+/// This is the allow-set [`EnvironmentInheritance::Allowlisted`] names, and it
+/// is an ALLOW-SET BUILT BEFORE LAUNCH, not a denylist applied to the parent
+/// environment after the child exists: it names exactly the inherited values a
+/// child may receive, and every name outside it is absent by construction
+/// because it was never named.
+///
+/// It carries the [`SecretGrantRef`]s of the grant alongside those names. Each
+/// one is a provider/key pair that never contains the secret, so a granted
+/// set still admits no secret VALUE here: it records WHICH grant applies, and
+/// resolving a value for it is the owner port's decision, not this
+/// contract's.
+///
+/// `Default` is the empty set and is what an ungranted launch carries, so
+/// "models and third-party Modules do not inherit secrets by default"
+/// (I1.6) is realised by construction rather than by filtering: with no
+/// explicit grant there is no set, and the executor builds the child's
+/// environment from the projection alone.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentAllowSet {
+    #[serde(default)]
+    names: BTreeSet<String>,
+    /// The explicit grants this set admits. Empty is the default.
+    #[serde(default)]
+    grants: BTreeSet<SecretGrantRef>,
+}
+
+impl EnvironmentAllowSet {
+    /// Creates the allowed set from exact names and grant references.
+    ///
+    /// This is the one constructor that admits a non-empty set, so it is the
+    /// only place a caller states "inherit exactly this". It fails closed on
+    /// any name the contract cannot put in an environment block and on any
+    /// secret-like name, because such a name has no value in an ambient
+    /// environment that is not itself secret material.
+    ///
+    /// Both halves of the set are bounded by the same [`MAX_ENVIRONMENT_ENTRIES`]
+    /// ceiling. A grant is a provider/key pair and never a value, so a bounded
+    /// set of grants still admits no secret material; the bound is what keeps
+    /// "one explicit set" from being an unbounded credential list, and it is
+    /// why the grant half cannot be asserted at a size the name half beside it
+    /// would already have refused.
+    ///
+    /// # Errors
+    /// Returns `LimitExceeded` past [`MAX_ENVIRONMENT_ENTRIES`] on either
+    /// half, `InvalidOpaqueValue` for an empty, oversized, or malformed name,
+    /// and `SecretBoundary` for a name that is itself secret-like.
+    pub fn new(
+        names: impl IntoIterator<Item = String>,
+        grants: impl IntoIterator<Item = SecretGrantRef>,
+    ) -> Result<Self, ContractError> {
+        let mut allowed = BTreeSet::new();
+        for name in names {
+            validate_environment_name(&name)?;
+            if is_secret_like(&name) {
+                return Err(ContractError::SecretBoundary {
+                    field: "inherited_environment_names",
+                });
+            }
+            allowed.insert(name);
+        }
+        let grants = grants.into_iter().collect::<BTreeSet<_>>();
+        if allowed.len() > MAX_ENVIRONMENT_ENTRIES {
+            return Err(ContractError::LimitExceeded {
+                field: "inherited_environment_names",
+                limit: MAX_ENVIRONMENT_ENTRIES,
+            });
+        }
+        if grants.len() > MAX_ENVIRONMENT_ENTRIES {
+            return Err(ContractError::LimitExceeded {
+                field: "inherited_environment_grants",
+                limit: MAX_ENVIRONMENT_ENTRIES,
+            });
+        }
+        Ok(Self {
+            names: allowed,
+            grants,
+        })
+    }
+
+    /// Returns the exact inherited names this set admits.
+    pub fn names(&self) -> &BTreeSet<String> {
+        &self.names
+    }
+
+    /// Returns the explicit grants this set admits, in canonical order.
+    pub fn grants(&self) -> &BTreeSet<SecretGrantRef> {
+        &self.grants
+    }
+
+    /// Returns true when this set names anything at all.
+    ///
+    /// An empty set is the absent grant: the inheritance policy that permits
+    /// one is refused rather than honoured.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty() && self.grants.is_empty()
+    }
+
+    /// Returns whether this exact name is admitted.
+    pub fn permits(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// Returns whether a grant of this exact reference is admitted.
+    pub fn permits_reference(&self, reference: &SecretRef) -> bool {
+        self.grants
+            .iter()
+            .any(|grant| grant.reference() == reference)
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        if self.names.len() > MAX_ENVIRONMENT_ENTRIES {
+            return Err(ContractError::LimitExceeded {
+                field: "inherited_environment_names",
+                limit: MAX_ENVIRONMENT_ENTRIES,
+            });
+        }
+        // The grant half is bounded by the same ceiling here, so a wire value
+        // restored without `EnvironmentAllowSet::new` is refused on exactly the
+        // same boundary the constructor refuses it on.
+        if self.grants.len() > MAX_ENVIRONMENT_ENTRIES {
+            return Err(ContractError::LimitExceeded {
+                field: "inherited_environment_grants",
+                limit: MAX_ENVIRONMENT_ENTRIES,
+            });
+        }
+        for name in &self.names {
+            validate_environment_name(name)?;
+            if is_secret_like(name) {
+                return Err(ContractError::SecretBoundary {
+                    field: "inherited_environment_names",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A secret-safe environment projection.
@@ -273,6 +458,9 @@ pub struct EnvironmentProjection {
     secret_refs: Vec<SecretRef>,
     #[serde(default)]
     inheritance: EnvironmentInheritance,
+    /// The explicit allowed environment set. Empty unless a grant names one.
+    #[serde(default)]
+    allowed: EnvironmentAllowSet,
 }
 
 impl EnvironmentProjection {
@@ -281,6 +469,31 @@ impl EnvironmentProjection {
         non_secret: BTreeMap<String, String>,
         secret_refs: Vec<SecretRef>,
         inheritance: EnvironmentInheritance,
+    ) -> Result<Self, ContractError> {
+        Self::with_allowed(
+            non_secret,
+            secret_refs,
+            inheritance,
+            EnvironmentAllowSet::default(),
+        )
+    }
+
+    /// Builds a projection that also carries the explicit allowed environment
+    /// set of its grant.
+    ///
+    /// This is the constructor that admits inheritance at all. With
+    /// [`EnvironmentAllowSet::default`], which is what [`Self::new`] passes and
+    /// what every existing caller passes, the set is empty and nothing is
+    /// inherited, so the existing construction keeps its exact meaning.
+    ///
+    /// # Errors
+    /// Returns the same failures as [`Self::new`] for the plain map, plus
+    /// [`EnvironmentAllowSet::new`]'s failures for the allowed names.
+    pub fn with_allowed(
+        non_secret: BTreeMap<String, String>,
+        secret_refs: Vec<SecretRef>,
+        inheritance: EnvironmentInheritance,
+        allowed: EnvironmentAllowSet,
     ) -> Result<Self, ContractError> {
         if non_secret.len() > MAX_ENVIRONMENT_ENTRIES {
             return Err(ContractError::LimitExceeded {
@@ -304,10 +517,18 @@ impl EnvironmentProjection {
                 });
             }
         }
+        // An `Allowlisted` policy with an empty set stays admissible HERE so an
+        // existing caller that states the policy without a grant keeps minting
+        // exactly what it minted before. The refusal lives at the launch
+        // boundary instead, where every start actually passes: the executor
+        // refuses an `Allowlisted` policy whose set is empty, so the policy can
+        // never resolve to "inherit whatever the process happens to have".
+        allowed.validate()?;
         Ok(Self {
             non_secret,
             secret_refs,
             inheritance,
+            allowed,
         })
     }
 
@@ -326,11 +547,33 @@ impl EnvironmentProjection {
         self.inheritance
     }
 
+    /// Returns the explicit allowed environment set of this launch.
+    ///
+    /// An empty set is the normal, default state of an ungranted launch.
+    #[must_use]
+    pub const fn allowed(&self) -> &EnvironmentAllowSet {
+        &self.allowed
+    }
+
+    /// Returns whether this projection admits any inherited environment or
+    /// handle at all.
+    ///
+    /// This is the contract-level statement of the default-deny rule: it is
+    /// true for every projection built by [`Self::new`] and for every
+    /// deserialised default, so "an ungranted launch receives zero secret
+    /// material" is a structural property of the value rather than a check
+    /// applied to a child's environment after it exists.
+    #[must_use]
+    pub fn is_ungranted(&self) -> bool {
+        self.allowed.is_empty() && self.secret_refs.is_empty()
+    }
+
     fn validate(&self) -> Result<(), ContractError> {
-        Self::new(
+        Self::with_allowed(
             self.non_secret.clone(),
             self.secret_refs.clone(),
             self.inheritance,
+            self.allowed.clone(),
         )
         .map(|_| ())
     }
@@ -3621,6 +3864,63 @@ mod tests {
         let restored: ProcessEvidence = serde_json::from_value(wire)?;
         assert_eq!(restored.axes().status, EvidenceStatus::Verified);
         assert!(restored.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_environment_set_is_empty_by_default_and_never_names_a_secret() -> TestResult {
+        // An ungranted launch: the default set is empty, the policy is the
+        // default `None`, and nothing is inherited.
+        let ungranted = EnvironmentProjection::new(
+            BTreeMap::from([("MODE".to_owned(), "test".to_owned())]),
+            Vec::new(),
+            EnvironmentInheritance::None,
+        )?;
+        assert!(ungranted.is_ungranted());
+        assert!(ungranted.allowed().is_empty());
+        assert!(!ungranted.allowed().permits("PATH"));
+        let ungranted_reference = SecretRef::new("credential_manager", "provider/token")?;
+        assert!(!ungranted.allowed().permits_reference(&ungranted_reference));
+
+        // The default state is also what the wire restores.
+        let restored: EnvironmentProjection =
+            serde_json::from_value(serde_json::to_value(&ungranted)?)?;
+        assert_eq!(restored, ungranted);
+        assert!(restored.is_ungranted());
+
+        // A grant names the exact environment it inherits, and nothing else.
+        let granted_reference = SecretRef::new("credential_manager", "provider/token")?;
+        let granted = EnvironmentProjection::with_allowed(
+            BTreeMap::new(),
+            Vec::new(),
+            EnvironmentInheritance::Allowlisted,
+            EnvironmentAllowSet::new(
+                ["PATH".to_owned(), "SYSTEMROOT".to_owned()],
+                [SecretGrantRef::new(granted_reference.clone())?],
+            )?,
+        )?;
+        assert!(!granted.is_ungranted());
+        assert!(granted.allowed().permits("PATH"));
+        assert!(!granted.allowed().permits("ANYNAME"));
+        assert!(granted.allowed().permits_reference(&granted_reference));
+
+        // A secret-like NAME is refused even when a grant states it: the
+        // allow-set admits no secret material by name.
+        assert!(matches!(
+            EnvironmentAllowSet::new(["API_TOKEN".to_owned()], []),
+            Err(ContractError::SecretBoundary { .. })
+        ));
+
+        // An `Allowlisted` policy with an empty set names nothing, so it can only
+        // ever build the same block the `None` policy builds. The launch-boundary
+        // refusal that makes that unarguable is in the executor.
+        let policy_only = EnvironmentProjection::new(
+            BTreeMap::new(),
+            Vec::new(),
+            EnvironmentInheritance::Allowlisted,
+        )?;
+        assert!(policy_only.is_ungranted());
+        assert!(policy_only.allowed().is_empty());
         Ok(())
     }
 

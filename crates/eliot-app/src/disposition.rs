@@ -133,11 +133,6 @@ const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     ConsumerSurface {
-        path: "integrations/opencode/plugins/eliot.js",
-        live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
-        body: OPENCODE_PLUGIN,
-    },
-    ConsumerSurface {
         path: "plugin/eliot-governor/.codex-plugin/plugin.json",
         live_reference: "\"name\": \"eliot-governor\"",
         body: CODEX_PLUGIN_METADATA,
@@ -148,24 +143,9 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         body: WINDOWS_RELEASE_BUILD,
     },
     ConsumerSurface {
-        path: "scripts/build-claude-desktop-extension.ps1",
-        live_reference: "server\\eliot-governor.exe",
-        body: CLAUDE_DESKTOP_BUILD,
-    },
-    ConsumerSurface {
         path: "docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md",
         live_reference: "eliot-governor --config",
         body: CREDENTIAL_RUNBOOK,
-    },
-    ConsumerSurface {
-        path: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
-        live_reference: "server/eliot-governor.exe mcp stdio",
-        body: CLAUDE_DESKTOP_GUIDE,
-    },
-    ConsumerSurface {
-        path: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
-        live_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-        body: CLAUDE_CODE_PLUGIN_GUIDE,
     },
     ConsumerSurface {
         path: "integrations/claude/eliot/README.md",
@@ -191,21 +171,6 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "integrations/codex/route-profile.json",
         live_reference: "\"path\": \"plugin/eliot-governor/.mcp.json\"",
         body: CODEX_ROUTE_PROFILE,
-    },
-    ConsumerSurface {
-        path: "scripts/test-claude-connector.ps1",
-        live_reference: "'release\\eliot-governor.exe'",
-        body: CLAUDE_CONNECTOR_TEST,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/claude-desktop/README.md",
-        live_reference: "cargo build --release -p eliot-app",
-        body: CLAUDE_DESKTOP_README,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/claude-desktop/mcpb/README.md",
-        live_reference: "`eliot-governor.exe`",
-        body: CLAUDE_DESKTOP_MCPB_README,
     },
     ConsumerSurface {
         path: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
@@ -1141,13 +1106,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             expiry: "remove by 2026-12-31, when the Codex Governor plugin subtree is removed together with the accepted #18 consumer and retirement evidence under #1719",
         },
         ConsumerEntry {
-            consumer: "OpenCode host integration",
-            proof: "integrations/opencode/plugins/eliot.js",
-            live_reference: "host-integrations/opencode/bin/eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when OpenCode resolves its governor executable to a current root binary under #13",
-        },
-        ConsumerEntry {
             consumer: "Windows x64 release bundle staging",
             proof: "scripts/build-eliot-windows-x64-release.ps1",
             live_reference: "integrations/codex/plugins/eliot-governor/bin/eliot-governor.exe",
@@ -1155,32 +1113,11 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             expiry: "remove by 2026-12-31, when the release bundle no longer stages eliot-governor.exe at root or plugin bin",
         },
         ConsumerEntry {
-            consumer: "Claude Desktop MCPB package staging",
-            proof: "scripts/build-claude-desktop-extension.ps1",
-            live_reference: "server\\eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the packaged MCPB server is a current root binary under #11",
-        },
-        ConsumerEntry {
             consumer: "Operator credential runbook",
             proof: "docs/operations/SURREALDB_CREDENTIAL_AUTHORITY.md",
             live_reference: "eliot-governor --config",
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when the runbook targets bins/eliot under #11",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop operator guide",
-            proof: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
-            live_reference: "server/eliot-governor.exe mcp stdio",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the guide targets the current root server binary under #11",
-        },
-        ConsumerEntry {
-            consumer: "Claude Code operator guide",
-            proof: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
-            live_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the guide documents the agent-bridge front door under #13",
         },
         ConsumerEntry {
             consumer: "Claude plugin operator README",
@@ -1216,27 +1153,6 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "\"path\": \"plugin/eliot-governor/.mcp.json\"",
             disposition: Disposition::ExtractToCurrentOwner,
             expiry: "remove when the codex route profile names current-owner surfaces under #13",
-        },
-        ConsumerEntry {
-            consumer: "Claude connector install-layout test",
-            proof: "scripts/test-claude-connector.ps1",
-            live_reference: "'release\\eliot-governor.exe'",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when connector tests target the current root server binary under #11",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop package build instructions",
-            proof: "integrations/claude/claude-desktop/README.md",
-            live_reference: "cargo build --release -p eliot-app",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the package instructions build and stage the current owner server under #11/#18",
-        },
-        ConsumerEntry {
-            consumer: "Claude Desktop MCPB package instructions",
-            proof: "integrations/claude/claude-desktop/mcpb/README.md",
-            live_reference: "`eliot-governor.exe`",
-            disposition: Disposition::TemporaryFixture,
-            expiry: "remove by 2026-12-31, when the MCPB guide names only the current owner server under #11/#18",
         },
         ConsumerEntry {
             consumer: "Legacy UL cross-agent reference MCP client",
@@ -1304,6 +1220,10 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
 /// `legacy_reference` is the retired legacy invocation and must be absent
 /// from `proof`; `current_owner_reference` is the current-owner route text
 /// and must be present. `evidence` records how the migration was performed.
+///
+/// `Copy` so a refusal case can regress one field of a declared row without
+/// borrowing the declared table itself.
+#[derive(Debug, Clone, Copy)]
 pub struct MigratedConsumerEdge {
     /// Named calling surface, never a bare command name.
     pub consumer: &'static str,
@@ -1376,12 +1296,68 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; opencode is a bridge-delegated host whose facade entry gate already redirects default-profile mcp stdio to this argv (crates/eliot-app/src/main.rs::BRIDGE_DELEGATED_MCP_HOSTS and crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served on the admitted SPINE_FUNCTIONAL contour through the Kernel front door with no Governor, Store, WAL, or writer construction",
     },
     MigratedConsumerEdge {
+        consumer: "OpenCode plugin host-event bridge transport",
+        proof: "integrations/opencode/plugins/eliot.js",
+        legacy_reference: "host-integrations/opencode/bin/eliot-governor.exe",
+        current_owner_reference: "bins/eliot-agent-bridge/src/opencode_host_events.rs::serve_host_events",
+        current_owner: "bins/eliot-agent-bridge (loopback host-events HTTP server)",
+        evidence: "the one-shot process fallback is gone from the plugin: bridgeExecutable, invokeLegacyProcessBridge, ELIOT_GOVERNOR_EXE and Bun.spawn were deleted, and the plugin no longer resolves or launches any governor executable. invokeBridge (integrations/opencode/plugins/eliot.js:676-707) reaches only the loopback host-event route built by httpBridgeConfiguration (eliot.js:400-434), which reads ELIOT_OPENCODE_BRIDGE_URL and POSTs /v1/host-events to the current owner's server, and returns a typed ActionGate failure when no such route is configured; the retired `eliot-governor.exe host event` arm was refused unconditionally at the facade dispatch entry gate anyway (crates/eliot-app/src/main.rs:2258-2271), so the deleted fallback could only ever have launched a process that refuses its own argv",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Code plugin lifecycle-hooks architecture guide",
+        proof: "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
+        legacy_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+        current_owner_reference: "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour and hook intake)",
+        evidence: "the front-door-selection section now documents the current owner for this host tree: the tracked host config declares one `eliot` server at ${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe with mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration, hooks/hooks.json invokes the same bridge's `hook <event>` intake, and no legacy Governor hook is invoked from this tree. The retained `eliot-governor host install/activate/doctor` operator lines in the install snippets are the separate Governor installer surface, not this guide's documented MCP/hook route",
+    },
+    MigratedConsumerEdge {
         consumer: "Codex plugin install route",
         proof: "integrations/codex/marketplace.json",
         legacy_reference: "\"command\": \"bin/eliot-governor.exe\"",
         current_owner_reference: "\"command\": \"bin/eliot-agent-bridge.exe\"",
         current_owner: "bins/eliot-agent-bridge (codex_controller MCP access edge; scope/capability admission in cli_contract)",
         evidence: "the default-installed marketplace entry now declares its MCP server route explicitly as the bridge (integrations/codex/marketplace.json plugins[eliot-governor].eliot_mcp_server): bridge argv mcp --profile codex_controller --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>, matching the staged plugin manifest the release builder stages beside the retained governor copy, binds in RELEASE.json codex_plugin_bridge, and verifies; the install policy and legacy plugin directory identity are unchanged and the installed plugin launches nothing but the bridge",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude connector install-layout and MCP surface test",
+        proof: "scripts/test-claude-connector.ps1",
+        legacy_reference: "'bin\\eliot-governor.exe'",
+        current_owner_reference: "'bin\\eliot-agent-bridge.exe'",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "the migrated surfaces of this test are the staged-artifact and MCP arms: it resolves its canonical release binary from cargo metadata as release\\eliot-agent-bridge.exe (the same metadata.target_directory path the packager and the Windows x64 release builder copy from), compares the installed Claude Code plugin bridge, the staged claude-desktop-mcpb\\eliot-agent-bridge\\server\\eliot-agent-bridge.exe and the packager's recorded bridge_sha256 against that one digest, and drives both compact MCP surfaces through the bridge argv the tracked host manifests declare. Two facade facts are retained in the same file and are deliberately NOT part of this row's asserted pair: the release\\eliot-governor.exe path, which resolves only the retained `host doctor` host-installer probe (scripts/test-claude-connector.ps1:113-115) that has no agent-bridge counterpart (the bridge front doors are mcp/hook/host-events/loopback-http) and therefore proves host surface selection rather than a staged artifact, and the `eliot-governor host install/activate` operator lines the guide still documents; neither is a migrated edge and neither is checked here",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop MCPB package staging",
+        proof: "scripts/build-claude-desktop-extension.ps1",
+        legacy_reference: "server\\eliot-governor.exe",
+        current_owner_reference: "server\\eliot-agent-bridge.exe",
+        current_owner: "bins/eliot-agent-bridge (packaged MCPB server binary)",
+        evidence: "the packager resolves release\\eliot-agent-bridge.exe from cargo metadata when no -BridgeExe is passed, stages it as server\\eliot-agent-bridge.exe, and refuses to continue unless the staged bridge file exists; the retired `& $GovernorExe mcp catalog --host claude --surface desktop` invocation is gone, so the script no longer runs a command its own entry gate rejects",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop operator guide",
+        proof: "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md",
+        legacy_reference: "server/eliot-governor.exe mcp stdio",
+        current_owner_reference: "server/eliot-agent-bridge.exe mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration ${__dirname}/server/agent-bridge/client-declaration-v2.json",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "the guide's embedded server command block now names the bridge argv the packaged manifest declares, and the prose states the packaged server is the current-owner agent bridge rather than the retired facade; the retained & $governor host install/activate/doctor lines are the separate current Governor installer surface",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop package build instructions",
+        proof: "integrations/claude/claude-desktop/README.md",
+        legacy_reference: "cargo build --release -p eliot-app",
+        current_owner_reference: "cargo build --release -p eliot-agent-bridge --bin eliot-agent-bridge",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "the build snippet now builds the packaged server's owning binary instead of the facade package, and the surrounding prose describes the same release eliot-agent-bridge.exe used by other hosts",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Desktop MCPB package instructions",
+        proof: "integrations/claude/claude-desktop/mcpb/README.md",
+        legacy_reference: "`eliot-governor.exe`",
+        current_owner_reference: "`eliot-agent-bridge.exe`",
+        current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
+        evidence: "the bundle description now names the single release eliot-agent-bridge.exe the package ships and states it constructs no Governor, Store, WAL, or writer object",
     },
 ];
 
@@ -1390,6 +1366,13 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
     match path {
         "plugin/eliot-governor/.mcp.json" => Some(CODEX_PLUGIN_MCP),
         "integrations/claude/claude-desktop/mcpb/manifest.json" => Some(CLAUDE_DESKTOP_MCPB),
+        "scripts/test-claude-connector.ps1" => Some(CLAUDE_CONNECTOR_TEST),
+        "scripts/build-claude-desktop-extension.ps1" => Some(CLAUDE_DESKTOP_BUILD),
+        "docs/integrations/claude/CLAUDE_DESKTOP_MCPB.md" => Some(CLAUDE_DESKTOP_GUIDE),
+        "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md" => Some(CLAUDE_CODE_PLUGIN_GUIDE),
+        "integrations/claude/claude-desktop/README.md" => Some(CLAUDE_DESKTOP_README),
+        "integrations/claude/claude-desktop/mcpb/README.md" => Some(CLAUDE_DESKTOP_MCPB_README),
+        "integrations/opencode/plugins/eliot.js" => Some(OPENCODE_PLUGIN),
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
         "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
         "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
@@ -1410,36 +1393,47 @@ pub fn migrated_edge_guard() -> Result<(), String> {
         );
     }
     for edge in MIGRATED_CONSUMER_EDGES {
-        if edge.consumer.is_empty()
-            || edge.proof.is_empty()
-            || edge.legacy_reference.is_empty()
-            || edge.current_owner_reference.is_empty()
-            || edge.current_owner.is_empty()
-            || edge.evidence.is_empty()
-        {
-            return Err(
-                "migrated consumer edge is missing consumer, proof, references, owner, or evidence"
-                    .to_owned(),
-            );
-        }
-        let Some(body) = migrated_proof_body(edge.proof) else {
-            return Err(format!(
-                "migrated consumer edge proof {} is not a baked migrated file",
-                edge.proof
-            ));
-        };
-        if body.contains(edge.legacy_reference) {
-            return Err(format!(
-                "migrated consumer edge {} still names the legacy invocation {:?}",
-                edge.proof, edge.legacy_reference
-            ));
-        }
-        if !body.contains(edge.current_owner_reference) {
-            return Err(format!(
-                "migrated consumer edge {} no longer names its current-owner route {:?}; the migration regressed or the proof is wrong",
-                edge.proof, edge.current_owner_reference
-            ));
-        }
+        migrated_edge_row_is_live(edge)?;
+    }
+    Ok(())
+}
+
+/// The one row check [`migrated_edge_guard`] runs, over one declared row.
+///
+/// The guard is the loop over [`MIGRATED_CONSUMER_EDGES`]; this is its body,
+/// unchanged and in the same order, so the startup caller and the refusal
+/// cases exercise exactly the same predicates against the baked proof rather
+/// than a re-implementation of them.
+fn migrated_edge_row_is_live(edge: &MigratedConsumerEdge) -> Result<(), String> {
+    if edge.consumer.is_empty()
+        || edge.proof.is_empty()
+        || edge.legacy_reference.is_empty()
+        || edge.current_owner_reference.is_empty()
+        || edge.current_owner.is_empty()
+        || edge.evidence.is_empty()
+    {
+        return Err(
+            "migrated consumer edge is missing consumer, proof, references, owner, or evidence"
+                .to_owned(),
+        );
+    }
+    let Some(body) = migrated_proof_body(edge.proof) else {
+        return Err(format!(
+            "migrated consumer edge proof {} is not a baked migrated file",
+            edge.proof
+        ));
+    };
+    if body.contains(edge.legacy_reference) {
+        return Err(format!(
+            "migrated consumer edge {} still names the legacy invocation {:?}",
+            edge.proof, edge.legacy_reference
+        ));
+    }
+    if !body.contains(edge.current_owner_reference) {
+        return Err(format!(
+            "migrated consumer edge {} no longer names its current-owner route {:?}; the migration regressed or the proof is wrong",
+            edge.proof, edge.current_owner_reference
+        ));
     }
     Ok(())
 }
@@ -1449,44 +1443,78 @@ pub fn migrated_edge_guard() -> Result<(), String> {
 /// no inventory entry, when a retained path carries two dispositions, or when
 /// an inventory proof is not one of the baked surfaces.
 pub fn consumer_disposition_guard() -> Result<(), String> {
+    consumer_disposition_guard_with_inventory(current_consumer_inventory())
+}
+
+/// The body of [`consumer_disposition_guard`], over an explicit inventory.
+///
+/// The declared guard is that body with [`current_consumer_inventory`] as the
+/// inventory and the two loops it runs. Only the inventory the guard reads is a
+/// parameter, so the startup caller keeps running exactly the predicates it
+/// always ran while a refusal case can present one declared row without editing
+/// the declared tables.
+fn consumer_disposition_guard_with_inventory(inventory: &[ConsumerEntry]) -> Result<(), String> {
     if CONSUMER_SURFACES.is_empty() {
         return Err("no facade consumer surface is baked; the inventory guard is blind".to_owned());
     }
     for surface in CONSUMER_SURFACES {
-        if !surface.body.contains(surface.live_reference) {
-            return Err(format!(
-                "baked facade consumer surface {} no longer contains its recorded live reference {:?}",
-                surface.path, surface.live_reference
-            ));
-        }
-        let recorded = inventory_entries_for(surface.path);
-        let Some(entry) = recorded.first() else {
-            return Err(format!(
-                "baked facade consumer surface {} still reaches the legacy binary through {:?} but has no inventory entry",
-                surface.path, surface.live_reference
-            ));
-        };
-        if recorded.len() > 1 {
-            return Err(format!(
-                "retained path {} carries {} dispositions; exactly one disposition per retained path is required",
-                surface.path,
-                recorded.len()
-            ));
-        }
-        if entry.live_reference != surface.live_reference {
-            return Err(format!(
-                "inventory entry for {} records live reference {:?} but the baked surface records {:?}",
-                surface.path, entry.live_reference, surface.live_reference
-            ));
-        }
+        consumer_surface_row_is_live_with_inventory(surface, inventory)?;
     }
-    for entry in current_consumer_inventory() {
+    for entry in inventory {
         if baked_surface(entry.proof).is_none() {
             return Err(format!(
                 "inventory proof {} is not one of the baked facade consumer surfaces",
                 entry.proof
             ));
         }
+    }
+    Ok(())
+}
+
+/// The one declared-surface check [`consumer_disposition_guard`] runs, over
+/// one baked surface and the inventory rows citing it.
+fn consumer_surface_row_is_live(surface: &ConsumerSurface) -> Result<(), String> {
+    consumer_surface_row_is_live_with_inventory(surface, current_consumer_inventory())
+}
+
+/// The body of [`consumer_surface_row_is_live`], over an explicit inventory.
+///
+/// The extracted row check is that body with [`current_consumer_inventory`] as
+/// the inventory: unchanged and in the same order, so the startup caller and
+/// the refusal cases exercise exactly the same predicates against the baked
+/// proof rather than a re-implementation of them.
+fn consumer_surface_row_is_live_with_inventory(
+    surface: &ConsumerSurface,
+    inventory: &[ConsumerEntry],
+) -> Result<(), String> {
+    if !surface.body.contains(surface.live_reference) {
+        return Err(format!(
+            "baked facade consumer surface {} no longer contains its recorded live reference {:?}",
+            surface.path, surface.live_reference
+        ));
+    }
+    let recorded: Vec<&ConsumerEntry> = inventory
+        .iter()
+        .filter(|entry| entry.proof == surface.path)
+        .collect();
+    let Some(entry) = recorded.first() else {
+        return Err(format!(
+            "baked facade consumer surface {} still reaches the legacy binary through {:?} but has no inventory entry",
+            surface.path, surface.live_reference
+        ));
+    };
+    if recorded.len() > 1 {
+        return Err(format!(
+            "retained path {} carries {} dispositions; exactly one disposition per retained path is required",
+            surface.path,
+            recorded.len()
+        ));
+    }
+    if entry.live_reference != surface.live_reference {
+        return Err(format!(
+            "inventory entry for {} records live reference {:?} but the baked surface records {:?}",
+            surface.path, entry.live_reference, surface.live_reference
+        ));
     }
     Ok(())
 }
@@ -1500,31 +1528,43 @@ fn assert_inventory_entries_are_live() -> Result<(), String> {
         return Err("facade disposition inventory is empty".to_owned());
     }
     for entry in inventory {
-        if entry.consumer.is_empty() || entry.proof.is_empty() || entry.expiry.is_empty() {
-            return Err("facade inventory entry is missing consumer, proof, or expiry".to_owned());
-        }
-        if entry.live_reference.is_empty() {
-            return Err(format!(
-                "facade inventory entry {} records no live reference",
-                entry.proof
-            ));
-        }
-        let live = baked_surface(entry.proof)
-            .is_some_and(|surface| surface.body.contains(entry.live_reference));
-        if entry.disposition == Disposition::Remove && live {
-            return Err(format!(
-                "recorded removal of {} has not happened: the file still contains the legacy invocation {:?}",
-                entry.proof, entry.live_reference
-            ));
-        }
-        if entry.disposition != Disposition::Remove && !live {
-            return Err(format!(
-                "recorded {} for {} is not backed by its proof: {:?} is absent from that file, so the edge migrated or the proof is wrong",
-                entry.disposition.label(),
-                entry.proof,
-                entry.live_reference
-            ));
-        }
+        inventory_entry_row_is_live(entry)?;
+    }
+    Ok(())
+}
+
+/// The one row check [`assert_inventory_entries_are_live`] runs, over one
+/// declared inventory row and the baked surface it cites.
+///
+/// The guard is the loop over [`current_consumer_inventory`]; this is its body,
+/// unchanged and in the same order, so the startup caller and the refusal
+/// cases exercise exactly the same predicates against the baked proof rather
+/// than a re-implementation of them.
+fn inventory_entry_row_is_live(entry: &ConsumerEntry) -> Result<(), String> {
+    if entry.consumer.is_empty() || entry.proof.is_empty() || entry.expiry.is_empty() {
+        return Err("facade inventory entry is missing consumer, proof, or expiry".to_owned());
+    }
+    if entry.live_reference.is_empty() {
+        return Err(format!(
+            "facade inventory entry {} records no live reference",
+            entry.proof
+        ));
+    }
+    let live = baked_surface(entry.proof)
+        .is_some_and(|surface| surface.body.contains(entry.live_reference));
+    if entry.disposition == Disposition::Remove && live {
+        return Err(format!(
+            "recorded removal of {} has not happened: the file still contains the legacy invocation {:?}",
+            entry.proof, entry.live_reference
+        ));
+    }
+    if entry.disposition != Disposition::Remove && !live {
+        return Err(format!(
+            "recorded {} for {} is not backed by its proof: {:?} is absent from that file, so the edge migrated or the proof is wrong",
+            entry.disposition.label(),
+            entry.proof,
+            entry.live_reference
+        ));
     }
     Ok(())
 }
@@ -1952,4 +1992,525 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
     facade_surface_guard()?;
     crate::cell_declaration_registry::cell_declaration_guard()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CLAUDE_CODE_PLUGIN_GUIDE, CLAUDE_CONNECTOR_TEST, CONSUMER_SURFACES, ConsumerEntry,
+        ConsumerSurface, Disposition, MIGRATED_CONSUMER_EDGES, MigratedConsumerEdge,
+        OPENCODE_PLUGIN, OPENCODE_README, baked_surface, consumer_disposition_guard,
+        consumer_disposition_guard_with_inventory, consumer_surface_row_is_live,
+        current_consumer_inventory, inventory_entries_for, inventory_entry_row_is_live,
+        migrated_edge_guard, migrated_edge_row_is_live, migrated_proof_body,
+        run_facade_disposition_guards,
+    };
+
+    /// The row [`MIGRATED_CONSUMER_EDGES`] declares for `proof`, owned so a
+    /// refusal case can regress one field without touching the declared table.
+    fn declared_edge(proof: &str) -> MigratedConsumerEdge {
+        let edge = MIGRATED_CONSUMER_EDGES
+            .iter()
+            .find(|edge| edge.proof == proof)
+            .unwrap_or_else(|| panic!("no migrated consumer edge declares {proof}"));
+        MigratedConsumerEdge {
+            consumer: edge.consumer,
+            proof: edge.proof,
+            legacy_reference: edge.legacy_reference,
+            current_owner_reference: edge.current_owner_reference,
+            current_owner: edge.current_owner,
+            evidence: edge.evidence,
+        }
+    }
+
+    /// The row [`current_consumer_inventory`] declares for `proof`, owned.
+    fn declared_entry(proof: &str) -> ConsumerEntry {
+        let entry = current_consumer_inventory()
+            .iter()
+            .find(|entry| entry.proof == proof)
+            .unwrap_or_else(|| panic!("no facade inventory entry cites {proof}"));
+        ConsumerEntry {
+            consumer: entry.consumer,
+            proof: entry.proof,
+            live_reference: entry.live_reference,
+            disposition: entry.disposition,
+            expiry: entry.expiry,
+        }
+    }
+
+    /// The [`CONSUMER_SURFACES`] row for `path`, rebaked onto `body`.
+    fn declared_surface(path: &str, body: &'static str) -> ConsumerSurface {
+        let surface = CONSUMER_SURFACES
+            .iter()
+            .find(|surface| surface.path == path)
+            .unwrap_or_else(|| panic!("{path} is not a declared facade consumer surface"));
+        ConsumerSurface {
+            path: surface.path,
+            live_reference: surface.live_reference,
+            body,
+        }
+    }
+
+    /// One inventory row copied from [`current_consumer_inventory`], owned so a
+    /// refusal case can cite a proof or reference of its own without touching
+    /// the declared inventory.
+    ///
+    /// The borrowed row supplies the real consumer/proof/expiry of a declared
+    /// entry; `live_reference` and `disposition` are supplied by the caller.
+    fn fixture_entry(declared: &ConsumerEntry, live_reference: &'static str) -> ConsumerEntry {
+        let consumer = declared.consumer;
+        ConsumerEntry {
+            consumer,
+            proof: declared.proof,
+            live_reference,
+            disposition: declared.disposition,
+            expiry: declared.expiry,
+        }
+    }
+
+    #[test]
+    fn disposition_guards_pass_on_the_baked_tree() {
+        // `main` runs this suite on the spawned startup thread before
+        // `Cli::parse()`, so an `Err` here is a non-zero exit for every
+        // subcommand. These are the three guards the stale rows made fail.
+        run_facade_disposition_guards()
+            .expect("the facade disposition guard suite must pass on the current baked files");
+        migrated_edge_guard().expect("migrated edge guard must pass on the current baked files");
+        consumer_disposition_guard()
+            .expect("consumer disposition guard must pass on the current baked files");
+    }
+
+    #[test]
+    fn repaired_rows_are_no_longer_declared_as_live_facade_consumers() {
+        // A migrated proof may carry exactly one disposition. These three edges
+        // migrated, so they belong to MIGRATED_CONSUMER_EDGES only; re-declaring
+        // one as a live surface or a retained inventory row would both fail
+        // consumer_disposition_guard and claim an edge twice.
+        for path in [
+            "integrations/opencode/plugins/eliot.js",
+            "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
+            "scripts/test-claude-connector.ps1",
+        ] {
+            assert!(
+                CONSUMER_SURFACES.iter().all(|surface| surface.path != path),
+                "{path} migrated off the facade and must not stay a live consumer surface"
+            );
+            assert!(
+                current_consumer_inventory()
+                    .iter()
+                    .all(|entry| entry.proof != path),
+                "{path} migrated off the facade and must not stay a retained inventory row"
+            );
+        }
+        for path in [
+            "integrations/opencode/plugins/eliot.js",
+            "docs/integrations/claude/CLAUDE_CODE_PLUGIN.md",
+        ] {
+            assert!(
+                MIGRATED_CONSUMER_EDGES
+                    .iter()
+                    .any(|edge| edge.proof == path),
+                "{path} migrated off the facade and must be proven by a migrated-edge row"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_plugin_row_pins_the_deleted_governor_spawn_to_the_loopback_bridge() {
+        let edge = declared_edge("integrations/opencode/plugins/eliot.js");
+        // The retired executable fallback is gone from the baked plugin.
+        assert!(
+            !OPENCODE_PLUGIN.contains("host-integrations/opencode/bin/eliot-governor.exe"),
+            "the OpenCode plugin must not resolve the retired governor executable again"
+        );
+        assert!(
+            !OPENCODE_PLUGIN.contains("ELIOT_GOVERNOR_EXE"),
+            "the OpenCode plugin must not read the legacy governor executable variable again"
+        );
+        assert!(
+            !OPENCODE_PLUGIN.contains("Bun.spawn"),
+            "the OpenCode plugin must not spawn a legacy process again"
+        );
+        // What replaced it is the current owner's loopback host-event route,
+        // and that is exactly the reference the row pins.
+        assert!(OPENCODE_PLUGIN.contains("ELIOT_OPENCODE_BRIDGE_URL"));
+        assert!(OPENCODE_PLUGIN.contains("/v1/host-events"));
+        assert_eq!(
+            edge.legacy_reference,
+            "host-integrations/opencode/bin/eliot-governor.exe"
+        );
+        assert_eq!(
+            edge.current_owner_reference,
+            "bins/eliot-agent-bridge/src/opencode_host_events.rs::serve_host_events"
+        );
+        migrated_edge_row_is_live(&edge)
+            .expect("the OpenCode plugin row must hold on the baked plugin");
+    }
+
+    #[test]
+    fn claude_code_guide_row_pins_the_plugin_root_route_to_the_agent_bridge() {
+        let edge = declared_edge("docs/integrations/claude/CLAUDE_CODE_PLUGIN.md");
+        // The guide still legitimately documents the retained Governor
+        // installer surface, so the row may only claim the plugin-root route.
+        assert!(
+            CLAUDE_CODE_PLUGIN_GUIDE.contains("release\\eliot-governor.exe"),
+            "the guide is expected to keep the retained host install/activate/doctor lines"
+        );
+        assert_eq!(
+            edge.legacy_reference,
+            "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe"
+        );
+        assert_eq!(
+            edge.current_owner_reference,
+            "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe"
+        );
+        migrated_edge_row_is_live(&edge)
+            .expect("the Claude Code guide row must hold on the baked guide");
+    }
+
+    #[test]
+    fn claude_connector_row_pins_the_staged_plugin_binary_and_keeps_the_host_doctor_fact() {
+        let edge = declared_edge("scripts/test-claude-connector.ps1");
+        // The narrowed pair is the staged-artifact arm: the facade's
+        // plugin-bin path is gone and the bridge's is present.
+        assert_eq!(edge.legacy_reference, "'bin\\eliot-governor.exe'");
+        assert_eq!(
+            edge.current_owner_reference,
+            "'bin\\eliot-agent-bridge.exe'"
+        );
+        migrated_edge_row_is_live(&edge)
+            .expect("the connector row must hold on the baked connector test");
+        // The retained host-installer diagnostic is still in the file and is
+        // recorded in the row's evidence as a separate fact, not as the pair.
+        assert!(
+            CLAUDE_CONNECTOR_TEST.contains("'release\\eliot-governor.exe'"),
+            "the retained host doctor probe must survive; deleting it is not this repair"
+        );
+        assert!(
+            edge.evidence.contains("host doctor"),
+            "the retained host doctor fact must stay recorded in the row evidence"
+        );
+    }
+
+    #[test]
+    fn migrated_edge_row_refuses_a_regressed_current_owner_route() {
+        // Refusal: a row whose current-owner route is absent from its baked
+        // proof is refused. Only that one field is regressed, so the refusal is
+        // exactly the missing-route predicate and nothing else.
+        let declared = declared_edge("integrations/opencode/plugins/eliot.js");
+        let refusal = migrated_edge_row_is_live(&MigratedConsumerEdge {
+            current_owner_reference:
+                "bins/eliot-agent-bridge/src/opencode_host_events.rs::serve_host_event",
+            ..declared
+        })
+        .expect_err("a migrated edge whose current-owner route is absent must be refused");
+        assert!(
+            refusal.contains("no longer names its current-owner route"),
+            "unexpected refusal text: {refusal}"
+        );
+    }
+
+    #[test]
+    fn migrated_edge_row_refuses_an_unbaked_proof_and_an_empty_evidence() {
+        // Refusal: a row may not cite a proof that is not baked, and may not
+        // ship without the evidence that explains how it migrated.
+        let declared = declared_edge("integrations/opencode/plugins/eliot.js");
+        let unbaked = migrated_edge_row_is_live(&MigratedConsumerEdge {
+            proof: "integrations/opencode/plugins/eliot.js.stub",
+            ..declared
+        })
+        .expect_err("an unbaked migrated-edge proof must be refused");
+        assert!(
+            unbaked.contains("is not a baked migrated file"),
+            "unexpected refusal text: {unbaked}"
+        );
+        let unevidenced = migrated_edge_row_is_live(&MigratedConsumerEdge {
+            evidence: "",
+            ..declared
+        })
+        .expect_err("a migrated edge without evidence must be refused");
+        assert!(
+            unevidenced.contains("missing consumer, proof, references, owner, or evidence"),
+            "unexpected refusal text: {unevidenced}"
+        );
+    }
+
+    #[test]
+    fn consumer_surface_row_refuses_a_declared_surface_that_no_longer_contains_its_reference() {
+        // Refusal: a declared surface rebaked onto bytes that no longer contain
+        // its live reference is refused. This is the predicate the two stale
+        // consumer-surface rows used to trip.
+        let surface = declared_surface("integrations/codex/route-profile.json", "{\n}\n");
+        let refusal = consumer_surface_row_is_live(&surface)
+            .expect_err("a declared surface missing its live reference must be refused");
+        assert!(
+            refusal.contains("no longer contains its recorded live reference"),
+            "unexpected refusal text: {refusal}"
+        );
+    }
+
+    #[test]
+    fn inventory_row_refuses_a_retained_disposition_with_no_live_proof() {
+        // Refusal: an inventory row that claims a retained fixture while its
+        // own proof no longer contains the recorded reference is refused. The
+        // reference is one the baked OpenCode plugin never carried, so this is
+        // the state a migrated proof leaves behind when its row is not updated.
+        let mut declared = declared_entry("integrations/opencode/README.md");
+        declared.live_reference = "host-integrations/opencode/bin/eliot-governor.exe";
+        assert!(!OPENCODE_PLUGIN.contains(declared.live_reference));
+        let refusal = inventory_entry_row_is_live(&declared)
+            .expect_err("a retained disposition not backed by its proof must be refused");
+        assert!(
+            refusal.contains("is not backed by its proof"),
+            "unexpected refusal text: {refusal}"
+        );
+    }
+
+    #[test]
+    fn inventory_row_refuses_a_recorded_removal_that_has_not_happened() {
+        // Refusal: `Disposition::Remove` is satisfied only when the proof has
+        // really stopped containing the recorded legacy invocation.
+        let declared = declared_entry("integrations/opencode/README.md");
+        inventory_entry_row_is_live(&declared)
+            .expect("the declared OpenCode README row must remain live-backed");
+        let refusal = inventory_entry_row_is_live(&ConsumerEntry {
+            disposition: Disposition::Remove,
+            ..declared
+        })
+        .expect_err("a recorded removal whose proof still contains the reference must be refused");
+        assert!(
+            refusal.contains("recorded removal of"),
+            "unexpected refusal text: {refusal}"
+        );
+    }
+
+    #[test]
+    fn migrated_edge_row_refuses_a_proof_that_still_names_its_legacy_invocation() {
+        // Refusal: the reverted-migration predicate. A migrated proof that
+        // still carries a legacy invocation it claims to have retired is the
+        // one state this whole table exists to catch, and it is the only branch
+        // that can catch it.
+        //
+        // The string used here is verified against the baked bytes by this
+        // test itself, not by assumption: `scripts/test-claude-connector.ps1`
+        // line 113 still resolves `'release\eliot-governor.exe'` for the
+        // retained `host doctor` host-installer probe. The declared row
+        // deliberately asserts the narrower staged-artifact pair instead, so
+        // the row is narrow on purpose and the probe is not in the pair; see
+        // `claude_connector_row_pins_the_staged_plugin_binary_and_keeps_the_host_doctor_fact`,
+        // which pins that same retained string. This case therefore claims the
+        // same proof and a legacy reference the proof really does contain — a
+        // reverted migration, not a wrong proof.
+        let reverted = "'release\\eliot-governor.exe'";
+        let declared = declared_edge("scripts/test-claude-connector.ps1");
+        assert!(
+            CLAUDE_CONNECTOR_TEST.contains(reverted),
+            "the reverted-legacy reference must really be present in the baked proof"
+        );
+        assert_ne!(
+            declared.legacy_reference, reverted,
+            "if the declared row already asserted this reference the connector test would fail its own guard"
+        );
+        let refusal = migrated_edge_row_is_live(&MigratedConsumerEdge {
+            legacy_reference: reverted,
+            ..declared
+        })
+        .expect_err(
+            "a migrated edge whose proof still names the legacy invocation must be refused",
+        );
+        assert!(
+            refusal.contains("still names the legacy invocation"),
+            "unexpected refusal text: {refusal}"
+        );
+        assert!(
+            refusal.contains(reverted),
+            "the refusal must name the legacy reference that survived the migration: {refusal}"
+        );
+        // Direction: the correctly narrowed declared row is accepted by the
+        // same predicate, so this refusal cannot be satisfied by refusing
+        // everything.
+        migrated_edge_row_is_live(&declared)
+            .expect("the declared narrowed connector row must still be accepted");
+    }
+
+    #[test]
+    fn consumer_surface_row_refuses_a_live_surface_with_no_inventory_entry() {
+        // Refusal: a baked surface that still reaches the legacy binary must
+        // carry a disposition. The fixture body and live reference are the
+        // declared OpenCode README ones; only `path` moves, onto a path no
+        // inventory row cites, so this is exactly the no-inventory-entry
+        // predicate and nothing else.
+        const UNLISTED: &str = "integrations/opencode/README.unlisted.md";
+        let surface = declared_surface("integrations/opencode/README.md", OPENCODE_README);
+        assert!(
+            inventory_entries_for(UNLISTED).is_empty(),
+            "the fixture path must not be cited by any declared disposition"
+        );
+        let orphan = ConsumerSurface {
+            path: UNLISTED,
+            ..surface
+        };
+        let refusal = consumer_surface_row_is_live(&orphan)
+            .expect_err("a live facade surface with no inventory entry must be refused");
+        assert!(
+            refusal.contains("still reaches the legacy binary"),
+            "unexpected refusal text: {refusal}"
+        );
+        assert!(
+            refusal.contains(UNLISTED),
+            "the refusal must name the surface that lost its disposition: {refusal}"
+        );
+        // The declared surface itself is live with its disposition, so the
+        // predicate is not simply refusing every surface it is handed.
+        consumer_surface_row_is_live(&surface)
+            .expect("the declared OpenCode README surface must hold with its disposition");
+    }
+
+    #[test]
+    fn consumer_surface_row_refuses_a_retained_path_that_carries_two_dispositions() {
+        // Refusal: one retained path, one disposition. `live_reference` is
+        // regressed to the inventory's own recorded reference, so the first
+        // predicate (baked surface vs. its recorded reference) still passes and
+        // the refusal is exactly the duplicate-disposition count.
+        let declared = declared_entry("integrations/opencode/README.md");
+        let rebaked = OPENCODE_README.replace(
+            "eliot-governor host install --host opencode",
+            "eliot-governor host install",
+        );
+        let surface = declared_surface("integrations/opencode/README.md", &rebaked);
+        assert!(
+            surface.body.contains("eliot-governor host install"),
+            "the rebaked fixture must keep the declared reference present in the surface body"
+        );
+        assert_eq!(
+            surface.live_reference, declared.live_reference,
+            "the surface and the inventory must agree on the reference, or the duplicate-disposition predicate is not what is exercised"
+        );
+        let refusal = consumer_surface_row_is_live(&surface)
+            .expect_err("a retained path carrying two dispositions must be refused");
+        assert!(
+            refusal.contains("carries 2 dispositions"),
+            "unexpected refusal text: {refusal}"
+        );
+        assert!(
+            refusal.contains("integrations/opencode/README.md"),
+            "the refusal must name the path that carries two dispositions: {refusal}"
+        );
+    }
+
+    #[test]
+    fn consumer_surface_row_refuses_an_inventory_reference_the_baked_surface_does_not_record() {
+        // Refusal: the inventory and the baked surface must record the same
+        // live reference for one path. The surface body is rebaked and its
+        // `live_reference` is moved one clause off the declared value (the
+        // trailing `--host opencode` is dropped), so the body still contains
+        // its own reference and the surface-vs-inventory comparison is the
+        // only predicate that can fail.
+        let declared = declared_entry("integrations/opencode/README.md");
+        let drifted = "eliot-governor host install";
+        let rebaked = OPENCODE_README.replace(
+            "eliot-governor host install --host opencode",
+            "eliot-governor host install",
+        );
+        let surface = ConsumerSurface {
+            live_reference: drifted,
+            body: &rebaked,
+            ..declared_surface("integrations/opencode/README.md", OPENCODE_README)
+        };
+        assert!(
+            surface.body.contains(surface.live_reference),
+            "the rebaked surface must still contain its own recorded live reference"
+        );
+        let refusal = consumer_surface_row_is_live(&surface)
+            .expect_err("an inventory reference the baked surface does not record must be refused");
+        assert!(
+            refusal.contains("records live reference"),
+            "unexpected refusal text: {refusal}"
+        );
+        assert!(
+            refusal.contains(drifted) && refusal.contains(declared.live_reference),
+            "the refusal must name both disagreeing references: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_declared_inventory_row_citing_an_unbaked_surface_is_refused() {
+        // Refusal: an inventory row may not cite a proof outside
+        // `CONSUMER_SURFACES`. The cited path is a real declared
+        // `MIGRATED_CONSUMER_EDGES` proof, which is baked as migrated bytes but
+        // is deliberately not a facade consumer surface — so a row re-declared
+        // there would claim one edge twice.
+        let declared = declared_edge("integrations/opencode/plugins/eliot.js");
+        assert!(
+            baked_surface(declared.proof).is_none(),
+            "a migrated proof must not also be a declared facade consumer surface"
+        );
+        assert!(
+            migrated_proof_body(declared.proof).is_some(),
+            "the cited proof must really be baked, or the baked-surface lookup would be vacuous"
+        );
+        let real = declared_entry("integrations/opencode/README.md");
+        // This guard reads the declared inventory only, so the misplaced row is
+        // introduced by copying a declared row into a one-entry inventory view
+        // and handing that view to the guard's body.
+        let live_reference = if real.disposition == Disposition::Remove {
+            // A `Remove` row must not name a reference its proof still
+            // contains, so keep the guard's baked-surface arm green too.
+            "a reference the proof does not contain"
+        } else {
+            real.live_reference
+        };
+        let refusal = consumer_disposition_guard_with_inventory(&[ConsumerEntry {
+            proof: declared.proof,
+            ..fixture_entry(&real, live_reference)
+        }])
+        .expect_err("an inventory row citing an unbaked facade surface must fail the guard");
+        assert!(
+            refusal.contains("is not one of the baked facade consumer surfaces"),
+            "unexpected refusal text: {refusal}"
+        );
+        assert!(
+            refusal.contains(declared.proof),
+            "the refusal must name the inventory proof that is not a baked surface: {refusal}"
+        );
+        // Direction: the same guard accepts the declared row on its own.
+        consumer_disposition_guard_with_inventory(&[real])
+            .expect("the declared OpenCode README row must be an accepted baked surface");
+    }
+
+    #[test]
+    fn every_declared_migrated_edge_is_true_against_its_baked_proof() {
+        // The guard's coverage is exactly the table, so a row cannot be added
+        // without this loop following it, and no row can be excluded from it.
+        // The loop iterates `MIGRATED_CONSUMER_EDGES` itself and derives every
+        // expectation from the row: a test that hard-coded the migrated proof
+        // paths is what let eleven rows be certified by nothing at all.
+        for edge in MIGRATED_CONSUMER_EDGES {
+            migrated_edge_row_is_live(edge).unwrap_or_else(|refusal| {
+                panic!(
+                    "the declared migrated edge {} must hold: {refusal}",
+                    edge.proof
+                )
+            });
+            assert!(
+                migrated_proof_body(edge.proof).is_some(),
+                "the declared migrated edge {} must name a baked migrated proof",
+                edge.proof
+            );
+        }
+        // The guard must pass over the whole declared table, and it must
+        // examine a row per declared row: the declared-table denominator is
+        // what pins the table down, so dropping a row and its proof together
+        // fails here instead of leaving the suite green.
+        migrated_edge_guard().expect("the declared migrated edges must all be live-backed");
+        let examined = MIGRATED_CONSUMER_EDGES
+            .iter()
+            .filter(|edge| migrated_edge_row_is_live(edge).is_ok())
+            .count();
+        assert_eq!(
+            examined,
+            MIGRATED_CONSUMER_EDGES.len(),
+            "the migrated-edge guard must examine exactly the declared table"
+        );
+    }
 }

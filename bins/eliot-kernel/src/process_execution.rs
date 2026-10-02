@@ -30,15 +30,15 @@ use eliot_kernel_service::{
     ProcessExecutionResponse,
 };
 use eliot_ors::{
-    EpochIdentity, EpochLineage, OpaqueLabel, ProcessEvidenceRecord,
+    EpochIdentity, EpochLineage, ManifestResourceLimits, OpaqueLabel, ProcessEvidenceRecord,
     ProcessStartReplayRecord as OrsReplayRecord, ProcessStartReplayState as OrsReplayState,
     ProcessStreamRecoveryBinding, ProcessStreamRecoveryProjection, RecoveryOwner,
     RedbRecoveryStore,
 };
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::{
-    ProtectedSecret, RecoverableJobBinding, RecoverableJobObject, RetainedProcessPathLease,
-    WindowsPlatform,
+    JobObjectLimits, ProtectedSecret, RecoverableJobBinding, RecoverableJobObject,
+    RetainedProcessPathLease, WindowsPlatform,
 };
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
@@ -2450,6 +2450,218 @@ impl ProcessExecutionGateway {
         }))
     }
 
+    /// Reads the admitted Module Manifest Job Object/resource ceilings of the
+    /// owner generation for one exact Kernel child launch (issue #1888, I1.6;
+    /// I1.9).
+    ///
+    /// This is the single place the launch path resolves manifest limits, and it
+    /// resolves them from the Generation Registry row the Kernel owner already
+    /// holds (`evidence_store`), not from a caller-authored field on the
+    /// `ProcessIntent`. `RedbRecoveryStore::load_kernel_execution_manifest`
+    /// re-verifies the stored manifest's own bound digest on readback, so a
+    /// tampered or hand-built row cannot supply a ceiling, and the identity
+    /// check below refuses a row whose recorded admission is not this launch's
+    /// exact owner module and generation — the two values
+    /// `ProcessStartPorts::validate_admission` already proved equal to the
+    /// authenticated `ProcessOwnerBinding` and the admitted State Fence.
+    ///
+    /// The manifest is therefore the only source of the Job's process and
+    /// working-set ceilings, reached through the existing admitted boundary
+    /// rather than a new `eliot-process` -> `eliot-ors` dependency edge, which
+    /// would invert the layering (`eliot-ors` already depends on
+    /// `eliot-process`, and `eliot-process` is `#![forbid(unsafe_code)]` P-03
+    /// effect material that must stay independent of the manifest record).
+    ///
+    /// A missing or non-admitted manifest refuses: the caller-authored
+    /// `ResourceLimits` is never read here, so it can neither supply a limit nor
+    /// widen one.
+    fn manifest_job_limits(
+        &self,
+        owner: &ProcessOwnerBinding,
+    ) -> Result<ManifestResourceLimits, ProcessExecutionError> {
+        let manifest = self
+            .evidence_store
+            .load_kernel_execution_manifest(owner.module_id(), owner.generation().get())
+            .map_err(|error| {
+                ProcessExecutionError::Unavailable(format!(
+                    "admitted Module Manifest resource limits are unreadable: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ProcessExecutionError::Unavailable(
+                    "Kernel child launch requires the admitted Module Manifest resource limits"
+                        .to_owned(),
+                )
+            })?;
+        if manifest.admission.module_id != owner.module_id()
+            || manifest.admission.generation.value() != owner.generation().get()
+            || !manifest.has_governor_admission()
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        manifest.validate().map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "admitted Module Manifest resource limits are not admitted: {error}"
+            ))
+        })?;
+        // The projection's own `ManifestResourceLimits::validate` runs inside
+        // `KernelExecutionManifest::validate` above, so each of the three
+        // ceilings handed on is already non-zero and in range.
+        Ok(manifest.projection.resource_limits)
+    }
+
+    /// Returns the admitted Module Manifest Job Object ceilings of the owner
+    /// generation, derived onto the physical `JobObjectLimits` shape.
+    ///
+    /// `max_processes` becomes the Job's `active_process_limit` and
+    /// `max_working_set_bytes` becomes its `memory_bytes` ceiling: those are the
+    /// two ceilings the Windows Job Object actually installs, so the manifest
+    /// value is the authority for both. `cpu_time_ms` stays `None` because
+    /// `ManifestResourceLimits` records no CPU-*time* budget at all — it records
+    /// `cpu_rate_control_percent`, which `JobObjectLimits` has no CPU-*time*
+    /// field for (see `JobObjectLimits::require_admitted_job_limits`). The
+    /// caller-authored CPU-time ceiling can therefore never be treated as
+    /// bounded by an admitted CPU-time value.
+    ///
+    /// `ManifestResourceLimits::validate` already ran inside
+    /// [`Self::manifest_job_limits`], so both values are non-zero; the `usize`
+    /// narrowing is re-checked by `JobObjectLimits::require_admitted_job_limits`,
+    /// which refuses an absent, unrepresentable or out-of-range ceiling instead
+    /// of truncating it or falling back to an unlimited Job.
+    ///
+    /// This is the single place the manifest's ceilings become the physical
+    /// `JobObjectLimits`; `ProcessStartPorts::execute` installs only the value
+    /// returned here, never a caller-authored `ResourceLimits` ceiling.
+    #[cfg(windows)]
+    fn manifest_job_object_limits(
+        limits: &ManifestResourceLimits,
+    ) -> Result<JobObjectLimits, ProcessExecutionError> {
+        JobObjectLimits::require_admitted_job_limits(
+            Some(limits.max_working_set_bytes),
+            Some(limits.max_processes),
+            Some(limits.cpu_rate_control_percent),
+        )
+        .map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "admitted Module Manifest limits are not installable on this Job: {error}"
+            ))
+        })
+    }
+
+    /// Decides whether the caller-authored `ResourceLimits` of one launch asks
+    /// for a Job Object ceiling above the admitted Module Manifest's.
+    ///
+    /// Issue #1888 / I1.6: the Job Object ceilings are the admitted Module
+    /// Manifest's, so a caller-authored `ResourceLimits` may therefore only ever
+    /// ask for a ceiling at or UNDER the admitted one. Anything the caller asks
+    /// for above an admitted ceiling widens the Job and refuses, before the
+    /// executor creates or assigns the Job. Asking for less than or exactly the
+    /// admitted value is not a widening, so it launches — and the Job is
+    /// installed from the ADMITTED values, never from the caller's, so the
+    /// installed Job is always the admitted one or tighter.
+    ///
+    /// The comparison is per field and only ever penalises a caller exceeding an
+    /// admitted ceiling. A field the caller leaves absent installs nothing and is
+    /// never a widening; a caller CPU-time ceiling always widens, because the
+    /// manifest records no CPU-*time* budget (it records a rate-control
+    /// percentage, which the caller's own request has no counterpart for, so a
+    /// caller can never widen it — see
+    /// [`Self::manifest_job_object_limits`]).
+    #[cfg(windows)]
+    fn requested_job_limits_widen_admitted(
+        request: &ProcessRequest,
+        admitted_job_limits: &JobObjectLimits,
+    ) -> bool {
+        // A present ceiling above the admitted one widens the Job.
+        let widens = |asked: Option<u64>, admitted: Option<u64>| match (asked, admitted) {
+            (Some(asked), Some(admitted)) => asked > admitted,
+            // An absent caller ceiling installs nothing, so it can never
+            // widen the admitted one.
+            (None, _) => false,
+            // The admitted memory and process ceilings are always present,
+            // so this arm is only reachable for a ceiling the manifest
+            // does not record at all: an unlimited admitted Job.
+            (Some(_), None) => true,
+        };
+        match JobObjectLimits::new(
+            request.resource_limits().cpu_time_ms(),
+            request.resource_limits().memory_bytes(),
+            request.resource_limits().max_descendants().checked_add(1),
+            None,
+        ) {
+            Ok(requested) => {
+                requested.cpu_time_ms().is_some_and(|asked| {
+                    // The manifest records no CPU-time ceiling, so any
+                    // caller CPU-time ceiling exceeds it.
+                    asked > admitted_job_limits.cpu_time_ms().unwrap_or(0)
+                }) || widens(requested.memory_bytes(), admitted_job_limits.memory_bytes())
+                    || requested
+                        .active_process_limit()
+                        .zip(admitted_job_limits.active_process_limit())
+                        .is_some_and(|(asked, admitted)| asked > admitted)
+            }
+            // A caller `ResourceLimits` the Job cannot express decides
+            // nothing: the Job is installed from the admitted ceilings
+            // alone, so an inexpressible request is not a widening.
+            Err(_) => false,
+        }
+    }
+
+    /// Derives the admitted Module Manifest Job Object ceilings for one launch
+    /// and releases this launch's descendant registration when they are not
+    /// installable on the Job.
+    ///
+    /// Admitted ceilings that are not installable on this Job refuse the launch
+    /// rather than falling back to the caller's values; a failed launch drops
+    /// its registration like any other failed start, so the refusal leaves no
+    /// attempt behind to reconcile.
+    #[cfg(windows)]
+    fn admitted_job_limits_or_release(
+        descendants: &Mutex<DescendantRegistry>,
+        operation_id: &eliot_process::OperationId,
+        manifest_limits: &ManifestResourceLimits,
+    ) -> Result<JobObjectLimits, ProcessExecutionError> {
+        match Self::manifest_job_object_limits(manifest_limits) {
+            Ok(admitted) => Ok(admitted),
+            Err(error) => {
+                if let Ok(mut registry) = descendants.lock() {
+                    registry.remove(operation_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-derives the exact retained Host-owned outer Job binding a Kernel
+    /// child launch must nest in.
+    ///
+    /// The binding travels on the launch tuple as retained wire material, so it
+    /// is re-decoded here and matched by the caller against the outer Job
+    /// identity this composition carries. A binding that cannot be encoded or
+    /// decoded refuses the launch. No Job Object is created or assigned here:
+    /// the executor's own pre-resume membership checks still run before any
+    /// child executes.
+    #[cfg(windows)]
+    fn recovered_outer_job_binding(
+        candidate: &HostKernelCandidateBinding,
+    ) -> Result<Result<RecoverableJobBinding, ProcessExecutionError>, ProcessExecutionError> {
+        Ok(serde_json::to_value(&candidate.job_binding)
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable(
+                    "Host Kernel Job binding cannot be encoded".to_owned(),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| {
+                    ProcessExecutionError::Unavailable(
+                        "Host Kernel Job binding is malformed".to_owned(),
+                    )
+                })
+            }))
+    }
+
     pub(crate) fn mark_unknown(
         &self,
         operation_id: &eliot_process::OperationId,
@@ -3965,6 +4177,22 @@ impl ProcessStartPorts for ProcessExecutionGateway {
             }
             return Err(error);
         }
+        // Issue #1888 / I1.6: "CPU, memory, and process limits are set by Module
+        // Manifest". The admitted ceilings are read here, at the executor
+        // handoff and before any child exists, and every later Job-limit
+        // decision on this launch is taken against them. A missing, unreadable
+        // or non-admitted manifest refuses this launch and drops the descendant
+        // registration like any other failed start; nothing falls back to the
+        // caller-authored `ResourceLimits`, which supplies no Job ceiling.
+        let manifest_limits = match self.manifest_job_limits(owner) {
+            Ok(limits) => limits,
+            Err(error) => {
+                if let Ok(mut registry) = self.descendants.lock() {
+                    registry.remove(&operation_id);
+                }
+                return Err(error);
+            }
+        };
         let sink: Arc<dyn ProcessEvidenceSink> = Arc::new(OrsProcessStreamRecoverySink {
             store: Arc::clone(&self.evidence_store),
             owner: owner.clone(),
@@ -3976,26 +4204,40 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         #[cfg(windows)]
         let started = match outer_binding {
             Some(candidate) => {
-                let binding: Result<RecoverableJobBinding, ProcessExecutionError> =
-                    serde_json::to_value(&candidate.job_binding)
-                        .map_err(|_| {
-                            ProcessExecutionError::Unavailable(
-                                "Host Kernel Job binding cannot be encoded".to_owned(),
-                            )
-                        })
-                        .and_then(|value| {
-                            serde_json::from_value(value).map_err(|_| {
-                                ProcessExecutionError::Unavailable(
-                                    "Host Kernel Job binding is malformed".to_owned(),
-                                )
-                            })
-                        });
+                let admitted_job_limits = match Self::admitted_job_limits_or_release(
+                    &self.descendants,
+                    &operation_id,
+                    &manifest_limits,
+                ) {
+                    Ok(admitted) => admitted,
+                    Err(error) => return Err(error),
+                };
+                // A caller `ResourceLimits` that would widen an admitted
+                // Module Manifest ceiling refuses this launch, before the
+                // executor creates or assigns the Job.
+                if Self::requested_job_limits_widen_admitted(&request, &admitted_job_limits) {
+                    if let Ok(mut registry) = self.descendants.lock() {
+                        registry.remove(&operation_id);
+                    }
+                    return Err(ProcessExecutionError::Unavailable(
+                        "Kernel child Job limits must not exceed the admitted Module Manifest limits"
+                            .to_owned(),
+                    ));
+                }
+                // The outer Job binding is re-derived and re-checked against the
+                // exact retained Host-owned outer Job identity before the launch
+                // reaches the executor.
+                let binding = Self::recovered_outer_job_binding(candidate)?;
                 match binding {
                     Ok(binding)
                         if binding.job_identity().name() == candidate.job_object_id.as_str() =>
                     {
-                        self.executor
-                            .start_with_kernel_outer_job_binding(request, sink, binding)
+                        self.executor.start_with_kernel_outer_job_binding(
+                            request,
+                            sink,
+                            binding,
+                            Some(admitted_job_limits),
+                        )
                     }
                     Ok(_) => Err(ProcessExecutionError::Contract(
                         eliot_process::ContractError::DispatchBindingMismatch,
@@ -4009,7 +4251,7 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         };
         #[cfg(not(windows))]
         let started = {
-            let _ = (request, sink, outer_binding);
+            let _ = (request, sink, outer_binding, manifest_limits);
             Err(ProcessExecutionError::Unavailable(
                 "Windows process launch is unavailable on this platform".to_owned(),
             ))

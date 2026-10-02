@@ -2,6 +2,8 @@ use crate::StoreError;
 use crate::surreal_rpc::SurrealRpcTransport;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
+#[cfg(windows)]
+use eliot_platform_windows::{JobObject, WindowsAdapterError};
 use eliot_runtime_contracts::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,
 };
@@ -20,8 +22,6 @@ use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
 #[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -31,16 +31,47 @@ pub struct SurrealServerSupervisor {
     config: SurrealServerConfig,
 }
 
-#[derive(Debug)]
 pub struct ReadySurrealServer {
     transport: Option<Arc<SurrealRpcTransport>>,
     started_pid: Option<u32>,
     lease_path: Option<PathBuf>,
     supervisor: SurrealServerSupervisor,
+    /// Sole owning handle of the kill-on-close Job Object this runtime's own
+    /// server process is assigned to (issue #1888, package K-STORE).
+    ///
+    /// `ReadySurrealServer::drop` used to release only the client lease, which
+    /// left a server this runtime started running even after a clean exit. The
+    /// handle here is what makes an owned server end with its owner: the kernel
+    /// evaluates `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` when this value is
+    /// dropped, and when the owning process itself ends for any reason.
+    ///
+    /// `JobObject` is a raw-kernel handle owner and deliberately implements no
+    /// `Debug` - printing a live job handle would invite formatting it as if it
+    /// were a plain value. The field therefore carries a hand-written `Debug`
+    /// that reports only whether a job is held, never the handle itself.
+    kill_on_close_job: Option<JobObject>,
     // Probe handle on the bridge data-root lease, held for the session so a
     // bridge generation cannot claim the same production root mid-session
     // (I5.2/A5). `std::fs::File` is `Send + Debug`; released on drop.
     _data_root_guard: Option<std::fs::File>,
+}
+
+/// Hand-written `Debug` for [`ReadySurrealServer`].
+///
+/// The derived form cannot be used because [`JobObject`] is a raw kernel handle
+/// owner that deliberately implements no `Debug`: printing a live handle would
+/// invite treating it as a plain value. This reports only whether a kill-on-close
+/// job is HELD, which is the fact that decides whether an owned server ends with
+/// its owner - and never the handle itself.
+impl std::fmt::Debug for ReadySurrealServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadySurrealServer")
+            .field("started_pid", &self.started_pid)
+            .field("lease_path", &self.lease_path)
+            .field("holds_kill_on_close_job", &self.kill_on_close_job.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Outcome of releasing this runtime's handle on the canonical `SurrealDB` server.
@@ -101,9 +132,33 @@ struct SpawnedServerFinalizer<'a> {
     supervisor: &'a SurrealServerSupervisor,
     child: Option<Child>,
     pid: Option<u32>,
+    /// Kill-on-close Job handle for the spawned server, or `None` when this
+    /// launch reached an earlier refusal before a Job existed. Held for exactly
+    /// the same span as `child` (issue #1888, K-STORE): the guard owns the
+    /// process between `spawn` and readiness, so the guard owns its Job.
+    #[cfg(windows)]
+    kill_on_close_job: Option<JobObject>,
 }
 
 impl<'a> SpawnedServerFinalizer<'a> {
+    #[cfg(windows)]
+    fn new(
+        supervisor: &'a SurrealServerSupervisor,
+        child: Child,
+        pid: Option<u32>,
+        kill_on_close_job: Option<JobObject>,
+    ) -> Self {
+        Self {
+            supervisor,
+            child: Some(child),
+            pid,
+            kill_on_close_job,
+        }
+    }
+
+    /// Non-Windows has no Job Object, so the guard owns only the child. The
+    /// signature matches the Windows constructor so both callers are identical.
+    #[cfg(not(windows))]
     fn new(supervisor: &'a SurrealServerSupervisor, child: Child, pid: Option<u32>) -> Self {
         Self {
             supervisor,
@@ -116,6 +171,27 @@ impl<'a> SpawnedServerFinalizer<'a> {
         self.pid
     }
 
+    /// Transfers the retained kill-on-close Job to the ready server.
+    #[cfg(windows)]
+    fn release_kill_on_close_job(&mut self) -> Option<JobObject> {
+        self.kill_on_close_job.take()
+    }
+
+    /// Terminates the whole assigned process set through the Job Object, so
+    /// cleanup cannot leave a descendant of this server behind.
+    ///
+    /// The handle is TAKEN, not borrowed in place: the caller is already holding
+    /// a `&mut Child` from this same finalizer, so borrowing the field as well
+    /// would borrow it twice. Taking it also guarantees the Job is closed
+    /// exactly once, on whichever path terminates the assigned set first.
+    #[cfg(windows)]
+    fn terminate_assigned_set(&mut self, exit_code: u32) -> Result<(), WindowsAdapterError> {
+        match self.kill_on_close_job.take() {
+            Some(job) => job.terminate(exit_code),
+            None => Ok(()),
+        }
+    }
+
     fn child_mut(&mut self) -> Result<&mut Child, StoreError> {
         self.child
             .as_mut()
@@ -123,16 +199,25 @@ impl<'a> SpawnedServerFinalizer<'a> {
     }
 
     /// Transfers process ownership to `ReadySurrealServer` without terminating
-    /// the detached server when this guard is dropped.
+    /// the server when this guard is dropped.
+    ///
+    /// The child is dropped but the Job handle is NOT: it is still held here and
+    /// is moved into the ready server by
+    /// [`Self::release_kill_on_close_job`] first, so the kill domain spans the
+    /// whole server life without a gap (issue #1888, K-STORE).
     fn disarm(mut self) {
-        let _detached_child = self.child.take();
+        let _owned_child = self.child.take();
     }
 
     async fn finalize_error(mut self, primary: StoreError) -> StoreError {
         let mut cleanup_failures = Vec::new();
 
-        if let Some(child) = self.child.as_mut() {
-            let child_is_live = match child.try_wait() {
+        // Liveness is probed in its OWN scope so the `&mut Child` borrow ends
+        // before the assigned set is terminated. Terminating needs the Job field
+        // of the same finalizer, and holding the child borrow across it would
+        // borrow `self` twice.
+        let child_is_live = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
                 Ok(Some(_status)) => {
                     // `try_wait` returned the exit status and reaped this exact
                     // child, so there is no live process left to kill.
@@ -143,8 +228,20 @@ impl<'a> SpawnedServerFinalizer<'a> {
                     cleanup_failures.push(format!("exact child status probe: {error}"));
                     true
                 }
-            };
-            if child_is_live {
+            },
+            None => false,
+        };
+
+        if child_is_live {
+            // Terminate the whole assigned set through the Job before
+            // waiting on the root child, so a descendant cannot survive the
+            // failed launch. The helper TAKES the handle (see its doc), which is
+            // also what guarantees the Job is closed exactly once.
+            #[cfg(windows)]
+            if let Err(error) = self.terminate_assigned_set(0xE1_04) {
+                cleanup_failures.push(format!("assigned set terminate: {error:?}"));
+            }
+            if let Some(child) = self.child.as_mut() {
                 if let Err(error) = child.start_kill() {
                     cleanup_failures.push(format!("exact child kill: {error}"));
                 }
@@ -163,6 +260,9 @@ impl<'a> SpawnedServerFinalizer<'a> {
             }
         }
         self.child.take();
+        // Closing the Job here is the last cleanup step: any member that outlived
+        // the explicit kills above is terminated by kill-on-close.
+        self.kill_on_close_job.take();
 
         if let Some(pid) = self.pid
             && let Err(error) = self.supervisor.remove_pid_file_if_matches(pid)
@@ -183,9 +283,13 @@ impl<'a> SpawnedServerFinalizer<'a> {
 
 impl Drop for SpawnedServerFinalizer<'_> {
     fn drop(&mut self) {
+        // Cancellation lands here with the Job still owned, so the Job close is
+        // what ends the server: a partially-started launch can never outlive its
+        // owner even on the cancellation path (issue #1888, K-STORE).
         if let Some(child) = self.child.as_mut() {
             let _kill_result = child.start_kill();
         }
+        self.kill_on_close_job.take();
     }
 }
 
@@ -230,7 +334,7 @@ impl SurrealServerSupervisor {
         {
             match self.connect_and_auth(password, 750).await {
                 Ok(transport) => {
-                    return self.ready_server(transport, None, data_root_guard.take());
+                    return self.ready_server(transport, None, None, data_root_guard.take());
                 }
                 Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                 Err(_connection_error) => {}
@@ -245,7 +349,7 @@ impl SurrealServerSupervisor {
                 let password = self.read_or_create_password()?;
                 match self.connect_and_auth(&password, 750).await {
                     Ok(transport) => {
-                        return self.ready_server(transport, None, data_root_guard.take());
+                        return self.ready_server(transport, None, None, data_root_guard.take());
                     }
                     Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                     Err(_connection_error) => {}
@@ -256,7 +360,7 @@ impl SurrealServerSupervisor {
             match self.read_existing_password()? {
                 Some(password) => match self.connect_and_auth(&password, 750).await {
                     Ok(transport) => {
-                        return self.ready_server(transport, None, data_root_guard.take());
+                        return self.ready_server(transport, None, None, data_root_guard.take());
                     }
                     Err(error @ StoreError::ServerAuthFailed(_)) => return Err(error),
                     Err(error) => last_error = error.to_string(),
@@ -396,9 +500,9 @@ impl SurrealServerSupervisor {
         password: SecretString,
         data_root_guard: Option<std::fs::File>,
     ) -> Result<ReadySurrealServer, StoreError> {
-        let child = self.spawn_server(&password)?;
+        let (child, kill_on_close_job) = self.spawn_server(&password)?;
         let pid = child.id();
-        let mut spawned = SpawnedServerFinalizer::new(self, child, pid);
+        let mut spawned = SpawnedServerFinalizer::new(self, child, pid, Some(kill_on_close_job));
 
         let startup = async {
             let pid = spawned.pid().ok_or_else(|| {
@@ -461,7 +565,11 @@ impl SurrealServerSupervisor {
 
         match startup {
             Ok((transport, pid)) => {
-                match self.ready_server(transport, Some(pid), data_root_guard) {
+                // The kill-on-close Job moves from the startup guard to the ready
+                // server before the guard is disarmed, so the owned server is
+                // never momentarily uncontained (issue #1888, K-STORE).
+                let kill_on_close_job = spawned.release_kill_on_close_job();
+                match self.ready_server(transport, Some(pid), kill_on_close_job, data_root_guard) {
                     Ok(ready) => {
                         spawned.disarm();
                         Ok(ready)
@@ -473,7 +581,18 @@ impl SurrealServerSupervisor {
         }
     }
 
-    fn spawn_server(&self, password: &SecretString) -> Result<tokio::process::Child, StoreError> {
+    /// Spawns the owned server and admits it into a kill-on-close Job Object.
+    ///
+    /// The Job is created and the child assigned immediately after `spawn()` and
+    /// before the server is used, and the returned handle is retained by
+    /// `SpawnedServerFinalizer` and then by `ReadySurrealServer` for the
+    /// server's whole life (issue #1888, package K-STORE). A refused assignment
+    /// terminates the already-created child and returns a typed error: there is
+    /// no unassigned launch.
+    fn spawn_server(
+        &self,
+        password: &SecretString,
+    ) -> Result<(tokio::process::Child, JobObject), StoreError> {
         let log_path = self.log_path()?;
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent)?;
@@ -505,20 +624,39 @@ impl SurrealServerSupervisor {
                 .arg("--allow-funcs")
                 .arg(self.config.capabilities.allow_funcs.join(","));
         }
+        // `DETACHED_PROCESS` is deliberately NOT set (issue #1888, K-STORE).
+        // It severed the server from its parent's console lifetime and was part
+        // of why a leaked server outlived even a clean run. `CREATE_NEW_PROCESS_GROUP`
+        // is kept for signal isolation, and `CREATE_NO_WINDOW` for a headless
+        // server; the process tree is bound to its owner by the kill-on-close
+        // Job Object instead.
         #[cfg(windows)]
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 
         command
             .arg("--deny-net")
             .arg("--")
             .arg(&self.config.storage);
 
-        command
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(log))
             .spawn()
-            .map_err(|error| StoreError::ServerStartFailed(error.to_string()))
+            .map_err(|error| StoreError::ServerStartFailed(error.to_string()))?;
+
+        // Assign immediately after spawn and before the server is used. A
+        // refusal is terminal and visibly typed: the child this call already
+        // created is terminated before the error returns, so a refused launch
+        // leaves no running server behind.
+        let job = match assign_owned_server_to_kill_on_close_job(child.id()) {
+            Ok(job) => job,
+            Err(error) => {
+                let _kill_result = child.start_kill();
+                return Err(error);
+            }
+        };
+        Ok((child, job))
     }
 
     fn read_or_create_password(&self) -> Result<SecretString, StoreError> {
@@ -782,10 +920,17 @@ impl SurrealServerSupervisor {
         Ok(count)
     }
 
+    /// Builds the ready handle for one server session.
+    ///
+    /// `kill_on_close_job` is `Some` only when THIS runtime spawned the server,
+    /// because only then does this runtime own the process it must end with its
+    /// owner. A runtime that connected to a pre-existing server passes `None`
+    /// and must not stop it.
     fn ready_server(
         &self,
         transport: SurrealRpcTransport,
         started_pid: Option<u32>,
+        kill_on_close_job: Option<JobObject>,
         data_root_guard: Option<std::fs::File>,
     ) -> Result<ReadySurrealServer, StoreError> {
         Ok(ReadySurrealServer {
@@ -793,6 +938,7 @@ impl SurrealServerSupervisor {
             started_pid,
             lease_path: Some(self.create_client_lease()?),
             supervisor: self.clone(),
+            kill_on_close_job,
             _data_root_guard: data_root_guard,
         })
     }
@@ -917,6 +1063,56 @@ impl SurrealServerSupervisor {
             .await;
         }
     }
+}
+
+/// Creates the kill-on-close Job Object that owns one supervised server and
+/// admits `child_process_id` into it.
+///
+/// This is the single admission point for the legacy supervisor's own spawn,
+/// and it also serves the `live-edge` scratch-server fixture in
+/// `crate::payload_byte_preservation` (issue #1888, package K-STORE), so a
+/// fixture that starts a `surreal.exe` server does not introduce a second launch
+/// path of its own. It reuses the existing
+/// `eliot_platform_windows::JobObject` primitives directly:
+/// `new_kill_on_close` configures `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+/// `assign_process` performs the assignment, returning the exact observed
+/// process identity. No second Job Object type exists in this repository and
+/// none is defined here.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Process`] carrying the exact typed
+/// [`WindowsAdapterError`] when the Job cannot be created or the process cannot
+/// be assigned, and [`StoreError::ConfigMessage`] when the spawned child
+/// exposes no usable process id. The caller terminates the child it already
+/// created, so a refusal never leaves a running server: there is no unassigned
+/// fallback.
+#[cfg(windows)]
+pub(crate) fn assign_owned_server_to_kill_on_close_job(
+    child_process_id: Option<u32>,
+) -> Result<JobObject, StoreError> {
+    let job = JobObject::new_kill_on_close().map_err(owned_server_job_refusal)?;
+    let process_id = child_process_id.filter(|id| *id != 0).ok_or_else(|| {
+        StoreError::ConfigMessage(
+            "owned SurrealDB child exposed no process id for kill-on-close job admission"
+                .to_owned(),
+        )
+    })?;
+    job.assign_process(process_id)
+        .map_err(owned_server_job_refusal)?;
+    Ok(job)
+}
+
+/// Projects one refused Job admission onto a typed store error.
+///
+/// The typed `WindowsAdapterError` survives into the message rather than being
+/// flattened to prose, so a caller can still tell an access refusal from an
+/// invalid input or a platform failure.
+#[cfg(windows)]
+fn owned_server_job_refusal(cause: WindowsAdapterError) -> StoreError {
+    StoreError::Process(format!(
+        "owned SurrealDB kill-on-close job admission refused ({cause:?})"
+    ))
 }
 
 fn generate_password() -> String {
@@ -1239,9 +1435,49 @@ impl Drop for StartLock {
     }
 }
 
+/// Ends this value's server, whether or not the caller asked it to.
+///
+/// Releasing the client lease is the cooperative half and is all this drop can
+/// do on its own: a lease says "this runtime is done using the port", it does
+/// not end anything. The owned server is ended by TAKING the kill-on-close Job
+/// handle this value holds. Taking it, rather than leaving it to automatic field
+/// drop, is what makes the contract true by construction instead of by
+/// accident: closing the last handle to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// Job is the kernel's guarantee that every assigned process is terminated, so
+/// a `ReadySurrealServer` that is dropped - a failed assertion, an early `?`, a
+/// cancelled future, a fixture root going out of scope - cannot leave a
+/// `surreal.exe` holding the canonical data root and its bind port
+/// (issue #1888, package K-STORE; `I1.6`: "the process tree receives
+/// kill-on-close at its outer ownership boundary").
+///
+/// The take is `#[cfg(windows)]` because the handle only exists there; on
+/// other targets the lease release is the whole of this drop, exactly as
+/// before. Mirrors [`SpawnedServerFinalizer::drop`], which takes the same
+/// handle at the other end of the same launch.
+///
+/// A runtime that CONNECTED to a pre-existing server holds no Job here, so this
+/// drop leaves that server running. Ownership is the only thing that stops a
+/// process, and this drop acts on exactly the processes it owns.
+///
+/// This does not weaken - and does not replace - the existing explicit stop.
+/// [`Self::shutdown_if_spawned`] consumes `self`, stops the owned process on
+/// its own coordinated, drained path, and only THEN does this drop run. Closing
+/// a kill-on-close Job that no live process is assigned to ends nothing extra,
+/// so the two orderings agree: the coordinated stop is what a caller that asks
+/// for a stop gets, and the Job close underneath it is what guarantees the
+/// outcome - it also ends any descendant the coordinated stop did not reach.
+/// The case this drop newly covers is the one where nothing asked for a stop at
+/// all: a dropped server is ended by the Job whether or not its owner was ever
+/// going to call `shutdown_if_spawned`.
 impl Drop for ReadySurrealServer {
     fn drop(&mut self) {
         let _ = self.release_client_lease();
+        // The client lease must go FIRST. A lease still held by a runtime whose
+        // provider is already dead would make the next starter wait on a drain
+        // that can never complete, so the order here is part of the contract and
+        // not incidental.
+        #[cfg(windows)]
+        self.kill_on_close_job.take();
     }
 }
 
