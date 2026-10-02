@@ -2178,3 +2178,151 @@ impl HostComposition {
         ))
     }
 }
+
+// F-LOG-HOST-5 (#980) executed contour of the Phase-B authority identity group.
+//
+// Placed at the owner because `PhaseBAuthorityIdentity` and
+// `phase_b_observe_authority` are `pub(super)` inside this private module: an
+// integration test under `tests/` cannot name them. The case drives the REAL
+// emitter and asserts what production rendered, read back out of a real
+// `tracing` subscriber — the same seam the crate's other diagnostics tests use.
+#[cfg(all(test, windows))]
+mod authority_identity_contour_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct CaptureSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureSink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `body` under a real `tracing` subscriber and returns exactly the
+    /// text production emitted while it ran.
+    fn capture(body: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let bytes = {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, body);
+            sink.bytes
+                .lock()
+                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .clone()
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn host_epoch(sequence: u64) -> EpochIdentity {
+        EpochIdentity::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .unwrap_or_else(|_| panic!("test lineage must parse")),
+            std::num::NonZeroU64::new(sequence).unwrap_or_else(|| panic!("test sequence")),
+        )
+        .unwrap_or_else(|error| panic!("test epoch must build: {error}"))
+    }
+
+    // WORK_UNIT_CASE: 980/23 — an authority record carries the identity its
+    // owner already proved and states every other slot's absence explicitly,
+    // so a record can never imply a binding no owner established.
+    #[test]
+    fn authority_record_projects_proven_identity_and_explicit_absence_for_the_rest() {
+        let (manifest, root) =
+            crate::journal_tests::liveness_manifest_with_distinct_store_digests()
+                .unwrap_or_else(|error| panic!("liveness manifest: {error}"));
+        let installation = PlatformHandle::new("installation:authority-contour")
+            .unwrap_or_else(|error| panic!("test installation: {error}"));
+        let host = crate::fresh_host_epoch(installation, None)
+            .unwrap_or_else(|error| panic!("test host epoch: {error}"));
+        let activation = host_epoch(1);
+        let mut identity = PhaseBAuthorityIdentity::new(&host, &activation);
+
+        // Before its owner proves the record's own Host epoch, that slot is
+        // absent, never restated from the unverified claim.
+        let before = capture(|| {
+            phase_b_observe_authority(
+                "host.phase-b current authority descriptor requested",
+                &manifest,
+                None,
+                &identity,
+            );
+        });
+        assert!(
+            before.contains(&format!("installation={}", host.installation.as_str())),
+            "the owner-held installation must be projected: {before}"
+        );
+        assert!(
+            before.contains("live_activation="),
+            "the owner-held live activation must be projected: {before}"
+        );
+        for absent in [
+            "host_epoch",
+            "fence",
+            "declared",
+            "authority",
+            "durable_authority",
+            "preparation",
+        ] {
+            assert!(
+                before.contains(&format!("{absent}={PHASE_B_IDENTITY_UNAVAILABLE}")),
+                "an unproven authority slot {absent} must state its absence: {before}"
+            );
+        }
+
+        // After the owner proves the record's own Host epoch, the exact proven
+        // value replaces the missing-evidence disposition in that one slot and
+        // no other.
+        identity.bind_host_epoch(&host_epoch(7));
+        let after = capture(|| {
+            phase_b_observe_authority(
+                "host.phase-b previous authority historical evidence observed",
+                &manifest,
+                None,
+                &identity,
+            );
+        });
+        assert!(
+            after.contains("host_epoch=550e8400-e29b-41d4-a716-446655440000/7"),
+            "the owner-proven Host epoch must be projected exactly: {after}"
+        );
+        assert!(
+            !after.contains(&format!("host_epoch={PHASE_B_IDENTITY_UNAVAILABLE}")),
+            "a proven Host epoch must not stay at its absence disposition: {after}"
+        );
+        for still_absent in [
+            "fence",
+            "declared",
+            "authority",
+            "durable_authority",
+            "preparation",
+        ] {
+            assert!(
+                after.contains(&format!("{still_absent}={PHASE_B_IDENTITY_UNAVAILABLE}")),
+                "an unproven authority slot {still_absent} must stay absent: {after}"
+            );
+        }
+        assert!(
+            !after.contains("host.phase-b-rollback restored"),
+            "an authority record is not a rollback disposition: {after}"
+        );
+        let _removed = std::fs::remove_dir_all(root);
+    }
+}
