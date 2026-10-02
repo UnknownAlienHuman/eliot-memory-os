@@ -277,23 +277,36 @@ fn hook_runtime_root() -> Result<PathBuf, HookIntakeError> {
 /// removed, and it is that total the owner compares — on every chunking path,
 /// because the owner makes the fills not matter: every fill charges its content
 /// bytes once and consumes every byte it charges, and a fill that ends on a
-/// lone CR leaves the stream whole with the CR held out of the charge, so that
-/// held CR is charged exactly once by whichever later fill resolves it rather
-/// than re-delivered with the content behind it. The one arrival the owner's
-/// LF-only scan cannot classify in the fill that carries it is therefore that
-/// fill ending on a lone CR, because the CR and the newline that would prove it
-/// framing land in different fills. A record of `max_record_bytes` content
-/// bytes, `\r`, `\n` is ACCEPTED in one fill, in 64 KiB fills that divide the
-/// content evenly, in fills that leave the `\r` on a fill of its own, in a
-/// one-byte fill, and in fills that divide neither the ceiling nor the
-/// terminator — the same total, from all of them — and the byte stream is
-/// refused identically once it carries one byte more of content. (Before the
-/// held-CR arm existed, the fourth of those arrivals was refused at exactly
-/// `max_record_bytes` content bytes, so the disposition depended on the
+/// lone CR leaves the stream whole with that CR buffered at its stream position
+/// but uncharged, so that it is charged exactly once by whichever later fill
+/// resolves it rather than re-delivered with the content behind it. The one
+/// arrival the owner's LF-only scan cannot classify in the fill that carries it
+/// is therefore that fill ending on a lone CR, because the CR and the newline
+/// that would prove it framing land in different fills. A record of
+/// `max_record_bytes` content bytes, `\r`, `\n` is ACCEPTED in one fill, in 64 KiB
+/// fills that divide the content evenly, in fills that leave the `\r` on a
+/// fill of its own, in a one-byte fill, and in fills that divide neither the
+/// ceiling nor the terminator — the same total, from all of them — and the byte
+/// stream is refused identically once it carries one byte more of content.
+/// (Before the held-CR arm existed, the fourth of those arrivals was refused at
+/// exactly `max_record_bytes` content bytes, so the disposition depended on the
 /// caller's buffer size rather than on the bytes.) A carriage return that no
 /// newline follows is content, not framing: it is charged against the ceiling
 /// and kept in the record, so an EOF-final record that ends on a CR is not
 /// silently shortened.
+///
+/// The accepted BYTES are a function of the byte stream on the same footing.
+/// A held carriage return is buffered where the stream puts it and is removed,
+/// when it turns out to be framing, by that recorded position rather than by
+/// appending it later behind content that preceded it. Appending instead was
+/// what made one byte stream produce several different accepted records — a
+/// shipped 8 KiB arrival and a 64 KiB arrival of the same hook payload could
+/// hand back different bytes — and, when the reordering happened to repair an
+/// otherwise-invalid UTF-8 sequence, it could even turn a record that must be
+/// REFUSED into one that is accepted. A CR is legal JSON whitespace, so those
+/// reordered records still decoded, and a wrong payload reached
+/// [`EliotHookService`] with no error anywhere: the owner now retains such a
+/// byte in place, and never re-appends it out of order.
 ///
 /// [`ReadOutcome::Record`] is reachable only when the ceiling held for every
 /// chunk of it, so an accepted payload is never a truncation of a longer
