@@ -24,7 +24,7 @@
 //! - `boundary_rows_bind_a_landed_case` binds every production row to a
 //!   landed case so the table cannot claim proof that does not exist.
 //!
-//! The 22-case matrix itself is LANDED: cases 1 and 3..22 carry a
+//! The 22-case matrix itself is LANDED, with no gap: all 22 cases carry a
 //! `// WORK_UNIT_CASE: 891/<n>` marker, and each marker's `fn` is a real
 //! `#[test]`. The `deferred_cases` list in
 //! `tests/data/host_lifecycle_diagnostics.json` is the stale artefact, not
@@ -614,11 +614,12 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
 ///
 /// This is the EXECUTED proof that the matrix really runs. A marker without a
 /// live test, or a doubled marker, fails here rather than being described as
-/// coverage. Case 2 is the one case whose proof is not landed yet: its four
-/// production rows still name `891/case-2`, but no case-2 test exists, so the
-/// exact denominator is `1..=22` minus case 2. That gap is named here instead
-/// of being papered over, and the count is pinned so the day case 2 lands this
-/// test fails until the pin is updated.
+/// coverage. Case 2 was the last case whose proof was not landed; its four
+/// production rows now name a real `#[test] fn case_2_..`, so the matrix has
+/// no gap and the denominator is exactly `1..=22`. The absence of an exception
+/// list is itself pinned here: the inverse check below proves every
+/// `fn case_<n>_` test in `lib.rs` is paid for by a marker, so a case cannot
+/// re-open a silent gap by keeping its proof while dropping its marker.
 #[test]
 fn case_matrix_denominator_is_exactly_1_to_22() {
     let lib = manifest_source("src/lib.rs");
@@ -665,23 +666,41 @@ fn case_matrix_denominator_is_exactly_1_to_22() {
         );
     }
 
-    // Exact denominator: every case except the named case-2 gap, once each.
+    // Exact denominator: every case in the matrix, once each, no gap.
     let mut covered: Vec<u32> = markers.iter().map(|(case, _)| *case).collect();
     covered.sort_unstable();
-    let expected: Vec<u32> = (1..=22).filter(|case| *case != 2).collect();
+    let expected: Vec<u32> = (1..=22).collect();
     assert_eq!(
         covered, expected,
-        "the landed case markers must be exactly 1..=22 minus case 2"
+        "the landed case markers must be exactly 1..=22, with no gap"
     );
 
-    // The gap is explicit, not silent: case 2 has no marker and no test.
-    assert!(
-        !covered.contains(&2),
-        "case 2 must be listed as the unlanded case while it has no marker"
-    );
-    assert!(
-        !lib.contains("fn case_2_"),
-        "a case_2 test exists, so the unlanded-case pin must be updated"
+    // The inverse of the denominator, so no case can re-open a silent gap: a
+    // case proof that is not paid for by a marker is a claim the denominator
+    // never admitted, and a marker with no proof is coverage that does not
+    // run. Case 2 is held here exactly like the other 21.
+    let mut proved: Vec<u32> = Vec::new();
+    for line in lines.iter() {
+        let trimmed = line.trim();
+        let Some(name) = trimmed.strip_prefix("fn case_") else {
+            continue;
+        };
+        let Some((number, _)) = name.split_once('_') else {
+            panic!("a case test must name its case number, got {name:?}");
+        };
+        let number = number.parse::<u32>().unwrap_or_else(|_| {
+            panic!("a case test must name its case number, got {name:?}")
+        });
+        assert!(
+            markers.iter().any(|(case, _)| *case == number),
+            "{name} claims matrix case {number} with no WORK_UNIT_CASE marker"
+        );
+        proved.push(number);
+    }
+    proved.sort_unstable();
+    assert_eq!(
+        proved, expected,
+        "every matrix case must be proved by exactly one `fn case_<n>_` test"
     );
 
     // Each marker is a real test, not a comment: `#[test]` precedes every one.
@@ -813,24 +832,31 @@ fn boundary_fixture_binds_production_table() {
     );
 }
 
-/// Binds every production boundary row to a case marker that actually exists.
+/// Binds every production boundary row to a case proof that actually exists.
 ///
 /// The table's `test` field is the claim of proof. A row naming a case with no
-/// landed marker is proof that does not exist, so this fails on it instead of
-/// leaving the claim unchecked. Case 2's four rows are the known exception and
-/// are named explicitly, because their gap is real and reported rather than
-/// hidden: the rows are pinned by name so the day case 2 lands, this test
-/// fails until the exception is removed.
+/// landed proof is proof that does not exist, so this fails on it instead of
+/// leaving the claim unchecked. Every row is now bound the same way and there
+/// is no exception list, because every case the table names is landed - case
+/// 2's four rows included. Each claim must resolve to both the
+/// `// WORK_UNIT_CASE: 891/<n>` marker and the live `#[test] fn case_<n>_`
+/// behind it.
 #[test]
 fn boundary_rows_bind_a_landed_case() {
     let lib = production_source();
+    // The markers and the case tests live in the `#[cfg(test)]` case module
+    // that `production_source()` excises by design, so they are read from the
+    // whole source. Scanning the production haystack finds no marker at all,
+    // which made "case 2 is not landed" vacuously true and every other row's
+    // binding unprovable.
+    let whole = manifest_source("src/lib.rs");
     let rows = production_boundary_rows(&lib);
     assert!(
         !rows.is_empty(),
         "the production boundary table must yield rows from lib.rs"
     );
 
-    let marked: Vec<String> = lib
+    let marked: Vec<String> = whole
         .lines()
         .filter_map(|line| {
             line.trim()
@@ -839,44 +865,47 @@ fn boundary_rows_bind_a_landed_case() {
         })
         .collect();
 
-    // The four rows whose case-2 proof is not landed yet.
-    let unlanded_case_2 = [
-        "open.requested",
-        "open.admitted",
-        "start.requested",
-        "start.started",
-    ];
-
+    let mut bound: Vec<&str> = Vec::new();
     for row in &rows {
         let Some(case) = row.test.strip_prefix("891/case-") else {
             // T-A/T-B probes and other issues' cases are not this matrix.
             continue;
         };
-        if case == "2" {
-            assert!(
-                unlanded_case_2.contains(&row.name.as_str()),
-                "only the four case-2 rows may name the unlanded case 2, got {:?}",
-                row.name
-            );
-            assert!(
-                !marked.contains(&"2".to_owned()),
-                "case 2 is now landed, so the case-2 exception must be removed"
-            );
-            continue;
-        }
         assert!(
             marked.contains(&case.to_owned()),
             "boundary row {:?} names case {case}, which has no WORK_UNIT_CASE marker",
             row.name
         );
-    }
-
-    // Every name in the exception list is a real production row, so the
-    // exception cannot outlive the rows it describes.
-    for name in unlanded_case_2 {
         assert!(
-            rows.iter().any(|row| row.name == name),
-            "the case-2 exception names {name:?}, which is not a production row"
+            whole.contains(&format!("fn case_{case}_")),
+            "boundary row {:?} names case {case}, whose marker sits on no live test",
+            row.name
+        );
+        bound.push(row.name.as_str());
+    }
+    // The bindings above must not be an empty set: a table that renamed every
+    // `test` field out of the `891/case-` namespace would pass this loop by
+    // skipping every row, which is unproved, not proved.
+    assert!(
+        !bound.is_empty(),
+        "the boundary table must name matrix cases, or no row binding is proved"
+    );
+
+    // The four rows that used to be the named exception are now bound by the
+    // same path, so the closure of that gap is pinned rather than assumed:
+    // each is still a real production row and each still names case 2.
+    for name in [
+        "open.requested",
+        "open.admitted",
+        "start.requested",
+        "start.started",
+    ] {
+        let row = rows.iter().find(|row| row.name == name).unwrap_or_else(|| {
+            panic!("the closed case-2 gap pins row {name:?}, which is not a production row")
+        });
+        assert_eq!(
+            row.test, "891/case-2",
+            "row {name:?} must still name the landed case 2"
         );
     }
 }
