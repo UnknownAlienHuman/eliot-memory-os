@@ -2404,9 +2404,9 @@ mod gateway_cases {
     use super::*;
     use crate::{
         HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding,
-        HostProcessBinding, KERNEL_CONTROL_PIPE, KernelActivationPermit, KernelControlCommand,
-        KernelReadyReceipt, KernelService, KernelServiceState, KernelStoreGateway,
-        ProcessObservation, RestartBudget,
+        HostProcessBinding, HostStoreBootstrapRequirement, KERNEL_CONTROL_PIPE,
+        KernelActivationPermit, KernelControlCommand, KernelReadyReceipt, KernelService,
+        KernelServiceState, KernelStoreGateway, ProcessObservation, RestartBudget,
     };
     use eliot_contracts::AuthorityEpoch;
     use eliot_ipc::{
@@ -2580,6 +2580,7 @@ mod gateway_cases {
         connection_id: String,
         artifact_hash: String,
         config_hash: String,
+        requirement: HostStoreBootstrapRequirement,
         mode: ServerMode,
         log: Arc<ServerLog>,
     ) {
@@ -2591,7 +2592,17 @@ mod gateway_cases {
         assert_eq!(frame.kind, FrameKind::Control, "992 expects EBP hello");
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: "loopback-store-session".to_owned(),
+            // The production validator `store_client.rs::decode_server_hello`
+            // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+            // projected from the requirement the client admits with. This
+            // responder is handed that requirement, so the announced principal
+            // is the authenticated one rather than a retyped literal
+            // (issue #4652). No other handshake guard is changed.
+            session_principal_binding: format!(
+                "sid={};session={}",
+                requirement.expected_peer_sid.as_str(),
+                requirement.expected_peer_session_id
+            ),
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -2766,6 +2777,7 @@ mod gateway_cases {
             connection_id,
             artifact,
             config,
+            requirement.clone(),
             mode,
             Arc::clone(&log),
         ));
@@ -3707,6 +3719,7 @@ async fn serve_startup(
     connection_id: String,
     artifact_hash: String,
     config_hash: String,
+    requirement: HostStoreBootstrapRequirement,
     answers: std::sync::Arc<StartupAnswers>,
 ) {
     let limits = eliot_ipc::TransportLimits::default();
@@ -3721,7 +3734,17 @@ async fn serve_startup(
     );
     let hello = eliot_protocol::ServerHello {
         selected_protocol: eliot_protocol::ProtocolVersion::CURRENT,
-        session_principal_binding: "startup-992-store-session".to_owned(),
+        // The production validator `store_client.rs::decode_server_hello`
+        // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+        // projected from the requirement the client admits with. This responder
+        // is handed that requirement, so the announced principal is the
+        // authenticated one rather than a retyped literal (issue #4652). No
+        // other handshake guard is changed.
+        session_principal_binding: format!(
+            "sid={};session={}",
+            requirement.expected_peer_sid.as_str(),
+            requirement.expected_peer_session_id
+        ),
         allowed_capabilities: eliot_store_api::CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
@@ -3927,6 +3950,7 @@ async fn startup_route(tag: &str) -> (StartupRoute, std::sync::Arc<StartupAnswer
         connection_id,
         artifact,
         config,
+        requirement.clone(),
         std::sync::Arc::clone(&answers),
     ));
     let client = EbpCanonicalStoreClient::connect(transport, requirement)

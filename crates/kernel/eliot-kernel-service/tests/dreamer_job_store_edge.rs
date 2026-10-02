@@ -405,7 +405,16 @@ impl ScriptedPeer {
     fn hello_frame(&self) -> Frame {
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: "edge-store-session".to_owned(),
+            // The production validator `store_client.rs::decode_server_hello`
+            // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+            // projected from the requirement the client admits with, so the
+            // scripted peer answers with that same tuple instead of a retyped
+            // literal (issue #4652). No other handshake guard is changed.
+            session_principal_binding: format!(
+                "sid={};session={}",
+                self.requirement.expected_peer_sid.as_str(),
+                self.requirement.expected_peer_session_id
+            ),
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -1462,6 +1471,7 @@ mod gateway_cases {
         connection_id: String,
         artifact_hash: String,
         config_hash: String,
+        requirement: HostStoreBootstrapRequirement,
         authority_epoch: EpochId,
         reply: LoopbackReply,
         log: Arc<Mutex<LoopbackLog>>,
@@ -1474,7 +1484,17 @@ mod gateway_cases {
         assert_eq!(frame.kind, FrameKind::Control, "loopback expects EBP hello");
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: "loopback-store-session".to_owned(),
+            // The production validator `store_client.rs::decode_server_hello`
+            // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+            // projected from the requirement the client admits with. This
+            // responder is handed that requirement, so the announced principal
+            // is the authenticated one rather than a retyped literal
+            // (issue #4652). No other handshake guard is changed.
+            session_principal_binding: format!(
+                "sid={};session={}",
+                requirement.expected_peer_sid.as_str(),
+                requirement.expected_peer_session_id
+            ),
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -1652,6 +1672,7 @@ mod gateway_cases {
             connection_id,
             artifact,
             config,
+            requirement.clone(),
             live.authority_epoch.clone(),
             reply,
             Arc::clone(&log),
