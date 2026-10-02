@@ -32,6 +32,37 @@ namespace Eliot.Operator.Services;
 /// this process's own release rather than from peer liveness: there is no
 /// observation of the broker here that a later request could rely on.
 ///
+/// That refusal to write a later leg is a property of the BROKER's wire, not a
+/// client choice, and it is why no `authority` object is presented anywhere
+/// today. `OperatorPipeRequest` in `bins/eliot-user-broker/src/main.rs` is a
+/// closed, `deny_unknown_fields` enum of exactly two members,
+/// `operator_challenge` and `redeem_operator_handoff`, and
+/// `serve_operator_pipe_connection` requires them in that order and returns
+/// immediately after writing the second response, dropping the server end. A
+/// third line is therefore never read: writing one would put bytes into a
+/// pipe the broker has already closed, which is a silent no-op at best and an
+/// unknown-outcome report for a state change nobody performed at worst. So the
+/// retained principal is enforced locally on the state-changing routes (see
+/// `GovernorPipeClient.RequireRetainedHumanPrincipal`) and is presented to no
+/// broker arm, because no broker arm reads one.
+///
+/// The missing link is broker-side, in two named parts, and neither is
+/// closable in this file:
+///
+/// * a state-changing operator-pipe request that carries an `authority` and is
+///   served after redemption. The gated arms that parse one exist only on the
+///   broker's own stdin protocol (`Request::Cancel`, `Request::Reconcile`,
+///   `Request::Launch` and the notify operations), and stdin is written by
+///   whatever process spawned the broker. This UI process has no handle to it,
+///   so stdin is not reachable from here either.
+/// * an owner for `approval_hash`. `HumanStateAuthority` requires it as a
+///   non-optional field and `admit_human_state_change` refuses every value by
+///   name at `HumanApprovalActionDigestUnverifiable` because this broker holds
+///   no independently derived authority action digest. Nothing in the tree
+///   produces one, so a client could only supply an invented 64-hex string.
+///   `OperatorHumanPrincipal` deliberately omits it, and no member is added to
+///   carry a value this process never observed or was granted.
+///
 /// Retention is process memory and is never persisted or carried across
 /// processes, so a restarted UI comes up with no retained session at all and
 /// the next request has to earn a fresh Kernel challenge/session token through
