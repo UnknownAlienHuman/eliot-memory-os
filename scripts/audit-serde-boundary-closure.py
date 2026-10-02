@@ -84,6 +84,68 @@ PROTECTED_FIELDS = frozenset(
 )
 BYPASS_SHAPES = frozenset({"flatten", "untagged", "alias", "manual-visitor"})
 
+# ---------------------------------------------------------------------------
+# The closed #929 ``check(root)`` result contract admitted at this boundary.
+#
+# #929 owns these values. They are restated here as the exact admission shape
+# this coordinator requires, so a result that is merely *well typed* but is not
+# a real #929 checked identity is refused as malformed API output instead of
+# being carried into the 20 closure cases. Nothing here is derived from the
+# returned value; nothing here widens what #929 can legitimately return.
+# ---------------------------------------------------------------------------
+
+# ``header["proof_ceiling"]`` must EQUAL this, not merely be a string.
+ACCEPTED_PROOF_CEILING = "SOURCE_INVENTORY_AND_OWNERSHIP_ONLY"
+# ``header["base_sha"]`` is ``git rev-parse HEAD``: a 40-hex object id, or this
+# literal when #929 cannot resolve one. Any other shape is not a base identity.
+ACCEPTED_UNKNOWN_BASE_SHA = "unknown-base"
+# Identity of the inventory schema this coordinator is written against.
+ACCEPTED_SCHEMA_PREFIX = "eliot.serde-boundary-inventory."
+# Closed header vocabularies.
+ACCEPTED_COVERAGE_STATES = frozenset({"COMPLETE", "INCOMPLETE"})
+ACCEPTED_FAMILY_READINESS = frozenset({"READY", "BLOCKED"})
+
+# Explicit required-key sets for the three levels of the returned result. A
+# load-bearing field that is absent is refused; it is never read as an empty
+# checked identity. Unknown *additional* fields are tolerated and ignored (they
+# are inert evidence for this coordinator), but nothing load-bearing is
+# defaulted.
+CHECKED_RESULT_REQUIRED_KEYS = frozenset({"rows", "digest", "header"})
+CHECKED_HEADER_REQUIRED_KEYS = frozenset(
+    {
+        "schema",
+        "tool_version",
+        "rule_revision",
+        "proof_ceiling",
+        "issue",
+        "base_sha",
+        "base_sha_source",
+        "provenance_authority",
+        "canonical_excludes",
+        "denominator_status",
+        "ambiguous_reason",
+        "coverage",
+        "family_readiness",
+        "family_blocked_reason",
+        "safety",
+        "candidate_count",
+        "classified_count",
+        "unknown_count",
+        "unassigned_count",
+        "ready_children",
+        "blocked_children",
+        "denominator_digest",
+        "aggregate_digest",
+    }
+)
+CHECKED_ROW_REQUIRED_KEYS = frozenset(
+    {"candidate_id", "id", "disposition", "owner", "digest"}
+)
+
+_SHA256_HEX_DIGITS = frozenset("0123456789abcdef")
+_GIT_OBJECT_ID_LENGTH = 40
+_SHA256_DIGEST_LENGTH = 64
+
 
 class InventoryUnavailable(Exception):
     """Raised when no checked #929 inventory is available; precise cause.
@@ -395,94 +457,224 @@ def load_checked_inventory(root: Path) -> CheckedInventory:
     return _validate_checked_result(result)
 
 
-def _validate_checked_result(result: Any) -> CheckedInventory:
-    """Validate ``check(root)``'s exact contract without rescanning source.
+def _contract_failure(detail: str) -> InventoryUnavailable:
+    """Every admission failure keeps the one inventory/API contract category."""
+    return InventoryUnavailable(f"inventory contract failure: {detail}")
 
-    Rejects malformed result/row shapes, missing or duplicate
-    identities, digest mismatch between the result and its header, and
-    header counts inconsistent with the returned rows. Legitimate
-    unknown/needs-repair rows pass through untouched: #929's
-    classification stays authoritative and this adapter replaces none
-    of it.
+
+def _is_sha256_digest(value: Any) -> bool:
+    """True only for a lowercase 64-hex SHA-256 identity.
+
+    ``str`` is checked exactly, so a bool, int or bytes value is not a digest.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == _SHA256_DIGEST_LENGTH
+        and all(char in _SHA256_HEX_DIGITS for char in value)
+    )
+
+
+def _is_git_object_id(value: Any) -> bool:
+    """True only for a lowercase 40-hex git object id."""
+    return (
+        isinstance(value, str)
+        and len(value) == _GIT_OBJECT_ID_LENGTH
+        and all(char in _SHA256_HEX_DIGITS for char in value)
+    )
+
+
+def _is_checked_base_sha(value: Any) -> bool:
+    """The base identity form #929 promises for a checked source snapshot.
+
+    ``git rev-parse HEAD`` yields a 40-hex object id; when #929 cannot resolve
+    one it records the literal ``unknown-base``. A blank string is neither.
+    """
+    if value == ACCEPTED_UNKNOWN_BASE_SHA:
+        return True
+    return _is_git_object_id(value)
+
+
+def _is_exact_int(value: Any) -> bool:
+    """A real integer count. ``bool`` is a subclass of ``int`` in Python."""
+    return type(value) is int
+
+
+def _non_blank_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _require_keys(
+    mapping: Mapping[str, Any], required: frozenset[str], level: str
+) -> None:
+    missing = sorted(required - set(mapping.keys()))
+    if missing:
+        raise _contract_failure(f"check(root) {level} is missing {missing}")
+
+
+def _validate_checked_result(result: Any) -> CheckedInventory:
+    """Validate ``check(root)``'s exact identity contract without rescanning.
+
+    Trusting Python value types is insufficient here: a Boolean is an ``int``,
+    any non-empty string is a plausible ``str``, and two conflicting row
+    identities can collapse to whichever one happens to be truthy. This
+    adapter therefore admits a result only when it carries the real #929
+    identity material:
+
+    - lowercase 64-hex aggregate, denominator and per-row digests, with the
+      result digest equal to the header aggregate;
+    - a ``base_sha`` in the form #929 promises, and a ``proof_ceiling`` that
+      *equals* the accepted #929 ceiling;
+    - both row identity fields present, non-blank, and equal, with no
+      duplicate identity across rows;
+    - dispositions inside #929's closed vocabulary — legitimate ``unknown``
+      and ``needs-repair`` rows are preserved as findings, while a foreign
+      disposition is malformed API output, not a closure-case result;
+    - non-blank owner and a real row digest, never silently normalised;
+    - real integer (non-boolean) counts that agree with the returned rows.
+
+    Any failure is an ``inventory contract failure`` raised before
+    ``evaluate_cases`` runs, so no closure case is ever presented as current
+    over an identity that was never admitted.
     """
     if not isinstance(result, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) returned "
-            f"{type(result).__name__}, expected a mapping with "
-            "rows/digest/header"
+        raise _contract_failure(
+            f"check(root) returned {type(result).__name__}, expected a mapping "
+            "with rows/digest/header"
         )
-    rows_raw = result.get("rows")
+    _require_keys(result, CHECKED_RESULT_REQUIRED_KEYS, "result")
+    rows_raw = result["rows"]
     if not isinstance(rows_raw, list):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no rows list"
-        )
-    digest = result.get("digest")
-    if not isinstance(digest, str) or not digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no "
-            "aggregate digest"
-        )
-    header = result.get("header")
+        raise _contract_failure("check(root) result rows is not a list")
+    digest = result["digest"]
+    header = result["header"]
     if not isinstance(header, Mapping):
-        raise InventoryUnavailable(
-            "inventory contract failure: check(root) result has no header "
-            "mapping"
+        raise _contract_failure("check(root) result header is not a mapping")
+    _require_keys(header, CHECKED_HEADER_REQUIRED_KEYS, "header")
+
+    # --- top-level and header identity material ----------------------------
+    if not _is_sha256_digest(digest):
+        raise _contract_failure(
+            f"check(root) result digest {digest!r} is not a lowercase 64-hex "
+            "SHA-256 aggregate identity"
         )
-    if header.get("aggregate_digest") != digest:
-        raise InventoryUnavailable(
-            "inventory contract failure: result digest does not match "
-            "header aggregate_digest"
+    header_aggregate = header["aggregate_digest"]
+    if not _is_sha256_digest(header_aggregate):
+        raise _contract_failure(
+            "header aggregate_digest "
+            f"{header_aggregate!r} is not a lowercase 64-hex SHA-256 identity"
         )
-    denominator = header.get("denominator_digest")
-    if not isinstance(denominator, str) or not denominator:
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no denominator_digest"
+    if header_aggregate != digest:
+        raise _contract_failure(
+            "result digest does not match header aggregate_digest"
         )
-    candidate_count = header.get("candidate_count")
-    if not isinstance(candidate_count, int) or candidate_count != len(rows_raw):
-        raise InventoryUnavailable(
-            "inventory contract failure: header candidate_count "
-            f"{candidate_count!r} != returned rows {len(rows_raw)}"
+    denominator = header["denominator_digest"]
+    if not _is_sha256_digest(denominator):
+        raise _contract_failure(
+            "header denominator_digest "
+            f"{denominator!r} is not a lowercase 64-hex SHA-256 identity"
         )
-    base_sha = header.get("base_sha")
-    if not isinstance(base_sha, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no base_sha"
+    proof_ceiling = header["proof_ceiling"]
+    if proof_ceiling != ACCEPTED_PROOF_CEILING:
+        raise _contract_failure(
+            f"header proof_ceiling {proof_ceiling!r} != accepted #{INVENTORY_ISSUE} "
+            f"ceiling {ACCEPTED_PROOF_CEILING!r}"
         )
-    proof_ceiling = header.get("proof_ceiling")
-    if not isinstance(proof_ceiling, str):
-        raise InventoryUnavailable(
-            "inventory contract failure: header has no proof_ceiling"
+    base_sha = header["base_sha"]
+    if not _is_checked_base_sha(base_sha):
+        raise _contract_failure(
+            f"header base_sha {base_sha!r} is not a #{INVENTORY_ISSUE} checked "
+            "source identity (40-hex object id or "
+            f"{ACCEPTED_UNKNOWN_BASE_SHA!r})"
         )
+    schema = header["schema"]
+    if not _non_blank_str(schema) or not schema.startswith(
+        ACCEPTED_SCHEMA_PREFIX
+    ):
+        raise _contract_failure(
+            f"header schema {schema!r} is not the #{INVENTORY_ISSUE} inventory "
+            f"schema ({ACCEPTED_SCHEMA_PREFIX}*)"
+        )
+    issue = header["issue"]
+    if not _is_exact_int(issue) or issue != INVENTORY_ISSUE:
+        raise _contract_failure(
+            f"header issue {issue!r} != owning issue {INVENTORY_ISSUE}"
+        )
+    for key in (
+        "tool_version",
+        "rule_revision",
+        "safety",
+        "base_sha_source",
+        "provenance_authority",
+    ):
+        if not _non_blank_str(header[key]):
+            raise _contract_failure(f"header {key} is blank or not a string")
+    excludes = header["canonical_excludes"]
+    if (
+        not isinstance(excludes, list)
+        or not excludes
+        or not all(_non_blank_str(item) for item in excludes)
+    ):
+        raise _contract_failure(
+            "header canonical_excludes is not a non-empty list of strings"
+        )
+    for key, vocabulary in (
+        ("denominator_status", ACCEPTED_COVERAGE_STATES),
+        ("coverage", ACCEPTED_COVERAGE_STATES),
+        ("family_readiness", ACCEPTED_FAMILY_READINESS),
+    ):
+        if header[key] not in vocabulary:
+            raise _contract_failure(
+                f"header {key} {header[key]!r} is outside the closed vocabulary "
+                f"{sorted(vocabulary)}"
+            )
+    for key in ("ambiguous_reason", "family_blocked_reason"):
+        if not isinstance(header[key], str):
+            raise _contract_failure(f"header {key} is not a string")
+
+    # --- row identity material --------------------------------------------
     rows: list[InventoryRow] = []
     seen: set[str] = set()
     for entry in rows_raw:
         if not isinstance(entry, Mapping):
-            raise InventoryUnavailable(
-                "inventory contract failure: row is "
-                f"{type(entry).__name__}, expected a mapping"
+            raise _contract_failure(
+                f"row is {type(entry).__name__}, expected a mapping"
             )
-        cid = entry.get("candidate_id") or entry.get("id")
-        if not isinstance(cid, str) or not cid:
-            raise InventoryUnavailable(
-                "inventory contract failure: row without candidate identity"
+        _require_keys(entry, CHECKED_ROW_REQUIRED_KEYS, "row")
+        candidate_id = entry["candidate_id"]
+        row_id = entry["id"]
+        if not _non_blank_str(candidate_id):
+            raise _contract_failure(
+                f"row candidate_id {candidate_id!r} is blank or not a string"
             )
+        if not _non_blank_str(row_id):
+            raise _contract_failure(
+                f"row id {row_id!r} is blank or not a string"
+            )
+        if candidate_id != row_id:
+            raise _contract_failure(
+                f"row claims two identities: candidate_id {candidate_id!r} != "
+                f"id {row_id!r}"
+            )
+        cid = candidate_id
         if cid in seen:
-            raise InventoryUnavailable(
-                f"inventory contract failure: duplicate row {cid}"
-            )
+            raise _contract_failure(f"duplicate row identity {cid}")
         seen.add(cid)
-        disposition = entry.get("disposition")
-        owner = entry.get("owner")
-        row_digest = entry.get("digest")
-        if (
-            not isinstance(disposition, str)
-            or not isinstance(owner, str)
-            or not isinstance(row_digest, str)
-        ):
-            raise InventoryUnavailable(
-                f"inventory contract failure: row {cid} has malformed "
-                "disposition/owner/digest"
+        disposition = entry["disposition"]
+        if disposition not in KNOWN_DISPOSITIONS:
+            raise _contract_failure(
+                f"row {cid} disposition {disposition!r} is outside the closed "
+                f"#{INVENTORY_ISSUE} vocabulary {sorted(KNOWN_DISPOSITIONS)}"
+            )
+        owner = entry["owner"]
+        if not _non_blank_str(owner):
+            raise _contract_failure(
+                f"row {cid} owner {owner!r} is blank or not a string"
+            )
+        row_digest = entry["digest"]
+        if not _is_sha256_digest(row_digest):
+            raise _contract_failure(
+                f"row {cid} digest {row_digest!r} is not a lowercase 64-hex "
+                "SHA-256 identity"
             )
         rows.append(
             InventoryRow(
@@ -492,13 +684,52 @@ def _validate_checked_result(result: Any) -> CheckedInventory:
                 digest=row_digest,
             )
         )
+
+    # --- returned count relationships --------------------------------------
+    counts: dict[str, int] = {}
+    for key in (
+        "candidate_count",
+        "classified_count",
+        "unknown_count",
+        "unassigned_count",
+        "ready_children",
+        "blocked_children",
+    ):
+        value = header[key]
+        if not _is_exact_int(value) or value < 0:
+            raise _contract_failure(
+                f"header {key} {value!r} is not a real non-negative integer "
+                "count"
+            )
+        counts[key] = value
+    if counts["candidate_count"] != len(rows):
+        raise _contract_failure(
+            "header candidate_count "
+            f"{counts['candidate_count']!r} != returned rows {len(rows)}"
+        )
+    if counts["classified_count"] != len(rows):
+        raise _contract_failure(
+            "header classified_count "
+            f"{counts['classified_count']!r} != returned rows {len(rows)}"
+        )
+    unknown_rows = sum(1 for row in rows if row.disposition == "unknown")
+    if counts["unknown_count"] != unknown_rows:
+        raise _contract_failure(
+            f"header unknown_count {counts['unknown_count']!r} != "
+            f"{unknown_rows} returned unknown row(s)"
+        )
+    if counts["unassigned_count"] > counts["candidate_count"]:
+        raise _contract_failure(
+            f"header unassigned_count {counts['unassigned_count']!r} exceeds "
+            f"candidate_count {counts['candidate_count']!r}"
+        )
     return CheckedInventory(
         rows=tuple(rows),
         aggregate_digest=digest,
         denominator_digest=denominator,
         base_sha=base_sha,
         proof_ceiling=proof_ceiling,
-        candidate_count=candidate_count,
+        candidate_count=counts["candidate_count"],
     )
 
 
@@ -1093,7 +1324,274 @@ def build_self_test_input() -> ReconciliationInput:
     )
 
 
+# ---------------------------------------------------------------------------
+# Fake-API regressions for the checked identity contract (#2701 audit).
+#
+# Every shape below is one #929 ``check(root)`` result the adapter MUST refuse.
+# A refused result is refused, never coerced into "no problems found": the
+# admission phase raises before ``evaluate_cases`` runs.
+# ---------------------------------------------------------------------------
+
+_FAKE_AGGREGATE = "a" * _SHA256_DIGEST_LENGTH
+_FAKE_DENOMINATOR = "b" * _SHA256_DIGEST_LENGTH
+_FAKE_ROW_DIGEST = "c" * _SHA256_DIGEST_LENGTH
+_FAKE_BASE_SHA = "0" * _GIT_OBJECT_ID_LENGTH
+_FAKE_CANDIDATE_ID = "fake-package:crates/fake.rs:FakeType:1"
+
+
+def _fake_check_result() -> dict[str, Any]:
+    """One faithful #929 ``check(root)`` result with a single repair row."""
+    return {
+        "rows": [
+            {
+                "candidate_id": _FAKE_CANDIDATE_ID,
+                "id": _FAKE_CANDIDATE_ID,
+                "disposition": "needs-repair",
+                "owner": "#929",
+                "digest": _FAKE_ROW_DIGEST,
+            }
+        ],
+        "digest": _FAKE_AGGREGATE,
+        "header": {
+            "schema": "eliot.serde-boundary-inventory.v1",
+            "tool_version": "0.4.0",
+            "rule_revision": "929.4",
+            "proof_ceiling": ACCEPTED_PROOF_CEILING,
+            "issue": INVENTORY_ISSUE,
+            "base_sha": _FAKE_BASE_SHA,
+            "base_sha_source": "git-rev-parse-HEAD",
+            "provenance_authority": (
+                "informational-observational-outside-proof-ceiling"
+            ),
+            "canonical_excludes": ["base_sha", "base_sha_source"],
+            "denominator_status": "COMPLETE",
+            "ambiguous_reason": "",
+            "coverage": "COMPLETE",
+            "family_readiness": "BLOCKED",
+            "family_blocked_reason": "unknown-evidence",
+            "safety": "FINDINGS_REMAIN_BLOCKING",
+            "candidate_count": 1,
+            "classified_count": 1,
+            "unknown_count": 0,
+            "unassigned_count": 0,
+            "ready_children": 0,
+            "blocked_children": 1,
+            "denominator_digest": _FAKE_DENOMINATOR,
+            "aggregate_digest": _FAKE_AGGREGATE,
+        },
+    }
+
+
+# The exact counterexample from the #2701 external audit (comment 5908785311):
+# conflicting row identities, non-digest identities, an absent base identity, a
+# foreign proof ceiling, a Boolean accepted as an integer count, counts that
+# contradict the row set, and an empty owner presented as owner evidence.
+AUDIT_COUNTEREXAMPLE_2701: dict[str, Any] = {
+    "rows": [
+        {
+            "candidate_id": "candidate-A",
+            "id": "candidate-B",
+            "disposition": "unknown",
+            "owner": "",
+            "digest": "",
+        }
+    ],
+    "digest": "x",
+    "header": {
+        "aggregate_digest": "x",
+        "denominator_digest": "y",
+        "candidate_count": True,
+        "base_sha": "",
+        "proof_ceiling": "NOT_THE_929_CEILING",
+        "classified_count": 999,
+        "unknown_count": 0,
+    },
+}
+
+
+def _broken(
+    *,
+    header: dict[str, Any] | None = None,
+    drop_header: tuple[str, ...] = (),
+    row: dict[str, Any] | None = None,
+    drop_row: tuple[str, ...] = (),
+    extra_rows: list[dict[str, Any]] | None = None,
+    digest: str | None = None,
+) -> dict[str, Any]:
+    """A faithful #929 result with exactly the named defect(s) applied.
+
+    Every regression below is built from a complete, otherwise-valid result so
+    that the refusal is attributable to that one defect and not to some earlier
+    field also being wrong.
+    """
+    result = _fake_check_result()
+    if extra_rows is not None:
+        result["rows"] = result["rows"] + extra_rows
+    if row is not None:
+        result["rows"][0] = {**result["rows"][0], **row}
+    if drop_row:
+        result["rows"][0] = {
+            key: value
+            for key, value in result["rows"][0].items()
+            if key not in drop_row
+        }
+    if header is not None:
+        result["header"] = {**result["header"], **header}
+    if drop_header:
+        result["header"] = {
+            key: value
+            for key, value in result["header"].items()
+            if key not in drop_header
+        }
+    if digest is not None:
+        result["digest"] = digest
+        result["header"]["aggregate_digest"] = digest
+    return result
+
+
+_FAKE_SECOND_ROW = {
+    "candidate_id": "fake-package:crates/fake.rs:OtherType:2",
+    "id": "fake-package:crates/fake.rs:OtherType:2",
+    "disposition": "current-closed",
+    "owner": "#929",
+    "digest": "d" * _SHA256_DIGEST_LENGTH,
+}
+
+
+def _refusal_regressions() -> list[tuple[str, Any]]:
+    """(label, fake check result) pairs that must all be refused."""
+    return [
+        # The audit's own counterexample, verbatim.
+        ("audit-2701-counterexample", AUDIT_COUNTEREXAMPLE_2701),
+        # Row identity: both fields required, non-blank, equal, unique.
+        (
+            "conflicting candidate_id/id",
+            _broken(row={"id": "fake-package:crates/fake.rs:OtherType:2"}),
+        ),
+        ("missing row id field", _broken(drop_row=("id",))),
+        (
+            "missing row candidate_id field",
+            _broken(drop_row=("candidate_id",)),
+        ),
+        (
+            "blank row identity material",
+            _broken(row={"candidate_id": "   ", "id": "   "}),
+        ),
+        (
+            "duplicate row identity",
+            _broken(
+                extra_rows=[
+                    {
+                        **_FAKE_SECOND_ROW,
+                        "candidate_id": _FAKE_CANDIDATE_ID,
+                        "id": _FAKE_CANDIDATE_ID,
+                    }
+                ],
+                header={"candidate_count": 2, "classified_count": 2},
+            ),
+        ),
+        # Digest identities: lowercase 64-hex only.
+        ("non-digest row digest", _broken(row={"digest": ""})),
+        ("non-digest row digest (short hex)", _broken(row={"digest": "abcd"})),
+        (
+            "non-digest aggregate identity",
+            _broken(digest="x"),
+        ),
+        (
+            "non-digest denominator identity",
+            _broken(header={"denominator_digest": "y"}),
+        ),
+        # Base identity and proof ceiling.
+        ("blank base identity", _broken(header={"base_sha": ""})),
+        (
+            "non-object-id base identity",
+            _broken(header={"base_sha": "not-a-commit"}),
+        ),
+        (
+            "foreign proof ceiling",
+            _broken(header={"proof_ceiling": "NOT_THE_929_CEILING"}),
+        ),
+        # Disposition: closed #929 vocabulary at this boundary.
+        ("foreign disposition", _broken(row={"disposition": "covered"})),
+        # Owner: exact, non-ambiguous, never blank.
+        ("blank row owner", _broken(row={"owner": ""})),
+        ("missing row owner", _broken(drop_row=("owner",))),
+        ("missing row digest", _broken(drop_row=("digest",))),
+        # Counts: real integers whose returned relationships hold.
+        ("boolean candidate_count", _broken(header={"candidate_count": True})),
+        (
+            "boolean classified_count",
+            _broken(header={"classified_count": False}),
+        ),
+        (
+            "inconsistent candidate_count",
+            _broken(header={"candidate_count": 999}),
+        ),
+        (
+            "inconsistent classified_count",
+            _broken(header={"classified_count": 999}),
+        ),
+        (
+            "inconsistent unknown_count",
+            _broken(header={"unknown_count": 3}),
+        ),
+        (
+            "unassigned_count exceeds candidate_count",
+            _broken(header={"unassigned_count": 2}),
+        ),
+        # A load-bearing field that is absent is not an empty identity.
+        (
+            "load-bearing header field absent",
+            _broken(drop_header=("denominator_digest",)),
+        ),
+        (
+            "load-bearing base identity absent",
+            _broken(drop_header=("base_sha",)),
+        ),
+    ]
+
+
+def self_test_checked_identity_contract() -> None:
+    """Prove the checked identity contract admits only real #929 results."""
+    admitted = _validate_checked_result(_fake_check_result())
+    if admitted.aggregate_digest != _FAKE_AGGREGATE:
+        raise AssertionError("faithful fake result lost its aggregate identity")
+    if admitted.candidate_count != 1 or len(admitted.rows) != 1:
+        raise AssertionError("faithful fake result lost its row accounting")
+    if admitted.rows[0].disposition != "needs-repair":
+        raise AssertionError("a valid needs-repair row must survive admission")
+
+    # A legitimate `unknown` row is a finding, not a contract failure: it is
+    # preserved as returned and counted in the returned header.
+    unknown_result = json.loads(json.dumps(_fake_check_result()))
+    unknown_result["rows"][0]["disposition"] = "unknown"
+    unknown_result["header"]["unknown_count"] = 1
+    unknown_admitted = _validate_checked_result(unknown_result)
+    if unknown_admitted.rows[0].disposition != "unknown":
+        raise AssertionError("a valid unknown row must be preserved as a finding")
+
+    for label, fake in _refusal_regressions():
+        try:
+            _validate_checked_result(fake)
+        except InventoryUnavailable as error:
+            cause = str(error)
+            if not cause.startswith("inventory contract failure: "):
+                raise AssertionError(
+                    f"self-test {label!r} left the inventory contract "
+                    f"category: {cause}"
+                ) from error
+            continue
+        raise AssertionError(
+            f"self-test {label!r} was admitted as a checked #929 identity"
+        )
+    print(
+        "SERDE_BOUNDARY_CLOSURE_SELF_TEST: checked-identity contract "
+        f"({len(_refusal_regressions())} malformed shapes refused)"
+    )
+
+
 def self_test() -> ReconciliationResult:
+    self_test_checked_identity_contract()
     data = build_self_test_input()
     # Prove the lexical core really runs: the fixtures above must contain one
     # unknown field and one raw duplicate.
