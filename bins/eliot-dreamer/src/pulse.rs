@@ -445,7 +445,10 @@ pub(crate) fn verify_denominator_coverage(
         return Err(PULSE_DENOMINATOR_INCOMPLETE);
     }
     for id in PulseStageId::ORDER {
-        let occurrences = records.iter().filter(|record| record.stage == id.as_str()).count();
+        let occurrences = records
+            .iter()
+            .filter(|record| record.stage == id.as_str())
+            .count();
         if occurrences != 1 {
             return Err(PULSE_DENOMINATOR_INCOMPLETE);
         }
