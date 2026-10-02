@@ -2106,7 +2106,13 @@ impl SwarmStateRoot {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("state root {}: {error}", root.display()))?;
-        let root = std::fs::canonicalize(&root)
+        // The guard canonicalizes its own test root through
+        // `canonical_windows_path`, which drops the `\\?\` verbatim prefix that
+        // `std::fs::canonicalize` hands back. Resolving the root through that
+        // same helper keeps the state root and the protected contour in one
+        // path form, so the leaf this store owns stays inside the contour
+        // instead of being refused as outside it.
+        let root = eliot_platform_windows::canonical_windows_path(&root)
             .map_err(|error| format!("canonicalize state root {}: {error}", root.display()))?;
         let override_root = eliot_platform_windows::test_support::override_protected_root(&root);
         Ok(Self {
