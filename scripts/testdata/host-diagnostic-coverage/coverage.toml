@@ -1905,7 +1905,7 @@ file = "bins/eliot-host/src/tests.rs"
 case = "scm_store_late_dead_shared_route_records_intent_before_replacement"
 [[boundary.zeroscan]]
 ident = "cutover_generation"
-allowed = ["bins/eliot-host/src/lib.rs:286", "bins/eliot-host/src/lib.rs:966", "bins/eliot-host/src/lib.rs:8803"]
+allowed = ["bins/eliot-host/src/lib.rs:591", "bins/eliot-host/src/lib.rs:1271", "bins/eliot-host/src/lib.rs:14194"]
 
 [[boundary]]
 id = "B-lib-generation-cutover-live"
@@ -3077,14 +3077,14 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [boundary.reexport]
 file = "bins/eliot-host/src/lib.rs"
-start = 1796
-end = 1800
+start = 5292
+end = 5296
 digest = "b11efe5bb2d724d9d3c2887a6979d59123f3814f4349e60074957482302cd6b9"
 markers = ["pub use notify_fallback_setup"]
 [boundary.ext_caller]
 file = "bins/eliot/src/main.rs"
-start = 2543
-end = 2611
+start = 2775
+end = 2843
 digest = "94bea49e0a706712bf75eccb2b38598e7a9a3944cb1cbeb039e71f7959fd081a"
 markers = ["NOTIFY_FALLBACK_SETUP_RECOVERY_REQUIRED", "NOTIFY_FALLBACK_SETUP_REJECTED", "NOTIFY_FALLBACK_SETUP_PUBLISHED", "setup_notify_fallback_per_user"]
 
