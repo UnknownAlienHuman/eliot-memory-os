@@ -103,10 +103,11 @@
 //! [`row_family_denominator`] is bound to at least one table, so none is excused
 //! from having one; that too is asserted in a test rather than counted here. A
 //! table with no disposition is refused with [`OrsError::MigrationRequired`] on
-//! all three paths that run — [`export_page`], [`export_snapshot`] and
-//! [`import_page_quarantined`] — so it cannot be silently exported, imported or
-//! counted, and no table disappears because its name was absent from an old
-//! checklist.
+//! every path that runs it — [`export_page`], [`export_snapshot`],
+//! [`import_page_quarantined`] and
+//! [`import_backup_process_stream_recovery_suspended`](super::RedbRecoveryStore::import_backup_process_stream_recovery_suspended)
+//! — so it cannot be silently exported, imported or counted, and no table
+//! disappears because its name was absent from an old checklist.
 //!
 //! Be precise about what that means, because the previous version of this
 //! paragraph was the defect. The census used to compare itself only with
@@ -429,9 +430,6 @@ impl super::RedbRecoveryStore {
         page: &OrsBackupPage,
         rows: &[ProcessStreamRecoveryProjection],
     ) -> Result<Vec<ProcessStreamRecoveryWriteOutcome>, OrsError> {
-        // This path COMMITS durable rows, so it carries the same census gate the
-        // three quarantine paths carry. It was the one writer that reached
-        // `import_process_stream_recovery_suspended` without it, which meant a
         validate_import_binding(&import.source, &import.destination)?;
         page.validate_binding()?;
         if page.expires_at_ms <= super::current_unix_ms()? {
@@ -443,7 +441,7 @@ impl super::RedbRecoveryStore {
             // first write so no reader overlaps the write loop below.
             let read = self.database.begin_read().map_err(storage)?;
             // This path COMMITS durable rows, so it carries the same census gate
-            // the three quarantine paths carry. It was the one writer that
+            // the other quarantine paths carry. It was the one writer that
             // reached `import_process_stream_recovery_suspended` without it, so a
             // store whose census was incomplete could still write recovery rows
             // and the omission surfaced only later, on somebody's export. It is
@@ -1688,7 +1686,7 @@ fn check_declared_tables_are_censused() -> Result<(), OrsError> {
 /// redb reports for the file being read, under the caller's own transaction, so
 /// the census describes the same moment as the pages.
 ///
-/// Five checks, all fail-closed, all [`OrsError::MigrationRequired`] because a
+/// Six checks, all fail-closed, all [`OrsError::MigrationRequired`] because a
 /// store whose tables outrun the compiled contract is exactly a schema the
 /// compiled binary was not built for:
 ///
@@ -1780,8 +1778,8 @@ fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
     // Check 6 runs inside this function and opens NO transaction and NO table:
     // it is a pure comparison over crate-level constants, so it does not depend
     // on a materialised table. Note the read transaction is ALREADY open at each
-    // of this function's three call sites - what check 6 guarantees is
-    // independence from materialisation, not ordering before `begin_read`.
+    // of this function's call sites - what check 6 guarantees is independence
+    // from materialisation, not ordering before `begin_read`.
     // Checks 3 and 4, against the family policy this module delegates to.
     let denominator = row_family_denominator();
     for entry in &census {
@@ -4593,7 +4591,6 @@ mod census_tests {
         RowFamilyDisposition, TableDisposition, census_counts, check_declared_tables_are_censused,
         dispositioned_tables, row_family_denominator,
     };
-    use crate::RedbRecoveryStore;
     use redb::TableHandle;
 
     // `declared_ors_tables` is private to `store`, and a private item is visible to
