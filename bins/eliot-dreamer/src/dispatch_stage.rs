@@ -2876,10 +2876,16 @@ mod orientation_packet_mapping_tests {
             packet.recommended_probes_or_next_actions.len()
         );
         for (index, probe) in mapped.recommended_probes_or_next_actions.iter().enumerate() {
-            assert_eq!(probe, &packet.recommended_probes_or_next_actions[index].text);
+            assert_eq!(
+                probe,
+                &packet.recommended_probes_or_next_actions[index].text
+            );
         }
         // Invalidation conditions travel verbatim.
-        assert_eq!(mapped.invalidation_conditions, packet.invalidation_conditions);
+        assert_eq!(
+            mapped.invalidation_conditions,
+            packet.invalidation_conditions
+        );
         assert!(
             mapped.provenance.contains(&OPERATION.to_owned()),
             "provenance must carry the projection-input proof, got {:?}",
