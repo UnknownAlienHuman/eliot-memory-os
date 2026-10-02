@@ -433,9 +433,7 @@ impl ProviderCallReservationOwner {
     }
 
     pub fn snapshot(&self) -> Result<ProviderCallLedger, EngineError> {
-        self.with_lock(|path| {
-            load_provider_call_ledger(path).map_err(EngineError::from)
-        })
+        self.with_lock(|path| load_provider_call_ledger(path).map_err(EngineError::from))
     }
 
     /// Read the ledger without creating or rewriting anything.
@@ -798,7 +796,7 @@ fn validate_provider_call_ledger(ledger: &ProviderCallLedger) -> Result<(), Engi
                 "provider call budget counters are not recomputed from their reservations",
             ));
         }
-        if bounded_u32(consumed_slots) > budget.max_calls {
+        if consumed > budget.max_calls {
             return Err(rejected(
                 "provider call budget is exceeded by its own reservations",
             ));
