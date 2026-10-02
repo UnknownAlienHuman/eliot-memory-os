@@ -11619,8 +11619,17 @@ mod live_surreal_evidence_pack_e2e {
     /// the Host-managed installation performs. This fixture spawns the
     /// provider briefly with the test credential, waits for its bound
     /// endpoint, then kills and reaps it; the adapter spawns and owns its own
-    /// provider child afterwards. The child is always reaped (`kill_on_drop`
-    /// plus explicit `kill`/`wait`), never orphaned.
+    /// provider child afterwards.
+    ///
+    /// The bootstrap child is launched through the one job-owned launch path
+    /// (issue #1888, package K-STORE) rather than through its own `spawn()`:
+    /// it is admitted into a kill-on-close Job Object immediately and the
+    /// returned lease is held for the whole bootstrap window, so this provider
+    /// ends with its owner even when the test process is terminated from the
+    /// outside and no `Drop` ever runs. A refused admission kills and reaps the
+    /// child instead of continuing uncontained: there is no unassigned
+    /// fallback. The child is still always reaped (`kill_on_drop` plus
+    /// explicit `kill`/`wait`), never orphaned.
     async fn bootstrap_root_user(
         exe: &Path,
         work: &Path,
@@ -11630,7 +11639,8 @@ mod live_surreal_evidence_pack_e2e {
         password: &str,
     ) {
         let data_url = format!("surrealkv://{}", data.to_string_lossy().replace('\\', "/"));
-        let mut child = tokio::process::Command::new(exe)
+        let mut spawn = tokio::process::Command::new(exe);
+        spawn
             .args([
                 "start",
                 "--no-banner",
@@ -11646,9 +11656,15 @@ mod live_surreal_evidence_pack_e2e {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("bootstrap provider spawns");
+            .kill_on_drop(true);
+        let (mut child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+            || spawn.spawn(),
+            |child: &tokio::process::Child| child.id(),
+            |child: &mut tokio::process::Child| {
+                let _kill_result = child.start_kill();
+            },
+        )
+        .expect("bootstrap provider is admitted into its kill-on-close job");
         let mut bound = false;
         for _ in 0..300 {
             assert!(

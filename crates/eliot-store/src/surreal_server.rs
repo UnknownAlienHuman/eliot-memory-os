@@ -1068,8 +1068,12 @@ impl SurrealServerSupervisor {
 /// Creates the kill-on-close Job Object that owns one supervised server and
 /// admits `child_process_id` into it.
 ///
-/// This is the single admission point for the legacy supervisor's own spawn. It
-/// reuses the existing `eliot_platform_windows::JobObject` primitives directly:
+/// This is the single admission point for the legacy supervisor's own spawn,
+/// and it also serves the `live-edge` scratch-server fixture in
+/// `crate::payload_byte_preservation` (issue #1888, package K-STORE), so a
+/// fixture that starts a `surreal.exe` server does not introduce a second launch
+/// path of its own. It reuses the existing
+/// `eliot_platform_windows::JobObject` primitives directly:
 /// `new_kill_on_close` configures `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
 /// `assign_process` performs the assignment, returning the exact observed
 /// process identity. No second Job Object type exists in this repository and
@@ -1084,7 +1088,7 @@ impl SurrealServerSupervisor {
 /// created, so a refusal never leaves a running server: there is no unassigned
 /// fallback.
 #[cfg(windows)]
-fn assign_owned_server_to_kill_on_close_job(
+pub(crate) fn assign_owned_server_to_kill_on_close_job(
     child_process_id: Option<u32>,
 ) -> Result<JobObject, StoreError> {
     let job = JobObject::new_kill_on_close().map_err(owned_server_job_refusal)?;
