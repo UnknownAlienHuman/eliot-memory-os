@@ -117,7 +117,7 @@ pub struct BackupManifest {
     /// Source store storage root this backup was taken from.
     ///
     /// #938: the key is required in the current form for the same pinned
-    /// version reason. `null` stays a legitimate value: a remote SurrealDB
+    /// version reason. `null` stays a legitimate value: a remote `SurrealDB`
     /// endpoint has no local storage root, so the sole writer emits `null`
     /// even for an effect-bearing manifest. The key, not a default, is what
     /// keeps an omitted binding distinguishable from an absent storage root.

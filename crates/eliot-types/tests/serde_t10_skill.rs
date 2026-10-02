@@ -100,9 +100,8 @@ fn missing_version_and_product_decode_empty_and_compare_stale() {
 
 #[test]
 fn known_nested_fingerprints_decode_through_eval_case_result_and_baseline() {
-    let result: EvalCaseResult =
-        serde_json::from_value(case("case_result_nested_known_accept"))
-            .expect("a fully known nested fingerprint set must decode through EvalCaseResult");
+    let result: EvalCaseResult = serde_json::from_value(case("case_result_nested_known_accept"))
+        .expect("a fully known nested fingerprint set must decode through EvalCaseResult");
     assert_eq!(
         result.result_id, "eval-case-result-01920000-0000-7000-8000-000000000002",
         "the record itself must decode, so the positive case proves the owner path accepts it"
@@ -112,7 +111,8 @@ fn known_nested_fingerprints_decode_through_eval_case_result_and_baseline() {
         .as_ref()
         .expect("the known nested fingerprint set must survive the EvalCaseResult decode");
     assert_eq!(
-        result_fingerprints.harness_fingerprint, "eliot-engine-eval-case-schema"
+        result_fingerprints.harness_fingerprint,
+        "eliot-engine-eval-case-schema"
     );
     assert_eq!(result_fingerprints.oracle_version, "0.1.0");
     assert_eq!(
@@ -131,7 +131,8 @@ fn known_nested_fingerprints_decode_through_eval_case_result_and_baseline() {
         .as_ref()
         .expect("the known nested fingerprint set must survive the EvalBaseline decode");
     assert_eq!(
-        baseline_fingerprints.harness_fingerprint, "eliot-engine-eval-case-schema"
+        baseline_fingerprints.harness_fingerprint,
+        "eliot-engine-eval-case-schema"
     );
     assert_eq!(baseline_fingerprints.oracle_version, "0.1.0");
     assert_eq!(
@@ -144,8 +145,7 @@ fn known_nested_fingerprints_decode_through_eval_case_result_and_baseline() {
 fn nested_unknown_identity_dimension_refused_through_eval_case_result() {
     let refusal = refusal_message::<EvalCaseResult>(case("case_result_nested_unknown_refuse"));
     assert!(
-        refusal.contains("unknown field")
-            && refusal.contains("`evaluator_tier`"),
+        refusal.contains("unknown field") && refusal.contains("`evaluator_tier`"),
         "EvalCaseResult must refuse the unsupported nested identity member and name it; \
          a refusal for any other field would not close nested-field erasure: {refusal}"
     );
@@ -155,8 +155,7 @@ fn nested_unknown_identity_dimension_refused_through_eval_case_result() {
 fn nested_unknown_identity_dimension_refused_through_eval_baseline() {
     let refusal = refusal_message::<EvalBaseline>(case("baseline_nested_unknown_refuse"));
     assert!(
-        refusal.contains("unknown field")
-            && refusal.contains("`evaluator_tier`"),
+        refusal.contains("unknown field") && refusal.contains("`evaluator_tier`"),
         "EvalBaseline must refuse the unsupported nested identity member and name it; \
          a refusal for any other field would not close nested-field erasure: {refusal}"
     );

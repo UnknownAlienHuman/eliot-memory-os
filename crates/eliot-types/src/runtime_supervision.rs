@@ -190,18 +190,14 @@ where
     deserialize_optional_protected_string(deserializer, "executable_sha256")
 }
 
-fn deserialize_expected_governor_sha256<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
+fn deserialize_expected_governor_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
     deserialize_optional_protected_string(deserializer, "expected_governor_sha256")
 }
 
-fn deserialize_observed_governor_sha256<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
+fn deserialize_observed_governor_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -600,7 +596,7 @@ struct DescendantsAtRootExitFailedWire {
 ///
 /// The message carries only the fixed invariant name returned by `validate`; no
 /// received identifier, path or hash is echoed onto an operator surface.
-fn invalid_descendant_evidence<E>(invariant: String) -> E
+fn invalid_descendant_evidence<E>(invariant: &str) -> E
 where
     E: de::Error,
 {
@@ -623,16 +619,20 @@ impl<'de> Deserialize<'de> for DescendantsAtRootExit {
                     descendants: captured.descendants,
                 })
             }
-            DescendantsAtRootExitWire::Failed(failed) => Self::Failed(DescendantsAtRootExitFailed {
-                schema_version: failed.schema_version,
-                root_pid: failed.root_pid,
-                root_exit_code: failed.root_exit_code,
-                capture_elapsed_ms: failed.capture_elapsed_ms,
-                error_kind: failed.error_kind,
-                detail: failed.detail,
-            }),
+            DescendantsAtRootExitWire::Failed(failed) => {
+                Self::Failed(DescendantsAtRootExitFailed {
+                    schema_version: failed.schema_version,
+                    root_pid: failed.root_pid,
+                    root_exit_code: failed.root_exit_code,
+                    capture_elapsed_ms: failed.capture_elapsed_ms,
+                    error_kind: failed.error_kind,
+                    detail: failed.detail,
+                })
+            }
         };
-        value.validate().map_err(invalid_descendant_evidence::<D::Error>)?;
+        value
+            .validate()
+            .map_err(|invariant| invalid_descendant_evidence::<D::Error>(&invariant))?;
         Ok(value)
     }
 }
@@ -1089,9 +1089,7 @@ mod tests {
 
     #[test]
     fn optional_protected_checkpoint_identities_refuse_spelled_out_absences() {
-        const CHECKPOINT_PREFIX: &str = concat!(
-            r#"{"schema_version":"eliot-operation-runtime-v1","operation_id":"op-1","generation":1,"phase":"running","dispatch_state":"not_started","cancellation_state":"not_requested","reconciliation_state":"not_required","active_process_count":0,"stdin_bytes":0,"stdout_bytes":0,"stderr_bytes":0,"phase_started_at":"2026-10-01T00:00:00Z","last_progress_at":"2026-10-01T00:00:00Z","phase_deadline_at":"2026-10-01T00:00:00Z","absolute_deadline_at":"2026-10-01T00:00:00Z","restart_count":0,"last_evidence_refs":[],"#,
-            );
+        const CHECKPOINT_PREFIX: &str = r#"{"schema_version":"eliot-operation-runtime-v1","operation_id":"op-1","generation":1,"phase":"running","dispatch_state":"not_started","cancellation_state":"not_requested","reconciliation_state":"not_required","active_process_count":0,"stdin_bytes":0,"stdout_bytes":0,"stderr_bytes":0,"phase_started_at":"2026-10-01T00:00:00Z","last_progress_at":"2026-10-01T00:00:00Z","phase_deadline_at":"2026-10-01T00:00:00Z","absolute_deadline_at":"2026-10-01T00:00:00Z","restart_count":0,"last_evidence_refs":[],"#;
         let checkpoint = |identity: &str| {
             let mut bytes = String::from(CHECKPOINT_PREFIX);
             bytes.push_str(identity);
@@ -1109,9 +1107,9 @@ mod tests {
         ] {
             let bytes = checkpoint(identity);
             let decoded: Result<OperationRuntimeCheckpoint, _> = serde_json::from_str(&bytes);
-            let refusal = decoded.expect_err(&format!(
-                "{identity} is a spelled-out absence and must not decode"
-            ));
+            let Err(refusal) = decoded else {
+                panic!("{identity} is a spelled-out absence and must not decode")
+            };
             assert!(
                 refusal.to_string().contains(identity_field(identity)),
                 "{identity} must be refused for its own reason, not by an unrelated \

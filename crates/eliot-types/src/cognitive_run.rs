@@ -619,9 +619,8 @@ mod schema_version_selection {
     /// refused by the owner step, and that the refusal names the version this build owns.
     fn assert_refused<T: serde::de::DeserializeOwned>(current: &str, label: &str) {
         let foreign = with_version(current, "eliot-cognitive-run-v99");
-        let error = match serde_json::from_str::<T>(&foreign) {
-            Ok(_) => panic!("a foreign layout must not decode as a current {label}"),
-            Err(error) => error,
+        let Err(error) = serde_json::from_str::<T>(&foreign) else {
+            panic!("a foreign layout must not decode as a current {label}")
         };
         assert!(
             error.to_string().contains(COGNITIVE_RUN_SCHEMA_VERSION),

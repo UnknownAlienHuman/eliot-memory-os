@@ -39,9 +39,7 @@ where
 /// decoded document before the model exists. There is no second scheme and no per-caller
 /// copy. A MISSING `schema_version` has no `serde(default)` and is refused by the
 /// missing-field path.
-fn select_project_understanding_schema_version<'de, D>(
-    deserializer: D,
-) -> Result<String, D::Error>
+fn select_project_understanding_schema_version<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -266,6 +264,13 @@ mod schema_version_selection {
     // member of a `ContextPacketL3`, so current project proof is unchanged.
     #[test]
     fn current_schema_version_still_decodes_and_keeps_its_evidence() {
+        // The nested member form is the real ingress: a packet artifact carries the model
+        // under `project_understanding`, and it is owner-checked by the same decoder.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PacketMember {
+            project_understanding: Option<ProjectUnderstandingModel>,
+        }
         let model: ProjectUnderstandingModel = match serde_json::from_str(MODEL) {
             Ok(model) => model,
             Err(error) => panic!("current-version model must decode: {error}"),
@@ -274,14 +279,10 @@ mod schema_version_selection {
         assert_eq!(model.task_id, "task-fixture-001");
         assert_eq!(model.intent.acceptance_refs, ["accept:fixture-1"]);
         assert_eq!(model.causal_model.hops.len(), 1);
-        assert_eq!(model.causal_model.hops[0].status, CausalHopStatus::Supported);
-        // The nested member form is the real ingress: a packet artifact carries the model
-        // under `project_understanding`, and it is owner-checked by the same decoder.
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct PacketMember {
-            project_understanding: Option<ProjectUnderstandingModel>,
-        }
+        assert_eq!(
+            model.causal_model.hops[0].status,
+            CausalHopStatus::Supported
+        );
         let member = format!("{{\"project_understanding\": {MODEL} }}");
         match serde_json::from_str::<PacketMember>(&member) {
             Ok(packet) => assert_eq!(
@@ -307,12 +308,13 @@ mod schema_version_selection {
     #[test]
     fn unsupported_and_missing_schema_versions_are_refused_at_the_decoder() {
         let foreign = with_version(MODEL, "project-understanding-v99");
-        let error = match serde_json::from_str::<ProjectUnderstandingModel>(&foreign) {
-            Ok(_) => panic!("a foreign layout must not decode as current project understanding"),
-            Err(error) => error,
+        let Err(error) = serde_json::from_str::<ProjectUnderstandingModel>(&foreign) else {
+            panic!("a foreign layout must not decode as current project understanding")
         };
         assert!(
-            error.to_string().contains(PROJECT_UNDERSTANDING_SCHEMA_VERSION),
+            error
+                .to_string()
+                .contains(PROJECT_UNDERSTANDING_SCHEMA_VERSION),
             "refusal must name the version this build owns, got: {error}"
         );
         let missing = without_version(MODEL);
