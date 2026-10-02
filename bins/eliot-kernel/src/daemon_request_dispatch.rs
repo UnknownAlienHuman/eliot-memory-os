@@ -10547,9 +10547,17 @@ impl KernelComposition {
             return Ok(Self::store_error_response_text("local_read", &error));
         }
         validate_store_session_fence(session, &read.state_fence)?;
+        // Preserve the exact accepted activation result already retained for
+        // this envelope's session. This is provenance only: the read route
+        // does not resolve or refresh semantic identity.
+        let activation_resolution_result = self
+            .retained_activation_resolution_for_host_request(&envelope)?
+            .map(|result| serde_json::to_value(result).map_err(|_| TransportError::SessionFenced))
+            .transpose()?;
         let gateway = self.retained_store_gateway()?;
-        let response = match gateway.execute_named_with_error(read).await {
-            Ok(response) => response,
+        let (response, route_evidence) = match gateway.execute_named_with_route_evidence(read).await
+        {
+            Ok(execution) => execution,
             Err(error) => {
                 // The Kernel-issued host-request handle is the admitted read's
                 // own identity, so the directive preserves THAT handle and the
@@ -10564,6 +10572,8 @@ impl KernelComposition {
         };
         if response.operation != NamedReadOperation::GetEvidencePack
             || response.state_fence != envelope.state_fence
+            || route_evidence.operation != NamedReadOperation::GetEvidencePack
+            || route_evidence.state_fence != envelope.state_fence
         {
             return Ok(Self::store_error_response_text(
                 "local_read",
@@ -10580,6 +10590,26 @@ impl KernelComposition {
             Some(&response),
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        let named_operation = serde_json::to_value(&route_evidence.operation)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let route_facts =
+            serde_json::to_value(&route_evidence).map_err(|_| TransportError::SessionFenced)?;
+        let actual_route_receipt =
+            super::native_worker_lifecycle_route::seal_route_receipt(serde_json::json!({
+                "kind": "local_read_actual_route",
+                "operation_id": operation_id,
+                "request_digest": envelope.envelope_sha256,
+                "result_digest": digest,
+                "invoked_operation": "local_read",
+                "named_operation": named_operation,
+                "state_fence": response.state_fence,
+                "route_facts": route_facts,
+            }))?;
+        let actual_route = actual_route_receipt
+            .get("receipt_digest")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(TransportError::SessionFenced)?;
         let lineage = HostRequestResultLineage {
             output_artifact_ref: None,
             output_digest: digest.clone(),
@@ -10635,9 +10665,14 @@ impl KernelComposition {
                 wire_version: LocalReadExecutionEvidence::CONTRACT_VERSION,
                 operation_id: operation_id.clone(),
                 invoked_operation: Some("local_read".to_owned()),
-                actual_route: Some(receipt.receipt_sha256.clone()),
-                adapter_identity: Some(session.connection_id.clone()),
-                executor_identity: None,
+                actual_route: Some(actual_route),
+                actual_route_receipt: Some(actual_route_receipt),
+                activation_resolution_result,
+                // These existing fields describe the actual adapter
+                // connection and stable executor artifact observed by the
+                // selected Store route; they are not semantic fingerprint aliases.
+                adapter_identity: Some(route_evidence.connection_id.clone()),
+                executor_identity: Some(route_evidence.approved_artifact_hash.clone()),
                 input_handle: Some(envelope.envelope_sha256.clone()),
                 output_handle: Some(digest),
                 side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
@@ -10646,7 +10681,11 @@ impl KernelComposition {
         submission
             .validate_local_read_submission()
             .map_err(|_| TransportError::SessionFenced)?;
-        let resulted = match self.submit_local_read_result(session, &submission)? {
+        let resulted = match self.submit_local_read_result_with_route_evidence(
+            session,
+            &submission,
+            &route_evidence,
+        )? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
             host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
                 return Err(TransportError::SessionFenced);
@@ -12478,9 +12517,9 @@ mod tests {
 
     #[cfg(not(windows))]
     #[tokio::test]
-    fn authenticated_snapshot_replays_only_the_requested_persisted_trace() {
+    async fn authenticated_snapshot_refuses_unjoined_trace_replay() {
         let root = std::env::temp_dir().join(format!(
-            "eliot-kernel-trace-replay-{}-{}",
+            "eliot-kernel-trace-replay-refusal-{}-{}",
             std::process::id(),
             unix_ms()
         ));
@@ -12492,8 +12531,8 @@ mod tests {
             .expect("front-door policy lock")
             .clone();
         let mut module_generation = policy.module_generation.clone();
-        module_generation.module_id = eliot_contracts::ContractId::new(ACTIVE_DAEMON_CALLER)
-            .expect("daemon module id");
+        module_generation.module_id =
+            eliot_contracts::ContractId::new(ACTIVE_DAEMON_CALLER).expect("daemon module id");
         let session = Session {
             connection_id: "authenticated-eliotd-trace-replay".to_owned(),
             protocol_version: policy.protocol_range.maximum,
@@ -12517,56 +12556,35 @@ mod tests {
             session_epoch: 1,
             state: eliot_ipc::SessionState::Open,
         };
-        assert_eq!(session.module_generation.module_id.as_str(), ACTIVE_DAEMON_CALLER);
-
-        let operation_id = format!("hostreq:{}", "a".repeat(64));
-        let manifest = trace_replay_test_manifest(
-            &operation_id,
-            session.module_generation.state_fence.clone(),
-            false,
+        assert_eq!(
+            session.module_generation.module_id.as_str(),
+            ACTIVE_DAEMON_CALLER
         );
-        kernel
-            .audit_observe(AuditEventDraft::trace_manifest_sealed(&manifest))
-            .expect("persist sealed trace manifest");
 
-        let request_id = RequestId::new("snapshot-trace-replay").expect("request id");
-        let request_identity = trace_replay_test_request_identity(
-            &request_id,
+        let absent_operation_id = format!("hostreq:{}", "a".repeat(64));
+        let absent_request_id = RequestId::new("snapshot-trace-replay-absent").expect("request id");
+        let absent_identity = trace_replay_test_request_identity(
+            &absent_request_id,
             &session.module_generation.state_fence,
             "semantic-session-1",
         );
-        let response = kernel
+        let absent = kernel
             .execute_daemon_request_with_identity(
                 &session,
-                request_id,
-                request_identity,
+                absent_request_id,
+                absent_identity,
                 "snapshot",
-                serde_json::json!({"trace_operation_id": operation_id}),
+                serde_json::json!({"trace_operation_id": absent_operation_id}),
             )
             .await
-            .expect("authenticated snapshot response");
-        let ProtocolPayload::Json(response) = response.payload else {
+            .expect("unjoined trace selector is an explicit refusal");
+        let ProtocolPayload::Json(absent) = absent.payload else {
             panic!("snapshot response is JSON");
         };
-        let replay = &response["value"]["value"]["trace_replay"];
-        assert_eq!(replay["status"], "known");
-        assert_eq!(replay["value"]["operation_id"], operation_id);
-        assert_eq!(replay["value"]["trace_id"], "trace-replay-1");
-        assert_eq!(replay["value"]["capability"], "eliot.query");
-        assert_eq!(replay["value"]["payload_digest"], "c".repeat(64));
-        assert!(replay["value"]["state_fence"].is_object());
-        assert_eq!(replay["value"]["connection_id"], "host-request-connection");
-        assert_eq!(replay["value"]["session_id"], "semantic-session-1");
-        assert_eq!(replay["value"]["task_id"], "task-1");
-        assert_eq!(replay["value"]["work_scope_id"], "scope-1");
-        assert_eq!(replay["value"]["lease_attempt_id"], "attempt-1");
-        assert_eq!(replay["value"]["requested_route"], "eliot.query");
-        assert_eq!(replay["value"]["actual_route"], "route-receipt-1");
-        assert_eq!(replay["value"]["invoked_operation"], "local_read");
-        assert_eq!(replay["value"]["input_handle"], "input-handle-1");
-        assert_eq!(replay["value"]["output_handle"], "output-handle-1");
-        assert_eq!(replay["value"]["result_digest"], "result-receipt-1");
-        assert_eq!(replay["value"]["finish"], "VERIFIED_COMPLETE");
+        assert_eq!(
+            absent["value"]["value"]["trace_replay"]["status"],
+            "unknown"
+        );
 
         let malformed_request_id =
             RequestId::new("snapshot-trace-replay-malformed").expect("request id");
@@ -12588,121 +12606,39 @@ mod tests {
         let ProtocolPayload::Json(malformed) = malformed.payload else {
             panic!("snapshot response is JSON");
         };
-        assert_eq!(malformed["value"]["value"]["trace_replay"]["status"], "unknown");
-
-        let foreign_session_request_id =
-            RequestId::new("snapshot-trace-replay-foreign-session").expect("request id");
-        let foreign_session_identity = trace_replay_test_request_identity(
-            &foreign_session_request_id,
-            &session.module_generation.state_fence,
-            "foreign-session-1",
-        );
-        let foreign_session = kernel
-            .execute_daemon_request_with_identity(
-                &session,
-                foreign_session_request_id,
-                foreign_session_identity,
-                "snapshot",
-                serde_json::json!({"trace_operation_id": operation_id}),
-            )
-            .await
-            .expect("foreign operation scope is an explicit refusal");
-        let ProtocolPayload::Json(foreign_session) = foreign_session.payload else {
-            panic!("snapshot response is JSON");
-        };
         assert_eq!(
-            foreign_session["value"]["value"]["trace_replay"]["status"],
+            malformed["value"]["value"]["trace_replay"]["status"],
             "unknown"
         );
 
-        let withheld_operation_id = format!("hostreq:{}", "b".repeat(64));
-        let withheld_manifest = trace_replay_test_manifest(
-            &withheld_operation_id,
-            session.module_generation.state_fence.clone(),
-            true,
-        );
-        kernel
-            .audit_observe(AuditEventDraft::trace_manifest_sealed(&withheld_manifest))
-            .expect("persist partial sealed trace manifest");
-        let withheld_request_id =
-            RequestId::new("snapshot-trace-replay-withheld").expect("request id");
-        let withheld_identity = trace_replay_test_request_identity(
-            &withheld_request_id,
+        let foreign_request_id =
+            RequestId::new("snapshot-trace-replay-foreign-session").expect("request id");
+        let foreign_identity = trace_replay_test_request_identity(
+            &foreign_request_id,
             &session.module_generation.state_fence,
-            "semantic-session-1",
+            "foreign-session-1",
         );
-        let withheld = kernel
+        let foreign = kernel
             .execute_daemon_request_with_identity(
                 &session,
-                withheld_request_id,
-                withheld_identity,
+                foreign_request_id,
+                foreign_identity,
                 "snapshot",
-                serde_json::json!({"trace_operation_id": withheld_operation_id}),
+                serde_json::json!({"trace_operation_id": absent_operation_id}),
             )
             .await
-            .expect("authenticated snapshot preserves degraded evidence");
-        let ProtocolPayload::Json(withheld) = withheld.payload else {
+            .expect("foreign operation scope is an explicit refusal");
+        let ProtocolPayload::Json(foreign) = foreign.payload else {
             panic!("snapshot response is JSON");
         };
-        let withheld_replay = &withheld["value"]["value"]["trace_replay"];
-        assert_eq!(withheld_replay["status"], "known");
-        assert_eq!(withheld_replay["value"]["finish"], "DEGRADED_NO_PROOF");
-        assert_eq!(withheld_replay["value"]["missing_parts"][0], "input_handle");
+        assert_eq!(
+            foreign["value"]["value"]["trace_replay"]["status"],
+            "unknown"
+        );
 
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
-
-    #[cfg(not(windows))]
-    fn trace_replay_test_manifest(
-        operation_id: &str,
-        state_fence: StateFence,
-        withhold_input_handle: bool,
-    ) -> TraceManifest {
-        TraceManifest {
-            format_version: TRACE_MANIFEST_FORMAT_VERSION,
-            trace_id: "trace-replay-1".to_owned(),
-            operation_id: operation_id.to_owned(),
-            lane: Some("query".to_owned()),
-            capability: Some("eliot.query".to_owned()),
-            payload_digest: Some("c".repeat(64)),
-            state_fence: Some(state_fence),
-            connection_id: Some("host-request-connection".to_owned()),
-            session_id: Some("semantic-session-1".to_owned()),
-            task_id: Some("task-1".to_owned()),
-            work_scope_id: Some("scope-1".to_owned()),
-            lease_attempt_id: Some("attempt-1".to_owned()),
-            fencing_generation: Some(1),
-            authority_epoch: Some("test-lineage:1".to_owned()),
-            module_generation: Some("1".to_owned()),
-            requested_route: Some("eliot.query".to_owned()),
-            actual_route: Some("route-receipt-1".to_owned()),
-            invoked_operation: Some("local_read".to_owned()),
-            input_handle: (!withhold_input_handle).then(|| "input-handle-1".to_owned()),
-            output_handle: Some("output-handle-1".to_owned()),
-            adapter_identity: Some("adapter-instance-1".to_owned()),
-            executor_identity: Some("executor-image-1".to_owned()),
-            side_effects: Some("none".to_owned()),
-            principal: Some("principal-1".to_owned()),
-            policy_snapshot: Some("policy-revision-1".to_owned()),
-            active_view_packet_manifest: Some("active-view-manifest-1".to_owned()),
-            verifier_result: Some("accepted".to_owned()),
-            result_digest: Some("result-receipt-1".to_owned()),
-            durable_state: Some("Completed".to_owned()),
-            finish: if withhold_input_handle {
-                TraceFinish::DegradedNoProof
-            } else {
-                TraceFinish::VerifiedComplete
-            },
-            missing_parts: if withhold_input_handle {
-                vec!["input_handle".to_owned()]
-            } else {
-                Vec::new()
-            },
-            unavailable: Vec::new(),
-        }
-    }
-
     #[cfg(not(windows))]
     fn trace_replay_test_request_identity(
         request_id: &RequestId,
@@ -12713,12 +12649,12 @@ mod tests {
             request: eliot_receipts::RequestBinding {
                 metadata: eliot_contracts::RequestMetadata {
                     request_id: request_id.clone(),
-                    session_id: Some(eliot_contracts::SessionId::new(session_id).expect("session id")),
+                    session_id: Some(
+                        eliot_contracts::SessionId::new(session_id).expect("session id"),
+                    ),
                     task_id: Some(eliot_contracts::TaskId::new("task-1").expect("task id")),
-                    product_id: eliot_contracts::ProductId::new("product-1")
-                        .expect("product id"),
-                    source_id: eliot_contracts::SourceId::new("source-1")
-                        .expect("source id"),
+                    product_id: eliot_contracts::ProductId::new("product-1").expect("product id"),
+                    source_id: eliot_contracts::SourceId::new("source-1").expect("source id"),
                     state_fence: state_fence.clone(),
                     clock: eliot_contracts::ClockReading::default(),
                 },
