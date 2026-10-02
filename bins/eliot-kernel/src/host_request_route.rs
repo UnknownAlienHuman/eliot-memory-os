@@ -7061,6 +7061,7 @@ impl KernelComposition {
                         &event,
                         &identity.request.state_fence,
                         identity.deadline_unix_ms,
+                        AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
                         None,
                     )?
                 } else {
@@ -7073,6 +7074,7 @@ impl KernelComposition {
                                 &event,
                                 &identity.request.state_fence,
                                 identity.deadline_unix_ms,
+                                AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
                                 Some(binding.work_scope_id.as_str()),
                             )
                         },
@@ -7080,12 +7082,27 @@ impl KernelComposition {
                 }
             }
             AGENT_BRIDGE_HOOK_FORWARD_OPERATION => {
-                // A hook is a digest-only transport observation with no ORS
-                // mutation; preserve this cold observation lane without
-                // fabricating an application binding.
-                let _transition = self.agent_bridge_transition_read()?;
-                let hook = bridge_hook_from_payload(&payload)?;
-                self.admit_bridge_hook_observation(session, &hook)?
+                // The bridge carries the original validated HostEvent wire
+                // and a same-event DurableObservation envelope. The latter
+                // is admitted through the existing live application binding
+                // and checked ORS owner; the hook digest remains bound to the
+                // exact original wire and is never treated as persistence by
+                // itself.
+                let hook = bridge_hook_from_payload(&payload, &identity.request.state_fence)?;
+                self.with_live_bridge_application_binding(
+                    session,
+                    &identity.request.state_fence,
+                    |binding| {
+                        self.admit_bridge_event_envelope(
+                            session,
+                            &hook.event,
+                            &identity.request.state_fence,
+                            identity.deadline_unix_ms,
+                            AGENT_BRIDGE_HOOK_FORWARD_OPERATION,
+                            Some(binding.work_scope_id.as_str()),
+                        )
+                    },
+                )?
             }
             AGENT_BRIDGE_EVENT_GAP_OPERATION => {
                 let gap = bridge_gap_from_payload(&payload, &session.connection_id)?;
@@ -7286,6 +7303,7 @@ impl KernelComposition {
         event: &EventEnvelope,
         frame_fence: &eliot_contracts::StateFence,
         deadline_unix_ms: u64,
+        requested_route: &str,
         work_scope_id: Option<&str>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
@@ -7366,6 +7384,7 @@ impl KernelComposition {
                     &envelope_sha,
                     &privacy,
                     expired,
+                    requested_route,
                 )
             }
             DeliveryClass::BestEffortTelemetry => {
@@ -7538,6 +7557,7 @@ impl KernelComposition {
         envelope_sha: &str,
         privacy: &serde_json::Value,
         expired: bool,
+        requested_route: &str,
     ) -> Result<serde_json::Value, TransportError> {
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
@@ -7567,7 +7587,7 @@ impl KernelComposition {
             // version is this adapter's own revision, never a producer-side
             // version this Kernel cannot observe.
             "adapter_version": BRIDGE_EVENT_ADAPTER_VERSION,
-            "requested_route": AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
+            "requested_route": requested_route,
             "owner_principal": evidence.principal,
             "owner_authority_lineage": evidence.authority_lineage,
             "owner_connection": evidence.connection,
@@ -7736,39 +7756,6 @@ impl KernelComposition {
             "acked_cursor": acked,
             "fresh": false,
         } }))
-    }
-
-    /// Admits one digest-bound hook observation without a durable phase.
-    ///
-    /// The hook signature carries no acknowledgement, so no durability is
-    /// claimed: the reply answers RECEIVED transport observation bound to the
-    /// exact hook digest. The bridge journal (core `observe_host_event`) owns
-    /// the diagnostic history; no ORS row is staged here.
-    fn admit_bridge_hook_observation(
-        &self,
-        session: &Session,
-        hook: &BridgeHookObservation,
-    ) -> Result<serde_json::Value, TransportError> {
-        if !matches!(
-            self.service_state()
-                .map_err(|_| TransportError::SessionFenced)?,
-            KernelServiceState::Ready
-        ) {
-            return Err(TransportError::AttributedBackpressure(
-                eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
-            ));
-        }
-        let _ = session;
-        Ok(serde_json::json!({
-            "status": "known",
-            "value": {
-                "accepted": true,
-                "received": true,
-                "event_id": hook.event_id,
-                "sequence": hook.sequence,
-                "hook_digest": hook.digest,
-            },
-        }))
     }
 
     /// Admits one forwarded coverage gap into durable coverage without moving
@@ -9424,24 +9411,24 @@ pub(crate) fn bridge_event_envelope_from_payload(
     Ok(envelope)
 }
 
-/// One digest-bound hook observation: the hook identity plus the exact digest
-/// of its canonical bytes. The Kernel binds the digest without interpreting
-/// hook semantics; the typed [`HostEventEnvelope`] contract lives
-/// bridge-side, where it is validated before sending.
+/// One host-hook observation paired with the existing durable bridge-event
+/// envelope. The original hook digest binds the exact source bytes; the
+/// durable envelope is checked against those bytes before its authenticated
+/// ORS route is entered.
 pub(crate) struct BridgeHookObservation {
-    pub(crate) event_id: String,
-    pub(crate) sequence: u64,
-    pub(crate) digest: String,
+    pub(crate) event: EventEnvelope,
 }
 
-/// Decodes one digest-bound hook observation from a hook payload.
+/// Decodes one digest-bound hook and its same-event durable envelope.
 ///
-/// The payload carries the closed operation string, the hook JSON under
-/// `hook_envelope`, and its canonical digest under `hook_digest`. The digest
-/// is recomputed over the canonical bytes and must match exactly, so the
-/// reply binds the immutable observation the bridge presented.
+/// The payload carries the original hook JSON and its canonical digest as
+/// well as the existing typed durable event envelope. The digest is
+/// recomputed over the canonical original bytes; the durable envelope must
+/// retain those exact bytes inline before this route hands it to the ORS
+/// owner.
 pub(crate) fn bridge_hook_from_payload(
     payload: &serde_json::Value,
+    frame_fence: &eliot_contracts::StateFence,
 ) -> Result<BridgeHookObservation, TransportError> {
     let hook_value = payload
         .get("hook_envelope")
@@ -9467,10 +9454,45 @@ pub(crate) fn bridge_hook_from_payload(
         .and_then(serde_json::Value::as_u64)
         .filter(|sequence| *sequence != 0)
         .ok_or(TransportError::SessionFenced)?;
+    let event_value = payload
+        .get("event_envelope")
+        .cloned()
+        .ok_or(TransportError::SessionFenced)?;
+    let event: EventEnvelope =
+        serde_json::from_value(event_value).map_err(|_| TransportError::SessionFenced)?;
+    event
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    event
+        .require_known_payload_type()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let source = match &event.payload_or_blob_ref {
+        eliot_protocol::EventPayload::Inline(payload) => match payload.as_ref() {
+            ProtocolPayload::Json(value) => value,
+            _ => return Err(TransportError::SessionFenced),
+        },
+        eliot_protocol::EventPayload::BlobRef(_) => {
+            return Err(TransportError::SessionFenced);
+        }
+    };
+    if source != &hook_value
+        || event.event_id != event_id
+        || event.sequence != sequence
+        || event.delivery_class != DeliveryClass::DurableObservation
+        || !event.ack_required
+        || !event.authority_epoch.is_same_authority(&frame_fence.authority_epoch)
+        || event.producer_generation.value() != frame_fence.resource_generation.value()
+        || !event
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&frame_fence.authority_epoch)
+        || event.state_fence.resource_generation.value()
+            != frame_fence.resource_generation.value()
+    {
+        return Err(TransportError::SessionFenced);
+    }
     Ok(BridgeHookObservation {
-        event_id: event_id.to_owned(),
-        sequence,
-        digest,
+        event,
     })
 }
 
