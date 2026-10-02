@@ -320,6 +320,38 @@ pub struct RestoreReport {
     pub component: String,
     pub plan: RestorePlan,
     pub receipt: RestoreReceipt,
+    /// Owner-issued restore receipt artifact for this restore, named relative
+    /// to `plan.target_data_root` — the owner's own member layout, not an
+    /// absolute path this writer could have chosen for it.
+    ///
+    /// #938: this report is retained evidence, and a deserialized copy of it is
+    /// not owner issuance. The owner of the isolated restore —
+    /// `eliot-backup`'s `restore_runner`, writer of the documented member
+    /// `OWNER_RESTORE_RECEIPT_MEMBER` — is the only party that knows which path
+    /// inside the isolated root names its own issuance. Naming that artifact
+    /// here is what stops a consumer from deriving the path itself and then
+    /// trusting whatever it finds at it. The key is required in the current
+    /// form: `RestoreReport` carries no enclosing version, so no legacy
+    /// interpretation of an omitted key exists, and the sibling
+    /// `RestorePlan::exact_action_hash` and `RestoreReceipt::exact_action_hash`
+    /// already require their keys in this same retained document, so a report
+    /// predating any of them is already refused at decode. `null` is the
+    /// legitimate value of a report whose restore was never an owner-issued
+    /// isolated restore — a dry run or a rejected target — and a consumer that
+    /// would authorize a rollback from this evidence refuses a report whose
+    /// naming is `null` before authorizing anything.
+    pub owner_receipt_ref: Option<PathRef>,
+    /// Digest binding the owner-issued artifact named above.
+    ///
+    /// #938: this is the effect binding of the naming, and the key is required
+    /// for the same reason as `owner_receipt_ref`. The owner persists exactly
+    /// `canonical_json_bytes(receipt)` (`restore_runner.rs::persist_owner_receipt`)
+    /// and hashes it with its own `sha256_hex`, so this is the owner's scheme
+    /// over its own bytes and nothing else; a name alone is not a binding,
+    /// because the same path may later hold a different or rewritten document.
+    /// No value may be defaulted: an unbound artifact stays absent as `null` so
+    /// the consumer's refusal fires on it, and never a synthesised digest.
+    pub owner_receipt_sha256: Option<String>,
     pub generated_at: OffsetDateTime,
 }
 
