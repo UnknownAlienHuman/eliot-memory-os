@@ -565,3 +565,227 @@ fn require_distinct_owners(cells: &[(String, String)]) -> Result<(), CellRegistr
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DECLARED_CELLS, CellRegistryError, enforce_compiled_table, enforce_declared_cells,
+        enforce_manifest_contract_agreement, parse_contract, parse_manifest,
+    };
+
+    /// The single declared cell the compiled-table drift cases pivot on.
+    const CELL: (&str, &str, &str) = (
+        "governor.daemon.composition",
+        "daemon-composition",
+        "eliotd::DaemonComposition",
+    );
+
+    /// A second real declared cell, so agreement is proven across cells and
+    /// not only inside one row.
+    const OTHER_CELL: (&str, &str, &str) = (
+        "governor.daemon.kernel-transport",
+        "daemon-kernel-transport",
+        "eliotd::DaemonKernelClient",
+    );
+
+    /// A minimal `[package.metadata.eliot]` declaration carrying exactly
+    /// `cells`, so the scanners [`enforce_declared_cells`] itself runs can be
+    /// driven against content the real baked manifest does not contain.
+    fn manifest_text(cells: &[(&str, &str, &str)]) -> String {
+        let mut text = String::from("[package.metadata.eliot]\nfunctional_cell_refs = [\n");
+        for (cell, _, _) in cells {
+            text.push_str(&format!("  \"{cell}\",\n"));
+        }
+        text.push_str("]\nfunctional_cell_state_owners = [\n");
+        for (cell, state, owner) in cells {
+            text.push_str(&format!(
+                "  {{ cell = \"{cell}\", state = \"{state}\", owner = \"{owner}\" }},\n"
+            ));
+        }
+        text.push_str("]\n\n[dependencies]\n");
+        text
+    }
+
+    /// The matching generated contract block, between the exact markers
+    /// [`parse_contract`] requires.
+    fn contract_text(cells: &[(&str, &str)]) -> String {
+        let mut text = String::from("# BEGIN GENERATED declared_functional_cell\n");
+        for (cell, owner) in cells {
+            text.push_str("\n[[declared_functional_cell]]\n");
+            text.push_str(&format!("cell = \"{cell}\"\n"));
+            text.push_str(&format!("mutable_state_owner = \"{owner}\"\n"));
+        }
+        text.push_str("# END GENERATED declared_functional_cell\n");
+        text
+    }
+
+    /// The baked declaration, the generated contract block and the compiled
+    /// table are one registry: [`enforce_declared_cells`] — the call
+    /// `DaemonComposition::start` makes before composing anything — accepts
+    /// the real tree, every compiled row is an `eliotd` daemon cell with a
+    /// distinct mutable-state owner, and a declaration the compiled table does
+    /// not mirror is refused with a typed
+    /// [`CellRegistryError::CompiledTableDrift`] naming both owners.
+    ///
+    /// Executable evidence for issue #18 W1 / AUD-5848557601-1: a daemon
+    /// built from a diverged tree refuses to compose on a stale cell registry
+    /// instead of running with an unproven ownership claim.
+    #[test]
+    fn compiled_cell_registry_is_proved_against_the_declaration_with_typed_drift()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(enforce_declared_cells(), Ok(()));
+
+        for (index, compiled) in DECLARED_CELLS.iter().enumerate() {
+            assert!(
+                compiled.cell.starts_with("governor.daemon."),
+                "declared cell {} is not an eliotd daemon capability cell",
+                compiled.cell
+            );
+            assert!(
+                !DECLARED_CELLS[..index]
+                    .iter()
+                    .any(|earlier| earlier.owner == compiled.owner),
+                "mutable-state owner {} is claimed by more than one declared cell",
+                compiled.owner
+            );
+        }
+
+        // Both cells are real declared cells, so neither per-cell check fails;
+        // the compiled table still carries cells this declaration does not
+        // name, which is the excess-declaration refusal.
+        let extra = DECLARED_CELLS
+            .iter()
+            .find(|compiled| {
+                compiled.cell != CELL.0 && compiled.cell != OTHER_CELL.0
+            })
+            .ok_or("compiled table names only the two declared cells")?;
+        assert_eq!(
+            enforce_compiled_table(&parse_manifest(&manifest_text(&[
+                CELL,
+                OTHER_CELL
+            ]))?),
+            Err(CellRegistryError::CompiledTableDrift {
+                cell: extra.cell.to_owned(),
+                compiled_owner: extra.owner.to_owned(),
+                manifest_owner: "<undeclared>".to_owned(),
+            })
+        );
+
+        // The same cell declared under a different owner: the compiled table
+        // still carries the manifest's own owner.
+        assert_eq!(
+            enforce_compiled_table(&parse_manifest(&manifest_text(&[(
+                CELL.0,
+                CELL.1,
+                "eliotd::SecondComposition",
+            )]))?),
+            Err(CellRegistryError::CompiledTableDrift {
+                cell: CELL.0.to_owned(),
+                compiled_owner: CELL.2.to_owned(),
+                manifest_owner: "eliotd::SecondComposition".to_owned(),
+            })
+        );
+        Ok(())
+    }
+
+    /// The manifest and the generated contract block must agree on every cell
+    /// and on the owner of every cell: a missing row, an undeclared row and a
+    /// renamed owner are three distinct typed refusals, never one silent
+    /// acceptance of a projection that fell behind its source.
+    #[test]
+    fn cell_contract_projection_must_match_the_manifest_cell_for_cell()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest = parse_manifest(&manifest_text(&[CELL, OTHER_CELL]))?;
+        assert_eq!(
+            enforce_manifest_contract_agreement(
+                &manifest,
+                &parse_contract(&contract_text(&[
+                    (CELL.0, CELL.2),
+                    (OTHER_CELL.0, OTHER_CELL.2),
+                ]))?
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            enforce_manifest_contract_agreement(
+                &manifest,
+                &parse_contract(&contract_text(&[(CELL.0, CELL.2)]))?
+            ),
+            Err(CellRegistryError::MissingContractCell {
+                cell: OTHER_CELL.0.to_owned(),
+            })
+        );
+
+        assert_eq!(
+            enforce_manifest_contract_agreement(
+                &manifest,
+                &parse_contract(&contract_text(&[
+                    (CELL.0, CELL.2),
+                    (OTHER_CELL.0, OTHER_CELL.2),
+                    ("governor.daemon.undeclared", "eliotd::UndeclaredOwner"),
+                ]))?
+            ),
+            Err(CellRegistryError::UndeclaredContractCell {
+                cell: "governor.daemon.undeclared".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            enforce_manifest_contract_agreement(
+                &manifest,
+                &parse_contract(&contract_text(&[
+                    (CELL.0, "eliotd::OtherComposition"),
+                    (OTHER_CELL.0, OTHER_CELL.2),
+                ]))?
+            ),
+            Err(CellRegistryError::ContractOwnerMismatch {
+                cell: CELL.0.to_owned(),
+                manifest_owner: CELL.2.to_owned(),
+                contract_owner: "eliotd::OtherComposition".to_owned(),
+            })
+        );
+        Ok(())
+    }
+
+    /// Exactly one mutable-state owner per declared cell: two cells claiming
+    /// the same owner, a declared cell with no owner row, and a manifest with
+    /// no declaration section are three separate typed refusals, so neither a
+    /// second owner nor an undeclared state can pass as a valid registry.
+    #[test]
+    fn duplicate_missing_and_absent_state_owners_are_typed_refusals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            parse_manifest(&manifest_text(&[
+                CELL,
+                (OTHER_CELL.0, OTHER_CELL.1, CELL.2)
+            ])),
+            Err(CellRegistryError::DuplicateOwner {
+                owner,
+                first_cell,
+                second_cell,
+            }) if owner == CELL.2 && first_cell == CELL.0 && second_cell == OTHER_CELL.0
+        ));
+
+        let unowned = manifest_text(&[CELL]).replace(
+            &format!(
+                "  {{ cell = \"{}\", state = \"{}\", owner = \"{}\" }},\n",
+                CELL.0, CELL.1, CELL.2
+            ),
+            "",
+        );
+        assert!(matches!(
+            parse_manifest(&unowned),
+            Err(CellRegistryError::RefsOwnersMismatch { detail })
+                if detail == "refs carry 1 cells, owners carry 0"
+        ));
+
+        assert!(matches!(
+            parse_manifest("[dependencies]\n"),
+            Err(CellRegistryError::MalformedManifest { detail })
+                if detail.contains("[package.metadata.eliot] section is missing")
+        ));
+        Ok(())
+    }
+}
+
