@@ -99,12 +99,21 @@ fn row(member: SnapshotMember, key: CueComparisonKey) -> ClosedSnapshotRow {
     ClosedSnapshotRow::new_at_revision(member, key, source(), 7).expect("valid closed row")
 }
 
-fn sealed_snapshot(members: Vec<SnapshotMember>) -> CueSnapshot {
+/// Builds one snapshot whose rebuild digest is recomputed from the exact
+/// recorded inputs.
+///
+/// `sources` is the rebuild denominator the snapshot claims to have been built
+/// from, and every one of them must be joined by a retained row under the same
+/// exact source (`validate_closed_rows_at_revision`). An empty-complete
+/// snapshot searched everything and found nothing, so it retains no row and
+/// therefore records no source: naming a source there would be a denominator
+/// the snapshot cannot reproduce from its own inputs.
+fn sealed_snapshot(sources: Vec<SourceHandle>, members: Vec<SnapshotMember>) -> CueSnapshot {
     let mut snapshot = CueSnapshot::new(
         CONTRACT_REVISION.to_owned(),
         SnapshotId::new("snapshot-1").expect("id"),
         members,
-        RebuildIdentity::new(profile(), vec![source()], digest(0)),
+        RebuildIdentity::new(profile(), sources, digest(0)),
         fence(),
     );
     let sealed = snapshot.canonical_digest().expect("sealed digest");
@@ -273,7 +282,7 @@ fn row_identity_rejects_inadmissible_and_blank_dimensions() -> TestResult {
 #[test]
 fn snapshot_closure_accepts_exact_denominator() -> TestResult {
     let members = vec![member(CueKind::Symbol, "Task", 1, "src/a.rs")];
-    let snapshot = sealed_snapshot(members.clone());
+    let snapshot = sealed_snapshot(vec![source()], members.clone());
     let rows = vec![row(
         members[0].clone(),
         key("scope-1", CueKind::Symbol, MatchMode::Exact, "task"),
@@ -288,7 +297,7 @@ fn duplicate_row_ids_fail_closed() {
     // spellings: one v2 row identity, two members.
     let first = member(CueKind::Symbol, "Task", 1, "src/a.rs");
     let second = member(CueKind::Symbol, "task", 2, "src/a.rs");
-    let snapshot = sealed_snapshot(vec![first.clone(), second.clone()]);
+    let snapshot = sealed_snapshot(vec![source()], vec![first.clone(), second.clone()]);
     let rows = vec![
         row(
             first,
@@ -313,7 +322,7 @@ fn duplicate_semantic_bindings_fail_closed() {
     // row identities, one semantic binding.
     let first = member(CueKind::Symbol, "Task", 1, "src/a.rs");
     let second = member(CueKind::Symbol, "Task", 2, "src/a.rs");
-    let snapshot = sealed_snapshot(vec![first.clone(), second.clone()]);
+    let snapshot = sealed_snapshot(vec![source()], vec![first.clone(), second.clone()]);
     let rows = vec![
         row(
             first,
@@ -338,7 +347,7 @@ fn missing_endpoint_and_overweight_edge_fail_closed() -> TestResult {
         member(CueKind::Symbol, "Task", 1, "src/a.rs"),
         member(CueKind::Symbol, "Other", 2, "src/b.rs"),
     ];
-    let snapshot = sealed_snapshot(members.clone());
+    let snapshot = sealed_snapshot(vec![source()], members.clone());
     let rows = vec![
         row(
             members[0].clone(),
@@ -389,7 +398,7 @@ fn missing_endpoint_and_overweight_edge_fail_closed() -> TestResult {
 #[test]
 fn denominator_mismatch_fails_while_empty_complete_differs_from_partial() -> TestResult {
     let members = vec![member(CueKind::Symbol, "Task", 1, "src/a.rs")];
-    let snapshot = sealed_snapshot(members.clone());
+    let snapshot = sealed_snapshot(vec![source()], members.clone());
     let rows = vec![row(
         members[0].clone(),
         key("scope-1", CueKind::Symbol, MatchMode::Exact, "task"),
@@ -399,7 +408,9 @@ fn denominator_mismatch_fails_while_empty_complete_differs_from_partial() -> Tes
         Err(CueContractError::SnapshotNotRebuildable)
     ));
 
-    let empty = sealed_snapshot(Vec::new());
+    // Searched everything, found nothing: an empty-complete snapshot retains
+    // no row, so it records no source to rebuild from.
+    let empty = sealed_snapshot(Vec::new(), Vec::new());
     let complete = denominator(0, 0, 0, 0);
     assert!(complete.is_empty_complete());
     assert!(complete.is_complete());

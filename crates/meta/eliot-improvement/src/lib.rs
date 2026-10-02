@@ -258,8 +258,8 @@
 //!   `grep` for `std::fs`, `std::net`, `std::process`, `std::thread`,
 //!   `std::env`, `Command::new`, `tokio`, `async `, `await` and `unsafe`
 //!   over `src/*.rs` returns ZERO source hits. The textual matches for those
-//!   strings live in `tests/promotion_input.rs:1199-1221` and
-//!   `tests/learning_closure.rs:1928-1941`, where they are the FORBIDDEN list
+//!   strings live in `tests/promotion_input.rs:1216-1238` and
+//!   `tests/learning_closure.rs:1945-1958`, where they are the FORBIDDEN list
 //!   of a source-bound test that asserts the module's own source contains none
 //!   of them. `unsafe_code = "forbid"` is inherited from the workspace
 //!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
@@ -372,7 +372,7 @@
 //! Counted by matching the `#[test]` attribute in each file's source, not by a
 //! test run. Two of them are source-bound negatives rather than behavioural
 //! proofs and are the direct evidence for the effect claims above:
-//! `tests/promotion_input.rs:1197` and `tests/learning_closure.rs:1926` read
+//! `tests/promotion_input.rs:1214` and `tests/learning_closure.rs:1943` read
 //! their own module's source with `include_str!` and assert the forbidden
 //! effect vocabulary is absent.
 
