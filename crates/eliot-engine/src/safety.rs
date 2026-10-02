@@ -736,6 +736,38 @@ impl RestoreService {
                 "restore evidence does not authorize rollback of this target",
             ));
         }
+        // #938: the retained report is decoded evidence, so its status and mode
+        // must be checked against the effect it claims before it authorizes the
+        // irreversible rename below. A success/effect status may not carry a
+        // missing action binding, a dry run may not stand for an executed
+        // restore, and a receipt may not stand in for a receipt of the retained
+        // plan's approved action.
+        if restore_report.plan.restore_mode != RestoreMode::RestoreToNewRoot {
+            return Err(service_error(
+                "restore_rollback",
+                "restore evidence plan is not a restore-to-new-root action",
+            ));
+        }
+        if restore_report.receipt.dry_run {
+            return Err(service_error(
+                "restore_rollback",
+                "restore evidence is a dry run and records no executed restore",
+            ));
+        }
+        let retained_action_hash = restore_report.receipt.exact_action_hash.as_deref().ok_or_else(
+            || {
+                service_error(
+                    "restore_rollback",
+                    "restored-to-new-root restore evidence carries no exact action hash",
+                )
+            },
+        )?;
+        if restore_report.plan.exact_action_hash.as_deref() != Some(retained_action_hash) {
+            return Err(service_error(
+                "restore_rollback",
+                "restored-to-new-root restore receipt is not bound to its plan's exact action hash",
+            ));
+        }
         let evidence_checksum = checksum_file(&evidence)?;
         let exact_action_hash = rollback_action_hash(target, &evidence_checksum.digest_hex)?;
         let quarantine = rollback_quarantine_path(target, &exact_action_hash)?;

@@ -102,13 +102,37 @@ pub struct BackupManifest {
     pub config_snapshot_refs: Vec<String>,
     pub surreal_export_ref: Option<String>,
     pub surreal_export_status: String,
-    #[serde(default)]
+    /// Source store endpoint this backup was taken from.
+    ///
+    /// #938: the key is required in the current form. There is no accepted
+    /// historical form to select here: `schema_version` above is pinned by
+    /// `deserialize_manifest_schema_version` to `crate::SCHEMA_VERSION`, so the
+    /// only accepted manifest is one written by the sole current writer, which
+    /// always emits this key. `null` remains the legitimate value of a
+    /// dry-run manifest, and the sole writer emits exactly that
+    /// (`BackupService::build_backup` has no `config` in that mode). An
+    /// effect-bearing (`dry_run == false`) manifest must carry the endpoint,
+    /// and `BackupService::verify` refuses a completed backup without an export.
     pub surreal_source_endpoint: Option<String>,
-    #[serde(default)]
+    /// Source store storage root this backup was taken from.
+    ///
+    /// #938: the key is required in the current form for the same pinned
+    /// version reason. `null` stays a legitimate value: a remote SurrealDB
+    /// endpoint has no local storage root, so the sole writer emits `null`
+    /// even for an effect-bearing manifest. The key, not a default, is what
+    /// keeps an omitted binding distinguishable from an absent storage root.
     pub surreal_source_storage_ref: Option<PathRef>,
     pub control_wal_snapshot_ref: Option<String>,
     pub blob_manifest_ref: String,
-    #[serde(default)]
+    /// Root under which the copied blob payloads were written.
+    ///
+    /// #938: the key is required in the current form. This is the effect
+    /// binding of a completed backup — the sole writer emits `Some` for every
+    /// non-dry-run manifest and `None` only for a dry run — so a missing key
+    /// may not silently decode as "this backup copied no payloads".
+    /// `BackupService::verify_blob_payload_manifest` already refuses a
+    /// completed manifest whose value is `null`; requiring the key closes the
+    /// decode shape that preceded that check.
     pub blob_payload_root: Option<PathRef>,
     pub blob_payloads: Vec<BackupBlobEntry>,
     pub report_manifest_ref: Option<String>,
@@ -196,11 +220,28 @@ pub struct RestorePlan {
     pub backup_manifest_ref: String,
     pub target_data_root: PathRef,
     pub restore_mode: RestoreMode,
-    #[serde(default)]
+    /// Endpoint the restore is bound to.
+    ///
+    /// #938: the key is required in the current form. `RestorePlan` carries no
+    /// enclosing version, so no legacy interpretation of an omitted key is
+    /// available; the sole writer always emits it, as `null` for a plan that
+    /// names no endpoint (`RestoreService::plan_from_manifest`).
     pub target_endpoint: Option<String>,
-    #[serde(default)]
+    /// Storage root the restore is bound to.
+    ///
+    /// #938: the key is required in the current form for the same reason as
+    /// `target_endpoint`; `null` is a legitimate value for a target with no
+    /// local storage root.
     pub target_storage_ref: Option<PathRef>,
-    #[serde(default)]
+    /// Exact approved action this plan authorizes.
+    ///
+    /// #938: this is the effect binding of the plan and the key is required.
+    /// `RestoreService::plan_logical` is the only producer of an
+    /// effect-bearing plan and always sets it; a plan that authorized an
+    /// effect could previously deserialize with no approved action at all.
+    /// `null` stays legitimate for the non-effect-bearing plan forms
+    /// (`RestoreService::plan`, `plan_from_manifest`), and an effect-bearing
+    /// plan is refused at the consumer when its binding is `null`.
     pub exact_action_hash: Option<String>,
     pub checks: Vec<RestoreCheck>,
     pub created_at: OffsetDateTime,
@@ -233,7 +274,15 @@ pub struct RestoreReceipt {
     pub verified_checksums: bool,
     pub restored_objects: u64,
     pub restored_blobs: u64,
-    #[serde(default)]
+    /// Exact approved action this receipt reports the execution of.
+    ///
+    /// #938: this is the effect binding of the receipt and the key is required.
+    /// `RestoreReceipt` carries no enclosing version, so no legacy
+    /// interpretation of an omitted key exists, and the sibling
+    /// `RestoreRollbackReceipt::exact_action_hash` is already a required
+    /// `String`. A success-shaped status may not stand in for an executed
+    /// approved action: `RestoreService::rollback_isolated` refuses a retained
+    /// receipt whose binding is `null` before it authorizes any rollback.
     pub exact_action_hash: Option<String>,
     pub dry_run: bool,
     pub started_at: OffsetDateTime,
@@ -574,7 +623,15 @@ pub struct IncidentRecord {
     pub last_known_safe_refs: Vec<String>,
     pub recovery_commands: Vec<String>,
     pub summary: String,
-    #[serde(default)]
+    /// Campaign-integrity details for a containment failure, when any.
+    ///
+    /// #938: the key is required in the current form. `IncidentRecord` carries
+    /// no enclosing version, so there is no versioned compatibility owner that
+    /// would admit a historical omission, and an incident record is a closed
+    /// record: its campaign-integrity consumer decides containment from this
+    /// field, so a silently dropped key must not be readable as "no details".
+    /// `null` remains the legitimate value of an incident that is not a
+    /// campaign-integrity containment, and both current producers emit the key.
     pub campaign_integrity: Option<crate::delegation_calibration::CampaignIntegrityIncidentDetails>,
 }
 
