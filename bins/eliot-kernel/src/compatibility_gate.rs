@@ -14,8 +14,9 @@
 //! process boundary is gated in the OTHER process, at `eliotd`'s own
 //! `daemon_kernel_client::handshake::admit_kernel_peer_compatibility`, which
 //! constructs no `CompatibilityEnvelope` and calls neither `admit_handshake`
-//! nor this module. It compares the peer's presented values against values
-//! THIS binary holds, using the owner admissions in `eliot_kernel_core`
+//! nor this module. It compares the peer's presented values against values the
+//! RECEIVER holds - `eliotd`'s own compiled constants and declarations, not this
+//! binary's - using the owner admissions in `eliot_kernel_core`
 //! (`admit_contract_set_digest`, `admit_canonical_format_range`,
 //! `admit_architecture_source_digest`, `admit_normative_pair_receipt`,
 //! `admit_migration_class`), and it REFUSES the absence of any of the five.

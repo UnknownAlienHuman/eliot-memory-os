@@ -80,16 +80,19 @@ pub(crate) const RUNTIME_HEALTH_ROUTE_SCOPE: &str = "daemon";
 /// is over WHICH public surfaces were admitted, never over an artifact or a
 /// configuration.
 ///
-/// What this digest does NOT prove on this binary's own ingresses, stated here
-/// rather than implied: its two production callers are
+/// What this digest does NOT prove on this binary's OWN comparison sites, stated
+/// here rather than implied: two of its three production callers are
 /// `compatibility_gate::durable_compatibility_state` and
 /// `compatibility_gate::process_compatibility_envelope`, and both run in this
-/// process over these same constants, so the value is compared with itself and
-/// cannot disagree with a peer. The same boundary's module documentation says so
-/// directly. A boundary that can diverge must present an envelope issued by the
-/// candidate artifact's own owner, as the store bridge does with the separate
-/// [`admit_store_api_contract_set`] comparison, whose two operands really are
-/// derived in two different processes.
+/// process over these same constants, so on those two the value is compared with
+/// itself and cannot disagree with a peer. The THIRD caller is
+/// `front_door_session::front_door_handshake_policy`, which PUBLISHES the digest
+/// into the daemon's `ServerHello` rather than comparing it here; the comparison
+/// that can disagree with a peer happens in the other process, at `eliotd`'s
+/// `admit_kernel_peer_compatibility`. A boundary that can diverge must present a
+/// value the candidate artifact's own owner issued, as the store bridge does with
+/// the separate [`admit_store_api_contract_set`] comparison, whose two operands
+/// really are derived in two different processes.
 ///
 /// `eliot-kernel-service` depends on `eliot-kernel-core`, so the owner crate
 /// cannot name the service's identity itself; this adapter is that one input.

@@ -255,10 +255,13 @@ fn front_door_watchdog_peer_profile(
 /// decision from publishing the envelope and would fence every Kernel that
 /// currently starts without an artifact or protected-snapshot digest. It is
 /// recorded here instead: the refusal that such an object actually meets is the
-/// receiver's - `eliotd`'s `KernelSnapshotWire` and `eliot-cli`'s
-/// `KernelConfigSnapshot` both declare these keys as REQUIRED, and the
-/// agent-bridge whole-object digest refuses it too. The
-/// `a_policy_missing_a_digest_pinned_key_is_published_not_repaired` test pins
+/// receiver's, by two DIFFERENT mechanisms. `eliotd`'s `KernelSnapshotWire`
+/// declares all six keys as REQUIRED, so a missing one fails its decode. The
+/// agent-bridge whole-object digest refuses it too. `eliot-cli`'s
+/// `KernelConfigSnapshot` refuses it as an UNKNOWN field rather than a missing
+/// required one - it declares `artifact_digest` and has no `protected_snapshot_
+/// digest` member at all - which is the same refusal reached the other way round.
+/// The `a_policy_missing_a_digest_pinned_key_is_published_not_repaired` test pins
 /// that measured state.
 ///
 /// # Why only the daemon caller receives the five keys
