@@ -107,6 +107,7 @@ fn frozen_known_tool_lookup_serves_one_owner_per_method() {
 fn contract_request_and_transport_surface_join_to_the_owner() {
     let request = ToolRequest::State(StateInput {
         include: Vec::new(),
+        bootstrap: None,
     });
     let profile = validate_tool_request_owner(&request).expect("state request has an owner");
     assert_eq!(profile.method.canonical_name, "eliot.state");

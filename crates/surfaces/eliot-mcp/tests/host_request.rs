@@ -20,6 +20,7 @@ fn invocation() -> Result<HostInvocationRequest, HostContractError> {
         client_capabilities: ClientCapabilities { tasks: true },
         tool: ToolRequest::State(StateInput {
             include: vec!["task".to_owned(), "attention".to_owned()],
+            bootstrap: None,
         }),
         deadline_preference_ms: Some(5_000),
         observed_context: HostObservedContext {
