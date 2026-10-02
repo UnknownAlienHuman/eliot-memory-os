@@ -234,6 +234,7 @@ pub use store_client::{
 pub use store_gateway::KernelStoreGateway;
 #[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
+pub use store_gateway::NamedReadRouteEvidence;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
 // Issue #2806: the due-wake horizon advance retains a durable obligation before

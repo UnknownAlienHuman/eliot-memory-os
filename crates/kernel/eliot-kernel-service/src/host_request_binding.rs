@@ -1156,6 +1156,14 @@ fn requested_host_request_record(
         payload_digest: envelope.identity.payload_sha256.clone(),
         payload_schema_id: Some(label(&envelope.identity.payload_schema_id)?),
         payload_body: None,
+        // Retain the exact original unsigned request bytes. The protocol
+        // owner clears only `envelope_sha256`; the original digest remains the
+        // immutable row key and is not recomputed here.
+        admitted_input_bytes: Some(envelope.canonical_unsigned_bytes().map_err(|_| {
+            PortFailure::TransportBindingRejected {
+                reason: "original host-request bytes could not be canonicalized".to_owned(),
+            }
+        })?),
         connection_ref: label(&envelope.connection_id)?,
         session_ref: optional_label(envelope.identity.session_id.as_ref())?,
         task_ref: optional_label(envelope.identity.task_id.as_ref())?,
@@ -1220,6 +1228,11 @@ fn operation_identity_binding_record(
             }
         })?,
     );
+    // This namespace-binding row has its own fixed digest rather than the
+    // envelope digest, so it must not carry the original envelope bytes as if
+    // they were the input bound by this row. The original operation row keeps
+    // those bytes.
+    record.admitted_input_bytes = None;
     record
         .validate()
         .map_err(|_| PortFailure::TransportBindingRejected {
@@ -1800,6 +1813,7 @@ mod local_read_result_tests {
             payload_digest: "b".repeat(64),
             payload_schema_id: None,
             payload_body: None,
+            admitted_input_bytes: None,
             connection_ref: label("conn-1"),
             session_ref: None,
             task_ref: None,
