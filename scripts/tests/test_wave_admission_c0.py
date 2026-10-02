@@ -41,6 +41,19 @@ Accepted owner evidence consumed (never re-authored here)
   snapshot. No test-authored string list grants authority anywhere in this file.
 * ``scripts/tests/test_cognitive_topology_contract.py`` (#816) — the owner of the
   cognitive wave/edge/decision/donor topology contract.
+* ``scripts/verify-dependency-policy.py`` — the accepted dependency owner. Case 27
+  reads its own observed-edge read of the real manifests
+  (``_collect_rust_dependency_graph``: source kind, path, features, workspace
+  membership) and its own findings, instead of reinterpreting the manifests here.
+  Case 26 reads its declared terminal status *and* its exit, and refuses a run
+  that reached one of its own non-evaluation statuses — reached for real by
+  re-running the same oracle with an empty PATH, so its configured scanner is
+  unresolvable.
+* ``scripts/verify.ps1`` — the one ordered gate-definition owner. Case 24 derives
+  the per-package Clippy invocation, and therefore the accepted warning policy,
+  from the argv that owner declares for ``cargo-clippy-workspace``, read through
+  the profile owner's existing PowerShell AST projection. The policy is never
+  written down in this file.
 
 Per-leaf evidence is kept in two separate, non-interchangeable phases:
 
