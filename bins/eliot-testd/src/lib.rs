@@ -1651,7 +1651,7 @@ fn selected_toolchain_name(rustup_home: &str, source_root: &Path) -> Result<Stri
             entry
                 .file_type()
                 .ok()
-                .filter(|kind| kind.is_dir())
+                .filter(std::fs::FileType::is_dir)
                 .map(|_| entry.file_name().to_string_lossy().into_owned())
         })
         .filter(|name| name == &requested || name.starts_with(&format!("{requested}-")))
@@ -1687,7 +1687,10 @@ fn read_toolchain_override(source_root: &Path) -> Result<Option<String>, TestdEr
             continue;
         }
         let text = read_bounded_text(&path, "rust-toolchain override")?;
-        let value = if name.ends_with(".toml") {
+        let value = if std::path::Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
             toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
         } else {
             text.lines()
@@ -1802,6 +1805,44 @@ fn owner_home_path(variable: &str, suffix: &str) -> Result<String, TestdError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+/// The closed owner-registered key set a productive `TestD` tool environment must
+/// carry, in the order the owner registered it. The set is closed: a productive
+/// dispatch admits exactly these keys and nothing else.
+const PRODUCTIVE_TOOL_ENVIRONMENT_KEYS: [&str; 11] = [
+    TESTD_ENV_NEXTEST_GATE,
+    TESTD_ENV_NEXTEST_SHA256,
+    TESTD_ENV_CARGO,
+    TESTD_ENV_RUSTC,
+    TESTD_ENV_CARGO_SHA256,
+    TESTD_ENV_RUSTC_SHA256,
+    TESTD_ENV_CARGO_HOME,
+    TESTD_ENV_RUSTUP_HOME,
+    TESTD_ENV_TOOLCHAIN,
+    TESTD_ENV_PATH,
+    "CARGO_TARGET_DIR",
+];
+
+/// Every owner-registered toolchain home must be an existing absolute
+/// directory. A relative or absent home would let a productive dispatch
+/// resolve a toolchain outside the owner-admitted tree.
+fn validate_productive_toolchain_homes(
+    values: &BTreeMap<String, String>,
+) -> Result<(), TestdError> {
+    for key in [TESTD_ENV_CARGO_HOME, TESTD_ENV_RUSTUP_HOME] {
+        let path = values.get(key).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "productive environment is missing a toolchain home",
+        })?;
+        if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "productive toolchain home is not an existing absolute directory",
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_productive_tool_environment(
     environment: &[(String, String)],
     nextest_path: &str,
@@ -1809,19 +1850,7 @@ fn validate_productive_tool_environment(
     cache_root: &str,
 ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
     let values: BTreeMap<_, _> = environment.iter().cloned().collect();
-    let expected_keys = [
-        TESTD_ENV_NEXTEST_GATE,
-        TESTD_ENV_NEXTEST_SHA256,
-        TESTD_ENV_CARGO,
-        TESTD_ENV_RUSTC,
-        TESTD_ENV_CARGO_SHA256,
-        TESTD_ENV_RUSTC_SHA256,
-        TESTD_ENV_CARGO_HOME,
-        TESTD_ENV_RUSTUP_HOME,
-        TESTD_ENV_TOOLCHAIN,
-        TESTD_ENV_PATH,
-        "CARGO_TARGET_DIR",
-    ];
+    let expected_keys = PRODUCTIVE_TOOL_ENVIRONMENT_KEYS;
     if values.len() != environment.len()
         || values.len() != expected_keys.len()
         || expected_keys.iter().any(|key| !values.contains_key(*key))
@@ -1840,8 +1869,15 @@ fn validate_productive_tool_environment(
         validate_owner_tool_path(path)?;
     }
     let nextest = validate_owner_tool_path(nextest_path)?;
-    let cargo = values.get(TESTD_ENV_CARGO).expect("checked above");
-    let rustc = values.get(TESTD_ENV_RUSTC).expect("checked above");
+    // Both keys are present by the closed-set check above; carrying the same
+    // typed cause rather than `expect` keeps a future set edit fail-closed
+    // instead of panicking on a productive dispatch.
+    let missing_tool = || TestdError::Invalid {
+        field: "tool_environment",
+        reason: "productive environment is missing an owner-registered tool",
+    };
+    let cargo = values.get(TESTD_ENV_CARGO).ok_or_else(missing_tool)?;
+    let rustc = values.get(TESTD_ENV_RUSTC).ok_or_else(missing_tool)?;
     let expected_hashes = [
         (TESTD_ENV_NEXTEST_SHA256, nextest_path),
         (TESTD_ENV_CARGO_SHA256, cargo),
@@ -1872,18 +1908,7 @@ fn validate_productive_tool_environment(
             reason: "productive environment is missing the owner-selected toolchain",
         });
     }
-    for key in [TESTD_ENV_CARGO_HOME, TESTD_ENV_RUSTUP_HOME] {
-        let path = values.get(key).ok_or(TestdError::Invalid {
-            field: "tool_environment",
-            reason: "productive environment is missing a toolchain home",
-        })?;
-        if !Path::new(path).is_absolute() || !Path::new(path).is_dir() {
-            return Err(TestdError::Invalid {
-                field: "tool_environment",
-                reason: "productive toolchain home is not an existing absolute directory",
-            });
-        }
-    }
+    validate_productive_toolchain_homes(&values)?;
     if values.get("CARGO_TARGET_DIR").map(String::as_str) != Some(target_root)
         || values.get(TESTD_ENV_CARGO_HOME).map(String::as_str) != Some(cache_root)
     {
@@ -2007,12 +2032,10 @@ fn load_dispatch_job(
     material: &crate::testd_material::ValidatedTestdMaterial,
 ) -> Result<(TestdStore, TestJob), TestdError> {
     let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
-    let job = store
-        .get(&material.job_id)?
-        .ok_or_else(|| TestdError::Invalid {
-            field: "job_id",
-            reason: "admitted dispatch has no canonical TestD job row",
-        })?;
+    let job = store.get(&material.job_id)?.ok_or(TestdError::Invalid {
+        field: "job_id",
+        reason: "admitted dispatch has no canonical TestD job row",
+    })?;
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         job.verifier_dispatch
             .as_ref()
@@ -2108,7 +2131,7 @@ fn derive_dispatch_process_intent(
         .map(|envelope| {
             envelope
                 .fixture_environment()
-                .map_err(|error| TestdError::InvalidBinding)
+                .map_err(|_error| TestdError::InvalidBinding)
         })
         .transpose()?;
     let params = TestdDerivedIntentParams {
@@ -2189,6 +2212,11 @@ fn project_dispatch_receipt_state(
     }
 }
 
+// The `async` is the dispatch-wire seam this function is published as: the
+// binary drives it through `block_on_drive` and the terminal-publisher variant
+// awaits it, so the signature is part of the owner contract even where this
+// particular body performs no suspension of its own today.
+#[allow(clippy::unused_async)]
 pub async fn drive_validated_dispatch_material(
     material: &crate::testd_material::ValidatedTestdMaterial,
     source_root: &str,
@@ -2240,7 +2268,7 @@ pub async fn drive_validated_dispatch_material(
 
 /// Production one-shot entry: executes the durable admitted job and then
 /// waits on the same authenticated Kernel session for the daemon's committed
-/// verifier-fact WriteReceipt. Worker terminal state alone never maps to a
+/// verifier-fact `WriteReceipt`. Worker terminal state alone never maps to a
 /// successful return from this entry.
 pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     material: &crate::testd_material::ValidatedTestdMaterial,

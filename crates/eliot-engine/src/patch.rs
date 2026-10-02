@@ -1379,6 +1379,14 @@ fn governed_lane_refusal() -> EngineError {
 /// fingerprint fields one needs. [`governed_lane_refusal`] records exactly which
 /// producer is missing. Every other program is unaffected; `git apply` does not
 /// write to a target directory.
+// SAFETY-OWNERSHIP: I10.8.2 direct-spawn escape for one item. Owner: the
+// eliot-engine patch/verifier lane, a minimal bootstrap for `git apply` and its
+// admitted verifiers, holding no ProcessExecutor permit. Operation: the bounded
+// command this function already gates - a cargo launch above is refused, the
+// timeout is already applied, and `kill_on_drop` is set. Removal: delete with the
+// lane's direct spawn when the governed BuildFingerprint admission
+// (issue #1897 AUD7) supplies a governed permit and this launcher goes with it.
+#[allow(clippy::disallowed_methods)]
 async fn run_bounded_command<S>(
     program: &str,
     args: &[S],
