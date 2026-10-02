@@ -1292,7 +1292,7 @@ fn interrupted_after_staging_retains_published_material_for_resume() {
             primary,
             retained,
             cleanup,
-        } => (*primary, retained.as_ref(), *cleanup),
+        } => (primary.clone(), retained.as_ref(), *cleanup),
         other => panic!("published material is reported as retained, got {other}"),
     };
     // The engine's own typed failure is preserved as the cause, unchanged.
