@@ -1354,10 +1354,30 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
     let inventory = read_workspace(
         "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml",
     )?;
-    assert!(inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:LegacyCueKindV1"));
+    // Row ids are the five-part `_stable_row_id` tuple
+    // `package:path:kind:type:enclosing-function`, where a top-level
+    // declaration carries the literal `<root>` for its empty function and a
+    // collided id is widened by the `@mod:`/`@scope:`/`@span:` disambiguation
+    // rungs. Match the structural prefix, never the row id in full: the
+    // disambiguating suffix is derived from live source and may legitimately
+    // appear or vanish on regeneration, and the row ids that the legacy crate's
+    // own tests reference are legitimately namespaced by test function.
+    let legacy_id = matched_lines(
+        &inventory,
+        "eliot-types:crates/eliot-types/src/ul/cue.rs:derive:LegacyCueKindV1",
+    );
+    assert_eq!(
+        legacy_id.len(),
+        1,
+        "expected exactly one inventory row for the renamed V1 seam, saw: {legacy_id:?}"
+    );
+    let bare_id = matched_lines(
+        &inventory,
+        "eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind\"",
+    );
     assert!(
-        !inventory.contains("eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind\""),
-        "stale bare-name inventory row for the renamed V1 seam"
+        bare_id.is_empty(),
+        "stale bare-name inventory row for the renamed V1 seam: {bare_id:?}"
     );
     Ok(())
 }
