@@ -642,6 +642,48 @@ impl HostTerminalCorrelation {
         }
     }
 
+    /// Binds whichever of the three operation identities the OWNER INPUT TYPE
+    /// at this boundary actually carries, and leaves every slot it does not
+    /// carry explicitly missing (#893).
+    ///
+    /// [`Self::bound`] requires all three handles, which is right where the
+    /// owner issues all three but cannot express the case where the owner's own
+    /// input type holds fewer: it forces the caller to either drop a handle it
+    /// honestly holds (the empty-guard arming this closes) or synthesize a value
+    /// the owner never issued (the fabrication this record exists to prevent).
+    /// A `None` slot renders through the SAME explicit missing disposition
+    /// [`Self::unavailable`] renders for it — the `tx_missing` / `effect_missing`
+    /// / `req_missing` flags — so a partial binding invents no new vocabulary,
+    /// no new flag, and no derived, defaulted, recomputed or empty-string value
+    /// standing in for an identity.
+    ///
+    /// `None` is a statement about the owner's input type, not about a failure:
+    /// pass `None` only for a slot that handle did not exist at this boundary
+    /// because that owner never issued one. NEVER pass `None` for a handle the
+    /// caller holds but did not bother to pass — that is exactly how a missing
+    /// identity turns back into an unbindable guard arming.
+    ///
+    /// [`Self::is_available`] is deliberately left requiring all three, so it
+    /// keeps its existing meaning ("the full `tx`/`effect`/`req` triple is
+    /// present") and no existing constructor renders differently. A partial
+    /// binding therefore renders `correlation_available = false` alongside its
+    /// precise per-slot `*_missing` flags: `correlation_available` never
+    /// over-claims, and the per-slot flags are the granularity that says which
+    /// single identity IS bound. Bounding and truncation honesty are unchanged:
+    /// each `Some` value goes through the same shared [`bound_field`].
+    #[must_use]
+    pub fn partially_bound(
+        transaction: Option<&str>,
+        effect: Option<&str>,
+        request: Option<&str>,
+    ) -> Self {
+        Self {
+            transaction: transaction.map(bound_field),
+            effect: effect.map(bound_field),
+            request: request.map(bound_field),
+        }
+    }
+
     /// Explicitly uncorrelated: no operation identity exists yet at this
     /// boundary (pre-subject failure, e.g. a malformed request that never
     /// yielded a transaction). The terminal record then says correlation is
