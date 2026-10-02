@@ -893,6 +893,7 @@ fn path_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::*;
 
     /// A real canonical directory for the local application-data root.
