@@ -710,7 +710,7 @@ sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "47e388ace385a7c8b256e687c5f2c60a5a96a5ea8b7c65bef692a87fd641ccc6"
+sha256 = "d38509b1bfc588b53fc7cb732f99c237e9d90d04a90d23a11288f021ab4f3068"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -1014,14 +1014,14 @@ detail = "Two early-return sites, same frozen code; no child test binds the op."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6715
-end = 6715
-digest = "a3d8716e6bd9d8e737f4d4117b6c10ecf35f38efb977bc7bf43457defd0502f1"
+start = 11469
+end = 11472
+digest = "6fe2858b19cd0e7ee94e4460284bdda2302c9afd18f0a327dfb5cb42dd7ad2b4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_TERMINAL"]
 [[boundary.site]]
-start = 6846
-end = 6846
-digest = "55f4997739b66a7861b146fbf3a49db11994c4679ea7b4b76acfdda2cb84673b"
+start = 11608
+end = 11611
+digest = "54eb3c50ee3b8f1b5f527fa02ff4876687977cb95d2873877f5d55fca061f49c"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_TERMINAL"]
 [[boundary.site]]
 start = 1599
@@ -1048,9 +1048,9 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6959
-end = 6959
-digest = "ee0dbee6ee60fa695bd0bf8254bfc291ecadeb92574d34d6244db93623d00d8d"
+start = 11730
+end = 11733
+digest = "3cb925333c7de339ba3248551d39d8c68c06affa60584801fe88152c0da2469d"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_FINALIZE_TERMINAL"]
 [[boundary.site]]
 start = 1609
@@ -1077,14 +1077,14 @@ detail = "Emitter present; no bound test."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 6989
-end = 6989
-digest = "b3981933a2e14d47b877268cd53aca8ca6a184f9173402ef8654e26cca064be4"
+start = 11767
+end = 11770
+digest = "769860cceca609a3143d07c6ae6ad56261a65bc01e132ba81f1128a5088bc0cd"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7220
-end = 7220
-digest = "576e87ede89c0747c9f452b7d33880b45fd8d593ef0979c9d6fb9b776b5dfaec"
+start = 12006
+end = 12009
+digest = "3f2ec08f7d9d8f39420a21e259500c45b03050ac47bd25c1889c5cb7e56789ad"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_PHASE_B_RECONCILE_TERMINAL"]
 [[boundary.site]]
 start = 1615
@@ -1139,14 +1139,14 @@ detail = "T-B drives the real op; SCM receipt vs Unknown distinct."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 7415
-end = 7415
-digest = "0282a2a7398a07a325f5def37b6476ad532c711762d2f6a139cf960eec496802"
+start = 12238
+end = 12241
+digest = "bbb7aeeb29a315d42e77827a002b8b985cdce3a5af1afa86a19c30d88a7e668a"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_TERMINAL"]
 [[boundary.site]]
-start = 7431
-end = 7431
-digest = "9bf1c65496571f1db638a99465ef62f676b7bd7c0d854b8b3aaa731bd42e7110"
+start = 12257
+end = 12260
+digest = "59a7961a60a3b3bf1d9250f4afe0bc48018a5cd238daa6d794ab4e8e05762de2"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_TERMINAL"]
 [[boundary.site]]
 start = 1637
@@ -1176,34 +1176,34 @@ detail = "Six early-return sites, one frozen code; T-B pins the op shape. In-tre
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 7458
-end = 7458
-digest = "eca869d2d405ef27d2c370e013f62e54b1ace54b3b3782dd1088559a5f934973"
+start = 12289
+end = 12292
+digest = "9ec413a6b2223cc06e89907c2cc58bb6bb3dc795ad83e8ffede20d8d2e4fb8e3"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7466
-end = 7466
-digest = "eca869d2d405ef27d2c370e013f62e54b1ace54b3b3782dd1088559a5f934973"
+start = 12300
+end = 12303
+digest = "9ec413a6b2223cc06e89907c2cc58bb6bb3dc795ad83e8ffede20d8d2e4fb8e3"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7481
-end = 7481
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12318
+end = 12321
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7493
-end = 7493
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12333
+end = 12336
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7505
-end = 7505
-digest = "1ae1c38b226405b994a15b463c977c87a900c5bb74287d1b9564334a62364289"
+start = 12348
+end = 12351
+digest = "93d6abba4486a36497156cb1472801e1ee19a8371a5b2a538d756800475dd0d4"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
-start = 7516
-end = 7516
-digest = "4747a353913c260003213207bea1b751add5fd94eada97bb85a9e936025a69e3"
+start = 12362
+end = 12365
+digest = "bea3d1d7c869e8b9fecda966191acefb9bcdd2b3058a628a4bb817f4c1ef2e4a"
 markers = ["host_lifecycle_observe_terminal", "BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL"]
 [[boundary.site]]
 start = 1659
