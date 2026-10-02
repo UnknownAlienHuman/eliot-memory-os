@@ -38,7 +38,7 @@ use eliot_kernel::diagnostic_brief::{
 use eliot_kernel::kernel_audit::{
     AuditAssuranceClass, AuditCaptureMode, AuditEventKind, AuditLineage, AuditRecord,
 };
-use eliot_kernel::trace_manifest::{TraceEvidence, TraceFinish, TraceManifest};
+use eliot_kernel::trace_manifest::{SealEvidence, TraceEvidence, TraceFinish, TraceManifest};
 use eliot_ors::{
     HostRequestEffectEvidence, HostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
     HostRequestRetainedResultClass, HostRequestState, OpaqueLabel, OperationIdentity,
@@ -207,7 +207,11 @@ fn seal(observed: &TraceEvidence) -> TraceManifest {
         &durable_record(),
         None,
         "query",
-        observed,
+        &SealEvidence {
+            principal: None,
+            active_view_packet_manifest: None,
+            evidence: observed,
+        },
     )
 }
 

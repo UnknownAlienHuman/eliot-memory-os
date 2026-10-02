@@ -30,8 +30,8 @@ use eliot_kernel::kernel_audit::{
     AuditAssuranceClass, AuditCaptureMode, AuditEventKind, AuditLineage, AuditRecord,
 };
 use eliot_kernel::trace_manifest::{
-    TRACE_MANIFEST_FORMAT_VERSION, TRACE_MANIFEST_REQUIRED_SLOTS, TraceEvidence, TraceFinish,
-    TraceManifest,
+    SealEvidence, TRACE_MANIFEST_FORMAT_VERSION, TRACE_MANIFEST_REQUIRED_SLOTS, TraceEvidence,
+    TraceFinish, TraceManifest,
 };
 use eliot_ors::{
     HostRequestEffectEvidence, HostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
@@ -130,6 +130,17 @@ fn retained_lineage() -> HostRequestRetainedLineage {
     }
 }
 
+/// The digest the durable row records for the fence it was admitted under.
+///
+/// The seal retains the presented fence only when the row's own
+/// `fence_digest` proves it is that fence, so the fixture binds the real
+/// digest rather than a placeholder: otherwise the sealed manifest would
+/// withhold `state_fence` and every required slot bound to it.
+fn fence_digest() -> String {
+    let bytes = serde_json::to_vec(&policy_bound_fence()).unwrap_or_default();
+    eliot_contracts::sha256_hex(&bytes)
+}
+
 fn durable_record() -> HostRequestRecord {
     HostRequestRecord {
         contract_version: 1,
@@ -153,7 +164,7 @@ fn durable_record() -> HostRequestRecord {
         task_ref: Some(OpaqueLabel::new("trace-manifest-task").expect("task ref")),
         scope_ref: Some(OpaqueLabel::new("trace-manifest-scope").expect("scope ref")),
         capability_ref: OpaqueLabel::new("eliot.query").expect("capability ref"),
-        fence_digest: "e".repeat(64),
+        fence_digest: fence_digest(),
         authority_epoch: test_epoch(),
         generation: 7,
         deadline_unix_ms: u64::MAX,
@@ -171,7 +182,9 @@ fn durable_record() -> HostRequestRecord {
             actual_route: Some("query".to_owned()),
             invoked_operation: Some("local_read".to_owned()),
             adapter_identity: Some("trace-manifest-adapter".to_owned()),
-            executor_identity: None,
+            // I16.12 names the process/job-object identity required too, so a
+            // run that claims every required class has to carry one.
+            executor_identity: Some("trace-manifest-executor".to_owned()),
         }),
         result_lineage: Some(retained_lineage()),
         commit_order: 1,
@@ -219,13 +232,19 @@ fn complete_evidence() -> TraceEvidence {
 }
 
 fn seal(evidence: &TraceEvidence) -> TraceManifest {
+    // `principal` and `active_view_packet_manifest` are left to the durable
+    // evidence projection, which is the owner this proof exercises.
     TraceManifest::seal(
         &test_session(),
         &result_body(),
         &durable_record(),
         None,
         "query",
-        evidence,
+        &SealEvidence {
+            principal: None,
+            active_view_packet_manifest: None,
+            evidence: evidence,
+        },
     )
 }
 
@@ -238,6 +257,7 @@ fn sealed_record(manifest: &TraceManifest) -> AuditRecord {
         kind: AuditEventKind::TRACE_MANIFEST_SEALED.to_owned(),
         lineage: {
             let mut lineage = AuditLineage::empty();
+            lineage.trace_id = Some(manifest.trace_id.clone());
             lineage.operation_id = Some(manifest.operation_id.clone());
             lineage
         },
@@ -398,7 +418,11 @@ fn withholding_or_forging_one_evidence_class_degrades_and_is_refused_on_readback
             &durable_record(),
             None,
             "query",
-            &substituted,
+            &SealEvidence {
+                principal: None,
+                active_view_packet_manifest: None,
+                evidence: &substituted,
+            },
         )
         .missing_parts
         .contains(&"policy_snapshot".to_owned()),
@@ -413,16 +437,20 @@ fn withholding_or_forging_one_evidence_class_degrades_and_is_refused_on_readback
         &durable_record(),
         None,
         "query",
-        &TraceEvidence {
-            policy_snapshot: Some(POLICY_SNAPSHOT.to_owned()),
-            policy_snapshot_binding: Some(StateFence {
-                authority_epoch: test_epoch(),
-                resource_generation: ResourceGeneration::new(9).expect("generation"),
-                task_revision: None,
-                policy_revision: Some(PolicyRevision::new(2).expect("policy revision")),
-                integration_revision: None,
-            }),
-            ..complete_evidence()
+        &SealEvidence {
+            principal: None,
+            active_view_packet_manifest: None,
+            evidence: &TraceEvidence {
+                policy_snapshot: Some(POLICY_SNAPSHOT.to_owned()),
+                policy_snapshot_binding: Some(StateFence {
+                    authority_epoch: test_epoch(),
+                    resource_generation: ResourceGeneration::new(9).expect("generation"),
+                    task_revision: None,
+                    policy_revision: Some(PolicyRevision::new(2).expect("policy revision")),
+                    integration_revision: None,
+                }),
+                ..complete_evidence()
+            },
         },
     );
     assert!(

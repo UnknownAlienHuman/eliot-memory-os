@@ -1529,6 +1529,12 @@ fn materialize_descriptor_bound_host_fixture(
         authority_epoch: launch.authority_state_fence.authority_epoch.clone(),
         generation: descriptor_generation,
         restart_policy: None,
+        // The two I1.9 launch coordinates are stated absences, the same
+        // disposition the production materializer publishes and the same Host
+        // readback accepts: this fixture proves generation binding, and the
+        // digest is computed from the bytes below.
+        job_object_limits: None,
+        health_readiness_contract_ref: None,
         descriptor_sha256: String::new(),
     }
     .with_computed_digest()?;

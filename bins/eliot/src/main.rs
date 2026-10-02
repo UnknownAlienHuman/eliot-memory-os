@@ -28,6 +28,7 @@ use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
     ProductionCanaryCompletionBinding, Pulse, publish_production_evidence,
 };
+use eliot_ors::ManifestResourceLimits;
 use eliot_platform_windows::{
     FileIdentity, HostOwnerLease, InstallerRootError, InstallerRootObjectSnapshot,
     InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec, InstallerRootProfile,
@@ -505,6 +506,32 @@ enum InstallationCommand {
         /// automatic restart, never a synthesised default.
         #[arg(long, value_parser = absolute_path)]
         eliotd_restart_policy: Option<PathBuf>,
+        /// Absolute path to the operator's APPROVED Job Object and resource
+        /// limits JSON (I1.9) for the supervised `eliotd` child.
+        ///
+        /// The value is the `ManifestResourceLimits` record the Generation
+        /// Registry manifest carries for this generation: the declared Job
+        /// Object policy token, the hard process-count ceiling, the hard
+        /// working-set byte ceiling and the CPU rate-control percentage. Every
+        /// one of those numbers is read from that approved record; this command
+        /// declares none of them. Omitting the option means the approved launch
+        /// material declares no limits, and the descriptor is published with no
+        /// limits at all — the fail-closed disposition that makes the
+        /// manifest-bound launch gate refuse the launch, never implicit limits.
+        #[arg(long, value_parser = absolute_path)]
+        eliotd_job_object_limits: Option<PathBuf>,
+        /// Exact health/readiness contract reference the operator's approved
+        /// launch material declares for the supervised `eliotd` child (I1.9).
+        ///
+        /// It is inert text carried to the descriptor unchanged; it is compared
+        /// by the manifest-bound launch gate against the contract the Generation
+        /// Registry manifest recorded. Omitting the option means the approved
+        /// launch material declares no readiness contract, and the descriptor is
+        /// published with no reference at all — the fail-closed disposition that
+        /// makes the manifest-bound launch gate refuse the launch, never an
+        /// unstated contract.
+        #[arg(long)]
+        eliotd_health_readiness_contract_ref: Option<String>,
     },
     /// Publish the per-user Notify fallback declaration and register the
     /// signed Task Scheduler fallback. Runs in the interactive session
@@ -2374,6 +2401,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             profile_anchor_root,
             installation_key,
             eliotd_restart_policy,
+            eliotd_job_object_limits,
+            eliotd_health_readiness_contract_ref,
         } => run_installation_materialize_source_bundle(
             eliot_host,
             eliot_watchdog,
@@ -2406,6 +2435,8 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             agent_bridge_exe,
             agent_bridge_account,
             eliotd_restart_policy,
+            eliotd_job_object_limits,
+            eliotd_health_readiness_contract_ref,
         ),
         InstallationCommand::SetupNotifyFallback {
             installation,
@@ -2882,6 +2913,18 @@ fn run_installation_setup_notify_fallback(
 /// deliberately NOT re-run here; the descriptor owner proves the value once,
 /// at `EliotdLaunchDescriptor::validate`, and this command adds no second
 /// validation site to drift from it.
+///
+/// The operator's APPROVED health/readiness contract reference for the same
+/// child (I1.9) needs no reader of its own: it is inert text, this command
+/// supplies the approved reference verbatim, and it derives none from the
+/// artifact, the config, the executable, the current directory or a default.
+/// `None` stays `None` through the materializer onto the descriptor and into the
+/// descriptor digest, where the manifest-bound launch gate reads the absence and
+/// refuses the launch rather than evaluating readiness against an unstated
+/// contract; a blank or control-bearing reference is refused by the descriptor
+/// owner at `EliotdLaunchDescriptor::validate` before anything is published, and
+/// that check is deliberately not duplicated here for the same reason
+/// `RestartPolicyV1::validate` is not.
 fn read_admitted_restart_policy(
     approved_profile: Option<&Path>,
 ) -> Result<Option<RestartPolicyV1>> {
@@ -2904,6 +2947,50 @@ fn read_admitted_restart_policy(
         );
     }
     Ok(Some(policy))
+}
+
+/// Reads the operator's APPROVED Job Object and resource limits for the one
+/// supervised `eliotd` child, and hands back an absence as an absence.
+///
+/// The value is the shared `eliot_ors::ManifestResourceLimits` record the
+/// Generation Registry manifest carries for this generation (I1.9), so this
+/// command introduces no second limits vocabulary and translates nothing into
+/// one: it reads the exact approved record and never synthesises, defaults,
+/// clamps or widens a policy token, process ceiling, working-set ceiling or CPU
+/// rate percentage.
+///
+/// Two refusals live here and neither converts a failure into a pass-through:
+///
+/// - `None` means the approved launch material declares no limits for this
+///   child. It stays `None` through the materializer onto the descriptor and into
+///   the descriptor digest, where the manifest-bound launch gate reads the
+///   absence and refuses the launch rather than applying implicit limits.
+/// - a record the owner would not admit is refused by the descriptor owner at
+///   `EliotdLaunchDescriptor::validate`, through
+///   `ManifestResourceLimits::validate`, before anything is published.
+///
+/// That shared legality check is deliberately NOT re-run here, for the same
+/// reason `RestartPolicyV1::validate` is not: the descriptor owner proves the
+/// value once, and this command adds no second validation site to drift from it.
+/// Unlike the restart policy there is also no child-identity coordinate to bind
+/// here — the limits record names no child — so there is nothing else for this
+/// surface to check before publication.
+fn read_admitted_job_object_limits(
+    approved: Option<&Path>,
+) -> Result<Option<ManifestResourceLimits>> {
+    let Some(path) = approved else {
+        return Ok(None);
+    };
+    // The same bounded regular-file read every other installation input uses:
+    // one read, the existing 16 MiB input limit, no new store or persistence.
+    let bytes = load_input(path)?;
+    let limits: ManifestResourceLimits = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "approved eliotd job object limits {} is malformed: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(limits))
 }
 
 #[allow(
@@ -2943,6 +3030,8 @@ fn run_installation_materialize_source_bundle(
     agent_bridge_exe: Option<PathBuf>,
     agent_bridge_account: Option<String>,
     eliotd_restart_policy: Option<PathBuf>,
+    eliotd_job_object_limits: Option<PathBuf>,
+    eliotd_health_readiness_contract_ref: Option<String>,
 ) -> Result<i32> {
     let profile_selection = profile_selection_input(ResolveProfileRequest {
         profile,
@@ -2955,6 +3044,8 @@ fn run_installation_materialize_source_bundle(
         staging_root: staging_root.clone(),
     })?;
     let eliotd_restart_policy = read_admitted_restart_policy(eliotd_restart_policy.as_deref())?;
+    let eliotd_job_object_limits =
+        read_admitted_job_object_limits(eliotd_job_object_limits.as_deref())?;
     let materialize_input = source_bundle_materializer::CanarySourceBundleMaterializeInput {
         eliot_host_exe: eliot_host,
         eliot_watchdog_exe: eliot_watchdog,
@@ -2984,6 +3075,12 @@ fn run_installation_materialize_source_bundle(
         // is the same admitted object, not a second independently-proved one.
         staging_root: profile_selection.staging_root.clone(),
         eliotd_restart_policy,
+        // Both coordinates are the operator's approved declarations, carried
+        // verbatim. Neither is defaulted, derived or synthesised here, and an
+        // omitted option stays an explicit `None` so the manifest-bound launch
+        // gate refuses the launch instead of applying an unstated value.
+        eliotd_job_object_limits,
+        eliotd_health_readiness_contract_ref,
     };
     let receipt =
         match source_bundle_materializer::materialize_canary_source_bundle(&materialize_input) {

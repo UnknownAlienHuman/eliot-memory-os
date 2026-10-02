@@ -236,14 +236,44 @@
 //! family column is this inventory's reading of the I5.17 family list; I5.17
 //! itself does not map a named mutation to a family, so the mapping documents
 //! the existing surface rather than making a new activation decision.
+//! The table above is itself incomplete against
+//! `operation_catalogue::ACTIVATED_MUTATIONS`, the governing array: it omits the
+//! activated rows `RecordModuleCatalogSnapshot`, `AdmitMailboxMessage`, and
+//! `RecordAuthorityRevocation`.
 //!
 //! Declared in [`crate::NamedMutationOperation`] but not activated, and therefore
 //! refused pre-stage with `StoreError::UnknownOperation` rather than mapped to a
-//! status or upsert behavior: `RecordAuthorityRevocation` and
-//! `ApplyInstrumentRegistryState`.
-//! `RecordAuthorityRevocation` is explicitly known-but-unsupported (issue #686):
-//! its typed parameter contract and the Governor decision edge are closed, but
-//! its catalogue row, proven per-backend handlers, and consumer triple are not.
+//! status or upsert behavior: `ApplyInstrumentRegistryState`.
+//! `RecordAuthorityRevocation` was in that list until issue #686 activated it.
+//! It was known-but-unsupported for a stated reason: its typed parameter
+//! contract and the Governor decision edge were closed while its catalogue row,
+//! proven per-backend handlers, and consumer triple did not yet exist. That is
+//! the historical reason, not the present state. That slice supplied the
+//! catalogue row and the typed-validation arm, so an admitted revocation now
+//! resolves to a mutation entry instead of failing closed at this gate, and the
+//! per-backend WRITE handler has since landed
+//! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+//! appended into the canonical atomic transaction by
+//! `append_authority_revocation_statements`), together with the count-test
+//! migration in `tests/operation_manifest_catalogue.rs`.
+//!
+//! Admission is the whole of what this gate settles for that row, and the
+//! distinction matters here: the handler is production-registered and its
+//! rendered statements are unit-proven, but the DURABLE COMMIT of this leg is
+//! NOT proven — no real-Surreal edge proof of it exists — so an admission this
+//! gate now grants is a claim about reachability and shape, never a claim that
+//! a revocation is durably stored. What remains absent at the read edge is the
+//! consumer triple of the PAIRED READ, so the row still only records the
+//! closure the authority owner already committed and durably fenced, and grants
+//! no re-grant, restoration, or support.
+//! `GetAuthorityRevocationHistory` is a named read, not a member of this mutation
+//! inventory, and that slice does not activate it: its typed read contract and the
+//! Governor history-evidence decoder are closed, but its read row, proven
+//! per-backend read handler and consumer triple are not — the Kernel intercepts
+//! that named read and serves it from the retained P-07 ORS before the store
+//! bridge sees it — so it still fails closed with
+//! `StoreError::UnknownOperation` in `validate_read_against_catalogue`, and a
+//! revocation the store can now write still cannot be read back from it.
 //! `ApplySwarmOwnerRevisions` is ACTIVATED (issue #1702) under the
 //! `TaskControl` family with the closed owner-revision typed contract: it is
 //! admitted only when the owner-specific authorization evidence travels inside
@@ -255,11 +285,20 @@
 //!
 //! Issue #1874's body describes seven reachable mutations and names
 //! `RecordAuthorityRevocation` among them. That list is a subset, not the
-//! activated set, and `RecordAuthorityRevocation` is not reachable at all; the
-//! activated set is the twenty-one rows above. I5.15's own initial executable set
-//! is a contract-denomination list and does not enumerate named mutations, so
-//! the twenty-one rows activate under I5.17 against this crate's proven
-//! handler, schema, and consumer triple.
+//! activated set. The activated set is the twenty-four rows of
+//! `operation_catalogue::ACTIVATED_MUTATIONS`, this crate's only activation
+//! source; the table above is an incomplete rendering of that array and omits
+//! three activated rows, `RecordModuleCatalogSnapshot`, `AdmitMailboxMessage`,
+//! and `RecordAuthorityRevocation`. Where the two disagree the array governs.
+//! I5.15's own initial executable set is a contract-denomination list and does
+//! not enumerate named mutations, so the twenty-four rows activate under I5.17
+//! against this crate's proven handler, schema, and consumer triple as
+//! ordinary peers, with no narrower row among them: the WRITE row
+//! `RecordAuthorityRevocation` is activated on the same terms as the other
+//! twenty-three, and what remains unproven is the other half of the pair — the
+//! paired READ `GetAuthorityRevocationHistory`, whose read row, proven
+//! per-backend handler and consumer triple do not exist — so the write leg is
+//! activated but not yet read-back-proven.
 //!
 //! # Non-goals
 //!

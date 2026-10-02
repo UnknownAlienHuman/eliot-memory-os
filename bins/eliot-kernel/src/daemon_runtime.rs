@@ -21,8 +21,6 @@ use eliot_process::{
     ProcessOwnerBinding, ProcessStartReceipt,
 };
 
-#[cfg(windows)]
-use super::DaemonRestartRefusal;
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
@@ -32,6 +30,8 @@ use super::{
     fresh_eliotd_launch_descriptor, probe_ready_state_admitted, sha256_hex,
     stable_owner_principal_digest,
 };
+#[cfg(windows)]
+use super::{AdmittedDaemonRestartPolicy, DaemonRestartRefusal};
 
 /// F-LOG-KERNEL-4 (#903): daemon-runtime boundary observations.
 ///
@@ -78,6 +78,355 @@ fn daemon_recovery_terminal_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::StoreAlreadyConnected => "RECOVERY_STORE_ALREADY_CONNECTED",
         KernelBuildError::Principal(_) => "RECOVERY_PRINCIPAL",
     }
+}
+
+/// The manifest-bound outcome of one production launch of the `eliotd` child
+/// (issue #1884; I1.9).
+///
+/// It is produced for BOTH production launch arms — the first launch of the
+/// child and the replacement of a failed generation — because both reach the
+/// same launch primitive, and that primitive takes a sealed binding as an
+/// argument. `Admitted` carries the sealed
+/// [`eliot_ors::BoundKernelExecutionManifest`] the ORS verifier issued for this
+/// exact module and generation, so the artifact/config identity, the launch
+/// coordinates and the bounded restart budget the attempt is decided under are
+/// read out of the immutable manifest rather than out of contemporaneous
+/// configuration. It is the only value a launch may take its recorded identity
+/// from: the type has no public constructor and no `Deserialize`, so this file
+/// cannot assemble one and can only obtain one from the verifier.
+/// `Refused` carries the daemon's own typed restart refusal, mapped from the ORS
+/// reconciliation cause so that cause survives the layer boundary instead of
+/// being flattened into one refusal.
+#[cfg(windows)]
+enum DaemonRestartManifestAdmission {
+    /// The verifier admitted this launch under the sealed immutable manifest.
+    ///
+    /// Boxed because the sealed binding is far larger than the refusal beside it,
+    /// and this enum crosses the launch path by value.
+    Admitted(Box<eliot_ors::BoundKernelExecutionManifest>),
+    /// A typed refusal withholds the launch.
+    Refused(DaemonRestartRefusal),
+}
+
+/// Projects one recorded ORS manifest cause onto the daemon's own typed restart
+/// refusal.
+///
+/// The recorded budget exhaustion keeps the existing
+/// [`DaemonRestartRefusal::RestartBudgetExhausted`], which is exactly what it
+/// is. Every other manifest-side cause keeps its own bounded reason code, so an
+/// absent, receipt-less, stale, incompatible, revoked or identity-mismatched
+/// manifest is never reported as a spent budget, and a refusal that IS a spent
+/// budget is never reported as one of those. A cause that names one substituted
+/// authority or launch coordinate keeps its own code as well, so a substituted
+/// restart budget is not reported as a spent one. The codes are a fixed
+/// vocabulary derived only from the ORS cause, so no recorded payload can reach
+/// an observation.
+///
+/// The effect-lease family of causes belongs to the effect-replay verifier and
+/// cannot be produced by the launch verifier, so those variants share one
+/// bounded code rather than each claiming a launch-specific meaning.
+#[cfg(windows)]
+const fn daemon_restart_refusal_for_manifest_cause(
+    kind: eliot_ors::KernelReconciliationKind,
+) -> DaemonRestartRefusal {
+    use eliot_ors::KernelReconciliationKind as Cause;
+    match kind {
+        Cause::ManifestRestartBudgetExhausted => DaemonRestartRefusal::RestartBudgetExhausted,
+        Cause::ManifestAbsent => DaemonRestartRefusal::ClassWithholds("restart_manifest_absent"),
+        Cause::ManifestIdentityMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_identity_mismatch")
+        }
+        Cause::ManifestCandidateBindingMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_candidate_binding_mismatch")
+        }
+        Cause::ManifestIncompatible => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_incompatible")
+        }
+        Cause::ManifestRevoked => DaemonRestartRefusal::ClassWithholds("restart_manifest_revoked"),
+        Cause::ManifestReceiptless => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_receiptless")
+        }
+        Cause::ManifestForeignEpoch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_foreign_epoch")
+        }
+        Cause::ManifestInvalid => DaemonRestartRefusal::ClassWithholds("restart_manifest_invalid"),
+        Cause::ManifestCatalogPolicyStale => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_catalog_policy_stale")
+        }
+        Cause::ManifestRevocationUnacknowledged => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_revocation_unacknowledged")
+        }
+        Cause::ManifestDeliveryGapOpen => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_delivery_gap_open")
+        }
+        Cause::ManifestNotEffectCapable => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_not_effect_capable")
+        }
+        // A sealed Governor admission defect is the manifest's own structural
+        // refusal, so it keeps its own code rather than being reported as the
+        // undifferentiated "not admitted" reading.
+        Cause::GovernorAdmissionSealAbsent => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_absent")
+        }
+        Cause::GovernorAdmissionSealWithheld => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_withheld")
+        }
+        Cause::GovernorAdmissionSealMalformed => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_malformed")
+        }
+        Cause::GovernorAdmissionSealIdentityMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_identity_mismatch",
+        ),
+        Cause::GovernorAdmissionSealRevisionMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_revision_mismatch",
+        ),
+        Cause::GovernorAdmissionSealStateFenceAbsent => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_state_fence_absent",
+        ),
+        Cause::GovernorAdmissionSealOwnerDigestMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_owner_digest_mismatch",
+        ),
+        // A substituted AUTHORITY coordinate is refused as itself. Each of the
+        // seven admission and launch coordinates ORS compares one at a time keeps
+        // its own bounded code, so a substituted class, ceiling, route-scope
+        // set, dependency order, Job Object limit set, readiness contract or
+        // restart budget is never reported as one of its neighbours and never as
+        // the undifferentiated "not admitted" reading. A substituted budget is
+        // deliberately distinct from `ManifestRestartBudgetExhausted` above:
+        // that cause means the recorded budget is already SPENT, while this one
+        // means the candidate offered a budget the record does not carry.
+        Cause::ManifestRestartAuthorizationClassMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_authorization_class_mismatch")
+        }
+        Cause::ManifestAdmittedEffectCeilingMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_effect_ceiling_mismatch")
+        }
+        Cause::ManifestAdmittedAllowedScopesMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_allowed_scopes_mismatch")
+        }
+        Cause::ManifestDependencyOrderMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_dependency_order_mismatch")
+        }
+        Cause::ManifestResourceLimitsMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_resource_limits_mismatch")
+        }
+        Cause::ManifestReadinessContractMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_readiness_contract_mismatch")
+        }
+        Cause::ManifestRestartBudgetMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_restart_budget_mismatch")
+        }
+        // An UNOBSERVED coordinate is refused as itself and is deliberately a
+        // different refusal from the substituted one above: the descriptor stated
+        // nothing at all to compare, so the launch is refused instead of being
+        // admitted on the assumption that the owner would have stated the
+        // recorded value. The two keep separate codes for exactly that reason.
+        Cause::ManifestResourceLimitsUnobserved => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_resource_limits_unobserved")
+        }
+        Cause::ManifestReadinessContractUnobserved => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_readiness_contract_unobserved")
+        }
+        // The last resort, and it is reachable by exactly one documented family:
+        // the `Effect*` causes of the ORS vocabulary belong to the exact-effect
+        // replay verifier, which verifies an unexpired lease for one operation and
+        // never a whole-generation launch, so a launch gate cannot produce one. A
+        // cause added to ORS without a launch-specific meaning lands here too,
+        // which is why the wildcard stays one bounded code rather than a
+        // per-cause claim this file cannot make.
+        _ => DaemonRestartRefusal::ClassWithholds("restart_manifest_not_admitted"),
+    }
+}
+
+/// The launch coordinates this owner OBSERVES on the Host-approved launch
+/// descriptor for the exact candidate it intends to run (issue #1884; I1.9).
+///
+/// This is the INDEPENDENT side of the launch-binding comparison. It is built
+/// from `EliotdLaunchDescriptor`, which is loaded from a separately
+/// digest-bound approved file and is explicitly not inferred from the Kernel
+/// executable, the current directory or the environment
+/// (`crates/kernel/eliot-kernel-service/src/protocol.rs:550`). The immutable
+/// manifest row is never read here: restating the recorded values would compare
+/// the manifest with itself and could never fail.
+///
+/// * `artifact_sha256` is the descriptor's own `executable_sha256`, the digest
+///   of the approved `eliotd.exe` bytes;
+/// * `config_sha256` is its own `config_descriptor_sha256`, the digest of the
+///   exact daemon configuration bytes;
+/// * `protocol_sha256` is its own `protected_snapshot_digest`, the
+///   domain-separated identity of the protected Kernel/eliotd snapshot, which
+///   the descriptor's own contract keeps distinct from the configuration digest;
+/// * `start_command` is projected from the descriptor's own exact child
+///   contour: the approved executable followed by the exact child argv
+///   excluding `argv[0]`, in the declared order, joined by one space, WITH THE
+///   `--launch-nonce <launch_nonce>` PAIR LEFT OUT. The descriptor states that
+///   contour as separate fields and carries no rendered command text, so the
+///   projection is the render.
+///
+/// The ONE excluded argv component is the launch-correlation pair, and it is
+/// excluded because the descriptor's own field documentation excludes it as
+/// identity. `EliotdLaunchDescriptor::launch_nonce` is a "Public
+/// launch-correlation nonce carried through the explicit argv contract. It is
+/// not a secret or an authority credential; authenticated process/Job/pipe
+/// evidence remains the authority proof"
+/// (`crates/kernel/eliot-kernel-service/src/protocol.rs:621`). `validate` fixes
+/// that pair at argv indices 4 and 5 and `fresh_eliotd_launch_descriptor`
+/// (`bins/eliot-kernel/src/runtime_identity.rs`) derives a NEW value for it on
+/// every attempt from the previous descriptor digest, the previous nonce, the
+/// attempt ordinal and the wall clock. A per-attempt correlation value therefore
+/// cannot be a component of a RECORDED launch identity: rendering it made the
+/// compared value differ from the recorded one for every restart BY
+/// CONSTRUCTION, so every restart was refused as
+/// `ManifestCandidateBindingMismatch` for a reason that was not a substitution.
+///
+/// The pair is left out whole and nothing else is: no placeholder token is
+/// substituted for it, no template spelling is invented for it, and no other
+/// argument is dropped or reordered. The config path, the config digest and the
+/// executable digest all stay in the compared string, because those ARE
+/// identity.
+///
+/// A descriptor whose argv or executable changes therefore changes this value
+/// and is refused, which is the point: an equality that a manifest's own value
+/// can satisfy is not a check.
+///
+/// RESIDUAL CONTRACT GAP (reported, deliberately not repaired here). The
+/// RECORDED `start_command` is not composed by this file. It is the Module
+/// Catalog's own `command_ref`, projected into the recorded manifest by
+/// `admitted_execution_projection`
+/// (`crates/governor/eliot-module-registry/src/lib.rs`). No document in this
+/// repository defines how a catalog `command_ref` is SPELLED relative to the
+/// canonical child argv: whether it carries the executable path, whether it
+/// carries the flags, whether it carries the nonce. The compared form is
+/// therefore exactly the canonical argv minus the nonce pair, the recorded form
+/// is the catalog's own text, and the relation between the two is undefined by
+/// any document here. Nothing in this file normalises, tolerates or falls back
+/// on that relation, because inventing a spelling, a normaliser or a tolerant
+/// comparison for it would be a second and unauthoritative definition of what
+/// the manifest records.
+#[cfg(windows)]
+fn daemon_candidate_launch_binding(
+    launch: &EliotdLaunchDescriptor,
+) -> eliot_ors::KernelLaunchBinding {
+    // The `--launch-nonce` flag is LOCATED in the descriptor's own canonical
+    // argv rather than assumed at a fixed index, and the pair it introduces is
+    // dropped whole: the flag and the value behind it are one correlation
+    // component, and skipping either alone would render half of it.
+    let nonce_flag = launch
+        .arguments
+        .iter()
+        .position(|argument| argument.as_str() == "--launch-nonce");
+    let mut start_command = launch.executable.as_str().to_owned();
+    for (index, argument) in launch.arguments.iter().enumerate() {
+        if nonce_flag.is_some_and(|flag| index == flag || index == flag + 1) {
+            continue;
+        }
+        start_command.push(' ');
+        start_command.push_str(argument.as_str());
+    }
+    eliot_ors::KernelLaunchBinding {
+        artifact_sha256: launch.executable_sha256.clone(),
+        config_sha256: launch.config_descriptor_sha256.clone(),
+        protocol_sha256: launch.protected_snapshot_digest.clone(),
+        start_command,
+    }
+}
+
+/// The dependency order and bounded restart budget this owner OBSERVES for the
+/// exact child it intends to run, read from the admitted restart declaration
+/// (issue #1884; I1.9).
+///
+/// The declaration is the admitted owner of both: `RestartPolicyV1` carries the
+/// typed dependency edges with their invalidation triggers and the bounded
+/// attempt window, backoff, jitter, cooldown, healthy-reset condition, quarantine
+/// threshold and escalation target. It is read through
+/// [`AdmittedDaemonRestartPolicy::policy_for_generation`], which re-proves the
+/// retained binding — the declared digest and both source revisions — against the
+/// very generation and State Fence the descriptor states, so a declaration
+/// admitted for another generation cannot supply this launch's coordinates.
+///
+/// * the start order is the declared dependency vector's own position. The
+///   admitted declaration states no separate order field, so this file reads the
+///   declaration order and does not invent a topology of its own; the recorded
+///   manifest must carry the same order for the two to be equal;
+/// * the budget ceiling is the declared `max_attempts_in_window` and the
+///   quarantine rule is the declared `escalation_target`, the two values the
+///   declaration states for exactly this pair.
+///
+/// A descriptor that states no admitted declaration has neither coordinate. That
+/// absence is refused as `PolicyNotAdmitted` — the fail-closed disposition the
+/// declaration's own contract describes ("no admitted declaration means no
+/// automatic restart at all for this child") — and a declaration whose binding no
+/// longer proves this generation is refused as
+/// `PolicyNotBoundToAdmittedGeneration`. Neither is defaulted into a budget.
+#[cfg(windows)]
+fn daemon_candidate_restart_coordinates(
+    admitted: Option<&AdmittedDaemonRestartPolicy>,
+    launch: &EliotdLaunchDescriptor,
+) -> Result<
+    (
+        Vec<eliot_ors::ManifestDependencyEntry>,
+        eliot_ors::ManifestRestartBudget,
+    ),
+    DaemonRestartRefusal,
+> {
+    let admitted = admitted.ok_or(DaemonRestartRefusal::PolicyNotAdmitted)?;
+    let state_fence =
+        eliot_contracts::StateFence::new(launch.authority_epoch.clone(), launch.generation);
+    let policy = admitted
+        .policy_for_generation(launch.generation, &state_fence)
+        .map_err(|_error| DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration)?;
+    let dependency_order = policy
+        .dependencies
+        .iter()
+        .enumerate()
+        .map(|(position, edge)| eliot_ors::ManifestDependencyEntry {
+            module_id: edge.dependency_id.clone(),
+            startup_order: u32::try_from(position).unwrap_or(u32::MAX),
+        })
+        .collect();
+    Ok((
+        dependency_order,
+        eliot_ors::ManifestRestartBudget {
+            max_restarts: policy.intensity.max_attempts_in_window,
+            quarantine_rule: policy.intensity.escalation_target.clone(),
+        },
+    ))
+}
+
+/// The Job Object/resource limits and the health/readiness contract reference
+/// this owner OBSERVES on the Host-approved launch descriptor for the exact
+/// child it intends to run (issue #1884; I1.9, AUD3).
+///
+/// Both are read from `EliotdLaunchDescriptor`'s OWN `job_object_limits` and
+/// `health_readiness_contract_ref` fields, so the comparison against the
+/// immutable manifest keeps an independent side. The descriptor is loaded from a
+/// separately digest-bound approved file and is not inferred from the Kernel
+/// executable, the current directory or the environment, so a descriptor whose
+/// Job Object limits or readiness contract no longer stand for the admitted
+/// manifest changes what this returns and is refused by the verifier.
+///
+/// `None` means the DESCRIPTOR states none, and that is a legitimate
+/// observation rather than a shape error:
+/// `KernelExecutionRestartRequest` carries both coordinates as `Option` exactly
+/// so a caller that can observe neither can say "I observed nothing" instead of
+/// inventing a value. The absence is forwarded unchanged and the DECISION
+/// refuses it, under `ManifestResourceLimitsUnobserved` or
+/// `ManifestReadinessContractUnobserved`; this file projects that recorded kind
+/// through `daemon_restart_refusal_for_manifest_cause` like every other one. An
+/// unobservable coordinate is never assumed equal to the recorded one and is
+/// never defaulted into a permissive one.
+///
+/// The immutable manifest row is never read here. Restating the recorded values
+/// from it would compare the manifest with itself and could never fail, which is
+/// the vacuous comparison this delivery removes.
+#[cfg(windows)]
+fn daemon_candidate_observed_job_object_limits_and_readiness(
+    launch: &EliotdLaunchDescriptor,
+) -> (Option<eliot_ors::ManifestResourceLimits>, Option<String>) {
+    (
+        launch.job_object_limits.clone(),
+        launch.health_readiness_contract_ref.clone(),
+    )
 }
 
 #[cfg(windows)]
@@ -582,9 +931,55 @@ impl KernelComposition {
         Ok(evidence.view().clone())
     }
 
+    /// The admission dispatcher the BOUNDED RECOVERY launch arm passes through
+    /// (issue #1884; I1.9, AUD3, W1.5).
+    ///
+    /// It chooses between the two dispositions the recovery arm can be in, and
+    /// both of them land on the same sealed
+    /// [`eliot_ors::BoundKernelExecutionManifest`] the launch primitive requires,
+    /// or on a typed refusal. The operator activation arm reaches the same
+    /// first-launch disposition directly, through
+    /// `KernelComposition::admit_daemon_restart_under_manifest` with a zero
+    /// recorded spend, because an activation names no previous generation to
+    /// replace; `KernelComposition::launch_eliotd_for_activation_under_manifest`
+    /// is that entry. There is no production launch arm that reaches a process
+    /// launch without that sealed binding.
+    ///
+    /// Only the REPLACEMENT carries restart-specific machinery, and it is
+    /// restart-specific by definition rather than by exemption:
+    ///
+    /// * a replacement is additionally decided by the admitted restart
+    ///   declaration, the durable restart record for this child identity and
+    ///   generation, and the declared attempt threshold, so a restart cannot hand
+    ///   out a fresh window;
+    /// * a first launch has no previous generation to replace, so it consumes no
+    ///   restart budget, reads no restart record and is admitted straight against
+    ///   the sealed manifest for this exact generation.
+    ///
+    /// Both arms refuse before the previous generation is closed, so a withheld
+    /// launch never destroys a child it cannot replace.
+    #[cfg(windows)]
+    fn admit_daemon_launch_under_manifest(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        attempt: u64,
+        previous_receipt: Option<&ProcessStartReceipt>,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        match previous_receipt {
+            Some(receipt) => self.admit_daemon_restart_attempt(launch, attempt, Some(receipt)),
+            None => self.admit_daemon_restart_under_manifest(launch, 0),
+        }
+    }
+
     /// Decides one automatic restart attempt against the owner's DURABLE
-    /// restart record and returns the refusal that withholds it, or `None`
-    /// when the attempt is admitted.
+    /// restart record and the immutable execution manifest bound to the
+    /// admitted generation, and returns either the sealed manifest-bound
+    /// authority the replacement may run under or the refusal that withholds it.
+    ///
+    /// This is the REPLACEMENT arm of
+    /// [`KernelComposition::admit_daemon_launch_under_manifest`]; a first launch
+    /// does not come here, from either production entry, because it is not a
+    /// restart and spends no budget.
     ///
     /// `attempt` is the Kernel's restart ordinal for this process lifetime and
     /// is NOT the budget: it names the replacement generation and is compared
@@ -594,8 +989,7 @@ impl KernelComposition {
     /// supervised child's stable identity (`ACTIVE_DAEMON_CALLER`) and to the
     /// admitted generation being replaced.
     ///
-    /// Two refusals can arise here, and both are absences rather than
-    /// defaults:
+    /// The refusals that can arise here are absences rather than defaults:
     ///
     /// * no admitted restart policy means this child has no declared restart
     ///   budget at all, so its replacement is refused as
@@ -604,25 +998,33 @@ impl KernelComposition {
     ///   must never destroy a child it cannot replace.
     /// * a durable record that already exists under this child's identity and
     ///   admitted generation means the restart disposition for this lineage was
-    ///   already decided durably, so the attempt is refused as
-    ///   `DaemonRestartRefusal::RestartBudgetExhausted` and no fresh window is
-    ///   opened. That record is what a recreated supervisor reads back.
+    ///   already decided durably, so the attempt is refused and no fresh window
+    ///   is opened. That record is what a recreated supervisor reads back, and
+    ///   it is read back as the decision it is: the recorded cause is projected
+    ///   through [`daemon_restart_refusal_for_manifest_cause`], so a recorded
+    ///   manifest defect keeps its own reason instead of being reported as a
+    ///   spent budget. This boundary never rewrites a row it did not read as
+    ///   absent: an existing durable disposition is never treated as permission
+    ///   and never replaced by a locally recomputed one.
     ///
-    /// The third outcome is an unreadable or invalid durable record, which is
-    /// returned as a mechanical failure: an unreadable record is never read as
-    /// an absent one and never as permission.
+    /// The remaining outcomes are an unreadable or invalid durable record and
+    /// an unreadable manifest row, both of which are returned as mechanical
+    /// failures: an unreadable record is never read as an absent one and never
+    /// as permission.
     #[cfg(windows)]
     fn admit_daemon_restart_attempt(
         &self,
         launch: &EliotdLaunchDescriptor,
         attempt: u64,
         previous_receipt: Option<&ProcessStartReceipt>,
-    ) -> Result<Option<DaemonRestartRefusal>, KernelBuildError> {
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
         let admitted_generation = launch.generation;
         let admitted_state_fence =
             eliot_contracts::StateFence::new(launch.authority_epoch.clone(), admitted_generation);
         let Some(admitted) = self.daemon_restart_policy.as_ref() else {
-            return Ok(Some(DaemonRestartRefusal::PolicyNotAdmitted));
+            return Ok(DaemonRestartManifestAdmission::Refused(
+                DaemonRestartRefusal::PolicyNotAdmitted,
+            ));
         };
         // The threshold is read only while the retained binding still proves
         // the exact admitted generation and fence the caller observed. A
@@ -632,7 +1034,7 @@ impl KernelComposition {
         let Ok(declared_threshold) =
             admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence)
         else {
-            return Ok(Some(
+            return Ok(DaemonRestartManifestAdmission::Refused(
                 DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
             ));
         };
@@ -644,17 +1046,42 @@ impl KernelComposition {
                     "eliotd durable restart record is unreadable: {error}"
                 ))
             })?;
-        // ANY durable row under this child's identity and generation means the
-        // restart disposition for this lineage was already decided and
-        // committed. It is therefore read back as the decision it is, and this
-        // boundary never rewrites a row it did not read as absent: an existing
-        // durable disposition is never treated as permission and never
-        // replaced by a locally recomputed one.
-        if recorded.is_some() {
-            return Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted));
+        // A durable row under this child's identity and generation is the
+        // decision it was committed as, read back unchanged and never replaced
+        // by a locally recomputed one. Its recorded CAUSE is projected through
+        // the shared mapping, so a recorded manifest defect keeps its own
+        // reason instead of every cause collapsing into one budget refusal.
+        if let Some(recorded) = recorded {
+            return Ok(DaemonRestartManifestAdmission::Refused(
+                daemon_restart_refusal_for_manifest_cause(recorded.kind),
+            ));
         }
+        // Issue #1884 (I1.9): the restart disposition is decided against the
+        // immutable `KernelExecutionManifest` recorded for this exact module
+        // and generation, and never against contemporaneous configuration.
+        // `load_and_verify_kernel_execution_restart` loads that manifest by the
+        // request's own identity, re-verifies its recorded bound digest on
+        // readback, and then runs the pure verifier over the candidate
+        // coordinates this owner OBSERVED, the Authority Epoch, the I1.12
+        // evidence and the recorded restart budget. A missing, receipt-less,
+        // stale, incompatible, revoked or identity-mismatched manifest therefore
+        // refuses the restart instead of admitting it, and the ORS owner persists
+        // that refusal's reconciliation item and moves the generation lifecycle
+        // before returning, so the affected generation stays visibly degraded.
+        //
+        // `restarts_spent` is the durably recorded spend, which is exactly zero
+        // on this arm: the durable record above is the spend record and it was
+        // read back as absent. The process-local `attempt` ordinal is NOT spent
+        // and is never substituted for it; the recorded budget ceiling is read
+        // from the immutable manifest inside the verifier.
+        let bound = match self.admit_daemon_restart_under_manifest(launch, 0)? {
+            DaemonRestartManifestAdmission::Admitted(bound) => bound,
+            DaemonRestartManifestAdmission::Refused(refusal) => {
+                return Ok(DaemonRestartManifestAdmission::Refused(refusal));
+            }
+        };
         if attempt < u64::from(declared_threshold) {
-            return Ok(None);
+            return Ok(DaemonRestartManifestAdmission::Admitted(bound));
         }
         let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
         store
@@ -662,8 +1089,8 @@ impl KernelComposition {
                 kind: eliot_ors::KernelReconciliationKind::ManifestRestartBudgetExhausted,
                 module_id: ACTIVE_DAEMON_CALLER.to_owned(),
                 generation: admitted_generation,
-                bound_manifest_sha256: None,
-                recorded_manifest_sha256: None,
+                bound_manifest_sha256: Some(bound.manifest_sha256().to_owned()),
+                recorded_manifest_sha256: Some(bound.manifest_sha256().to_owned()),
                 lease_id: None,
                 operation_id: None,
                 observed_at_ms,
@@ -682,7 +1109,655 @@ impl KernelComposition {
             "eliotd bounded restart budget is spent for this child identity",
             self.current_state_fence().as_ref(),
         ));
-        Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted))
+        Ok(DaemonRestartManifestAdmission::Refused(
+            DaemonRestartRefusal::RestartBudgetExhausted,
+        ))
+    }
+
+    /// Reads the immutable execution manifest recorded for this exact module and
+    /// generation and asks its owner in ORS to verify this launch against it
+    /// (issue #1884; I1.9, W1.5, AUD3).
+    ///
+    /// This is the ONE manifest gate both production launch arms reach: a first
+    /// launch of the child and the replacement of a failed generation. It admits
+    /// nothing by itself — it returns the sealed binding the launch primitive
+    /// requires, or a typed refusal.
+    ///
+    /// `restarts_spent` is the durably recorded restart spend this attempt is
+    /// decided under; the recorded budget CEILING is never supplied here, it is
+    /// read from the immutable manifest by the verifier itself.
+    ///
+    /// Every request field is stated from an independent observation, a durable
+    /// readback, or an explicit fail-closed reading. Nothing here rebuilds,
+    /// defaults or reconstructs a manifest, and nothing here restates a recorded
+    /// value back into the comparison that is supposed to check it:
+    ///
+    /// * the module identity is this supervised child's stable identity, the
+    ///   same identity an admitted restart policy's `subject_id` must name, and
+    ///   the generation is the admitted generation being launched;
+    /// * the bound manifest digest is the digest the Generation Registry row
+    ///   records for exactly this module and generation;
+    /// * `candidate` is the launch contour this owner OBSERVES on the
+    ///   Host-approved descriptor it would actually launch from, built by
+    ///   [`daemon_candidate_launch_binding`]. The recorded binding is never fed
+    ///   back in, so a descriptor whose artifact, config, protocol snapshot or
+    ///   child argv no longer stands for the admitted manifest is refused here
+    ///   rather than confirming itself;
+    /// * `candidate_dependency_order` and `candidate_restart_budget` are read
+    ///   through the admitted restart declaration this composition retains, whose
+    ///   own accessors re-prove its digest against the generation and State
+    ///   Fence the descriptor states. A child whose descriptor states no
+    ///   admitted declaration has neither coordinate and is refused as
+    ///   `PolicyNotAdmitted`: that is the fail-closed disposition the
+    ///   declaration's own contract describes, never an unlimited budget;
+    /// * `candidate_resource_limits` and `candidate_health_readiness_contract_ref`
+    ///   are read from the Host-approved descriptor's OWN `job_object_limits` and
+    ///   `health_readiness_contract_ref` fields by
+    ///   `daemon_candidate_observed_job_object_limits_and_readiness` and are
+    ///   forwarded exactly as stated, including a stated absence. The request
+    ///   type carries both as `Option` so this owner never has to invent one, and
+    ///   a descriptor that states neither is refused by the ORS verifier under
+    ///   its own recorded kind (`ManifestResourceLimitsUnobserved`,
+    ///   `ManifestReadinessContractUnobserved`) rather than by a local shape
+    ///   check here: an unobserved coordinate is the decision's refusal, not a
+    ///   malformed request, and the ORS owner records it durably like any other;
+    /// * `current_authority_epoch` is this child's own retained launch epoch read
+    ///   as the Kernel authority epoch counter, exactly as this owner's process
+    ///   execution gate reads it for an exact effect replay
+    ///   (`require_effect_replay_authority`);
+    /// * `current_catalog_revision` and `current_policy_revision` are the
+    ///   recorded admission's accepted revisions, and `catalog_view` is
+    ///   [`eliot_ors::CatalogPolicyView::Unavailable`] because this owner holds
+    ///   no live Module Catalog/Policy readback — there is none in ORS or on the
+    ///   control wire, which is the same absence ORS records as its own
+    ///   assumption at `authorize_effect_replay_for_operation`. The absent
+    ///   readback keeps the fail-closed reading, so an effect-capable manifest is
+    ///   capped at shadow diagnostics and is refused below rather than opened as
+    ///   normal-effect service. It is never flipped to `Current`;
+    /// * `revocation` is
+    ///   [`eliot_ors::RevocationAcknowledgement::Unacknowledged`] and `delivery`
+    ///   is [`eliot_ors::EffectDeliveryAcknowledgement::GapOpen`] because the only
+    ///   revocation-event and delivery-state readbacks ORS owns are keyed by
+    ///   EFFECT OPERATION LEASE identity (`load_revocation_event` and
+    ///   `load_effect_delivery_record` both take an `OperationIdentity`), and a
+    ///   general launch names no lease, so no row can be read here. An absent
+    ///   readback keeps the fail-closed reading: an unobservable clearance is not
+    ///   a clearance, exactly as ORS itself reads it for the leased path;
+    /// * `compatibility` is the I1.12 verdict recorded for this exact module and
+    ///   generation, read back from the durable versioned-artifact registry. A
+    ///   generation with no recorded verdict is refused and never given a
+    ///   synthesised one;
+    /// * the generation's own lifecycle readback
+    ///   (`RedbRecoveryStore::load_generation_lifecycle`) is consulted before the
+    ///   request is built: a generation ORS has already recorded as `Degraded` or
+    ///   `Quarantined` is refused under the cause that record carries, so a
+    ///   durable refusal is a real lifecycle state a later attempt reads back
+    ///   instead of a side-table row nobody consumes. An ABSENT row is not a
+    ///   refusal here and is not read as one: no degradation recorded means no
+    ///   degradation happened, and the admission still requires the recorded
+    ///   immutable manifest, which
+    ///   `RedbRecoveryStore::load_observed_generation_lifecycle` composes with
+    ///   that absence into the one observation the ORS verifier itself checks. The
+    ///   store owns that composition, so this owner cannot present a clearance it
+    ///   built out of an absence - it either has the recorded degradation or it
+    ///   has nothing to say.
+    #[cfg(windows)]
+    fn admit_daemon_restart_under_manifest(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        restarts_spent: u32,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        let store = self.generation_gateway.ors.as_ref();
+        let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
+        let generation = launch.generation;
+        let manifest = store
+            .load_kernel_execution_manifest(ACTIVE_DAEMON_CALLER, generation.value())
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd immutable execution manifest is unreadable: {error}"
+                ))
+            })?;
+        // A generation with no recorded manifest can name no bound manifest
+        // digest, so no request can be stated for it at all. The absence is
+        // recorded durably under ORS's own typed kind and refused, so the
+        // affected generation stays visibly degraded instead of restarting.
+        let Some(manifest) = manifest else {
+            return self.refuse_daemon_restart_under_manifest(
+                ACTIVE_DAEMON_CALLER,
+                eliot_ors::KernelReconciliationKind::ManifestAbsent,
+                generation,
+                None,
+                None,
+                observed_at_ms,
+            );
+        };
+        // A receipt-less manifest records no accepted Catalog/Policy revision,
+        // so this owner can state no current one and cannot construct the request
+        // at all. It is refused under ORS's own receipt-less kind rather than
+        // being given a synthesised revision.
+        if !manifest.has_governor_admission() {
+            return self.refuse_daemon_restart_under_manifest(
+                ACTIVE_DAEMON_CALLER,
+                eliot_ors::KernelReconciliationKind::ManifestReceiptless,
+                generation,
+                None,
+                Some(manifest.manifest_sha256.as_str()),
+                observed_at_ms,
+            );
+        }
+        // The generation's own lifecycle row is the REAL lifecycle owner, and it
+        // is read before anything is launched: a generation ORS has already
+        // recorded as `Degraded` or `Quarantined` for a recorded manifest refusal
+        // launches nothing.
+        if let Some(cause) = self.daemon_generation_launch_blocker(generation)? {
+            return self.refuse_daemon_restart_under_manifest(
+                ACTIVE_DAEMON_CALLER,
+                cause,
+                generation,
+                None,
+                Some(manifest.manifest_sha256.as_str()),
+                observed_at_ms,
+            );
+        }
+        let compatibility = store
+            .load_versioned_artifact_registry(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd recorded I1.12 verdicts are unreadable: {error}"
+                ))
+            })?
+            .compatibility(ACTIVE_DAEMON_CALLER, generation.value())
+            .cloned();
+        let Some(compatibility) = compatibility else {
+            // No recorded I1.12 verdict means this owner can state no
+            // compatibility evidence, so no request can be built for this
+            // generation. It is refused under ORS's own incompatible kind, which
+            // is the cause its verifier produces for a candidate that fails
+            // I1.12 evidence, and the refusal is recorded durably so the
+            // affected generation stays visibly degraded instead of restarting.
+            return self.refuse_daemon_restart_under_manifest(
+                ACTIVE_DAEMON_CALLER,
+                eliot_ors::KernelReconciliationKind::ManifestIncompatible,
+                generation,
+                None,
+                Some(manifest.manifest_sha256.as_str()),
+                observed_at_ms,
+            );
+        };
+        self.verify_daemon_launch_under_manifest(
+            launch,
+            &manifest,
+            compatibility,
+            restarts_spent,
+            observed_at_ms,
+        )
+    }
+
+    /// The recorded cause that blocks any launch of this generation, read from
+    /// the Generation Registry's own lifecycle row (issue #1884; I1.9, AUD5).
+    ///
+    /// This is the real lifecycle owner the refusal path moves, and the launch
+    /// path consults: a `Degraded` or `Quarantined` generation launches nothing,
+    /// and it is refused under the cause that row KEEPS. `GenerationLifecycleRecord`
+    /// never replaces its first cause, so a later and different observation for
+    /// the same generation cannot erase the reason the generation degraded.
+    ///
+    /// `Ok(None)` means the row admits a launch. An ABSENT row is deliberately
+    /// not read as `Undegraded`: ORS records `Undegraded` only for a generation
+    /// whose admitted manifest it persisted, so an absent row is an unrecorded
+    /// generation and it is left to the manifest checks, which refuse it. An
+    /// unreadable row is a mechanical failure, never a permission.
+    #[cfg(windows)]
+    fn daemon_generation_launch_blocker(
+        &self,
+        generation: eliot_contracts::ResourceGeneration,
+    ) -> Result<Option<eliot_ors::KernelReconciliationKind>, KernelBuildError> {
+        let lifecycle = self
+            .generation_gateway
+            .ors
+            .as_ref()
+            .load_generation_lifecycle(ACTIVE_DAEMON_CALLER, generation.value())
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd generation lifecycle readback is unreadable: {error}"
+                ))
+            })?;
+        let Some(lifecycle) = lifecycle else {
+            return Ok(None);
+        };
+        if lifecycle.admits_launch() {
+            return Ok(None);
+        }
+        match lifecycle.first_refusal_cause {
+            Some(cause) => Ok(Some(cause)),
+            None => Err(KernelBuildError::Service(
+                "eliotd generation lifecycle row refuses launch with no recorded cause".to_owned(),
+            )),
+        }
+    }
+
+    /// Builds the manifest-bound launch request out of the independent
+    /// observations and asks the ORS owner to verify this exact launch against
+    /// the immutable manifest (issue #1884; I1.9, W1.5).
+    ///
+    /// `load_and_verify_kernel_execution_restart` loads the manifest by this
+    /// request's own identity, re-verifies its recorded bound digest on
+    /// readback, and then runs the pure verifier over the observed candidate
+    /// coordinates, the Authority Epoch, the I1.12 evidence, the recorded
+    /// compatibility evidence and the recorded restart budget. A missing,
+    /// receipt-less, stale, incompatible, revoked or identity-mismatched
+    /// manifest therefore refuses the launch instead of admitting it, and the
+    /// ORS owner persists that refusal's reconciliation item and moves the real
+    /// generation lifecycle before returning, so the affected generation stays
+    /// visibly degraded.
+    ///
+    /// Every coordinate below is this owner's own observation. The recorded
+    /// manifest row is read only for the two values that are BY DEFINITION the
+    /// record's own identity — the bound digest and the accepted Catalog/Policy
+    /// revisions the admission sealed — and never as a substitute for an
+    /// observation.
+    #[cfg(windows)]
+    fn verify_daemon_launch_under_manifest(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        manifest: &eliot_ors::KernelExecutionManifest,
+        compatibility: eliot_ors::CompatibilityEvidence,
+        restarts_spent: u32,
+        observed_at_ms: i64,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        let store = self.generation_gateway.ors.as_ref();
+        let generation = launch.generation;
+        // The candidate contour is read from the descriptor this owner would
+        // actually launch from, so the comparison has an independent side.
+        let candidate = daemon_candidate_launch_binding(launch);
+        // The dependency order and the bounded restart budget are the admitted
+        // restart declaration's, read through the retained binding so the
+        // declaration's own digest is re-proved against this generation and
+        // State Fence. A child with no admitted declaration states neither
+        // coordinate and is refused, which is that declaration's own fail-closed
+        // disposition rather than a synthesised budget.
+        let (candidate_dependency_order, candidate_restart_budget) =
+            match daemon_candidate_restart_coordinates(self.daemon_restart_policy.as_ref(), launch)
+            {
+                Ok(coordinates) => coordinates,
+                Err(refusal) => {
+                    return Ok(DaemonRestartManifestAdmission::Refused(refusal));
+                }
+            };
+        // The Job Object/resource limits and the health/readiness contract
+        // reference are the two coordinates the descriptor states or states
+        // none of, and both are forwarded exactly as observed. A stated absence
+        // is not a local refusal: it is a legitimate observation the ORS verifier
+        // refuses under its own recorded kind, so the request is built either
+        // way and the decision owns the disposition.
+        let (candidate_resource_limits, candidate_health_readiness_contract_ref) =
+            daemon_candidate_observed_job_object_limits_and_readiness(launch);
+        let current_authority_epoch = eliot_contracts::AuthorityEpoch::new(
+            launch.authority_epoch.sequence.get(),
+        )
+        .map_err(|error| {
+            KernelBuildError::Service(format!(
+                "eliotd retained epoch is not a Kernel authority epoch: {error}"
+            ))
+        })?;
+        let request = eliot_ors::KernelExecutionRestartRequest {
+            module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+            generation,
+            bound_manifest_sha256: manifest.manifest_sha256.clone(),
+            candidate,
+            candidate_dependency_order,
+            candidate_resource_limits,
+            candidate_health_readiness_contract_ref,
+            candidate_restart_budget,
+            current_authority_epoch,
+            current_catalog_revision: manifest.admission.catalog_revision,
+            current_policy_revision: manifest.admission.policy_revision,
+            catalog_view: eliot_ors::CatalogPolicyView::Unavailable,
+            revocation: eliot_ors::RevocationAcknowledgement::Unacknowledged,
+            delivery: eliot_ors::EffectDeliveryAcknowledgement::GapOpen,
+            compatibility,
+            restarts_spent,
+            observed_at_ms,
+        };
+        let decision = store
+            .load_and_verify_kernel_execution_restart(&request)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd manifest-bound launch verification failed: {error}"
+                ))
+            })?;
+        match &decision.admission {
+            // Only a normal-service admission carries launch authority, and it
+            // carries the sealed manifest the launch must be bound to.
+            eliot_ors::KernelServiceAdmission::ReadRebuildService(bound)
+            | eliot_ors::KernelServiceAdmission::EffectService(bound) => Ok(
+                DaemonRestartManifestAdmission::Admitted(Box::new(bound.clone())),
+            ),
+            // `None` starts nothing, and shadow diagnostics carry no external
+            // effect and no canonical write admission, so neither is a normal
+            // launch. Both are refused with the decision's own recorded cause,
+            // which the ORS owner has already persisted.
+            eliot_ors::KernelServiceAdmission::ShadowDiagnosticsOnly(_)
+            | eliot_ors::KernelServiceAdmission::None => {
+                Ok(DaemonRestartManifestAdmission::Refused(
+                    Self::daemon_manifest_restart_cause(&decision),
+                ))
+            }
+        }
+    }
+
+    /// The typed refusal one refused manifest-bound decision carries.
+    ///
+    /// The decision's own first durable reconciliation item is the cause, so the
+    /// ORS refusal survives the layer boundary instead of being reported as an
+    /// unrelated budget or class verdict. The admission-derived codes below are
+    /// only reached if a decision ever refused without recording a cause.
+    #[cfg(windows)]
+    fn daemon_manifest_restart_cause(
+        decision: &eliot_ors::KernelRestartDecision,
+    ) -> DaemonRestartRefusal {
+        if let Some(item) = decision.reconciliation.first() {
+            return daemon_restart_refusal_for_manifest_cause(item.kind);
+        }
+        match decision.admission {
+            eliot_ors::KernelServiceAdmission::ShadowDiagnosticsOnly(_) => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_shadow_diagnostics_only")
+            }
+            eliot_ors::KernelServiceAdmission::None => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_declined")
+            }
+            eliot_ors::KernelServiceAdmission::ReadRebuildService(_)
+            | eliot_ors::KernelServiceAdmission::EffectService(_) => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_cause_unrecorded")
+            }
+        }
+    }
+
+    /// Records one manifest-bound launch refusal durably and returns it as this
+    /// file's typed refusal carrying the ORS kind's own bounded reason code.
+    ///
+    /// The write goes through the ORS owner, which appends the escalation under
+    /// its own attempt ordinal and moves the generation's real lifecycle record
+    /// in the same transaction, so a later attempt reads the degradation back
+    /// instead of recomputing it.
+    ///
+    /// `module_id` and `generation` are the affected pair the caller proved, not
+    /// this file's assumption about it: the lifecycle row that moves is the one
+    /// keyed by exactly that pair, so a caller that holds a sealed binding reads
+    /// both from the binding's own recorded admission.
+    #[cfg(windows)]
+    fn refuse_daemon_restart_under_manifest(
+        &self,
+        module_id: &str,
+        kind: eliot_ors::KernelReconciliationKind,
+        generation: eliot_contracts::ResourceGeneration,
+        bound_manifest_sha256: Option<&str>,
+        recorded_manifest_sha256: Option<&str>,
+        observed_at_ms: i64,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        self.generation_gateway
+            .ors
+            .as_ref()
+            .persist_kernel_restart_reconciliation(&eliot_ors::KernelReconciliationItem {
+                kind,
+                module_id: module_id.to_owned(),
+                generation,
+                bound_manifest_sha256: bound_manifest_sha256.map(str::to_owned),
+                recorded_manifest_sha256: recorded_manifest_sha256.map(str::to_owned),
+                lease_id: None,
+                operation_id: None,
+                observed_at_ms,
+            })
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd manifest-bound restart refusal could not be persisted: {error}"
+                ))
+            })?;
+        Ok(DaemonRestartManifestAdmission::Refused(
+            daemon_restart_refusal_for_manifest_cause(kind),
+        ))
+    }
+
+    /// Refuses the launch unless the observed launch binding is the WHOLE
+    /// recorded launch binding the sealed manifest carries (issue #1884; I1.9,
+    /// AUD3).
+    ///
+    /// The immutable bytes, the exact daemon configuration, the protected
+    /// snapshot identity and the rendered child command this launch would start
+    /// are compared against the RECORDED launch binding, never against the
+    /// retained descriptor alone and never against the manifest with itself, so
+    /// a descriptor whose recorded launch identity no longer stands for the
+    /// admitted manifest is refused instead of being launched.
+    ///
+    /// The comparison is over all FOUR `eliot_ors::KernelLaunchBinding` fields
+    /// as ONE record. It was previously narrowed to `artifact_sha256` and
+    /// `config_sha256` alone, which is precisely the two fields a per-attempt
+    /// refresh does NOT mutate: the refresh changes the launch nonce and the
+    /// descriptor digest, so the narrowed form covered neither the rendered
+    /// `start_command` nor the protected `protocol_sha256` while this function's
+    /// own documentation claimed it re-checked "the recorded launch identity". A
+    /// whole-record equality cannot silently narrow again the way a pair of named
+    /// scalars could: a future field added to `KernelLaunchBinding` enters this
+    /// comparison structurally, with no edit to this function.
+    ///
+    /// `observed` and `bound` are two DISTINCT values and neither stands in for
+    /// the other: `observed` is the projected candidate
+    /// ([`daemon_candidate_launch_binding`]) built from the descriptor that will
+    /// actually be launched, and `bound` is the sealed record. What is COMPARED
+    /// comes from `observed`; what is APPLIED, in
+    /// [`KernelComposition::launch_eliotd_under_manifest`], comes from `bound`.
+    ///
+    /// It is checked twice on purpose and by the same rule: once before the
+    /// active launch descriptor and the runtime status are replaced, so a
+    /// withheld launch never installs a contour the manifest does not record, and
+    /// once inside the launch primitive itself, so no future caller of that
+    /// primitive can reach a process start without the check.
+    ///
+    /// A refusal is RECORDED, not merely returned (issue #1884; I1.9, AUD5).
+    /// Before the error is built, the disagreement is escalated through
+    /// [`KernelComposition::refuse_daemon_restart_under_manifest`] — the SAME
+    /// durable path every other refusal in this contour takes — which calls
+    /// `RedbRecoveryStore::persist_kernel_restart_reconciliation` in
+    /// `crates/kernel/eliot-ors/src/store.rs`. That owner appends the escalation
+    /// under its own attempt ordinal and moves the affected generation's real
+    /// `GENERATION_LIFECYCLES` row in the same transaction, so the generation is
+    /// visibly degraded and
+    /// [`KernelComposition::daemon_generation_launch_blocker`] blocks its next
+    /// attempt instead of an improvised restart being tried again. The recorded
+    /// kind is
+    /// [`eliot_ors::KernelReconciliationKind::ManifestCandidateBindingMismatch`],
+    /// this file's own recorded cause for a launch-identity disagreement, and the
+    /// affected identity is read from the sealed binding's own recorded admission
+    /// through `BoundKernelExecutionManifest::manifest` rather than assumed. The
+    /// observable refusal reason below is unchanged: the durable cause and the
+    /// bounded diagnostic code are separate vocabularies.
+    #[cfg(windows)]
+    fn require_recorded_launch_identity(
+        &self,
+        observed: &eliot_ors::KernelLaunchBinding,
+        bound: &eliot_ors::BoundKernelExecutionManifest,
+        context: &tracing::Span,
+    ) -> Result<(), KernelBuildError> {
+        let binding = bound.launch_binding();
+        if observed == &binding {
+            return Ok(());
+        }
+        // The evidence is durable BEFORE the error is returned, and a failure to
+        // record it is itself an error rather than a silently dropped refusal.
+        // The admission this call projects is deliberately not read: it is this
+        // branch's own refusal, already decided, and the value that matters - the
+        // appended `KERNEL_RESTART_RECONCILIATIONS` row and the lifecycle move
+        // the append performed - is the store's own effect, which the `?` below
+        // makes a precondition of returning at all. The reason this function
+        // returns is its own bounded code, not the ORS projection.
+        self.refuse_daemon_restart_under_manifest(
+            bound.manifest().admission.module_id.as_str(),
+            eliot_ors::KernelReconciliationKind::ManifestCandidateBindingMismatch,
+            bound.manifest().admission.generation,
+            Some(bound.manifest().manifest_sha256.as_str()),
+            Some(bound.manifest().manifest_sha256.as_str()),
+            i64::try_from(super::unix_ms()).unwrap_or(i64::MAX),
+        )?;
+        let reason = daemon_restart_refusal_reason(&DaemonRestartRefusal::ClassWithholds(
+            "restart_launch_identity_not_the_recorded_manifest",
+        ));
+        observe_daemon_runtime_in_context("kernel.daemon.restart_refused", reason, context);
+        Err(self.daemon_failure_error(format!("eliotd automatic restart refused: {reason}")))
+    }
+
+    /// The ONE production launch primitive for the supervised `eliotd` child
+    /// (issue #1884; I1.9, AUD3, W1.5).
+    ///
+    /// It takes the sealed `BoundKernelExecutionManifest` as an argument and
+    /// there is no way to obtain one without the ORS verifier: the type has a
+    /// private field, a private constructor and no `Deserialize`, so no caller
+    /// and no request can assemble one. That is the compile-time guard the audit
+    /// asks for: this function is unreachable without a sealed manifest binding,
+    /// and every launch this file performs goes through it. A launch path that
+    /// wants to skip the manifest cannot call the primitive at all.
+    ///
+    /// The recorded launch identity is re-checked here through
+    /// [`KernelComposition::require_recorded_launch_identity`] immediately before
+    /// the process authority is reached, and it is re-checked as a WHOLE
+    /// [`eliot_ors::KernelLaunchBinding`] record — all four fields, the observed
+    /// one against the sealed one — so the primitive is not a way to launch a
+    /// contour the manifest does not record, and so no future caller of it can
+    /// narrow the check to the two digest scalars the check used to compare.
+    ///
+    /// `observed` is the candidate THIS launch would run and `bound` is the
+    /// sealed record the gate admitted. They are two distinct values and neither
+    /// stands in for the other: `observed` is only ever COMPARED, and everything
+    /// this function APPLIES is projected from `bound`.
+    ///
+    /// The two remaining recorded launch coordinates are APPLIED from the SAME
+    /// sealed binding this gate admitted, never from a second observation of
+    /// owner state. `bound` is handed to the process primitive unchanged, and
+    /// the OS-level ceilings that primitive installs are projected from
+    /// `bound`'s own `resource_limits()` by
+    /// `KernelComposition::eliotd_manifest_bound_resource_limits`
+    /// (`bins/eliot-kernel/src/daemon_process_launch.rs`). The ACTIVE
+    /// Host-approved descriptor is not re-read here, so what is applied is the
+    /// sealed manifest's own `resource_limits()`, structurally, whatever the
+    /// active slot holds at the moment of the process start. The applied
+    /// ceilings and the applied readiness contract are named on the launch span
+    /// below from that same binding, so the launch is observably the one the
+    /// manifest records.
+    ///
+    /// What the removed second read did NOT do is worth stating, because it is
+    /// the substitution the ORS owner already refuses: comparing the active
+    /// descriptor's `job_object_limits` against `bound.resource_limits()` here
+    /// re-derived a check the admission had already made coordinate by
+    /// coordinate, through
+    /// [`KernelComposition::verify_daemon_launch_under_manifest`] and
+    /// `daemon_candidate_observed_job_object_limits_and_readiness`, and it
+    /// refused with a reason this file recorded nowhere in ORS. A descriptor that
+    /// states limits the manifest does not record is still refused, and durably,
+    /// by that decision under `ManifestResourceLimitsMismatch`; a descriptor that
+    /// states none at all is still refused, and durably, under
+    /// `ManifestResourceLimitsUnobserved`, because the absence is forwarded to
+    /// the decision rather than shaped into a request error here. The applied
+    /// ceilings no longer depend on which of the two survived.
+    #[cfg(windows)]
+    async fn launch_eliotd_under_manifest(
+        &self,
+        observed: &eliot_ors::KernelLaunchBinding,
+        bound: &eliot_ors::BoundKernelExecutionManifest,
+        context: &tracing::Span,
+    ) -> Result<ProcessStartReceipt, KernelBuildError> {
+        self.require_recorded_launch_identity(observed, bound, context)?;
+        // The applied Job Object/resource limits and the applied readiness
+        // contract are read out of the sealed binding, once, and the very same
+        // `bound` is what the primitive below receives. Nothing this launch
+        // applies is projected from a re-read of the active descriptor.
+        let applied_limits = bound.resource_limits();
+        let applied_readiness = bound.health_readiness_contract_ref();
+        let applied_max_processes = applied_limits.max_processes.to_string();
+        let applied_max_working_set_bytes = applied_limits.max_working_set_bytes.to_string();
+        let applied_cpu_rate_control = applied_limits.cpu_rate_control_percent.to_string();
+        for (field, applied) in [
+            (
+                "job_object_policy",
+                applied_limits.job_object_policy.as_str(),
+            ),
+            ("max_processes", applied_max_processes.as_str()),
+            (
+                "max_working_set_bytes",
+                applied_max_working_set_bytes.as_str(),
+            ),
+            (
+                "cpu_rate_control_percent",
+                applied_cpu_rate_control.as_str(),
+            ),
+            ("readiness_contract", applied_readiness),
+        ] {
+            context.record(
+                field,
+                super::kernel_diagnostics::bound_field(applied).text(),
+            );
+        }
+        self.launch_eliotd_in_context(context, bound).await
+    }
+
+    /// The one production launch entry for the operator-facing activation
+    /// contour: it admits the activation's exact generation under the sealed
+    /// immutable manifest and then launches through
+    /// `KernelComposition::launch_eliotd_under_manifest` (issue #1884; I1.9).
+    ///
+    /// `KernelControlCommand::Activate` in
+    /// `bins/eliot-kernel/src/control_plane.rs` is a production launch, not a
+    /// recovery: it starts the child for the generation the activation names. It
+    /// therefore reaches the process authority through the same manifest gate as
+    /// a bounded recovery, and never around it.
+    ///
+    /// This is the FIRST-LAUNCH arm, so it selects exactly the arm
+    /// `KernelComposition::admit_daemon_launch_under_manifest` takes with no
+    /// previous receipt — a zero recorded restart spend, and none of the
+    /// replacement-only policy, durable-record and threshold machinery.
+    ///
+    /// A generation with no recorded manifest, a receipt-less manifest, no
+    /// recorded I1.12 verdict, a `Degraded`/`Quarantined` lifecycle row, or a
+    /// candidate binding the manifest does not record launches nothing here. The
+    /// refusal is persisted through
+    /// `RedbRecoveryStore::persist_kernel_restart_reconciliation` inside that
+    /// admission and returned as this file's own typed refusal, so the affected
+    /// generation stays visibly degraded instead of starting.
+    ///
+    /// The generation and Authority Epoch are read from the ACTIVE Host-approved
+    /// launch descriptor — the same descriptor the launch primitive will run
+    /// from — so the manifest lookup names the identity that is actually
+    /// launched.
+    #[cfg(windows)]
+    pub(crate) async fn launch_eliotd_for_activation_under_manifest(
+        &self,
+        context: &tracing::Span,
+    ) -> Result<ProcessStartReceipt, KernelBuildError> {
+        let launch = self
+            .active_daemon_launch()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?
+            .ok_or_else(|| {
+                KernelBuildError::Service("eliotd launch descriptor is required".to_owned())
+            })?;
+        // `restarts_spent` is zero on this arm and is not an assumption: a first
+        // launch has no previous generation to replace, so there is no restart to
+        // spend. The recorded budget CEILING is not supplied here either — the
+        // verifier reads it from the immutable manifest itself.
+        let bound = match self.admit_daemon_restart_under_manifest(&launch, 0)? {
+            DaemonRestartManifestAdmission::Admitted(bound) => bound,
+            DaemonRestartManifestAdmission::Refused(refusal) => {
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime_in_context("kernel.daemon.restart_refused", reason, context);
+                return Err(self
+                    .daemon_failure_error(format!("eliotd activation launch refused: {reason}")));
+            }
+        };
+        // The candidate the gate admitted and the primitive re-checks is projected from
+        // the very descriptor this activation launches, which is the ACTIVE
+        // Host-approved one read above. Projecting it here and again inside the
+        // admission would be the same pure projection of the same value, so the
+        // two sides of the comparison stay one value by construction.
+        let observed = daemon_candidate_launch_binding(&launch);
+        self.launch_eliotd_under_manifest(&observed, bound.as_ref(), context)
+            .await
     }
 
     /// Performs one Kernel-owned bounded recovery of a failed daemon
@@ -828,23 +1903,64 @@ impl KernelComposition {
         // refusal is returned. A daemon restart therefore cannot hand out a
         // fresh window: the record IS the window.
         //
-        // Absence stays absence. `Ok(None)` means this child's declared budget
-        // was never recorded as spent, and it is never widened into an
-        // unlimited budget; an unreadable or invalid record is a mechanical
-        // failure, not a permission. The declared THRESHOLD is read only from
-        // an admitted policy, and a child with no admitted policy has no
-        // declared budget at all, so its replacement is refused as
-        // `PolicyNotAdmitted` rather than being given a synthesised default.
-        if previous_receipt.is_some() {
-            let refused =
-                self.admit_daemon_restart_attempt(&launch, attempt, previous_receipt.as_ref())?;
-            if let Some(refusal) = refused {
+        // Absence stays absence. An admitted disposition means this child's
+        // declared budget was never recorded as spent and that the immutable
+        // manifest bound to the admitted generation admitted the replacement;
+        // neither is ever widened into an unlimited budget, and an unreadable
+        // or invalid record is a mechanical failure, not a permission. The
+        // declared THRESHOLD is read only from an admitted policy, and a child
+        // with no admitted policy has no declared budget at all, so its
+        // replacement is refused as `PolicyNotAdmitted` rather than being given
+        // a synthesised default.
+        //
+        // Issue #1884 (I1.9, AUD3, W1.5): the admitted disposition carries the
+        // sealed `BoundKernelExecutionManifest` the ORS verifier issued, and that
+        // is the only value the launch below may take its identity from.
+        //
+        // BOTH arms pass through the same gate. A first launch of the child is
+        // not a restart and spends no restart budget, but it is a production
+        // launch, so it is admitted under the same sealed manifest binding
+        // instead of around it; only the restart-specific policy, durable-record
+        // and threshold machinery is replacement-only. There is no branch left in
+        // which this file reaches a process launch without a sealed binding.
+        //
+        // The FRESH descriptor is derived HERE, before the gate, and it is the one
+        // the gate is handed. That is the whole reason for the position: the gate
+        // must compare the descriptor that will ACTUALLY be launched, and the
+        // launch primitive builds its `ProcessIntent` from the descriptor
+        // installed in the active slot below, which is this refreshed one.
+        // Admitting the PRE-refresh descriptor would compare a contour the launch
+        // never runs, and because the refresh rewrites the launch nonce it made
+        // every such comparison disagree by construction.
+        //
+        // Deriving the descriptor installs nothing: the active launch slot, the
+        // front-door policy nonce, the runtime status and the previous process
+        // are all still untouched at this point, and the recorded-row read, the
+        // generation lifecycle read, the request build and the decision order
+        // inside the gate are unchanged. A refused admission therefore leaves the
+        // previous generation's descriptor, nonce and operation identity exactly
+        // as they were, which is what "a withheld replacement must never destroy
+        // a child it cannot replace" requires.
+        let next_launch = fresh_eliotd_launch_descriptor(&launch, attempt + 1)?;
+        // One projection of that refreshed descriptor, used by BOTH the gate and
+        // the launch primitive's re-check. It is a pure function of the
+        // descriptor, so the two call sites cannot drift apart, and it is the
+        // descriptor that will be launched rather than a re-read of the active
+        // slot.
+        let observed_launch_binding = daemon_candidate_launch_binding(&next_launch);
+        let bound_restart_manifest = match self.admit_daemon_launch_under_manifest(
+            &next_launch,
+            attempt,
+            previous_receipt.as_ref(),
+        )? {
+            DaemonRestartManifestAdmission::Admitted(bound) => bound,
+            DaemonRestartManifestAdmission::Refused(refusal) => {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
                 return Err(self
                     .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
             }
-        }
+        };
         // The two refusals that no declared restart class may bypass (I14.10)
         // are decided here, on the exact reconciled evidence of the generation
         // being replaced: after its process is proven terminal and before any
@@ -906,7 +2022,17 @@ impl KernelComposition {
             let reason = "eliotd recovery has no exact prior process disposition".to_owned();
             return Err(self.daemon_failure_error(reason));
         }
-        let next_launch = fresh_eliotd_launch_descriptor(&launch, attempt + 1)?;
+        // The recorded-identity check happens HERE, before the active descriptor
+        // and the runtime status are replaced, so a launch withheld for a contour
+        // the manifest does not record never installs it. It compares the SAME
+        // projected binding the gate admitted and the primitive re-checks — the
+        // whole record, every field of it — and not a re-read of anything else.
+        // The launch primitive applies the same rule again.
+        self.require_recorded_launch_identity(
+            &observed_launch_binding,
+            &bound_restart_manifest,
+            context,
+        )?;
         {
             let mut policy = self.front_door_policy.lock().map_err(|_| {
                 KernelBuildError::Service("front-door policy lock poisoned".to_owned())
@@ -944,7 +2070,17 @@ impl KernelComposition {
         }
         self.note_agent_bridge_peer_set_change();
         self.daemon_status_changed.notify_one();
-        let launched = match self.launch_eliotd_in_context(context).await {
+        // Issue #1884 (I1.9): the single launch primitive, reached only with the
+        // sealed manifest binding admitted above and with the observed binding
+        // projected from the very descriptor installed in the active slot.
+        let launched = match self
+            .launch_eliotd_under_manifest(
+                &observed_launch_binding,
+                &bound_restart_manifest,
+                context,
+            )
+            .await
+        {
             Ok(receipt) => receipt,
             Err(error) => {
                 *child_terminal_owned = true;
@@ -1185,5 +2321,1449 @@ impl KernelComposition {
         // Issue #1844: a daemon crash compiles its brief.
         self.observe_diagnostic_problem(DiagnosticTrigger::ModuleCrashOrRestartExhaustion);
         Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod daemon_manifest_restart_admission_tests {
+    //! Issue #1884 (I1.9, AUD3, AUD5, W1.5) package-local negative proof for the
+    //! manifest-bound `eliotd` launch gate's refusal vocabulary, and for WHERE that
+    //! gate records a launch-identity refusal (I1.9, AUD5).
+    //!
+    //! The causal property is that ONE recorded ORS reconciliation cause projects
+    //! into that cause's OWN bounded reason code, so a manifest defect is never
+    //! reported as a spent restart budget, a spent budget is never reported as a
+    //! manifest defect, a substituted launch coordinate is never reported as its
+    //! neighbour, and the single fallback code is reached only by the documented
+    //! effect-lease family the restart verifier cannot produce.
+    //!
+    //! What this module is NOT: a store-backed wiring proof. It pins the mapping
+    //! table, and it pins WHERE
+    //! `KernelComposition::require_recorded_launch_identity` records its refusal
+    //! by reading this file's own source at compile time. The other half of
+    //! `bins/AGENTS.md:86` — that no production launch reaches a process start
+    //! without a sealed `BoundKernelExecutionManifest` — is carried by the
+    //! signature of `KernelComposition::launch_eliotd_under_manifest` and by the
+    //! fact that BOTH production launch arms enter the sealed gate before they
+    //! reach it: the bounded recovery through
+    //! `KernelComposition::admit_daemon_launch_under_manifest` in
+    //! `recover_eliotd_inner`, and the operator activation through
+    //! `KernelComposition::launch_eliotd_for_activation_under_manifest`. It is a
+    //! type-level fact rather than something a table can assert.
+    //!
+    //! Every test here is pure and falsifiable, and they come in two shapes:
+    //! assertions over the real `eliot_ors` types this crate already depends on,
+    //! and source guards that read this file's own source at compile time through
+    //! `THIS_FILE`. Every refusal-vocabulary assertion goes through
+    //! `daemon_restart_refusal_reason`, because `DaemonRestartRefusal` derives
+    //! nothing and is compared by its projected code.
+    //! `DaemonRestartManifestAdmission::Admitted` is deliberately not exercised:
+    //! `BoundKernelExecutionManifest` has a private field, a private
+    //! `const fn verified` and no `Deserialize`, so a locally built enum would
+    //! assert nothing about the real gate.
+    //!
+    //! For the same reason the DURABLE write of that gate cannot be exercised
+    //! here, and no store is faked for it. Reaching it needs a real sealed
+    //! binding, and the only ingress that mints one
+    //! (`RedbRecoveryStore::persist_admitted_kernel_execution_manifest`) verifies
+    //! the canonical Governor owner receipt against the admission seal field by
+    //! field before it writes, so a manifest row is reachable only through the
+    //! Governor accept path in `eliot-module-registry` — a crate this composition
+    //! root does not depend on and must not grow an edge to from a test. The
+    //! ordering claim is therefore measured against the source that decides it,
+    //! which is the strongest thing this crate can falsify on its own.
+
+    use super::*;
+    use eliot_ors::KernelReconciliationKind as Cause;
+
+    /// The reason the wildcard arm is allowed to produce.
+    const FALLBACK_REASON: &str = "restart_manifest_not_admitted";
+
+    /// Every cause the gate maps to a cause-specific reason, with the exact code
+    /// that reason must be. The table is the specification, not a count: adding a
+    /// cause to ORS means classifying it in `placement_of`, listing it in
+    /// `EVERY_RECORDED_CAUSE` and giving it a row here, and a cause that keeps
+    /// its own code can never be confused with another one that does.
+    const MAPPED_CAUSES: &[(Cause, &str)] = &[
+        (
+            Cause::ManifestRestartBudgetExhausted,
+            "restart_budget_exhausted_durably",
+        ),
+        (Cause::ManifestAbsent, "restart_manifest_absent"),
+        (
+            Cause::ManifestIdentityMismatch,
+            "restart_manifest_identity_mismatch",
+        ),
+        (
+            Cause::ManifestCandidateBindingMismatch,
+            "restart_manifest_candidate_binding_mismatch",
+        ),
+        (Cause::ManifestIncompatible, "restart_manifest_incompatible"),
+        (Cause::ManifestRevoked, "restart_manifest_revoked"),
+        (Cause::ManifestReceiptless, "restart_manifest_receiptless"),
+        (
+            Cause::ManifestForeignEpoch,
+            "restart_manifest_foreign_epoch",
+        ),
+        (Cause::ManifestInvalid, "restart_manifest_invalid"),
+        (
+            Cause::ManifestCatalogPolicyStale,
+            "restart_manifest_catalog_policy_stale",
+        ),
+        (
+            Cause::ManifestRevocationUnacknowledged,
+            "restart_manifest_revocation_unacknowledged",
+        ),
+        (
+            Cause::ManifestDeliveryGapOpen,
+            "restart_manifest_delivery_gap_open",
+        ),
+        (
+            Cause::ManifestNotEffectCapable,
+            "restart_manifest_not_effect_capable",
+        ),
+        (
+            Cause::GovernorAdmissionSealAbsent,
+            "restart_governor_admission_seal_absent",
+        ),
+        (
+            Cause::GovernorAdmissionSealWithheld,
+            "restart_governor_admission_seal_withheld",
+        ),
+        (
+            Cause::GovernorAdmissionSealMalformed,
+            "restart_governor_admission_seal_malformed",
+        ),
+        (
+            Cause::GovernorAdmissionSealIdentityMismatch,
+            "restart_governor_admission_seal_identity_mismatch",
+        ),
+        (
+            Cause::GovernorAdmissionSealRevisionMismatch,
+            "restart_governor_admission_seal_revision_mismatch",
+        ),
+        (
+            Cause::GovernorAdmissionSealStateFenceAbsent,
+            "restart_governor_admission_seal_state_fence_absent",
+        ),
+        (
+            Cause::GovernorAdmissionSealOwnerDigestMismatch,
+            "restart_governor_admission_seal_owner_digest_mismatch",
+        ),
+        (
+            Cause::ManifestRestartAuthorizationClassMismatch,
+            "restart_manifest_authorization_class_mismatch",
+        ),
+        (
+            Cause::ManifestAdmittedEffectCeilingMismatch,
+            "restart_manifest_effect_ceiling_mismatch",
+        ),
+        (
+            Cause::ManifestAdmittedAllowedScopesMismatch,
+            "restart_manifest_allowed_scopes_mismatch",
+        ),
+        (
+            Cause::ManifestDependencyOrderMismatch,
+            "restart_manifest_dependency_order_mismatch",
+        ),
+        (
+            Cause::ManifestResourceLimitsMismatch,
+            "restart_manifest_resource_limits_mismatch",
+        ),
+        (
+            Cause::ManifestReadinessContractMismatch,
+            "restart_manifest_readiness_contract_mismatch",
+        ),
+        (
+            Cause::ManifestRestartBudgetMismatch,
+            "restart_manifest_restart_budget_mismatch",
+        ),
+        (
+            Cause::ManifestResourceLimitsUnobserved,
+            "restart_manifest_resource_limits_unobserved",
+        ),
+        (
+            Cause::ManifestReadinessContractUnobserved,
+            "restart_manifest_readiness_contract_unobserved",
+        ),
+    ];
+
+    /// Which of the two proven tables one recorded cause belongs to.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CausePlacement {
+        /// Keeps its own bounded reason code.
+        OwnCode,
+        /// Belongs to the effect-lease family a whole-generation launch gate
+        /// cannot produce, and reaches the one fallback code.
+        EffectLeaseFamily,
+    }
+
+    /// Classifies EVERY variant of the ORS reconciliation vocabulary.
+    ///
+    /// The `match` is exhaustive on purpose and carries NO wildcard arm, so a
+    /// variant added to `eliot_ors::KernelReconciliationKind` makes this
+    /// function stop compiling until it is classified. That is what makes "only
+    /// the effect family falls back" a checked claim rather than an assertion:
+    /// a new cause cannot reach the wildcard arm of
+    /// `daemon_restart_refusal_for_manifest_cause` while this proof still
+    /// passes. The completeness assertion in the test below is what then forces
+    /// the classification to be mirrored as a row in the matching table.
+    fn placement_of(cause: Cause) -> CausePlacement {
+        match cause {
+            Cause::ManifestAbsent
+            | Cause::ManifestIdentityMismatch
+            | Cause::ManifestCandidateBindingMismatch
+            | Cause::ManifestIncompatible
+            | Cause::ManifestRevoked
+            | Cause::ManifestReceiptless
+            | Cause::ManifestForeignEpoch
+            | Cause::ManifestRestartBudgetExhausted
+            | Cause::ManifestInvalid
+            | Cause::ManifestCatalogPolicyStale
+            | Cause::ManifestRevocationUnacknowledged
+            | Cause::ManifestDeliveryGapOpen
+            | Cause::ManifestNotEffectCapable
+            | Cause::GovernorAdmissionSealAbsent
+            | Cause::GovernorAdmissionSealWithheld
+            | Cause::GovernorAdmissionSealMalformed
+            | Cause::GovernorAdmissionSealIdentityMismatch
+            | Cause::GovernorAdmissionSealRevisionMismatch
+            | Cause::GovernorAdmissionSealStateFenceAbsent
+            | Cause::GovernorAdmissionSealOwnerDigestMismatch
+            | Cause::ManifestRestartAuthorizationClassMismatch
+            | Cause::ManifestAdmittedEffectCeilingMismatch
+            | Cause::ManifestAdmittedAllowedScopesMismatch
+            | Cause::ManifestDependencyOrderMismatch
+            | Cause::ManifestResourceLimitsMismatch
+            | Cause::ManifestReadinessContractMismatch
+            | Cause::ManifestRestartBudgetMismatch
+            | Cause::ManifestResourceLimitsUnobserved
+            | Cause::ManifestReadinessContractUnobserved => CausePlacement::OwnCode,
+            Cause::EffectLeaseAbsent
+            | Cause::EffectLeaseInvalid
+            | Cause::EffectOperationIdentityMismatch
+            | Cause::EffectReceiptMismatch
+            | Cause::EffectScopeMismatch
+            | Cause::EffectManifestMismatch
+            | Cause::EffectEpochMismatch
+            | Cause::EffectCatalogPolicyStale
+            | Cause::EffectLeaseExpired
+            | Cause::EffectLeaseRevoked
+            | Cause::EffectLeaseRevocationUnacknowledged
+            | Cause::EffectLeaseNotActive
+            | Cause::EffectDeliveryGapOpen
+            | Cause::EffectGenerationDegraded
+            | Cause::EffectGenerationLifecycleUnrecorded
+            | Cause::EffectLeaseIdentityAbsent
+            | Cause::EffectLeaseIdentityMismatch => CausePlacement::EffectLeaseFamily,
+        }
+    }
+
+    /// Every variant of `eliot_ors::KernelReconciliationKind`, enumerated as the
+    /// source declares it and re-checked against `placement_of` below. The two
+    /// tables above are counted against THIS list, so a variant that is
+    /// classified but given no row fails the test rather than passing silently.
+    const EVERY_RECORDED_CAUSE: &[Cause] = &[
+        Cause::ManifestAbsent,
+        Cause::ManifestIdentityMismatch,
+        Cause::ManifestCandidateBindingMismatch,
+        Cause::ManifestIncompatible,
+        Cause::ManifestRevoked,
+        Cause::ManifestReceiptless,
+        Cause::ManifestForeignEpoch,
+        Cause::ManifestRestartBudgetExhausted,
+        Cause::ManifestInvalid,
+        Cause::ManifestCatalogPolicyStale,
+        Cause::ManifestRevocationUnacknowledged,
+        Cause::ManifestDeliveryGapOpen,
+        Cause::ManifestNotEffectCapable,
+        Cause::EffectLeaseAbsent,
+        Cause::EffectLeaseInvalid,
+        Cause::EffectOperationIdentityMismatch,
+        Cause::EffectReceiptMismatch,
+        Cause::EffectScopeMismatch,
+        Cause::EffectManifestMismatch,
+        Cause::EffectEpochMismatch,
+        Cause::EffectCatalogPolicyStale,
+        Cause::EffectLeaseExpired,
+        Cause::EffectLeaseRevoked,
+        Cause::EffectLeaseRevocationUnacknowledged,
+        Cause::EffectLeaseNotActive,
+        Cause::EffectDeliveryGapOpen,
+        Cause::EffectGenerationDegraded,
+        Cause::EffectGenerationLifecycleUnrecorded,
+        Cause::GovernorAdmissionSealAbsent,
+        Cause::GovernorAdmissionSealWithheld,
+        Cause::GovernorAdmissionSealMalformed,
+        Cause::GovernorAdmissionSealIdentityMismatch,
+        Cause::GovernorAdmissionSealRevisionMismatch,
+        Cause::GovernorAdmissionSealStateFenceAbsent,
+        Cause::GovernorAdmissionSealOwnerDigestMismatch,
+        Cause::EffectLeaseIdentityAbsent,
+        Cause::EffectLeaseIdentityMismatch,
+        Cause::ManifestRestartAuthorizationClassMismatch,
+        Cause::ManifestAdmittedEffectCeilingMismatch,
+        Cause::ManifestAdmittedAllowedScopesMismatch,
+        Cause::ManifestDependencyOrderMismatch,
+        Cause::ManifestResourceLimitsMismatch,
+        Cause::ManifestReadinessContractMismatch,
+        Cause::ManifestRestartBudgetMismatch,
+        Cause::ManifestResourceLimitsUnobserved,
+        Cause::ManifestReadinessContractUnobserved,
+    ];
+
+    /// The effect-lease family, which the wildcard covers: these causes belong
+    /// to the exact-effect replay verifier, which decides one leased operation
+    /// and never a whole-generation launch, so a launch gate cannot produce one.
+    /// The list is the whole `Effect*` part of the ORS vocabulary, so the
+    /// distinctness of the explicit table below it is checkable by eye.
+    const EFFECT_LEASE_FAMILY: &[Cause] = &[
+        Cause::EffectLeaseAbsent,
+        Cause::EffectLeaseInvalid,
+        Cause::EffectOperationIdentityMismatch,
+        Cause::EffectReceiptMismatch,
+        Cause::EffectScopeMismatch,
+        Cause::EffectManifestMismatch,
+        Cause::EffectEpochMismatch,
+        Cause::EffectCatalogPolicyStale,
+        Cause::EffectLeaseExpired,
+        Cause::EffectLeaseRevoked,
+        Cause::EffectLeaseRevocationUnacknowledged,
+        Cause::EffectLeaseNotActive,
+        Cause::EffectDeliveryGapOpen,
+        Cause::EffectGenerationDegraded,
+        Cause::EffectGenerationLifecycleUnrecorded,
+        Cause::EffectLeaseIdentityAbsent,
+        Cause::EffectLeaseIdentityMismatch,
+    ];
+
+    /// The reason one recorded cause projects into.
+    fn reason_for(cause: Cause) -> &'static str {
+        daemon_restart_refusal_reason(&daemon_restart_refusal_for_manifest_cause(cause))
+    }
+
+    #[test]
+    fn recorded_manifest_absence_keeps_its_own_reason_and_is_not_a_spent_budget() {
+        // The pre-delivery gate reported every recorded cause as a spent budget
+        // (`if recorded.is_some() { RestartBudgetExhausted }`), which made an
+        // absent manifest indistinguishable from an exhausted one.
+        let absent = reason_for(Cause::ManifestAbsent);
+        let spent = reason_for(Cause::ManifestRestartBudgetExhausted);
+        assert_eq!(absent, "restart_manifest_absent");
+        assert_eq!(spent, "restart_budget_exhausted_durably");
+        assert_ne!(absent, spent);
+        // The converse half. Without it a whole-table inversion — every cause
+        // mapped to one literal — would satisfy the assertions above.
+        assert_ne!(reason_for(Cause::ManifestRestartBudgetMismatch), spent);
+        assert_eq!(
+            reason_for(Cause::ManifestRestartBudgetMismatch),
+            "restart_manifest_restart_budget_mismatch"
+        );
+    }
+
+    #[test]
+    fn every_mapped_cause_keeps_its_own_reason_and_only_the_effect_family_falls_back() {
+        // COMPLETENESS against the whole ORS vocabulary, measured rather than
+        // claimed. `placement_of` classifies every variant the source declares,
+        // and the two tables are counted against that classification, so a cause
+        // classified `OwnCode` without its own row — or classified into the
+        // effect family without being listed there — fails here instead of
+        // quietly reaching the wildcard arm.
+        let classified_own_code = EVERY_RECORDED_CAUSE
+            .iter()
+            .filter(|cause| placement_of(**cause) == CausePlacement::OwnCode)
+            .count();
+        let classified_effect_family = EVERY_RECORDED_CAUSE
+            .iter()
+            .filter(|cause| placement_of(**cause) == CausePlacement::EffectLeaseFamily)
+            .count();
+        assert_eq!(
+            classified_own_code,
+            MAPPED_CAUSES.len(),
+            "a recorded cause classified as keeping its own reason has no row in MAPPED_CAUSES"
+        );
+        assert_eq!(
+            classified_effect_family,
+            EFFECT_LEASE_FAMILY.len(),
+            "a recorded cause classified into the effect-lease family is not in EFFECT_LEASE_FAMILY"
+        );
+        assert_eq!(
+            MAPPED_CAUSES.len() + EFFECT_LEASE_FAMILY.len(),
+            EVERY_RECORDED_CAUSE.len(),
+            "the two proven tables do not cover the recorded cause vocabulary"
+        );
+        for (cause, expected) in MAPPED_CAUSES {
+            assert_eq!(
+                placement_of(*cause),
+                CausePlacement::OwnCode,
+                "cause {cause:?} is classified out of the own-code table"
+            );
+            assert_eq!(
+                reason_for(*cause),
+                *expected,
+                "cause {cause:?} lost its own reason"
+            );
+            assert_ne!(
+                *expected, FALLBACK_REASON,
+                "cause {cause:?} collapsed into the fallback code"
+            );
+        }
+        // The wildcard is reached by the documented family and by nothing else:
+        // every effect-lease cause is one bound restart cannot produce, and each
+        // of them is projected as the last resort rather than as a claim this
+        // file cannot make about a whole-generation launch.
+        for cause in EFFECT_LEASE_FAMILY {
+            assert_eq!(
+                placement_of(*cause),
+                CausePlacement::EffectLeaseFamily,
+                "cause {cause:?} is classified out of the effect-lease family"
+            );
+            assert_eq!(
+                reason_for(*cause),
+                FALLBACK_REASON,
+                "cause {cause:?} left the family"
+            );
+        }
+        // Additional, and deliberately not sufficient on its own: mapping every
+        // explicit cause to one literal and deleting another would keep a bare
+        // count intact, and two causes swapping literals would pass a count too.
+        // The value assertions above are what make the claim; this only says the
+        // codes are pairwise distinct.
+        for (index, (cause, reason)) in MAPPED_CAUSES.iter().enumerate() {
+            for (other_cause, other_reason) in &MAPPED_CAUSES[index + 1..] {
+                assert_ne!(
+                    reason, other_reason,
+                    "causes {cause:?} and {other_cause:?} share one reason code"
+                );
+            }
+        }
+    }
+
+    /// This file's own source, resolved at compile time, so a running Kernel never
+    /// locates a file to read it.
+    const THIS_FILE: &str = include_str!("daemon_runtime.rs");
+
+    /// The body of `KernelComposition::require_recorded_launch_identity`, from its
+    /// own definition up to the launch primitive that follows it.
+    ///
+    /// Both boundaries are exact spellings, so a moved or renamed gate fails the
+    /// lookup instead of silently proving an empty slice.
+    fn launch_identity_gate_source() -> &'static str {
+        let start = THIS_FILE
+            .find("    fn require_recorded_launch_identity(")
+            .expect("the launch-identity gate is defined in this file");
+        let end = THIS_FILE[start..]
+            .find("    #[cfg(windows)]\n    async fn launch_eliotd_under_manifest(")
+            .map(|offset| start + offset)
+            .expect("the launch primitive follows the launch-identity gate");
+        &THIS_FILE[start..end]
+    }
+
+    /// The refusal case (issue #1884; I1.9, AUD5): a launch whose candidate
+    /// digests are not the sealed binding's own recorded launch binding is
+    /// refused AND is recorded durably under the ORS kind this file already maps
+    /// for a launch-identity disagreement, before the error is returned.
+    #[test]
+    fn a_launch_identity_disagreement_is_recorded_under_its_own_kind_before_the_error_is_built() {
+        // The DURABLE cause and the OBSERVABLE refusal reason are two separate
+        // vocabularies, and recording the first must not change the second.
+        assert_eq!(
+            reason_for(Cause::ManifestCandidateBindingMismatch),
+            "restart_manifest_candidate_binding_mismatch"
+        );
+        let gate_reason = daemon_restart_refusal_reason(&DaemonRestartRefusal::ClassWithholds(
+            "restart_launch_identity_not_the_recorded_manifest",
+        ));
+        assert_eq!(
+            gate_reason, "restart_launch_identity_not_the_recorded_manifest",
+            "the gate's returned refusal reason changed"
+        );
+        assert_ne!(
+            gate_reason,
+            reason_for(Cause::ManifestCandidateBindingMismatch),
+            "the returned reason must stay the gate's own code, not the ORS projection"
+        );
+        // The recorded kind is this file's own kind for a launch-identity
+        // disagreement, and never the fallback, a spent budget, or the
+        // record-identity cause it must stay distinguishable from.
+        for other in [
+            FALLBACK_REASON,
+            reason_for(Cause::ManifestRestartBudgetExhausted),
+            reason_for(Cause::ManifestIdentityMismatch),
+        ] {
+            assert_ne!(
+                reason_for(Cause::ManifestCandidateBindingMismatch),
+                other,
+                "the launch-identity cause collapsed into {other}"
+            );
+        }
+
+        let gate = launch_identity_gate_source();
+        // The check itself still decides the refusal: it reads the sealed
+        // binding's recorded launch binding and returns `Ok` only on a WHOLE
+        // record equality. Which fields that equality covers — and the proof that
+        // the narrowed two-scalar form is gone — is measured by
+        // `the_identity_gate_compares_whole_records_and_admits_the_refreshed_descriptor`.
+        assert!(
+            gate.contains("let binding = bound.launch_binding();"),
+            "the gate no longer reads the sealed binding's recorded launch binding"
+        );
+        assert!(
+            gate.contains("if observed == &binding {"),
+            "the gate no longer decides admission on a whole-record equality of the observed and recorded launch bindings"
+        );
+        // The refusal is recorded through the ONE escalation path this contour
+        // already uses — the same `KernelComposition::refuse_daemon_restart_under_manifest`
+        // that reaches `RedbRecoveryStore::persist_kernel_restart_reconciliation`
+        // and moves the real generation lifecycle — under this file's own kind for
+        // a launch-identity disagreement.
+        let record = gate
+            .find("self.refuse_daemon_restart_under_manifest(")
+            .expect("the launch-identity refusal is not recorded durably");
+        assert!(
+            gate.contains("KernelReconciliationKind::ManifestCandidateBindingMismatch"),
+            "the launch-identity refusal is not recorded under ManifestCandidateBindingMismatch"
+        );
+        // ORDER, which is the whole causal property: the comparison still decides
+        // the refusal first, the durable write happens next, and only then is the
+        // error built and returned. An evidence write after the return is exactly
+        // the defect this closes.
+        let check = gate
+            .find("let binding = bound.launch_binding();")
+            .expect("the recorded-digest check is gone");
+        let observed = gate
+            .find("observe_daemon_runtime_in_context(")
+            .expect("the bounded observation is gone");
+        let returned = gate
+            .find("self.daemon_failure_error(")
+            .expect("the gate no longer returns a typed failure");
+        assert!(
+            check < record && record < observed && observed < returned,
+            "the launch-identity refusal must compare, then record durably, then observe, then return"
+        );
+        // The positive arm of the very same check, measured on the same source: a
+        // contour whose candidate digests ARE the recorded ones returns before the
+        // escalation call, so a launch the manifest does record publishes no
+        // refusal and moves no generation lifecycle row.
+        let admitted = gate
+            .find("return Ok(());")
+            .expect("the gate no longer admits a contour the manifest records");
+        assert!(
+            admitted < record,
+            "a contour the manifest does record must not be recorded as a refusal"
+        );
+        // BOTH production call sites reach this instrumented function and nothing
+        // else does, so neither arm can launch a contour the manifest does not
+        // record without the escalation being published. The count is the shape
+        // claim: a THIRD call site would have to be classified here.
+        let call_sites = THIS_FILE
+            .matches("self.require_recorded_launch_identity(")
+            .count();
+        assert_eq!(
+            call_sites, 2,
+            "the launch-identity gate has {call_sites} call sites; the bounded recovery and the operator activation arms are the two that exist"
+        );
+        let test_module = THIS_FILE
+            .find("mod daemon_manifest_restart_admission_tests")
+            .expect("this module is declared in this file");
+        for (index, offset) in THIS_FILE
+            .match_indices("self.require_recorded_launch_identity(")
+            .map(|(offset, _matched)| offset)
+            .enumerate()
+        {
+            assert!(
+                offset < test_module,
+                "launch-identity gate call site {index} is not production code"
+            );
+        }
+    }
+
+    /// One exact span of this file's source, from an exact opening spelling to
+    /// the exact spelling that follows it.
+    ///
+    /// Both boundaries are exact spellings, so a moved or renamed function fails
+    /// the lookup instead of silently proving an empty slice.
+    fn source_between(open: &str, close: &str) -> &'static str {
+        let start = THIS_FILE
+            .find(open)
+            .expect("the opening spelling is not in this file");
+        let end = THIS_FILE[start..]
+            .find(close)
+            .map(|offset| start + offset)
+            .expect("the closing spelling does not follow the opening one");
+        &THIS_FILE[start..end]
+    }
+
+    /// This file's PRODUCTION code: every comment line removed, and everything
+    /// from this test module onwards cut off.
+    ///
+    /// Comments are removed because the launch gate's own documentation names the
+    /// refused ORS kinds and the descriptor's field names in full, and a guard
+    /// that cannot tell a documented kind from a constructed one either passes
+    /// vacuously or fails on its own prose. This module is cut off because a
+    /// guard written inside a test must not be able to satisfy itself.
+    fn production_code_without_comments() -> String {
+        let test_module = THIS_FILE
+            .find("mod daemon_manifest_restart_admission_tests")
+            .expect("this module is declared in this file");
+        let mut code = String::new();
+        for line in THIS_FILE[..test_module].lines() {
+            if !line.trim_start().starts_with("//") {
+                code.push_str(line);
+                code.push('\n');
+            }
+        }
+        code
+    }
+
+    /// A changed Job Object limit set — including a change confined to
+    /// `job_object_policy` ALONE, with every other field equal — is refused
+    /// (issue #1884; I1.9, AUD3).
+    ///
+    /// `job_object_policy` is a policy identity token with NO OS representation:
+    /// the process adapter installs the three numeric ceilings, and the token
+    /// names the isolation policy in the manifest and on the launch span. It is
+    /// therefore exactly the field a comparison that reaches for the ceilings
+    /// alone would silently drop, so the totality of the comparison over that one
+    /// field is MEASURED on the real `eliot_ors::ManifestResourceLimits` this gate
+    /// hands to the decision, over the real derived equality the decision runs,
+    /// rather than described.
+    ///
+    /// The other half is provenance, and both halves are needed: a total
+    /// comparison over a value this file could reshape proves nothing, and a
+    /// faithfully forwarded value compared over a dropped field proves nothing.
+    /// So this also pins that the compared value IS the ACTIVE Host-approved
+    /// descriptor's own `job_object_limits`, moved into the ORS request by bare
+    /// field initialisation, with the recorded manifest never read on that side —
+    /// the comparison keeps an independent side and cannot satisfy itself.
+    #[test]
+    fn a_changed_job_object_limit_including_the_policy_token_alone_is_refused() {
+        let recorded = eliot_ors::ManifestResourceLimits {
+            job_object_policy: "job-object-recorded-1884".to_owned(),
+            max_processes: 4,
+            max_working_set_bytes: 1_073_741_824,
+            cpu_rate_control_percent: 50,
+        };
+        // A token-only substitution is a VALID limit set in its own right, so what
+        // it earns is a substitution refusal and not a shape error.
+        assert!(
+            recorded.validate().is_ok(),
+            "the recorded limit set is not a valid one"
+        );
+        let mut token_only = recorded.clone();
+        token_only.job_object_policy = "job-object-substituted-1884".to_owned();
+        assert!(
+            token_only.validate().is_ok(),
+            "a token-only substitution stopped being a valid limit set, so this case would now measure a shape error"
+        );
+        assert_ne!(
+            recorded, token_only,
+            "a limit set differing only in `job_object_policy` compares equal, so a substituted Job Object policy is invisible to the gate"
+        );
+        // Not vacuously unequal: an identical record is equal, so the assertion
+        // above measured a difference and not an always-false comparison.
+        assert_eq!(recorded, recorded.clone());
+        // Nor is the token the ONLY discriminating field, which a comparison
+        // narrowed to the token alone would break in the other direction.
+        let mut processes = recorded.clone();
+        processes.max_processes = 8;
+        assert_ne!(
+            recorded, processes,
+            "a changed process-count ceiling compares equal"
+        );
+        let mut working_set = recorded.clone();
+        working_set.max_working_set_bytes = 2_147_483_648;
+        assert_ne!(
+            recorded, working_set,
+            "a changed working-set ceiling compares equal"
+        );
+        let mut cpu = recorded.clone();
+        cpu.cpu_rate_control_percent = 25;
+        assert_ne!(
+            recorded, cpu,
+            "a changed CPU rate-control ceiling compares equal"
+        );
+
+        // PROVENANCE. The other side of the comparison is the descriptor's own
+        // field, and it is the very ORS record the recorded limits are.
+        let observed = source_between(
+            "fn daemon_candidate_observed_job_object_limits_and_readiness(",
+            "#[cfg(windows)]\nfn record_daemon_recovery_operation_context(",
+        );
+        assert!(
+            observed.contains("Option<eliot_ors::ManifestResourceLimits>"),
+            "the observed limits are no longer the very ORS record the recorded limits are"
+        );
+        assert!(
+            observed.contains("launch.job_object_limits.clone(),"),
+            "the observed limits are no longer the descriptor's own `job_object_limits`"
+        );
+        assert!(
+            !observed.contains("resource_limits()"),
+            "the observed side reads the recorded limits, so the comparison lost its independent side"
+        );
+        // FORWARDING. Bare field initialisation, so no local step can reshape the
+        // value between the descriptor and the decision.
+        let verifier = source_between(
+            "    fn verify_daemon_launch_under_manifest(",
+            "    /// The typed refusal one refused manifest-bound decision carries.",
+        );
+        for coordinate in [
+            "\n            candidate_resource_limits,\n",
+            "\n            candidate_health_readiness_contract_ref,\n",
+        ] {
+            assert!(
+                verifier.contains(coordinate),
+                "the observed coordinate `{coordinate}` no longer reaches the ORS request unchanged"
+            );
+        }
+        assert!(
+            !verifier.contains("candidate_resource_limits:"),
+            "the request's limits coordinate is now assigned instead of forwarded unchanged"
+        );
+        // The token is never WRITTEN in production code: a local normalization, a
+        // local default or a local comparison over the token would each add one of
+        // these two spellings, and any of them would make the descriptor's token
+        // something other than the token the gate compared.
+        let code = production_code_without_comments();
+        for written in ["job_object_policy =", "job_object_policy:"] {
+            assert!(
+                !code.contains(written),
+                "the Job Object policy token is written in production code (`{written}`), so the descriptor's token is no longer the token that is compared or applied"
+            );
+        }
+        // The kind that answers a substituted limit set is named in this file in
+        // exactly one production place, and that place is the projection of a
+        // RECORDED ORS cause. So a token-only substitution has one owner for its
+        // refusal, and this file never decides the comparison itself.
+        assert_eq!(
+            code.matches("ManifestResourceLimitsMismatch").count(),
+            1,
+            "the resource-limits substitution kind is named in more than one production place"
+        );
+        assert_eq!(
+            code.matches("Cause::ManifestResourceLimitsMismatch")
+                .count(),
+            1,
+            "the resource-limits substitution kind is constructed outside this file's recorded-cause projection"
+        );
+        // And it is reported as a substituted LIMIT SET, not as the substituted
+        // launch identity a field with no OS representation could be mistaken for.
+        assert_eq!(
+            reason_for(Cause::ManifestResourceLimitsMismatch),
+            "restart_manifest_resource_limits_mismatch"
+        );
+        assert_ne!(
+            reason_for(Cause::ManifestResourceLimitsMismatch),
+            reason_for(Cause::ManifestCandidateBindingMismatch),
+            "a substituted Job Object limit is reported as a substituted launch identity"
+        );
+        // The token also reaches the launch observably, out of the sealed binding.
+        let primitive = source_between(
+            "    async fn launch_eliotd_under_manifest(",
+            "    /// The one production launch entry for the operator-facing activation",
+        );
+        assert!(
+            primitive
+                .contains("(\"job_object_policy\", applied_limits.job_object_policy.as_str()),"),
+            "the launch no longer names the applied Job Object policy token"
+        );
+    }
+
+    /// An ABSENT Job Object limit set or health/readiness contract reference is
+    /// the ORS decision's own recorded refusal, and this file has no second,
+    /// local refusal arm for either coordinate (issue #1884; I1.9, AUD3).
+    ///
+    /// `eliot_ors::KernelExecutionRestartRequest` carries both coordinates as
+    /// `Option` so this owner can say "I observed nothing" instead of inventing a
+    /// value, and `manifest_blocking_defect` refuses the absence under
+    /// `ManifestResourceLimitsUnobserved` /
+    /// `ManifestReadinessContractUnobserved`. What reaches this file's own
+    /// bounded code is then the kind of the decision's FIRST DURABLE
+    /// reconciliation item, so the refusal reported is the decision's recorded
+    /// kind rather than a shape check invented here.
+    ///
+    /// The claim that matters for a substitution-proof gate is the NEGATIVE one.
+    /// A local arm for these two coordinates would report "this owner stated
+    /// nothing" as something it is not, and would leave it unrecorded in ORS, so
+    /// the affected generation would never become degraded. That is why the counts
+    /// below are exact and measured over production CODE: any arm this file grew
+    /// for either kind shows up as a second occurrence under its own spelling.
+    #[test]
+    fn an_absent_limit_or_readiness_coordinate_is_the_decisions_own_refusal_and_has_no_local_arm() {
+        let observed = source_between(
+            "fn daemon_candidate_observed_job_object_limits_and_readiness(",
+            "#[cfg(windows)]\nfn record_daemon_recovery_operation_context(",
+        );
+        // Both coordinates keep a spelling for an absent observation, and both are
+        // the descriptor's own fields, forwarded as stated.
+        assert!(
+            observed.contains("Option<eliot_ors::ManifestResourceLimits>"),
+            "the observed limits no longer carry an absent observation"
+        );
+        assert!(
+            observed.contains("Option<String>"),
+            "the observed readiness reference no longer carries an absent observation"
+        );
+        for forwarded in [
+            "launch.job_object_limits.clone(),",
+            "launch.health_readiness_contract_ref.clone(),",
+        ] {
+            assert!(
+                observed.contains(forwarded),
+                "the observed side no longer forwards `{forwarded}` as stated"
+            );
+        }
+        // No default, no substitution and no synthetic value on the observed side:
+        // a stated absence must reach the decision as a stated absence.
+        for shaped in ["Some(", "unwrap_or", "or_default", "unwrap_or_default"] {
+            assert!(
+                !observed.contains(shaped),
+                "the observed coordinates are shaped by `{shaped}` instead of being forwarded as stated"
+            );
+        }
+        let verifier = source_between(
+            "    fn verify_daemon_launch_under_manifest(",
+            "    /// The typed refusal one refused manifest-bound decision carries.",
+        );
+        for coordinate in [
+            "\n            candidate_resource_limits,\n",
+            "\n            candidate_health_readiness_contract_ref,\n",
+        ] {
+            assert!(
+                verifier.contains(coordinate),
+                "the observed coordinate `{coordinate}` is no longer forwarded to the decision"
+            );
+        }
+        // ONE local refusal arm in this function, and it belongs to the dependency
+        // order and restart budget, which have no unobserved case. A second arm for
+        // the limits or the readiness reference would make this count wrong.
+        assert_eq!(
+            verifier
+                .matches("DaemonRestartManifestAdmission::Refused(")
+                .count(),
+            2,
+            "verify_daemon_launch_under_manifest no longer has exactly one local refusal arm and one decision-projected refusal"
+        );
+        let local = verifier
+            .find("Err(refusal) => {")
+            .expect("the dependency-order/restart-budget refusal arm is gone");
+        let projected = verifier
+            .find("Self::daemon_manifest_restart_cause(&decision)")
+            .expect("the refused decision is no longer projected from the ORS decision");
+        assert!(
+            local < projected,
+            "the decision-projected refusal now precedes the one local arm, so a local arm answers for the decision"
+        );
+        // The projected kind is the DECISION's own recorded kind, read from its
+        // first durable reconciliation item rather than reconstructed here.
+        let cause = source_between(
+            "    fn daemon_manifest_restart_cause(",
+            "    /// Records one manifest-bound launch refusal durably",
+        );
+        assert!(
+            cause.contains("decision.reconciliation.first()"),
+            "the refusal is no longer read from the decision's own recorded reconciliation item"
+        );
+        assert!(
+            cause.contains("daemon_restart_refusal_for_manifest_cause(item.kind)"),
+            "the refusal is no longer projected from the recorded item's own kind"
+        );
+        // NO second local arm anywhere in production code: each unobserved kind is
+        // named in exactly one production place, and that place is the projection.
+        let code = production_code_without_comments();
+        for kind in [
+            "ManifestResourceLimitsUnobserved",
+            "ManifestReadinessContractUnobserved",
+        ] {
+            assert_eq!(
+                code.matches(kind).count(),
+                1,
+                "the unobserved kind `{kind}` is named in more than one production place, so a local refusal arm for it exists"
+            );
+            assert_eq!(
+                code.matches(&format!("Cause::{kind}")).count(),
+                1,
+                "the unobserved kind `{kind}` is constructed outside this file's recorded-cause projection"
+            );
+        }
+        // "Stated nothing" stays a different refusal from "stated something else",
+        // so an absent coordinate is never reported as a substitution.
+        assert_eq!(
+            reason_for(Cause::ManifestResourceLimitsUnobserved),
+            "restart_manifest_resource_limits_unobserved"
+        );
+        assert_ne!(
+            reason_for(Cause::ManifestResourceLimitsUnobserved),
+            reason_for(Cause::ManifestResourceLimitsMismatch),
+            "an unobserved limit set is reported as a substituted one"
+        );
+        assert_ne!(
+            reason_for(Cause::ManifestReadinessContractUnobserved),
+            reason_for(Cause::ManifestReadinessContractMismatch),
+            "an unobserved readiness contract is reported as a substituted one"
+        );
+    }
+
+    /// The launch primitive ITSELF is the gate, it runs before the process launch
+    /// is reached, and the sealed binding is what it launches (issue #1884;
+    /// I1.9, AUD3, W1.5).
+    ///
+    /// `KernelComposition::require_recorded_launch_identity` is checked twice on
+    /// the bounded recovery arm and by the same rule: once in
+    /// `recover_eliotd_inner` before the active descriptor and the runtime status
+    /// are replaced, so a withheld contour is never installed, and once INSIDE
+    /// `launch_eliotd_under_manifest` before the process authority is reached, so
+    /// no future caller of that primitive can reach a process start without the
+    /// check. The DURABLE recording of that refusal through
+    /// `KernelComposition::refuse_daemon_restart_under_manifest`, before the
+    /// error is built, is proved by
+    /// `a_launch_identity_disagreement_is_recorded_under_its_own_kind_before_the_error_is_built`
+    /// above; what is added here is where the second check sits.
+    ///
+    /// What the primitive launches is also pinned: the applied Job Object limits
+    /// and the applied readiness contract are read out of the SAME sealed binding
+    /// the gate admitted, and never out of a re-read of the active descriptor, so
+    /// what the process adapter installs is the sealed manifest's own record
+    /// whatever the active slot holds at the moment of the process start. That is
+    /// why a descriptor swapped in after the comparison cannot widen this launch.
+    #[test]
+    fn the_launch_primitive_rechecks_the_identity_and_launches_only_the_sealed_binding() {
+        let primitive = source_between(
+            "    async fn launch_eliotd_under_manifest(",
+            "    /// The one production launch entry for the operator-facing activation",
+        );
+        assert!(
+            primitive.contains("bound: &eliot_ors::BoundKernelExecutionManifest,"),
+            "the launch primitive no longer takes the sealed binding as an argument"
+        );
+        let identity = primitive
+            .find("self.require_recorded_launch_identity(")
+            .expect("the launch primitive no longer re-checks the recorded launch identity");
+        let process = primitive
+            .find("self.launch_eliotd_in_context(")
+            .expect("the launch primitive no longer reaches the process launch");
+        assert!(
+            identity < process,
+            "the recorded-identity check now runs after the process launch is reached"
+        );
+        for applied in [
+            "let applied_limits = bound.resource_limits();",
+            "let applied_readiness = bound.health_readiness_contract_ref();",
+        ] {
+            assert!(
+                primitive.contains(applied),
+                "the applied launch coordinate `{applied}` is no longer read from the sealed binding"
+            );
+        }
+        assert!(
+            !primitive.contains("active_daemon_launch"),
+            "the launch primitive re-reads the active launch descriptor, so what it applies is no longer the sealed manifest's own record"
+        );
+        // The very same binding, not a projection of it, is what the process
+        // launch receives.
+        assert!(
+            primitive.contains("self.launch_eliotd_in_context(context, bound).await"),
+            "the process launch is no longer handed the sealed binding itself"
+        );
+        // And this file reaches the process launch from exactly one place, so a
+        // new reach would have to enter the sealed gate too.
+        let code = production_code_without_comments();
+        assert_eq!(
+            code.matches("launch_eliotd_in_context(").count(),
+            1,
+            "this file now reaches the process launch from more than one place, and a new reach is not covered by this guard"
+        );
+        // The other half of "inside the primitive as well as before it": the
+        // bounded recovery arm checks BEFORE it installs the fresh contour and
+        // before it enters the gate.
+        let recovery = source_between(
+            "    async fn recover_eliotd_inner(",
+            "    #[cfg(windows)]\n    pub(crate) async fn ensure_daemon_ready_for_probe_in_context(",
+        );
+        let identity = recovery
+            .find("self.require_recorded_launch_identity(")
+            .expect("the bounded recovery arm no longer checks the recorded launch identity");
+        let installed = recovery
+            .find(".daemon_active_launch")
+            .expect("the bounded recovery arm no longer installs a fresh active launch descriptor");
+        let launched = recovery
+            .find(".launch_eliotd_under_manifest(")
+            .expect("the bounded recovery arm no longer launches through the manifest gate");
+        assert!(
+            identity < installed,
+            "the recovery arm now installs the fresh contour before checking the recorded launch identity"
+        );
+        assert!(
+            identity < launched,
+            "the recovery arm now reaches the manifest-bound launch before checking the recorded launch identity"
+        );
+    }
+
+    /// The exact argv component
+    /// `EliotdLaunchDescriptor::validate` fixes at indices 4 and 5, and which
+    /// `daemon_candidate_launch_binding` leaves out. Spelled once here so the
+    /// fixture's canonical argv cannot drift from the production comparison
+    /// without the `validate` assertions below failing.
+    const NONCE_ARGUMENT_FLAG: &str = "--launch-nonce";
+
+    /// The eight-value canonical child argv `EliotdLaunchDescriptor::validate`
+    /// fixes, with the launch nonce as the supplied value.
+    ///
+    /// The order is the contract's own order — config descriptor, config digest,
+    /// launch nonce, executable digest — and `validate()` is asserted on every
+    /// fixture in the tests below, so a fixture that stopped being a contour the
+    /// gate could be handed fails there instead of quietly measuring nothing.
+    fn canonical_arguments(
+        config_path: &str,
+        config_sha256: &str,
+        executable_sha256: &str,
+        nonce: &PlatformHandle,
+    ) -> Vec<PlatformHandle> {
+        let handle = |value: &str| PlatformHandle::new(value).expect("descriptor handle");
+        vec![
+            handle("--config-descriptor"),
+            handle(config_path),
+            handle("--config-descriptor-sha256"),
+            handle(config_sha256),
+            handle(NONCE_ARGUMENT_FLAG),
+            nonce.clone(),
+            handle("--executable-sha256"),
+            handle(executable_sha256),
+        ]
+    }
+
+    /// One Host-approved `eliotd` descriptor over the canonical argv, with the
+    /// four values the compared `start_command` is rendered from supplied by the
+    /// caller and everything else held at a fixed valid value.
+    ///
+    /// Every case recomputes its OWN digest through the descriptor's own
+    /// `with_computed_digest`, exactly as the production refresh does, so no
+    /// case asserts against a stale or hand-written digest.
+    fn launch_descriptor(
+        executable: &str,
+        config_path: &str,
+        config_sha256: &str,
+        executable_sha256: &str,
+        nonce: &PlatformHandle,
+    ) -> EliotdLaunchDescriptor {
+        let handle = |value: &str| PlatformHandle::new(value).expect("descriptor handle");
+        EliotdLaunchDescriptor {
+            wire_id: "eliot.kernel.eliotd-launch".to_owned(),
+            wire_version: EliotdLaunchDescriptor::CONTRACT_VERSION,
+            executable: handle(executable),
+            executable_sha256: executable_sha256.to_owned(),
+            arguments: canonical_arguments(config_path, config_sha256, executable_sha256, nonce),
+            working_directory: handle("C:/eliot"),
+            config_descriptor: handle(config_path),
+            config_descriptor_sha256: config_sha256.to_owned(),
+            protected_snapshot_digest: "c".repeat(64),
+            launch_nonce: nonce.clone(),
+            authority_epoch: eliot_contracts::EpochId::new(
+                eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("lineage"),
+                std::num::NonZeroU64::new(3).expect("sequence"),
+            )
+            .expect("authority epoch"),
+            generation: eliot_contracts::ResourceGeneration::new(7).expect("resource generation"),
+            restart_policy: None,
+            job_object_limits: None,
+            health_readiness_contract_ref: None,
+            descriptor_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("descriptor digest")
+    }
+
+    /// One launch-correlation nonce in the descriptor's own `eliotd:` opaque
+    /// format.
+    fn launch_nonce_handle(suffix: &str) -> PlatformHandle {
+        PlatformHandle::new(format!("eliotd:{suffix}")).expect("launch nonce handle")
+    }
+
+    /// The compared `start_command` is the canonical argv with ONLY the
+    /// `--launch-nonce <nonce>` pair left out; everything else the descriptor
+    /// states is identity and stays in it.
+    ///
+    /// The nonce is per attempt by construction:
+    /// `fresh_eliotd_launch_descriptor`
+    /// (`bins/eliot-kernel/src/runtime_identity.rs`) rewrites it from the previous
+    /// descriptor digest, the previous nonce, the attempt ordinal and
+    /// `unix_ms()`. Rendering it made the compared value differ from the recorded
+    /// one for every restart without anything being substituted, so this measures
+    /// the exclusion and, just as importantly, that the exclusion is confined to
+    /// that one pair.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the projection case keeps the excluded pair, every retained component, and the four single-field substitutions in one measured order"
+    )]
+    fn the_projection_excludes_the_nonce_pair_and_keeps_every_other_component() {
+        let executable_sha256 = "a".repeat(64);
+        let config_sha256 = "b".repeat(64);
+        let executable = "C:/eliot/eliotd.exe";
+        let config_path = "C:/eliot/eliotd-governor.json";
+        let first_nonce = launch_nonce_handle("0123456789abcdef0123456789abcdef");
+        let second_nonce = launch_nonce_handle("fedcba9876543210fedcba9876543210");
+        assert_ne!(first_nonce, second_nonce);
+
+        let baseline = launch_descriptor(
+            executable,
+            config_path,
+            &config_sha256,
+            &executable_sha256,
+            &first_nonce,
+        );
+        // The fixture is a contour the launch gate could actually be handed:
+        // `validate` is the descriptor's OWN contract, and a fixture that stops
+        // satisfying it would measure nothing below.
+        assert!(
+            baseline.validate().is_ok(),
+            "the launch-descriptor fixture is not a descriptor the gate could be handed"
+        );
+        assert_eq!(
+            baseline.arguments[4].as_str(),
+            NONCE_ARGUMENT_FLAG,
+            "the fixture's canonical argv no longer carries the nonce flag where the descriptor's contract fixes it"
+        );
+        assert_eq!(
+            baseline.arguments[5].as_str(),
+            first_nonce.as_str(),
+            "the fixture's canonical argv no longer carries the nonce where the descriptor's contract fixes it"
+        );
+        let baseline_binding = daemon_candidate_launch_binding(&baseline);
+
+        // THE EXCLUSION. A descriptor differing ONLY in the per-attempt launch
+        // nonce — and therefore only in the argv's index 5 — projects to the SAME
+        // compared command, so a restart can equal the recorded command at all.
+        let refreshed = launch_descriptor(
+            executable,
+            config_path,
+            &config_sha256,
+            &executable_sha256,
+            &second_nonce,
+        );
+        assert!(
+            refreshed.validate().is_ok(),
+            "the refreshed launch-descriptor fixture is not a descriptor the gate could be handed"
+        );
+        assert_ne!(
+            baseline.launch_nonce, refreshed.launch_nonce,
+            "the two fixtures no longer differ in the launch nonce, so this case would measure nothing"
+        );
+        assert_ne!(
+            baseline.arguments[5].as_str(),
+            refreshed.arguments[5].as_str(),
+            "the two fixtures' canonical argv no longer differ at the nonce index"
+        );
+        assert_ne!(
+            baseline.descriptor_sha256, refreshed.descriptor_sha256,
+            "the refresh does not change the descriptor digest, so it is not the same contour the contract describes"
+        );
+        let refreshed_binding = daemon_candidate_launch_binding(&refreshed);
+        assert_eq!(
+            baseline_binding.start_command, refreshed_binding.start_command,
+            "a per-attempt launch nonce changed the compared start command, so every restart disagrees with the recorded command by construction"
+        );
+        // Both halves of the pair are out: the flag and the value behind it are
+        // ONE correlation component, and rendering either alone would render half
+        // of a per-attempt value.
+        for (label, binding, nonce) in [
+            ("baseline", &baseline_binding, &first_nonce),
+            ("refreshed", &refreshed_binding, &second_nonce),
+        ] {
+            assert!(
+                !binding.start_command.contains(NONCE_ARGUMENT_FLAG),
+                "the {label} compared command still carries the launch-nonce flag"
+            );
+            assert!(
+                !binding.start_command.contains(nonce.as_str()),
+                "the {label} compared command still carries its launch nonce value"
+            );
+        }
+        // NOTHING ELSE IS LEFT OUT. The config path, the config digest and the
+        // executable digest are identity and must survive the projection, or the
+        // exclusion has silently grown.
+        for kept in [
+            executable,
+            "--config-descriptor",
+            config_path,
+            "--config-descriptor-sha256",
+            config_sha256.as_str(),
+            "--executable-sha256",
+            executable_sha256.as_str(),
+        ] {
+            assert!(
+                baseline_binding.start_command.contains(kept),
+                "the compared command dropped `{kept}`, so the exclusion is wider than the launch-nonce pair"
+            );
+        }
+        // And the exclusion is confined to the command text: the three digest
+        // coordinates of the binding are untouched by a nonce refresh.
+        assert_eq!(
+            baseline_binding.artifact_sha256, refreshed_binding.artifact_sha256,
+            "a per-attempt launch nonce changed the observed artifact digest"
+        );
+        assert_eq!(
+            baseline_binding.config_sha256, refreshed_binding.config_sha256,
+            "a per-attempt launch nonce changed the observed config digest"
+        );
+        assert_eq!(
+            baseline_binding.protocol_sha256, refreshed_binding.protocol_sha256,
+            "a per-attempt launch nonce changed the observed protocol digest"
+        );
+
+        // EVERY OTHER COMPONENT STILL REFUSES. Each of these four descriptors is
+        // valid in its own right and differs from the baseline in exactly one
+        // identity component, so each projects to a DIFFERENT compared command:
+        // excluding the nonce pair must not have relaxed anything else into
+        // equality.
+        for (component, changed) in [
+            (
+                "the executable",
+                launch_descriptor(
+                    "C:/eliot/other/eliotd.exe",
+                    config_path,
+                    &config_sha256,
+                    &executable_sha256,
+                    &first_nonce,
+                ),
+            ),
+            (
+                "the config path",
+                launch_descriptor(
+                    executable,
+                    "C:/eliot/other-governor.json",
+                    &config_sha256,
+                    &executable_sha256,
+                    &first_nonce,
+                ),
+            ),
+            (
+                "the config digest",
+                launch_descriptor(
+                    executable,
+                    config_path,
+                    &"d".repeat(64),
+                    &executable_sha256,
+                    &first_nonce,
+                ),
+            ),
+            (
+                "the executable digest",
+                launch_descriptor(
+                    executable,
+                    config_path,
+                    &config_sha256,
+                    &"e".repeat(64),
+                    &first_nonce,
+                ),
+            ),
+        ] {
+            assert!(
+                changed.validate().is_ok(),
+                "the `{component}` substitution is not a descriptor the gate could be handed"
+            );
+            assert_ne!(
+                baseline_binding.start_command,
+                daemon_candidate_launch_binding(&changed).start_command,
+                "a descriptor differing in {component} projects to the same compared command, so that substitution is invisible to the gate"
+            );
+        }
+    }
+
+    /// A `KernelLaunchBinding` that differs in ANY ONE of its four fields is
+    /// unequal to the recorded one, and an identical clone is equal — so the
+    /// primitive's whole-record comparison is a real comparison over the whole
+    /// record and not an always-false one.
+    ///
+    /// This is the value the gate now compares, so it is measured on the real
+    /// `eliot_ors` record rather than on a local proxy.
+    #[test]
+    fn a_whole_record_substitution_in_any_one_field_is_refused() {
+        let recorded = eliot_ors::KernelLaunchBinding {
+            artifact_sha256: "a".repeat(64),
+            config_sha256: "b".repeat(64),
+            protocol_sha256: "c".repeat(64),
+            start_command: "C:/eliot/eliotd.exe --config-descriptor C:/eliot/eliotd-governor.json"
+                .to_owned(),
+        };
+        assert!(
+            recorded.validate().is_ok(),
+            "the recorded launch binding is not a valid one, so the cases below would measure a shape error"
+        );
+        // Not vacuously unequal: an identical record is equal, so every `assert_ne!`
+        // below measured a DIFFERENCE and not an always-false comparison.
+        assert_eq!(
+            recorded,
+            recorded.clone(),
+            "an identical launch binding compares unequal, so the gate would refuse every launch"
+        );
+        for (field, substituted) in [
+            (
+                "artifact_sha256",
+                eliot_ors::KernelLaunchBinding {
+                    artifact_sha256: "d".repeat(64),
+                    ..recorded.clone()
+                },
+            ),
+            (
+                "config_sha256",
+                eliot_ors::KernelLaunchBinding {
+                    config_sha256: "d".repeat(64),
+                    ..recorded.clone()
+                },
+            ),
+            (
+                "protocol_sha256",
+                eliot_ors::KernelLaunchBinding {
+                    protocol_sha256: "d".repeat(64),
+                    ..recorded.clone()
+                },
+            ),
+            (
+                "start_command",
+                eliot_ors::KernelLaunchBinding {
+                    start_command: "C:/eliot/eliotd.exe --config-descriptor C:/eliot/other.json"
+                        .to_owned(),
+                    ..recorded.clone()
+                },
+            ),
+        ] {
+            assert!(
+                substituted.validate().is_ok(),
+                "the `{field}` substitution is not a valid launch binding, so this case would measure a shape error"
+            );
+            assert_ne!(
+                recorded, substituted,
+                "a launch binding differing only in `{field}` compares equal, so the identity gate is narrowed to a field set that does not cover it"
+            );
+        }
+        // The two fields a per-attempt refresh does NOT touch are not the whole
+        // record, which is why comparing only them let a substituted `start_command`
+        // and a substituted `protocol_sha256` through.
+        let narrowed = eliot_ors::KernelLaunchBinding {
+            artifact_sha256: "d".repeat(64),
+            config_sha256: "d".repeat(64),
+            ..recorded.clone()
+        };
+        assert_ne!(
+            recorded, narrowed,
+            "a binding differing only in the two previously compared digests compares equal"
+        );
+    }
+
+    /// The identity gate compares the WHOLE projected binding rather than two
+    /// named digest scalars, and the recovery contour hands its gate the
+    /// REFRESHED descriptor rather than the one it is about to replace.
+    ///
+    /// Both halves are source guards, because `BoundKernelExecutionManifest` is
+    /// sealed — one private field, a private `const fn verified` and no
+    /// `Deserialize` — so a test in this crate cannot construct one and cannot
+    /// reach the gate with a real pair of values. The structural half is measured
+    /// on the real `KernelLaunchBinding` in
+    /// `a_whole_record_substitution_in_any_one_field_is_refused`.
+    #[test]
+    fn the_identity_gate_compares_whole_records_and_admits_the_refreshed_descriptor() {
+        let gate = launch_identity_gate_source();
+        for signature in [
+            "observed: &eliot_ors::KernelLaunchBinding,",
+            "bound: &eliot_ors::BoundKernelExecutionManifest,",
+            "context: &tracing::Span,",
+        ] {
+            assert!(
+                gate.contains(signature),
+                "the identity gate's parameter list no longer declares `{signature}`, so it does not receive the observed binding"
+            );
+        }
+        assert!(
+            gate.contains("if observed == &binding {"),
+            "the identity gate no longer decides admission on a whole-record equality"
+        );
+        // The narrowed form is GONE, measured over production CODE with the
+        // comments stripped, so this file's own documentation about the old form
+        // cannot satisfy it and a guard written inside a test cannot satisfy
+        // itself.
+        let code = production_code_without_comments();
+        for narrowed in ["candidate_artifact_sha256", "candidate_config_sha256"] {
+            assert!(
+                !code.contains(narrowed),
+                "production code still names `{narrowed}`, so the identity gate still compares named digest scalars rather than the whole projected binding"
+            );
+        }
+        // And it compares no field of the sealed record BY NAME either, which is
+        // what a whole-record equality looks like and what a narrowing would undo.
+        for field in [
+            "binding.artifact_sha256",
+            "binding.config_sha256",
+            "binding.protocol_sha256",
+            "binding.start_command",
+        ] {
+            assert!(
+                !gate.contains(field),
+                "the identity gate still reaches into `{field}`, so the comparison is narrowed to named fields"
+            );
+        }
+
+        // THE RECOVERY CONTOUR. The refresh must precede the admission, and the
+        // admission must be handed the refreshed descriptor, or the gate compares
+        // a contour the launch never runs.
+        let recovery = source_between(
+            "    async fn recover_eliotd_inner(",
+            "    #[cfg(windows)]\n    pub(crate) async fn ensure_daemon_ready_for_probe_in_context(",
+        );
+        let refresh = recovery
+            .find("fresh_eliotd_launch_descriptor(")
+            .expect("the bounded recovery arm no longer refreshes the launch descriptor");
+        let observed = recovery
+            .find("let observed_launch_binding = daemon_candidate_launch_binding(&next_launch);")
+            .expect("the bounded recovery arm no longer projects the candidate binding");
+        let admitted = recovery
+            .find("self.admit_daemon_launch_under_manifest(")
+            .expect("the bounded recovery arm no longer admits its launch under the manifest");
+        assert!(
+            refresh < observed,
+            "the bounded recovery arm now projects the candidate before the descriptor is refreshed"
+        );
+        assert!(
+            observed < admitted,
+            "the bounded recovery arm now admits the PRE-refresh descriptor, so the gate compares a contour the launch never runs"
+        );
+        assert!(
+            recovery.contains("&next_launch,\n            attempt,"),
+            "the bounded recovery arm no longer admits the refreshed descriptor it will install"
+        );
+        // The SAME projected value reaches the gate and the launch primitive, and
+        // it reaches both by reference: one projection, two comparisons, no
+        // second observation that could disagree with the first.
+        let identity = recovery
+            .find("self.require_recorded_launch_identity(")
+            .expect("the bounded recovery arm no longer checks the recorded launch identity");
+        let launched = recovery
+            .find(".launch_eliotd_under_manifest(")
+            .expect("the bounded recovery arm no longer launches through the manifest gate");
+        assert!(
+            identity < launched,
+            "the bounded recovery arm now reaches the manifest-bound launch before checking the recorded launch identity"
+        );
+        assert_eq!(
+            recovery.matches("&observed_launch_binding,").count(),
+            2,
+            "the projected binding does not reach both the identity gate and the launch primitive unchanged"
+        );
+        // And the activation arm projects from the ACTIVE descriptor it launches.
+        let activation = source_between(
+            "    pub(crate) async fn launch_eliotd_for_activation_under_manifest(",
+            "    /// Performs one Kernel-owned bounded recovery of a failed daemon",
+        );
+        assert!(
+            activation.contains("let observed = daemon_candidate_launch_binding(&launch);"),
+            "the operator activation arm no longer projects the candidate binding from the descriptor it launches"
+        );
+        assert!(
+            activation
+                .contains("self.launch_eliotd_under_manifest(&observed, bound.as_ref(), context)"),
+            "the operator activation arm no longer hands the projected binding and the sealed binding to the launch primitive as two distinct values"
+        );
     }
 }

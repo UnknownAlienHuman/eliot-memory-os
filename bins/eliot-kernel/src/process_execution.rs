@@ -1884,19 +1884,49 @@ pub(crate) trait ProcessStartPorts {
     /// Authorizes one REPLAY of an already-reserved operation on its exact
     /// unexpired effect operation lease (issue #1885; I1.9, W2/W5).
     ///
-    /// Called only from the `Existing(replay)` arm, never from the `Acquired`
-    /// arm: a first process start is a new operation authorized by admission,
-    /// while a replay of an effect-capable operation may resume only under the
-    /// unexpired lease that already authorized its effect. The owner binding
-    /// supplies the authenticated module identity, generation and live
+    /// Called from the `Existing(record)` arm of the process-start pipeline and
+    /// nowhere else: the operation is already reserved, so it may resume only
+    /// under the unexpired lease that already authorized its effect. The owner
+    /// binding supplies the authenticated module identity, generation and live
     /// Authority Epoch; the effect receipt, route scope, manifest digest and
     /// admitting Catalog/Policy revisions are read from the durable ORS rows,
     /// and a denial is persisted as a durable reconciliation intent before this
     /// returns, so a refused replay is never discarded.
+    ///
+    /// The sibling `Acquired` arm is a NEW operation and is gated by
+    /// `require_new_effect_operation_authority` below, not by this one; the two
+    /// arms keep their own gate and their own order.
     fn require_effect_replay_authority(
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
+        context: &tracing::Span,
+    ) -> Result<(), ProcessExecutionError>;
+    /// Decides what ONE new registered operation needs, from the class the recorded
+    /// manifest states (issue #1884 AUD4; I1.9 lines 40-46).
+    ///
+    /// Called from the `Acquired` arm of the process-start pipeline: that arm is
+    /// a FIRST process start, so the operation it registers is a NEW operation.
+    /// The recorded manifest gate runs first for both classes, so a generation
+    /// with no admitted manifest is refused before this decision. A
+    /// `read_rebuild` generation is then admitted on the admitted manifest alone,
+    /// under its bounded restart budget and with no operation lease; an
+    /// effect-capable generation is admitted only with an unexpired effect
+    /// operation lease covering this exact operation, which is what I1.9 line 46
+    /// requires for new effect admission. `admission_digest` is the digest the
+    /// pipeline already computed over the admitted request and
+    /// `deadline_unix_ms` is the admitted dispatch deadline; both are recorded
+    /// values, not ones recomputed here.
+    ///
+    /// The decision and the effect dispatch it gates run inside the same
+    /// `run_process_start` invocation, so there is exactly one decision in this
+    /// path and none anywhere else.
+    fn require_new_effect_operation_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        deadline_unix_ms: u64,
         context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError>;
     /// Returns a completed receipt only after its durable contract and exact
@@ -2637,15 +2667,18 @@ impl ProcessExecutionGateway {
     /// Gates one effect-capable process-start REPLAY on its exact unexpired
     /// effect operation lease (issue #1885; I1.9, W2/W5).
     ///
-    /// A first process start is a new operation and is authorized by admission
-    /// (I1.9: "new effect admission requires a current Module Catalog/Policy
-    /// view"). A process start that resumes an already-reserved operation is a
-    /// **replay**, and only a replay needs this lease: I1.9 says an
+    /// A process start that resumes an already-reserved operation is a
+    /// **replay** of an effect that was already authorized, and it may resume
+    /// only the exact operation an unexpired lease covers: I1.9 line 45 says an
     /// effect-capable generation "may resume only exact already-authorized
     /// operations covered by an unexpired operation lease". This method is
-    /// therefore called from the `Existing(replay)` arm of the process-start
-    /// pipeline, never from the acquire arm, so a new operation is never gated
-    /// on a lease that by definition does not exist yet.
+    /// therefore called from the `Existing(record)` arm of the process-start
+    /// pipeline. Its sibling `Acquired` arm is a NEW operation and is gated by
+    /// `require_new_effect_operation_authority` below, which reads the recorded
+    /// manifest's own class instead of looking a lease up: an effect-capable
+    /// class has that operation's lease ISSUED here, and a `read_rebuild` class
+    /// is admitted on the admitted manifest alone with no lease at all. The two
+    /// arms keep separate gates and neither one is derived from the other.
     ///
     /// The observation is the replayed record's own authenticated owner binding
     /// (module identity, generation and the live Authority Epoch it was admitted
@@ -2706,6 +2739,102 @@ impl ProcessExecutionGateway {
         Err(ProcessExecutionError::Contract(
             eliot_process::ContractError::DispatchBindingMismatch,
         ))
+    }
+
+    /// Decides what ONE new registered operation needs and refuses the start
+    /// when it does not have it (issue #1884 AUD4; I1.9 lines 40-46).
+    ///
+    /// This is the production gate the reservation path was missing.
+    /// `ProcessExecutionReplayBegin::Acquired` is a FIRST process start, so the
+    /// operation it registers is a NEW operation, and I1.9 gives that exact
+    /// case two answers, keyed by the class the sealed manifest records:
+    ///
+    /// * a read-only/rebuildable generation is admitted on the admitted manifest
+    ///   ALONE, under the bounded restart budget that same manifest records —
+    ///   I1.9 line 41 lets it "restart from the exact manifest under bounded
+    ///   restart budget" — and no operation lease is issued for it, because the
+    ///   generation records no effect authority to lease;
+    /// * an effect-capable generation is admitted only with an unexpired effect
+    ///   operation lease covering this exact operation, established together with
+    ///   the current Module Catalog/Policy view I1.9 line 46 requires for new
+    ///   effect admission. The lease is how this composition point establishes
+    ///   that view for such a generation, because the issuer reads the recorded
+    ///   admitted manifest, the recorded generation disposition, the recorded
+    ///   revocation and delivery acknowledgements and the recorded restart
+    ///   ceiling for itself and refuses on any of them it cannot read.
+    ///
+    /// The recorded manifest gate runs FIRST for both classes, so a generation
+    /// with no admitted manifest, or with one that is not intact, is refused
+    /// before either answer is reached. Nothing is defaulted and nothing is
+    /// assumed from the caller being the Kernel.
+    ///
+    /// The observation is the caller's authenticated owner binding, the digest
+    /// `run_process_start` already computed over the admitted request, the
+    /// admitted dispatch deadline and the Kernel clock. The effect receipt the
+    /// lease records is that admission digest — the one digest the Kernel holds
+    /// over the exact admitted effect request — and the lease expiry is the
+    /// admitted deadline, so a lease never outlives the permit it was issued
+    /// under. The lease identity is derived from the owner's module identity,
+    /// its generation and this operation identity alone, so a retry addresses
+    /// that one lease identity and not a second, freshly chosen one; whether the
+    /// recorded row accepts a retry is
+    /// [`eliot_ors::RedbRecoveryStore::persist_effect_operation_lease`]'s own
+    /// idempotence decision and is not claimed here.
+    ///
+    /// This runs inside the same `run_process_start` invocation that later hands
+    /// the start to the executor, so the decision and the effect dispatch it
+    /// gates are one production call chain and no second decision exists
+    /// anywhere else in this path. The emitted observation names the answer that
+    /// was actually reached, so a read/rebuild admission is never reported as a
+    /// lease issuance.
+    pub(crate) fn require_new_effect_operation_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        deadline_unix_ms: u64,
+        context: &tracing::Span,
+    ) -> Result<(), ProcessExecutionError> {
+        let issued_at_ms = i64::try_from(super::unix_ms()).map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation lease observation clock: {error}"
+            ))
+        })?;
+        let expires_at_ms = i64::try_from(deadline_unix_ms).map_err(|error| {
+            ProcessExecutionError::Unavailable(format!("effect operation lease expiry: {error}"))
+        })?;
+        match issue_new_effect_operation_lease(
+            self.evidence_store.as_ref(),
+            owner,
+            operation_id,
+            admission_digest,
+            issued_at_ms,
+            expires_at_ms,
+        ) {
+            Ok(NewEffectOperationAuthority::ReadRebuildManifest) => {
+                observe_process_in_context(
+                    context,
+                    "kernel.process.read_rebuild_manifest_admitted",
+                    "admitted",
+                );
+            }
+            Ok(NewEffectOperationAuthority::EffectOperationLease) => {
+                observe_process_in_context(
+                    context,
+                    "kernel.process.effect_operation_lease_issued",
+                    "issued",
+                );
+            }
+            Err(error) => {
+                observe_process_in_context(
+                    context,
+                    "kernel.process.effect_operation_lease_refused",
+                    "refused",
+                );
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Creates the one safe context used by an owner-bound process operation.
@@ -3522,6 +3651,267 @@ impl ProcessExecutionGateway {
     }
 }
 
+/// Reads the recorded execution manifest that gates EVERY first process start,
+/// and with it the current Module Catalog/Policy view an effect-capable class
+/// needs (issue #1884; I1.9 lines 40-46 and line 52).
+///
+/// This is the manifest gate, and it runs FIRST for both recorded classes. A
+/// read-only/rebuildable generation (I1.9 line 41) and an effect-capable one
+/// (I1.9 line 44) alike cannot start without it, because I1.9 line 52 states
+/// that a "Missing, stale or incompatible manifest means visible degradation
+/// and escalation, not an improvised restart". What the two classes do
+/// differently afterwards is not this gate but the operation lease, so the gate
+/// returns the recorded manifest and its caller reads that manifest's OWN
+/// recorded `restart_authorization_class`: the class is read from the sealed
+/// manifest row, never decided by this composition point.
+///
+/// The gate is two durable ORS readbacks and nothing else: the admitted
+/// `KernelExecutionManifest` recorded for the owner's own `{module_id,
+/// generation}` — which is where the accepted Module Catalog revision, the
+/// Policy revision and the sealed Governor admission receipt live — and the
+/// generation's recorded disposition. `KernelExecutionManifest::validate`
+/// re-checks the sealed Governor admission, both non-zero revisions, the
+/// admitted class/ceiling/scope bounds and the manifest digest, so a receipt-less
+/// or tampered row is refused rather than read as a current view.
+///
+/// For an effect-capable class the view established here is also the current
+/// Module Catalog/Policy view I1.9 line 46 requires for new effect admission.
+/// This composition point holds no live Module Catalog/Policy owner, so it
+/// cannot observe a Governor supersession that never re-admitted this
+/// generation. That residual is the one
+/// [`eliot_ors::RedbRecoveryStore::authorize_effect_replay_for_operation`]
+/// states for its own seam, and it is bounded here by the same durable rows the
+/// issuer reads: the recorded restart ceiling, the recorded revocation and
+/// delivery state for the exact lease identity, and the admitted deadline the
+/// lease expires at.
+///
+/// A generation ORS has positively observed for neither a recorded disposition
+/// nor an intact admitted manifest is REFUSED here, with the store's own typed
+/// `EffectOperationLeaseGenerationUnrecorded` reason preserved. There is no
+/// fallback view, no "unknown but allowed" reading, and no default. A recorded
+/// class that is absent or unreadable never reaches the class branch at all: the
+/// row does not decode into a manifest, so the readback above fails and the
+/// start is refused. The class is never defaulted, and an unreadable class is
+/// read neither as read/rebuild nor as effect-capable.
+fn current_effect_capability_view(
+    store: &RedbRecoveryStore,
+    owner: &ProcessOwnerBinding,
+) -> Result<eliot_ors::KernelExecutionManifest, ProcessExecutionError> {
+    let module_id = owner.module_id();
+    let generation = owner.generation().get();
+    // Composed first, because its refusal is the store's own typed one: a
+    // generation ORS holding neither a recorded lifecycle row nor an intact
+    // admitted manifest is `EffectOperationLeaseGenerationUnrecorded`, never
+    // `Undegraded` by absence.
+    let disposition = store
+        .load_observed_generation_lifecycle(module_id, generation)
+        .map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: no current Module Catalog/Policy view for module {module_id} generation {generation}: {error}"
+            ))
+        })?;
+    // The COMPOSED observation's own predicate is the gate, never a comparison
+    // restated here: it is true exactly for a generation whose recorded
+    // degradation (if any) and recorded admitted manifest (if any) together say
+    // it still admits a new effect operation. Absence is never read as a
+    // clearance - the composition refuses a generation that holds neither
+    // durable fact before this line is reached.
+    if !disposition.admits_new_effect_leases() {
+        return Err(ProcessExecutionError::Unavailable(format!(
+            "effect operation authority: recorded generation disposition {:?} is not a current Module Catalog/Policy view for module {module_id} generation {generation}",
+            disposition.disposition()
+        )));
+    }
+    let manifest = store
+        .load_kernel_execution_manifest(module_id, generation)
+        .map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: current Module Catalog/Policy view for module {module_id} generation {generation} is unreadable: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: no admitted execution manifest is recorded for module {module_id} generation {generation}, so no current Module Catalog/Policy view exists"
+            ))
+        })?;
+    manifest.validate().map_err(|error| {
+        ProcessExecutionError::Unavailable(format!(
+            "effect operation authority: the recorded execution manifest for module {module_id} generation {generation} does not carry an intact Governor admission: {error}"
+        ))
+    })?;
+    Ok(manifest)
+}
+
+/// What the new-operation gate established for one FIRST process start
+/// (issue #1884; I1.9 lines 40-46).
+///
+/// The variant is decided by the class the sealed manifest RECORDS, never by
+/// this seam, so the two branches below cannot drift apart: one answer to the
+/// class question, read back from the durable manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NewEffectOperationAuthority {
+    /// A read-only/rebuildable generation. I1.9 line 41 says such a generation
+    /// "may restart from the exact manifest under bounded restart budget", so the
+    /// recorded manifest ALONE admits this start: no operation lease is issued
+    /// and no lease row exists for it, because the generation records no effect
+    /// authority to lease.
+    ReadRebuildManifest,
+    /// An effect-capable generation. I1.9 lines 44-46 hold it to an unexpired
+    /// operation lease over the exact already-authorized operation, plus a
+    /// current Module Catalog/Policy view for any new effect admission, so this
+    /// start holds an unexpired effect operation lease issued for this exact
+    /// operation.
+    EffectOperationLease,
+}
+
+/// Decides what one NEW operation needs, from the class the recorded manifest
+/// states (issue #1884 AUD4; I1.9 lines 40-46).
+///
+/// The manifest gate runs first for BOTH classes (see
+/// `current_effect_capability_view`): a generation with no admitted manifest, or
+/// with a manifest that is not intact, is refused before this decision is made at
+/// all. The decision is then the recorded class's own:
+///
+/// * `read_rebuild` — the start is admitted on the admitted manifest ALONE,
+///   under the bounded restart budget that same manifest records, and this
+///   function returns without touching the route-scope precondition below or
+///   issuing any lease;
+/// * `EffectExactLease` or `CurrentCatalogRequired` — the effect-capable path,
+///   unchanged: the current view is established and an unexpired effect
+///   operation lease must cover this exact operation before the start proceeds.
+///
+/// For an effect-capable class, every lease binding this function does not own —
+/// the module identity, the generation, the manifest digest, the admitting
+/// Catalog and Policy revisions, the admitting Authority Epoch and the allowed
+/// route scope — is copied from that recorded manifest rather than from the
+/// caller. The lease is then handed to
+/// [`eliot_ors::RedbRecoveryStore::issue_effect_operation_lease_for_operation`],
+/// which re-reads the recorded manifest, the recorded lifecycle record, the
+/// recorded revocation and delivery acknowledgements and the recorded restart
+/// ceiling, rebuilds the lease through
+/// [`eliot_ors::EffectOperationLease::issue`] and persists it. A refusal from
+/// that issuer is the refusal of this gate, with its exact `OrsError` reason
+/// preserved; nothing is retried and nothing is widened.
+///
+/// The two values the caller supplies are the ones only the caller holds: the
+/// digest it computed over the admitted request, which this records as the
+/// lease's effect receipt, and the observation clock paired with the admitted
+/// deadline. The revocation and delivery values in the candidate below are NOT
+/// this composition's claim about the current state: the issuer replaces the
+/// revocation value with the durable revocation-event readback for this exact
+/// lease identity, refuses it unless that readback states no revocation event,
+/// and replaces the delivery value with the durable delivery readback for this
+/// exact lease identity, refusing anything that is not a recorded
+/// `Acknowledged` observation — including the ABSENCE of a row, which is not an
+/// acknowledged delivery. Neither value written here can decide anything — which
+/// is why this seam must not be the place that asserts an acknowledged delivery,
+/// and does not.
+///
+/// That delivery observation currently has no producer: the effect-delivery row
+/// has no production writer on this branch, so the issuance seam above refuses
+/// every effect-capable lease and the effect-capable process start stays closed
+/// behind that refusal. The owning contract for the observation is issue #1885
+/// ("[I1-audit] Gate effect-capable restart on exact unexpired operation leases"),
+/// which introduces the operation-lease record bound to the exact operation and
+/// effect receipt together with its revocation/delivery acknowledgement state.
+/// Until that record exists, this composition point fails closed rather than
+/// inventing an acknowledgement.
+fn issue_new_effect_operation_lease(
+    store: &RedbRecoveryStore,
+    owner: &ProcessOwnerBinding,
+    operation_id: &eliot_process::OperationId,
+    admission_digest: &str,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+) -> Result<NewEffectOperationAuthority, ProcessExecutionError> {
+    let manifest = current_effect_capability_view(store, owner)?;
+    // The discriminator is the class this generation's sealed manifest RECORDS,
+    // read back through the gate above. This seam does not choose it, because
+    // only the recorded manifest can establish which of I1.9's two classes the
+    // generation is, and choosing it here would be a second answer to the same
+    // question. I1.9 line 41 admits a read-only/rebuildable generation from the
+    // exact manifest under its bounded restart budget and gives it no effect
+    // authority, so there is nothing to lease for it; I1.9 lines 44-46 hold an
+    // effect-capable generation to an unexpired lease over that exact operation.
+    // An unreadable or absent class never arrives here: the gate refuses the
+    // unreadable manifest first, so no unknown class can be read as read/rebuild
+    // or as effect-capable.
+    if manifest.restart_authorization_class() == eliot_ors::RestartAuthorizationClass::ReadRebuild {
+        return Ok(NewEffectOperationAuthority::ReadRebuildManifest);
+    }
+    let generation = manifest.admission.generation;
+    let lease_id = eliot_ors::OperationIdentity::new(format!(
+        "effect-operation-lease:{}:{:020}:{}",
+        owner.module_id(),
+        generation.value(),
+        operation_id.as_str(),
+    ))
+    .map_err(|error| {
+        ProcessExecutionError::Unavailable(format!(
+            "effect operation authority: no lease identity for module {} generation {}: {error}",
+            owner.module_id(),
+            generation.value(),
+        ))
+    })?;
+    // The exact route scope this lease may not widen is a per-operation
+    // coordinate, and this composition point holds no binding that names it. The
+    // only non-arbitrary scope available is the recorded set itself, so the
+    // single-scope case is used and a manifest that admits several scopes is
+    // REFUSED rather than leased against a scope picked here. This precondition
+    // belongs to the effect-capable path only: it states which scope a lease may
+    // not exceed, and a `read_rebuild` generation records no leaseable effect
+    // scope, so it is reached only above the class branch. No scope is picked,
+    // widened or relaxed for either class.
+    let [scope] = manifest.allowed_scopes() else {
+        return Err(ProcessExecutionError::Unavailable(format!(
+            "effect operation authority: the recorded execution manifest for module {} generation {} records {} allowed route scopes, so no exact operation scope can be leased for operation {}",
+            owner.module_id(),
+            generation.value(),
+            manifest.allowed_scopes().len(),
+            operation_id.as_str(),
+        )));
+    };
+    let scope = scope.clone();
+    let lease = eliot_ors::EffectOperationLease {
+        schema_version: eliot_ors::EFFECT_OPERATION_LEASE_SCHEMA_VERSION,
+        lease_id,
+        manifest_module_id: manifest.admission.module_id.clone(),
+        manifest_generation: generation,
+        bound_manifest_sha256: manifest.manifest_sha256.clone(),
+        authority_epoch: eliot_contracts::AuthorityEpoch::new(
+            owner.authority_epoch().sequence.get(),
+        )
+        .map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: the live Authority Epoch is not a lease epoch: {error}"
+            ))
+        })?,
+        operation_id: eliot_ors::OperationIdentity::new(operation_id.as_str()).map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: the operation identity is not a lease operation: {error}"
+            ))
+        })?,
+        effect_receipt_sha256: admission_digest.to_owned(),
+        allowed_scope: scope,
+        expires_at_ms,
+        catalog_revision: manifest.admission.catalog_revision,
+        policy_revision: manifest.admission.policy_revision,
+        state: eliot_runtime_contracts::LeaseState::Active,
+        revocation: eliot_ors::RevocationAcknowledgement::None,
+        delivery: eliot_ors::EffectDeliveryAcknowledgement::Acknowledged,
+        issued_at_ms,
+    };
+    store
+        .issue_effect_operation_lease_for_operation(&lease)
+        .map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "effect operation authority: no unexpired effect operation lease covers operation {}: {error}",
+                operation_id.as_str(),
+            ))
+        })?;
+    Ok(NewEffectOperationAuthority::EffectOperationLease)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "reservation, canonical projection, authority issue, executor handoff, and replay linearization are one ordered operation"
@@ -3569,13 +3959,42 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
                 "kernel.process.start_registration",
                 "acquired",
             );
-            ProcessStartReservation {
+            let mut reservation = ProcessStartReservation {
                 ports,
                 operation_id: admission.intent().operation_id().clone(),
                 admission_digest: digest.clone(),
                 owner: owner.clone(),
                 active: true,
+            };
+            // #1884 AUD4 (I1.9 lines 40-46): this is a FIRST process start, so
+            // the operation it registers is a NEW operation, and I1.9 states two
+            // answers for a new operation, keyed by the class the recorded
+            // manifest seals. A read-only/rebuildable generation is admitted on
+            // the admitted manifest ALONE, under the bounded restart budget that
+            // same manifest records (I1.9 line 41), with no operation lease. An
+            // effect-capable generation is admitted only with an unexpired effect
+            // operation lease covering this exact operation, established with the
+            // current Module Catalog/Policy view I1.9 line 46 requires for new
+            // effect admission. The gate reads that class from the durable
+            // manifest, so this seam does not choose it. The gate runs on this
+            // same call, before the snapshot, the context, the request and the
+            // executor handoff below, and the dispatch it admits is the one this
+            // invocation performs, so the decision and the effect dispatch are one
+            // production call chain. A refusal releases the reservation this arm
+            // just took, so a refused new operation is not left reserved.
+            if let Err(error) = ports.require_new_effect_operation_authority(
+                owner,
+                &admission.intent().operation_id().clone(),
+                &digest,
+                admission.deadline_unix_ms(),
+                diagnostic_context,
+            ) {
+                return Err(match reservation.release() {
+                    Ok(()) => error,
+                    Err(_) => ProcessExecutionError::UnknownOutcome,
+                });
             }
+            reservation
         }
         ProcessExecutionReplayBegin::Existing(record) => {
             observe_process_in_context(
@@ -3593,10 +4012,12 @@ pub(crate) async fn run_process_start<P: ProcessStartPorts>(
             // unexpired effect operation lease. The gate runs before the
             // recorded receipt is replayed and before any effect is executed;
             // a denial refuses the resume and the store has already persisted
-            // the durable reconciliation intent (W5). A first process start
-            // takes the `Acquired` arm and is authorized by admission instead,
-            // so a new operation is never gated on a lease that cannot exist
-            // yet.
+            // the durable reconciliation intent (W5). A first process start takes
+            // the `Acquired` arm above and is gated by
+            // `require_new_effect_operation_authority`, which issues the lease
+            // for that new exact operation when the recorded class is
+            // effect-capable and admits a `read_rebuild` generation on the
+            // recorded manifest alone.
             ports.require_effect_replay_authority(
                 owner,
                 &admission.intent().operation_id().clone(),
@@ -3824,6 +4245,24 @@ impl ProcessStartPorts for ProcessExecutionGateway {
         context: &tracing::Span,
     ) -> Result<(), ProcessExecutionError> {
         ProcessExecutionGateway::require_effect_replay_authority(self, owner, operation_id, context)
+    }
+
+    fn require_new_effect_operation_authority(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: &eliot_process::OperationId,
+        admission_digest: &str,
+        deadline_unix_ms: u64,
+        context: &tracing::Span,
+    ) -> Result<(), ProcessExecutionError> {
+        ProcessExecutionGateway::require_new_effect_operation_authority(
+            self,
+            owner,
+            operation_id,
+            admission_digest,
+            deadline_unix_ms,
+            context,
+        )
     }
 
     async fn completed_receipt(
@@ -4502,6 +4941,475 @@ mod process_execution_diagnostics_tests {
         }
         for canary in ["top-secret-canary", "super-secret-canary"] {
             assert!(!text.contains(canary), "secret canary leaked: {canary}");
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod new_effect_operation_authority_1884_tests {
+    //! #1884 AUD4: the `Acquired` arm of `run_process_start` registers a NEW
+    //! operation, and I1.9 lines 40-46 put that exact case under two rules keyed
+    //! by the class the sealed manifest records — a `read_rebuild` generation may
+    //! restart from the exact manifest under bounded restart budget, while an
+    //! effect-capable one needs an unexpired effect operation lease covering that
+    //! exact operation plus a current Module Catalog/Policy view. These six cases
+    //! drive the production composition function against a real redb ORS fixture,
+    //! so each one is a store-edge proof: an absent current view, a generation whose
+    //! recorded disposition is not a clearance, an effect-capable generation that IS
+    //! positively observed but for which no effect operation lease is issued, a
+    //! `read_rebuild` generation admitted on the recorded manifest with no lease row
+    //! at all, that same `read_rebuild` generation still refused once the manifest
+    //! gate records a degradation, and a recorded effect-capable class that reaches
+    //! no read/rebuild admission at all.
+
+    use super::*;
+
+    use std::error::Error;
+
+    use eliot_contracts::{
+        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    };
+    use eliot_ors::test_support::KernelRouteStoreFixture;
+    use eliot_ors::{
+        AdmittedModuleGeneration, CapabilityRouteScope, GenerationDisposition,
+        GovernorAdmissionReceipt, GovernorGenerationAdmissionSeal,
+        GovernorGenerationAdmissionSealParts, KernelExecutionProjection, KernelReconciliationItem,
+        KernelReconciliationKind, LifecycleAdmissionDisposition, ManifestDependencyEntry,
+        ManifestEffectCeiling, ManifestResourceLimits, ManifestRestartBudget, OperationIdentity,
+        RestartAuthorizationClass, StateFenceSnapshot, StateMigrationDecision,
+    };
+
+    const MODULE_ID: &str = "module-1884-new-effect";
+    const GENERATION: u64 = 3;
+    const EPOCH_SEQUENCE: u64 = 1;
+    const CATALOG_REVISION: u64 = 7;
+    const POLICY_REVISION: u64 = 11;
+    const LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440188";
+    const OBSERVED_AT_MS: i64 = 1_700_000_000_000;
+    const LEASE_WINDOW_MS: i64 = 60_000;
+    const ADMISSION_OPERATION_ID: &str = "operation-1884-catalog-admission";
+    const ADMISSION_IDEMPOTENCY_KEY: &str = "idempotency-1884-catalog-admission";
+    const START_OPERATION_ID: &str = "operation-1884-new-effect";
+
+    /// A fixture digest. Only digests the ORS itself computes carry meaning; this
+    /// one stands for the admission digest the pipeline computes over the
+    /// admitted request and is what the lease records as its effect receipt.
+    fn hex_digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect::<String>()
+    }
+
+    fn test_epoch() -> Result<EpochId, Box<dyn Error>> {
+        Ok(EpochId::new(
+            EpochLineageId::new(LINEAGE_ID)?,
+            std::num::NonZeroU64::new(EPOCH_SEQUENCE)
+                .ok_or("1884: the fixture epoch sequence must be non-zero")?,
+        )?)
+    }
+
+    fn test_owner() -> Result<ProcessOwnerBinding, Box<dyn Error>> {
+        Ok(ProcessOwnerBinding::new(
+            MODULE_ID,
+            hex_digest('c'),
+            test_epoch()?,
+            Generation::new(GENERATION)?,
+        )?)
+    }
+
+    fn start_operation_id() -> Result<OperationId, Box<dyn Error>> {
+        Ok(OperationId::new(START_OPERATION_ID)?)
+    }
+
+    fn test_scope() -> Result<CapabilityRouteScope, Box<dyn Error>> {
+        Ok(CapabilityRouteScope::declare(
+            MODULE_ID,
+            "process-start",
+            "work-scope-1884",
+            "effect-domain-1884",
+        )?)
+    }
+
+    fn test_seal_parts(
+        scope: &CapabilityRouteScope,
+    ) -> Result<GovernorGenerationAdmissionSealParts, Box<dyn Error>> {
+        let fence = StateFence::new(test_epoch()?, ResourceGeneration::new(GENERATION)?);
+        let mut parts = GovernorGenerationAdmissionSealParts {
+            operation_id: OperationIdentity::new(ADMISSION_OPERATION_ID)?,
+            idempotency_key: ADMISSION_IDEMPOTENCY_KEY.to_owned(),
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            catalog_revision: CATALOG_REVISION,
+            policy_revision: POLICY_REVISION,
+            accepted_manifest_sha256: hex_digest('a'),
+            state_fence: StateFenceSnapshot::capture(&fence, EPOCH_SEQUENCE)?,
+            lifecycle_disposition: LifecycleAdmissionDisposition::Admitted,
+            restart_authorization_class: RestartAuthorizationClass::EffectExactLease,
+            admitted_effect_ceiling: ManifestEffectCeiling::EffectExactLease,
+            admitted_allowed_scopes: vec![scope.clone()],
+            owner_canonical_sha256: String::new(),
+        };
+        // The seal only exists when the recorded owner digest is the canonical
+        // digest over these exact fields, so it is computed with the crate's own
+        // function and never invented.
+        parts.owner_canonical_sha256 = GovernorGenerationAdmissionSeal::canonical_sha256(&parts)?;
+        Ok(parts)
+    }
+
+    /// Records a genuine effect-capable admitted generation through the two real
+    /// ORS writers: the canonical Governor admission receipt and the Generation
+    /// Registry manifest. The manifest persist also records the generation's
+    /// positive `Undegraded` lifecycle row, so this fixture IS a generation ORS
+    /// has positively observed.
+    fn record_admitted_effect_manifest(store: &RedbRecoveryStore) -> Result<(), Box<dyn Error>> {
+        let scope = test_scope()?;
+        let parts = test_seal_parts(&scope)?;
+        store.persist_governor_admission_receipt(&GovernorAdmissionReceipt::issue(
+            &parts,
+            OBSERVED_AT_MS,
+        )?)?;
+        let admission = AdmittedModuleGeneration {
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            authority_epoch: AuthorityEpoch::new(EPOCH_SEQUENCE)?,
+            catalog_revision: CATALOG_REVISION,
+            policy_revision: POLICY_REVISION,
+            governor_admission_seal: GovernorGenerationAdmissionSeal::seal(parts)?,
+            restart_authorization_class: RestartAuthorizationClass::EffectExactLease,
+            admitted_effect_ceiling: ManifestEffectCeiling::EffectExactLease,
+            admitted_allowed_scopes: vec![scope.clone()],
+        };
+        let projection = KernelExecutionProjection {
+            artifact_sha256: hex_digest('a'),
+            config_sha256: hex_digest('b'),
+            protocol_sha256: hex_digest('c'),
+            start_command: "eliot-module-1884 --serve".to_owned(),
+            dependency_order: vec![ManifestDependencyEntry {
+                module_id: "module-1884-new-effect-dependency".to_owned(),
+                startup_order: 0,
+            }],
+            resource_limits: ManifestResourceLimits {
+                job_object_policy: "job-object-1884".to_owned(),
+                max_processes: 4,
+                max_working_set_bytes: 1_073_741_824,
+                cpu_rate_control_percent: 80,
+            },
+            health_readiness_contract_ref: "readiness-contract-1884".to_owned(),
+            restart_budget: ManifestRestartBudget {
+                max_restarts: 3,
+                quarantine_rule: "quarantine-1884".to_owned(),
+            },
+            effect_ceiling: ManifestEffectCeiling::EffectExactLease,
+            allowed_scopes: vec![scope],
+            state_class_behavior: StateMigrationDecision::CheckpointTransfer,
+        };
+        store.persist_admitted_kernel_execution_manifest(&admission, &projection)?;
+        Ok(())
+    }
+
+    /// Records a genuine read-only/rebuildable admitted generation through the
+    /// same two real ORS writers as `record_admitted_effect_manifest`, so this
+    /// fixture is equally a generation ORS has positively observed.
+    ///
+    /// Its recorded `read_rebuild` class, `ReadRebuild` effect ceiling and EMPTY
+    /// allowed-scope set are the bounds a generation carrying no effect authority
+    /// is admitted under, and the empty scope set is also what pins the
+    /// composition's ORDER, because the single-scope precondition of the
+    /// effect-capable path cannot be satisfied by this manifest at all. If that
+    /// precondition were reached for this class, the start would be refused
+    /// instead of admitted.
+    fn record_admitted_read_rebuild_manifest(
+        store: &RedbRecoveryStore,
+    ) -> Result<(), Box<dyn Error>> {
+        let fence = StateFence::new(test_epoch()?, ResourceGeneration::new(GENERATION)?);
+        let mut parts = GovernorGenerationAdmissionSealParts {
+            operation_id: OperationIdentity::new(ADMISSION_OPERATION_ID)?,
+            idempotency_key: ADMISSION_IDEMPOTENCY_KEY.to_owned(),
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            catalog_revision: CATALOG_REVISION,
+            policy_revision: POLICY_REVISION,
+            accepted_manifest_sha256: hex_digest('a'),
+            state_fence: StateFenceSnapshot::capture(&fence, EPOCH_SEQUENCE)?,
+            lifecycle_disposition: LifecycleAdmissionDisposition::Admitted,
+            restart_authorization_class: RestartAuthorizationClass::ReadRebuild,
+            admitted_effect_ceiling: ManifestEffectCeiling::ReadRebuild,
+            admitted_allowed_scopes: Vec::new(),
+            owner_canonical_sha256: String::new(),
+        };
+        // Same rule as the effect fixture: the seal exists only when the recorded
+        // owner digest is the canonical digest over these exact fields.
+        parts.owner_canonical_sha256 = GovernorGenerationAdmissionSeal::canonical_sha256(&parts)?;
+        store.persist_governor_admission_receipt(&GovernorAdmissionReceipt::issue(
+            &parts,
+            OBSERVED_AT_MS,
+        )?)?;
+        let admission = AdmittedModuleGeneration {
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            authority_epoch: AuthorityEpoch::new(EPOCH_SEQUENCE)?,
+            catalog_revision: CATALOG_REVISION,
+            policy_revision: POLICY_REVISION,
+            governor_admission_seal: GovernorGenerationAdmissionSeal::seal(parts)?,
+            restart_authorization_class: RestartAuthorizationClass::ReadRebuild,
+            admitted_effect_ceiling: ManifestEffectCeiling::ReadRebuild,
+            admitted_allowed_scopes: Vec::new(),
+        };
+        let projection = KernelExecutionProjection {
+            artifact_sha256: hex_digest('a'),
+            config_sha256: hex_digest('b'),
+            protocol_sha256: hex_digest('c'),
+            start_command: "eliot-module-1884 --rebuild".to_owned(),
+            dependency_order: Vec::new(),
+            resource_limits: ManifestResourceLimits {
+                job_object_policy: "job-object-1884".to_owned(),
+                max_processes: 2,
+                max_working_set_bytes: 536_870_912,
+                cpu_rate_control_percent: 50,
+            },
+            health_readiness_contract_ref: "readiness-contract-1884".to_owned(),
+            restart_budget: ManifestRestartBudget {
+                max_restarts: 2,
+                quarantine_rule: "quarantine-1884".to_owned(),
+            },
+            effect_ceiling: ManifestEffectCeiling::ReadRebuild,
+            allowed_scopes: Vec::new(),
+            state_class_behavior: StateMigrationDecision::CheckpointTransfer,
+        };
+        store.persist_admitted_kernel_execution_manifest(&admission, &projection)?;
+        Ok(())
+    }
+
+    /// Records one real refusal through the real lifecycle owner, which moves
+    /// this generation off `Undegraded`.
+    fn record_generation_refusal(store: &RedbRecoveryStore) -> Result<(), Box<dyn Error>> {
+        let item = KernelReconciliationItem {
+            kind: KernelReconciliationKind::EffectCatalogPolicyStale,
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            bound_manifest_sha256: None,
+            recorded_manifest_sha256: None,
+            lease_id: None,
+            operation_id: Some(OperationIdentity::new(START_OPERATION_ID)?),
+            observed_at_ms: OBSERVED_AT_MS,
+        };
+        store.persist_effect_replay_reconciliation(&item)?;
+        Ok(())
+    }
+
+    /// Runs the production composition and returns what it established for the
+    /// new operation: the admitted mode, or the recorded refusal reason.
+    ///
+    /// The outer `Result` is this fixture's own failure channel and the inner
+    /// one is the composition's, so a refusal keeps the store's typed reason
+    /// instead of being summarized here.
+    fn new_effect_operation_outcome(
+        store: &RedbRecoveryStore,
+    ) -> Result<Result<NewEffectOperationAuthority, String>, Box<dyn Error>> {
+        let owner = test_owner()?;
+        match issue_new_effect_operation_lease(
+            store,
+            &owner,
+            &start_operation_id()?,
+            &hex_digest('d'),
+            OBSERVED_AT_MS,
+            OBSERVED_AT_MS + LEASE_WINDOW_MS,
+        ) {
+            Ok(admitted) => Ok(Ok(admitted)),
+            Err(ProcessExecutionError::Unavailable(reason)) => Ok(Err(reason)),
+            Err(other) => {
+                Err(format!("1884: the gate refused with an unrelated failure: {other}").into())
+            }
+        }
+    }
+
+    /// Runs the production composition and returns the recorded refusal reason.
+    fn new_effect_operation_refusal_reason(
+        store: &RedbRecoveryStore,
+    ) -> Result<String, Box<dyn Error>> {
+        match new_effect_operation_outcome(store)? {
+            Err(reason) => Ok(reason),
+            Ok(admitted) => Err(format!(
+                "1884: the gate admitted a new operation as {admitted:?} when it had to be refused"
+            )
+            .into()),
+        }
+    }
+
+    /// The restart authorization class the DURABLE manifest records for this
+    /// generation, read back through the production manifest gate.
+    fn recorded_restart_authorization_class(
+        store: &RedbRecoveryStore,
+    ) -> Result<RestartAuthorizationClass, Box<dyn Error>> {
+        Ok(current_effect_capability_view(store, &test_owner()?)?.restart_authorization_class())
+    }
+
+    #[test]
+    fn a_new_effect_operation_with_no_recorded_module_catalog_view_is_refused()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-new-effect-no-catalog-view")?;
+        let reason = new_effect_operation_refusal_reason(fixture.store().as_ref())?;
+        assert!(
+            reason.contains("no current Module Catalog/Policy view"),
+            "1884: an unrecorded generation must be refused as an unestablished view, got {reason}"
+        );
+        assert!(
+            fixture
+                .store()
+                .load_effect_operation_lease_for_operation(&OperationIdentity::new(
+                    START_OPERATION_ID
+                )?)?
+                .is_none(),
+            "1884: a refused new effect operation must leave no lease row behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_effect_operation_against_a_non_undegraded_generation_is_refused()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-new-effect-degraded")?;
+        record_admitted_effect_manifest(fixture.store().as_ref())?;
+        assert_eq!(
+            fixture
+                .store()
+                .load_observed_generation_lifecycle(MODULE_ID, GENERATION)?
+                .disposition(),
+            GenerationDisposition::Undegraded,
+            "1884: the fixture must start from a positively observed generation"
+        );
+        record_generation_refusal(fixture.store().as_ref())?;
+        let reason = new_effect_operation_refusal_reason(fixture.store().as_ref())?;
+        assert!(
+            reason.contains("is not a current Module Catalog/Policy view"),
+            "1884: a recorded degradation must not read as a current view, got {reason}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_effect_operation_with_no_issued_effect_operation_lease_is_refused()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-new-effect-no-lease")?;
+        record_admitted_effect_manifest(fixture.store().as_ref())?;
+        let owner = test_owner()?;
+        // The Kernel-owned half is positively satisfied here: the recorded
+        // admitted manifest and the recorded `Undegraded` disposition establish a
+        // current Module Catalog/Policy view, so the refusal below is the ORS
+        // issuer's and not this composition's.
+        let view = current_effect_capability_view(fixture.store().as_ref(), &owner)?;
+        assert_eq!(
+            view.restart_authorization_class(),
+            RestartAuthorizationClass::EffectExactLease
+        );
+        let reason = new_effect_operation_refusal_reason(fixture.store().as_ref())?;
+        assert!(
+            reason.contains("no unexpired effect operation lease covers operation"),
+            "1884: an operation with no issued lease must be refused by the ORS issuer, got {reason}"
+        );
+        Ok(())
+    }
+
+    /// The positive case I1.9 line 41 states: a read-only/rebuildable generation
+    /// may restart from the exact manifest under bounded restart budget, so a
+    /// first start of one is admitted with NO effect operation lease row present.
+    /// This fails if the read/rebuild branch of the recorded class is removed.
+    #[test]
+    fn a_read_rebuild_first_start_is_admitted_without_an_effect_operation_lease()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-read-rebuild-no-lease")?;
+        record_admitted_read_rebuild_manifest(fixture.store().as_ref())?;
+        // The discriminator is read back from the DURABLE manifest through the
+        // same production gate the start itself runs, so this case cannot pass on
+        // a class this test chose instead of the one the store records.
+        assert_eq!(
+            recorded_restart_authorization_class(fixture.store().as_ref())?,
+            RestartAuthorizationClass::ReadRebuild
+        );
+        // The admission is read through the same production gate the start runs,
+        // and a refusal here is the case FAILING: the arm types must agree, so the
+        // refusal is mapped into this test's own error type rather than returned
+        // from a `match` whose sibling arm asserts.
+        let admitted = new_effect_operation_outcome(fixture.store().as_ref())?.map_err(
+            |reason| -> Box<dyn Error> {
+                format!(
+                    "1884: a read/rebuild first start must be admitted on the recorded manifest, got refused: {reason}"
+                )
+                .into()
+            },
+        )?;
+        assert_eq!(admitted, NewEffectOperationAuthority::ReadRebuildManifest);
+        assert!(
+            fixture
+                .store()
+                .load_effect_operation_lease_for_operation(&OperationIdentity::new(
+                    START_OPERATION_ID
+                )?)?
+                .is_none(),
+            "1884: a read/rebuild first start must not be admitted through an effect operation lease row"
+        );
+        Ok(())
+    }
+
+    /// The manifest gate is not skipped for the read/rebuild class either: the
+    /// same generation, once the lifecycle owner records a degradation, is
+    /// refused before the class is ever read. This fails if the gate is skipped
+    /// or weakened for a `read_rebuild` manifest.
+    #[test]
+    fn a_read_rebuild_generation_with_a_recorded_degradation_is_refused()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-read-rebuild-degraded")?;
+        record_admitted_read_rebuild_manifest(fixture.store().as_ref())?;
+        assert_eq!(
+            fixture
+                .store()
+                .load_observed_generation_lifecycle(MODULE_ID, GENERATION)?
+                .disposition(),
+            GenerationDisposition::Undegraded,
+            "1884: the fixture must start from a positively observed generation"
+        );
+        record_generation_refusal(fixture.store().as_ref())?;
+        let reason = new_effect_operation_refusal_reason(fixture.store().as_ref())?;
+        assert!(
+            reason.contains("is not a current Module Catalog/Policy view"),
+            "1884: a recorded degradation must refuse a read/rebuild start too, got {reason}"
+        );
+        Ok(())
+    }
+
+    /// The negative discriminator: a recorded effect-capable class reaches no
+    /// read/rebuild admission. Only the read/rebuild class skips the lease, and
+    /// only when the DURABLE manifest is the one that records it. This fails if
+    /// the branch stops reading the recorded class.
+    #[test]
+    fn a_recorded_effect_capable_class_reaches_no_read_rebuild_admission()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("1884-effect-class-no-read-rebuild")?;
+        record_admitted_effect_manifest(fixture.store().as_ref())?;
+        assert_eq!(
+            recorded_restart_authorization_class(fixture.store().as_ref())?,
+            RestartAuthorizationClass::EffectExactLease,
+            "1884: this fixture must not read as a read/rebuild generation"
+        );
+        match new_effect_operation_outcome(fixture.store().as_ref())? {
+            Ok(admitted) => Err(format!(
+                "1884: an effect-capable class was admitted as {admitted:?} with no issued effect operation lease"
+            )
+            .into()),
+            Err(reason) => {
+                assert!(
+                    reason.contains("no unexpired effect operation lease covers operation"),
+                    "1884: an effect-capable class must still be refused by the ORS lease issuer, got {reason}"
+                );
+                assert!(
+                    fixture
+                        .store()
+                        .load_effect_operation_lease_for_operation(&OperationIdentity::new(
+                            START_OPERATION_ID
+                        )?)?
+                        .is_none(),
+                    "1884: a refused effect-capable new operation must leave no lease row behind"
+                );
+                Ok(())
+            }
         }
     }
 }

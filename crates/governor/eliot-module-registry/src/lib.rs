@@ -21,7 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ContractVersion, OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
+    AuthorityEpoch, ContractVersion, OperationId, RequestMetadata, ResourceGeneration, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_runtime_contracts::{
     RestartDependencyKind, RestartGroupStrategy, RestartInvalidationTrigger,
@@ -93,6 +94,21 @@ pub enum ModuleError {
     NotFound,
     #[error("module generation admission receipt has not been read back from its owner")]
     AdmissionReceiptUnverified,
+    /// No canonical receipt is recorded for the offered operation identity.
+    #[error("module catalog recorded no admission receipt for this operation identity")]
+    AdmissionReceiptNotIssued,
+    /// A receipt exists for this operation, but not the offered one.
+    #[error("module catalog admission receipt id does not match the recorded receipt")]
+    AdmissionReceiptMismatch,
+    /// The recorded receipt admits another module or generation.
+    #[error("module catalog admission receipt belongs to another module generation")]
+    AdmissionReceiptGenerationMismatch,
+    /// The receipt carries this generation under a different manifest digest.
+    #[error("module catalog admission receipt records another accepted manifest digest")]
+    AdmissionReceiptManifestDigestMismatch,
+    /// The receipt was accepted at another catalog revision or State Fence.
+    #[error("module catalog admission receipt records another catalog revision or state fence")]
+    AdmissionReceiptRevisionMismatch,
     #[error("module catalog operation identity conflict")]
     IdentityConflict,
     /// The declared required dependency edges contain a cycle.
@@ -878,6 +894,27 @@ pub struct GenerationAdmission {
     pub execution: KernelExecutionManifest,
     pub catalog_revision: u64,
     pub state_fence: StateFence,
+    /// The Kernel/ORS Generation Registry generation this admission is for.
+    ///
+    /// The Module Catalog names the admitted generation as owner text
+    /// ([`GenerationId`]) in `execution.generation_id`, while the Generation
+    /// Registry states the same generation as the numeric counter of
+    /// [`eliot_ors::AdmittedModuleGeneration`]. I1.9 gives those two registries
+    /// different owners and forbids one actor owning both lifecycles, so this
+    /// catalog does not mint the counter: it records the value the Generation
+    /// Registry owner issued for this candidate and the seal copies that exact
+    /// recorded value.
+    ///
+    /// It is deliberately a separate field from
+    /// [`StateFence::resource_generation`]. That fence counter is the decision's
+    /// own resource generation; nothing binds it to this module generation, so
+    /// it is never read as one, and this field is never derived from it or from
+    /// the opaque `GenerationId` text.
+    ///
+    /// A `ResourceGeneration` is a non-zero counter, so an admission that does
+    /// not state one cannot be constructed from the wire and is refused by name
+    /// at the seal rather than admitted with a fabricated generation.
+    pub registry_generation: ResourceGeneration,
     pub admission_receipt: CatalogReceiptId,
 }
 
@@ -885,6 +922,11 @@ impl GenerationAdmission {
     pub fn validate(&self) -> Result<(), ModuleError> {
         self.candidate.validate()?;
         self.execution.validate()?;
+        // I1.9: the Generation Registry counter is the Generation Registry
+        // owner's value, recorded here. An admission that states no usable one
+        // names the gap instead of leaving the seal to substitute another
+        // counter.
+        admitted_registry_generation(self)?;
         // I1.9: the Governor issues the lifecycle/admission receipt with the
         // revision. An admission without one cannot authorize a Kernel
         // manifest, so it is rejected at issuance, not downstream.
@@ -907,6 +949,496 @@ impl GenerationAdmission {
             return Err(ModuleError::IdentityConflict);
         }
         Ok(())
+    }
+}
+
+/// Seals one verified [`GenerationAdmission`] into the single canonical sealed
+/// projection a Kernel Generation Registry copy is made from:
+/// [`eliot_ors::GovernorGenerationAdmissionSeal`].
+///
+/// This is the only adapter from this owner contract to that projection, so
+/// there is exactly one spelling of the field-by-field mapping and one seal
+/// version it is recorded under. The projection itself is owned by the Kernel
+/// side; nothing here restates or redeclares it.
+///
+/// The change must be the accepted-generation change itself, the row must be the
+/// row that accepted it at the expected revision and State Fence, and the
+/// operation identity, module, catalog revision, policy revision, accepted
+/// manifest digest, State Fence snapshot and lifecycle disposition are copied
+/// from those owner values.
+///
+/// The admitted restart authorization class, the admitted effect ceiling and the
+/// admitted route scope set are stated from that same owner row through this
+/// crate's one owner-to-Generation-Registry mapping, and the scope set is the
+/// set [`admitted_execution_projection`] carries for that same row, so the seal
+/// and the Generation Registry record it is issued for state one scope set
+/// rather than two mappings of it, entry for entry and in the same order. They
+/// are inside the seal's canonical owner digest, so widening any of the three on
+/// a record is refused against a digest the owner did not compute.
+///
+/// A mismatch is refused rather than resolved: a stale revision, a different
+/// fence, a row that does not carry this exact admission, a module or generation
+/// that differs from the row, a withheld restart policy, a manifest that declares
+/// no `execution_policy` and therefore no route scopes, or an admitting fence
+/// with no policy revision all name the gap instead of producing a seal with a
+/// substituted field.
+pub fn seal_generation_admission(
+    change: &ModuleCatalogChange,
+    entry: &ModuleCatalogEntry,
+    expected_catalog_revision: u64,
+    expected_state_fence: &StateFence,
+) -> Result<eliot_ors::GovernorGenerationAdmissionSeal, ModuleError> {
+    change.validate()?;
+    entry.validate()?;
+    let CatalogMutation::AcceptGeneration { admission } = &change.mutation else {
+        return Err(ModuleError::InvalidField {
+            field: "mutation",
+            reason: "a seal is issued only for an accepted-generation change",
+        });
+    };
+    admission.validate()?;
+    if entry.module_id != change.module_id {
+        return Err(ModuleError::IdentityConflict);
+    }
+    // The seal is issued for the revision this admission was accepted at. A
+    // catalog that has since moved on has no current admission to seal, so a
+    // later revision is refused rather than sealed under a revision the
+    // admission never named.
+    if expected_catalog_revision == 0 || expected_catalog_revision != admission.catalog_revision {
+        return Err(ModuleError::RevisionConflict);
+    }
+    expected_state_fence
+        .validate()
+        .map_err(|error| ModuleError::Contract(error.to_string()))?;
+    if admission.state_fence != *expected_state_fence || entry.state_fence != *expected_state_fence
+    {
+        return Err(ModuleError::FenceMismatch);
+    }
+    // The owner row must carry this exact admission, so a replaced or unrelated
+    // candidate cannot be sealed under a receipt that names another one.
+    if entry.accepted_generation.as_ref() != Some(admission) {
+        return Err(ModuleError::AdmissionReceiptUnverified);
+    }
+    if admission.candidate.module_id != entry.module_id
+        || admission.execution.module_id != entry.module_id
+        || admission.execution.generation_id != admission.candidate.candidate_id
+    {
+        return Err(ModuleError::IdentityConflict);
+    }
+    // The policy revision is the fence's own value. A fence that carries none
+    // has no policy revision to seal, and one is never derived from the restart
+    // policy digest or from any other field.
+    let Some(policy_revision) = admission.state_fence.policy_revision else {
+        return Err(ModuleError::InvalidField {
+            field: "seal.policy_revision",
+            reason: "the admitting state fence carries no policy revision",
+        });
+    };
+    // Only an admitted restart policy can be sealed, and it must be the exact
+    // digest the accepted execution projection is already bound to. A withheld
+    // disposition admits no policy to bind, so it is refused here rather than
+    // sealed as an automatic restart authority.
+    let Some(admitted_policy_digest) = entry.restart_policy_disposition.policy_digest() else {
+        return Err(ModuleError::InvalidField {
+            field: "seal.lifecycle_admission",
+            reason: "the catalog withheld this generation's restart policy",
+        });
+    };
+    if admitted_policy_digest != admission.execution.restart_policy_digest {
+        return Err(ModuleError::IdentityConflict);
+    }
+    let operation_id = eliot_ors::OperationIdentity::new(change.operation_id.as_str())
+        .map_err(sealed_projection_refusal)?;
+    // The sealed projection records the admitting fence as a canonical snapshot
+    // of that exact fence value, observed under the fence's own epoch sequence.
+    // The snapshot is a capture of the recorded fence, not a re-statement of it.
+    let state_fence = eliot_ors::StateFenceSnapshot::capture(
+        &admission.state_fence,
+        admission.state_fence.authority_epoch.sequence.get(),
+    )
+    .map_err(sealed_projection_refusal)?;
+    let generation = admitted_registry_generation(admission)?;
+    // The owner row the catalog now records is the row the Generation Registry
+    // copy is made from, so its own execution projection is the one admitted
+    // scope set: the projection is built here rather than re-derived from the
+    // policy field, and it is neither sorted, deduped, widened nor narrowed.
+    // A manifest that declares no `execution_policy` states no scopes, and
+    // `admitted_execution_projection` refuses that by name rather than this
+    // adapter sealing an empty set.
+    let admitted_projection = admitted_execution_projection(entry)?;
+    let mut parts = eliot_ors::GovernorGenerationAdmissionSealParts {
+        operation_id,
+        idempotency_key: change.idempotency_key.clone(),
+        module_id: admission.execution.module_id.as_str().to_owned(),
+        generation,
+        catalog_revision: admission.catalog_revision,
+        policy_revision: policy_revision.value(),
+        accepted_manifest_sha256: admission.execution.manifest_digest.clone(),
+        state_fence,
+        lifecycle_disposition: eliot_ors::LifecycleAdmissionDisposition::Admitted,
+        // The three admitted bounds are the module's own admitted values, never
+        // a value this adapter picks: the owner row states the class and the
+        // ceiling, and the owner row's execution projection states the scopes.
+        restart_authorization_class: admitted_restart_authorization(
+            entry.manifest.restart_authorization,
+        ),
+        admitted_effect_ceiling: admitted_effect_ceiling(entry.manifest.effect_ceiling),
+        admitted_allowed_scopes: admitted_projection.allowed_scopes,
+        // The canonical owner digest is computed over the other fields by the
+        // sealed projection's own digest function, which recomputes it on every
+        // validation; it is never a digest this owner invents.
+        owner_canonical_sha256: String::new(),
+    };
+    parts.owner_canonical_sha256 =
+        eliot_ors::GovernorGenerationAdmissionSeal::canonical_sha256(&parts)
+            .map_err(sealed_projection_refusal)?;
+    eliot_ors::GovernorGenerationAdmissionSeal::seal(parts).map_err(sealed_projection_refusal)
+}
+
+/// The technical execution projection one accepted generation is copied into the
+/// Generation Registry with (I1.9).
+///
+/// It is built here from the owner row and the owner's own `execution_policy`
+/// declaration, never from contemporaneous configuration: an absent
+/// `execution_policy` states no Job Object limits, restart budget, state-class
+/// behavior, route scope or policy revision, so the projection is refused by
+/// name instead of carrying runtime defaults. Every field is one owner field.
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and builds the Generation Registry copy from exactly this projection; the
+/// mapping itself stays here so there is one spelling of it.
+pub fn admitted_execution_projection(
+    entry: &ModuleCatalogEntry,
+) -> Result<eliot_ors::KernelExecutionProjection, ModuleError> {
+    let manifest = &entry.manifest;
+    let Some(policy) = manifest.execution_policy.as_ref() else {
+        return Err(ModuleError::InvalidField {
+            field: "execution_policy",
+            reason: "the accepted manifest declares no source-owned execution values",
+        });
+    };
+    if policy.policy_revision
+        != entry
+            .state_fence
+            .policy_revision
+            .map_or(0, eliot_contracts::PolicyRevision::value)
+    {
+        return Err(ModuleError::RevisionConflict);
+    }
+    let mut modules = BTreeSet::new();
+    let mut positions = BTreeSet::new();
+    let dependency_order = manifest
+        .dependencies
+        .iter()
+        .map(|dependency| {
+            if !modules.insert(dependency.module_id.clone())
+                || !positions.insert(dependency.startup_order)
+            {
+                return Err(ModuleError::IdentityConflict);
+            }
+            Ok(eliot_ors::ManifestDependencyEntry {
+                module_id: dependency.module_id.as_str().to_owned(),
+                startup_order: dependency.startup_order,
+            })
+        })
+        .collect::<Result<Vec<_>, ModuleError>>()?;
+    Ok(eliot_ors::KernelExecutionProjection {
+        artifact_sha256: manifest.artifact_digest.clone(),
+        config_sha256: manifest.config_digest.clone(),
+        protocol_sha256: manifest.protocol_digest.clone(),
+        start_command: manifest.command_ref.clone(),
+        dependency_order,
+        resource_limits: eliot_ors::ManifestResourceLimits {
+            job_object_policy: policy.resource_limits.job_object_policy.clone(),
+            max_processes: policy.resource_limits.max_processes,
+            max_working_set_bytes: policy.resource_limits.max_working_set_bytes,
+            cpu_rate_control_percent: policy.resource_limits.cpu_rate_control_percent,
+        },
+        health_readiness_contract_ref: manifest.health_contract_ref.clone(),
+        restart_budget: eliot_ors::ManifestRestartBudget {
+            max_restarts: policy.restart_budget.max_restarts,
+            quarantine_rule: policy.restart_budget.quarantine_rule.clone(),
+        },
+        effect_ceiling: admitted_effect_ceiling(manifest.effect_ceiling),
+        allowed_scopes: policy
+            .allowed_route_scopes
+            .iter()
+            .map(|scope| eliot_ors::CapabilityRouteScope {
+                module_id: scope.module_id.as_str().to_owned(),
+                capability: scope.capability_id.as_str().to_owned(),
+                work_scope: scope.work_scope.clone(),
+                effect_domain: scope.effect_domain.clone(),
+                route_scope_hash: scope.route_scope_hash.clone(),
+            })
+            .collect(),
+        state_class_behavior: admitted_state_class_behavior(policy.state_class_behavior),
+    })
+}
+
+/// The one spelling of the owner effect ceiling in the Generation Registry
+/// vocabulary (I1.9).
+///
+/// Both sides state the same three ordered classes; a mapping that did not
+/// preserve the order would let a read/rebuild generation be recorded as
+/// effect-capable, so each arm is explicit rather than derived from a name or a
+/// rank comparison.
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and states the Generation Registry record's admitted class through exactly
+/// this mapping; the mapping itself stays here so there is one spelling of it.
+pub const fn admitted_effect_ceiling(ceiling: EffectCeiling) -> eliot_ors::ManifestEffectCeiling {
+    match ceiling {
+        EffectCeiling::ReadRebuild => eliot_ors::ManifestEffectCeiling::ReadRebuild,
+        EffectCeiling::CandidateOnly => eliot_ors::ManifestEffectCeiling::CandidateNoEffect,
+        EffectCeiling::EffectExactLease => eliot_ors::ManifestEffectCeiling::EffectExactLease,
+    }
+}
+
+/// The one spelling of the owner restart authorization in the Generation
+/// Registry vocabulary (I1.9).
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and states the Generation Registry record's admitted class through exactly
+/// this mapping; the mapping itself stays here so there is one spelling of it.
+pub const fn admitted_restart_authorization(
+    authorization: RestartAuthorization,
+) -> eliot_ors::RestartAuthorizationClass {
+    match authorization {
+        RestartAuthorization::ReadRebuild => eliot_ors::RestartAuthorizationClass::ReadRebuild,
+        RestartAuthorization::EffectExactLease => {
+            eliot_ors::RestartAuthorizationClass::EffectExactLease
+        }
+        RestartAuthorization::CurrentCatalogRequired => {
+            eliot_ors::RestartAuthorizationClass::CurrentCatalogRequired
+        }
+    }
+}
+
+/// The one spelling of the owner state-class behavior in the Generation Registry
+/// vocabulary (I1.9).
+const fn admitted_state_class_behavior(
+    behavior: ModuleStateClassBehavior,
+) -> eliot_ors::StateMigrationDecision {
+    match behavior {
+        ModuleStateClassBehavior::RetainCompatible => {
+            eliot_ors::StateMigrationDecision::RetainCompatible
+        }
+        ModuleStateClassBehavior::CheckpointTransfer => {
+            eliot_ors::StateMigrationDecision::CheckpointTransfer
+        }
+        ModuleStateClassBehavior::RebuildFromSnapshot => {
+            eliot_ors::StateMigrationDecision::RebuildFromSnapshot
+        }
+        ModuleStateClassBehavior::ForwardRepairRequired => {
+            eliot_ors::StateMigrationDecision::ForwardRepairRequired
+        }
+    }
+}
+
+/// The Authority Epoch the admission was issued under.
+///
+/// The Generation Registry admission carries the lineage-aware epoch's numeric
+/// sequence, which is the counter that registry compares; the exact
+/// `(lineage_id, sequence)` tuple travels in the sealed State Fence snapshot and
+/// is checked there, so no lineage is dropped by stating the sequence here.
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and states the Generation Registry record's epoch through exactly this
+/// mapping; the mapping itself stays here so there is one spelling of it.
+pub fn admitted_authority_epoch(
+    admission: &GenerationAdmission,
+) -> Result<AuthorityEpoch, ModuleError> {
+    AuthorityEpoch::new(admission.state_fence.authority_epoch.sequence.get())
+        .map_err(|error| ModuleError::Contract(error.to_string()))
+}
+
+/// The owner facts the sealed projection was computed from, read back off the
+/// sealed value.
+///
+/// [`seal_generation_admission`] is the only writer of a seal and it is total:
+/// every field it refuses to state is a refusal, so a seal that exists states
+/// every owner fact, and the receipt is issued over exactly the field set the
+/// owner digest was computed from rather than over a second mapping of the owner
+/// row. That includes the admitted restart authorization class, effect ceiling
+/// and route scope set, which are read back off the seal through its own
+/// accessors and in the seal's own order, so recomputing the canonical digest
+/// over this readback reproduces the seal's recorded owner digest instead of a
+/// digest over a field set the three bounds are missing from.
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and issues the canonical ORS admission receipt over exactly these sealed
+/// facts, so receipt and seal cannot drift onto a second mapping.
+pub fn sealed_facts_of(
+    seal: &eliot_ors::GovernorGenerationAdmissionSeal,
+) -> eliot_ors::GovernorGenerationAdmissionSealParts {
+    eliot_ors::GovernorGenerationAdmissionSealParts {
+        operation_id: seal.operation_id().clone(),
+        idempotency_key: seal.idempotency_key().to_owned(),
+        module_id: seal.module_id().to_owned(),
+        generation: seal.generation(),
+        catalog_revision: seal.catalog_revision(),
+        policy_revision: seal.policy_revision(),
+        accepted_manifest_sha256: seal.accepted_manifest_sha256().to_owned(),
+        state_fence: seal.state_fence().clone(),
+        lifecycle_disposition: seal.lifecycle_disposition(),
+        restart_authorization_class: seal.restart_authorization_class(),
+        admitted_effect_ceiling: seal.admitted_effect_ceiling(),
+        admitted_allowed_scopes: seal.admitted_allowed_scopes().to_vec(),
+        owner_canonical_sha256: String::new(),
+    }
+}
+
+/// The Generation Registry generation counter this owner records for an
+/// admission.
+///
+/// I1.9 states the three registries and their owners, and states the Generation
+/// Registry as containing "installed/running/candidate generations"; the Module
+/// Catalog row therefore carries the admitted generation as owner text
+/// ([`GenerationId`]) while the sealed projection states it as that registry's
+/// numeric counter. `ResourceGeneration` is the exact counter vocabulary the
+/// Generation Registry already uses for a generation identity, so this owner
+/// records the value its own admission carries and the seal copies it verbatim.
+///
+/// Two counters that are NOT the generation are refused here rather than
+/// substituted:
+///
+/// * the opaque `GenerationId` text is never parsed into a number;
+/// * [`StateFence::resource_generation`] is the admitting decision's own
+///   resource generation, a different counter that nothing binds to this module
+///   generation.
+///
+/// The value is re-validated here so a hand-built admission whose counter is
+/// zero is refused by name instead of sealing a generation the Generation
+/// Registry never issued.
+fn admitted_registry_generation(
+    admission: &GenerationAdmission,
+) -> Result<ResourceGeneration, ModuleError> {
+    let value = admission.registry_generation;
+    if value.value() == 0 {
+        return Err(ModuleError::InvalidField {
+            field: "admission.registry_generation",
+            reason: "the admission records no Generation Registry generation counter",
+        });
+    }
+    Ok(value)
+}
+
+/// The canonical Module Catalog receipt row this owner reads back to admit one
+/// generation.
+///
+/// I1.9 requires a governed Catalog/lifecycle receipt before Kernel persists the
+/// manifest, and this crate has no canonical Store handle: the store bridge owns
+/// the read. This value is what that read must return, and it is compared
+/// field-by-field against the admission offered for acceptance before any ORS
+/// mutation is reachable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogAdmissionReceipt {
+    /// Canonical operation identity the receipt was recorded under.
+    pub operation_id: OperationId,
+    /// Canonical idempotency key of the same accepting operation.
+    pub idempotency_key: String,
+    /// The Module Catalog receipt id the owner recorded.
+    pub admission_receipt: CatalogReceiptId,
+    /// Module the recorded receipt admits.
+    pub module_id: ModuleId,
+    /// Owner text generation identity the recorded receipt admits.
+    pub generation_id: GenerationId,
+    /// Generation Registry generation counter the recorded receipt admits.
+    pub registry_generation: ResourceGeneration,
+    /// Exact Module Catalog revision the recorded receipt was accepted at.
+    pub catalog_revision: u64,
+    /// Exact accepted-execution-manifest digest the recorded receipt carries.
+    pub accepted_manifest_sha256: String,
+    /// Exact admitting State Fence the recorded receipt was issued under.
+    pub state_fence: StateFence,
+}
+
+impl CatalogAdmissionReceipt {
+    /// The checks every accept path makes before it admits a generation.
+    ///
+    /// Each refusal names its own gap, so an invented receipt, a receipt that
+    /// belongs to another generation, and a receipt that carries this
+    /// generation's text identity under a different accepted-manifest digest
+    /// are three distinct outcomes rather than one undifferentiated error. All
+    /// of them are raised before any ORS mutation is reachable.
+    pub fn verify_for(
+        &self,
+        operation_id: &OperationId,
+        idempotency_key: &str,
+        admission: &GenerationAdmission,
+    ) -> Result<(), ModuleError> {
+        // An invented receipt is not merely unmatched: it names an operation
+        // this owner never issued. It is refused before any field comparison so
+        // it cannot be reported as a mismatch of some other kind.
+        if self.operation_id != *operation_id || self.idempotency_key != idempotency_key {
+            return Err(ModuleError::AdmissionReceiptNotIssued);
+        }
+        if self.admission_receipt != admission.admission_receipt {
+            return Err(ModuleError::AdmissionReceiptMismatch);
+        }
+        // A receipt belonging to another generation is a different refusal from
+        // an invented one, and from a receipt whose recorded accepted-manifest
+        // digest disagrees with this admission's.
+        if self.module_id != admission.execution.module_id
+            || self.generation_id != admission.execution.generation_id
+            || self.registry_generation != admission.registry_generation
+        {
+            return Err(ModuleError::AdmissionReceiptGenerationMismatch);
+        }
+        if self.accepted_manifest_sha256 != admission.execution.manifest_digest {
+            return Err(ModuleError::AdmissionReceiptManifestDigestMismatch);
+        }
+        if self.catalog_revision != admission.catalog_revision
+            || self.state_fence != admission.state_fence
+        {
+            return Err(ModuleError::AdmissionReceiptRevisionMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The canonical Store read this owner needs before it admits a generation.
+///
+/// This crate has no Store handle: `ModuleCatalogOwnerReadback` in
+/// `crates/governor/eliot-governor/src/module_registry_admission.rs` is the type
+/// that already reads the canonical Module Catalog snapshot and its owner
+/// revision, and it is the implementation point for this port. An accept path
+/// with no readback is a fabricated authority, so [`ModuleCatalog::apply`]
+/// requires this port for the `AcceptGeneration` arm instead of assuming a
+/// receipt exists.
+pub trait CatalogAdmissionReceiptReadback {
+    /// Reads back the canonical recorded receipt for one operation identity.
+    ///
+    /// An operation this owner never recorded has no receipt, so absence is
+    /// `Ok(None)` rather than an invented row.
+    fn read_admission_receipt(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<CatalogAdmissionReceipt>, ModuleError>;
+}
+
+/// Maps one sealed-projection refusal onto this owner's typed refusal.
+///
+/// The arms preserve the refusal each foreign variant states: a fence that does
+/// not match stays a fence mismatch, a malformed sealed field stays an invalid
+/// field, and a recorded field set whose canonical owner digest does not bind it
+/// stays an identity conflict, which is the refusal this crate already records
+/// when one of its own digests does not bind its recorded fields. Any other
+/// foreign refusal is recorded as the contract failure it is, with the foreign
+/// cause retained rather than dropped.
+///
+/// It is `pub` because the Governor accept path is composed outside this crate
+/// and must record the same refusals in the same way; a second spelling here
+/// would let one path report a refusal as another.
+pub fn sealed_projection_refusal(error: eliot_ors::OrsError) -> ModuleError {
+    match error {
+        eliot_ors::OrsError::FenceMismatch => ModuleError::FenceMismatch,
+        eliot_ors::OrsError::InvalidField { .. } => ModuleError::InvalidField {
+            field: "seal",
+            reason: "the sealed admission projection refused one of its own typed fields",
+        },
+        eliot_ors::OrsError::IntegrityProblem { .. } => ModuleError::IdentityConflict,
+        other => ModuleError::Contract(other.to_string()),
     }
 }
 
@@ -1226,6 +1758,12 @@ struct AppliedCatalogMutation {
     entry: ModuleCatalogEntry,
     invalidated_dependents: Vec<ModuleId>,
     invalidation_trigger: Option<RestartInvalidationTrigger>,
+    /// The sealed Governor admission projection this acceptance produced.
+    ///
+    /// It is present exactly for a generation acceptance, so an accept path that
+    /// produced no seal cannot return a transition: the Kernel Generation
+    /// Registry copy is made from this value and from nothing else.
+    admission_seal: Option<eliot_ors::GovernorGenerationAdmissionSeal>,
 }
 
 impl AppliedCatalogMutation {
@@ -1236,8 +1774,24 @@ impl AppliedCatalogMutation {
             entry,
             invalidated_dependents: Vec::new(),
             invalidation_trigger: None,
+            admission_seal: None,
         }
     }
+}
+
+/// What one applied catalog change produced.
+///
+/// For an `AcceptGeneration` change this also carries the canonical sealed
+/// Governor admission projection ([`seal_generation_admission`]), which is the
+/// only value the Kernel Generation Registry copy may be made from. Desired-state
+/// changes admit no generation and carry no seal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppliedCatalogTransition {
+    /// The prepared semantic transition for the canonical writer.
+    pub prepared: PreparedCatalogTransition,
+    /// The sealed admission projection, present exactly for an accepted
+    /// generation.
+    pub admission_seal: Option<eliot_ors::GovernorGenerationAdmissionSeal>,
 }
 
 impl ModuleCatalog {
@@ -1296,10 +1850,17 @@ impl ModuleCatalog {
         Ok(snapshot)
     }
 
+    /// Applies one catalog change and returns the prepared transition.
+    ///
+    /// `readback` is required, not optional: an `AcceptGeneration` mutation can
+    /// only be admitted when the canonical Module Catalog receipt for its
+    /// operation identity has been read back and matches, so this crate cannot
+    /// reach an accept path without a real owner read.
     pub fn apply(
         &mut self,
         request: &ModuleCatalogChange,
-    ) -> Result<PreparedCatalogTransition, ModuleError> {
+        readback: &dyn CatalogAdmissionReceiptReadback,
+    ) -> Result<AppliedCatalogTransition, ModuleError> {
         request.validate()?;
         if request.state_fence != self.state_fence {
             return Err(ModuleError::FenceMismatch);
@@ -1309,7 +1870,7 @@ impl ModuleCatalog {
         }
         let before = self.snapshot()?;
         let previous = self.entries.get(&request.module_id).cloned();
-        let applied = self.apply_mutation(&request.module_id, previous, &request.mutation)?;
+        let applied = self.apply_mutation(request, previous, readback, self.revision + 1)?;
         self.revision += 1;
         self.entries
             .insert(request.module_id.clone(), applied.entry);
@@ -1345,7 +1906,10 @@ impl ModuleCatalog {
                 self.select_invalidation_dependents(&request.module_id, trigger)?;
         }
         prepared.verify_invalidation_dependents(&expected_dependents)?;
-        Ok(prepared)
+        Ok(AppliedCatalogTransition {
+            prepared,
+            admission_seal: applied.admission_seal,
+        })
     }
 
     /// Selects the dependents affected by an invalidation of `subject`, from
@@ -1444,17 +2008,22 @@ impl ModuleCatalog {
     /// catalog's current revision and state fence.
     ///
     /// The order inside an arm is the order of the checks the catalog relies
-    /// on, and each arm is refused before it replaces anything. Caller-supplied
-    /// generation admissions remain refused until the owner receipt can be read
-    /// back; desired-state `Upsert` and `SetState` change no accepted generation
-    /// and invalidate nothing that is already running.
+    /// on, and each arm is refused before it replaces anything. A generation is
+    /// admitted only after the canonical owner receipt has been read back for
+    /// this change's operation identity and matched field by field, and the arm
+    /// produces the sealed admission projection the Kernel Generation Registry
+    /// copy is made from; desired-state `Upsert` and `SetState` change no
+    /// accepted generation, admit nothing, and invalidate nothing that is
+    /// already running.
     fn apply_mutation(
         &self,
-        module_id: &ModuleId,
+        change: &ModuleCatalogChange,
         entry: Option<ModuleCatalogEntry>,
-        mutation: &CatalogMutation,
+        readback: &dyn CatalogAdmissionReceiptReadback,
+        after_catalog_revision: u64,
     ) -> Result<AppliedCatalogMutation, ModuleError> {
-        match mutation {
+        let module_id = &change.module_id;
+        match &change.mutation {
             CatalogMutation::Upsert {
                 manifest,
                 desired_state,
@@ -1468,7 +2037,7 @@ impl ModuleCatalog {
                         manifest.restart_policy.as_ref(),
                     )
                     .map_err(|error| ModuleError::Contract(error.to_string()))?,
-                    catalog_revision: self.revision + 1,
+                    catalog_revision: after_catalog_revision,
                     state_fence: self.state_fence.clone(),
                     accepted_generation: entry
                         .as_ref()
@@ -1485,15 +2054,90 @@ impl ModuleCatalog {
                 let mut current = entry.ok_or(ModuleError::NotFound)?;
                 current.desired_state = *desired_state;
                 current.removal_reason.clone_from(removal_reason);
-                current.catalog_revision = self.revision + 1;
+                current.catalog_revision = after_catalog_revision;
                 current.state_fence = self.state_fence.clone();
                 current.validate()?;
                 Ok(AppliedCatalogMutation::without_invalidation(current))
             }
-            CatalogMutation::AcceptGeneration { .. } => {
-                Err(ModuleError::AdmissionReceiptUnverified)
+            CatalogMutation::AcceptGeneration { admission } => {
+                self.admit_generation(change, entry, admission, readback, after_catalog_revision)
             }
         }
+    }
+
+    /// Admits one generation onto its row, once the canonical owner receipt has
+    /// been read back and matched, and produces the sealed admission projection
+    /// the Generation Registry copy is made from.
+    ///
+    /// Every refusal here is raised before the row is replaced and before any
+    /// ORS mutation is reachable, and each names its own gap: an invented
+    /// receipt, a receipt for another generation, a receipt carrying this
+    /// generation's text identity under another accepted-manifest digest, a
+    /// receipt for another revision or fence, a non-enabled module, a stale
+    /// revision, a different State Fence, and a withheld restart policy are
+    /// nine distinct outcomes rather than one undifferentiated error.
+    fn admit_generation(
+        &self,
+        change: &ModuleCatalogChange,
+        entry: Option<ModuleCatalogEntry>,
+        admission: &GenerationAdmission,
+        readback: &dyn CatalogAdmissionReceiptReadback,
+        after_catalog_revision: u64,
+    ) -> Result<AppliedCatalogMutation, ModuleError> {
+        let mut current = entry.ok_or(ModuleError::NotFound)?;
+        // Only a module the catalog currently wants can have a generation
+        // admitted for it. A disabled, quarantined or removed module has no
+        // running generation to admit.
+        if current.desired_state != DesiredModuleState::Enabled {
+            return Err(ModuleError::InvalidField {
+                field: "desired_state",
+                reason: "only an enabled module may have a generation admitted",
+            });
+        }
+        admission.validate()?;
+        // The admission is accepted at the revision this transition produces, so
+        // the seal names that revision and not one the admission was carried in
+        // with.
+        if admission.catalog_revision != after_catalog_revision {
+            return Err(ModuleError::RevisionConflict);
+        }
+        if admission.candidate.module_id != change.module_id {
+            return Err(ModuleError::IdentityConflict);
+        }
+        // The admission must be issued under the catalog's current State Fence,
+        // so the seal names that exact fence and not one the caller carried in
+        // from an earlier catalog.
+        if admission.state_fence != self.state_fence {
+            return Err(ModuleError::FenceMismatch);
+        }
+        // The owner read comes before any catalog mutation, and an absent receipt
+        // is its own refusal: this owner issued no admission under this operation
+        // identity, so an invented non-blank receipt text has nothing to match.
+        let receipt = readback
+            .read_admission_receipt(&change.operation_id)?
+            .ok_or(ModuleError::AdmissionReceiptNotIssued)?;
+        receipt.verify_for(&change.operation_id, &change.idempotency_key, admission)?;
+        current.catalog_revision = after_catalog_revision;
+        current.state_fence = self.state_fence.clone();
+        current.accepted_generation = Some(admission.clone());
+        current.validate()?;
+        // The seal is produced from the accepted row this arm produced, so it
+        // binds the exact entry, revision, fence and lifecycle disposition the
+        // catalog now records.
+        let admission_seal =
+            seal_generation_admission(change, &current, after_catalog_revision, &self.state_fence)?;
+        // An accepted generation supersedes the running one, so the selection
+        // this transition records is derived from the declared invalidation
+        // edges under the operational-state trigger, never from a caller's list.
+        let trigger = RestartInvalidationTrigger::OperationalStateInvalidated;
+        let invalidated_dependents =
+            self.select_invalidation_dependents(&change.module_id, trigger)?;
+        Ok(AppliedCatalogMutation {
+            entry: current,
+            invalidated_dependents,
+            invalidation_trigger: Some(trigger),
+            admission_seal: Some(admission_seal),
+        })
     }
 }
 

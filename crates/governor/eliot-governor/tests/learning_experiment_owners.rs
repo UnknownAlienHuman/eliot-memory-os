@@ -446,27 +446,30 @@ fn assessment(
 /// fields is bound to the owner that published it.
 #[test]
 fn experimental_candidate_binds_each_field_to_its_owner() -> Fixture {
-    let owners = owners("positive", &Knobs::default())?;
-    let outcome = run_improvement_experiment_loop(&owners.input);
+    let published = owners("positive", &Knobs::default())?;
+    let outcome = run_improvement_experiment_loop(&published.input);
     let ExperimentLoopOutcome::Experimental(boxed) = outcome else {
         panic!("a fully owner-published derivation must produce an experiment");
     };
     let candidate: &ImprovementExperimentCandidate = &boxed;
     candidate.validate()?;
-    candidate.validate_against_attribution(owners.attribution)?;
+    candidate.validate_against_attribution(published.attribution)?;
 
     // Seam 1 — attribution-lineage owner: four fields, all read out of the
     // sealed attribution record.
-    assert_eq!(candidate.binding, owners.attribution.binding);
-    assert_eq!(candidate.target, owners.attribution.target);
-    assert_eq!(candidate.attribution_id, owners.attribution.attribution_id);
+    assert_eq!(candidate.binding, published.attribution.binding);
+    assert_eq!(candidate.target, published.attribution.target);
+    assert_eq!(
+        candidate.attribution_id,
+        published.attribution.attribution_id
+    );
     assert_eq!(
         candidate.attribution_digest,
-        owners.attribution.canonical_digest
+        published.attribution.canonical_digest
     );
 
     // Seam 2 — mechanism owner.
-    assert_eq!(candidate.hypothesis, owners.mechanism.hypothesis);
+    assert_eq!(candidate.hypothesis, published.mechanism.hypothesis);
     assert!(!candidate.pre_observation_discriminator.as_str().is_empty());
 
     // Seam 3 — bounded-plan owner.
@@ -474,7 +477,7 @@ fn experimental_candidate_binds_each_field_to_its_owner() -> Fixture {
         candidate.eligibility,
         format!(
             "scope={};budget={};deadline={}",
-            owners.plan.scope_ref, owners.plan.budget_ref, owners.plan.deadline_ref
+            published.plan.scope_ref, published.plan.budget_ref, published.plan.deadline_ref
         )
     );
     assert_ne!(candidate.intervention_id, candidate.control_id);
@@ -490,7 +493,7 @@ fn experimental_candidate_binds_each_field_to_its_owner() -> Fixture {
     // repeating a reference.
     assert_eq!(
         candidate.rollback_refs,
-        vec![owners.rollback.rollback_ref.clone()]
+        vec![aid(&published.rollback.rollback_ref)?]
     );
 
     // Seam 6 — contamination owner.
@@ -502,18 +505,21 @@ fn experimental_candidate_binds_each_field_to_its_owner() -> Fixture {
 
     // Seam 7 — evidence-freeze owner. The digest is the maintenance owner's own
     // domain-separated, versioned commitment, not a digest recomputed here.
-    let commitment = eliot_maintenance::proposal_digest(owners.proposal)?;
+    let commitment = eliot_maintenance::proposal_digest(published.proposal)?;
     assert_eq!(candidate.evidence_freeze_digest, commitment.digest);
     assert!(
         candidate
             .evidence_freeze_refs
-            .contains(&ArtifactId::new(owners.activation.evidence_id.clone())?)
+            .contains(&ArtifactId::new(published.activation.evidence_id.clone())?)
     );
 
     // Seam 8 — outcome/verifier owner: the dimensioned result and the weakest
     // causal ceiling it supports, never a scalar score.
-    assert_eq!(candidate.outcome_dimensions, owners.assessment.dimensions);
-    assert_eq!(candidate.claim_ceiling, owners.assessment.causal_ceiling);
+    assert_eq!(
+        candidate.outcome_dimensions,
+        published.assessment.dimensions
+    );
+    assert_eq!(candidate.claim_ceiling, published.assessment.causal_ceiling);
     assert!(
         candidate
             .outcome_dimensions
@@ -539,14 +545,14 @@ fn experimental_candidate_binds_each_field_to_its_owner() -> Fixture {
         .ok_or("the independence dimension is mandatory")?;
     assert_eq!(
         independence_dimension.owner_receipt.as_ref(),
-        Some(&ArtifactId::new(owners.activation.evidence_id.clone())?)
+        Some(&ArtifactId::new(published.activation.evidence_id.clone())?)
     );
 
     // Identity is content: a different attribution lineage never shares the
     // experiment identity.
-    let other = owners("other-lineage", &Knobs::default())?;
+    let other_owners = owners("other-lineage", &Knobs::default())?;
     let ExperimentLoopOutcome::Experimental(other_boxed) =
-        run_improvement_experiment_loop(&other.input)
+        run_improvement_experiment_loop(&other_owners.input)
     else {
         panic!("a fully owner-published derivation must produce an experiment");
     };
