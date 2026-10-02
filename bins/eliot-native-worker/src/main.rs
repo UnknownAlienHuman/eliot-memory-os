@@ -161,6 +161,10 @@ fn run() -> i32 {
         Ok(authority) => Arc::new(authority),
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
+    let expected_authority_id = match authority.authority_id() {
+        Ok(authority_id) => authority_id,
+        Err(error) => return deny_invalid_material(&error.to_string()),
+    };
     let process = match authority.issue(&intent, grant, &material.nonce, now) {
         Ok(process) => process,
         Err(error) => return deny_invalid_material(&error.to_string()),
@@ -197,7 +201,14 @@ fn run() -> i32 {
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
     ));
-    drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
+    drive_admitted_material(
+        &mut lifecycle,
+        &mut worker,
+        &material,
+        process,
+        &admission,
+        &expected_authority_id,
+    )
 }
 
 /// Drives one validated admitted presentation to `Ready` and serves.
@@ -222,6 +233,7 @@ fn drive_admitted_material<E, A, R, C, L>(
     material: &ValidatedAdmittedMaterial,
     process: ProcessRequest,
     admission: &PresentationEchoAdmission,
+    expected_authority_id: &str,
 ) -> i32
 where
     E: ProcessExecutor,
@@ -235,7 +247,11 @@ where
     // is retained with the drive receipt below. No unchecked bypass route
     // remains: this entry is the only production caller of the drive.
     match block_on(eliot_native_worker::drive_governed_material(
-        lifecycle, worker, material, process,
+        lifecycle,
+        worker,
+        material,
+        process,
+        expected_authority_id,
     )) {
         Ok((actions, _ready)) => emit_governed_provenance(&actions),
         Err(error) => return fail_drive(&error),
@@ -266,6 +282,7 @@ where
         &material.admission.claim().work_scope_id,
         &fence,
         &epoch,
+        expected_authority_id,
     )) {
         Ok(_) => {
             // Issue #1912: a serve that ends cancelled or holding an
@@ -1723,6 +1740,20 @@ mod tests {
         )
     }
 
+    /// Independently derives the expected issuer from the immutable
+    /// admitted claim identity and its original launch nonce.
+    fn expected_kernel_authority_id(material: &ValidatedAdmittedMaterial) -> String {
+        let claim = material.admission.claim();
+        load(eliot_kernel::native_worker_dispatch_derivation(
+            &claim.claim_id,
+            &claim.operation_id,
+            claim.worker_generation,
+            &claim.authority_epoch,
+            &material.nonce,
+        ))
+        .authority_id
+    }
+
     #[test]
     #[cfg(windows)]
     fn governed_drive_admits_enveloped_material_to_ready_with_provenance() {
@@ -1731,11 +1762,13 @@ mod tests {
             "governed-drive",
             drive_carriers("scope-1", &fence_json, &epoch_json),
         );
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
             &material,
             process,
+            &expected_authority_id,
         ))
         .unwrap_or_else(|error| panic!("governed drive must reach Ready, got {error:?}"));
         assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
@@ -1765,12 +1798,14 @@ mod tests {
         // Missing: legacy bytes carry no carriers; nothing is submitted.
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
             governed_drive_parts("governed-missing", Vec::new());
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let detail = refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
                 &material,
                 process,
+                &expected_authority_id,
             )),
             "missing envelopes",
         );
@@ -1791,12 +1826,14 @@ mod tests {
                 &epoch_json,
             )],
         );
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let detail = refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
                 &material,
                 process,
+                &expected_authority_id,
             )),
             "mismatched envelope",
         );
@@ -1821,12 +1858,14 @@ mod tests {
                 &epoch_json,
             )],
         );
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let detail = refusal_detail(
             block_on(eliot_native_worker::drive_governed_material(
                 &mut lifecycle,
                 &mut worker,
                 &material,
                 process,
+                &expected_authority_id,
             )),
             "stale envelope",
         );
@@ -1851,6 +1890,7 @@ mod tests {
         let frame_bytes = encode_frame(&health_frame());
         let mut reader = Cursor::new(frame_bytes.clone());
         let mut writer = Vec::new();
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let detail = refusal_detail(
             block_on(worker.serve_one_frame_governed(
                 &mut reader,
@@ -1859,6 +1899,7 @@ mod tests {
                 &material.admission.claim().work_scope_id,
                 &fence_json,
                 &epoch_json,
+                &expected_authority_id,
             )),
             "stdio without an envelope",
         );
@@ -1871,11 +1912,13 @@ mod tests {
         assert_eq!(reader.position(), 0);
         // Admission drives to Ready, then the governed stdio path serves a
         // real bounded frame with durable events.
+        let expected_authority_id = expected_kernel_authority_id(&material);
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
             &material,
             process,
+            &expected_authority_id,
         ))
         .unwrap_or_else(|error| panic!("governed drive must reach Ready, got {error:?}"));
         assert_eq!(actions.len(), 4);
@@ -1896,6 +1939,7 @@ mod tests {
             &material.admission.claim().work_scope_id,
             &fence_json,
             &epoch_json,
+            &expected_authority_id,
         ))
         .unwrap_or_else(|error| panic!("governed stdio must serve, got {error:?}"));
         assert!(!shutdown);
