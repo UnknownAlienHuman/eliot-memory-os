@@ -1300,7 +1300,11 @@ fn case_05_missing_stale_wrong_parent_revision() {
     // refusal for a parentless recipe is the anchor refusal, not a missing
     // parent revision, and that is what this case asserts.
     assert!(matches!(
-        compose_campaign_harness_overlay(&input(&parentless_fixture, &[parentless_delta], &pairs,)),
+        compose_campaign_harness_overlay(&input(
+            &parentless_fixture,
+            std::slice::from_ref(&parentless_delta),
+            &pairs,
+        )),
         Err(OverlayError::Contract(Contract::ScopeMismatch {
             field: "recipe.task_plan_anchor"
         }))
@@ -1314,8 +1318,11 @@ fn case_05_missing_stale_wrong_parent_revision() {
     // faked. The same field is genuinely reachable through `admit_local`
     // (admission.rs:131-135), which is where a parentless fence is still
     // refused.
-    let parentless_result =
-        compose_campaign_harness_overlay(&input(&parentless_fixture, &[parentless_delta], &pairs,));
+    let parentless_result = compose_campaign_harness_overlay(&input(
+        &parentless_fixture,
+        std::slice::from_ref(&parentless_delta),
+        &pairs,
+    ));
     assert!(parentless_result.is_err());
     assert!(!matches!(
         parentless_result,
