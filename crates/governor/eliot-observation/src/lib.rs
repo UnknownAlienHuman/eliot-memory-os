@@ -26,7 +26,7 @@ pub use eliot_observation_contracts::{
     ObservationRecordEnvelope, ObservationRecordEnvelopeV2, ObservationRecordKind,
     ObservationScope, PrivacyRetentionDisclosure, ProducerGenerationRef, ProducerTrace,
     RecordFamilyClassification, RecordFamilyContractError, RecordFamilyPayloadV2, SamplingPolicy,
-    SystemObservationJournalRecord,
+    SystemObservationJournalRecord, record_family_contract_identity,
 };
 
 use eliot_contracts::{
@@ -88,6 +88,16 @@ pub enum GovernorObservationError {
     RecordFamilyNotAccepted {
         /// Classification retained for the cold fallback.
         disposition: RecordFamilyClassification,
+    },
+    /// A retained v2 record family was admitted under a record-family contract
+    /// identity other than the one in force, so the versioned compatibility
+    /// rule that admitted it cannot be re-proved.
+    #[error("record-family contract identity mismatch: recorded {recorded:?}, current {current:?}")]
+    RecordFamilyContractMismatch {
+        /// Identity recorded by the admission that produced the receipt.
+        recorded: ContractIdentity,
+        /// Identity of the record-family contract at validation time.
+        current: ContractIdentity,
     },
     /// A task-bound observation did not include exact selection evidence.
     #[error("task selection evidence is required")]
@@ -598,6 +608,21 @@ pub struct ObservationAdmissionReceipt {
     /// Optional family-complete v2 record retained by the additive path.
     #[serde(default)]
     pub record_v2: Option<ObservationRecordEnvelopeV2>,
+    /// Identity of the record-family contract whose versioned compatibility
+    /// rule admitted the retained v2 record.
+    ///
+    /// Present exactly when `record_v2` is present, derived by the admission
+    /// itself and never caller-selected. `None` means NO versioned record-family
+    /// rule was applied, i.e. no v2 record was retained; it is not a placeholder
+    /// for an unknown rule.
+    ///
+    /// Migration disposition (explicit, breaking, fail-closed): a receipt that
+    /// retains a v2 record but carries no identity was admitted before this
+    /// binding existed, and which rule admitted it is then unrecoverable, so it
+    /// is refused rather than re-proved under the current rule. A receipt with
+    /// no v2 record keeps validating unchanged.
+    #[serde(default)]
+    pub record_family_contract: Option<ContractIdentity>,
     /// Optional semantic evidence retained by exact handle/binding.
     pub evidence: Option<EvidenceEnvelope>,
     /// Capture route and durability recorded as observation metadata.
@@ -636,6 +661,7 @@ impl ObservationAdmissionReceipt {
                 return Err(error.into());
             }
         }
+        self.check_record_family_contract()?;
         if let Some(evidence) = &self.evidence {
             evidence.validate()?;
             if evidence.state_fence != self.state_fence {
@@ -697,6 +723,40 @@ impl ObservationAdmissionReceipt {
             });
         }
         Ok(())
+    }
+
+    /// Re-proves the record-family contract identity a retained v2 record was
+    /// admitted under.
+    ///
+    /// The receipt's own recorded identity is validated through the foundation
+    /// [`ContractIdentity::validate`] and then compared with the identity the
+    /// record-family owner currently publishes, so a receipt cannot be replayed
+    /// under a rule other than the one that produced it. The recorded value is
+    /// never rewritten to match; a divergence is a typed
+    /// [`GovernorObservationError::RecordFamilyContractMismatch`].
+    fn check_record_family_contract(&self) -> Result<(), GovernorObservationError> {
+        match (&self.record_v2, &self.record_family_contract) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(GovernorObservationError::InvalidField {
+                field: "admission.record_family_contract",
+                reason: "a retained record-family payload requires its contract identity",
+            }),
+            (None, Some(_)) => Err(GovernorObservationError::InvalidField {
+                field: "admission.record_family_contract",
+                reason: "a record-family contract identity requires a retained payload",
+            }),
+            (Some(_), Some(recorded)) => {
+                recorded.validate()?;
+                let current = record_family_contract_identity()?;
+                if recorded != &current {
+                    return Err(GovernorObservationError::RecordFamilyContractMismatch {
+                        recorded: recorded.clone(),
+                        current,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -906,6 +966,16 @@ impl ObservationJournal {
             .map(|evidence| canonical_json_bytes(evidence).map(|bytes| sha256_hex(&bytes)))
             .transpose()
             .map_err(|_| GovernorObservationError::Serialization)?;
+        // The record-family identity is ESTABLISHED here, from the owner the
+        // retained v2 record was validated against. It is never supplied by the
+        // submission, so a caller cannot select the rule its record is admitted
+        // under, and `admit_record_family_v2` / the classifier stay the only
+        // judges of the family itself.
+        let record_family_contract = if submission.record_v2.is_some() {
+            Some(record_family_contract_identity()?)
+        } else {
+            None
+        };
         let receipt = ObservationAdmissionReceipt {
             operation_id: submission.operation_id.clone(),
             idempotency_key: submission.idempotency_key.clone(),
@@ -914,6 +984,7 @@ impl ObservationJournal {
             state_fence: submission.state_fence.clone(),
             record: submission.record.clone(),
             record_v2: submission.record_v2.clone(),
+            record_family_contract,
             evidence: submission.evidence.clone(),
             capture_route: submission.capture_route,
             durability: submission.durability,
