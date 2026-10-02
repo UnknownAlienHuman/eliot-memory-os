@@ -5136,9 +5136,10 @@ impl RedbRecoveryStore {
     /// restating any of those figures here: naming them again is how the fifth
     /// wrong one gets written, and a reviewer cannot check a number in prose
     /// without re-deriving it. The counts are computed from the same lists
-    /// `backup_snapshot::check_declared_tables_are_censused` reads, and a test
-    /// asserts them, so adding a table shows up as a test failure rather than as
-    /// a sentence that quietly stopped being true.
+    /// `backup_snapshot::check_declared_tables_are_censused` reads, and
+    /// `store::backup_snapshot`'s unit tests assert that derivation, so adding
+    /// an uncensused table shows up as a test failure rather than as a sentence
+    /// that quietly stopped being true.
     ///
     /// `declared == dispositioned` is the load-bearing relation: it is the
     /// issue's "every stored row family is included or has an explicit

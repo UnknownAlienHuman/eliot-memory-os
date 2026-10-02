@@ -4676,8 +4676,7 @@ mod census_tests {
         }
     }
 
-    /// The counts are DERIVED, self-consistent, and the public surface returns the
-    /// same numbers.
+    /// The counts are DERIVED and self-consistent.
     ///
     /// This replaces three hand-transcribed sentences in this file's own module
     /// header, which disagreed with each other and with the code. The
@@ -4703,10 +4702,11 @@ mod census_tests {
              make the family binding vacuous"
         );
         // The public accessor is deliberately NOT compared to the numbers this
-        // test just derived. `backup_row_family_census_counts` is a thin
-        // re-export of `census_counts`, so asserting it equals the values read
-        // from the same function compares a value with itself and cannot fail.
-        // What this test actually pins is the DERIVATION: that `declared` comes
+        // test just derived. `RedbRecoveryStore::backup_row_family_census_counts`
+        // is a thin re-export of `census_counts`, so asserting it equals the
+        // values read from the same function compares a value with itself and
+        // cannot fail. What this test actually pins is the DERIVATION: that
+        // `declared` comes
         // from the declaration lists independently of the census, that the two
         // agree, and that the split is non-degenerate in both directions.
     }
