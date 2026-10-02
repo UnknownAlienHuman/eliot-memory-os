@@ -606,23 +606,23 @@ mod tests {
     const LAST_REF: &str = "  \"governor.daemon.learning-closure\",\n";
     const LAST_ROW: &str = "  { cell = \"governor.daemon.learning-closure\", state = \"learning-closure\", owner = \"eliot_governor::LearningClosureService\" },\n";
 
-    /// Add one tenth cell to BOTH real files, naming the same owner in each.
-    ///
-    /// The ref goes into `functional_cell_refs` and the owner row into
-    /// `functional_cell_state_owners`, so the addition stays internally
-    /// consistent; the contract gains one matching projection row.
-    fn add_declared_cell(cell: &str, state: &str, owner: &str) -> (String, String) {
-        let manifest = replace_once(
+    /// Add one tenth cell to the real manifest: a ref plus its owner row.
+    fn add_manifest_cell(cell: &str, state: &str, owner: &str) -> String {
+        let with_ref = replace_once(
             MANIFEST_TEXT,
             LAST_REF,
             &format!("{LAST_REF}  \"{cell}\",\n"),
         );
-        let manifest = replace_once(
-            &manifest,
+        replace_once(
+            &with_ref,
             LAST_ROW,
             &format!("{LAST_ROW}{}", owner_row(cell, state, owner)),
-        );
-        let contract = replace_once(
+        )
+    }
+
+    /// Add one matching `[[declared_functional_cell]]` row to the real contract.
+    fn add_contract_cell(cell: &str, owner: &str) -> String {
+        replace_once(
             CONTRACT_TEXT,
             "# END GENERATED declared_functional_cell",
             &format!(
@@ -630,8 +630,19 @@ mod tests {
                  \"bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs\"\n\
                  mutable_state_owner = \"{owner}\"\n# END GENERATED declared_functional_cell"
             ),
-        );
-        (manifest, contract)
+        )
+    }
+
+    /// Add one tenth cell to BOTH real files, naming the same owner in each.
+    ///
+    /// The ref goes into `functional_cell_refs` and the owner row into
+    /// `functional_cell_state_owners`, so the addition stays internally
+    /// consistent; the contract gains one matching projection row.
+    fn add_declared_cell(cell: &str, state: &str, owner: &str) -> (String, String) {
+        (
+            add_manifest_cell(cell, state, owner),
+            add_contract_cell(cell, owner),
+        )
     }
 
     /// The real guard's stage order over one mutated pair: parse both texts,
@@ -648,6 +659,31 @@ mod tests {
         let contract = parse_contract(contract_text)?;
         enforce_manifest_contract_agreement(&manifest, &contract)?;
         enforce_compiled_table(&manifest)
+    }
+
+    #[test]
+    fn a_declared_cell_the_contract_does_not_project_is_missing_contract_cell() {
+        // Arm: the real manifest declares a tenth cell that the real generated
+        // contract block does not project. Refs and owner rows still agree and
+        // owners are still distinct, so the manifest itself is clean; the
+        // manifest/contract stage must refuse and must name the unprojected
+        // cell rather than accepting the shorter projection as complete.
+        let manifest = add_manifest_cell(
+            "governor.daemon.learning-closure-extra",
+            "learning-closure-extra",
+            "eliot_governor::ExtraLearningClosure",
+        );
+
+        let Err(error) = compiled_table_drift_over(&manifest, CONTRACT_TEXT) else {
+            panic!("a declared cell with no contract row must not pass");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::MissingContractCell {
+                cell: "governor.daemon.learning-closure-extra".to_owned(),
+            },
+            "the typed refusal must name the cell the contract projection lacks"
+        );
     }
 
     #[test]
