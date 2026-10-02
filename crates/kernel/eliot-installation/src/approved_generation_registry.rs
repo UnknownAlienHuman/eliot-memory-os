@@ -3867,6 +3867,14 @@ impl ApprovedGenerationRegistry {
                 field: "prepared_destination_materialisation".to_owned(),
                 reason: error.to_string(),
             })?;
+        // "Never activated" is decided in the DESTINATION's own identity space:
+        // the destination installation must not have become one of the
+        // installation identities this authority holds. It is deliberately NOT
+        // also `approved_target_build == active_generation`: the approved target
+        // is a BUILD identity, and the production shape carries the source's own
+        // currently approved build there, so that clause was true for every
+        // prepared destination and made cleanup unreachable — retention without
+        // release.
         if self.generations.iter().any(|generation| {
             generation
                 .manifest
@@ -3874,8 +3882,7 @@ impl ApprovedGenerationRegistry {
                 .installation_epoch
                 .installation
                 == admission.destination_installation
-        }) || self.active_generation.as_ref() == Some(&admission.approved_target_build)
-        {
+        }) {
             return Err(InstallationError::IdentityConflict);
         }
         let Some(index) = self
@@ -4029,13 +4036,14 @@ impl ApprovedGenerationRegistry {
                 field: "prepared_isolated_destination".to_owned(),
                 reason: error.to_string(),
             })?;
-        // "Never activated" is decided against this projection's OWN current
-        // state: the destination must not have become one of the installation
-        // identities this authority holds, and the approved target must not have
-        // become active. The previous form compared the approved target with the
-        // active generation, which in the production shape were the same field of
-        // the same record, so cleanup could never recognise an activated
-        // destination.
+        // "Never activated" is decided in the DESTINATION's own identity space:
+        // the destination installation must not have become one of the
+        // installation identities this authority holds. The previous form also
+        // demanded `approved_target_build != active_generation`, but the approved
+        // target is a BUILD identity and the production shape carries the
+        // source's own currently approved build there — so that clause was true
+        // for every prepared destination and no destination could ever be
+        // cleaned up.
         if self.generations.iter().any(|generation| {
             generation
                 .manifest
@@ -4043,8 +4051,7 @@ impl ApprovedGenerationRegistry {
                 .installation_epoch
                 .installation
                 == admission.destination_installation
-        }) || self.active_generation.as_ref() == Some(&admission.approved_target_build)
-        {
+        }) {
             return Err(InstallationError::IdentityConflict);
         }
         let Some(index) = self

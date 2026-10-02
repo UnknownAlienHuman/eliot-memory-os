@@ -2401,7 +2401,7 @@ mod tests {
 
     use super::{
         DestinationLeafObservation, IsolatedDestinationError, IsolatedDestinationRefusal,
-        PreparedDestinationMaterialisation,
+        PreparedDestinationMaterialisation, observe_destination_leaf,
     };
     use crate::{FileIdentity, InstallationError, PlatformHandle};
 
@@ -2581,4 +2581,282 @@ mod tests {
             assert_eq!(encoded, format!("\"{}\"", observation.as_str()));
         }
     }
+
+    /// The observer itself is exercised against a REAL leaf, so the enum is not
+    /// only a value the fixtures choose.
+    ///
+    /// The three arms under test are the ones a caller can actually reach:
+    /// a name nobody created, a name that is a real directory, and a name that
+    /// is a real FILE. A file matters because `exists()`-style reasoning about
+    /// "is this a directory" is not what this observer claims; it claims
+    /// whether the NAME is taken at all, and a destination that is a file is
+    /// just as much a name this operation does not own.
+    #[test]
+    fn leaf_observer_reports_absence_and_presence_on_a_real_path() {
+        let base = std::env::temp_dir().join(format!(
+            "eliot-leaf-observer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&base).expect("the observer fixture root is creatable");
+        let absent = base.join("absent-leaf");
+        assert_eq!(
+            observe_destination_leaf(&absent.to_string_lossy()),
+            Ok(DestinationLeafObservation::Absent),
+            "a name nobody created is the only observation that admits a new allocation"
+        );
+        let directory = base.join("directory-leaf");
+        std::fs::create_dir(&directory).expect("the directory leaf is creatable");
+        assert_eq!(
+            observe_destination_leaf(&directory.to_string_lossy()),
+            Ok(DestinationLeafObservation::Present)
+        );
+        let file = base.join("file-leaf");
+        std::fs::write(&file, b"occupied").expect("the file leaf is creatable");
+        assert_eq!(
+            observe_destination_leaf(&file.to_string_lossy()),
+            Ok(DestinationLeafObservation::Present),
+            "a file at the destination name is still a name this operation does not own"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The owner-declared LAYOUT decides the installation classification, and
+    /// the declared root is the one the owner's own root topology derives.
+    ///
+    /// This is the arm the name-based predecessor could never reach: it asked
+    /// whether some component happened to be spelled `installations`, and the
+    /// isolated restore area is a SIBLING of that component, so every derived
+    /// destination was lexically guaranteed to be outside. Compared against the
+    /// declared root, a path that IS inside the installation area is recognised
+    /// as such and refused, while the area itself is outside it and admitted —
+    /// so both directions of the decision are observable rather than one.
+    #[test]
+    fn declared_layout_classification_separates_the_area_from_an_installation_contour() {
+        use crate::{InstallationHostRootClass, classify_installation_host_root};
+
+        let declared = handle_installations_root();
+        let installation_key = "a".repeat(64);
+        let area = r"C:\ProgramData\Eliot\isolated-restore";
+        let classified = |path: &str| {
+            classify_installation_host_root(std::path::Path::new(path), &declared)
+                .expect("both paths are comparable Windows roots")
+        };
+
+        assert_eq!(
+            classified(area),
+            InstallationHostRootClass::Unowned,
+            "the owner-declared isolated area is a sibling of the installations root, so it is \
+             outside every installation contour"
+        );
+        assert_eq!(
+            classified(&format!(
+                r"{area}\\{installation_key}"
+            )),
+            InstallationHostRootClass::Unowned,
+            "the derived destination leaf under the area is likewise outside every installation \
+             contour, which is what makes it a legal destination at all"
+        );
+        assert_eq!(
+            classified(&format!(
+                r"{}\installations\{installation_key}\host",
+                r"C:\ProgramData\Eliot"
+            )),
+            InstallationHostRootClass::InstallationHostRoot,
+            "a real installation Host root of the declared layout is recognised"
+        );
+        assert_eq!(
+            classified(&format!(
+                r"{}\installations\{installation_key}",
+                r"C:\ProgramData\Eliot"
+            )),
+            InstallationHostRootClass::InstallationArea,
+            "the installation key itself is the installation's own area"
+        );
+        assert_eq!(
+            classified(r"C:\ProgramData\Eliot\installations\not-a-key"),
+            InstallationHostRootClass::Unowned,
+            "a component that is not an owner installation key names no installation"
+        );
+        assert_eq!(
+            classified(r"C:\ProgramData\Eliot\installations"),
+            InstallationHostRootClass::InstallationArea,
+            "the declared installations root is the area, not any installation's Host root"
+        );
+        assert_eq!(
+            classified(r"C:\Somewhere\Else\key\host"),
+            InstallationHostRootClass::Unowned,
+            "a path outside the declared root is outside every installation contour"
+        );
+    }
+
+    /// A path that cannot be compared at all is a FAULT, never `Unowned`.
+    ///
+    /// `Unowned` means "the owner looked, and this path is outside the declared
+    /// installation area". Returning it for a path the owner could not even
+    /// parse would make an unparseable caller input indistinguishable from a
+    /// proven-outside one, and the admission would proceed on a name nobody
+    /// classified.
+    #[test]
+    fn declared_layout_classification_refuses_an_uncomparable_path() {
+        use crate::{InstallationError, classify_installation_host_root};
+
+        let declared = handle_installations_root();
+        for unparseable in ["relative\\path", r"\\?\C:\verbatim", "C:no-root"] {
+            assert!(
+                matches!(
+                    classify_installation_host_root(std::path::Path::new(unparseable), &declared),
+                    Err(InstallationError::InvalidField { .. })
+                ),
+                "{unparseable} is not a comparable Windows root, so it must be a fault"
+            );
+        }
+        assert!(
+            matches!(
+                classify_installation_host_root(
+                    std::path::Path::new(r"C:\ProgramData\Eliot\installations\a\host"),
+                    &crate::PlatformHandle::new("relative-installations-root")
+                        .expect("a non-blank handle is constructible"),
+                ),
+                Err(InstallationError::InvalidField { .. })
+            ),
+            "an unparseable DECLARED root makes every classification unprovable"
+        );
+    }
+
+    /// The declared installations root is derived, not spelled out twice.
+    ///
+    /// `RuntimeStateRoots::installations_root` is the owner's own declaration,
+    /// and the installer hierarchy publishes exactly that value, so the
+    /// admission's classification root and the root the installer creates one
+    /// leaf at a time can never drift apart.
+    ///
+    /// Windows-gated because both fixtures resolve a REAL retained OS contour:
+    /// `ProgramData` through `protected_program_data_root` and the portable
+    /// root through a `UserOwnedRootReadLease`. The DERIVATION under test is
+    /// platform-independent, but the contours it is derived from are not, so on
+    /// another platform there is nothing to assert and the two
+    /// `ProfileViolation` arms below are still covered by the derivation
+    /// itself refusing `portable_dev` before it touches the OS.
+    #[cfg(windows)]
+    #[test]
+    fn declared_installations_root_is_derived_and_shared_with_the_hierarchy() {
+        use crate::{InstallationProfile, RuntimeStateRoots};
+
+        let system = profiled_system_roots();
+        let declared = system
+            .installations_root()
+            .expect("a profiled root declares an installations root");
+        assert_eq!(
+            declared.as_str(),
+            format!(
+                r"{}\Eliot\installations",
+                system.profile_anchor_root.as_str()
+            ),
+            "the declared root is the profile-root-derived installations area"
+        );
+        assert!(
+            system.installation_root.as_str().starts_with(declared.as_str())
+                && system.installation_root.as_str() != declared.as_str(),
+            "the declared area strictly CONTAINS this installation root rather than being it"
+        );
+        let area = system
+            .isolated_restore_root()
+            .expect("a profiled root declares an isolated restore area");
+        assert!(
+            !crate::WindowsPathIdentity::parse_root(area.as_str(), "test.area")
+                .expect("the area is a comparable Windows root")
+                .contains(
+                    &crate::WindowsPathIdentity::parse_root(declared.as_str(), "test.declared")
+                        .expect("the declared root is a comparable Windows root")
+                ),
+            "the isolated area is a sibling of the installations root, never inside it"
+        );
+        let hierarchy = system
+            .installer_root_hierarchy()
+            .expect("a profiled root has a declared installer hierarchy");
+        assert!(
+            hierarchy
+                .iter()
+                .any(|(name, root)| *name == "installations_root" && *root == declared),
+            "the installer hierarchy publishes the same derived installations root"
+        );
+        assert!(
+            !hierarchy
+                .iter()
+                .any(|(name, root)| *name == "installations_root" && *root != declared),
+            "there is exactly one declared installations root, so no reader can pick another"
+        );
+
+        let portable = portable_roots();
+        assert!(
+            matches!(
+                portable.installations_root(),
+                Err(crate::InstallationError::ProfileViolation(_))
+            ),
+            "portable_dev retains no shared installation area, so it declares no such root"
+        );
+        assert!(
+            matches!(
+                RuntimeStateRoots::derive_profiled(
+                    InstallationProfile::PortableDev,
+                    portable.profile_anchor_root.clone(),
+                    &"a".repeat(64),
+                ),
+                Err(crate::InstallationError::ProfileViolation(_))
+            ),
+            "portable_dev is not a profiled derivation at all"
+        );
+    }
+
+    /// A `SystemService` root topology anchored at the OS-resolved
+    /// `ProgramData`, which is the contour the production Host runs in.
+    #[cfg(windows)]
+    fn profiled_system_roots() -> crate::RuntimeStateRoots {
+        use crate::{InstallationProfile, RuntimeStateRoots};
+        let program_data = crate::protected_program_data_root()
+            .expect("ProgramData resolves for the profiled contour");
+        RuntimeStateRoots::derive_profiled(
+            InstallationProfile::SystemService,
+            crate::PlatformHandle::new(program_data.to_string_lossy().into_owned())
+                .expect("the OS-resolved anchor is a valid handle"),
+            &"a".repeat(64),
+        )
+        .expect("the profiled contour derives from its OS-validated anchor")
+    }
+
+    /// A retained disposable portable root, which declares no shared area.
+    ///
+    /// `derive_portable` re-resolves the root through a real
+    /// `UserOwnedRootReadLease`, so the fixture creates it and is therefore
+    /// Windows-gated with its only consumer.
+    #[cfg(windows)]
+    fn portable_roots() -> crate::RuntimeStateRoots {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-installations-root-portable-{}-{}",
+            std::process::id(),
+            NEXT_UNIQUE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("the portable fixture root is creatable");
+        crate::RuntimeStateRoots::derive_portable(
+            crate::PlatformHandle::new(root.to_string_lossy().into_owned())
+                .expect("the fixture root is a valid handle"),
+        )
+        .expect("the retained portable contour derives")
+    }
+
+    /// One `ProgramData`-shaped declared installations root, as a standalone
+    /// handle so the classification tests do not need a retained contour.
+    fn handle_installations_root() -> crate::PlatformHandle {
+        crate::PlatformHandle::new(r"C:\ProgramData\Eliot\installations")
+            .expect("a declared installations root is a valid handle")
+    }
+
+    /// A per-process sequence so two concurrent fixture roots never collide.
+    #[cfg(windows)]
+    static NEXT_UNIQUE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 }

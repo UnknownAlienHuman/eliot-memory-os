@@ -1910,9 +1910,12 @@ impl InstallationHostRootClass {
 ///
 /// # Errors
 ///
-/// Returns [`InstallationError::IncompleteObservation`] when either path is not
-/// a comparable Windows root, because a classification that cannot be computed
-/// is never `Unowned`: absence of proof is not proof of absence.
+/// Returns [`InstallationError::InvalidField`] when either path is not a
+/// comparable Windows root, because a classification that cannot be computed is
+/// never `Unowned`: absence of proof is not proof of absence. `InvalidField`
+/// rather than a refusal variant is deliberate — the fault is in the SHAPE of
+/// the value handed in, and a caller that receives it can tell it apart from a
+/// classification it actually computed.
 pub fn classify_installation_host_root(
     path: &Path,
     declared_installations_root: &PlatformHandle,
