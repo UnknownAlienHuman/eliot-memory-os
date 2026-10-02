@@ -6650,8 +6650,6 @@ fn validate_local_read_actual_route_owner_binding(
     let evidence = body.evidence.as_ref();
     let actual_route = evidence.and_then(|item| item.actual_route.as_deref());
     let receipt = evidence.and_then(|item| item.actual_route_receipt.as_ref());
-    let activation_resolution =
-        evidence.and_then(|item| item.activation_resolution_result.as_ref());
     let Some(envelope) = envelope else {
         // A terminal exact replay is handled before this gate and must match
         // the original ORS evidence byte-for-byte. A first persist with no
