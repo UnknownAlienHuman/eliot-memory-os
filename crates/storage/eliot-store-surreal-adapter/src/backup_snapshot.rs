@@ -104,19 +104,21 @@
 //! per-capture limits in `eliot_store_api::backup_io` plus
 //! [`PER_MEMBER_CHARGE_BYTES`]; they are not a heap measurement and no RSS claim
 //! is made from serialized size. The transport/frame/decode bytes are bounded
-//! separately and earlier: the accepted client-set facade carries an ELIOT-owned
-//! response byte ceiling into the RPC transport ([`capture_response_ceiling`],
-//! [`crate::client::snapshot_response_ceiling`]), which is issued from the
-//! capture's own admitted `bounds.max_bytes` plus the fixed registry's bounded
-//! protocol envelope, is charged against the received frame *before* UTF-8
-//! conversion and before any `serde_json::Value` is constructed, and stops the
-//! statement-list decode the moment the admitted aggregate budget is crossed.
-//! An over-budget response is therefore refused as
-//! [`StoreError::PayloadTooLarge`] at the transport boundary and recorded as
-//! [`InterruptionReason::ResponseTooLarge`], never as a provider that is gone and
-//! never as an empty denominator. What this owner additionally bounds is
-//! everything it builds on top of the decoded rows — see [`read_enumeration`]
-//! and [`decoded_class_bytes`].
+//! separately and earlier, at the accepted client-set facade
+//! ([`capture_response_ceiling`], [`crate::client::snapshot_response_ceiling`]):
+//! the session socket is constructed with an ELIOT-issued frame and message
+//! bound derived from the owner-issued [`MAX_SNAPSHOT_BYTES`]
+//! (`client::session::response_bound_config`), so an oversize provider response
+//! is refused inside the transport while it is still a network frame and is never
+//! materialised; each frame a capture read is then handed is charged against the
+//! capture's own admitted `bounds.max_bytes` plus the fixed registry's protocol
+//! envelope before any `serde_json::Value` is constructed, and the statement-list
+//! decode stops at the statement that would exceed the admitted budget. An
+//! over-budget response is therefore refused as [`StoreError::PayloadTooLarge`]
+//! and recorded as [`InterruptionReason::ResponseTooLarge`], never as a provider
+//! that is gone and never as an empty denominator. What this owner additionally
+//! bounds is everything it builds on top of the decoded rows — see
+//! [`read_enumeration`] and [`decoded_class_bytes`].
 //!
 //! Reclamation does not depend on client traffic. Every installed capture
 //! registers a retirement deadline in the owner's expiry frontier
@@ -362,39 +364,42 @@ async fn run_pinned_snapshot_query(
     .map_err(redact_snapshot_error)
 }
 
-/// Issues the transport response ceiling this capture's provider reads run
-/// under, from the capture's own admitted byte budget.
+/// Issues the response bound this capture's provider reads run under, from the
+/// capture's own admitted byte budget.
 ///
 /// The budget is the request's `bounds.max_bytes`, which
 /// [`SnapshotBeginRequest::validate`] has already proved non-zero and no
-/// stronger than [`MAX_SNAPSHOT_BYTES`]; the fixed registry adds the bounded
-/// protocol envelope on top (see
+/// stronger than [`MAX_SNAPSHOT_BYTES`]; the fixed registry adds the protocol
+/// envelope on top (see
 /// [`crate::client::snapshot_response_ceiling`]). The result is therefore never
-/// weaker than the admitted `max_bytes`, and a caller cannot select it.
+/// weaker than the admitted `max_bytes`, and a caller cannot select it. The
+/// envelope half is an engineering allowance rather than an owner-issued value
+/// and is recorded as a named limitation at
+/// `client::rpc_parse::SNAPSHOT_PROTOCOL_ENVELOPE_BYTES`.
 fn capture_response_ceiling(request: &SnapshotBeginRequest) -> Result<ResponseCeiling, StoreError> {
     crate::client::snapshot_response_ceiling(request.bounds.max_bytes)
         .map_err(AdapterError::into_store_error)
 }
 
-/// Issues the transport response ceiling for the ECXF source capture.
+/// Issues the response bound for the ECXF source capture.
 ///
 /// An [`EcxfExportRequest`] carries no byte budget of its own, so the admitted
 /// aggregate is the named content ceiling this module already enforces on
 /// exactly these rows ([`MAX_SNAPSHOT_BYTES`], checked in
-/// [`capture_ecxf_source`]). Using that existing admitted value keeps the
-/// ceiling tied to a real owner-issued limit instead of an invented constant.
+/// [`capture_ecxf_source`]). Using that existing admitted value keeps the bound
+/// tied to a real owner-issued limit instead of an invented constant.
 fn ecxf_response_ceiling() -> Result<ResponseCeiling, StoreError> {
     crate::client::snapshot_response_ceiling(MAX_SNAPSHOT_BYTES)
         .map_err(AdapterError::into_store_error)
 }
 
-/// Re-proves the response ceiling a continuation's provider read runs under.
+/// Re-proves the response bound a continuation's provider read runs under.
 ///
-/// The retained [`SnapshotState::response_ceiling_bytes`] is the ceiling the
-/// capture was opened with. Every later provider read re-issues the ceiling from
-/// the same retained admitted budget and is refused when that derivation would
-/// be *weaker* than the retained one, so a page or close can never be served
-/// under a laxer transport envelope than the capture it continues.
+/// The retained [`SnapshotState::response_ceiling_bytes`] is the bound the
+/// capture was opened with. Every later provider read re-issues it from the same
+/// retained admitted budget and is refused when that derivation would be
+/// *weaker* than the retained one, so a page or close can never be served under
+/// a laxer response envelope than the capture it continues.
 fn require_capture_response_ceiling(
     state: &SnapshotState,
 ) -> Result<ResponseCeiling, StoreError> {
@@ -1155,19 +1160,19 @@ struct SnapshotState {
     /// worst-case reservation is settled into this field at publish, and it is
     /// released only when the payload is actually freed or the entry removed.
     charged_capture_bytes: u64,
-    /// The ELIOT-owned provider-response byte ceiling this capture's provider
+    /// The ELIOT-owned provider-response byte bound this capture's provider
     /// reads run under, in bytes.
     ///
     /// Issued once at begin from the capture's own admitted `bounds.max_bytes`
-    /// plus the fixed registry's bounded protocol envelope (see
+    /// plus the fixed registry's protocol envelope (see
     /// [`capture_response_ceiling`]) and retained here, so every later page and
     /// close read is re-proved against it by
     /// [`require_capture_response_ceiling`]. This is the "snapshot profile" half
-    /// of audit requirement 3: the ceiling that actually governed the transport
-    /// is a property of the retained capture, not an implicit global.
+    /// of audit requirement 3: the response bound that actually governed the
+    /// transport is a property of the retained capture, not an implicit global.
     /// `SnapshotEndReceipt` is a frozen `eliot-store-api` type with no field for
-    /// it and is outside this leaf's mutable scope, so the ceiling is bound on
-    /// the retained record the receipt's accounting is derived from.
+    /// it and is outside this leaf's mutable scope, so the bound is bound on the
+    /// retained record the receipt's accounting is derived from.
     response_ceiling_bytes: u64,
 }
 
@@ -2402,13 +2407,14 @@ fn canonical_source_rows(
 /// a bounded charge of the observed rows. A row that cannot be re-encoded is not
 /// measurable, so it is charged out rather than charged as free.
 ///
-/// The transport bound that runs before this one, named explicitly: the
-/// accepted client-set facade issues an ELIOT-owned response byte ceiling from
-/// the capture's admitted `bounds.max_bytes` (see
-/// [`capture_response_ceiling`]), and the RPC transport charges the received
-/// frame against it before UTF-8 conversion and before any `serde_json::Value`
-/// exists, then stops the statement-list decode the moment the admitted
-/// aggregate budget is crossed. So by the time this function runs, the decoded
+/// The transport bound that runs before this one, named explicitly: the accepted
+/// client-set facade issues an ELIOT-owned response byte bound from the capture's
+/// admitted `bounds.max_bytes` (see [`capture_response_ceiling`]), the session
+/// socket is constructed under an ELIOT-issued frame and message bound
+/// (`client::session::response_bound_config`), and each frame the bounded read is
+/// handed is charged against that bound before any `serde_json::Value` exists,
+/// with the statement-list decode stopping at the statement that would exceed
+/// the admitted budget. So by the time this function runs, the decoded
 /// observation it charges is already inside an owner-issued byte envelope. This
 /// bound is the second, independent line: it is the same
 /// [`MAX_SNAPSHOT_BYTES`] content ceiling applied per admitted class as the rows
@@ -3331,8 +3337,8 @@ enum InterruptionReason {
     /// A read of the bound point failed, so the capture cannot say the point
     /// still holds.
     ProviderReadFailed,
-    /// A provider response exceeded the capture's admitted response byte
-    /// ceiling, so the read was refused before its content was decoded.
+    /// A provider response exceeded the capture's admitted response byte bound,
+    /// so the read was refused before its content was decoded.
     ///
     /// This is a bounded refusal, not a transport blip: it is neither terminal
     /// for serving (a smaller store still serves) nor a transient read that a
@@ -3476,11 +3482,11 @@ struct CaptureCallClaim {
     claim_id: u64,
     /// The progress revision this claim was validated against.
     expected_revision: u64,
-    /// The response byte ceiling this call's provider read is admitted under.
+    /// The response byte bound this call's provider read is admitted under.
     ///
     /// Re-proved from the retained capture at admission time by
     /// [`require_capture_response_ceiling`] and carried here so the read cannot
-    /// pick its own ceiling between admission and the provider await.
+    /// pick its own bound between admission and the provider await.
     response_ceiling: ResponseCeiling,
     /// Set once the matching transition was applied and the slot released.
     settled: bool,
@@ -4207,10 +4213,10 @@ pub(crate) async fn begin_snapshot(
     };
     handle.validate()?;
 
-    // The response byte ceiling this capture's provider reads run under, issued
+    // The response byte bound this capture's provider reads run under, issued
     // from the capture's own admitted `bounds.max_bytes`. It is computed before
     // the publish so the retained entry and every later page/close read are
-    // bound to the same owner-issued ceiling.
+    // bound to the same owner-issued value.
     let response_ceiling_bytes = capture_response_ceiling(&request)?.max_bytes();
     // One more acquisition for the publish. The incarnation and the entry's
     // absence are both rechecked under it, so a successor that claimed this

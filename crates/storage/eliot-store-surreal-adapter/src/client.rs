@@ -121,7 +121,7 @@ pub(crate) async fn query(
 }
 
 /// Dispatches one closed named operation whose provider response is admitted
-/// under an ELIOT-owned byte ceiling.
+/// under an ELIOT-owned byte bound.
 ///
 /// The bounded-capture entry point of the accepted client-set facade (issue
 /// #951). `config` remains an explicit argument at this seam for the same
@@ -327,7 +327,7 @@ impl RpcTransport {
     }
 
     /// Executes one closed named operation whose provider response is admitted
-    /// under an ELIOT-owned byte ceiling.
+    /// under an ELIOT-owned byte bound.
     ///
     /// The bounded-capture entry point (issue #951). Lane selection is the same
     /// closed allowlist [`RpcTransport::query`] uses: a pooled read for an
@@ -352,12 +352,12 @@ impl RpcTransport {
     }
 
     /// Executes the compatibility (non-pooled) named query under a response
-    /// byte ceiling.
+    /// byte bound.
     ///
     /// Bounded snapshot operations are all pooled reads, so this arm exists for
     /// the same reason [`RpcTransport::query_facade`] does: a name outside the
     /// read allowlist must still reach a session, and it must reach it under the
-    /// ceiling its caller admitted rather than under a weaker unbounded read.
+    /// bound its caller admitted rather than under a weaker unbounded read.
     async fn query_facade_bounded(
         &self,
         operation: &'static str,
