@@ -508,11 +508,16 @@ pub(crate) fn read_bounded_record<R: std::io::BufRead>(
         if combined_len > profile.max_record_bytes {
             return discard_oversize_record(reader, profile);
         }
-        // `carriage_return_was_content` is read through the shared binding, so
-        // this single call site both appends the byte and proves to the
-        // ownership guard below that no terminator byte is removed anywhere
-        // after the charge it was counted in.
-        if std::hint::black_box(carriage_return_was_content) {
+        // The charge that counted the held CR and the append that keeps it are
+        // the same decision, in this one block, on the one binding the charge
+        // was computed from: a byte is charged to the ceiling and appended in
+        // the same iteration that classified it, so no byte can be charged
+        // without being appended or appended without being charged. Nothing
+        // removes bytes afterwards - no terminator byte is ever popped - so
+        // `record_content_len == record.len()` holds on every path that
+        // returns a `Record`, and the content total compared against the
+        // ceiling is the exact length of the bytes handed back.
+        if carriage_return_was_content {
             record.push(b'\r');
         }
         record.extend_from_slice(measured_content);
