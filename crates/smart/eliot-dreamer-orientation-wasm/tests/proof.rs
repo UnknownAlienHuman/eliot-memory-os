@@ -28,15 +28,16 @@ use eliot_dreamer_contracts::{
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
-    CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationDisposition, OrientationError, OrientationPolicy, project_orientation,
+    CurrentEpistemicPositionHandle, InertProbeStatus, LocalOrientationFrame,
+    OrientationCoverageDenominator, OrientationDisposition, OrientationError, OrientationPolicy,
+    project_orientation,
 };
 use eliot_dreamer_orientation_wasm::{
     CallLedger, GUEST_ABI_VERSION, GUEST_TARGET, GuestError, GuestRequest, HANDLER_SUBTYPE,
     TOOLCHAIN_CHANNEL, WORLD_NAME, WORLD_PACKAGE, check_wasm_imports, decode_request,
-    decode_response, descriptor, descriptor_digest, disposition_as_str, encode_request,
-    encode_response, handle_request_typed, handle_with_ledger, is_forbidden_import,
-    list_wasm_imports, parse_disposition, qualified_export_name, run,
+    decode_response, descriptor, disposition_as_str, encode_request, encode_response,
+    handle_request_typed, handle_with_ledger, is_forbidden_import, list_wasm_imports,
+    parse_disposition, qualified_export_name, run,
 };
 use eliot_epistemic_contracts::{
     AdmittedReceipt, AdmittedReceiptParams, ClaimId, CurrentEpistemicPosition, Currentness,
@@ -470,9 +471,16 @@ fn exact_world_subtype_descriptor_abi_and_target_readiness() {
     assert!(descriptor.capability_envelope.is_empty());
     let wit = String::from_utf8(eliot_dreamer_orientation_wasm::GUEST_WIT_BYTES.to_vec())
         .expect("guest.wit is UTF-8");
-    assert!(wit.contains("package eliot:wasm@1.0.0"));
-    assert!(wit.contains("world guest"));
-    assert!(wit.contains("export run"));
+    // Substring checks against the one frozen WIT file compiled in from
+    // `GUEST_WIT_BYTES`: what they establish is that these exact declarations
+    // occur in that file. They are not a check of the accepted WIT surface as a
+    // whole - a declaration restated elsewhere in the file, or a second world,
+    // would not be seen. The spellings are anchored on the trailing syntax
+    // (`;`, `{`, `: func`) so a longer neighbour name such as `guest_x` or
+    // `runner` cannot satisfy them.
+    assert!(wit.contains("package eliot:wasm@1.0.0;"));
+    assert!(wit.contains("world guest {"));
+    assert!(wit.contains("export run: func"));
     assert_eq!(
         descriptor.wit_digest,
         sha256_hex(eliot_dreamer_orientation_wasm::GUEST_WIT_BYTES)
@@ -485,9 +493,12 @@ fn exact_world_subtype_descriptor_abi_and_target_readiness() {
     assert!(toolchain.contains("wasm32-wasip2"));
     assert!(toolchain.contains(TOOLCHAIN_CHANNEL));
     assert_eq!(GUEST_TARGET, eliot_wasm_runtime::DEFAULT_GUEST_TARGET);
-    assert_eq!(descriptor_digest(), descriptor_digest());
     // ContractChallenge path (#756, OPEN): the typed world is frozen in-test
-    // as expected-but-absent; the accepted WIT has no such arm to consume.
+    // as expected-but-absent. The two field comparisons are exact. The third is
+    // a substring absence check over that same one frozen file: it shows the
+    // spelling `dreamer-handler` occurs nowhere in it, which is what "no such
+    // arm to consume" means for a file this test reads in full. It is not a
+    // statement about any other WIT the host might later accept.
     assert_eq!(descriptor.expected_typed_world, "dreamer-handler");
     assert_eq!(descriptor.typed_world_status, "EXPECTED_NOT_ACCEPTED");
     assert!(!wit.contains("dreamer-handler"));
@@ -516,7 +527,15 @@ fn wrong_subtype_payload_version_descriptor_rejected_before_call() {
         ));
     }
     request.handler_subtype = HANDLER_SUBTYPE.to_owned();
-    // Undecodable and trailing-garbage payloads never reach native either.
+    // What these two assertions show is narrow: `run` returns `Err` for
+    // undecodable bytes and for valid bytes carrying trailing garbage. They do
+    // NOT show that either payload "never reaches native" - `run` constructs its
+    // own `CallLedger` internally, so this test cannot observe native entries.
+    // That property rests on the implementation structure instead:
+    // `run_with_ledger` decodes with `?` before it reaches `handle_with_ledger`,
+    // and `handle_with_ledger` is the only production caller of
+    // `project_orientation`. If that ordering ever moved, this comment would be
+    // what went stale, not a failing assertion.
     assert!(run(&[0xFF, 0xFE, 0x00]).is_err());
     let mut trailing = encode_request(&request).expect("encode");
     trailing.extend_from_slice(b"trailing");
@@ -657,8 +676,20 @@ fn rivals_conflicts_gaps_probes_clarification_preserved() {
         candidate.bundle.omissions[0].handle
     );
     assert_eq!(packet.recommended_probes_or_next_actions.len(), 1);
+    // The derived enum is the wire spelling, unchanged from the previously
+    // emitted bytes, so no packet digest moves. `InertProbeStatus` has exactly
+    // one variant, so comparing a status to `ModelRecommendationInert` cannot
+    // fail; assert the serialized spelling instead.
+    assert_eq!(
+        serde_json::to_value(InertProbeStatus::ModelRecommendationInert).expect("status json"),
+        serde_json::json!("model_recommendation_inert")
+    );
     for probe in &packet.recommended_probes_or_next_actions {
-        assert_eq!(probe.status, "model_recommendation_inert");
+        assert_eq!(
+            serde_json::to_value(probe.status).expect("probe status json"),
+            serde_json::json!("model_recommendation_inert"),
+            "a probe status carried in the packet must keep the wire spelling"
+        );
         assert_eq!(probe.text, candidate.model.recommended_probes[0]);
     }
     assert_eq!(
@@ -852,7 +883,15 @@ fn exactly_one_native_call_no_duplicate_algorithm() {
     assert_eq!(ledger.calls(), 1);
     assert_eq!(response.native_calls, 1);
     assert!(response.packet.is_some());
-    // Structural proof: exactly one native call site outside tests.
+    // Structural check, deliberately narrower than its former claim. It counts
+    // the literal call spelling `project_orientation(` across those four files,
+    // so what it establishes is only that the spelling occurs exactly once
+    // there - which is real evidence against a plainly duplicated call. What it
+    // cannot establish is "exactly one call site": a second site reached
+    // through a re-export or a path alias would not match the literal, so the
+    // count would stay 1 while that site existed. The behavioural half is
+    // `ledger.calls() == 1` above, which runs the real path and counts actual
+    // native entries rather than source text.
     let mut sites = 0;
     for name in ["lib.rs", "conversion.rs", "descriptor.rs", "export.rs"] {
         sites += read_src(name).matches("project_orientation(").count();
@@ -861,8 +900,17 @@ fn exactly_one_native_call_no_duplicate_algorithm() {
 }
 
 // WORK_UNIT_CASE: 632/12
+/// Closed tripwire over a named list of forbidden source spellings.
+///
+/// Each spelling below is absent from all four guest source files, so a
+/// literal use of any one of them fails this test. It does NOT establish the
+/// absence of a generic serialization escape as a class: an aliased import
+/// (`use serde_json::Value as V;`), `serde_json::Map`, `serde_json::from_str`,
+/// `#[serde(flatten)]`, or a re-exported bridge would all pass it. Deciding a
+/// class rather than a list needs to resolve symbols instead of spellings,
+/// which no dependency here can do.
 #[test]
-fn no_generic_serialization_escape() {
+fn forbidden_spelling_list_absent_from_guest_sources() {
     let (request, _) = guest_request(false, false, "A bounded hypothesis");
     let bytes = encode_request(&request).expect("encode");
     let json = String::from_utf8(bytes).expect("canonical UTF-8");
@@ -950,7 +998,6 @@ fn standalone_capsule_through_e_host() {
 fn build_artifact_identity_and_admission_state() {
     assert_eq!(env!("CARGO_PKG_NAME"), "eliot-dreamer-orientation-wasm");
     assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.0");
-    assert_eq!(descriptor_digest(), descriptor_digest());
     assert_eq!(GUEST_TARGET, "wasm32-wasip2");
     // Controller-owned handoff (issue #632): the package must NOT be a root
     // workspace member on this branch; admission is a separate serialized turn.
@@ -989,21 +1036,31 @@ fn property_output_equals_native_without_proof_authority_effect() {
                 packet.disposition,
                 OrientationDisposition::Complete | OrientationDisposition::Partial
             ));
-            // The response envelope carries no proof/authority/effect surface.
+            // Substring absence check over the encoded response. The spellings
+            // are anchored on JSON key syntax (`"name":`), so they match a key
+            // rather than a value that merely contains the word; the bytes are
+            // compact canonical JSON, so `"name":` is the exact key form. What
+            // it shows is that these six key spellings occur nowhere in this
+            // envelope. It does not show the envelope lacks an effect surface
+            // under some other name, and it is not a proof of non-existence.
             let json = String::from_utf8(encode_response(&response).expect("encode"))
                 .expect("response UTF-8");
             for absent in [
-                "\"authority_granted\"",
-                "\"effect\"",
-                "\"finish\"",
-                "\"promotion\"",
-                "\"executed_probe\"",
-                "\"answer\"",
+                "\"authority_granted\":",
+                "\"effect\":",
+                "\"finish\":",
+                "\"promotion\":",
+                "\"executed_probe\":",
+                "\"answer\":",
             ] {
                 assert!(!json.contains(absent), "response must not raise {absent}");
             }
             for probe in &packet.recommended_probes_or_next_actions {
-                assert_eq!(probe.status, "model_recommendation_inert");
+                assert_eq!(
+                    serde_json::to_value(probe.status).expect("probe status json"),
+                    serde_json::json!("model_recommendation_inert"),
+                    "a probe status carried in the packet must keep the wire spelling"
+                );
             }
         }
     }
