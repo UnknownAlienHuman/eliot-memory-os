@@ -251,6 +251,33 @@ pub enum ContrastiveAbstractionResult {
     NoLearnablePattern { reason: String },
 }
 
+/// Current-task meaning frame.
+///
+/// Partial-candidate disposition, resolved against the actual callers on this
+/// branch rather than assumed:
+///
+/// - A partial candidate is legitimate **and stays Rust-side**.
+///   `crates/eliot-engine/src/context.rs::packet_task_meaning_frame` and
+///   `crates/eliot-app/src/mcp_stdio/operator.rs::dispatch_operator_snapshot`
+///   each build a frame from a real packet and fill the rest through
+///   `..TaskMeaningFrame::default()`. `Default` is Rust application
+///   construction; it is not a wire fallback, and it is never the producer of
+///   a partial *document*.
+/// - No production caller decodes a partial wire document. The wire decoders
+///   are `crates/eliot-app/src/mcp_stdio/task_handlers.rs::dispatch_task_meaning`
+///   (`TaskMeaningToolInput`), the same file's `dispatch_experience_recall`
+///   (`ExperienceRecallToolInput`), the `ExperienceRecallRequest.task_frame`
+///   member, and the `TaskCognitionView.task_meaning` read-back in
+///   `cognition.rs`. Each of them reaches this type through a member set that
+///   requires every field, so a document omitting `task_id`, `user_goal` or
+///   `current_evidence` refuses at the decoder.
+/// - Therefore no struct-wide `#[serde(default)]` is carried. Absence stays
+///   explicit unknown (I5.16) rather than reading back as a default identity or
+///   empty evidence that could satisfy a current-task boundary.
+///
+/// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused
+/// by `deny_unknown_fields`; `entity_roles` refuses a repeated key before map
+/// insertion.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskMeaningFrame {
@@ -782,4 +809,647 @@ pub struct CognitiveTransferLabReport {
     pub over_reconstruction_count: u32,
     pub operator_review_count: u32,
     pub receipt: Option<WriteReceiptRef>,
+}
+
+#[cfg(test)]
+mod decoder_boundary {
+    use super::*;
+
+    // Every fixture below is raw text, never a `serde_json::Value`: a `Value`
+    // fixture collapses a lexical duplicate member while parsing, so it cannot
+    // observe the facts the duplicate-key refusals exist to pin. Duplicate-key
+    // documents are stored as strings for the same reason.
+    const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+    const SESSION: &str = "22222222-2222-4222-8222-222222222222";
+    const RECEIPT: &str = "33333333-3333-4333-8333-333333333333";
+    const WRITE: &str = "44444444-4444-4444-8444-444444444444";
+    const FORMED_AT: &str = "2026-01-02T03:04:05Z";
+
+    /// One producer's exact wire form for an `ExperienceCase`: the nested problem,
+    /// causal, intervention and transfer owners, a `RAW_EPISODE` maturity in
+    /// SCREAMING_SNAKE_CASE, an explicit zero negative-transfer count, and a
+    /// candidate-only authority carrying a canonical receipt reference.
+    const CASE: &str = r#"{
+  "case_id": "case-fixture-001",
+  "project_id": "11111111-1111-4111-8111-111111111111",
+  "source_episode_refs": ["episode:fixture-1"],
+  "source_task_refs": ["task-fixture-001"],
+  "source_agent_sessions": ["22222222-2222-4222-8222-222222222222"],
+  "source_branch_commit_environment": {
+    "branch": "refs/heads/fixture",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "environment": ["linux-x64"],
+    "observed_at": "2026-01-02T03:04:05Z"
+  },
+  "problem_frame": {
+    "goal_pattern": "make the failing owner check pass",
+    "task_or_action_type": "governed_task",
+    "trigger_or_symptom": "the owner check exits non-zero",
+    "entity_roles": {"subject": "owner-suite", "object": "owner-check"},
+    "desired_state_transition": "the owner check exits zero",
+    "constraints": ["no new dependency"],
+    "relevant_invariants": ["invariant:fixture-1"]
+  },
+  "causal_model": {
+    "mechanism": "the fixture was never registered",
+    "causal_chain": ["the runner enumerates registered fixtures"],
+    "expected_observables": ["one passing owner fixture"],
+    "falsification_cues": ["the failure survives registration"]
+  },
+  "intervention_and_outcome": {
+    "attempted_actions": ["register the fixture"],
+    "decisive_action_or_non_action": "register the fixture",
+    "observed_outcome": "the owner fixture passes",
+    "verifier_refs": ["verifier:ci-fixture"]
+  },
+  "transfer_boundary": {
+    "retrieval_cues": ["fixture registration"],
+    "conceptual_aliases": ["test wiring"],
+    "applies_when": ["the runner discovers tests dynamically"],
+    "does_not_apply_when": ["the suite is generated at build time"],
+    "counterexample_refs": ["case:counter-1"],
+    "required_local_checks": ["run the owner package test"],
+    "recommended_first_probe": "run the owner test once",
+    "forbidden_direct_inference": ["the recorded effect was executed"]
+  },
+  "maturity": {
+    "state": "TRANSFER_VALIDATED",
+    "support_count": 3,
+    "contrast_count": 1,
+    "cross_host_transfer_count": 1,
+    "negative_transfer_count": 0
+  },
+  "authority": {
+    "current_truth": false,
+    "candidate_only": true,
+    "exact_source_refs": ["episode:fixture-1"],
+    "reasoning_job_ref": "job:fixture-1",
+    "review_refs": ["review:fixture-1"],
+    "canonical_receipt": {
+      "receipt_id": "33333333-3333-4333-8333-333333333333",
+      "write_id": "44444444-4444-4444-8444-444444444444"
+    }
+  },
+  "formed_at": "2026-01-02T03:04:05Z"
+}"#;
+
+    /// One producer's exact wire form for an `ExperiencePattern`, with a
+    /// `PATTERN_CANDIDATE` maturity and explicit `null` optional members, so the
+    /// distinction between absent-unknown and default-empty stays visible.
+    const PATTERN: &str = r#"{
+  "pattern_id": "pattern-fixture-001",
+  "project_id": "11111111-1111-4111-8111-111111111111",
+  "member_case_refs": ["case:fixture-001"],
+  "invariant_core": ["the owner package must run"],
+  "varying_surface_features": ["fixture identifiers"],
+  "success_conditions": ["the owner package test passes"],
+  "failure_conditions": ["the owner package test is never run"],
+  "counterexamples": ["case:counter-1"],
+  "applicability_classifier_features": ["package-local test wiring"],
+  "required_local_probe": "run the owner package test",
+  "transfer_evidence": ["transfer:fixture-1"],
+  "maturity": {
+    "state": "PATTERN_CANDIDATE",
+    "support_count": 2,
+    "contrast_count": 1,
+    "cross_host_transfer_count": 0,
+    "negative_transfer_count": 0
+  },
+  "authority": {
+    "current_truth": false,
+    "candidate_only": true,
+    "exact_source_refs": ["case:fixture-001"],
+    "reasoning_job_ref": null,
+    "review_refs": [],
+    "canonical_receipt": null
+  },
+  "formed_at": "2026-01-02T03:04:05Z"
+}"#;
+
+    /// One producer's exact wire form for a complete `TaskMeaningFrame`, as
+    /// `dispatch_task_meaning` and `dispatch_experience_recall` receive it.
+    const FRAME: &str = r#"{
+  "task_id": "task-fixture-001",
+  "user_goal": "close the semantic-memory decoder",
+  "normalized_goal": "close the semantic-memory decoder",
+  "execution_class": {
+    "domain": "code",
+    "action": "read_only",
+    "artifact": "code",
+    "subsystem_refs": ["crate:eliot-types"],
+    "source": "explicit_contract"
+  },
+  "task_or_action_type": "governed_task",
+  "desired_state_transition": "adversarial bytes refuse before typed output",
+  "problem_or_failure_signature": "a duplicate member survives a value round trip",
+  "entity_roles": {"subject": "eliot-types", "object": "semantic_memory"},
+  "project_module_boundary": ["crate:eliot-types"],
+  "files_symbols_config": ["crates/eliot-types/src/semantic_memory.rs"],
+  "control_data_state_path": ["crate:eliot-types -> semantic_memory"],
+  "constraints": ["one writer per file"],
+  "invariants": ["accepted wire bytes stay accepted"],
+  "current_evidence": ["commit:fixture"],
+  "material_unknowns": [],
+  "expected_artifact": "the closed decoder",
+  "predicted_observable": "duplicate members are refused",
+  "verifier_need": "package-local decoder proof",
+  "abstraction_level_needed": "auto",
+  "codecortex_report_ref": "codecortex:fixture"
+}"#;
+
+    /// `MemoryNeedDecision`, the recall request's owned `need` member.
+    const NEED: &str = r#"{
+  "task_id": "task-fixture-001",
+  "need": "causal_case",
+  "reason": "the current task has an unexplained failure",
+  "expected_decision_delta": "name the mechanism",
+  "max_candidates": 4,
+  "max_expansions": 1,
+  "deep_reconstruction_allowed": false,
+  "stop_if_no_novelty": true
+}"#;
+
+    /// `MemoryExposurePolicy`, the recall request's owned policy member.
+    const EXPOSURE: &str = r#"{
+  "mode": "mature_experience_only",
+  "allowed_kinds": ["causal_case", "experience_pattern"],
+  "excluded_handles": [],
+  "packet_cache_partition": "mature-experience",
+  "current_state_cross_session_memory_allowed": false
+}"#;
+
+    /// Replace the first occurrence of `member` with a duplicate of itself, so
+    /// the refused document is byte-for-byte identical to the accepted one
+    /// except for the repeated member. The lexical fact cannot be built from a
+    /// `serde_json::Value` without losing it.
+    fn with_duplicate_member(document: &str, member: &str, duplicate: &str) -> String {
+        let once = document.replacen(member, &format!("{member}\n  {duplicate}"), 1);
+        if once == document {
+            panic!("fixture member {member} must appear exactly once to duplicate it");
+        }
+        once
+    }
+
+    /// Remove one whole member line from a canonical document, so the result is
+    /// still well formed JSON and the only difference from the accepted document
+    /// is the absent member.
+    fn without_member(document: &str, member: &str) -> String {
+        let reduced = document.replacen(&format!("{member}\n"), "", 1);
+        if reduced == document {
+            panic!("fixture member {member} must appear exactly once to omit it");
+        }
+        reduced
+    }
+
+    /// The recall request as `dispatch_experience_recall` builds it: the current
+    /// task frame is an owned member, so a partial frame cannot satisfy the
+    /// current-task boundary.
+    fn recall_request(task_frame: &str) -> String {
+        recall_request_with(task_frame, NEED, EXPOSURE)
+    }
+
+    /// The same recall request with one substituted owned member, so the nested
+    /// need, policy and frame owners are all closed by the same decoder.
+    fn recall_request_with(task_frame: &str, need: &str, exposure_policy: &str) -> String {
+        format!(
+            "{{\"project_id\":\"{PROJECT}\",\"task_frame\":{task_frame},\"need\":{need},\"exposure_policy\":{exposure_policy}}}"
+        )
+    }
+
+    // WORK_UNIT_CASE: 938/2 -- current accepted bytes, digests and enum spellings unchanged.
+    //
+    // Positive case. Every named type in this module decodes from its producer's
+    // raw bytes, the `outcome` tag keeps its two snake_case spellings,
+    // `ExperienceMaturityState` keeps its SCREAMING_SNAKE_CASE spelling against
+    // every other enum's snake_case, and an explicit zero stays a zero.
+    #[test]
+    fn canonical_semantic_memory_documents_keep_their_current_wire_shape() {
+        let case = match serde_json::from_str::<ExperienceCase>(CASE) {
+            Ok(case) => case,
+            Err(error) => panic!("the canonical case must decode: {error}"),
+        };
+        assert_eq!(case.case_id, "case-fixture-001");
+        assert_eq!(case.project_id.to_string(), PROJECT);
+        assert_eq!(case.source_agent_sessions[0].to_string(), SESSION);
+        assert!(
+            case.source_branch_commit_environment.observed_at.is_some(),
+            "an explicit observed_at is retained"
+        );
+        assert_eq!(case.problem_frame.entity_roles["subject"], "owner-suite");
+        assert_eq!(case.maturity.state, ExperienceMaturityState::TransferValidated);
+        assert_eq!(case.maturity.negative_transfer_count, 0);
+        assert!(!case.authority.current_truth, "a candidate is not current truth");
+        assert!(case.authority.candidate_only);
+        assert_eq!(
+            case.authority
+                .canonical_receipt
+                .as_ref()
+                .map(|receipt| (receipt.receipt_id.to_string(), receipt.write_id.to_string())),
+            Some((RECEIPT.to_owned(), WRITE.to_owned()))
+        );
+        match serde_json::to_string(&case) {
+            Ok(encoded) => assert!(
+                encoded.contains(&format!(r#""formed_at":"{FORMED_AT}""#)),
+                "the RFC3339 wire form of formed_at is unchanged"
+            ),
+            Err(error) => panic!("re-encoding the accepted case must succeed: {error}"),
+        }
+
+        let pattern = match serde_json::from_str::<ExperiencePattern>(PATTERN) {
+            Ok(pattern) => pattern,
+            Err(error) => panic!("the canonical pattern must decode: {error}"),
+        };
+        assert_eq!(pattern.pattern_id, "pattern-fixture-001");
+        assert_eq!(pattern.maturity.state, ExperienceMaturityState::PatternCandidate);
+        assert!(pattern.authority.reasoning_job_ref.is_none());
+        assert!(pattern.authority.canonical_receipt.is_none());
+
+        let formed = match serde_json::from_str::<ExperienceFormationResult>(&format!(
+            "{{\"outcome\":\"formed\",\"experience_case\":{CASE}}}"
+        )) {
+            Ok(formed) => formed,
+            Err(error) => panic!("the formed outcome must decode: {error}"),
+        };
+        let ExperienceFormationResult::Formed { experience_case } = &formed else {
+            panic!("the formed outcome must decode into the formed variant");
+        };
+        assert_eq!(experience_case.case_id, "case-fixture-001");
+
+        let learned_nothing = match serde_json::from_str::<ExperienceFormationResult>(
+            r#"{"outcome":"nothing_to_learn","reason":"no contrasting pair"}"#,
+        ) {
+            Ok(result) => result,
+            Err(error) => panic!("the nothing_to_learn outcome must decode: {error}"),
+        };
+        let ExperienceFormationResult::NothingToLearn { reason } = &learned_nothing else {
+            panic!("nothing_to_learn must decode into its own variant");
+        };
+        assert_eq!(reason, "no contrasting pair");
+
+        let abstracted =
+            match serde_json::from_str::<ContrastiveAbstractionResult>(&format!(
+                "{{\"outcome\":\"formed\",\"pattern\":{PATTERN}}}"
+            )) {
+                Ok(result) => result,
+                Err(error) => panic!("the formed abstraction must decode: {error}"),
+            };
+        let ContrastiveAbstractionResult::Formed { pattern } = &abstracted else {
+            panic!("the formed abstraction must decode into the formed variant");
+        };
+        assert_eq!(pattern.pattern_id, "pattern-fixture-001");
+
+        let no_pattern = match serde_json::from_str::<ContrastiveAbstractionResult>(
+            r#"{"outcome":"no_learnable_pattern","reason":"one case is not a contrast"}"#,
+        ) {
+            Ok(result) => result,
+            Err(error) => panic!("no_learnable_pattern must decode: {error}"),
+        };
+        assert!(matches!(
+            no_pattern,
+            ContrastiveAbstractionResult::NoLearnablePattern { .. }
+        ));
+
+        let frame = match serde_json::from_str::<TaskMeaningFrame>(FRAME) {
+            Ok(frame) => frame,
+            Err(error) => panic!("the canonical task frame must decode: {error}"),
+        };
+        assert_eq!(frame.task_id, "task-fixture-001");
+        assert_eq!(frame.entity_roles["object"], "semantic_memory");
+        assert_eq!(
+            frame.execution_class.as_ref().map(|class| class.domain),
+            Some(crate::TaskExecutionDomain::Code)
+        );
+        assert_eq!(frame.codecortex_report_ref.as_deref(), Some("codecortex:fixture"));
+
+        let request =
+            match serde_json::from_str::<ExperienceRecallRequest>(&recall_request(FRAME)) {
+                Ok(request) => request,
+                Err(error) => panic!("the canonical recall request must decode: {error}"),
+            };
+        assert_eq!(request.task_frame.task_id, "task-fixture-001");
+        assert_eq!(request.need.need, MemoryNeed::CausalCase);
+        assert_eq!(request.exposure_policy.mode, MemoryExposureMode::MatureExperienceOnly);
+        assert_eq!(
+            request.exposure_policy.allowed_kinds,
+            [MemoryKind::CausalCase, MemoryKind::ExperiencePattern]
+        );
+
+        // The wire spellings are pinned in both directions: the lowercase
+        // maturity spelling must keep refusing, so a rename cannot silently
+        // invalidate stored records.
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                "\"TRANSFER_VALIDATED\"",
+                "\"transfer_validated\""
+            ))
+            .is_err(),
+            "the SCREAMING_SNAKE_CASE maturity spelling is the accepted one"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                "\"TRANSFER_VALIDATED\"",
+                "\"RawEpisode\""
+            ))
+            .is_err(),
+            "a Rust variant spelling is not a wire spelling"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceRecallRequest>(&recall_request_with(
+                FRAME,
+                &NEED.replace(r#""causal_case""#, r#""CausalCase""#),
+                EXPOSURE
+            ))
+            .is_err(),
+            "the snake_case need spelling is the accepted one"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceRecallRequest>(&recall_request_with(
+                FRAME,
+                NEED,
+                &EXPOSURE.replace(
+                    r#""experience_pattern""#,
+                    r#""ExperiencePattern""#
+                )
+            ))
+            .is_err(),
+            "the snake_case memory-kind spelling is the accepted one"
+        );
+    }
+
+    // WORK_UNIT_CASE: 938/3 -- an unknown outer protected member refuses.
+    //
+    // Refusal case. An unknown protected member on an ordinary envelope, and on
+    // the recall request that owns the task frame, must not ride along as
+    // current semantic truth.
+    #[test]
+    fn unknown_outer_protected_members_are_refused() {
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                r#""case_id": "case-fixture-001","#,
+                r#""case_id": "case-fixture-001", "applied": true,"#
+            ))
+            .is_err(),
+            "an added applied-effect member must not decode as an experience case"
+        );
+        assert!(
+            serde_json::from_str::<ExperiencePattern>(&PATTERN.replace(
+                r#""pattern_id": "pattern-fixture-001","#,
+                r#""pattern_id": "pattern-fixture-001", "erased": true,"#
+            ))
+            .is_err(),
+            "an added erasure member must not decode as an experience pattern"
+        );
+        assert!(
+            serde_json::from_str::<TaskMeaningFrame>(&FRAME.replace(
+                r#""task_id": "task-fixture-001","#,
+                r#""task_id": "task-fixture-001", "restored": true,"#
+            ))
+            .is_err(),
+            "an added restore member must not decode as a task meaning frame"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceRecallRequest>(&recall_request(
+                &FRAME.replace(
+                    r#""task_id": "task-fixture-001","#,
+                    r#""task_id": "task-fixture-001", "authorized": true,"#
+                )
+            ))
+            .is_err(),
+            "an added authorization member must not decode inside the recall request"
+        );
+    }
+
+    // WORK_UNIT_CASE: 938/4 -- an unknown nested protected member refuses.
+    //
+    // Refusal case. Owned nested structures are closed too: an unknown member on
+    // the problem frame, the environment owner, the authority, the exposure
+    // policy and the nested execution class must refuse before typed output.
+    #[test]
+    fn unknown_nested_protected_members_are_refused() {
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                r#""entity_roles": {"subject": "owner-suite", "object": "owner-check"},"#,
+                r#""entity_roles": {"subject": "owner-suite", "object": "owner-check", "operator": "owner"},"#
+            ))
+            .is_err(),
+            "an unknown nested role member must not decode"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                r#""commit": "0123456789abcdef0123456789abcdef01234567","#,
+                r#""commit": "0123456789abcdef0123456789abcdef01234567", "signed_by": "owner","#
+            ))
+            .is_err(),
+            "an unknown member of the source environment owner must not decode"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                r#""candidate_only": true,"#,
+                r#""candidate_only": true, "automatic_apply_allowed": true,"#
+            ))
+            .is_err(),
+            "a decoded authority is not self-issued apply permission"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&CASE.replace(
+                r#""write_id": "44444444-4444-4444-8444-444444444444""#,
+                r#""write_id": "44444444-4444-4444-8444-444444444444", "verified": true"#
+            ))
+            .is_err(),
+            "an unknown member of the nested receipt reference must not decode"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceRecallRequest>(&recall_request_with(
+                FRAME,
+                NEED,
+                &EXPOSURE.replace(
+                    r#""mode": "mature_experience_only","#,
+                    r#""mode": "mature_experience_only", "escalate": true,"#
+                )
+            ))
+            .is_err(),
+            "an unknown member of the nested exposure policy must not decode"
+        );
+        assert!(
+            serde_json::from_str::<TaskMeaningFrame>(&FRAME.replace(
+                r#""source": "explicit_contract""#,
+                r#""source": "explicit_contract", "inferred": true"#
+            ))
+            .is_err(),
+            "an unknown member of the nested execution class must not decode"
+        );
+    }
+
+    // WORK_UNIT_CASE: 938/5 -- duplicate identity, discriminator and map members refuse.
+    //
+    // Refusal case. Each refused document is the accepted document plus one
+    // repeated member, so the refusal is proven to come from the lexical
+    // duplicate and not from a shape difference.
+    #[test]
+    fn duplicate_identity_discriminator_and_map_members_are_refused() {
+        let duplicate_identity = with_duplicate_member(
+            CASE,
+            r#""case_id": "case-fixture-001","#,
+            r#""case_id": "case-fixture-002","#,
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&duplicate_identity).is_err(),
+            "a repeated case identity must refuse instead of keeping one value"
+        );
+
+        let duplicate_maturity = with_duplicate_member(
+            CASE,
+            r#""state": "TRANSFER_VALIDATED","#,
+            r#""state": "RAW_EPISODE","#,
+        );
+        assert!(
+            serde_json::from_str::<ExperienceCase>(&duplicate_maturity).is_err(),
+            "a repeated maturity state must refuse instead of keeping one value"
+        );
+
+        let duplicate_map_key = with_duplicate_member(
+            FRAME,
+            r#""subject": "eliot-types","#,
+            r#""subject": "operator","#,
+        );
+        assert!(
+            serde_json::from_str::<TaskMeaningFrame>(&duplicate_map_key).is_err(),
+            "a repeated entity-role key must refuse before map insertion"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceRecallRequest>(&recall_request(&duplicate_map_key))
+                .is_err(),
+            "a repeated entity-role key must refuse inside the recall request too"
+        );
+
+        // The raw-byte fixture is load bearing: the same bytes normalize through
+        // `Value` without any refusal, which is why the boundary cannot be
+        // proven from a normalized object.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&duplicate_map_key).is_ok(),
+            "a value parse collapses the duplicate, so only raw bytes can pin it"
+        );
+
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(
+                r#"{"outcome":"formed","outcome":"nothing_to_learn","reason":"retagged"}"#
+            )
+            .is_err(),
+            "a repeated outcome discriminator must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ContrastiveAbstractionResult>(
+                r#"{"outcome":"formed","outcome":"no_learnable_pattern","reason":"retagged"}"#
+            )
+            .is_err(),
+            "a repeated outcome discriminator must refuse for both result enums"
+        );
+    }
+
+    // WORK_UNIT_CASE: 938/6 -- unknown variants and mismatched tag payloads refuse.
+    //
+    // Refusal case. The `outcome` tag is not renamed and no variant is added: an
+    // unknown tag, a payload that belongs to the other variant, and a payload
+    // that is missing entirely all refuse.
+    #[test]
+    fn unknown_variants_and_mismatched_outcome_payloads_are_refused() {
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(
+                r#"{"outcome":"maybe_formed","reason":"proposed"}"#
+            )
+            .is_err(),
+            "an unknown outcome tag must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(&format!(
+                r#"{{"outcome":"nothing_to_learn","experience_case":{CASE}}}"#
+            ))
+            .is_err(),
+            "a formed payload under the nothing_to_learn tag must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(
+                r#"{"outcome":"formed","reason":"no case attached"}"#
+            )
+            .is_err(),
+            "a nothing_to_learn payload under the formed tag must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(r#"{"outcome":"formed"}"#).is_err(),
+            "a formed outcome without its owned case must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ContrastiveAbstractionResult>(
+                r#"{"outcome":"no_learnable_pattern","pattern":{"pattern_id":"pattern-fixture-001"}}"#
+            )
+            .is_err(),
+            "a formed payload under the no_learnable_pattern tag must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ContrastiveAbstractionResult>(
+                r#"{"outcome":"no_learnable_pattern"}"#
+            )
+            .is_err(),
+            "an outcome without its reason must refuse"
+        );
+        assert!(
+            serde_json::from_str::<ExperienceFormationResult>(
+                r#"{"experience_case":{"case_id":"case-fixture-001"}}"#
+            )
+            .is_err(),
+            "a missing outcome tag must not fall back to a variant"
+        );
+    }
+
+    // WORK_UNIT_CASE: 938/7 -- a partial frame cannot satisfy a current-task boundary.
+    //
+    // Refusal case. `Default` is Rust application construction: a partial
+    // candidate built in Rust is legitimate, and serializing it produces a
+    // complete document. A document that *omits* a member refuses, so
+    // default-empty identity or empty evidence never reaches a current-task
+    // boundary through the wire.
+    #[test]
+    fn a_partial_task_meaning_frame_cannot_become_a_current_task_frame() {
+        let candidate = TaskMeaningFrame {
+            task_id: "task-fixture-001".to_owned(),
+            user_goal: "close the semantic-memory decoder".to_owned(),
+            ..TaskMeaningFrame::default()
+        };
+        assert_eq!(
+            candidate.expected_artifact, "",
+            "the Rust-side partial candidate leaves unknown members empty"
+        );
+        let complete = match serde_json::to_string(&candidate) {
+            Ok(encoded) => encoded,
+            Err(error) => panic!("a Rust-side partial candidate must serialize: {error}"),
+        };
+        assert!(complete.contains(r#""expected_artifact":"""#));
+        match serde_json::from_str::<TaskMeaningFrame>(&complete) {
+            Ok(round_tripped) => assert_eq!(round_tripped, candidate),
+            Err(error) => panic!("a serialized complete frame must decode: {error}"),
+        }
+
+        // Each omission below removes one whole member line, so the result is
+        // still well formed JSON and the only difference from the accepted
+        // document is the absent member.
+        for (member, missing) in [
+            (r#""task_id": "task-fixture-001","#, "task identity"),
+            (r#""user_goal": "close the semantic-memory decoder","#, "user goal"),
+            (
+                r#""current_evidence": ["commit:fixture"],"#,
+                "current evidence",
+            ),
+        ] {
+            let omitted = without_member(FRAME, member);
+            assert!(
+                serde_json::from_str::<TaskMeaningFrame>(&omitted).is_err(),
+                "a frame missing its {missing} must refuse instead of defaulting"
+            );
+            assert!(
+                serde_json::from_str::<ExperienceRecallRequest>(&recall_request(&omitted))
+                    .is_err(),
+                "a recall request whose current task frame is missing its {missing} must refuse"
+            );
+        }
+    }
 }
