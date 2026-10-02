@@ -609,9 +609,17 @@ impl GovernedWorkEnvelope {
     ///
     /// Exactly
     /// `%LOCALAPPDATA%\Eliot\fixtures\<fixture namespace>`. The namespace is
-    /// derived from the whole lane tuple, so two work items never share one
-    /// directory, and the directory lives outside the build root so the Cargo
-    /// lane never owns or cleans runtime fixture state.
+    /// the LAST path segment, so the one retained string and the physical
+    /// directory cannot drift: there is no second name to keep in step with it.
+    /// The namespace is derived from the whole lane tuple, so two work items
+    /// never share one directory, and the directory lives outside the build
+    /// root so the Cargo lane never owns or cleans runtime fixture state.
+    ///
+    /// This is the input that makes the stored namespace physical: the runtime
+    /// claim a work item declares ([`LaneIdentity::fixture_resource_claims`]),
+    /// the directory the Kernel creates per job, and every child environment
+    /// that names it all resolve through this one function, so a namespace that
+    /// is stored but not honoured has no way to reach disk.
     ///
     /// # Errors
     ///
@@ -632,8 +640,10 @@ impl GovernedWorkEnvelope {
     /// resolves to, and both are emitted together: a child that knows the root
     /// without the namespace cannot prove which lane allocated it, and a child
     /// that knows the namespace without the root still resolves an ambient
-    /// fixture location. A work item with no fixture root therefore cannot be
-    /// started by any governed instrument.
+    /// fixture location. The root is read back from [`Self::fixture_root`],
+    /// which resolves it from the one retained namespace, so the two values a
+    /// child is given cannot name two different lanes. A work item with no
+    /// fixture root therefore cannot be started by any governed instrument.
     ///
     /// # Errors
     ///
@@ -641,7 +651,7 @@ impl GovernedWorkEnvelope {
     /// is invalid.
     pub fn fixture_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
         let namespace = self.fixture_namespace()?;
-        let root = fixture_root_of(&self.local_app_data, &namespace);
+        let root = self.fixture_root()?;
         Ok(vec![
             (FIXTURE_NAMESPACE_ENV.to_owned(), namespace),
             (FIXTURE_ROOT_ENV.to_owned(), path_text(&root)),
@@ -786,6 +796,12 @@ fn fixture_namespace_of(
 }
 
 /// The physical fixture directory one namespace resolves to.
+///
+/// The namespace is the last segment, so the physical root is a FUNCTION of
+/// the one retained value rather than a second name that has to be kept in
+/// step with it. Every physical use of the namespace — the exclusive resource
+/// claim, the directory the Kernel creates, and the root each child is told —
+/// goes through here.
 fn fixture_root_of(local_app_data: &Path, namespace: &str) -> PathBuf {
     local_app_data
         .join("Eliot")
@@ -844,4 +860,156 @@ fn segment(value: &str, field: &'static str) -> Result<(), WorkEnvelopeError> {
 /// Renders a derived root for the environment, which is text, not a path.
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real canonical directory for the local application-data root.
+    ///
+    /// The envelope requires one (`UnresolvedLocalAppData`), so a test that
+    /// derives a root has to hand it a directory that actually exists rather
+    /// than an invented path.
+    fn canonical_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("eliot-envelope-{label}"));
+        std::fs::create_dir_all(&root).expect("local app data root must create");
+        std::fs::canonicalize(&root).expect("local app data root must canonicalize")
+    }
+
+    fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => unreachable!("{error:?}"),
+        }
+    }
+
+    fn fingerprint_for(candidate: &str) -> BuildFingerprint {
+        BuildFingerprint {
+            workspace: "eliot".to_owned(),
+            candidate: candidate.to_owned(),
+            toolchain: "rustc 1.89.0 (x86_64-pc-windows-msvc)".to_owned(),
+            target: "x86_64-pc-windows-msvc".to_owned(),
+            profile: "dev".to_owned(),
+            features: Vec::new(),
+            environment_class: "non-inheriting-productive-testd".to_owned(),
+            source_closure_digest: crate::sha256_of(b"source-closure"),
+            manifest_digest: crate::sha256_of(b"manifest"),
+            build_script_digest: None,
+            proc_macro_digest: None,
+            build_class: "debug".to_owned(),
+            contract_revision: "rev-1".to_owned(),
+        }
+    }
+
+    fn lane_for(work_item_id: &str, candidate: &str, root: &Path) -> LaneIdentity {
+        LaneIdentity {
+            work_item_id: work_item_id.to_owned(),
+            workspace_id: "eliot".to_owned(),
+            worktree_id: "main-worktree".to_owned(),
+            fingerprint: fingerprint_for(candidate),
+            build_mode: BuildMode::InteractiveIncremental,
+            local_app_data: root.to_owned(),
+        }
+    }
+
+    /// Issue #1897 (AUD8): two DIFFERENT namespaces must resolve to two
+    /// DIFFERENT physical roots, and the namespace must reach the child
+    /// environment. A namespace that is stored, hashed and equality-checked but
+    /// never resolved is inert, and this is the proof that it is not: every
+    /// distinct lane gets its own directory, its own exclusive resource claim,
+    /// and both fixture bindings in the environment a governed child runs with.
+    #[test]
+    fn distinct_fixture_namespaces_resolve_to_distinct_physical_roots() {
+        let local_app_data = canonical_root("distinct-namespaces");
+        let lane = lane_for("wi-1897-a", "candidate-a", &local_app_data);
+        let other = lane_for("wi-1897-b", "candidate-b", &local_app_data);
+
+        // The two lanes differ in BOTH work item and build inputs, so their
+        // namespaces differ for both reasons a fixture root may differ.
+        let namespace = ok(lane.fixture_namespace());
+        let other_namespace = ok(other.fixture_namespace());
+        assert_ne!(namespace, other_namespace);
+
+        // The physical root is a function of the retained namespace: it is the
+        // last path segment, so the stored string and the directory cannot
+        // drift, and two namespaces cannot share one directory.
+        let root = ok(lane.fixture_root());
+        let other_root = ok(other.fixture_root());
+        assert_ne!(root, other_root);
+        assert_eq!(root.file_name().and_then(|n| n.to_str()), Some(&namespace));
+        assert_eq!(
+            root.parent(),
+            Some(
+                local_app_data
+                    .join("Eliot")
+                    .join(FIXTURE_ROOT_DIRECTORY)
+                    .as_path()
+            )
+        );
+
+        // The claim a submitting owner declares is named by that same derived
+        // root, so the allocator grants two distinct exclusive leases instead of
+        // letting two jobs touch one fixture tree.
+        let claim = ok(lane.fixture_resource_claims());
+        assert_eq!(claim.len(), 1);
+        assert_eq!(claim[0].kind, crate::ResourceKind::Fixture);
+        assert_eq!(claim[0].name, path_text(&root));
+        let other_claim = ok(other.fixture_resource_claims());
+        assert_ne!(claim[0].name, other_claim[0].name);
+
+        // Both bindings reach the child environment, and each names the lane
+        // that allocated it.
+        let environment = ok(lane.fixture_environment());
+        assert_eq!(
+            environment,
+            vec![
+                (FIXTURE_NAMESPACE_ENV.to_owned(), namespace.clone()),
+                (FIXTURE_ROOT_ENV.to_owned(), path_text(&root)),
+            ]
+        );
+        assert_eq!(
+            ok(other.fixture_environment()),
+            vec![
+                (FIXTURE_NAMESPACE_ENV.to_owned(), other_namespace),
+                (FIXTURE_ROOT_ENV.to_owned(), path_text(&other_root)),
+            ]
+        );
+
+        std::fs::remove_dir_all(&local_app_data).expect("local app data root must clean");
+    }
+
+    /// The pre-allocation lane and the allocated envelope derive ONE namespace
+    /// and ONE physical root. The claims an owner declares before the envelope
+    /// exists and the namespace the store later derives must be the same value
+    /// by construction, not two derivations that happen to agree; the declared
+    /// claim is what the allocator grants a lease against, so a second
+    /// derivation would be a second directory.
+    #[test]
+    fn lane_and_envelope_derive_one_namespace_and_one_root() {
+        let local_app_data = canonical_root("one-derivation");
+        let lane = lane_for("wi-1897-shared", "candidate-shared", &local_app_data);
+        let lane_namespace = ok(lane.fixture_namespace());
+        let lane_root = ok(lane.fixture_root());
+        let claims = ok(lane.fixture_resource_claims());
+        let envelope = ok(GovernedWorkEnvelope::allocate(
+            lane,
+            claims.clone(),
+            Vec::new(),
+        ));
+        assert_eq!(ok(envelope.fixture_namespace()), lane_namespace);
+        assert_eq!(ok(envelope.fixture_root()), lane_root);
+        assert_eq!(
+            ok(envelope.fixture_environment()),
+            vec![
+                (FIXTURE_NAMESPACE_ENV.to_owned(), lane_namespace),
+                (FIXTURE_ROOT_ENV.to_owned(), path_text(&lane_root)),
+            ]
+        );
+        // The claim the owner declared before allocation is exactly the claim
+        // the allocated envelope carries, so the grant that backs it names one
+        // directory.
+        assert_eq!(envelope.resource_claims, claims);
+        std::fs::remove_dir_all(&local_app_data).expect("local app data root must clean");
+    }
 }

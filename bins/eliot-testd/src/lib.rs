@@ -1214,6 +1214,15 @@ pub struct TestdDerivedIntentParams {
     pub target_root: String,
     /// Canonical Cargo home/cache root admitted for this job.
     pub cache_root: String,
+    /// The fixture namespace and physical fixture root this work item was
+    /// allocated, read off the RETAINED work envelope (issue #1897, AUD8).
+    ///
+    /// Both bindings arrive together and are the exact pair the Kernel-issued
+    /// intent carries, because the environment projection is inside that
+    /// intent's `effect_digest` and the dispatch gate requires the two digests
+    /// to be equal. `None` only for a job admitted without a lane, which
+    /// resolves no lane fixture root at all rather than an ambient one.
+    pub fixture_environment: Option<Vec<(String, String)>>,
 }
 
 /// Derives one [`ProcessIntent`] only from the admitted profile binding
@@ -1330,10 +1339,19 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
 /// with no governed profile receipt as the quarantined legacy lane
 /// (issue #1813 W6; `Justfile` quick-lane note,
 /// `scripts/verify.ps1` `VERIFY_QUARANTINE`).
+///
+/// Issue #1897 (AUD8): a lane that carries a work envelope is bound to that
+/// envelope's fixture namespace and the physical root it resolves to. These
+/// are the SAME two bindings `TestdProcessToolIntent::validate_for_roots`
+/// emits on the Kernel-issued intent, so the re-derived intent's
+/// `effect_digest` — which covers the whole environment projection — still
+/// equals the Kernel-issued one. Without them this side re-derives a strictly
+/// smaller environment, the two digests can never agree, and
+/// `present_dispatch_admission` refuses every enveloped dispatch.
 fn derive_testd_intent_environment(
     params: &TestdDerivedIntentParams,
 ) -> Result<EnvironmentProjection, TestdError> {
-    if params.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
+    let projection = if params.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
         if !params.tool_environment.is_empty() {
             return Err(TestdError::Invalid {
                 field: "tool_environment",
@@ -1344,14 +1362,37 @@ fn derive_testd_intent_environment(
         values.insert("CARGO_TARGET_DIR".to_owned(), params.target_root.clone());
         values.insert("CARGO_HOME".to_owned(), params.cache_root.clone());
         EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
-            .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))
+            .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))?
     } else {
         validate_productive_tool_environment(
             &params.tool_environment,
             &params.executable_absolute,
             &params.target_root,
             &params.cache_root,
-        )
+        )?
+    };
+    // Issue #1897 (AUD8): the fixture namespace and the physical root it
+    // resolves to are an input to fixture isolation, not a retained label, so
+    // they travel into the child that writes the fixtures. The values are the
+    // RETAINED envelope's own pair, taken whole and never one key without the
+    // other, so this side and the Kernel-issued side emit byte-identical
+    // bindings. A job with no envelope is a lane that was never allocated one:
+    // its child resolves no lane fixture root at all rather than an ambient
+    // one, which is the pre-lane authority and is not this route's concern.
+    if let Some(fixture_bindings) = params.fixture_environment.as_deref() {
+        let mut values = projection.non_secret().clone();
+        for (name, value) in fixture_bindings {
+            if values.insert(name.clone(), value.clone()).is_some() {
+                return Err(TestdError::Invalid {
+                    field: "fixture_environment",
+                    reason: "a fixture binding collides with an admitted environment key",
+                });
+            }
+        }
+        EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
+            .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))
+    } else {
+        Ok(projection)
     }
 }
 
@@ -2055,6 +2096,21 @@ fn derive_dispatch_process_intent(
     // The Kernel-admitted slot suffix and the durable job arguments proved
     // equal at the dispatch agreement gate; the sealed argv derives from
     // the admitted material.
+    // Issue #1897 (AUD8): the fixture namespace and the physical root it
+    // resolves to are read off the RETAINED envelope on the row the store just
+    // reloaded — the same pair the Kernel issued the intent with — so this
+    // re-derived intent carries the identical bindings and its `effect_digest`
+    // still equals the issued one at `present_dispatch_admission`. A job with no
+    // retained envelope is a pre-lane job and keeps the pre-lane authority.
+    let fixture_environment = job
+        .work_envelope
+        .as_ref()
+        .map(|envelope| {
+            envelope
+                .fixture_environment()
+                .map_err(|error| TestdError::InvalidBinding)
+        })
+        .transpose()?;
     let params = TestdDerivedIntentParams {
         job_id: material.job_id.clone(),
         operation_id: job.process.operation_id.clone(),
@@ -2069,6 +2125,7 @@ fn derive_dispatch_process_intent(
         generation_root: job.target_roots.source_root.clone(),
         target_root: job.target_roots.target_root.clone(),
         cache_root: job.target_roots.cache_root.clone(),
+        fixture_environment,
     };
     derive_testd_intent(&params)
 }
@@ -2873,6 +2930,10 @@ mod tests {
             generation_root: cwd.to_string_lossy().into_owned(),
             target_root: cwd.to_string_lossy().into_owned(),
             cache_root: cwd.to_string_lossy().into_owned(),
+            // This job is the admission-time probe, which is admitted without a
+            // lane and so carries no envelope fixture bindings. A lane's
+            // namespace/root pair is proven on the enveloped route below.
+            fixture_environment: None,
         };
         let intent =
             super::derive_testd_intent(&params).expect("intent must derive from the binding");
@@ -2915,6 +2976,82 @@ mod tests {
             Err(eliot_process::ProcessExecutionError::Unavailable(_))
         ));
         std::fs::remove_dir_all(&cwd).expect("probe cwd must clean");
+    }
+
+    /// Issue #1897 (AUD8): the retained lane's fixture namespace and the
+    /// physical root it resolves to reach the RE-DERIVED child intent.
+    ///
+    /// The environment projection is inside `ProcessIntent::effect_digest`, and
+    /// `present_dispatch_admission` requires that digest to equal the
+    /// Kernel-issued one, so a side that re-derives a strictly smaller
+    /// environment can never satisfy the gate. This proves the testd side
+    /// carries the same pair the envelope derives, that it lands in the sealed
+    /// child environment, and that omitting it changes the digest — which is why
+    /// both legs must carry it.
+    #[test]
+    fn rederived_intent_carries_the_retained_fixture_namespace_and_root() {
+        use eliot_testd_core::{FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV, TESTD_ADMITTED_PROFILE};
+
+        let tool = admitted_tool_binding();
+        let cwd =
+            std::env::temp_dir().join(format!("eliot-testd-fixture-env-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).expect("fixture env cwd must create");
+
+        let fixture_root = cwd.join("fixtures").join("fx-lane-1897");
+        std::fs::create_dir_all(&fixture_root).expect("fixture root must create");
+        let namespace = "fx-lane-1897".to_owned();
+        let fixture_environment = vec![
+            (FIXTURE_NAMESPACE_ENV.to_owned(), namespace.clone()),
+            (
+                FIXTURE_ROOT_ENV.to_owned(),
+                fixture_root.to_string_lossy().into_owned(),
+            ),
+        ];
+
+        let params = super::TestdDerivedIntentParams {
+            job_id: "job-testd-fixture-env-1".to_owned(),
+            operation_id: "testd-op-fixture-env-1".to_owned(),
+            process_tree_id: "job-testd-fixture-env-1-tree".to_owned(),
+            profile: TESTD_ADMITTED_PROFILE.to_owned(),
+            slot_suffix: Vec::new(),
+            generation: 1,
+            session_nonce: "testd-fixture-env-session-01".to_owned(),
+            executable_absolute: tool.executable_absolute.clone(),
+            executable_sha256: tool.executable_sha256.clone(),
+            tool_environment: Vec::new(),
+            generation_root: cwd.to_string_lossy().into_owned(),
+            target_root: cwd.to_string_lossy().into_owned(),
+            cache_root: cwd.to_string_lossy().into_owned(),
+            fixture_environment: Some(fixture_environment),
+        };
+        let bound = super::derive_testd_intent(&params).expect("intent must derive");
+
+        // Both bindings reach the sealed child environment by their contract
+        // names, so the child that writes fixtures resolves this lane's tree.
+        let non_secret = bound.environment().non_secret();
+        assert_eq!(non_secret.get(FIXTURE_NAMESPACE_ENV), Some(&namespace));
+        assert_eq!(
+            non_secret.get(FIXTURE_ROOT_ENV),
+            Some(&fixture_root.to_string_lossy().into_owned())
+        );
+        bound.validate().expect("bound intent must validate");
+
+        // The same params WITHOUT the fixture bindings derive a different
+        // environment and therefore a different effect digest. That is the
+        // proof this leg had to grow the keys: the digests are equal only
+        // because both sides carry them.
+        let mut without = params;
+        without.fixture_environment = None;
+        let bare = super::derive_testd_intent(&without).expect("intent must derive");
+        assert!(
+            bare.environment()
+                .non_secret()
+                .get(FIXTURE_NAMESPACE_ENV)
+                .is_none()
+        );
+        assert_ne!(bare.effect_digest(), bound.effect_digest());
+
+        std::fs::remove_dir_all(&cwd).expect("fixture env cwd must clean");
     }
 
     /// The dispatch-wire drive seam projects cancellation without executing:
