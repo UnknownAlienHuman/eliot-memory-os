@@ -643,7 +643,6 @@ impl PooledSession {
         } else {
             self.session().request(operation, "query", params).await?
         };
-        };
         let mut results = RpcResults::from_value(&value)?;
         if results.values_len() < prefix_len {
             return Err(AdapterError::Serialization(

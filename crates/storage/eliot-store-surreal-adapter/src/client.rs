@@ -59,8 +59,8 @@ pub(crate) use backup_snapshot::{
     MEMBER_CLASS_ROW_LIMIT, SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement,
     snapshot_capability, snapshot_response_ceiling, validate_snapshot_operation,
 };
-pub(crate) use rpc_parse::ResponseCeiling;
 pub(crate) use provider_owner::ProviderOwner;
+pub(crate) use rpc_parse::ResponseCeiling;
 use session::RpcSession;
 use session_pool::{SessionPool, SessionRole};
 
