@@ -3,8 +3,8 @@
 //! These checks cover normalization and cache refusal using a scripted test
 //! executor; they do not claim a live analyzer launch or authenticated daemon
 //! queue proof. The live executable is
-//! `examples/live_acceptance.rs`; selected-source owner adoption is covered
-//! from the daemon's original caller composition.
+//! `examples/live_acceptance.rs`; selected-source owner adoption requires the
+//! daemon's original caller tests.
 //!
 //! Documentation routing: route `sha256:63ff31555e625ef8901dba3e1321c1f9af9e5ef43a9a71fa216486d794c86dd8`,
 //! read `sha256:33bb06ee7117e508fbbf976c7457b6174f7d2aac233c1815fe70d36be4391d73`,
