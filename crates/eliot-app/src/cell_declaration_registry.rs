@@ -247,7 +247,7 @@ fn check_residual_markers(contract: &toml::Value) -> Result<(), String> {
 mod tests {
     use super::{
         CELL_CONTRACT, CONTRACT_DECLARED_BY, ELIOTD_MANIFEST, cell_declaration_guard,
-        check_contract_mirror, manifest_cells, manifest_owners,
+        check_contract_mirror, check_residual_markers, manifest_cells, manifest_owners,
     };
 
     /// The real baked pair the production guard reads.
@@ -334,6 +334,33 @@ mod tests {
             .unwrap_or_else(|error| panic!("the mutated contract must still parse: {error}"));
         let (cells, owners) = real_declaration();
         check_contract_mirror(&mutated, &cells, &owners)
+    }
+
+    /// Run the real residual-marker stage over one mutation of the real contract.
+    fn markers_of_mutated_contract(from: &str, to: &str) -> Result<(), String> {
+        let mutated: toml::Value = toml::from_str(&replace_once(REAL_CONTRACT, from, to))
+            .unwrap_or_else(|error| panic!("the mutated contract must still parse: {error}"));
+        check_residual_markers(&mutated)
+    }
+
+    #[test]
+    fn raising_the_proof_ceiling_without_the_registry_is_refused() {
+        // Arm: the real contract's `proof_ceiling` is raised to a generated
+        // registry ceiling while the executable `CapabilityCellRegistry` is
+        // still absent (#13 scope). Support and status markers are untouched
+        // and still carry their residual, so only the exact-ceiling comparison
+        // can refuse the overclaim; this test pins that the ceiling must not be
+        // raised by editing the contract alone.
+        let result = markers_of_mutated_contract(
+            "proof_ceiling = \"CAPABILITY_CELL_REGISTRY_SOURCE_EDGE_CANDIDATE\"\n",
+            "proof_ceiling = \"CAPABILITY_CELL_REGISTRY_GENERATED\"\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("cell contract claims proof ceiling CAPABILITY_CELL_REGISTRY_GENERATED; raising it requires the executable registry, not this declaration projection".to_owned()),
+            "the ceiling must not be raisable without the executable registry"
+        );
     }
 
     #[test]
