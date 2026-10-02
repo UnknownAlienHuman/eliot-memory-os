@@ -118,9 +118,7 @@ impl RollbackContour {
             Self::BackupPrepared => "host.phase-b rollback backup prepared",
             Self::RestoreRequested => "host.phase-b rollback restore requested",
             Self::RestoreBackupOpenFailed => "host.phase-b rollback restore backup open failed",
-            Self::RestoreBackupVerifyFailed => {
-                "host.phase-b rollback restore backup verify failed"
-            }
+            Self::RestoreBackupVerifyFailed => "host.phase-b rollback restore backup verify failed",
             Self::RestoreBackupReadFailed => "host.phase-b rollback restore backup read failed",
             Self::RestoreDestinationOpenFailed => {
                 "host.phase-b rollback restore destination open failed"
@@ -258,10 +256,11 @@ pub(super) fn phase_b_write_rollback_backup(
         })? {
         PublicationOutcome::Published(_) => {}
         PublicationOutcome::Unknown(_) => {
-            let lease = phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
-                rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
-                error
-            })?;
+            let lease =
+                phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
+                    rollback_backup_observe(RollbackContour::BackupOpenFailed, Some(&profile));
+                    error
+                })?;
             lease.verify().map_err(|error| {
                 rollback_backup_observe(RollbackContour::BackupVerifyFailed, Some(&profile));
                 HostError::RecoveryRequired(error)
@@ -313,10 +312,11 @@ pub fn phase_b_restore_or_remove(
     })?;
     if std::fs::symlink_metadata(&backup).is_ok() {
         rollback_backup_observe(RollbackContour::RestoreRequested, Some(&profile));
-        let backup_lease = phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
-            rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
-            error
-        })?;
+        let backup_lease =
+            phase_b_open_existing(profile, portable_root, &backup).map_err(|error| {
+                rollback_backup_observe(RollbackContour::RestoreBackupOpenFailed, Some(&profile));
+                error
+            })?;
         backup_lease.verify().map_err(|error| {
             rollback_backup_observe(RollbackContour::RestoreBackupVerifyFailed, Some(&profile));
             HostError::RecoveryRequired(error)
@@ -387,13 +387,14 @@ pub fn phase_b_restore_or_remove(
         // No rollback sidecar exists: the uncommitted destination itself is
         // the rollback effect, so this contour observes the removal request,
         // the post-delete absence proof, and every failure disposition.
-        let lease = phase_b_open_existing(profile, portable_root, destination).map_err(|error| {
-            rollback_backup_observe(
-                RollbackContour::RemovalDestinationOpenFailed,
-                Some(&profile),
-            );
-            error
-        })?;
+        let lease =
+            phase_b_open_existing(profile, portable_root, destination).map_err(|error| {
+                rollback_backup_observe(
+                    RollbackContour::RemovalDestinationOpenFailed,
+                    Some(&profile),
+                );
+                error
+            })?;
         lease.verify().map_err(|error| {
             rollback_backup_observe(
                 RollbackContour::RemovalDestinationVerifyFailed,
@@ -402,11 +403,17 @@ pub fn phase_b_restore_or_remove(
             HostError::RecoveryRequired(error)
         })?;
         let current = phase_b_lease_bytes(&lease).map_err(|error| {
-            rollback_backup_observe(RollbackContour::RemovalDestinationReadFailed, Some(&profile));
+            rollback_backup_observe(
+                RollbackContour::RemovalDestinationReadFailed,
+                Some(&profile),
+            );
             error
         })?;
         let current_digest = phase_b_bytes_digest(&current).map_err(|error| {
-            rollback_backup_observe(RollbackContour::RemovalDestinationReadFailed, Some(&profile));
+            rollback_backup_observe(
+                RollbackContour::RemovalDestinationReadFailed,
+                Some(&profile),
+            );
             error
         })?;
         if preserve_template_digest.is_none_or(|expected| expected != &current_digest) {
