@@ -1310,44 +1310,38 @@ mod retained_root_observation_tests {
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
-    fn fixture_parent() -> PathBuf {
-        let workspace = std::env::current_dir()
-            .expect("test working directory is available")
-            .canonicalize()
-            .expect("test working directory canonicalizes");
-        let base = workspace.join("target").join("issue-1831-source-fixtures");
-        std::fs::create_dir_all(&base).expect("lane fixture base is created");
-        let base = base
-            .canonicalize()
-            .expect("lane fixture base canonicalizes");
-        assert!(
-            base.starts_with(&workspace),
-            "fixture remains in this lane workspace"
-        );
+    fn fixture_destination() -> PathBuf {
         let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let fixture = base.join(format!("retained-root-{}-{id}", std::process::id()));
-        std::fs::create_dir(&fixture).expect("unique lane fixture directory is created");
-        fixture
+        std::env::temp_dir().join(format!(
+            "eliot-1831-retained-root-{}-{id}",
+            std::process::id()
+        ))
     }
 
-    fn cleanup_fixture(owner: OwnedDirectoryPublication, fixture: &Path) {
-        let temporary = owner.temporary_path().to_path_buf();
-        assert_eq!(temporary.parent(), Some(fixture));
-        assert!(
-            temporary
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| name.starts_with(".bundle.tmp."))
-        );
+    fn cleanup_fixture(owner: OwnedDirectoryPublication) {
+        let handle = owner
+            .temporary_handle
+            .as_ref()
+            .expect("original create owner retains the temporary handle");
+        let handle_path = final_windows_path_from_handle(handle)
+            .expect("temporary path reads from original retained handle");
+        let handle_identity = file_identity_from_handle(handle)
+            .expect("temporary identity reads from original retained handle");
+        assert!(windows_paths_equal(&handle_path, owner.temporary_path()));
+        assert_eq!(handle_identity, owner.temporary_identity());
+
+        let retained_root = owner
+            .observe_retained_root()
+            .expect("original retained root remains measurable during cleanup");
+        assert_eq!(retained_root.file_identity(), owner.parent_identity());
+        delete_created_directory_handle(handle)
+            .expect("cleanup marks the original operation-owned directory handle");
         drop(owner);
-        std::fs::remove_dir(&temporary).expect("empty owned temporary fixture is removed");
-        std::fs::remove_dir(fixture).expect("unique fixture directory is removed");
     }
 
     #[test]
     fn retained_root_observation_reports_original_handle_identity_and_acl() {
-        let fixture = fixture_parent();
-        let destination = fixture.join("bundle");
+        let destination = fixture_destination();
         let publication = OwnedDirectoryPublication::create(&destination)
             .expect("original publication owner retains the fixture root");
         let observation = publication
@@ -1371,13 +1365,12 @@ mod retained_root_observation_tests {
                 .bytes()
                 .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         );
-        cleanup_fixture(publication, &fixture);
+        cleanup_fixture(publication);
     }
 
     #[test]
     fn retained_root_observation_refuses_a_changed_owner_identity() {
-        let fixture = fixture_parent();
-        let destination = fixture.join("bundle");
+        let destination = fixture_destination();
         let mut publication = OwnedDirectoryPublication::create(&destination)
             .expect("original publication owner retains the fixture root");
         let expected_identity = publication.contour.parent_identity;
@@ -1388,6 +1381,6 @@ mod retained_root_observation_tests {
             Err(DirectoryPublicationError::IdentityMismatch)
         );
         publication.contour.parent_identity = expected_identity;
-        cleanup_fixture(publication, &fixture);
+        cleanup_fixture(publication);
     }
 }
