@@ -291,9 +291,7 @@ fn kernel_activation_readiness_requested_fields<'a>(
     ));
     fields.push((
         "authority_epoch",
-        super::host_job_launch::LaunchIdentityField::Number(
-            candidate.kernel_epoch.sequence.get(),
-        ),
+        super::host_job_launch::LaunchIdentityField::Number(candidate.kernel_epoch.sequence.get()),
     ));
     fields.push((
         "ready_receipt_activation",
@@ -301,9 +299,7 @@ fn kernel_activation_readiness_requested_fields<'a>(
     ));
     fields.push((
         "ready_receipt_operation",
-        super::host_job_launch::LaunchIdentityField::Text(
-            ready.activation_operation_id.as_str(),
-        ),
+        super::host_job_launch::LaunchIdentityField::Text(ready.activation_operation_id.as_str()),
     ));
     fields
 }
@@ -332,9 +328,7 @@ fn kernel_activation_readiness_observed_fields<'a>(
     ));
     fields.push((
         "authority_epoch",
-        super::host_job_launch::LaunchIdentityField::Number(
-            permit.authority_epoch.sequence.get(),
-        ),
+        super::host_job_launch::LaunchIdentityField::Number(permit.authority_epoch.sequence.get()),
     ));
     fields.push((
         "resource_generation",
@@ -352,9 +346,7 @@ fn kernel_activation_readiness_observed_fields<'a>(
     ));
     fields.push((
         "receipt_journal_sequence",
-        super::host_job_launch::LaunchIdentityField::Number(
-            activation_receipt.journal_sequence,
-        ),
+        super::host_job_launch::LaunchIdentityField::Number(activation_receipt.journal_sequence),
     ));
     fields.push((
         "ready_activation",
@@ -362,9 +354,7 @@ fn kernel_activation_readiness_observed_fields<'a>(
     ));
     fields.push((
         "ready_operation",
-        super::host_job_launch::LaunchIdentityField::Text(
-            ready.activation_operation_id.as_str(),
-        ),
+        super::host_job_launch::LaunchIdentityField::Text(ready.activation_operation_id.as_str()),
     ));
     fields.push((
         "ready_process",

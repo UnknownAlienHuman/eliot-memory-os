@@ -287,12 +287,18 @@ pub fn host_scm_unknown_is_transient_pending(detail: &ServiceInspectionUnknownDe
 /// binding rather than a temporary; an observation SCM reported no live
 /// process for reads `Unavailable`, exactly as before.
 fn scm_matching_observed_fields<'a>(
-    requested: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    requested: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
     observed_config_digest: &'a str,
     state: ServiceState,
     checkpoint: Option<u64>,
     process: Option<&'a str>,
-) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
     let mut fields = requested.to_vec();
     fields.push((
         "observed_config_digest",
@@ -328,9 +334,15 @@ fn scm_matching_observed_fields<'a>(
 /// readback carries no creation time, so the slot cannot claim one — and a
 /// stage, state, or PID the platform could not observe reads `Unavailable`.
 fn scm_unknown_diagnostic_fields<'a>(
-    requested: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    requested: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
     detail: &ServiceInspectionUnknownDetail,
-) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
     let mut fields = requested.to_vec();
     fields.push((
         "win32_error",
@@ -381,7 +393,10 @@ fn scm_unknown_diagnostic_fields<'a>(
 /// state root and platform root are paths and never enter a record.
 fn scm_candidate_identity(
     spec: &InstalledCandidateSpec,
-) -> [(&'static str, super::host_job_launch::LaunchIdentityField<'_>); 3] {
+) -> [(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'_>,
+); 3] {
     [
         (
             "installation",
@@ -411,12 +426,18 @@ fn scm_candidate_identity(
 /// digests stay in the returned readback and never enter a record, and a
 /// readback that reported no live process reads `Unavailable`.
 fn scm_candidate_readback_observed_fields<'a>(
-    identity: &[(&'static str, super::host_job_launch::LaunchIdentityField<'a>)],
+    identity: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'a>,
+    )],
     observed_config_digest: &'a str,
     inspection: &ServiceRegistrationRuntimeInspection,
     observed_process: Option<&'a str>,
     manifest_installed: bool,
-) -> Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)> {
+) -> Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)> {
     let mut fields = identity.to_vec();
     fields.push((
         "observed_config_digest",
