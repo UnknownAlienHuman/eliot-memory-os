@@ -82,8 +82,8 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest:
-            eliot_store_api::supported_admission_contract_set_digest().unwrap(),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .unwrap(),
         operation_manifest_digest: eliot_store_api::operation_manifest_set_digest(&manifests)
             .unwrap(),
         // Derived bindings, never placeholders. The envelope path renders
