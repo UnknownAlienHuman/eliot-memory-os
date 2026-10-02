@@ -409,8 +409,8 @@ pub fn check_inline_response_ceiling(
 /// rejected explicitly and never interpreted as a generic command.
 ///
 /// The returned envelope is validated but not staged: persistence,
-/// duplicate suppression, acknowledgement phases, and cursor advancement
-/// remain owned by the receiver's durable owner.
+/// acknowledgement phases, and cursor advancement remain the duty of a
+/// receiver-side owner that does not exist in this crate.
 ///
 /// # Errors
 ///
@@ -448,9 +448,10 @@ pub fn lifecycle_event_envelope(frame: &Frame) -> Result<EventEnvelope, Transpor
 /// logical event and must never trigger a second canonical application.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LifecycleEventDispatch {
-    /// First receipt of this event identity. The durable owner persists
-    /// identity, sequence, disposition, source handle, retry route and
-    /// causal linkage before advancing any cursor.
+    /// First receipt of this event identity. This crate persists nothing:
+    /// whether identity, sequence, disposition, source handle, retry route and
+    /// causal linkage are recorded before any cursor advances is a
+    /// receiver-side owner's duty, and no such owner exists here.
     New(EventEnvelope),
     /// The same identity, sequence and content was already observed: an
     /// idempotent duplicate, not a second event.
@@ -460,6 +461,8 @@ pub enum LifecycleEventDispatch {
 /// Routes one lifecycle `Event` frame through the `EventEnvelope`
 /// replay/ack contract (I7.2 frame envelope, I7.4 lifecycle `Event`).
 ///
+/// Its only caller is [`dispatch_lifecycle_message`].
+///
 /// The frame must carry the envelope via [`lifecycle_event_envelope`]: a
 /// non-`Event` kind/message or a payload that is not an envelope is rejected
 /// explicitly and never interpreted as a generic command. An envelope whose
@@ -468,10 +471,13 @@ pub enum LifecycleEventDispatch {
 /// identity. An already-observed identity, sequence and content reports
 /// [`LifecycleEventDispatch::Duplicate`]; nothing is staged twice.
 ///
-/// The returned envelope is validated but not staged: persistence, receipt
-/// phases and cursor advancement remain owned by the receiver's durable
-/// owner, which also retains the presented identity, source handle and
-/// retry route for rejected events.
+/// The returned envelope is validated and its identity is recorded in the
+/// caller-supplied ledger, but nothing is persisted: receipt phases, cursor
+/// advancement and retention of the presented identity, source handle and
+/// retry route for rejected events remain the duty of a receiver-side owner
+/// that does not exist in this crate. The ledger itself is an in-memory
+/// map, not durable storage, so duplicate suppression holds only for as long
+/// as that one live ledger value.
 ///
 /// # Errors
 ///
@@ -512,13 +518,19 @@ pub fn dispatch_lifecycle_event(
 /// `RequestIdentity.cancellation_id` is applied through the existing
 /// [`CancellationRegistry::cancel_stable`] point, so a retried `Cancel`
 /// with the same idempotency identity observes the recorded terminal as
-/// [`CancellationDisposition::Duplicate`] instead of a second effect, and
-/// the recorded disposition survives retries and reconnects: the registry
-/// is owned by the lifecycle owner, never by the fenced session, and
-/// entries persist until an explicit `reap`. An unregistered identity
-/// reports [`CancellationDisposition::Unknown`] without minting state;
-/// observe the standing disposition without advancing state via
-/// [`CancellationRegistry::state`].
+/// [`CancellationDisposition::Duplicate`] instead of a second effect.
+///
+/// The recorded disposition is stable against *retries* only, and only for
+/// as long as the same live [`CancellationRegistry`] value is presented: the
+/// registry is a plain in-memory `BTreeMap` (see [`CancellationRegistry`])
+/// with no persistence, no serialization and no readback path, so a process
+/// restart loses every entry. Whether a reconnect preserves a disposition
+/// depends entirely on whether the reconnecting owner carries that same
+/// registry value across the reconnect; this crate holds no registry owner,
+/// no transport loop and no session owner that would make it true. An
+/// unregistered identity reports [`CancellationDisposition::Unknown`]
+/// without minting state; observe the standing disposition without
+/// advancing state via [`CancellationRegistry::state`].
 ///
 /// # Errors
 ///
@@ -549,7 +561,7 @@ pub fn dispatch_lifecycle_cancel(
 /// One entry point routes each lifecycle message to the owner that defines its
 /// meaning, so a caller never improvises a control path:
 ///
-/// - a lifecycle `Event` goes through the durable `EventEnvelope` replay/ack
+/// - a lifecycle `Event` goes through the `EventEnvelope` replay/ack
 ///   envelope ([`dispatch_lifecycle_event`]);
 /// - `Cancel` goes through the cancellation registry
 ///   ([`dispatch_lifecycle_cancel`]);
@@ -565,6 +577,14 @@ pub fn dispatch_lifecycle_cancel(
 /// A message with no request form and no control flow of its own — `Ready`,
 /// `Result`, `EventAck` and the native-worker messages — is refused by the same
 /// gate rather than interpreted as a generic command.
+///
+/// Reachability, stated as measured: this entry point is the sole non-test
+/// caller of [`dispatch_lifecycle_event`], [`dispatch_lifecycle_cancel`] and
+/// [`dispatch_lifecycle_control`], and it currently has no non-test caller of
+/// its own anywhere in the workspace — the transport/session owner that would
+/// receive frames and own the [`CancellationRegistry`] and
+/// [`eliot_protocol::ModuleLifecycle`] is not built here and no substitute was
+/// invented. It is therefore reachable but not yet driven in production.
 ///
 /// # Errors
 ///
@@ -626,7 +646,7 @@ pub enum LifecycleMessageOutcome {
     /// the control was not applied. The variant is explicit: a deadline expiry
     /// and an explicit cancellation are distinguishable recorded outcomes.
     Terminal(LifecycleRequestOutcome),
-    /// A lifecycle `Event` was routed through the durable replay/ack envelope.
+    /// A lifecycle `Event` was routed through the replay/ack envelope.
     Event(LifecycleEventDispatch),
     /// An explicit `Cancel` was applied through the cancellation registry.
     Cancel(CancellationDisposition),
@@ -640,8 +660,9 @@ pub enum LifecycleMessageOutcome {
 /// identity, so the request may still be applied. `Expired` and `Cancelled` are
 /// the two distinct recorded terminals: a presented-deadline expiry and an
 /// explicit `Cancel` never collapse into one another, and once either is
-/// recorded it is read back unchanged across retries and reconnects until an
-/// explicit reap.
+/// recorded it is read back unchanged across retries against the same live
+/// [`CancellationRegistry`] value until an explicit reap. A process restart
+/// loses it; see [`CancellationRegistry`] for the exact boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleRequestOutcome {
     /// No terminal recorded for this cancellation identity.
@@ -678,7 +699,8 @@ pub enum LifecycleRequestOutcome {
 /// Expiry is evaluated first and recorded through [`CancellationRegistry::expire`],
 /// so an identity already recorded as an explicit cancel keeps `Cancelled` and
 /// an already-expired identity keeps `Expired`: the first terminal wins and the
-/// recorded outcome is stable across retries and reconnects.
+/// recorded outcome is stable across retries against the same live registry
+/// value (see [`CancellationRegistry`] for what that does not survive).
 ///
 /// # Errors
 ///
@@ -781,18 +803,24 @@ const fn terminal_outcome(state: CancellationState) -> LifecycleRequestOutcome {
 /// `Start` resume tail, the effectful `Execute` request (A2) and the explicit
 /// `Fatal` terminal flow).
 ///
+/// Its only caller is the private `apply_pending_control` helper, reached from
+/// [`dispatch_lifecycle_message`].
+///
 /// The frame is routed through [`eliot_protocol::ModuleLifecycle::apply`]:
 /// validation, phase gating, checkpoint retention, drain reporting, the
 /// restart-correlation check and the owner-held idempotency/outcome replay
 /// all live in that one owner, and non-lifecycle messages are rejected with
 /// the typed protocol failure. A repeated `Execute` with the same validated
 /// idempotency identity returns the disposition already recorded in that
-/// owner's retained records and performs no second effect — including after a
-/// restart, because those records travel in the owner's
-/// [`eliot_protocol::ModuleLifecycle::snapshot`] readback. This dispatcher never
-/// infers phase from process state and never touches any other owner.
-/// A post-restart frame carrying a fresh uncorrelated idempotency key is
-/// rejected by the owner as a protocol failure, not admitted as a new request.
+/// owner's retained records and performs no second effect. Those records can
+/// be carried across a restart only through the owner's
+/// [`eliot_protocol::ModuleLifecycle::snapshot`] readback and an explicit
+/// restore, which is a receiver-side duty this crate does not perform: this
+/// dispatcher holds no lifecycle state of its own and persists nothing. This
+/// dispatcher never infers phase from process state and never touches any
+/// other owner. A frame carrying a fresh uncorrelated idempotency key is
+/// rejected by the owner as a protocol failure, not admitted as a new
+/// request.
 ///
 /// # Errors
 ///
@@ -908,7 +936,7 @@ pub const BACKPRESSURE_BRIDGE_EVENT_RECORDS: BackpressureSignal = BackpressureSi
 );
 
 /// The canonical envelope exceeded the 256 KiB structured-response ceiling:
-/// oversize envelopes never occupy unbounded durable memory. Recover by
+/// an oversize envelope never occupies unbounded retained memory. Recover by
 /// shrinking the envelope or carrying a large payload by Blob/Resource
 /// handle (I7.2), then resubmit; the attempt itself staged nothing.
 pub const BACKPRESSURE_BRIDGE_ENVELOPE_BYTES: BackpressureSignal = BackpressureSignal::new(
@@ -2261,9 +2289,10 @@ impl ReplayLedger {
 
 /// Cancellation state is explicit and reapable; the first terminal wins and
 /// never revives a fenced work item. `Cancelled` records an explicit
-/// `Cancel`; `Expired` records a deadline expiry. Entries persist until
-/// `reap`/`reap_bound`, so the recorded disposition survives retries and
-/// reconnects.
+/// `Cancel`; `Expired` records a deadline expiry. An entry is retained until
+/// `reap`/`reap_bound` overwrites it with [`CancellationState::Reaped`], so a
+/// recorded disposition survives retries against the same live registry
+/// value. It does not survive a process restart: see [`CancellationRegistry`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancellationState {
     Active,
@@ -2280,6 +2309,25 @@ pub enum CancellationDisposition {
     Unknown,
 }
 
+/// Process-local record of cancellation and deadline-expiry terminals, keyed
+/// by plain and by [`BoundIdentity`] cancellation identity.
+///
+/// Lifetime and durability, stated exactly because no weaker claim is true:
+/// this is a plain in-memory `BTreeMap` struct with no persistence, no
+/// serialization and no snapshot/restore surface, and it currently has no
+/// consumer outside this crate's own tests. A recorded disposition
+/// therefore:
+///
+/// - survives *retries* — it outlives the individual request frame, so the
+///   same identity re-presented to this same value reads the terminal back;
+/// - survives a *reconnect* only if the reconnecting owner keeps this same
+///   value alive across the reconnect, which is the caller's decision, not a
+///   property this crate provides;
+/// - does **not** survive a process restart, because nothing here writes the
+///   entries anywhere and nothing reads them back.
+///
+/// No session, transport loop or registry owner exists here to make a
+/// stronger statement honest, so none is claimed.
 #[derive(Debug, Default)]
 pub struct CancellationRegistry {
     entries: std::collections::BTreeMap<String, CancellationState>,
@@ -2318,12 +2366,15 @@ impl CancellationRegistry {
         }
     }
     /// Idempotent application point for an incoming lifecycle `Cancel` frame
-    /// keyed by its `RequestIdentity.cancellation_id` (lifecycle dispatcher
-    /// caller). Unlike [`Self::cancel`], a retried `Cancel` observes the
-    /// recorded terminal as [`CancellationDisposition::Duplicate`] instead of
-    /// an error, and an unregistered identity reports
-    /// [`CancellationDisposition::Unknown`] without minting state, so the
-    /// disposition is stable across retries and reconnects.
+    /// keyed by its `RequestIdentity.cancellation_id`. Its caller is
+    /// [`dispatch_lifecycle_cancel`], which is itself reached only through
+    /// [`dispatch_lifecycle_message`]. Unlike [`Self::cancel`], a retried
+    /// `Cancel` observes the recorded terminal as
+    /// [`CancellationDisposition::Duplicate`] instead of an error, and an
+    /// unregistered identity reports [`CancellationDisposition::Unknown`]
+    /// without minting state. The disposition is stable across retries against
+    /// this same registry value; see [`CancellationRegistry`] for exactly what
+    /// it does and does not survive.
     pub fn cancel_stable(&mut self, id: &str) -> CancellationDisposition {
         match self.entries.get_mut(id) {
             Some(state @ CancellationState::Active) => {
@@ -2335,11 +2386,12 @@ impl CancellationRegistry {
         }
     }
     /// Records a deadline expiry for a registered identity as the terminal
-    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
-    /// first terminal wins: an explicitly cancelled or already expired entry
-    /// keeps its recorded state and reports
-    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
-    /// stays distinguishable from an explicit cancellation across retries.
+    /// [`CancellationState::Expired`] outcome. Its only caller is the deadline
+    /// owner [`observe_lifecycle_deadline`]. The first terminal wins: an
+    /// explicitly cancelled or already expired entry keeps its recorded state
+    /// and reports [`CancellationDisposition::Duplicate`], so a
+    /// deadline-expired request stays distinguishable from an explicit
+    /// cancellation across retries against this same registry value.
     pub fn expire(&mut self, id: &str) -> CancellationDisposition {
         match self.entries.get_mut(id) {
             Some(state @ CancellationState::Active) => {
@@ -2354,10 +2406,15 @@ impl CancellationRegistry {
     pub fn state(&self, id: &str) -> Option<CancellationState> {
         self.entries.get(id).copied()
     }
-    /// Non-mutating observer for a bound entry's recorded disposition
-    /// (lifecycle dispatcher caller). Observing never advances state, so
-    /// retries and reconnects read back the same terminal recorded by
-    /// `cancel_bound`/`expire_bound` until an explicit `reap_bound`.
+    /// Non-mutating observer for a bound entry's recorded disposition.
+    ///
+    /// Its callers are [`observe_bound_lifecycle_deadline`] (twice: once to
+    /// refuse an unregistered identity, once to read back the standing
+    /// terminal). Observing never advances state, so a retry against the same
+    /// live registry value reads back the same terminal recorded by
+    /// `cancel_bound`/`expire_bound` until an explicit `reap_bound`; see
+    /// [`CancellationRegistry`] for exactly what that does and does not
+    /// survive.
     #[must_use]
     pub fn state_bound(&self, identity: &BoundIdentity) -> Option<CancellationState> {
         self.bound_entries.get(identity).map(|(_, state)| *state)
@@ -2424,11 +2481,12 @@ impl CancellationRegistry {
     }
 
     /// Records a deadline expiry for a bound identity as the terminal
-    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
-    /// first terminal wins: an explicitly cancelled or already expired entry
-    /// keeps its recorded state and reports
-    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
-    /// stays distinguishable from an explicit cancellation across retries.
+    /// [`CancellationState::Expired`] outcome. Its only caller is the bound
+    /// deadline owner [`observe_bound_lifecycle_deadline`]. The first terminal
+    /// wins: an explicitly cancelled or already expired entry keeps its
+    /// recorded state and reports [`CancellationDisposition::Duplicate`], so a
+    /// deadline-expired request stays distinguishable from an explicit
+    /// cancellation across retries against this same registry value.
     pub fn expire_bound(&mut self, identity: &BoundIdentity) -> CancellationDisposition {
         match self.bound_entries.get_mut(identity) {
             Some((_, state @ CancellationState::Active)) => {
