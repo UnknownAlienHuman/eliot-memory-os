@@ -55,6 +55,15 @@ pub const ADMITTED_SCOPE_CLASS: &str = "admitted-scope";
 /// Read from `eliot-diagnostic`; recorded here the same way the provider
 /// registry records it, without taking a dependency.
 pub const DIAGNOSTIC_PARSER_CONTRACT: &str = "eliot.instrument.diagnostic";
+/// Rust Analyzer bridge contract that owns semantic result normalization.
+pub const LSP_BRIDGE_NORMALIZER_CONTRACT: &str = "eliot.instrument.lsp-bridge";
+/// Rust Analyzer diagnostic instrument identity.
+pub const RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT: &str =
+    "eliot.instrument.rust-analyzer.diagnostics";
+/// Rust Analyzer version-probe instrument identity.
+pub const RUST_ANALYZER_VERSION_INSTRUMENT: &str = "eliot.instrument.rust-analyzer.version";
+/// One-shot profile containing only the admitted Rust Analyzer operations.
+pub const RUST_ANALYZER_PROFILE: &str = "rust-analyzer-one-shot";
 /// Parser generation shipped for every builtin [`InstrumentSpec`].
 ///
 /// Parser and profile generations are replaceable independently through
@@ -925,7 +934,7 @@ impl InstrumentProfile {
     }
 }
 
-/// Builds the builtin spec set backing the `compiler`, `test`, and `dev-fast` profiles.
+/// Builds the builtin spec set backing the verification and semantic profiles.
 ///
 /// Builtin specs pin the exact executable file, the owning adapter's schema
 /// authority, the isolated-process environment/credential/network classes,
@@ -957,6 +966,8 @@ impl InstrumentProfile {
 ///   renders;
 /// - rustfmt: `cargo fmt --all -- --check`, the exact command
 ///   [`eliot_instrument_rustfmt::RustfmtCommand::check`] renders.
+/// - rust-analyzer: one-shot `diagnostics <admitted-workspace>` and `--version`
+///   are separate specs because their parser identities differ.
 ///
 /// `--locked` is on every Cargo invocation because I18.21 and I2.22 make a
 /// locked resolution the precondition for a verification result, and
@@ -1061,7 +1072,87 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             max_concurrency: BUILTIN_MAX_CONCURRENCY,
         })?,
         builtin_rustfmt_spec(&credential, &network)?,
+        builtin_rust_analyzer_spec(
+            &credential,
+            &network,
+            RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT,
+            ContractId::new(DIAGNOSTIC_PARSER_CONTRACT)?,
+            vec!["diagnostics".to_owned()],
+        )?,
+        builtin_rust_analyzer_spec(
+            &credential,
+            &network,
+            RUST_ANALYZER_VERSION_INSTRUMENT,
+            ContractId::new(LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+            vec!["--version".to_owned()],
+        )?,
     ])
+}
+
+fn builtin_rust_analyzer_spec(
+    credential: &ContractId,
+    network: &ContractId,
+    instrument: &str,
+    parser: ContractId,
+    verification_command: Vec<String>,
+) -> Result<InstrumentSpec, ProfileError> {
+    InstrumentSpec::new(InstrumentSpecParams {
+        kind: InstrumentKindId::new(ContractId::new(instrument)?, BUILTIN_KIND_VERSION)?,
+        class: InstrumentClass::SemanticIndex,
+        revision: BUILTIN_SPEC_VERSION,
+        executable: "rust-analyzer".to_owned(),
+        executable_version: None,
+        parser,
+        parser_generation: BUILTIN_PARSER_GENERATION,
+        environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+        schema: ContractId::new(instrument)?,
+        argument_template: Vec::new(),
+        verification_command,
+        credential_policy: credential.clone(),
+        network_policy: network.clone(),
+        limits: ResourceLimits::new(None, None),
+        max_concurrency: BUILTIN_MAX_CONCURRENCY,
+    })
+}
+
+/// Builds the one-shot Rust Analyzer diagnostics/version profile.
+///
+/// The two stages use separate admitted instrument identities because the
+/// bridge binds diagnostics and version observations to different parsers.
+pub fn rust_analyzer_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        RUST_ANALYZER_PROFILE,
+        vec![
+            StageDecl::new(
+                "rust-analyzer-diagnostics".to_owned(),
+                ContractId::new(RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT)?,
+                InstrumentKind::Inspect,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "rust-analyzer-version".to_owned(),
+                ContractId::new(RUST_ANALYZER_VERSION_INSTRUMENT)?,
+                InstrumentKind::Inspect,
+                Vec::new(),
+                false,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        RUST_ANALYZER_PROFILE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![InstrumentKind::Inspect],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
 }
 
 /// The builtin `formatter` profile: metadata plus exactly the command
@@ -1498,7 +1589,7 @@ impl InstrumentRegistry {
         })
     }
 
-    /// Assembles the registry with the builtin `compiler`/`test` profiles.
+    /// Assembles the registry with builtin compiler, test, and semantic profiles.
     ///
     /// Builtins ship no supply-chain receipt: no machine observation exists
     /// at registry construction, so the pre-launch gate binds the admitted
@@ -1510,7 +1601,7 @@ impl InstrumentRegistry {
     pub fn with_builtin_profiles(generation: u64) -> Result<Self, ProfileError> {
         Self::build(
             builtin_specs()?,
-            vec![compiler_profile()?, test_profile()?],
+            vec![compiler_profile()?, test_profile()?, rust_analyzer_profile()?],
             generation,
             Vec::new(),
         )
@@ -1547,6 +1638,7 @@ impl InstrumentRegistry {
             vec![
                 compiler_profile()?,
                 test_profile()?,
+                rust_analyzer_profile()?,
                 package_verification_profile()?,
                 bundle_verification_profile()?,
             ],

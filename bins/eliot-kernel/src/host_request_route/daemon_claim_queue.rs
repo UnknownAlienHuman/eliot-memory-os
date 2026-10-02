@@ -26,7 +26,8 @@ use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    TaskControllerInvocation, TaskControllerResultBody, RequestIdentity,
+    SelectedSourceCaptureInvocation, host_request_operation_id,
 };
 use eliot_store_api::ScopeId;
 
@@ -92,6 +93,174 @@ fn evict_one_stale_campaign_packet(
 }
 
 impl KernelComposition {
+    /// Enqueues one admitted source-capture pair in its dedicated daemon lane.
+    ///
+    /// This stores the exact original frame identity and never aliases the
+    /// pair to a local-read attempt or a native-process claim.
+    pub(super) fn enqueue_selected_source_capture_pair_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        invocation: &SelectedSourceCaptureInvocation,
+        request_identity: &RequestIdentity,
+    ) -> Result<(), TransportError> {
+        if envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture {
+            return Err(TransportError::SessionFenced);
+        }
+        invocation
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let _admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        self.host_request_connection_gate_under_transition(envelope)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let operation_id = host_request_operation_id(envelope);
+        if let Some(existing) = index
+            .values()
+            .flatten()
+            .find(|row| row.operation_id == operation_id)
+        {
+            return if existing.request_digest == envelope.envelope_sha256
+                && existing.source_capture_envelope.as_ref() == Some(envelope)
+                && existing.source_capture_invocation.as_ref() == Some(invocation)
+                && existing.source_capture_request_identity.as_ref() == Some(request_identity)
+            {
+                Ok(())
+            } else {
+                Err(TransportError::IdentityConflict)
+            };
+        }
+        let queued = index
+            .values()
+            .flatten()
+            .filter(|row| row.source_capture_envelope.is_some())
+            .count();
+        if queued >= MAX_QUEUED_LOCAL_READS {
+            return Err(TransportError::Backpressure);
+        }
+        index
+            .entry(envelope.connection_id.clone())
+            .or_default()
+            .push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_held_bytes: 0,
+                local_read_attempt: LocalReadAttemptState::default(),
+                observe_envelope: None,
+                observe_tool: None,
+                observe_reservation: None,
+                observe_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
+                source_capture_envelope: Some(envelope.clone()),
+                source_capture_invocation: Some(invocation.clone()),
+                source_capture_request_identity: Some(request_identity.clone()),
+                source_capture_stage_intent: None,
+            });
+        Ok(())
+    }
+
+    /// Returns the exact admitted source-capture pair to the authenticated
+    /// daemon. The original request identity is not reconstructed or replaced.
+    pub(crate) fn claim_selected_source_capture_pair(
+        &self,
+        session: &Session,
+    ) -> Result<Option<(HostRequestEnvelope, SelectedSourceCaptureInvocation, RequestIdentity)>, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        for rows in index.values() {
+            for row in rows {
+                let (Some(envelope), Some(invocation), Some(request_identity)) = (
+                    row.source_capture_envelope.as_ref(),
+                    row.source_capture_invocation.as_ref(),
+                    row.source_capture_request_identity.as_ref(),
+                ) else {
+                    continue;
+                };
+                if activation_deadline_expired(now, envelope.identity.deadline_unix_ms)
+                    || !self.application_binding_live_for_claim(envelope, &admission_owner, true)?
+                {
+                    continue;
+                }
+                let operation_id = OperationIdentity::new(row.operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let durable = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&operation_id, &row.request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let Some(durable) = durable else { continue };
+                if durable.state != HostRequestState::Admitted
+                    || durable.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
+                    || envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture
+                {
+                    continue;
+                }
+                invocation
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                request_identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if session.module_generation.state_fence != envelope.state_fence {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(Some((
+                    envelope.clone(),
+                    invocation.clone(),
+                    request_identity.clone(),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn retire_selected_source_capture_pair_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) {
+        self.audit_observe(AuditEventDraft::orphan_queue_retired(
+            operation_id,
+            request_digest,
+        ));
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for rows in index.values_mut() {
+            rows.retain(|row| {
+                !(row.operation_id == operation_id
+                    && row.request_digest == request_digest
+                    && row.source_capture_envelope.is_some())
+            });
+        }
+    }
+
+
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,

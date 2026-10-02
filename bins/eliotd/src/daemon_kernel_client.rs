@@ -48,18 +48,26 @@ use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortE
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
+#[cfg(windows)]
+use eliot_ors::{
+    AdmissionReservationRecord, AdmissionReservationState, OperationalMutationReceipt,
+};
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
     AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
-    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
+    SELECTED_SOURCE_CAPTURE_CAPABILITY, SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID,
+    SelectedSourceCaptureInvocation, TaskControllerAttempt, TaskControllerInvocation,
+    TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 #[cfg(windows)]
 use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
+#[cfg(windows)]
+use eliot_store_api::ProposedAttemptRecord;
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
     TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
@@ -425,6 +433,304 @@ pub struct TaskControllerClaimedInvocation {
     pub request_identity: RequestIdentity,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
+}
+
+/// Kernel-claimed selected-source mutation request. The host envelope and
+/// original EBP `RequestIdentity` are retained exactly; this lane carries no
+/// LocalReadAttempt or Task Controller attempt.
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureClaimedInvocation {
+    pub host_request_envelope: HostRequestEnvelope,
+    pub invocation: SelectedSourceCaptureInvocation,
+    pub request_identity: RequestIdentity,
+}
+
+/// Exact Kernel-owned inactive ORS stage returned for one selected-source
+/// claim. The receipt and staged row are returned as typed original owner
+/// readback, not reconstructed authority.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureStagedAdmission {
+    pub record: ProposedAttemptRecord,
+    pub stage_receipt_id: String,
+    pub staged_record: AdmissionReservationRecord,
+    pub stage_receipt: OperationalMutationReceipt,
+}
+
+/// Original Kernel saga readback after the canonical ProposedAttempt has
+/// committed and the matching ORS reservation is active.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureActivation {
+    pub reservation_id: String,
+    pub canonical_operation_id: String,
+    pub launch_outbox_id: String,
+    pub commit_id: String,
+    pub activation_receipt: eliot_receipts::ReceiptIdentity,
+    pub canonical_admission_receipt: eliot_receipts::ReceiptIdentity,
+}
+
+#[cfg(windows)]
+fn parse_selected_source_capture_activation(
+    value: &serde_json::Value,
+    staged: &SelectedSourceCaptureStagedAdmission,
+    causal_receipt: &eliot_store_api::CausalWriteReceipt,
+) -> Result<SelectedSourceCaptureActivation, String> {
+    let string = |field: &str| -> Result<String, String> {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("admission_reservation.admit omits valid {field}"))
+    };
+    let result = SelectedSourceCaptureActivation {
+        reservation_id: string("reservation_id")?,
+        canonical_operation_id: string("canonical_operation_id")?,
+        launch_outbox_id: string("launch_outbox_id")?,
+        commit_id: string("commit_id")?,
+        activation_receipt: serde_json::from_value(
+            value
+                .get("activation_receipt")
+                .cloned()
+                .ok_or_else(|| "admission_reservation.admit omits activation_receipt".to_owned())?,
+        )
+        .map_err(|error| {
+            format!("activation receipt is not the original typed reference: {error}")
+        })?,
+        canonical_admission_receipt: serde_json::from_value(
+            value
+                .get("canonical_admission_receipt")
+                .cloned()
+                .ok_or_else(|| {
+                    "admission_reservation.admit omits canonical_admission_receipt".to_owned()
+                })?,
+        )
+        .map_err(|error| {
+            format!("canonical admission receipt is not the original typed reference: {error}")
+        })?,
+    };
+    let original_receipt = &causal_receipt.receipt;
+    let original_commit_id = original_receipt
+        .commit_id
+        .as_ref()
+        .map(|commit_id| commit_id.as_str())
+        .ok_or_else(|| "original canonical receipt omits its commit id".to_owned())?;
+    let original_admission_receipt = original_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| {
+            format!("original canonical receipt has no reconciliation envelope: {error}")
+        })?
+        .identity
+        .clone();
+    if original_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || original_receipt.operation_id.as_str()
+            != staged.staged_record.stage_operation_id.as_str()
+        || original_receipt.state_fence != staged.record.state_fence
+        || result.commit_id != original_commit_id
+        || result.canonical_admission_receipt != original_admission_receipt
+        || !original_receipt
+            .outbox_refs
+            .iter()
+            .any(|outbox| outbox.as_str() == result.launch_outbox_id)
+    {
+        return Err(
+            "admission_reservation.admit readback differs from the original canonical receipt, commit, or launch outbox"
+                .to_owned(),
+        );
+    }
+    eliot_ors::AdmissionReservationActivationEvidence {
+        canonical_admission_receipt: result.canonical_admission_receipt.clone(),
+        activation_receipt: result.activation_receipt.clone(),
+    }
+    .validate()
+    .map_err(|error| {
+        format!("admission_reservation.admit returned invalid typed activation evidence: {error}")
+    })?;
+    if result.reservation_id != staged.record.reservation_id
+        || result.canonical_operation_id != staged.staged_record.stage_operation_id.as_str()
+        || value.get("disposition").and_then(serde_json::Value::as_str) != Some("ACTIVATED")
+        || value
+            .get("launch_authorized")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err(
+            "admission_reservation.admit activation differs from the original staged canonical identity"
+                .to_owned(),
+        );
+    }
+    Ok(result)
+}
+
+/// Parses one `source_capture.claim` answer into its exact typed request.
+pub fn parse_selected_source_capture_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<SelectedSourceCaptureClaimedInvocation>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel source_capture.claim answer omits pair".to_owned())?;
+    if pair.is_null() {
+        return Ok(None);
+    }
+    if !pair.is_object() {
+        return Err("Kernel source_capture.claim pair is neither an object nor null".to_owned());
+    }
+    let decode = |field: &str| {
+        pair.get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel source_capture.claim pair omits {field}"))
+    };
+    let envelope: HostRequestEnvelope =
+        serde_json::from_value(decode("envelope")?).map_err(|error| {
+            format!("Kernel source_capture.claim envelope does not decode: {error}")
+        })?;
+    envelope
+        .validate_for_admission()
+        .map_err(|error| format!("Kernel source_capture.claim envelope is invalid: {error}"))?;
+    let invocation: SelectedSourceCaptureInvocation = serde_json::from_value(decode("invocation")?)
+        .map_err(|error| {
+            format!("Kernel source_capture.claim invocation does not decode: {error}")
+        })?;
+    invocation
+        .validate()
+        .map_err(|error| format!("Kernel source_capture.claim invocation is invalid: {error}"))?;
+    let request_identity: RequestIdentity = serde_json::from_value(decode("request_identity")?)
+        .map_err(|error| {
+            format!("Kernel source_capture.claim RequestIdentity does not decode: {error}")
+        })?;
+    request_identity.validate().map_err(|error| {
+        format!("Kernel source_capture.claim RequestIdentity is invalid: {error}")
+    })?;
+    if envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture
+        || envelope.identity.capability != SELECTED_SOURCE_CAPTURE_CAPABILITY
+        || envelope.identity.payload_schema_id != SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
+        || envelope.identity.parent_operation_id.is_some()
+        || envelope.identity.request_id != request_identity.request.metadata.request_id
+        || envelope.identity.idempotency_key != request_identity.idempotency_key
+        || envelope.identity.cancellation_id != request_identity.cancellation_id
+        || envelope.identity.deadline_unix_ms != request_identity.deadline_unix_ms
+        || request_identity.request.state_fence != envelope.state_fence
+        || request_identity.request.metadata.state_fence != envelope.state_fence
+        || request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string)
+            != envelope.identity.task_id
+        || request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(ToString::to_string)
+            != envelope.identity.session_id
+    {
+        return Err(
+            "Kernel source_capture.claim pair does not bind the typed invocation to its authenticated envelope and original RequestIdentity".to_owned(),
+        );
+    }
+    Ok(Some(SelectedSourceCaptureClaimedInvocation {
+        host_request_envelope: envelope,
+        invocation,
+        request_identity,
+    }))
+}
+
+/// Parses the original Kernel `source_capture.stage` response and compares
+/// every echoed record, ORS snapshot, and receipt binding with its retained
+/// claim and Governor owner selection.
+#[cfg(windows)]
+pub fn parse_selected_source_capture_staged_admission(
+    value: &serde_json::Value,
+    claimed: &SelectedSourceCaptureClaimedInvocation,
+    selected: &eliot_governor::TaskSelectionAdmissionBinding,
+    intent: &eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent,
+) -> Result<SelectedSourceCaptureStagedAdmission, String> {
+    let stage = value
+        .get("stage")
+        .ok_or_else(|| "Kernel source_capture.stage answer omits stage".to_owned())?;
+    let decode = |field: &str| {
+        stage
+            .get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel source_capture.stage answer omits {field}"))
+    };
+    let result = SelectedSourceCaptureStagedAdmission {
+        record: serde_json::from_value(decode("record")?)
+            .map_err(|error| format!("staged ProposedAttempt record does not decode: {error}"))?,
+        stage_receipt_id: decode("stage_receipt_id")?
+            .as_str()
+            .ok_or_else(|| "source_capture.stage receipt id is not a string".to_owned())?
+            .to_owned(),
+        staged_record: serde_json::from_value(decode("staged_record")?)
+            .map_err(|error| format!("inactive ORS record does not decode: {error}"))?,
+        stage_receipt: serde_json::from_value(decode("stage_receipt")?)
+            .map_err(|error| format!("inactive ORS receipt does not decode: {error}"))?,
+    };
+    let record = &result.record;
+    let staged = &result.staged_record;
+    record
+        .validate()
+        .map_err(|error| format!("Kernel staged ProposedAttempt record is invalid: {error}"))?;
+    staged
+        .validate()
+        .map_err(|error| format!("Kernel inactive ORS staged row is invalid: {error}"))?;
+    let invocation = &claimed.invocation;
+    let envelope = &claimed.host_request_envelope;
+    let identity = &claimed.request_identity;
+    let request_identity = serde_json::to_value(identity)
+        .map_err(|error| format!("original request identity cannot be encoded: {error}"))?;
+    let reservation_claims = serde_json::to_value(&intent.claims)
+        .map_err(|error| format!("typed ORS claims cannot be encoded: {error}"))?;
+    let authority_epoch = serde_json::to_value(&staged.authority_epoch)
+        .map_err(|error| format!("staged ORS epoch cannot be encoded: {error}"))?;
+    let expected_operation = match invocation.operation {
+        eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
+        eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
+    };
+    if record.work_item_id != selected.evidence_ref()
+        || record.proposed_attempt_id == record.work_item_id
+        || record.reservation_id == record.work_item_id
+        || record.reservation_id == record.proposed_attempt_id
+        || record.reservation_stage_receipt_id != result.stage_receipt_id
+        || record.request_identity != request_identity
+        || record.task_id != selected.task_ref()
+        || record.session_id != selected.session_ref()
+        || record.work_scope_id != selected.work_scope().binding.scope.scope_ref
+        || record.work_lease_id != selected.selection_source_ref()
+        || record.principal_id != selected.principal_ref()
+        || record.operation != expected_operation
+        || record.operation != intent.operation
+        || record.selected_relative_path != invocation.selected_relative_path
+        || record.selected_relative_path != intent.selected_relative_path
+        || record.selector != invocation.selector
+        || record.selector != intent.selector
+        || record.source_digest != intent.source_digest
+        || record.configuration_digest != intent.configuration_digest
+        || record.action_contract_digest != intent.action_contract_digest
+        || record.disposition != "ADMITTED"
+        || record.reservation_claims != reservation_claims
+        || record.authority_epoch != authority_epoch
+        || record.state_fence != envelope.state_fence
+        || staged.reservation_id != record.reservation_id
+        || staged.work_item_id != record.work_item_id
+        || staged.proposed_attempt_id != record.proposed_attempt_id
+        || staged.operation_id != staged.stage_operation_id
+        || staged.claims != intent.claims
+        || staged.state_fence.generation != envelope.state_fence.resource_generation.value()
+        || staged.state_fence.observed_authority_epoch
+            != envelope.state_fence.authority_epoch.sequence.get()
+        || staged.state != AdmissionReservationState::StagedInactive
+        || result.stage_receipt.record_id().as_str() != result.stage_receipt_id
+        || result.stage_receipt.subject_id() != &staged.reservation_id
+    {
+        return Err(
+            "source_capture.stage response differs from the retained claim, current owner selection, intent, or exact inactive ORS evidence".to_owned(),
+        );
+    }
+    Ok(result)
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -2279,6 +2585,68 @@ impl DaemonKernelClient {
             .await
     }
 
+    /// Sends one original P-03 operation through the authenticated
+    /// current-source Kernel route. The process request stays nested so its
+    /// serde `operation` tag cannot collide with the daemon routing key; the
+    /// original `RequestIdentity` is carried by the EBP frame and is never
+    /// reconstructed from the process selector.
+    #[cfg(windows)]
+    pub(super) async fn execute_current_source_process(
+        &self,
+        request: eliot_kernel_service::ProcessExecutionRequest,
+        identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
+    ) -> Result<eliot_kernel_service::ProcessExecutionResponse, KernelClientError> {
+        request
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let operation_id = request.operation_id().ok_or_else(|| {
+            KernelClientError::Contract(
+                "current-source process request omitted its operation identity".to_owned(),
+            )
+        })?;
+        let binding = &identity.request;
+        let current = &self.snapshot;
+        if binding.metadata.task_id.as_ref() != Some(&admitted_task_id)
+            || binding.metadata.request_id.as_str() != operation_id.as_str()
+            || binding.state_fence != current.state_fence()
+        {
+            return Err(KernelClientError::Contract(
+                "original request identity does not bind the current process operation and Kernel fence".to_owned(),
+            ));
+        }
+        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request
+            && (admission.recipient_module_id() != current.service.as_str()
+                || admission.deadline_unix_ms() != identity.deadline_unix_ms
+                || admission.intent().operation_id().as_str() != operation_id.as_str()
+                || !admission
+                    .state_fence()
+                    .authority_epoch()
+                    .is_same_authority(&binding.state_fence.authority_epoch)
+                || admission.state_fence().generation().get()
+                    != binding.state_fence.resource_generation.value())
+        {
+            return Err(KernelClientError::Contract(
+                "original process admission differs from its request identity".to_owned(),
+            ));
+        }
+
+        let value = self
+            .transact_async_with_identity(
+                "execute_current_source_process",
+                serde_json::json!({
+                    "request": request,
+                    "admitted_task_id": admitted_task_id,
+                }),
+                identity,
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
+    }
+
     #[cfg(windows)]
     pub(super) async fn transact_async_with_identity(
         &self,
@@ -2747,6 +3115,132 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_task_controller_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one admitted selected-source capture invocation from its
+    /// dedicated Kernel queue. It returns the exact original host envelope and
+    /// EBP request identity without borrowing either the evidence-query or
+    /// Task Controller attempt capability.
+    #[cfg(windows)]
+    pub async fn claim_selected_source_capture_pair_async(
+        &self,
+    ) -> Result<Option<SelectedSourceCaptureClaimedInvocation>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "source_capture.claim",
+                serde_json::json!({ "operation": "source_capture.claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Stages one distinct inactive ORS reservation for the exact claimed
+    /// source mutation and current Governor selection. The original request
+    /// identity rides the authenticated frame unchanged; Kernel binds it to
+    /// the retained HostRequest and derives proposal/reservation identities.
+    #[cfg(windows)]
+    pub async fn stage_selected_source_capture_async(
+        &self,
+        claimed: &SelectedSourceCaptureClaimedInvocation,
+        selected: &eliot_governor::TaskSelectionAdmissionBinding,
+        intent: eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent,
+    ) -> Result<SelectedSourceCaptureStagedAdmission, super::DaemonError> {
+        let expected_operation = match claimed.invocation.operation {
+            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
+            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
+        };
+        if intent.operation != expected_operation
+            || intent.selected_relative_path != claimed.invocation.selected_relative_path
+            || intent.selector != claimed.invocation.selector
+            || intent.work_item_id.as_str() != selected.evidence_ref()
+            || intent.work_lease_id != selected.selection_source_ref()
+            || intent.principal_id != selected.principal_ref()
+            || claimed
+                .request_identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                != Some(selected.task_ref())
+            || claimed
+                .request_identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                != Some(selected.session_ref())
+            || claimed
+                .host_request_envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                != Some(selected.work_scope().binding.scope.scope_ref.as_str())
+            || claimed.host_request_envelope.state_fence != *selected.state_fence()
+        {
+            return Err(super::DaemonError::Kernel(
+                "source_capture.stage intent differs from the exact claim or current Governor owner selection"
+                    .to_owned(),
+            ));
+        }
+        let operation_id =
+            eliot_protocol::host_request_operation_id(&claimed.host_request_envelope);
+        let staged_intent = intent.clone();
+        let value = self
+            .transact_async_with_identity(
+                "source_capture.stage",
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "request_digest": claimed.host_request_envelope.envelope_sha256,
+                    "intent": intent,
+                }),
+                claimed.request_identity.clone(),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_staged_admission(&value, claimed, selected, &staged_intent)
+            .map_err(super::DaemonError::Kernel)
+    }
+
+    /// Completes the existing ORS admission saga for the exact canonical
+    /// ProposedAttempt terminal receipt. The Kernel rereads that original
+    /// receipt and typed payload before it activates the reservation.
+    #[cfg(windows)]
+    pub async fn activate_selected_source_capture_async(
+        &self,
+        identity: &RequestIdentity,
+        staged: &SelectedSourceCaptureStagedAdmission,
+        causal_receipt: &eliot_store_api::CausalWriteReceipt,
+    ) -> Result<SelectedSourceCaptureActivation, super::DaemonError> {
+        let canonical_operation_id = staged.staged_record.stage_operation_id.as_str();
+        if canonical_operation_id != staged.record.reservation_stage_receipt_id
+            || staged.stage_receipt_id != staged.record.reservation_stage_receipt_id
+        {
+            return Err(super::DaemonError::Kernel(
+                "staged ORS operation identity differs from the ProposedAttempt stage receipt"
+                    .to_owned(),
+            ));
+        }
+        let value = self
+            .transact_async_with_identity(
+                "admission_reservation.admit",
+                serde_json::json!({
+                    "reservation_id": staged.record.reservation_id,
+                    "canonical_operation_id": canonical_operation_id,
+                    "work_item_id": staged.record.work_item_id,
+                    "proposed_attempt_id": staged.record.proposed_attempt_id,
+                    "state_fence": staged.record.state_fence,
+                }),
+                identity.clone(),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_activation(&value, staged, causal_receipt)
+            .map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced local-read result body for its waiting

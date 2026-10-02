@@ -835,6 +835,7 @@ impl KernelService {
                 })?;
             }
             HostRequestKind::Invocation
+            | HostRequestKind::SelectedSourceCapture
             | HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {

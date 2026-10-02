@@ -16,7 +16,7 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
+    CanonicalValidationSnapshot, CausalBinding, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
     PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
@@ -38,7 +38,7 @@ pub(super) const READ_VALIDATION_SNAPSHOT: &str = "BEGIN TRANSACTION; SELECT * F
 /// Must stay equal to the reference handler's version in
 /// `eliot-store-memory`: consumers match on this version before interpreting
 /// `records` / `provenance`; any shape change bumps it on both sides.
-const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 2;
 
 /// Version of the T11.3 cognitive read payloads. Each must stay equal to its
 /// reference counterpart in `eliot-store-memory`.
@@ -350,10 +350,7 @@ async fn named_read_payload(
             )?)
         }
         NamedReadOperation::GetEvidencePack => {
-            let rows = read_evidence_records(db, &adapter.config).await?;
-            let suppression = read_erasure_suppression(db, &adapter.config).await?;
-            evidence_pack_payload(query, state_fence, &rows, &suppression)
-                .map_err(AdapterError::Store)
+            evidence_pack_read_payload(db, &adapter.config, query, state_fence).await
         }
         NamedReadOperation::GetTaskState
         | NamedReadOperation::GetAttentionAndProblems
@@ -441,6 +438,48 @@ async fn cognitive_authority_payload(
             operation: format!("{other:?}"),
         }),
     }
+}
+
+/// Reads the exact retained evidence projection and attaches the Store's
+/// current causal allocation only when it stays unchanged across the payload
+/// reads.
+async fn evidence_pack_read_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let causal_binding = read_evidence_pack_causal_binding(db, config, state_fence).await?;
+    let rows = read_evidence_records(db, config).await?;
+    let suppression = read_erasure_suppression(db, config).await?;
+    let mut payload = evidence_pack_payload(query, state_fence, &rows, &suppression)
+        .map_err(AdapterError::Store)?;
+    let current_causal_binding = read_evidence_pack_causal_binding(db, config, state_fence).await?;
+    if current_causal_binding != causal_binding {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    let object = payload
+        .as_object_mut()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    object.insert("causal_binding".to_owned(), to_value(&causal_binding)?);
+    Ok(payload)
+}
+
+/// Reads the actual canonical causal tip and next position for an evidence
+/// pack from the Store's bounded allocation snapshot. The generic allocation
+/// helper can describe a first-write Genesis when a Store fence is absent;
+/// this read surface refuses that synthetic bootstrap projection and exposes
+/// only a real Store readback.
+async fn read_evidence_pack_causal_binding(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    expected_state_fence: &StateFence,
+) -> Result<CausalBinding, AdapterError> {
+    let (allocation_fence, projection) =
+        super::receipt_reconciliation::read_causal_allocation(db, config, expected_state_fence)
+            .await?;
+    allocation_fence.ok_or(StoreError::ReceiptNotFound)?;
+    Ok(projection.binding().clone())
 }
 
 const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
@@ -1215,7 +1254,11 @@ fn evidence_pack_payload(
     // receipt by operation_index.
     let mut ordered: Vec<&EvidenceReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
-    let mut indexed: Vec<(u64, &EvidenceRecordRow)> = Vec::new();
+    let mut indexed: Vec<(
+        u64,
+        &EvidenceRecordRow,
+        Option<eliot_store_api::TaskBinding>,
+    )> = Vec::new();
     let mut operation_base: u64 = 0;
     for row in ordered {
         let mut records: Vec<&EvidenceRecordRow> = row
@@ -1225,8 +1268,8 @@ fn evidence_pack_payload(
         records.sort_by_key(|record| record.operation_index);
         // Legacy receipts without recoverable captures remain absent. A
         // recoverable capture without its admitted identity fails closed.
-        let in_scope = if records.is_empty() {
-            false
+        let (in_scope, task_binding) = if records.is_empty() {
+            (false, None)
         } else {
             let receipt = row.receipt.as_ref().ok_or(StoreError::InvalidReceipt)?;
             receipt.validate()?;
@@ -1238,34 +1281,50 @@ fn evidence_pack_payload(
             }
             // The validated receipt retains its original write fence. Read
             // freshness does not erase observations admitted under older fences.
-            binding.scope_id.as_str() == scope_id.as_str()
+            if binding.scope_id.as_str() == scope_id.as_str() {
+                (
+                    true,
+                    receipt.require_reconciliation_envelope()?.core.task.clone(),
+                )
+            } else {
+                (false, None)
+            }
         };
         for record in records {
             validate_evidence_record(row, record)?;
             let capture_index = operation_base.saturating_add(record.operation_index as u64);
             if in_scope {
-                indexed.push((capture_index, record));
+                indexed.push((capture_index, record, task_binding.clone()));
             }
         }
         operation_base =
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
     }
     // Exact subject match only — never substring, never a default.
-    let matched: Vec<(u64, &EvidenceRecordRow)> = indexed
+    let matched: Vec<(
+        u64,
+        &EvidenceRecordRow,
+        Option<eliot_store_api::TaskBinding>,
+    )> = indexed
         .into_iter()
-        .filter(|(_, record)| record.subject == subject)
+        .filter(|(_, record, _)| record.subject == subject)
         .collect();
     let matched_total = matched.len();
     let records: Vec<Value> = matched
         .into_iter()
         .take(limit)
-        .map(|(capture_index, record)| {
+        .map(|(capture_index, record, task_binding)| {
             json!({
                 "capture_index": capture_index,
                 "operation": named_mutation_operation_name(
                     eliot_store_api::NamedMutationOperation::CaptureObservation,
                 ),
                 "parameters": record.parameters,
+                // This task binding is projected from the original validated
+                // canonical write receipt. A later task-scoped consumer can
+                // refuse cross-task retained blobs without interpreting the
+                // capture subject as authority.
+                "task_binding": task_binding,
             })
         })
         .collect();

@@ -10,10 +10,11 @@ use crate::SurrealStoreAdapter;
 use crate::config::{SchemaGeneration, SurrealAdapterConfig};
 use crate::error::AdapterError;
 use crate::plan::{
-    self, build_receipt_with_expected_heads, validate_receipt_identity_with_expected_heads,
-    validate_revision_heads,
+    self, build_receipt_with_expected_heads_and_causal,
+    validate_receipt_identity_with_expected_heads_and_causal, validate_revision_heads,
 };
 use crate::readiness::{CompiledMigration, MigrationReceipt, SemanticReadiness};
+use crate::source_artifact_context::CanonicalCausalProjection;
 use crate::write_execution::{
     AttemptOutcome, ExclusiveOpKind, ExecutableAttempt, OpExecution, ProviderGate,
     ReconcileOutcome, ReservedAttemptTransport, current_time_ms,
@@ -54,6 +55,7 @@ pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
 pub(crate) mod surreal_task_acceptance;
+pub(crate) mod surreal_proposed_attempt;
 use atomic_write::{
     ErasureInTx, TxLane, erasure_in_tx_parts, read_sealed_erasure_outcomes, to_value,
     write_canonical_transaction_with_expected_heads,
@@ -104,6 +106,7 @@ pub(crate) use read_boundary::{
     read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
+pub(crate) use receipt_reconciliation::read_receipt_with_causal;
 use receipt_reconciliation::{
     read_committed_effect_ids, read_committed_receipt_strict, read_fence, read_idempotency,
     read_receipt_by_operation,
@@ -1174,6 +1177,7 @@ async fn rendezvous_before_transaction(adapter: &SurrealStoreAdapter) -> Result<
 /// the line-count lint without changing the read/verify order.
 struct VerifiedAttemptState {
     fence: Option<FenceRecord>,
+    causal: CanonicalCausalProjection,
     current_revisions: Vec<RevisionHead>,
     current_orderings: Vec<OrderingHead>,
     /// Per-scope prior link hashes for the canonical event's chain links
@@ -1244,12 +1248,18 @@ async fn reuse_idempotent_receipt(
     .await?
     {
         Idempotency::Replay(receipt) => {
-            validate_receipt_identity_with_expected_heads(
+            let causal = receipt_reconciliation::read_causal_replay(
+                db,
+                &adapter.config,
+                &receipt.operation_id,
+                &receipt,
+            )
+            .await?;
+            plan::validate_receipt_identity_with_causal(
                 &receipt,
                 ctx,
                 transition,
-                expected_revision_heads,
-                expected_ordering_heads,
+                causal.binding(),
             )?;
             Ok(Some(receipt))
         }
@@ -1270,7 +1280,12 @@ async fn load_verified_attempt_state(
     expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
     expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
 ) -> Result<VerifiedAttemptState, AdapterError> {
-    let fence = read_fence(db, &adapter.config).await?;
+    let (fence, causal) = receipt_reconciliation::read_causal_allocation(
+        db,
+        &adapter.config,
+        &transition.state_fence,
+    )
+    .await?;
     if let Some(fence) = &fence
         && fence.state_fence != transition.state_fence
     {
@@ -1304,6 +1319,7 @@ async fn load_verified_attempt_state(
     )?;
     Ok(VerifiedAttemptState {
         fence,
+        causal,
         current_revisions,
         current_orderings,
         current_chain_tips,
@@ -1489,12 +1505,13 @@ async fn apply_with_retry(
         // hash (verified against the supplied claim), never a blind copy,
         // so Governor output, Kernel staging, store commit and WriteReceipt
         // carry the identical digest.
-        let receipt = build_receipt_with_expected_heads(
+        let receipt = build_receipt_with_expected_heads_and_causal(
             ctx,
             &transition,
             &plan,
             &expected_revision_heads,
             &expected_ordering_heads,
+            verified.causal.binding(),
         )?;
 
         // S-CONC-TX production-path rendezvous (issue #989): first attempt
@@ -1511,6 +1528,7 @@ async fn apply_with_retry(
             &transition,
             &plan,
             &receipt,
+            &verified.causal,
             verified.fence.is_none(),
             verified
                 .fence
@@ -1552,7 +1570,8 @@ async fn apply_with_retry(
             Ok(()) => {
                 // The error-free RPC proved its terminal allocation slot;
                 // the returned receipt is the durable readback, never the
-                // locally constructed prediction.
+                // locally constructed prediction. The original causal-owner
+                // receipt binding is validated on that same durable receipt.
                 let committed = verify_durable_commit_bundle(
                     adapter,
                     db,
@@ -1561,6 +1580,7 @@ async fn apply_with_retry(
                     &plan,
                     &expected_revision_heads,
                     &expected_ordering_heads,
+                    &verified.causal,
                 )
                 .await?;
                 validate_committed_canonical_transition(&plan, &committed)?;
@@ -1657,14 +1677,14 @@ async fn ensure_erasure_tables(
 ///
 /// 1. the exact receipt row exists, validates, carries its reconciliation
 ///    envelope, and binds this operation, idempotency key, canonical hash,
-///    and allocation (through
-///    [`validate_receipt_identity_with_expected_heads`]);
+///    expected heads, and original causal-owner predecessor through
+///    [`validate_receipt_identity_with_expected_heads_and_causal`];
 /// 2. the fence row exists at this transition's fence with both cursors
 ///    advanced exactly past this attempt's allocation — the single-row fence
 ///    CAS effect, proving no global-counter collision was silently ignored;
 /// 3. the durable outbox/event identity sets equal exactly the attempted
 ///    plan's sets: a missing, duplicate, or extra effect row fails the
-///    commit.
+///    commit. The strict effect readback runs after receipt and fence checks.
 ///
 /// Every failure is [`AdapterError::UnknownOutcome`] for same-operation
 /// receipt reconciliation — never a local success over an unproven commit.
@@ -1682,6 +1702,7 @@ async fn verify_durable_commit_bundle(
     plan: &plan::ApplyPlan,
     expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
     expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
+    causal: &CanonicalCausalProjection,
 ) -> Result<WriteReceipt, AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let unknown = || AdapterError::UnknownOutcome {
@@ -1690,12 +1711,13 @@ async fn verify_durable_commit_bundle(
     let committed =
         read_committed_receipt_strict(db, &adapter.config, &transition.identity.operation_id)
             .await?;
-    validate_receipt_identity_with_expected_heads(
+    validate_receipt_identity_with_expected_heads_and_causal(
         &committed,
         ctx,
         transition,
         expected_revision_heads,
         expected_ordering_heads,
+        causal.binding(),
     )
     .map_err(|_| unknown())?;
     let fence = read_fence(db, &adapter.config)

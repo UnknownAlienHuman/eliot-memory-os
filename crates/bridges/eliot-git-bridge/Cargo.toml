@@ -22,6 +22,7 @@ source_status = "IMPLEMENTED"
 workspace_admission = "admitted via #1830 root workspace membership as the typed Git bridge (I10.9); executor binding proven package-local; prototype classification retained pending integration-owner review"
 
 [dependencies]
+eliot-platform-windows.workspace = true
 eliot-process.workspace = true
 eliot-process-executor.workspace = true
 serde_json.workspace = true

@@ -2363,6 +2363,7 @@ impl KernelComposition {
                     field: "attempt_id",
                 }
             })?,
+            causal_operation_id: None,
             semantic_admission_revision: request.request_digest.clone(),
             claims: claims.clone(),
             state_fence: state_fence.clone(),

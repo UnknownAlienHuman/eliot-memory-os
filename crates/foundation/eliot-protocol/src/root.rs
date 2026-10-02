@@ -103,6 +103,14 @@ pub use task_controller::{
     TaskControllerInvocation, TaskControllerResultBody,
 };
 
+mod selected_source_capture;
+pub use selected_source_capture::{
+    MAX_SELECTED_SOURCE_CAPTURE_PATH_BYTES, MAX_SELECTED_SOURCE_CAPTURE_SELECTOR_BYTES,
+    SELECTED_SOURCE_CAPTURE_CAPABILITY, SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_ID,
+    SELECTED_SOURCE_CAPTURE_INVOCATION_WIRE_VERSION, SelectedSourceCaptureInvocation,
+    SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID, SelectedSourceCaptureOperation,
+};
+
 mod finish_attempt;
 pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,

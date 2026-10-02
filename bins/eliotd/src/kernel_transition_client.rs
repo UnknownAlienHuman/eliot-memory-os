@@ -9,9 +9,11 @@
 //! Forbidden authority: no Store/provider SDK, canonical ownership, semantic
 //! Governor reconstruction, retry/default synthesis, or alternate transport.
 
+use crate::task_binding_admission::DispatchedBinding;
 use eliot_contracts::{ArtifactId, OperationId, StateFence, TaskId};
 use eliot_governor::{
-    KernelPortError, KernelPortFuture, KernelTransitionPort, TaskControllerCampaignSourceHeads,
+    KernelPortError, KernelPortFuture, KernelTransitionPort, SourceArtifactAdmission,
+    TaskControllerCampaignSourceHeads, TaskSelectionAdmissionBinding,
 };
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignSourceRole, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
@@ -19,11 +21,12 @@ use eliot_learning_contracts::{
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RevisionHeadExpectation, ScopeId,
-    StoreHealth, TaskContractAcceptanceSet, WriteReceipt, decode_task_contract_acceptance_set,
-    generated_operation_manifests, task_contract_acceptance_read_request,
-    validate_store_receipt_envelope, verify_canonical_request_hash,
+    CampaignSourceRevisionRead, CanonicalRequestView, CausalWriteReceipt, NamedReadOperation,
+    NamedReadRequest, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
+    decode_task_contract_acceptance_set, generated_operation_manifests,
+    task_contract_acceptance_read_request, validate_store_receipt_envelope_with_causal,
+    verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
@@ -106,6 +109,59 @@ fn check_identity_binding(
             "cold unbound observation candidate: durable capture-first bytes retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
         );
     }
+    check_identity_transition_and_heads(
+        identity,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+}
+
+fn check_identity_binding_with_lsp_capture(
+    identity: &RequestIdentity,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    source_admission: &SourceArtifactAdmission,
+    binding: &DispatchedBinding,
+    current_selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), KernelPortError> {
+    identity
+        .validate()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    transition
+        .validate()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    let admission = super::task_binding_admission::admit_lsp_capture_with_live_binding(
+        identity,
+        source_admission,
+        transition,
+        binding,
+        current_selection,
+    )
+    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    if !matches!(
+        admission,
+        super::task_binding_admission::TaskBindingAdmission::TaskBound(_)
+    ) {
+        return Err(KernelPortError::Contract(
+            "live LSP capture binding was not admitted as TaskBound".to_owned(),
+        ));
+    }
+    check_identity_transition_and_heads(
+        identity,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+}
+
+fn check_identity_transition_and_heads(
+    identity: &RequestIdentity,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), KernelPortError> {
     if transition.state_fence != identity.request.metadata.state_fence {
         return Err(KernelPortError::Contract(
             "daemon transition fence does not match the admitted identity".to_owned(),
@@ -227,6 +283,98 @@ async fn read_task_controller_source_head(
     }
 }
 
+impl DaemonKernelClient {
+    /// Applies one LSP `CaptureObservation` using the original non-Serde
+    /// Governor `TaskSelection` binding, re-read immediately before this call.
+    /// The generic `KernelTransitionPort` remains task-binding strict and does
+    /// not admit task-relative captures without this dedicated owner join.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the LSP-only effect gate receives each independent original owner binding explicitly"
+    )]
+    pub(crate) async fn apply_prepared_with_lsp_capture_binding(
+        &self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        source_admission: &SourceArtifactAdmission,
+        binding: &DispatchedBinding,
+        current_selection: &TaskSelectionAdmissionBinding,
+    ) -> Result<CausalWriteReceipt, KernelPortError> {
+        check_identity_binding_with_lsp_capture(
+            identity,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            source_admission,
+            binding,
+            current_selection,
+        )?;
+        self.apply_prepared_exchange(
+            identity,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+    }
+
+    async fn apply_prepared_exchange(
+        &self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, KernelPortError> {
+        let span = tracing::info_span!(
+            "eliotd.transition_handoff",
+            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
+        );
+        async {
+            let _ = super::diagnostics::emit_handoff(
+                super::diagnostics::HandoffKind::Prepared,
+                identity.idempotency_key.as_str(),
+                identity.request.metadata.request_id.as_str(),
+            );
+            let expected_transition = transition.clone();
+            let value = self
+                .transact_async_with_identity(
+                    "apply_prepared",
+                    serde_json::json!({
+                        "context": identity.request.metadata.clone(),
+                        "transition": transition,
+                        "expected_revision_heads": expected_revision_heads,
+                        "expected_ordering_heads": expected_ordering_heads,
+                    }),
+                    identity.clone(),
+                )
+                .await
+                .map_err(kernel_port_error)?;
+            let value = kind_value(&value, "causal_write_receipt")?;
+            let pair: CausalWriteReceipt = serde_json::from_value(value)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            pair.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            validate_store_receipt_envelope_with_causal(
+                &identity.request.metadata,
+                &expected_transition,
+                &pair.receipt,
+                &pair.causal,
+            )
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            let _ = super::diagnostics::emit_handoff(
+                super::diagnostics::HandoffKind::Committed,
+                identity.idempotency_key.as_str(),
+                pair.receipt.operation_id.as_str(),
+            );
+            Ok(pair)
+        }
+        .instrument(span)
+        .await
+    }
+}
+
 impl KernelTransitionPort for DaemonKernelClient {
     fn apply_prepared<'a>(
         &'a self,
@@ -236,64 +384,58 @@ impl KernelTransitionPort for DaemonKernelClient {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
         let identity = identity.clone();
-        // #740: handoff/commitment span over the neutral transition
-        // boundary. Identity binding agreement marks the prepared handoff;
-        // the validated receipt envelope marks the commitment. The two
-        // are never the same record. The span instruments the future
-        // (`Send`-safe) instead of an entered guard, which cannot cross
-        // an await.
-        let span = tracing::info_span!(
-            "eliotd.transition_handoff",
-            operation = %super::diagnostics::sanitize_identity(&identity.idempotency_key)
-        );
-        Box::pin(
-            async move {
-                check_identity_binding(
-                    &identity,
-                    &transition,
-                    &expected_revision_heads,
-                    &expected_ordering_heads,
-                )?;
-                let _ = super::diagnostics::emit_handoff(
-                    super::diagnostics::HandoffKind::Prepared,
-                    identity.idempotency_key.as_str(),
-                    identity.request.metadata.request_id.as_str(),
-                );
-                let expected_transition = transition.clone();
-                let value = self
-                    .transact_async_with_identity(
-                        "apply_prepared",
-                        serde_json::json!({
-                            "context": identity.request.metadata.clone(),
-                            "transition": transition,
-                            "expected_revision_heads": expected_revision_heads,
-                            "expected_ordering_heads": expected_ordering_heads,
-                        }),
-                        identity.clone(),
-                    )
-                    .await
-                    .map_err(kernel_port_error)?;
-                let value = kind_value(&value, "write_receipt")?;
-                let receipt: WriteReceipt = serde_json::from_value(value)
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                validate_store_receipt_envelope(
-                    &identity.request.metadata,
-                    &expected_transition,
-                    &receipt,
-                )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                let _ = super::diagnostics::emit_handoff(
-                    super::diagnostics::HandoffKind::Committed,
-                    identity.idempotency_key.as_str(),
-                    receipt.operation_id.as_str(),
-                );
-                Ok(receipt)
-            }
-            .instrument(span),
-        )
+        Box::pin(async move {
+            KernelTransitionPort::apply_prepared_with_causal(
+                self,
+                &identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+            .map(|pair| pair.receipt)
+        })
+    }
+
+    fn apply_prepared_with_causal<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> KernelPortFuture<'a, CausalWriteReceipt> {
+        let identity = identity.clone();
+        Box::pin(async move {
+            check_identity_binding(
+                &identity,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            )?;
+            self.apply_prepared_exchange(
+                &identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+        })
     }
 
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
+        Box::pin(async move {
+            Ok(
+                KernelTransitionPort::receipt_with_causal(self, operation_id)
+                    .await?
+                    .map(|pair| pair.receipt),
+            )
+        })
+    }
+
+    fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> KernelPortFuture<'_, Option<CausalWriteReceipt>> {
         let state_fence = self.kernel_binding.state_fence.clone();
         // #740: receipt-boundary span over the owning read path
         // (`Send`-safe instrumentation; no entered guard crosses an await).
@@ -310,22 +452,22 @@ impl KernelTransitionPort for DaemonKernelClient {
                     )
                     .await
                     .map_err(kernel_port_error)?;
-                let value = kind_value(&value, "receipt")?;
-                let Some(receipt) = serde_json::from_value::<Option<WriteReceipt>>(value)
+                let value = kind_value(&value, "causal_write_receipt")?;
+                let Some(pair) = serde_json::from_value::<Option<CausalWriteReceipt>>(value)
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?
                 else {
                     return Ok(None);
                 };
-                receipt
-                    .validate()
+                pair.validate()
                     .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+                let receipt = &pair.receipt;
                 if receipt.operation_id != operation_id || receipt.state_fence != state_fence {
                     return Err(KernelPortError::Contract(
                     "daemon receipt does not match the requested operation and active state fence"
                         .to_owned(),
                 ));
                 }
-                Ok(Some(receipt))
+                Ok(Some(pair))
             }
             .instrument(span),
         )
