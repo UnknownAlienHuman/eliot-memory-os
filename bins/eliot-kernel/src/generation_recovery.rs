@@ -166,7 +166,8 @@ pub(crate) struct OrsGenerationCoordinator {
 /// to gate every restored route as a rollback (I1.12, issue #1890 W4).
 ///
 /// Built from the SAME live values the runtime handshake binds
-/// (`frame_dispatch::runtime_compatibility_evidence`) and the candidate-activation
+/// (`frame_dispatch::runtime_module_compatibility`) and the
+/// candidate-activation
 /// gate compares against (`compatibility_gate::durable_compatibility_state`), so
 /// the rollback gate and the activation handshake are compared against one
 /// durable state rather than three independently derived projections. Nothing is
