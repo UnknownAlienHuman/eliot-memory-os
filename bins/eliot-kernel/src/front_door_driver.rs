@@ -449,7 +449,13 @@ async fn serve_connection(
                 } else {
                     kernel
                         .execute_testd_request_with_control(
-                            &session, request_id, &operation, payload, control, true,
+                            &session,
+                            Some(&identity),
+                            request_id,
+                            &operation,
+                            payload,
+                            control,
+                            true,
                         )
                         .await?
                 };

@@ -251,6 +251,9 @@ struct TestdMaterialFile {
 /// exposes `epoch` and `generation` for exactly that proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedTestdMaterial {
+    /// Exact validated request bytes and attempt sequence presented by the
+    /// authenticated Kernel dispatch contour.
+    pub request: TestdMaterialRequest,
     /// Admitted testd job identity.
     pub job_id: String,
     /// Admitted operation: the bounded evidence handle for the future drive.
@@ -474,6 +477,7 @@ fn validate_material(
     }
     let owner_store_path = owner_store_path.to_path_buf();
     Ok(ValidatedTestdMaterial {
+        request: file.request.clone(),
         job_id: file.request.job_id,
         operation_id: file.admission.operation_id.clone(),
         profile: file.admission.profile.clone(),

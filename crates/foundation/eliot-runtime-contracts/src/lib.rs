@@ -18,6 +18,7 @@ use thiserror::Error;
 
 mod activation_lifecycle;
 mod control_reserve;
+mod file_identity;
 mod hot_artifact_map;
 mod hot_path;
 mod hot_path_manifest_file;
@@ -47,6 +48,7 @@ pub use control_reserve::{
     ControlReserveProfile, EmergencyOperationClass, NormalWorkClass, PermitTerminalDisposition,
     RequestedOperationClass, frozen_bottleneck_owner_map,
 };
+pub use file_identity::FileIdentity;
 pub use hot_artifact_map::{
     HotArtifactKind, HotArtifactMap, HotArtifactRecord, admitted_hot_artifact_map,
 };
@@ -1449,14 +1451,15 @@ mod tests {
 
     use eliot_contracts::EpochLineageId;
 
-    fn test_epoch(sequence: u64) -> EpochId {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical test lineage-A");
-        EpochId::new(
-            lineage,
-            NonZeroU64::new(sequence).expect("non-zero test sequence"),
-        )
-        .expect("valid test epoch")
+    fn test_epoch(sequence: u64) -> Result<EpochId, Box<dyn std::error::Error>> {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")?;
+        let sequence = NonZeroU64::new(sequence).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "non-zero test sequence required",
+            )
+        })?;
+        Ok(EpochId::new(lineage, sequence)?)
     }
 
     #[test]
@@ -1574,14 +1577,16 @@ mod tests {
     }
 
     #[test]
-    fn active_authority_requires_explicit_activation_receipt() {
+    fn active_authority_requires_explicit_activation_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
         let receipt = AuthorityActivationReceipt {
             activation_id: "activation-1".to_owned(),
             snapshot_id: "snapshot-1".to_owned(),
-            authority_epoch: test_epoch(1),
+            authority_epoch: test_epoch(1)?,
             state: AuthorityState::PendingKernelActivation,
         };
         assert!(receipt.validate().is_err());
+        Ok(())
     }
 
     #[test]

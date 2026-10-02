@@ -49,8 +49,9 @@ use eliot_instrument_runner::profile_run::{
 };
 use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
 use eliot_instrument_runner::{
-    AvailabilityInputs, DEV_FAST_PROFILE, InstrumentRunner, ProviderDispatch, ProviderDisposition,
-    StageLauncher, compose_provider_dispatch, dev_fast_registry, host_platform,
+    AdmissionSubmissionProofPort, AvailabilityInputs, DEV_FAST_PROFILE, InstrumentRunner,
+    ProviderDispatch, ProviderDisposition, StageLauncher, compose_provider_dispatch,
+    dev_fast_registry, host_platform,
 };
 use eliot_process::ProcessExecutor;
 use eliot_store::BlobStore;
@@ -550,12 +551,15 @@ impl GovernedProfileService {
         &self,
         name: &str,
         bindings: &ProfileResolutionBindings,
+        registry: &InstrumentRegistry,
         candidate_identity: Option<&str>,
         runner: &InstrumentRunner<E>,
         launcher: &dyn StageLauncher,
+        admission_proof: &dyn AdmissionSubmissionProofPort,
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
-        let (resolved, admitted, mut plan) = Self::resolve_once(name, bindings)?;
+        let (resolved, admitted, mut plan) =
+            Self::resolve_once_in_registry(name, bindings, registry)?;
         if let Some(candidate) = candidate_identity {
             plan.bind_candidate_identity(candidate).map_err(|error| {
                 rejected(
@@ -564,7 +568,9 @@ impl GovernedProfileService {
                 )
             })?;
         }
-        let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+        let runs =
+            StageOrchestrator::launch_plan_live(runner, registry, &plan, launcher, admission_proof)
+                .await;
         render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
     }
 
@@ -587,13 +593,23 @@ impl GovernedProfileService {
         name: &str,
         bindings: &ProfileResolutionBindings,
     ) -> Result<(ResolvedProfile, AdmittedProfile, StagePlan), EngineError> {
+        let registry = governed_registry_for(name, BUILTIN_REGISTRY_GENERATION)?;
+        Self::resolve_once_in_registry(name, bindings, &registry)
+    }
+
+    /// Resolves and plans from the current composition-owned instrument
+    /// registry supplied by the ordinary owner-dispatched execution path.
+    fn resolve_once_in_registry(
+        name: &str,
+        bindings: &ProfileResolutionBindings,
+        registry: &InstrumentRegistry,
+    ) -> Result<(ResolvedProfile, AdmittedProfile, StagePlan), EngineError> {
         let bindings = ProfileResolutionBindings::admitted(
             bindings.layout.clone(),
             bindings.scope.clone(),
             bindings.environment.clone(),
         )?;
-        let registry = governed_registry_for(name, BUILTIN_REGISTRY_GENERATION)?;
-        let resolved = ProfileCompiler::new(&registry)
+        let resolved = ProfileCompiler::new(registry)
             .resolve_admitted(
                 name,
                 bindings.layout.clone(),
@@ -612,7 +628,12 @@ impl GovernedProfileService {
                 &format!("resolved profile '{name}' did not compile: {reason}"),
             )
         })?;
-        let plan = StageOrchestrator::plan(&admitted);
+        let plan = StageOrchestrator::plan_resolved(&admitted, &resolved).map_err(|error| {
+            rejected(
+                "governed-profile",
+                &format!("resolved profile '{name}' did not plan: {error}"),
+            )
+        })?;
         require_resolved_stages(&resolved, &plan).map_err(|reason| {
             rejected(
                 "governed-profile",
@@ -928,6 +949,18 @@ fn project_evidence(evidence: &StageEvidence) -> (&'static str, String) {
             "retained",
             format!("{}:{byte_len}:{}", artifact.as_str(), tool.digest()),
         ),
+        StageEvidence::Transformed {
+            source_artifact,
+            source_byte_len,
+            result_digest,
+            ..
+        } => (
+            "transformed",
+            format!(
+                "{}:{source_byte_len}:{result_digest}",
+                source_artifact.as_str()
+            ),
+        ),
         StageEvidence::Omitted { reason } => ("omitted", reason.clone()),
         StageEvidence::Missing { reason } => ("missing", reason.clone()),
     }
@@ -946,6 +979,10 @@ fn persist_stage_report(
     admission: &StageAdmission,
 ) -> Result<GovernedStageReport, EngineError> {
     let (evidence_state, evidence_detail) = project_evidence(&run.evidence);
+    let transformed_result_bytes = match &run.evidence {
+        StageEvidence::Transformed { result_bytes, .. } => Some(result_bytes),
+        _ => None,
+    };
     let record = serde_json::json!({
         "schema_version": GOVERNED_RUN_RECORD_SCHEMA,
         "profile": plan.profile,
@@ -972,6 +1009,7 @@ fn persist_stage_report(
         "execution": format!("{:?}", run.execution),
         "evidence_state": evidence_state,
         "evidence_detail": evidence_detail,
+        "transformed_result_bytes": transformed_result_bytes,
         "executable_digest": run.executable_digest,
         "grant_digest": run.grant_digest,
         "operation_id": run.stage.operation_id,

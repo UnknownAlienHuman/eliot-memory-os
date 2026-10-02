@@ -1337,7 +1337,10 @@ async fn load_verified_attempt_state(
 async fn prepare_attempt_leg_writes(
     adapter: &SurrealStoreAdapter,
     db: &client::RpcTransport,
+    ctx: &eliot_store_api::RequestMeta,
     transition: &eliot_store_api::PreparedTransition,
+    expected_revision_heads: &[eliot_store_api::RevisionHeadExpectation],
+    expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
 ) -> Result<AttemptLegWrites, AdapterError> {
     let notification_writes =
         surreal_notification::prepare_notification_writes(db, &adapter.config, transition).await?;
@@ -1353,7 +1356,10 @@ async fn prepare_attempt_leg_writes(
         surreal_instrument_registry::prepare_instrument_registry_writes(
             db,
             &adapter.config,
+            ctx,
             transition,
+            expected_revision_heads,
+            expected_ordering_heads,
         )
         .await?;
     Ok(AttemptLegWrites {
@@ -1453,7 +1459,15 @@ async fn apply_with_retry(
         // Admitted side-leg computation after every fallible precondition
         // and before receipt planning (recomputed from fresh rows each
         // attempt; owner-row drift stays a typed semantic conflict).
-        let legs = prepare_attempt_leg_writes(adapter, db, &transition).await?;
+        let legs = prepare_attempt_leg_writes(
+            adapter,
+            db,
+            ctx,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )
+        .await?;
 
         let first_attempt = semantic_plan.is_none();
         let plan = if let Some(semantic) = &semantic_plan {

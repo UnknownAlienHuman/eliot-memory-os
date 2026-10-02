@@ -23,20 +23,33 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use eliot_contracts::{ModuleRuntimeClass, sha256_hex};
+use eliot_contracts::{ArtifactId, ModuleRuntimeClass, sha256_hex};
+use eliot_graph_api::{GraphQuery, GraphRevision};
 use eliot_instrument_api::{
-    BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentAdmissionRequest,
-    InstrumentInvocation, InstrumentKind, TARGET_LAYOUT_REVISION,
+    BuildClass, ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
+    TARGET_LAYOUT_REVISION,
 };
-use eliot_process::{ExitDisposition, ProcessEvidenceSink, ProcessExecutor, ProcessRequest};
+use eliot_process::{
+    ExitDisposition, ProcessEvidenceSink, ProcessExecutor, ProcessIntent, ProcessRequest,
+};
 use eliot_process_executor::ExecutableObservation;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
-use crate::admission_submission::submit_admission_snapshot;
-use crate::profile::{AdmissionError, AdmittedProfile, AdmittedStage, InstrumentRegistry};
+use crate::admission_submission::{
+    AdmissionSubmission, AdmissionSubmissionReadback, PureTransformSubmission,
+    prepare_admission_submission, prepare_pure_transform_submission,
+};
+use crate::profile::{
+    AdmittedProfile, AdmittedStage, InstrumentRegistry, PureTransformHandler, ResolvedProfile,
+    StageExecution, TargetLayout, WorkScope,
+};
 use crate::registry::{
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt,
 };
@@ -45,6 +58,242 @@ use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
 };
+use eliot_instrument_api::registry::ExternalStagePin;
+use eliot_ipc::RequestIdentity;
+use eliot_store_api::{
+    CanonicalReadClient, NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency,
+    ScopeId, WriteReceipt, decode_resource_content, validate_resource_snapshot_read_params,
+};
+
+fn environment_binding(
+    projection: &eliot_process::EnvironmentProjection,
+) -> eliot_instrument_api::registry::EnvironmentProjectionBinding {
+    eliot_instrument_api::registry::EnvironmentProjectionBinding {
+        non_secret: projection.non_secret().clone(),
+        secret_refs: projection
+            .secret_refs()
+            .iter()
+            .map(
+                |reference| eliot_instrument_api::registry::EnvironmentSecretReference {
+                    provider: reference.provider().to_owned(),
+                    key: reference.key().to_owned(),
+                },
+            )
+            .collect(),
+        inheritance: match projection.inheritance() {
+            eliot_process::EnvironmentInheritance::None => {
+                eliot_instrument_api::registry::EnvironmentInheritanceBinding::None
+            }
+            eliot_process::EnvironmentInheritance::Allowlisted => {
+                eliot_instrument_api::registry::EnvironmentInheritanceBinding::Allowlisted
+            }
+        },
+    }
+}
+
+/// Current-stage Kernel identity and profile-stage selection retained as
+/// inert request input. These fields carry no permission: the Kernel
+/// authenticates the current request identity and proves the scoped canonical
+/// registry row before creating a process admission. Historical registration
+/// identity is recovered only through its original receipt and ledger.
+#[derive(Clone, Debug)]
+pub struct RegistryLaunchSelection {
+    /// Current stage/read request identity, forwarded unchanged to Kernel.
+    pub request_identity: RequestIdentity,
+    /// Fixed canonical registry scope selected by the original registration.
+    pub scope_id: ScopeId,
+    /// Owner-pinned profile, revision, stage, and registry generation.
+    pub pin: ExternalStagePin,
+    /// Admitted target layout carried by the current-stage request.
+    pub layout: TargetLayout,
+    /// Admitted work scope and request fence carried by the current-stage request.
+    pub work_scope: WorkScope,
+    /// Current typed process intent, sent unchanged to Kernel.
+    pub intent: ProcessIntent,
+}
+
+/// Decodes the closed current Kernel identity and exact profile-stage
+/// selection from retained bootstrap evidence.
+///
+/// # Errors
+/// Returns a binding error for missing, unknown, malformed, or pre-bound data.
+pub fn registry_launch_selection(value: &Value) -> Result<RegistryLaunchSelection, RunnerError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| RunnerError::Binding("registry_selection is not an object".to_owned()))?;
+    if object.len() != 6
+        || [
+            "request_identity",
+            "scope_id",
+            "pin",
+            "layout",
+            "work_scope",
+            "intent",
+        ]
+        .iter()
+        .any(|key| !object.contains_key(*key))
+    {
+        return Err(RunnerError::Binding(
+            "registry_selection must contain exactly identity, scope, pin, layout, work scope, and intent".to_owned(),
+        ));
+    }
+    let layout = object["layout"].as_object().ok_or_else(|| {
+        RunnerError::Binding("registry_selection.layout is not an object".to_owned())
+    })?;
+    let work_scope = object["work_scope"].as_object().ok_or_else(|| {
+        RunnerError::Binding("registry_selection.work_scope is not an object".to_owned())
+    })?;
+    if layout.len() != 3
+        || ["source_root", "target_root", "cache_root"]
+            .iter()
+            .any(|key| !layout.contains_key(*key))
+        || work_scope.len() != 2
+        || ["declared_scope", "fence"]
+            .iter()
+            .any(|key| !work_scope.contains_key(*key))
+    {
+        return Err(RunnerError::Binding(
+            "original layout or work scope has unknown or missing fields".to_owned(),
+        ));
+    }
+    let text =
+        |object: &serde_json::Map<String, Value>, key: &str| -> Result<String, RunnerError> {
+            let value = object.get(key).and_then(Value::as_str).ok_or_else(|| {
+                RunnerError::Binding(format!("registry selection field '{key}' is not text"))
+            })?;
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(RunnerError::Binding(format!(
+                    "registry selection field '{key}' is blank or contains control characters"
+                )));
+            }
+            Ok(value.to_owned())
+        };
+    let selection = RegistryLaunchSelection {
+        request_identity: decode_registry_selection(
+            &object["request_identity"],
+            "request_identity",
+        )?,
+        scope_id: decode_registry_selection(&object["scope_id"], "scope_id")?,
+        pin: decode_registry_selection(&object["pin"], "pin")?,
+        layout: TargetLayout::new(
+            text(layout, "source_root")?,
+            text(layout, "target_root")?,
+            text(layout, "cache_root")?,
+        )
+        .map_err(|error| {
+            RunnerError::Binding(format!("original target layout is invalid: {error}"))
+        })?,
+        work_scope: WorkScope::new(
+            text(work_scope, "declared_scope")?,
+            decode_registry_selection(&work_scope["fence"], "work_scope.fence")?,
+        )
+        .map_err(|error| {
+            RunnerError::Binding(format!("original work scope is invalid: {error}"))
+        })?,
+        intent: decode_registry_selection(&object["intent"], "intent")?,
+    };
+    selection.request_identity.validate().map_err(|error| {
+        RunnerError::Binding(format!(
+            "original Kernel request identity is invalid: {error}"
+        ))
+    })?;
+    if selection.pin.profile.trim().is_empty()
+        || selection.pin.profile.chars().any(char::is_control)
+        || selection.pin.stage_id.trim().is_empty()
+        || selection.pin.stage_id.chars().any(char::is_control)
+        || selection.pin.profile_revision == 0
+        || selection.pin.registry_generation == 0
+    {
+        return Err(RunnerError::Binding(
+            "registry profile and stage pins must be valid and nonzero".to_owned(),
+        ));
+    }
+    if selection.work_scope.fence != selection.request_identity.request.state_fence {
+        return Err(RunnerError::Binding(
+            "original work scope fence differs from its Kernel request identity".to_owned(),
+        ));
+    }
+    selection.intent.validate().map_err(|error| {
+        RunnerError::Binding(format!("original process intent is invalid: {error}"))
+    })?;
+    if selection.intent.operation_id().as_str()
+        != selection
+            .request_identity
+            .request
+            .metadata
+            .request_id
+            .as_str()
+        || selection.intent.generation().get()
+            != selection
+                .request_identity
+                .request
+                .state_fence
+                .resource_generation
+                .value()
+        || selection.intent.instrument_admission_digest().is_some()
+    {
+        return Err(RunnerError::Binding(
+            "original process intent differs from its Kernel request identity or is already grant-bound".to_owned(),
+        ));
+    }
+    Ok(selection)
+}
+
+fn decode_registry_selection<T: DeserializeOwned>(
+    value: &Value,
+    field: &str,
+) -> Result<T, RunnerError> {
+    serde_json::from_value(value.clone())
+        .map_err(|error| RunnerError::Binding(format!("{field} is invalid: {error}")))
+}
+
+/// Exact owner evidence returned for one admission read: the original
+/// committed write receipt, its retained registration readback, and the
+/// fresh current readback through the authenticated owner.
+pub type AdmissionSubmissionOwnerReadback = (WriteReceipt, NamedReadResponse, NamedReadResponse);
+
+/// Opaque result of live stage admission. Only `StageOrchestrator` can create
+/// one; it is bound to the exact invocation and process request that passed
+/// executable observation, profile admission, and canonical registry proof.
+#[derive(Debug)]
+pub struct AdmittedStageGrant {
+    pub(crate) grant: InstrumentAdmissionGrant,
+    identity: ResolvedExecutableIdentity,
+    pub(crate) binding_seal: String,
+}
+
+impl AdmittedStageGrant {
+    /// Returns the observed executable identity for owner-persisted pin
+    /// metadata. The admission grant itself remains opaque.
+    #[must_use]
+    pub const fn executable_identity(&self) -> &ResolvedExecutableIdentity {
+        &self.identity
+    }
+}
+
+pub(crate) fn admitted_binding_seal(binding: &InstrumentBinding) -> Result<String, RunnerError> {
+    let request = binding
+        .process_request
+        .as_ref()
+        .ok_or(RunnerError::ReceiptMismatch)?;
+    admitted_request_seal(&binding.invocation, request)
+}
+
+fn admitted_request_seal(
+    invocation: &InstrumentInvocation,
+    request: &ProcessRequest,
+) -> Result<String, RunnerError> {
+    let encoded = serde_json::to_vec(&(
+        invocation,
+        request.operation_id().as_str(),
+        request.invocation_digest(),
+        request.generation().get(),
+        request.executable_sha256(),
+        request.argv(),
+    ))
+    .map_err(|_| RunnerError::ReceiptMismatch)?;
+    Ok(sha256_hex(&encoded))
+}
 
 /// Failures raised while planning or recording profile runs.
 ///
@@ -107,7 +356,7 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), ProfileRunErr
 /// executor operation reference binds at launch. Re-execution under the same
 /// identity never hides the first failed or unknown attempt: each attempt is
 /// a separate [`InstrumentRun`] under the same stable triple.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct StageIdentity {
     /// Admitted profile name.
     pub profile: String,
@@ -229,6 +478,9 @@ pub struct PlannedStage {
     pub stage: AdmittedStage,
     /// Plane route for the stage.
     pub route: TestExecutionPlaneRoute,
+    /// Exact resolved WorkScope/layout/environment used for admission.
+    /// External execution refuses plans that have no retained resolution.
+    pub resolution: Option<ResolvedProfile>,
 }
 
 /// One deterministic stage plan expanded from an admitted profile.
@@ -290,6 +542,251 @@ impl StagePlan {
 /// each stage invocation from the admitted plan, returns the sealed process
 /// request through its port, and supplies the governed evidence sink. The
 /// orchestrator never invents invocations, requests, or sinks.
+pub(crate) mod admission_proof_port_sealed {
+    pub trait Sealed {}
+}
+
+#[allow(
+    private_bounds,
+    reason = "the private supertrait seals owner proof implementations to this runner crate"
+)]
+pub trait AdmissionSubmissionProofPort: admission_proof_port_sealed::Sealed + Send + Sync {
+    /// Read-only access to the retained original registration proof.
+    fn read_admission<'a>(
+        &'a self,
+        _submission: &'a AdmissionSubmission,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<AdmissionSubmissionOwnerReadback, RunnerError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(RunnerError::Binding(
+                "external stage lacks an owner-backed original registration proof".to_owned(),
+            ))
+        })
+    }
+
+    /// Read-only access to the retained original registration proof for a
+    /// registered in-process transform. Implementations that only authorize
+    /// process launches stay fail-closed for this separate path.
+    fn read_pure_admission<'a>(
+        &'a self,
+        _submission: &'a PureTransformSubmission,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<AdmissionSubmissionOwnerReadback, RunnerError>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Err(RunnerError::Binding(
+                "pure transform lacks an owner-backed original registration proof".to_owned(),
+            ))
+        })
+    }
+}
+
+/// Explicit no-owner proof source for offline composition and cache-only
+/// paths. It cannot authorize a launch; every read uses the trait's typed
+/// refusal default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UnprovisionedAdmissionProofPort;
+
+impl admission_proof_port_sealed::Sealed for UnprovisionedAdmissionProofPort {}
+impl AdmissionSubmissionProofPort for UnprovisionedAdmissionProofPort {}
+
+/// Typed inputs retained from a canonical resource snapshot for an admitted
+/// pure transform. Construction reads the snapshot through its owner so a
+/// caller cannot pair arbitrary bytes with a chosen artifact identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PureTransformInput {
+    source_read_request: NamedReadRequest,
+    source_readback: NamedReadResponse,
+    source_artifact: ArtifactId,
+    source_bytes: Vec<u8>,
+    source_byte_len: u64,
+    source_content_base64: String,
+    source_sha256: String,
+    source_revision: u64,
+    query: GraphQuery,
+    graph_revision: GraphRevision,
+}
+
+impl PureTransformInput {
+    /// Reads and retains the exact canonical resource snapshot used as input.
+    ///
+    /// The artifact identity is derived from the URI returned by the owner;
+    /// callers provide only the exact named-read request and typed graph
+    /// query. No caller-supplied readback, digest, or raw bytes are accepted.
+    pub async fn retain_resource_snapshot<C: CanonicalReadClient + 'static>(
+        client: Arc<C>,
+        request: NamedReadRequest,
+        query: GraphQuery,
+        graph_revision: GraphRevision,
+    ) -> Result<Self, RunnerError> {
+        request
+            .validate()
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot request: {error}")))?;
+        if request.operation != NamedReadOperation::GetResourceSnapshot
+            || request.scope_id.is_some()
+            || request.consistency != ReadConsistency::ExactFence
+        {
+            return Err(RunnerError::Binding(
+                "pure transform input requires an exact-fence resource snapshot read".to_owned(),
+            ));
+        }
+        let requested_uri = validate_resource_snapshot_read_params(&request.parameters)
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot URI: {error}")))?;
+        query
+            .validate()
+            .map_err(|error| RunnerError::Binding(format!("pure transform query: {error}")))?;
+        if query
+            .expected_revision
+            .is_some_and(|expected| expected != graph_revision)
+        {
+            return Err(RunnerError::Binding(
+                "pure transform graph revision differs from the typed query".to_owned(),
+            ));
+        }
+
+        let readback = client
+            .execute_named(request.clone())
+            .await
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot read: {error}")))?;
+        readback.validate().map_err(|error| {
+            RunnerError::Binding(format!("resource snapshot readback: {error}"))
+        })?;
+        let response_fence = serde_json::to_value(readback.state_fence.clone())
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot fence: {error}")))?;
+        if readback.operation != NamedReadOperation::GetResourceSnapshot
+            || readback.state_fence != request.state_fence
+            || readback.payload.get("state_fence") != Some(&response_fence)
+        {
+            return Err(RunnerError::Binding(
+                "resource snapshot readback changed its operation or state fence".to_owned(),
+            ));
+        }
+        let returned_uri = readback
+            .payload
+            .get("uri")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RunnerError::Binding("resource snapshot readback omitted its URI".to_owned())
+            })?;
+        if returned_uri != requested_uri {
+            return Err(RunnerError::Binding(
+                "resource snapshot readback changed the requested URI".to_owned(),
+            ));
+        }
+        let source_sha256 = readback
+            .payload
+            .get("content_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RunnerError::Binding(
+                    "resource snapshot readback omitted its original content digest".to_owned(),
+                )
+            })?
+            .to_owned();
+        let source_content_base64 = readback
+            .payload
+            .get("content_base64")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RunnerError::Binding("resource snapshot readback omitted its content".to_owned())
+            })?
+            .to_owned();
+        let source_revision = readback
+            .payload
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| {
+                RunnerError::Binding(
+                    "resource snapshot readback omitted its positive owner revision".to_owned(),
+                )
+            })?;
+        let source_bytes = decode_resource_content(&source_content_base64, &source_sha256)
+            .map_err(|error| {
+                RunnerError::Binding(format!("resource snapshot content proof: {error}"))
+            })?;
+        let source_byte_len = u64::try_from(source_bytes.len())
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot length: {error}")))?;
+        let source_artifact = ArtifactId::new(returned_uri.to_owned())
+            .map_err(|error| RunnerError::Binding(format!("resource snapshot URI: {error}")))?;
+
+        Ok(Self {
+            source_read_request: request,
+            source_readback: readback,
+            source_artifact,
+            source_bytes,
+            source_byte_len,
+            source_content_base64,
+            source_sha256,
+            source_revision,
+            query,
+            graph_revision,
+        })
+    }
+
+    fn verify_original_snapshot(&self) -> Result<(), RunnerError> {
+        self.source_read_request.validate().map_err(|error| {
+            RunnerError::Binding(format!("retained resource snapshot request: {error}"))
+        })?;
+        self.source_readback.validate().map_err(|error| {
+            RunnerError::Binding(format!("retained resource snapshot readback: {error}"))
+        })?;
+        let requested_uri =
+            validate_resource_snapshot_read_params(&self.source_read_request.parameters).map_err(
+                |error| RunnerError::Binding(format!("retained resource snapshot URI: {error}")),
+            )?;
+        let response_fence = serde_json::to_value(self.source_readback.state_fence.clone())
+            .map_err(|error| RunnerError::Binding(format!("retained snapshot fence: {error}")))?;
+        if self.source_read_request.operation != NamedReadOperation::GetResourceSnapshot
+            || self.source_read_request.consistency != ReadConsistency::ExactFence
+            || self.source_read_request.scope_id.is_some()
+            || self.source_readback.operation != NamedReadOperation::GetResourceSnapshot
+            || self.source_readback.state_fence != self.source_read_request.state_fence
+            || self.source_readback.payload.get("state_fence") != Some(&response_fence)
+            || requested_uri != self.source_artifact.as_str()
+            || self
+                .source_readback
+                .payload
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_artifact.as_str())
+            || self
+                .source_readback
+                .payload
+                .get("content_sha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_sha256.as_str())
+            || self
+                .source_readback
+                .payload
+                .get("content_base64")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_content_base64.as_str())
+            || self
+                .source_readback
+                .payload
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.source_revision)
+        {
+            return Err(RunnerError::Binding(
+                "retained resource snapshot owner proof changed after validation".to_owned(),
+            ));
+        }
+        let verified = decode_resource_content(&self.source_content_base64, &self.source_sha256)
+            .map_err(|error| {
+                RunnerError::Binding(format!("retained resource snapshot proof: {error}"))
+            })?;
+        if verified != self.source_bytes || verified.len() as u64 != self.source_byte_len {
+            return Err(RunnerError::Binding(
+                "retained resource snapshot bytes changed after owner validation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub trait StageLauncher: Send + Sync {
     /// Derives the typed invocation for one planned stage.
     ///
@@ -304,6 +801,15 @@ pub trait StageLauncher: Send + Sync {
 
     /// Returns the governed evidence sink for one planned stage.
     fn sink(&self, stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink>;
+
+    /// Supplies typed raw evidence and the typed request for an admitted pure
+    /// transform. Existing external launchers do not silently acquire this
+    /// capability.
+    fn pure_input(&self, _stage: &PlannedStage) -> Result<PureTransformInput, RunnerError> {
+        Err(RunnerError::Binding(
+            "stage launcher has no retained input for the registered pure transform".to_owned(),
+        ))
+    }
 }
 
 /// Raw evidence state carried by one [`InstrumentRun`].
@@ -320,6 +826,24 @@ pub enum StageEvidence {
         byte_len: u64,
         /// Exact tool identity under which those bytes were produced.
         tool: RetainedToolIdentity,
+    },
+    /// Result of an admitted deterministic in-process transform. The raw
+    /// lineage carries its canonical URI, original digest, Store revision,
+    /// and length; `result_bytes` are the canonical typed result, never a
+    /// process output claim.
+    Transformed {
+        /// Handle of the retained raw artifact consumed by the transform.
+        source_artifact: ArtifactId,
+        /// Exact byte length of that raw input.
+        source_byte_len: u64,
+        /// Original canonical Store content digest for the source snapshot.
+        source_sha256: String,
+        /// Original Store-local snapshot revision read for the transform.
+        source_revision: u64,
+        /// Canonically serialized deterministic result.
+        result_bytes: Vec<u8>,
+        /// Digest of the exact result bytes.
+        result_digest: String,
     },
     /// Material output absent for an explicit, typed reason.
     Omitted {
@@ -506,6 +1030,60 @@ impl StageTargetLayout {
     }
 }
 
+/// Exact profile/spec/parser admission for a bounded pure transform.
+///
+/// This is copied from the compiled stage and carries no process grant or
+/// executable identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PureTransformAdmission {
+    /// Exact registered profile.
+    pub profile: String,
+    /// Exact profile revision.
+    pub profile_revision: u64,
+    /// Durable stage identity.
+    pub stage_id: String,
+    /// Existing registered transform identity.
+    pub instrument: String,
+    /// Exact transform contract digest.
+    pub spec_digest: String,
+    /// Exact registered parser identity.
+    pub parser: String,
+    /// Exact parser generation.
+    pub parser_generation: u64,
+}
+
+impl PureTransformAdmission {
+    fn from_stage(stage: &AdmittedStage) -> Self {
+        Self {
+            profile: stage.profile.clone(),
+            profile_revision: stage.profile_revision,
+            stage_id: stage.stage_id.clone(),
+            instrument: stage.spec.as_str().to_owned(),
+            spec_digest: stage.spec_digest.clone(),
+            parser: stage.parser.as_str().to_owned(),
+            parser_generation: stage.parser_generation,
+        }
+    }
+
+    /// Deterministic identity over the retained pure admission fields.
+    pub fn digest(&self) -> String {
+        sha256_hex(
+            format!(
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                self.profile,
+                self.profile_revision,
+                self.stage_id,
+                self.instrument,
+                self.spec_digest,
+                self.parser,
+                self.parser_generation,
+            )
+            .as_bytes(),
+        )
+    }
+}
+
 /// One durable run record per stage (I16.17).
 ///
 /// The record binds the durable [`StageIdentity`], the owning plane, the
@@ -532,6 +1110,10 @@ pub struct InstrumentRun {
     /// carries no grant. It travels into the aggregate digest so a changed
     /// executable/argument combination can never reuse an earlier receipt.
     pub grant_digest: Option<String>,
+    /// Original validated external admission data, retained unchanged.
+    pub admission_grant: Option<InstrumentAdmissionGrant>,
+    /// Distinct process-free admission for pure in-process transforms.
+    pub pure_admission: Option<PureTransformAdmission>,
     /// Candidate/configuration identity inherited from the stage plan, when
     /// this run belongs to a candidate-bound plan.
     pub candidate_identity: Option<String>,
@@ -540,6 +1122,51 @@ pub struct InstrumentRun {
 }
 
 impl InstrumentRun {
+    /// Records a successful admitted in-process transform while preserving
+    /// its raw input lineage. This record intentionally has neither an
+    /// executor operation identity nor process grant/executable fields.
+    fn transformed_in_plan(
+        route: &TestExecutionPlaneRoute,
+        input: &PureTransformInput,
+        result_bytes: Vec<u8>,
+        plan: &StagePlan,
+    ) -> Self {
+        let planned = plan.stages.iter().find(|planned| {
+            planned.route.stage().profile == route.stage().profile
+                && planned.route.stage().profile_revision == route.stage().profile_revision
+                && planned.route.stage().stage_id == route.stage().stage_id
+        });
+        let Some(planned) = planned else {
+            return Self::missing(route, "transformed stage does not belong to the bound plan");
+        };
+        if !matches!(planned.stage.execution, StageExecution::Pure { .. }) {
+            return Self::missing(route, "transformed stage has no pure admission");
+        }
+        let pure_admission = PureTransformAdmission::from_stage(&planned.stage);
+        let mut run = Self {
+            stage: route.stage().clone(),
+            plane: ModuleRuntimeClass::DerivedIndex,
+            testd_dispatchable: false,
+            execution: ExecutionStatus::Succeeded,
+            evidence: StageEvidence::Transformed {
+                source_artifact: input.source_artifact.clone(),
+                source_byte_len: input.source_byte_len,
+                source_sha256: input.source_sha256.clone(),
+                source_revision: input.source_revision,
+                result_digest: sha256_hex(&result_bytes),
+                result_bytes,
+            },
+            executable_digest: None,
+            grant_digest: None,
+            admission_grant: None,
+            pure_admission: Some(pure_admission),
+            candidate_identity: plan.candidate_identity.clone(),
+            target_layout: None,
+        };
+        run.candidate_identity.clone_from(&plan.candidate_identity);
+        run
+    }
+
     /// Records a launched stage whose terminal observation is still owned by
     /// the supervising lane.
     ///
@@ -624,6 +1251,8 @@ impl InstrumentRun {
             },
             executable_digest: Some(observed_executable_digest.to_owned()),
             grant_digest: Some(grant.grant_digest.clone()),
+            admission_grant: Some(grant.clone()),
+            pure_admission: None,
             candidate_identity: None,
             target_layout,
         })
@@ -681,6 +1310,8 @@ impl InstrumentRun {
             },
             executable_digest: None,
             grant_digest: None,
+            admission_grant: None,
+            pure_admission: None,
             candidate_identity: None,
             target_layout: None,
         }
@@ -726,6 +1357,8 @@ impl InstrumentRun {
             },
             executable_digest: Some(executable_digest),
             grant_digest: Some(grant.grant_digest.clone()),
+            admission_grant: Some(grant.clone()),
+            pure_admission: None,
             candidate_identity: None,
             target_layout,
         })
@@ -737,9 +1370,49 @@ impl InstrumentRun {
     /// observed executable identity. Anything else stays visible in the
     /// aggregate instead of collapsing into success.
     pub fn is_success(&self) -> bool {
-        self.execution == ExecutionStatus::Succeeded
-            && matches!(self.evidence, StageEvidence::Retained { .. })
-            && self.executable_digest.is_some()
+        if self.execution != ExecutionStatus::Succeeded {
+            return false;
+        }
+        match &self.evidence {
+            StageEvidence::Retained { .. } => {
+                self.executable_digest.is_some()
+                    && self.admission_grant.as_ref().is_some_and(|grant| {
+                        Some(grant.grant_digest.as_str()) == self.grant_digest.as_deref()
+                            && grant.digest() == grant.grant_digest
+                            && grant.max_concurrency > 0
+                    })
+                    && self.pure_admission.is_none()
+            }
+            StageEvidence::Transformed {
+                source_byte_len,
+                source_sha256,
+                source_revision,
+                result_bytes,
+                result_digest,
+                ..
+            } => {
+                self.stage.operation_id.is_none()
+                    && self.plane == ModuleRuntimeClass::DerivedIndex
+                    && !self.testd_dispatchable
+                    && self.executable_digest.is_none()
+                    && self.grant_digest.is_none()
+                    && self.admission_grant.is_none()
+                    && self.pure_admission.as_ref().is_some_and(|admission| {
+                        admission.profile == self.stage.profile
+                            && admission.profile_revision == self.stage.profile_revision
+                            && admission.stage_id == self.stage.stage_id
+                            && validate_digest(&admission.spec_digest, "pure spec digest").is_ok()
+                            && !admission.parser.trim().is_empty()
+                            && admission.parser_generation > 0
+                    })
+                    && self.target_layout.is_none()
+                    && *source_byte_len > 0
+                    && *source_revision > 0
+                    && validate_digest(source_sha256, "source_sha256").is_ok()
+                    && result_digest == &sha256_hex(result_bytes)
+            }
+            StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => false,
+        }
     }
 }
 
@@ -863,6 +1536,28 @@ impl ProfileAggregate {
                     material.push('\0');
                     material.push_str(&tool.digest());
                 }
+                StageEvidence::Transformed {
+                    source_artifact,
+                    source_byte_len,
+                    source_sha256,
+                    source_revision,
+                    result_bytes,
+                    result_digest,
+                } => {
+                    material.push_str(source_artifact.as_str());
+                    material.push('\0');
+                    material.push_str(&source_byte_len.to_string());
+                    material.push('\0');
+                    material.push_str(source_sha256);
+                    material.push('\0');
+                    material.push_str(&source_revision.to_string());
+                    material.push('\0');
+                    material.push_str(result_digest);
+                    material.push('\0');
+                    // Hash the bytes again while aggregating so a stale or
+                    // caller-edited digest cannot hide a changed result.
+                    material.push_str(&sha256_hex(result_bytes));
+                }
                 StageEvidence::Omitted { reason } | StageEvidence::Missing { reason } => {
                     material.push_str(reason);
                 }
@@ -871,6 +1566,20 @@ impl ProfileAggregate {
             material.push_str(run.executable_digest.as_deref().unwrap_or(""));
             material.push('\0');
             material.push_str(run.grant_digest.as_deref().unwrap_or(""));
+            material.push('\0');
+            material.push_str(
+                &run.admission_grant
+                    .as_ref()
+                    .map(InstrumentAdmissionGrant::digest)
+                    .unwrap_or_default(),
+            );
+            material.push('\0');
+            material.push_str(
+                &run.pure_admission
+                    .as_ref()
+                    .map(PureTransformAdmission::digest)
+                    .unwrap_or_default(),
+            );
             material.push('\0');
         }
         Self {
@@ -973,6 +1682,7 @@ impl StageOrchestrator {
                 PlannedStage {
                     route: TestExecutionPlaneRoute::route(identity, stage.kind, stage.external),
                     stage: stage.clone(),
+                    resolution: None,
                 }
             })
             .collect();
@@ -988,6 +1698,45 @@ impl StageOrchestrator {
         }
     }
 
+    /// Binds a compiled profile plan to its exact caller-resolved scope, roots,
+    /// environment, and registry identity. External admission requires this
+    /// retained resolution and never reconstructs it from a ProcessRequest.
+    pub fn plan_resolved(
+        admitted: &AdmittedProfile,
+        resolved: &ResolvedProfile,
+    ) -> Result<StagePlan, crate::profile::ProfileError> {
+        if admitted.name != resolved.name
+            || admitted.revision != resolved.revision
+            || admitted.registry_generation != resolved.registry_generation
+            || admitted.registry_digest != resolved.registry_digest
+            || admitted.profile_digest != resolved.profile_digest
+            || admitted.dag_digest != resolved.dag_digest
+            || admitted.stages.len() != resolved.stages.len()
+        {
+            return Err(crate::profile::ProfileError::Snapshot {
+                detail: "resolved profile differs from the exact compiled admission".to_owned(),
+            });
+        }
+        for (admitted_stage, resolved_stage) in admitted.stages.iter().zip(&resolved.stages) {
+            if admitted_stage.stage_id != resolved_stage.stage_id
+                || admitted_stage.spec != resolved_stage.spec
+                || admitted_stage.kind != resolved_stage.kind
+                || admitted_stage.required != resolved_stage.required
+                || admitted_stage.external != resolved_stage.external
+                || admitted_stage.depends_on != resolved_stage.depends_on
+            {
+                return Err(crate::profile::ProfileError::Snapshot {
+                    detail: "resolved stage differs from the exact compiled admission".to_owned(),
+                });
+            }
+        }
+        let mut plan = Self::plan(admitted);
+        for planned in &mut plan.stages {
+            planned.resolution = Some(resolved.clone());
+        }
+        Ok(plan)
+    }
+
     /// Launches every planned stage in topological order.
     ///
     /// The walk is total: launch, admission, and invocation failures become
@@ -1000,7 +1749,14 @@ impl StageOrchestrator {
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
     ) -> Vec<InstrumentRun> {
-        Self::launch_all(runner, None, plan, launcher).await
+        Self::launch_all(
+            runner,
+            None,
+            plan,
+            launcher,
+            &UnprovisionedAdmissionProofPort,
+        )
+        .await
     }
 
     /// Launches every planned stage with new admission checked against the
@@ -1017,6 +1773,21 @@ impl StageOrchestrator {
         registry: &InstrumentRegistry,
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> Vec<InstrumentRun> {
+        Self::launch_plan_live_with_proof(runner, registry, plan, launcher, proof).await
+    }
+
+    /// Launches a profile plan using an explicitly composition-retained
+    /// registry owner proof port. This lets a runtime keep its authenticated
+    /// proof provider at construction while a stage launcher supplies only
+    /// per-stage invocation, request, and evidence provisions.
+    pub async fn launch_plan_live_with_proof<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        registry: &InstrumentRegistry,
+        plan: &StagePlan,
+        launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
     ) -> Vec<InstrumentRun> {
         if plan.registry_generation != registry.generation()
             || plan.registry_digest != registry.digest()
@@ -1034,7 +1805,254 @@ impl StageOrchestrator {
                 })
                 .collect();
         }
-        Self::launch_all(runner, Some(registry), plan, launcher).await
+        Self::launch_all(runner, Some(registry), plan, launcher, proof).await
+    }
+
+    /// Launches one already-bound external stage through the same live
+    /// registry and original-registration proof gate used by profile walks.
+    ///
+    /// This is the narrow single-stage entry for existing application edges
+    /// that already own a typed invocation and a Kernel-sealed request. The
+    /// stage schema, executable receipt, live generation, and persisted
+    /// registration readback remain the same admission path as
+    /// [`Self::launch_plan_live`].
+    pub async fn launch_admitted_stage_live<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        registry: &InstrumentRegistry,
+        planned: &PlannedStage,
+        binding: &mut InstrumentBinding,
+        proof: &dyn AdmissionSubmissionProofPort,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<InstrumentStartReceipt, RunnerError> {
+        let admitted = Self::admit_stage_live(registry, planned, binding, proof).await?;
+        runner.launch_admitted(binding, &admitted, sink).await
+    }
+
+    /// Applies the live external-stage admission gate without starting a
+    /// child. The returned opaque grant can be consumed by the runner after
+    /// the caller completes any additional owner checks required by its
+    /// execution contour.
+    pub async fn admit_stage_live(
+        registry: &InstrumentRegistry,
+        planned: &PlannedStage,
+        binding: &InstrumentBinding,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> Result<AdmittedStageGrant, RunnerError> {
+        let process_request = binding
+            .process_request
+            .as_ref()
+            .ok_or(RunnerError::ReceiptMismatch)?;
+        Self::admit_stage_request_live(
+            registry,
+            planned,
+            &binding.invocation,
+            process_request,
+            proof,
+        )
+        .await
+    }
+
+    /// Applies the same live gate to an owner-held, non-cloneable process
+    /// request without taking ownership of it. This is the owner pre-start
+    /// entry for callers whose consuming executor retains the request.
+    pub async fn admit_stage_request_live(
+        registry: &InstrumentRegistry,
+        planned: &PlannedStage,
+        invocation: &InstrumentInvocation,
+        process_request: &ProcessRequest,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> Result<AdmittedStageGrant, RunnerError> {
+        let route = &planned.route;
+        let resolution = planned
+            .resolution
+            .as_ref()
+            .ok_or(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Resolution,
+            ))?;
+        if resolution.name != route.stage().profile
+            || resolution.revision != route.stage().profile_revision
+            || resolution.registry_generation != registry.generation()
+            || resolution.registry_digest != registry.digest()
+        {
+            return Err(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Resolution,
+            ));
+        }
+        if !route.external() {
+            return Err(RunnerError::Binding(
+                TestdPlaneAdmission::refuse_pure_stage(route),
+            ));
+        }
+        if let Some(reason) = Self::invocation_skew_reason(route, &planned.stage, invocation) {
+            return Err(RunnerError::Binding(reason));
+        }
+        process_request
+            .validate()
+            .map_err(|error| RunnerError::Binding(error.to_string()))?;
+        if invocation.declared_scope != resolution.scope.declared_scope
+            || process_request.working_directory() != resolution.layout.source_root
+            || process_request.fence().authority_epoch() != &resolution.scope.fence.authority_epoch
+            || process_request.fence().generation().get()
+                != resolution.scope.fence.resource_generation.get()
+            || resolution.environment.class != planned.stage.environment_class
+            || (planned.stage.environment_class == "isolated-process"
+                && (process_request.environment().inheritance()
+                    != eliot_process::EnvironmentInheritance::None
+                    || !process_request.environment().secret_refs().is_empty()))
+        {
+            return Err(RunnerError::Binding(
+                "ProcessIntent differs from the retained WorkScope, layout, or environment policy"
+                    .to_owned(),
+            ));
+        }
+        let limits = process_request.resource_limits();
+        if planned
+            .stage
+            .timeout_ms
+            .is_some_and(|ceiling| limits.wall_timeout_ms() > ceiling)
+            || planned.stage.max_output_bytes.is_some_and(|ceiling| {
+                limits.stdout_bytes() > ceiling || limits.stderr_bytes() > ceiling
+            })
+        {
+            return Err(RunnerError::Binding(
+                "ProcessIntent resource limits exceed the admitted stage ceiling".to_owned(),
+            ));
+        }
+        if process_request.operation_id().as_str() != invocation.request.request_id.as_str() {
+            return Err(RunnerError::IdentityMismatch);
+        }
+        let observed = ExecutableObservation::observe_from_intent(process_request.intent(), None)
+            .map_err(|error| {
+            RunnerError::ExecutableMismatch(format!(
+                "stage executable could not be observed: {error}"
+            ))
+        })?;
+        let mut identity = bridge_executor_observation(invocation.instrument.as_str(), observed)
+            .map_err(|error| RunnerError::Binding(error.to_string()))?;
+        let Some(file_identity) = identity.file_identity else {
+            return Err(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Executable,
+            ));
+        };
+        if process_request.intent().executable_file_identity() != Some(&file_identity) {
+            return Err(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Resolution,
+            ));
+        }
+        identity.tool_version = Self::recorded_tool_version(registry, &planned.stage, &identity)?;
+        let submission = prepare_admission_submission(registry, &planned.stage, &identity)
+            .map_err(|error| RunnerError::Binding(format!("stage admission refused: {error}")))?;
+        let (receipt, original_readback, current_readback) =
+            proof.read_admission(&submission).await?;
+        AdmissionSubmissionReadback::verify(
+            &submission,
+            receipt,
+            original_readback,
+            current_readback,
+        )
+        .map_err(|error| {
+            RunnerError::Binding(format!("canonical registry readback refused: {error}"))
+        })?;
+        let snapshot = registry
+            .persist()
+            .map_err(|error| RunnerError::Binding(format!("registry snapshot refused: {error}")))?;
+        let snapshot_value = serde_json::to_value(snapshot)
+            .map_err(|error| RunnerError::Binding(format!("registry snapshot refused: {error}")))?;
+        let snapshot: eliot_instrument_api::registry::InstrumentRegistrySnapshot<
+            serde_json::Value,
+        > = serde_json::from_value(snapshot_value)
+            .map_err(|error| RunnerError::Binding(format!("registry snapshot refused: {error}")))?;
+        let observation = eliot_instrument_api::registry::ExternalExecutableObservation {
+            canonical_path: identity.canonical_path.clone(),
+            executable_file_name: identity.executable_file_name(),
+            content_digest: identity.content_digest.clone(),
+            file_identity,
+            tool_version: identity.tool_version.clone(),
+        };
+        let pin = eliot_instrument_api::registry::ExternalStagePin {
+            profile: route.stage().profile.clone(),
+            profile_revision: route.stage().profile_revision,
+            stage_id: route.stage().stage_id.clone(),
+            registry_generation: snapshot.generation,
+        };
+        let resolved_execution = eliot_instrument_api::registry::ResolvedExecutionBinding {
+            source_root: resolution.layout.source_root.clone(),
+            environment_class: resolution.environment.class.clone(),
+            environment_digest: resolution.environment.digest.clone(),
+            environment_projection: environment_binding(
+                resolution.environment.projection.as_ref().ok_or_else(|| {
+                    RunnerError::Binding(
+                        "resolved profile did not retain its exact environment projection"
+                            .to_owned(),
+                    )
+                })?,
+            ),
+            declared_scope: resolution.scope.declared_scope.clone(),
+            authority_epoch: resolution.scope.fence.authority_epoch.clone(),
+            resource_generation: resolution.scope.fence.resource_generation.get(),
+        };
+        let process_limits = process_request.resource_limits();
+        let process_execution = eliot_instrument_api::registry::ProcessExecutionProjection {
+            working_directory: process_request.working_directory().to_owned(),
+            environment_digest: eliot_process_executor::environment_projection_digest(
+                process_request.environment(),
+            ),
+            environment_projection: environment_binding(process_request.environment()),
+            executable_file_identity: process_request
+                .intent()
+                .executable_file_identity()
+                .copied()
+                .ok_or(RunnerError::RegistryAdmission(
+                    eliot_instrument_api::registry::RegistryAdmissionError::Resolution,
+                ))?,
+            authority_epoch: process_request.fence().authority_epoch().clone(),
+            resource_generation: process_request.fence().generation().get(),
+            wall_timeout_ms: process_limits.wall_timeout_ms(),
+            stdout_bytes: process_limits.stdout_bytes(),
+            stderr_bytes: process_limits.stderr_bytes(),
+        };
+        let grant = eliot_instrument_api::registry::validate_external_stage(
+            &snapshot,
+            &pin,
+            invocation,
+            &observation,
+            process_request.argv(),
+            &resolved_execution,
+            &process_execution,
+        )
+        .map_err(RunnerError::RegistryAdmission)?;
+        if process_request.intent().instrument_admission_digest() != Some(grant.digest().as_str()) {
+            return Err(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Resolution,
+            ));
+        }
+        if let Some(reason) = Self::grant_at_use_skew_reason(
+            route,
+            &planned.stage,
+            &grant,
+            &identity,
+            process_request,
+            resolution,
+        ) {
+            return Err(RunnerError::Binding(reason));
+        }
+        Ok(AdmittedStageGrant {
+            grant,
+            identity,
+            binding_seal: admitted_request_seal(invocation, process_request)?,
+        })
+    }
+
+    /// Consumes a live gate result through the runner's single start path.
+    /// The opaque result is bound to this exact invocation/request pair, so an
+    /// owner may finish its durable pre-start checks before delegating here.
+    pub async fn launch_admitted_stage<E: ProcessExecutor + 'static>(
+        runner: &InstrumentRunner<E>,
+        binding: &mut InstrumentBinding,
+        admitted: &AdmittedStageGrant,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<InstrumentStartReceipt, RunnerError> {
+        runner.launch_admitted(binding, admitted, sink).await
     }
 
     /// Walks one plan in topological order, with the live registry when the
@@ -1044,6 +2062,7 @@ impl StageOrchestrator {
         live: Option<&InstrumentRegistry>,
         plan: &StagePlan,
         launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
     ) -> Vec<InstrumentRun> {
         let mut runs = Vec::with_capacity(plan.stages.len());
         let mut unlaunched: BTreeSet<String> = BTreeSet::new();
@@ -1064,7 +2083,7 @@ impl StageOrchestrator {
                 unlaunched.insert(route.stage().stage_id.clone());
                 continue;
             }
-            let mut run = Self::launch_one(runner, live, plan, planned, launcher).await;
+            let mut run = Self::launch_one(runner, live, plan, planned, launcher, proof).await;
             run.candidate_identity.clone_from(&plan.candidate_identity);
             if run.evidence.is_missing() {
                 unlaunched.insert(route.stage().stage_id.clone());
@@ -1132,6 +2151,7 @@ impl StageOrchestrator {
         grant: &InstrumentAdmissionGrant,
         observed: &ResolvedExecutableIdentity,
         process_request: &ProcessRequest,
+        resolution: &ResolvedProfile,
     ) -> Option<String> {
         if grant.profile != route.stage().profile
             || grant.profile_revision != route.stage().profile_revision
@@ -1144,6 +2164,7 @@ impl StageOrchestrator {
             || grant.parser.as_str() != stage.parser.as_str()
             || grant.parser_generation != stage.parser_generation
             || grant.arguments != stage.verification_command
+            || Some(grant.max_concurrency) != stage.max_concurrency
         {
             return Some(
                 "stage admission refused: grant differs from the admitted stage".to_owned(),
@@ -1173,6 +2194,10 @@ impl StageOrchestrator {
         }
         if grant.executable_path != observed.canonical_path
             || grant.content_digest != observed.content_digest
+            || grant.executable_file_identity != observed.file_identity
+            || grant.executable_file_identity.is_none()
+            || process_request.intent().executable_file_identity()
+                != grant.executable_file_identity.as_ref()
         {
             return Some(
                 "stage admission refused: grant carries a different executable object than observed"
@@ -1185,36 +2210,73 @@ impl StageOrchestrator {
                     .to_owned(),
             );
         }
-        match std::fs::canonicalize(process_request.intent().executable()) {
-            Ok(canonical) if canonical.to_string_lossy().as_ref() == observed.canonical_path => {
-                None
-            }
-            _ => Some(
+        if !matches!(
+            std::fs::canonicalize(process_request.intent().executable()),
+            Ok(canonical) if canonical.to_string_lossy().as_ref() == observed.canonical_path
+        ) {
+            return Some(
                 "stage admission refused: sealed request names a different executable object than the observed identity"
                     .to_owned(),
-            ),
+            );
         }
+        if grant.source_root.as_deref() != Some(resolution.layout.source_root.as_str())
+            || grant.declared_scope.as_deref() != Some(resolution.scope.declared_scope.as_str())
+            || grant.environment_digest.as_deref()
+                != Some(
+                    eliot_process_executor::environment_projection_digest(
+                        process_request.environment(),
+                    )
+                    .as_str(),
+                )
+            || grant.authority_epoch.as_ref() != Some(process_request.fence().authority_epoch())
+            || grant.resource_generation != Some(process_request.fence().generation().get())
+        {
+            return Some(
+                "stage admission refused: grant differs from the retained execution binding"
+                    .to_owned(),
+            );
+        }
+        None
     }
 
-    /// Admits one planned stage against the live registry when the composition
-    /// root still holds it, else against the compiled admission alone.
-    fn admit_planned_stage(
-        planned: &PlannedStage,
-        live: Option<&InstrumentRegistry>,
-        admission: &InstrumentAdmissionRequest,
+    /// Reuses only the version in the admitted original supply receipt after
+    /// the exact current spec, executable filename, bytes, and registry
+    /// generation still match that receipt. No caller text or version probe
+    /// supplies this value.
+    /// Returns the version from the admitted supply receipt after verifying
+    /// exact current spec, filename, observed bytes, receipt, and generation.
+    ///
+    /// The version is never accepted from caller text or probed in a child.
+    pub fn recorded_tool_version(
+        registry: &InstrumentRegistry,
+        stage: &AdmittedStage,
         identity: &ResolvedExecutableIdentity,
-        profile_revision: u64,
-    ) -> Result<InstrumentAdmissionGrant, AdmissionError> {
-        match live {
-            Some(registry) => {
-                planned
-                    .stage
-                    .admit_live(registry, admission, Some(identity), profile_revision)
-            }
-            None => planned
-                .stage
-                .admit(admission, Some(identity), profile_revision),
+    ) -> Result<Option<String>, RunnerError> {
+        let spec = registry
+            .spec(stage.spec.as_str())
+            .ok_or_else(|| RunnerError::Binding("admitted executable spec is absent".to_owned()))?;
+        let original = stage.supply_receipt.as_ref().ok_or_else(|| {
+            RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Executable,
+            )
+        })?;
+        let current = registry.supply_chain(stage.spec.as_str()).ok_or_else(|| {
+            RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Executable,
+            )
+        })?;
+        if spec.digest() != stage.spec_digest
+            || original.digest() != current.digest()
+            || original.spec_digest != spec.digest()
+            || original.generation != registry.generation()
+            || original.executable != identity.executable_file_name()
+            || original.content_digest != identity.content_digest
+        {
+            return Err(RunnerError::RegistryAdmission(
+                eliot_instrument_api::registry::RegistryAdmissionError::Executable,
+            ));
         }
+        Ok(original.tool_version.clone())
     }
 
     /// Binds and launches one stage through the existing runner primitives.
@@ -1235,20 +2297,35 @@ impl StageOrchestrator {
     /// the runner launch under [`InstrumentRunner::launch_admitted`]. A
     /// changed executable, an unknown identity, or an off-template argument
     /// combination becomes an explicit missing run here instead of a child
-    /// process. The tool version stays unobserved (`None`): no version is
-    /// attested on this path, so none is claimed, while a spec-pinned
-    /// version still gates inside admission.
+    /// process. The tool version comes only from the admitted original supply
+    /// receipt, after its spec, file name, bytes, and generation are matched.
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         live: Option<&InstrumentRegistry>,
         plan: &StagePlan,
         planned: &PlannedStage,
         launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
     ) -> InstrumentRun {
         let route = &planned.route;
-        if !route.external() {
-            return InstrumentRun::missing(route, TestdPlaneAdmission::refuse_pure_stage(route));
+        match (&planned.stage.execution, route.external()) {
+            (StageExecution::Pure { .. }, false) => {
+                return Self::launch_pure_one(live, plan, planned, launcher, proof).await;
+            }
+            (StageExecution::External, true) => {}
+            _ => {
+                return InstrumentRun::missing(
+                    route,
+                    "stage execution discriminator disagrees with its admitted route",
+                );
+            }
         }
+        let Some(registry) = live else {
+            return InstrumentRun::missing(
+                route,
+                "external stage lacks a live owner registry and persisted admission".to_owned(),
+            );
+        };
         let invocation = match launcher.invocation(planned) {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -1267,64 +2344,20 @@ impl StageOrchestrator {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
-        let observed =
-            match ExecutableObservation::observe_from_intent(process_request.intent(), None) {
-                Ok(observation) => observation,
-                Err(error) => {
-                    return InstrumentRun::missing(
-                        route,
-                        format!(
-                            "stage admission refused: {}",
-                            AdmissionError::ExecutableMismatch {
-                                detail: error.to_string(),
-                            }
-                        ),
-                    );
-                }
-            };
-        let identity = match bridge_executor_observation(invocation.instrument.as_str(), observed) {
-            Ok(identity) => identity,
-            Err(error) => {
-                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
-            }
-        };
-        let admission = planned
-            .stage
-            .admission_request(&invocation, Some(&identity));
-        let grant = match Self::admit_planned_stage(
-            planned,
-            live,
-            &admission,
-            &identity,
-            route.stage().profile_revision,
-        ) {
-            Ok(grant) => grant,
-            Err(error) => {
-                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
-            }
-        };
-        if let Some(reason) = Self::grant_at_use_skew_reason(
-            route,
-            &planned.stage,
-            &grant,
-            &identity,
-            &process_request,
-        ) {
-            return InstrumentRun::missing(route, reason);
-        }
-        if let Some(registry) = live
-            && let Err(error) = submit_admission_snapshot(registry, &planned.stage, &identity)
-        {
-            return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
-        }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
+        let admitted = match Self::admit_stage_live(registry, planned, &binding, proof).await {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return InstrumentRun::missing(route, format!("stage launch failed: {error}"));
+            }
+        };
         match runner
-            .launch_admitted(&mut binding, &grant, launcher.sink(planned))
+            .launch_admitted(&mut binding, &admitted, launcher.sink(planned))
             .await
         {
             Ok(receipt) => {
@@ -1337,14 +2370,155 @@ impl StageOrchestrator {
                 InstrumentRun::launched_in_plan(
                     route,
                     operation,
-                    &grant,
-                    identity.content_digest.as_str(),
+                    &admitted.grant,
+                    admitted.identity.content_digest.as_str(),
                     Some(target_layout),
                     plan,
                 )
             }
             Err(error) => InstrumentRun::missing(route, format!("stage launch failed: {error}")),
         }
+    }
+
+    /// Runs the one registered pure transform through its typed code-owned
+    /// handler. It still requires the same live snapshot and persisted owner
+    /// receipt/readback as external admission, but never binds a process
+    /// request, executor, testd lane, or synthetic executable identity.
+    async fn launch_pure_one(
+        live: Option<&InstrumentRegistry>,
+        plan: &StagePlan,
+        planned: &PlannedStage,
+        launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> InstrumentRun {
+        let route = &planned.route;
+        let Some(registry) = live else {
+            return InstrumentRun::missing(
+                route,
+                "pure transform lacks a live owner registry and persisted admission",
+            );
+        };
+        if let Err(error) = planned.stage.refuse_if_revoked(registry) {
+            return InstrumentRun::missing(
+                route,
+                format!("pure transform admission refused: {error}"),
+            );
+        }
+        let Some(spec) = registry.pure_transform(planned.stage.spec.as_str()) else {
+            return InstrumentRun::missing(
+                route,
+                "pure transform is absent from the live registry",
+            );
+        };
+        let StageExecution::Pure { parser_generation } = &planned.stage.execution else {
+            return InstrumentRun::missing(
+                route,
+                "pure transform stage lost its execution discriminator",
+            );
+        };
+        if *parser_generation != spec.parser_generation {
+            return InstrumentRun::missing(route, "pure transform parser generation is stale");
+        }
+        let submission = match prepare_pure_transform_submission(registry, &planned.stage) {
+            Ok(submission) => submission,
+            Err(error) => {
+                return InstrumentRun::missing(
+                    route,
+                    format!("pure transform admission refused: {error}"),
+                );
+            }
+        };
+        let (receipt, original_readback, current_readback) =
+            match proof.read_pure_admission(&submission).await {
+                Ok(readback) => readback,
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("pure transform owner proof unavailable: {error}"),
+                    );
+                }
+            };
+        if let Err(error) = AdmissionSubmissionReadback::verify_pure_transform(
+            &submission,
+            &planned.stage,
+            receipt,
+            original_readback,
+            current_readback,
+        ) {
+            return InstrumentRun::missing(
+                route,
+                format!("pure transform canonical registry readback refused: {error}"),
+            );
+        }
+        let input = match launcher.pure_input(planned) {
+            Ok(input) => input,
+            Err(error) => {
+                return InstrumentRun::missing(
+                    route,
+                    format!("pure transform input is unavailable: {error}"),
+                );
+            }
+        };
+        if let Err(error) = input.verify_original_snapshot() {
+            return InstrumentRun::missing(
+                route,
+                format!("pure transform original source proof failed: {error}"),
+            );
+        }
+        if input.source_bytes.len() > spec.max_input_bytes {
+            return InstrumentRun::missing(
+                route,
+                "pure transform raw input exceeds its registered bound",
+            );
+        }
+        if let Err(error) = input.query.validate() {
+            return InstrumentRun::missing(
+                route,
+                format!("pure transform query is invalid: {error}"),
+            );
+        }
+        if input
+            .query
+            .expected_revision
+            .is_some_and(|expected| expected != input.graph_revision)
+        {
+            return InstrumentRun::missing(
+                route,
+                "pure transform graph revision differs from the typed query",
+            );
+        }
+        let decoded = match spec.handler {
+            PureTransformHandler::ScipGraphQuery => {
+                let index = match eliot_instrument_scip::ScipIndex::decode(&input.source_bytes) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        return InstrumentRun::missing(
+                            route,
+                            format!("registered SCIP transform rejected retained input: {error}"),
+                        );
+                    }
+                };
+                match index.graph_result(&input.query, input.graph_revision) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return InstrumentRun::missing(
+                            route,
+                            format!("registered SCIP transform failed: {error}"),
+                        );
+                    }
+                }
+            }
+        };
+        let result_bytes = match serde_json::to_vec(&decoded) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return InstrumentRun::missing(
+                    route,
+                    format!("registered pure result could not be encoded: {error}"),
+                );
+            }
+        };
+        InstrumentRun::transformed_in_plan(route, &input, result_bytes, plan)
     }
 }
 
@@ -1363,6 +2537,57 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     ) -> ProfileAggregate {
         let plan = StageOrchestrator::plan(admitted);
         let runs = StageOrchestrator::launch_plan(self, &plan, launcher).await;
+        ProfileAggregate::assemble(&plan, runs)
+    }
+
+    /// Runs one admitted profile against the composition root's current
+    /// registry and its original persisted registration proof.
+    ///
+    /// The owner-backed launcher supplies a read-only receipt/readback for
+    /// each external stage. Registry-less callers must use
+    /// [`Self::run_profile_stages`], whose external stages remain unlaunched.
+    pub async fn run_profile_stages_live(
+        &self,
+        registry: &InstrumentRegistry,
+        admitted: &AdmittedProfile,
+        resolved: &ResolvedProfile,
+        launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> ProfileAggregate {
+        self.run_profile_stages_live_with_proof(registry, admitted, resolved, launcher, proof)
+            .await
+    }
+
+    /// Runs one admitted profile with the owner proof port retained by the
+    /// composition root, separate from per-stage launch provisions.
+    pub async fn run_profile_stages_live_with_proof(
+        &self,
+        registry: &InstrumentRegistry,
+        admitted: &AdmittedProfile,
+        resolved: &ResolvedProfile,
+        launcher: &dyn StageLauncher,
+        proof: &dyn AdmissionSubmissionProofPort,
+    ) -> ProfileAggregate {
+        let plan = match StageOrchestrator::plan_resolved(admitted, resolved) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let plan = StageOrchestrator::plan(admitted);
+                let runs = plan
+                    .stages
+                    .iter()
+                    .map(|planned| {
+                        InstrumentRun::missing(
+                            &planned.route,
+                            format!("resolved profile refused: {error}"),
+                        )
+                    })
+                    .collect();
+                return ProfileAggregate::assemble(&plan, runs);
+            }
+        };
+        let runs =
+            StageOrchestrator::launch_plan_live_with_proof(self, registry, &plan, launcher, proof)
+                .await;
         ProfileAggregate::assemble(&plan, runs)
     }
 }

@@ -48,6 +48,7 @@ mod dreamer_job;
 pub mod epistemic_revision;
 pub mod erasure_admission;
 pub mod experience_store;
+mod instrument_registry_readback;
 pub mod learning_store;
 mod mailbox;
 mod named_mutation_receipt;
@@ -112,6 +113,8 @@ pub use dreamer_job::{
     MAX_DREAMER_JOB_QUEUE_KEY_BYTES, MAX_DREAMER_JOB_TEXT_BYTES, dreamer_job_queue_key,
     map_durable_error, validate_ledger_bundle,
 };
+
+pub use instrument_registry_readback::validate_instrument_registry_registration_readback;
 
 pub use notification_state::{
     DecodedNotificationMutation, MAX_DEDUP_KEY_BYTES, MAX_NOTIFICATION_PAGE_LIMIT,

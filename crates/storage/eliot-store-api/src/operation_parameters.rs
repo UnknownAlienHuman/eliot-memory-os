@@ -176,6 +176,13 @@ pub enum ParameterShape {
     MailboxItemAdmission,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
+    /// Opaque, owner-governed registration authority ledger JSON text.
+    /// The storage API checks JSON-object syntax and preserves the exact text;
+    /// Governor owns the closed schema, version and authority semantics.
+    InstrumentRegistryAuthorityLedger,
+    /// Caller-observed store-local registry head revision for owner CAS;
+    /// zero is the explicit expected revision for a verified absent row.
+    InstrumentRegistryOwnerRevision,
     /// Closed canonical Problem candidate record for issue #1759 I2: the
     /// complete candidate `Problem` document the `ApplyProblemOwnerState` leg
     /// commits. The value must be a JSON object; the problem owner-state
@@ -207,6 +214,10 @@ impl ParameterShape {
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
             Self::MailboxItemAdmission => "eliot.mailbox.item-admission.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
+            Self::InstrumentRegistryAuthorityLedger => {
+                "eliot.governor.registration-authority-ledger"
+            }
+            Self::InstrumentRegistryOwnerRevision => "eliot.instrument.registry-owner-revision@1",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
         }
@@ -827,14 +838,26 @@ static GET_RESOURCE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 1] = [ParameterD
     required: true,
 }];
 
-/// Opaque versioned registry snapshot carried by the unactivated instrument
-/// registry mutation. The expected owner revision is bound by the prepared
-/// transition's standard revision-head CAS, not duplicated in payload data.
-static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "snapshot_json",
-    shape: ParameterShape::InstrumentRegistrySnapshot,
-    required: true,
-}];
+/// Opaque registry snapshot and Governor-owned authority-use ledger carried
+/// atomically by the instrument registry mutation, with the caller-observed
+/// local registry revision used by the adapter's owner-row compare-and-swap.
+static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::InstrumentRegistrySnapshot,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "registration_authority_json",
+        shape: ParameterShape::InstrumentRegistryAuthorityLedger,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_registry_revision",
+        shape: ParameterShape::InstrumentRegistryOwnerRevision,
+        required: true,
+    },
+];
 
 /// Owner-approved user-automation mutation fields (issue #1779 and #2865):
 /// the leg discriminator, the always-present automation identity, and the
@@ -1576,7 +1599,8 @@ pub const fn declared_read_parameters(
 /// `record_json`, `record_digest`, `scope_digest`, `fence_digest`,
 /// `idempotency_key`; digest IS the immutable revision identity);
 /// `ApplyInstrumentRegistryState` declares the opaque versioned
-/// `snapshot_json` string; its expected current revision comes from the
+/// `snapshot_json` string and the Governor-owned `registration_authority_json`
+/// JSON text; its expected current revision comes from the
 /// prepared transition's revision-head CAS. It remains unadvertised pending
 /// canonical store handlers. Every other variant declares none,
 /// so any supplied parameter fails closed. Variants without a catalogue entry
@@ -1698,7 +1722,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
     let structured = match declaration.shape {
         ParameterShape::OperationId
         | ParameterShape::Subject
-        | ParameterShape::BlackboardItemLookup => false,
+        | ParameterShape::BlackboardItemLookup
+        | ParameterShape::InstrumentRegistryOwnerRevision => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
@@ -1708,6 +1733,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::BlackboardItemRevision
         | ParameterShape::MailboxItemAdmission
         | ParameterShape::InstrumentRegistrySnapshot
+        | ParameterShape::InstrumentRegistryAuthorityLedger
         | ParameterShape::ProblemOwnerState
         | ParameterShape::TaskContractAcceptanceRecord => true,
     };
@@ -1846,6 +1872,19 @@ fn check_declared_shape(
             Ok(())
         }
         ParameterShape::InstrumentRegistrySnapshot => validate_instrument_registry_snapshot(value),
+        ParameterShape::InstrumentRegistryAuthorityLedger => {
+            validate_instrument_registry_authority_ledger(value)
+        }
+        ParameterShape::InstrumentRegistryOwnerRevision => {
+            if value.as_u64().is_some() {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidField {
+                    field: "instrument_registry.expected_registry_revision",
+                    reason: "expected registry revision must be a nonnegative u64",
+                })
+            }
+        }
         ParameterShape::CampaignSourceLookup => {
             let lookup: crate::CampaignSourceRevisionLookup = serde_json::from_value(value.clone())
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -1937,12 +1976,13 @@ fn validate_campaign_source_publications(value: &Value) -> Result<(), StoreError
     Ok(())
 }
 
-/// Decodes one validated `ApplyInstrumentRegistryState` parameter map.
+/// Decodes the snapshot from an `ApplyInstrumentRegistryState` parameter map.
 ///
-/// Runs the shared snapshot acceptance boundary first (JSON string with
-/// the supported schema/version), then returns the verbatim snapshot
-/// bytes. Both store contours share this decoder so neither backend
-/// interprets instrument admission on its own.
+/// Runs the shared snapshot acceptance boundary first (JSON string with the
+/// supported schema/version), then returns its verbatim bytes. This narrow
+/// decoder extracts only the snapshot portion; canonical mutation validation
+/// additionally requires the Governor authority ledger and caller-observed
+/// local registry revision.
 pub fn decode_instrument_registry_mutation(
     parameters: &BTreeMap<String, Value>,
 ) -> Result<String, StoreError> {
@@ -1960,6 +2000,61 @@ pub fn decode_instrument_registry_mutation(
             field: "instrument_registry.snapshot_json",
             reason: "instrument registry snapshot must be a JSON string",
         })
+}
+
+/// Returns the verbatim Governor registration-authority ledger JSON text.
+///
+/// This boundary checks that the parameter is valid JSON object text but does
+/// not interpret or normalize its owner-defined fields. Governor's closed
+/// `RegistrationAuthorityLedger` decoder owns schema, version and authority
+/// validation.
+pub fn decode_instrument_registry_authority_ledger(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<String, StoreError> {
+    let value = parameters
+        .get("registration_authority_json")
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.registration_authority_json",
+            reason: "instrument registry mutation requires registration_authority_json",
+        })?;
+    validate_instrument_registry_authority_ledger(value)?;
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.registration_authority_json",
+            reason: "instrument registry authority ledger must be JSON text",
+        })
+}
+
+/// Decodes the exact caller-observed local owner revision. Zero represents a
+/// verified absent registry row; positive values bind the row the caller read.
+pub fn decode_instrument_registry_expected_revision(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<u64, StoreError> {
+    parameters
+        .get("expected_registry_revision")
+        .and_then(Value::as_u64)
+        .ok_or(StoreError::InvalidField {
+            field: "instrument_registry.expected_registry_revision",
+            reason: "expected registry revision must be a nonnegative u64",
+        })
+}
+
+fn validate_instrument_registry_authority_ledger(value: &Value) -> Result<(), StoreError> {
+    let ledger_json = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "instrument registry authority ledger must be JSON text",
+    })?;
+    let ledger: Value = serde_json::from_str(ledger_json)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if !ledger.is_object() {
+        return Err(StoreError::InvalidField {
+            field: "instrument_registry.registration_authority_json",
+            reason: "instrument registry authority ledger must be a JSON object",
+        });
+    }
+    Ok(())
 }
 
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {

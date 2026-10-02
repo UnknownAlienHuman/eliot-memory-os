@@ -241,6 +241,8 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// Fence, operation identity, and canonical request hash from authenticated
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
+pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION;
 
 /// Authenticated named-read selector serving the complete owner-issued
 /// `UserAutomation` preflight projection (issue #1779, I11.12).
@@ -640,6 +642,23 @@ fn daemon_terminal_code(error: &TransportError) -> &'static str {
 
 fn trusted_daemon_operation(operation: &str) -> &'static str {
     match operation {
+        super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION => {
+            super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION
+        }
+        super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION => {
+            super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION
+        }
+        eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION => {
+            eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+        }
+        eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION => {
+            eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+        }
+        INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION => {
+            INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+        }
+        "instrument_registry_registration_claim" => "instrument_registry_registration_claim",
+        "instrument_registry_registration_result" => "instrument_registry_registration_result",
         "snapshot" => "snapshot",
         "daemon_ready" => "daemon_ready",
         "origin_challenge_issue" => "origin_challenge_issue",
@@ -660,6 +679,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "apply_prepared" => "apply_prepared",
         "receipt" => "receipt",
         "store_named" => "store_named",
+        eliot_protocol::COMMITTED_GRANT_ACTIVATION_READ_OPERATION => {
+            eliot_protocol::COMMITTED_GRANT_ACTIVATION_READ_OPERATION
+        }
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
         // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge legs.
@@ -736,6 +758,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct StoreNamedOperation {
     request: NamedReadRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommittedGrantActivationReadRequest {
+    grant_id: String,
 }
 
 /// Strips the daemon transport's routing key from one application body.
@@ -1438,6 +1466,101 @@ enum P07LifecycleTarget<'a> {
 }
 
 impl KernelComposition {
+    /// Reads one current activation from the retained P-07 owner. This route
+    /// exposes only an already committed active tuple; it never invokes an
+    /// activation or mutation port and refuses a tuple that no longer agrees
+    /// with the retained Governor hydration and live Kernel fence.
+    #[cfg(windows)]
+    fn committed_grant_activation_read(
+        &self,
+        session: &Session,
+        request: &CommittedGrantActivationReadRequest,
+    ) -> Result<eliot_protocol::CommittedGrantActivationReadResult, TransportError> {
+        use eliot_kernel_core::RootGrantHydrationSource as _;
+
+        if request.grant_id.trim().is_empty()
+            || request.grant_id.len() > 256
+            || request.grant_id.chars().any(char::is_whitespace)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let state_fence = session.module_generation.state_fence.clone();
+        state_fence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let owner = self.retained_p07_owner()?;
+        let bound = owner.as_ref().ok_or(TransportError::SessionFenced)?;
+        let current_revision = bound.bound_revision();
+        if current_revision == 0 || bound.source().revision() != current_revision {
+            return Err(TransportError::SessionFenced);
+        }
+        let hydrations = bound
+            .source()
+            .admitted_grant_hydrations()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut matching = hydrations
+            .into_iter()
+            .filter(|hydration| hydration.intent.grant_id == request.grant_id);
+        let hydration = matching.next();
+        if matching.next().is_some() {
+            return Err(TransportError::IdentityConflict);
+        }
+        let committed = bound.port().committed_activation(&request.grant_id);
+        let pair = match (hydration, committed) {
+            (None, None) => None,
+            (Some(_), None) => None,
+            (None, Some(_)) => return Err(TransportError::IdentityConflict),
+            (Some(hydration), Some((activation, mechanical_subset))) => {
+                let intent = &hydration.intent;
+                if intent.grant_graph_revision != current_revision
+                    || intent.binding.state_fence != state_fence
+                    || activation.receipt.state != eliot_runtime_contracts::AuthorityState::Active
+                    || activation.receipt.snapshot_id != intent.snapshot_id
+                    || !activation
+                        .receipt
+                        .authority_epoch
+                        .is_same_authority(&state_fence.authority_epoch)
+                    || activation.ors_record_id != intent.operation_id
+                    || activation.ors_subject_id != request.grant_id
+                    || activation.grant_graph_revision != current_revision
+                    || activation.mechanical_subset_commitment
+                        != intent.mechanical_subset_commitment
+                    || mechanical_subset != intent.mechanical_subset
+                    || mechanical_subset.grant_id != request.grant_id
+                {
+                    return Err(TransportError::IdentityConflict);
+                }
+                activation
+                    .receipt
+                    .validate()
+                    .map_err(|_| TransportError::IdentityConflict)?;
+                let subset = serde_json::to_value(&mechanical_subset)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let current_revocation_revision = bound
+                    .port()
+                    .current_grant_revocation_revision(&request.grant_id);
+                Some(eliot_protocol::CommittedGrantActivationProjection {
+                    receipt: activation.receipt,
+                    ors_record_id: activation.ors_record_id,
+                    ors_subject_id: activation.ors_subject_id,
+                    mechanical_subset_commitment: activation.mechanical_subset_commitment,
+                    grant_graph_revision: activation.grant_graph_revision,
+                    current_revocation_revision,
+                    mechanical_subset: subset,
+                })
+            }
+        };
+        let result = eliot_protocol::CommittedGrantActivationReadResult {
+            grant_id: request.grant_id.clone(),
+            state_fence,
+            pair,
+        };
+        result
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(result)
+    }
+
     /// Locks the retained P-07 owner bound by the Governor feed. An unbound
     /// composition withholds unsupported authority instead of routing to a
     /// no-authority port: the production path never selects
@@ -3295,6 +3418,133 @@ impl KernelComposition {
         subordinate_terminal_emitted: &mut bool,
     ) -> Result<Frame, TransportError> {
         let context = tracing::Span::current();
+        if operation == super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_registry_read_operation(session, identity, payload.clone())
+                .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        if operation == super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_stage_grant_operation(session, identity, payload.clone())
+                .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value =
+                self.instrument_stage_started_operation(session, identity, payload.clone())?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let historical_reservation_matches = serde_json::from_value::<
+                eliot_kernel_service::InstrumentStageTerminalRequest,
+            >(payload.clone())
+            .is_ok_and(|request| {
+                self.instrument_stage_runtime.matches_terminal_binding(
+                    identity,
+                    &session.peer,
+                    &request,
+                )
+            });
+            if identity.request.metadata.request_id != request_id
+                || (identity.request.state_fence != session.module_generation.state_fence
+                    && !historical_reservation_matches)
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value =
+                self.instrument_stage_terminal_operation(session, identity, payload.clone())?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION {
+            // The original authenticated front-door identity is carried into
+            // registration admission. Candidate JSON remains inert until the
+            // Governor joins it to current task, scope and grant owners.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let candidate: eliot_protocol::InstrumentRegistryRegistrationOperatorRequest =
+                serde_json::from_value(payload.clone())
+                    .map_err(|_| TransportError::SessionFenced)?;
+            let value =
+                self.submit_operator_registry_registration(session, &candidate, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
         #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
             // The closed UserAutomation operator vocabulary is authenticated by
@@ -3350,6 +3600,19 @@ impl KernelComposition {
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
+            }
+            #[cfg(windows)]
+            eliot_protocol::COMMITTED_GRANT_ACTIVATION_READ_OPERATION => {
+                let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                Self::validate_activation_submitter(session, Some(identity))?;
+                let request: CommittedGrantActivationReadRequest =
+                    serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                let value = self.committed_grant_activation_read(session, &request)?;
+                Ok(serde_json::json!({
+                    "kind": "committed_grant_activation",
+                    "value": value,
+                }))
             }
             "snapshot" => self.daemon_snapshot().map(|value| {
                 serde_json::json!({
@@ -4318,6 +4581,73 @@ impl KernelComposition {
                             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_instrument_registry_registration_pair(session)
+                        .map(|pair| match pair {
+                            Some((
+                                envelope,
+                                invocation,
+                                request_identity,
+                                operation_id,
+                                attempt,
+                            )) => {
+                                serde_json::json!({
+                                    "status": "known",
+                                    "value": {
+                                        "pair": {
+                                            "envelope": envelope,
+                                            "invocation": invocation,
+                                            "request_identity": request_identity,
+                                            "operation_id": operation_id,
+                                            "attempt": attempt,
+                                        }
+                                    },
+                                    "recovery": null,
+                                })
+                            }
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_instrument_registry_registration_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
                         Err(error) => Err(error),
                     }
                 }
@@ -12457,6 +12787,14 @@ mod tests {
             trusted_daemon_operation("origin_control_decide"),
             "origin_control_decide"
         );
+        assert_eq!(
+            trusted_daemon_operation(eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION),
+            eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+        );
+        assert_eq!(
+            trusted_daemon_operation(eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION),
+            eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+        );
         assert!(validate_origin_control_operation(OriginControlOperation::Kill).is_ok());
         for operation in [
             OriginControlOperation::Adopt,
@@ -13475,6 +13813,7 @@ mod local_read_dispatch_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

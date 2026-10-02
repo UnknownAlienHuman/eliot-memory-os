@@ -12,6 +12,7 @@ use blake3::Hash;
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{Assertability, EvidenceAxes, EvidenceStatus};
 use eliot_platform::ClockObservation;
+use eliot_runtime_contracts::FileIdentity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,6 +434,16 @@ pub struct ProcessIntent {
     working_directory: String,
     environment: EnvironmentProjection,
     resource_limits: ResourceLimits,
+    /// Exact executable file object observed by the executable owner.
+    /// Historical non-instrument intents omit this value and retain their
+    /// original effect-digest recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_file_identity: Option<FileIdentity>,
+    /// Original shared instrument admission digest, when this is an admitted
+    /// instrument stage. Kernel re-derives it from the canonical registry;
+    /// this inert field grants no authority by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instrument_admission_digest: Option<String>,
     effect_digest: String,
 }
 
@@ -466,6 +477,8 @@ impl ProcessIntent {
             working_directory: working_directory.into(),
             environment,
             resource_limits,
+            executable_file_identity: None,
+            instrument_admission_digest: None,
             effect_digest: String::new(),
         };
         intent.validate_without_digest()?;
@@ -481,6 +494,54 @@ impl ProcessIntent {
             &self.effect_digest,
             self.compute_effect_digest()?,
         )
+    }
+
+    /// Binds this intent to the exact shared instrument admission digest.
+    /// The Kernel must recompute the digest from the current canonical
+    /// registry before it issues a dispatch grant.
+    pub fn with_instrument_admission_digest(
+        mut self,
+        digest: impl Into<String>,
+    ) -> Result<Self, ContractError> {
+        self.validate()?;
+        let digest = digest.into();
+        validate_hex_digest("instrument_admission_digest", &digest)?;
+        if let Some(existing) = self.instrument_admission_digest.as_deref() {
+            if existing == digest {
+                return Ok(self);
+            }
+            return Err(ContractError::InvalidValue {
+                field: "instrument_admission_digest",
+                reason: "a sealed ProcessIntent cannot be rebound to another admission",
+            });
+        }
+        self.instrument_admission_digest = Some(digest);
+        self.validate_without_digest()?;
+        self.effect_digest = self.compute_effect_digest()?;
+        Ok(self)
+    }
+
+    /// Binds this intent to the exact file object observed by its owner.
+    /// The value can be added only after the existing intent digest validates;
+    /// a conflicting identity can never replace an earlier binding.
+    pub fn with_executable_file_identity(
+        mut self,
+        identity: FileIdentity,
+    ) -> Result<Self, ContractError> {
+        self.validate()?;
+        if let Some(existing) = self.executable_file_identity {
+            if existing == identity {
+                return Ok(self);
+            }
+            return Err(ContractError::InvalidValue {
+                field: "executable_file_identity",
+                reason: "a sealed ProcessIntent cannot be rebound to another file object",
+            });
+        }
+        self.executable_file_identity = Some(identity);
+        self.effect_digest = self.compute_effect_digest()?;
+        self.validate()?;
+        Ok(self)
     }
 
     fn validate_without_digest(&self) -> Result<(), ContractError> {
@@ -507,7 +568,12 @@ impl ProcessIntent {
                 reason: "arguments must not contain control characters",
             });
         }
-        self.environment.validate()
+        self.environment.validate().and_then(|()| {
+            if let Some(digest) = self.instrument_admission_digest.as_deref() {
+                validate_hex_digest("instrument_admission_digest", digest)?;
+            }
+            Ok(())
+        })
     }
 
     fn compute_effect_digest(&self) -> Result<String, ContractError> {
@@ -525,6 +591,10 @@ impl ProcessIntent {
             working_directory: &'a str,
             environment: &'a EnvironmentProjection,
             resource_limits: ResourceLimits,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            executable_file_identity: Option<FileIdentity>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            instrument_admission_digest: Option<&'a str>,
         }
         hash_serialized(&EffectMaterial {
             operation_id: &self.operation_id,
@@ -539,6 +609,8 @@ impl ProcessIntent {
             working_directory: &self.working_directory,
             environment: &self.environment,
             resource_limits: self.resource_limits,
+            executable_file_identity: self.executable_file_identity,
+            instrument_admission_digest: self.instrument_admission_digest.as_deref(),
         })
     }
 
@@ -600,6 +672,17 @@ impl ProcessIntent {
     /// Returns the resource limits.
     pub const fn resource_limits(&self) -> &ResourceLimits {
         &self.resource_limits
+    }
+
+    /// Returns the exact shared instrument admission digest, when this intent
+    /// is an external instrument stage.
+    pub fn instrument_admission_digest(&self) -> Option<&str> {
+        self.instrument_admission_digest.as_deref()
+    }
+
+    /// Returns the exact observed executable file object, when bound.
+    pub const fn executable_file_identity(&self) -> Option<&FileIdentity> {
+        self.executable_file_identity.as_ref()
     }
 
     /// Returns the exact executable/environment/effect digest.
@@ -3099,6 +3182,75 @@ mod tests {
         let mut legacy = wire;
         legacy["expected_revision_heads"] = serde_json::json!({"legacy": "a".repeat(64)});
         assert!(serde_json::from_value::<ProcessExecutionAdmissionRequest>(legacy).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn instrument_admission_digest_is_sealed_into_intent_without_rebinding() -> TestResult {
+        let original = intent()?;
+        let prior_effect = original.effect_digest().to_owned();
+        let admission = "d".repeat(64);
+        let bound = original
+            .clone()
+            .with_instrument_admission_digest(admission.clone())?;
+        assert_eq!(
+            bound.instrument_admission_digest(),
+            Some(admission.as_str())
+        );
+        assert_ne!(bound.effect_digest(), prior_effect);
+        assert_eq!(
+            bound.clone().with_instrument_admission_digest(admission)?,
+            bound
+        );
+
+        let mut tampered = original;
+        tampered.effect_digest = "e".repeat(64);
+        assert!(
+            tampered
+                .with_instrument_admission_digest("f".repeat(64))
+                .is_err()
+        );
+        assert!(
+            bound
+                .with_instrument_admission_digest("f".repeat(64))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executable_file_identity_is_bind_once_and_preserves_legacy_none_shape() -> TestResult {
+        let original = intent()?;
+        let original_digest = original.effect_digest().to_owned();
+        let wire = serde_json::to_value(&original)?;
+        assert!(wire.get("executable_file_identity").is_none());
+        let round_trip: ProcessIntent = serde_json::from_value(wire)?;
+        assert_eq!(round_trip, original);
+        assert_eq!(round_trip.effect_digest(), original_digest);
+
+        let observed = FileIdentity {
+            volume_serial_number: 7,
+            file_index: 11,
+        };
+        let bound = original.clone().with_executable_file_identity(observed)?;
+        assert_eq!(bound.executable_file_identity(), Some(&observed));
+        assert_ne!(bound.effect_digest(), original_digest);
+        assert_eq!(
+            bound.clone().with_executable_file_identity(observed)?,
+            bound
+        );
+        assert!(
+            bound
+                .with_executable_file_identity(FileIdentity {
+                    volume_serial_number: 7,
+                    file_index: 12,
+                })
+                .is_err()
+        );
+
+        let mut tampered = original;
+        tampered.effect_digest = "e".repeat(64);
+        assert!(tampered.with_executable_file_identity(observed).is_err());
         Ok(())
     }
 

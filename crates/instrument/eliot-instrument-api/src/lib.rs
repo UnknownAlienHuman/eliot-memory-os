@@ -9,15 +9,18 @@
 use std::fmt;
 
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, RequestId, RequestMetadata, StateFence,
-    canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId, RequestMetadata,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
+pub use eliot_runtime_contracts::FileIdentity;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 /// Stable identity of this contract surface.
+pub mod registry;
+
 pub const CONTRACT_NAME: &str = "eliot.instrument.api";
 /// Current wire revision of this contract surface.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
@@ -873,6 +876,10 @@ pub struct InstrumentAdmissionGrant {
     /// The grant pins the exact file object the owner observed, not just its
     /// name: a different path with the same file name cannot reuse this grant.
     pub executable_path: String,
+    /// OS file identity observed for this exact executable object.
+    /// Missing only in historical grants; new external admission requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_file_identity: Option<FileIdentity>,
     /// Admitted supply-chain receipt digest bound at admission.
     ///
     /// Empty when the registry admitted no receipt for the kind at this
@@ -886,6 +893,21 @@ pub struct InstrumentAdmissionGrant {
     pub environment_class: String,
     /// Admitted scope class; exact roots bind at resolve time.
     pub scope_class: String,
+    /// Exact resolved source root, bound to `ProcessIntent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<String>,
+    /// Exact declared `WorkScope` string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_scope: Option<String>,
+    /// Exact environment projection digest bound to `ProcessIntent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_digest: Option<String>,
+    /// Exact lineage-aware authority epoch bound to `ProcessIntent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<EpochId>,
+    /// Exact resource generation bound to `ProcessIntent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_generation: Option<u64>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -896,6 +918,9 @@ pub struct InstrumentAdmissionGrant {
     /// Admitted raw-output capture ceiling in bytes, when the spec sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_bytes: Option<u64>,
+    /// Declared per-kind maximum concurrency; enforced by the owning execution plane.
+    #[serde(default)]
+    pub max_concurrency: u32,
     /// Admitted parser identity.
     pub parser: ContractId,
     /// Admitted parser generation; replaceable through module cutover.
@@ -912,8 +937,8 @@ impl InstrumentAdmissionGrant {
 
     /// Canonical grant material shared by construction and verification.
     fn canonical_digest(&self) -> String {
-        let material = format!(
-            "{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        let mut material = format!(
+            "{}\0{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.kind_id,
             self.kind_version,
             self.kind,
@@ -928,6 +953,16 @@ impl InstrumentAdmissionGrant {
             self.arguments.join("\u{0}"),
             self.environment_class,
             self.scope_class,
+            self.source_root.as_deref().unwrap_or(""),
+            self.declared_scope.as_deref().unwrap_or(""),
+            self.environment_digest.as_deref().unwrap_or(""),
+            self.authority_epoch
+                .as_ref()
+                .map(Self::canonical_epoch_digest)
+                .unwrap_or_default(),
+            self.resource_generation
+                .map(|generation| generation.to_string())
+                .unwrap_or_default(),
             self.credential_policy.as_str(),
             self.network_policy.as_str(),
             self.timeout_ms
@@ -938,8 +973,24 @@ impl InstrumentAdmissionGrant {
                 .unwrap_or_default(),
             self.parser.as_str(),
             self.parser_generation,
+            self.max_concurrency,
         );
+        if let Some(identity) = self.executable_file_identity {
+            material.push('\0');
+            material.push_str(&identity.volume_serial_number.to_string());
+            material.push('\0');
+            material.push_str(&identity.file_index.to_string());
+        }
         sha256_hex(material.as_bytes())
+    }
+
+    /// Uses the contract's lineage-aware canonical digest for a validated `EpochId`.
+    #[allow(clippy::expect_used)] // The closed typed shape always serializes canonically.
+    fn canonical_epoch_digest(epoch: &EpochId) -> String {
+        StateFence::canonical_epoch_digest(epoch)
+            .expect("validated EpochId values have a canonical digest")
+            .as_str()
+            .to_owned()
     }
 }
 
@@ -953,10 +1004,10 @@ mod tests {
 
     fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
         EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            EpochLineageId::new(lineage).unwrap_or_else(|_| unreachable!()),
+            NonZeroU64::new(sequence).unwrap_or_else(|| unreachable!()),
         )
-        .expect("valid test epoch")
+        .unwrap_or_else(|_| unreachable!())
     }
 
     fn request() -> RequestMetadata {

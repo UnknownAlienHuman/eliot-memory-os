@@ -7,14 +7,14 @@
 //! [`SelfChangeBootstrap`] through its five phases, dispatches the surface's
 //! I18.31 special case through [`eliot_verifier::SpecialCase::verify`], and
 //! only after the machine mints the real [`GenerationReceipt`] does it admit
-//! the instrument launch through
-//! [`InstrumentRunner::launch_verified_with_bootstrap`] (runner surface) or
+//! the instrument launch through the runner's live canonical stage gate
+//! (runner surface) or
 //! report the cutover receipt (every other surface).
 //!
 //! Every phase is backed by a real process on this machine: the last-known-good
 //! pass, the candidate shadow pass, and the bounded canary all cross the sole
 //! [`WindowsProcessExecutor`], and the post-cutover launch crosses it exactly
-//! once through the bootstrapped runner. No phase is asserted, no digest is
+//! once after Kernel grants the selected canonical stage. No phase is asserted, no digest is
 //! fabricated, and the receipt cannot be hand-built
 //! ([`GenerationReceipt`] fields are private). The independence a cutover
 //! requires is observed too: the shadow pass must really run a different
@@ -31,9 +31,9 @@
 //! generation's own discriminator, child limits, and launch identities; the
 //! machine clock, executable bytes, process observations, and per-process
 //! authority material are observed; everything else is derived from those two.
-//! The per-process dispatch authority id, wall clock readings, and fresh key
-//! bytes follow the `eliot-testd` composition-root pattern; the permit window
-//! follows its issue/consume shape with the bundle standing in for the grant.
+//! The final process request consumes the original Kernel grant through the
+//! existing P-07 authority, while the covering receipt remains its separate
+//! bootstrap gate.
 
 #![forbid(unsafe_code)]
 // The cutover report on stdout and its fail-closed refusal on stderr are this
@@ -48,15 +48,29 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{
-    ClockReading, ContractId, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
-    ResourceGeneration, SourceId, StateFence, sha256_hex,
+use eliot_contracts::{ClockReading, EpochId, EpochLineageId, sha256_hex};
+use eliot_instrument_api::registry::{
+    EnvironmentInheritanceBinding, EnvironmentProjectionBinding, EnvironmentSecretReference,
+    ExternalExecutableObservation, InstrumentRegistrySnapshot, ProcessExecutionProjection,
+    ResolvedExecutionBinding, validate_external_stage,
 };
-use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
+use eliot_instrument_api::{FileIdentity, InstrumentInvocation, InstrumentKind};
 use eliot_instrument_runner::{
-    InstrumentRequestPort, InstrumentRunner, ProviderRegistry, ResolvedExecutableIdentity,
-    RunnerError,
-    registry::{InvalidationSet, RegistryFreshness},
+    InstrumentBinding, InstrumentRequestPort, InstrumentRunner,
+    KernelInstrumentStageRuntimeObserver, RegistryLaunchSelection, RunnerError,
+    kernel_registry_read_client::{InstrumentRegistryReadClient, registry_state_request},
+    profile::{
+        AdmittedProfile, InstrumentRegistry as CanonicalInstrumentRegistry, ProfileCompiler,
+        StageEnvironment, TargetLayout, WorkScope,
+    },
+    profile_run::{PlannedStage, StageOrchestrator},
+    registry_launch_selection,
+    registry_owner_readback::CanonicalRegistryProofPort,
+};
+use eliot_ipc::RequestIdentity;
+use eliot_kernel_service::{
+    INSTRUMENT_STAGE_GRANT_OPERATION, InstrumentStageGrantRequest, InstrumentStageGrantResponse,
+    KernelChildDispatchAuthority,
 };
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
@@ -270,6 +284,10 @@ struct LaunchCommand {
     target: String,
     /// The instrument kind the admitted invocation carries.
     kind: InstrumentKind,
+    /// Original operator/Kernel registry selection retained as inert request
+    /// input. Kernel authenticates this identity and proves the scoped row;
+    /// these fields alone grant no permission.
+    registry_selection: RegistryLaunchSelection,
     /// Absolute path to the launched executable, hashed from the machine.
     executable: PathBuf,
     /// Exact process argv for the admitted launch.
@@ -294,7 +312,7 @@ enum CliError {
     Bundle(String),
     /// A typed contract refused the composition or the bootstrap itself.
     Contract(String),
-    /// The launch reached no terminal state inside its admitted deadline.
+    /// The process owner still has a live operation requiring reconciliation.
     ReconcileRequired,
 }
 
@@ -1347,6 +1365,10 @@ fn launch(value: &serde_json::Value) -> Result<LaunchCommand, CliError> {
         declared_scope: text(object, "declared_scope")?,
         target: text(object, "target")?,
         kind: field(object, "kind")?,
+        registry_selection: registry_launch_selection(required(object, "registry_selection")?)
+            .map_err(|error| {
+                CliError::Bundle(format!("original registry selection refused: {error}"))
+            })?,
         executable: absolute_path(object, "launch", "executable")?,
         argv: string_list(object, "argv")?,
         working_directory: absolute_path(object, "launch", "working_directory")?,
@@ -1542,6 +1564,8 @@ fn run_discriminator(
 struct ChildObservation {
     /// Canonical executable path observed on this machine.
     executable_path: String,
+    /// Exact file object identity observed by the pinned executable reader.
+    file_identity: FileIdentity,
     /// Machine-derived content digest of the executable bytes.
     content_digest: String,
     /// Machine-derived environment projection identity.
@@ -1595,8 +1619,12 @@ fn observe_child_command(executable: &Path, argv: &[String]) -> Result<ChildObse
             "executable observation is incomplete".to_owned(),
         ));
     }
+    let file_identity = observation.file_identity.ok_or_else(|| {
+        CliError::Contract("executable observation has no owner-observed file identity".to_owned())
+    })?;
     Ok(ChildObservation {
         executable_path: observation.canonical_path,
+        file_identity,
         content_digest: observation.content_digest,
         environment_digest: observation.environment_digest,
         tool_version: observation.tool_version,
@@ -1994,11 +2022,10 @@ impl ProcessExecutor for LaunchExecutor {
 
 /// Launches the admitted instrument under the freshly minted receipt.
 ///
-/// This is the only launch of a self-change generation, and it goes through
-/// [`InstrumentRunner::launch_verified_with_bootstrap`], so the receipt must
-/// genuinely cover the runner surface before the verified launch runs. The
-/// launch binary is observed without executing, then executed exactly once
-/// through the bootstrapped runner.
+/// This is the only launch of a self-change generation. The generation
+/// receipt must cover the runner surface, then the original registration,
+/// current stage, and Kernel-issued process grant pass the live runner gate.
+/// The executable is observed without executing, then launched once.
 fn launch_under_receipt(
     evidence: &BootstrapEvidence,
     receipt: &GenerationReceipt,
@@ -2009,6 +2036,13 @@ fn launch_under_receipt(
             receipt.surface().as_str()
         )));
     }
+    let selected = retain_current_launch_selection(&evidence.launch.registry_selection)?;
+    if selected.registry.generation() != receipt.new_generation() {
+        return Err(CliError::Contract(
+            "cutover receipt generation differs from the actual current candidate registry"
+                .to_owned(),
+        ));
+    }
     let command = DiscriminatorCommand {
         executable: evidence.launch.executable.clone(),
         argv: evidence.launch.argv.clone(),
@@ -2016,71 +2050,248 @@ fn launch_under_receipt(
     };
     let executable = resolve_executable(&command.executable)?;
     let observed = observe_child_command(executable.as_path(), command.argv.as_slice())?;
-    let generation = Generation::new(receipt.new_generation())?;
-    let fingerprints = fingerprint_set(
-        &observed,
-        evidence.launch.instrument.as_str(),
-        evidence.normative_pair.as_str(),
-    );
-    let registry = ProviderRegistry::ready(
-        receipt.new_generation(),
-        evidence.normative_pair.clone(),
-        &fingerprints,
-    )?;
-    let clock = observation_clock(now_unix_ms());
+    let working_directory = std::fs::canonicalize(&command.working_directory).map_err(|error| {
+        CliError::Contract(format!(
+            "launch working directory {} is unavailable: {error}",
+            command.working_directory.display()
+        ))
+    })?;
+    let canonical_working_directory = working_directory.to_string_lossy();
+    let retained_source_root = selected
+        .planned
+        .resolution
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Contract("current external stage omitted its WorkScope resolution".to_owned())
+        })?
+        .layout
+        .source_root
+        .as_str();
+    if retained_source_root != canonical_working_directory.as_ref() {
+        return Err(CliError::Contract(
+            "canonical observed launch root differs from the original WorkScope owner root"
+                .to_owned(),
+        ));
+    }
+    let original_metadata = &evidence
+        .launch
+        .registry_selection
+        .request_identity
+        .request
+        .metadata;
+    let original_intent = &evidence.launch.registry_selection.intent;
+    if evidence.launch.target != canonical_working_directory.as_ref()
+        || original_intent.executable() != observed.executable_path
+        || original_intent.executable_sha256() != observed.content_digest
+        || original_intent.argv() != command.argv
+        || original_intent.working_directory() != canonical_working_directory
+        || original_metadata
+            .session_id
+            .as_ref()
+            .is_some_and(|session| session.as_str() != original_intent.session_id().as_str())
+    {
+        return Err(CliError::Contract(
+            "bootstrap command differs from the original Kernel process intent or resolved work root"
+                .to_owned(),
+        ));
+    }
+    let supply_receipt = selected
+        .planned
+        .stage
+        .supply_receipt
+        .as_ref()
+        .ok_or_else(|| {
+            CliError::Contract("original registry stage has no supply-chain receipt".to_owned())
+        })?;
+    let observed_file_name = Path::new(&observed.executable_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CliError::Contract("observed executable has no stable file name".to_owned())
+        })?;
+    if selected.planned.stage.spec.as_str() != evidence.launch.instrument
+        || selected.planned.stage.profile != selected.admitted.name
+        || selected.planned.stage.profile_revision != selected.admitted.revision
+        || evidence.launch.profile != selected.admitted.name
+        || selected.planned.stage.kind != evidence.launch.kind
+        || selected.planned.stage.argument_template != evidence.launch.arguments
+        || selected.planned.stage.verification_command != command.argv
+        || evidence.launch.product
+            != evidence
+                .launch
+                .registry_selection
+                .request_identity
+                .request
+                .metadata
+                .product_id
+                .as_str()
+        || evidence.launch.source
+            != evidence
+                .launch
+                .registry_selection
+                .request_identity
+                .request
+                .metadata
+                .source_id
+                .as_str()
+        || supply_receipt.instrument.as_str() != selected.planned.stage.spec.as_str()
+        || supply_receipt.generation != selected.registry.generation()
+        || supply_receipt.executable != observed_file_name
+        || supply_receipt.content_digest != observed.content_digest
+        || supply_receipt.tool_version.as_deref() != observed.tool_version.as_deref()
+        || supply_receipt.spec_digest != selected.planned.stage.spec_digest
+    {
+        return Err(CliError::Contract(
+            "bootstrap launch does not match the original admitted registry profile stage"
+                .to_owned(),
+        ));
+    }
+    let selection = &evidence.launch.registry_selection;
     let invocation = launch_invocation(
         &evidence.launch,
-        &observed,
-        receipt.new_generation(),
-        evidence.authority_epoch.clone(),
-        clock,
+        &selected.planned,
+        &selection.request_identity,
     )?;
-    let freshness = RegistryFreshness {
-        generation: receipt.new_generation(),
-        normative_pair_digest: evidence.normative_pair.as_str(),
-        fingerprints: &fingerprints,
+    let resolution = selected_resolution_binding(&selected.planned)?;
+    let bound_intent = selection
+        .intent
+        .clone()
+        .with_executable_file_identity(observed.file_identity)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "observed executable file identity could not bind to the new process intent: {error}"
+            ))
+        })?;
+    let process = process_execution_projection(selection, &bound_intent)?;
+    let external_observation = external_executable_observation(&observed)?;
+    let expected_admission = validate_external_stage(
+        &selected.snapshot,
+        &selection.pin,
+        &invocation,
+        &external_observation,
+        selection.intent.argv(),
+        &resolution,
+        &process,
+    )
+    .map_err(|error| {
+        CliError::Contract(format!("canonical registry admission refused: {error}"))
+    })?;
+    let bound_intent = bound_intent
+        .with_instrument_admission_digest(expected_admission.digest())
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "instrument process intent could not bind its original admission: {error}"
+            ))
+        })?;
+    let kernel = eliot_ipc::KernelClient::load()
+        .map_err(|error| CliError::Contract(format!("Kernel front door unavailable: {error}")))?;
+    let stage_grant_request = InstrumentStageGrantRequest {
+        scope_id: selection.scope_id.clone(),
+        pin: selection.pin.clone(),
+        invocation: invocation.clone(),
+        resolution,
+        intent: bound_intent.clone(),
     };
-    let entry = registry.resolve_current(&invocation, &freshness)?;
-    // The port request is sealed through the same cell the launch executor
-    // consumes through, under the receipt's new generation: the one-shot
-    // permit hands over exactly once and validates against the exact context
-    // it was issued with.
-    let cell = Arc::new(DispatchCell::activate()?);
-    let inputs = ChildInputs {
-        operation: invocation.request.request_id.as_str(),
-        executable: executable.as_path(),
-        argv: command.argv.as_slice(),
-        working_directory: command.working_directory.as_path(),
-        content_digest: observed.content_digest.as_str(),
-        generation,
-        session: evidence.session.as_str(),
-        limits: &evidence.limits,
-    };
-    let request = seal_child_request(
-        &cell,
-        &evidence.authority_epoch,
-        &inputs,
+    let request = serde_json::to_value(&stage_grant_request).map_err(|error| {
+        CliError::Contract(format!("Kernel stage grant request is invalid: {error}"))
+    })?;
+    let authenticated_response = block_on(kernel.transact_json_authenticated_async(
+        INSTRUMENT_STAGE_GRANT_OPERATION,
+        request,
+        selection.request_identity.clone(),
+    ))
+    .map_err(|error| CliError::Contract(format!("Kernel stage grant refused: {error}")))?;
+    if authenticated_response.operation() != INSTRUMENT_STAGE_GRANT_OPERATION
+        || authenticated_response.request_identity() != &selection.request_identity
+    {
+        return Err(CliError::Contract(
+            "authenticated Kernel response is bound to a different operation or original identity"
+                .to_owned(),
+        ));
+    }
+    let response: InstrumentStageGrantResponse =
+        serde_json::from_value(authenticated_response.payload().clone()).map_err(|error| {
+            CliError::Contract(format!("Kernel stage grant response is invalid: {error}"))
+        })?;
+    if response.admission != expected_admission {
+        return Err(CliError::Contract(
+            "Kernel stage admission differs from the original canonical profile and observed executable"
+                .to_owned(),
+        ));
+    }
+    if bound_intent.instrument_admission_digest() != Some(expected_admission.grant_digest.as_str())
+    {
+        return Err(CliError::Contract(
+            "original ProcessIntent does not retain the matched canonical admission digest"
+                .to_owned(),
+        ));
+    }
+    if !response.dispatch_grant.authority_epoch.is_same_authority(
+        &selection
+            .request_identity
+            .request
+            .state_fence
+            .authority_epoch,
+    ) || response.dispatch_grant.fence_generation
+        != selection
+            .request_identity
+            .request
+            .state_fence
+            .resource_generation
+            .value()
+    {
+        return Err(CliError::Contract(
+            "Kernel dispatch grant differs from the original request authority epoch or generation"
+                .to_owned(),
+        ));
+    }
+    let runtime_observer = Arc::new(KernelInstrumentStageRuntimeObserver::new(kernel));
+    let authority = Arc::new(KernelChildDispatchAuthority::new_with_observation_port(
+        runtime_observer,
+    )?);
+    let process_request = authority.issue_authenticated(
+        &stage_grant_request,
+        &selection.request_identity,
+        authenticated_response,
         now_unix_ms().max(1),
-        evidence.permit_expires_at_unix_ms,
     )?;
-    let port = LaunchPort::sealed(request);
-    let resolved = ResolvedExecutableIdentity::new(
-        evidence.launch.instrument.as_str(),
-        observed.executable_path.clone(),
-        observed.content_digest.clone(),
-        observed.tool_version.clone(),
-        observed.environment_digest.clone(),
-        observed.argv.clone(),
-    )?;
-    let runner = InstrumentRunner::new(Arc::new(LaunchExecutor::with(cell)));
-    let start = block_on(runner.launch_verified_with_bootstrap(
-        invocation,
-        &port,
-        entry,
-        Some(&resolved),
-        Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
-        receipt,
+    let process_request_digest = process_request.invocation_digest().to_owned();
+    let mut binding = InstrumentBinding::from_request(invocation, process_request)?;
+    let process_executor = Arc::new(WindowsProcessExecutor::new(
+        Arc::clone(&authority) as Arc<dyn DispatchValidationPort>
+    ));
+    let runner = InstrumentRunner::new(Arc::clone(&process_executor));
+    let admitted = block_on(StageOrchestrator::admit_stage_live(
+        &selected.registry,
+        &selected.planned,
+        &binding,
+        &selected.proof,
     ))?;
+    let start = block_on(StageOrchestrator::launch_admitted_stage(
+        &runner,
+        &mut binding,
+        &admitted,
+        Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
+    ))?;
+    let terminal_evidence = process_executor
+        .wait_for_terminal_evidence(start.process.operation_id().clone())
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "instrument stage terminal supervision refused: {error}"
+            ))
+        })?;
+    if terminal_evidence.operation_id() != binding.operation_id()
+        || terminal_evidence.request_digest() != process_request_digest.as_str()
+        || !eliot_instrument_runner::process_evidence_reports_terminal_or_transport_failure(
+            &terminal_evidence,
+        )
+    {
+        return Err(CliError::Contract(
+            "instrument stage terminal evidence differs from the original process request"
+                .to_owned(),
+        ));
+    }
+    authority.report_terminal(&terminal_evidence)?;
     Ok(format!(
         "{} operation={} executable_digest={}",
         cutover_report(receipt),
@@ -2090,6 +2301,415 @@ fn launch_under_receipt(
             |observation| observation.content_digest.clone()
         ),
     ))
+}
+
+/// Current canonical registry admission retained for the self-change launch.
+/// The proof reader owns the original committed registration receipt and checks
+/// it again at live stage admission; the recovered registry and stage come
+/// only from the Kernel's exact-fence current row.
+struct CurrentLaunchSelection {
+    registry: CanonicalInstrumentRegistry,
+    snapshot: InstrumentRegistrySnapshot<serde_json::Value>,
+    admitted: AdmittedProfile,
+    planned: PlannedStage,
+    proof: CanonicalRegistryProofPort<InstrumentRegistryReadClient>,
+}
+
+fn selected_resolution_binding(
+    planned: &PlannedStage,
+) -> Result<ResolvedExecutionBinding, CliError> {
+    let resolution = planned.resolution.as_ref().ok_or_else(|| {
+        CliError::Contract("external stage plan omitted its resolved WorkScope".to_owned())
+    })?;
+    Ok(ResolvedExecutionBinding {
+        source_root: resolution.layout.source_root.clone(),
+        environment_class: resolution.environment.class.clone(),
+        environment_digest: resolution.environment.digest.clone(),
+        environment_projection: environment_projection_binding(
+            resolution.environment.projection.as_ref().ok_or_else(|| {
+                CliError::Contract(
+                    "resolved external stage omitted its admitted environment projection"
+                        .to_owned(),
+                )
+            })?,
+        ),
+        declared_scope: resolution.scope.declared_scope.clone(),
+        authority_epoch: resolution.scope.fence.authority_epoch.clone(),
+        resource_generation: resolution.scope.fence.resource_generation.value(),
+    })
+}
+
+fn process_execution_projection(
+    selection: &RegistryLaunchSelection,
+    intent: &ProcessIntent,
+) -> Result<ProcessExecutionProjection, CliError> {
+    let limits = intent.resource_limits();
+    let executable_file_identity = intent.executable_file_identity().copied().ok_or_else(|| {
+        CliError::Contract(
+            "process execution projection has no owner-observed executable file identity"
+                .to_owned(),
+        )
+    })?;
+    Ok(ProcessExecutionProjection {
+        working_directory: intent.working_directory().to_owned(),
+        environment_digest: environment_projection_digest(intent.environment()),
+        environment_projection: environment_projection_binding(intent.environment()),
+        executable_file_identity,
+        authority_epoch: selection
+            .request_identity
+            .request
+            .state_fence
+            .authority_epoch
+            .clone(),
+        resource_generation: intent.generation().get(),
+        wall_timeout_ms: limits.wall_timeout_ms(),
+        stdout_bytes: limits.stdout_bytes(),
+        stderr_bytes: limits.stderr_bytes(),
+    })
+}
+
+fn environment_projection_binding(
+    projection: &EnvironmentProjection,
+) -> EnvironmentProjectionBinding {
+    EnvironmentProjectionBinding {
+        non_secret: projection.non_secret().clone(),
+        secret_refs: projection
+            .secret_refs()
+            .iter()
+            .map(|reference| EnvironmentSecretReference {
+                provider: reference.provider().to_owned(),
+                key: reference.key().to_owned(),
+            })
+            .collect(),
+        inheritance: match projection.inheritance() {
+            EnvironmentInheritance::None => EnvironmentInheritanceBinding::None,
+            EnvironmentInheritance::Allowlisted => EnvironmentInheritanceBinding::Allowlisted,
+        },
+    }
+}
+
+/// Selects the original validated WorkScope snapshot from the registration
+/// authority bytes already covered by the canonical row proof. The committed
+/// receipt selects and validates the historical registration lease; the fresh
+/// Kernel identity supplies only current task/product/scope/fence selectors.
+fn retained_work_scope_binding(
+    payload: &serde_json::Value,
+    original_receipt: &eliot_store_api::WriteReceipt,
+    identity: &RequestIdentity,
+    scope_id: &str,
+) -> Result<(String, String), CliError> {
+    let operation_id = payload
+        .get("operation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Contract(
+                "current canonical registry row omitted its original operation id".to_owned(),
+            )
+        })?;
+    if original_receipt.operation_id.as_str() != operation_id {
+        return Err(CliError::Contract(
+            "current registry row operation differs from its original committed receipt".to_owned(),
+        ));
+    }
+    let envelope = original_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "original registration receipt has no binding envelope: {error}"
+            ))
+        })?;
+    let authority_json = payload
+        .get("registration_authority_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Contract(
+                "current canonical registry row omitted original registration authority".to_owned(),
+            )
+        })?;
+    let ledger: serde_json::Value = serde_json::from_str(authority_json).map_err(|error| {
+        CliError::Contract(format!(
+            "original registration authority is invalid: {error}"
+        ))
+    })?;
+    if ledger.get("schema").and_then(serde_json::Value::as_str)
+        != Some("eliot.governor.registration-authority-ledger")
+        || ledger.get("version").and_then(serde_json::Value::as_u64) != Some(2)
+    {
+        return Err(CliError::Contract(
+            "original registration authority lacks the retained WorkScope snapshot version"
+                .to_owned(),
+        ));
+    }
+    let leases = ledger
+        .get("leases")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            CliError::Contract("original registration authority has no lease rows".to_owned())
+        })?;
+    let original_request = serde_json::to_value(&envelope.core.request).map_err(|error| {
+        CliError::Contract(format!("original receipt request encoding failed: {error}"))
+    })?;
+    let original_operation = serde_json::to_value(&envelope.core.operation).map_err(|error| {
+        CliError::Contract(format!(
+            "original receipt operation encoding failed: {error}"
+        ))
+    })?;
+    let original_fence = serde_json::to_value(&original_receipt.state_fence).map_err(|error| {
+        CliError::Contract(format!("original receipt fence encoding failed: {error}"))
+    })?;
+    let current_task = identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(|task| task.as_str());
+    let receipt_task = envelope
+        .core
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(|task| task.as_str());
+    let row_task = payload.get("task_id").and_then(serde_json::Value::as_str);
+    if identity.request.state_fence != envelope.core.request.state_fence
+        || identity.request.metadata.task_id != envelope.core.request.metadata.task_id
+        || identity.request.metadata.product_id != envelope.core.request.metadata.product_id
+        || current_task != row_task
+        || receipt_task != row_task
+        || envelope.core.work_scope.state_fence != identity.request.state_fence
+        || envelope.core.work_scope.scope_id.as_str() != scope_id
+    {
+        return Err(CliError::Contract(
+            "current stage identity task/product/scope/fence differs from original registration owners".to_owned(),
+        ));
+    }
+    let mut matches = leases.iter().filter(|record| {
+        record.get("operation") == Some(&original_operation)
+            && record
+                .get("operation")
+                .and_then(|operation| operation.get("operation_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(operation_id)
+    });
+    let record = matches.next().ok_or_else(|| {
+        CliError::Contract(
+            "original operation has no retained registration authority record".to_owned(),
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(CliError::Contract(
+            "original registration operation has duplicate retained authority rows".to_owned(),
+        ));
+    }
+    let original_identity = record.get("request_identity").ok_or_else(|| {
+        CliError::Contract("original registration lease omitted its request identity".to_owned())
+    })?;
+    if original_identity.get("request") != Some(&original_request)
+        || original_identity
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str)
+            != Some(envelope.core.operation.idempotency_key.as_str())
+    {
+        return Err(CliError::Contract(
+            "original lease identity differs from the committed registration receipt".to_owned(),
+        ));
+    }
+    let snapshot = record.get("work_scope_binding_snapshot").ok_or_else(|| {
+        CliError::Contract("original lease omitted its WorkScope snapshot".to_owned())
+    })?;
+    if snapshot.get("state_fence") != Some(&original_fence) {
+        return Err(CliError::Contract(
+            "retained WorkScope snapshot is not bound to the original request fence".to_owned(),
+        ));
+    }
+    let scope = snapshot
+        .get("binding")
+        .and_then(|binding| binding.get("scope"))
+        .ok_or_else(|| {
+            CliError::Contract("retained WorkScope snapshot omitted its scope".to_owned())
+        })?;
+    let scope_ref = scope
+        .get("scope_ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Contract("retained WorkScope scope reference is invalid".to_owned())
+        })?;
+    let root_identity = scope
+        .get("root_identity")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Contract("retained WorkScope root identity is invalid".to_owned())
+        })?;
+    let generation = scope.get("generation").and_then(serde_json::Value::as_u64);
+    let filesystem_scope = matches!(
+        scope.get("kind").and_then(serde_json::Value::as_str),
+        Some("directory" | "git_repo")
+    );
+    if !filesystem_scope
+        || scope_ref != scope_id
+        || generation != Some(original_receipt.state_fence.resource_generation.value())
+        || root_identity.trim().is_empty()
+        || root_identity.chars().any(char::is_control)
+    {
+        return Err(CliError::Contract(
+            "retained WorkScope scope/root does not match the original filesystem scope and fence"
+                .to_owned(),
+        ));
+    }
+    Ok((root_identity.to_owned(), scope_ref.to_owned()))
+}
+
+fn external_executable_observation(
+    observed: &ChildObservation,
+) -> Result<ExternalExecutableObservation, CliError> {
+    let executable_file_name = Path::new(&observed.executable_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CliError::Contract("observed executable has no stable file name".to_owned())
+        })?
+        .to_ascii_lowercase();
+    let executable_file_name = executable_file_name
+        .strip_suffix(".exe")
+        .unwrap_or(&executable_file_name)
+        .to_owned();
+    Ok(ExternalExecutableObservation {
+        canonical_path: observed.executable_path.clone(),
+        executable_file_name,
+        content_digest: observed.content_digest.clone(),
+        file_identity: observed.file_identity,
+        tool_version: observed.tool_version.clone(),
+    })
+}
+
+fn retain_current_launch_selection(
+    selection: &RegistryLaunchSelection,
+) -> Result<CurrentLaunchSelection, CliError> {
+    let kernel = eliot_ipc::KernelClient::load()
+        .map_err(|error| CliError::Contract(format!("Kernel front door unavailable: {error}")))?;
+    let client = Arc::new(
+        InstrumentRegistryReadClient::new(
+            kernel,
+            selection.request_identity.clone(),
+            selection.scope_id.clone(),
+        )
+        .map_err(|error| {
+            CliError::Contract(format!("original registry identity refused: {error}"))
+        })?,
+    );
+    let read_request = registry_state_request(
+        &selection.scope_id,
+        &selection.request_identity.request.state_fence,
+    );
+    let proof = block_on(CanonicalRegistryProofPort::retain_original(
+        Arc::clone(&client),
+        read_request.clone(),
+    ))
+    .map_err(|error| CliError::Contract(format!("original registry proof refused: {error}")))?;
+    let (_, _original_readback, current) = block_on(proof.current_owner_readback())
+        .map_err(|error| CliError::Contract(format!("current registry read refused: {error}")))?;
+    let snapshot = current
+        .payload
+        .get("snapshot_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Contract("current registry row omitted its canonical snapshot".to_owned())
+        })?;
+    let (owner_source_root, owner_scope_ref) = retained_work_scope_binding(
+        &current.payload,
+        proof.original_registration_receipt(),
+        &selection.request_identity,
+        selection.scope_id.as_str(),
+    )?;
+    if owner_source_root != selection.layout.source_root
+        || owner_scope_ref != selection.work_scope.declared_scope
+    {
+        return Err(CliError::Contract(
+            "original requested layout or scope differs from the retained canonical WorkScope owner".to_owned(),
+        ));
+    }
+    let snapshot_value: InstrumentRegistrySnapshot<serde_json::Value> =
+        serde_json::from_str(snapshot).map_err(|error| {
+            CliError::Contract(format!("current registry snapshot is invalid: {error}"))
+        })?;
+    let registry = CanonicalInstrumentRegistry::recover(snapshot).map_err(|error| {
+        CliError::Contract(format!("current registry recovery refused: {error}"))
+    })?;
+    if selection.pin.registry_generation != registry.generation() {
+        return Err(CliError::Contract(
+            "original registry pin generation differs from the current canonical row".to_owned(),
+        ));
+    }
+    let admitted = ProfileCompiler::new(&registry)
+        .compile_exact(&selection.pin.profile, selection.pin.profile_revision)
+        .map_err(|error| {
+            CliError::Contract(format!("pinned profile selection refused: {error}"))
+        })?;
+    let profile = registry
+        .admitted(&selection.pin.profile, selection.pin.profile_revision)
+        .map_err(|error| CliError::Contract(format!("pinned profile lookup refused: {error}")))?;
+    let environment = StageEnvironment::attest_projection(
+        profile.classes.environment.clone(),
+        selection.intent.environment().clone(),
+    )
+    .map_err(|error| {
+        CliError::Contract(format!(
+            "original WorkScope environment projection refused: {error}"
+        ))
+    })?;
+    let layout = TargetLayout::new(
+        owner_source_root,
+        selection.layout.target_root.clone(),
+        selection.layout.cache_root.clone(),
+    )
+    .map_err(|error| {
+        CliError::Contract(format!("original owner WorkScope layout refused: {error}"))
+    })?;
+    let work_scope = WorkScope::new(
+        owner_scope_ref,
+        selection.request_identity.request.state_fence.clone(),
+    )
+    .map_err(|error| CliError::Contract(format!("original owner WorkScope refused: {error}")))?;
+    let resolved = ProfileCompiler::new(&registry)
+        .resolve_full(
+            &selection.pin.profile,
+            selection.pin.profile_revision,
+            layout,
+            work_scope,
+            environment,
+        )
+        .map_err(|error| {
+            CliError::Contract(format!("original profile resolution refused: {error}"))
+        })?;
+    let plan = StageOrchestrator::plan_resolved(&admitted, &resolved)
+        .map_err(|error| CliError::Contract(format!("resolved stage plan refused: {error}")))?;
+    let planned = plan
+        .stages
+        .into_iter()
+        .find(|stage| {
+            stage.route.stage().profile == selection.pin.profile
+                && stage.route.stage().profile_revision == selection.pin.profile_revision
+                && stage.route.stage().stage_id == selection.pin.stage_id
+        })
+        .ok_or_else(|| {
+            CliError::Contract(
+                "original registry selection does not name a stage in the current profile revision"
+                    .to_owned(),
+            )
+        })?;
+    if !planned.route.external() {
+        return Err(CliError::Contract(
+            "original registry selection names a non-external profile stage".to_owned(),
+        ));
+    }
+    Ok(CurrentLaunchSelection {
+        registry,
+        snapshot: snapshot_value,
+        admitted,
+        planned,
+        proof,
+    })
 }
 
 /// Reports one completed cutover: the covering receipt, never a launch claim.
@@ -2141,61 +2761,28 @@ fn finish_under_receipt(
     Ok(())
 }
 
-/// Caller-attested registry fingerprints for one observed child.
-///
-/// The registry never reads files at runtime, so these slots are attested from
-/// the machine observation the launch itself pinned plus the recorded
-/// instrument and normative-pair identities.
-fn fingerprint_set(
-    observed: &ChildObservation,
-    instrument: &str,
-    normative_pair: &str,
-) -> InvalidationSet {
-    InvalidationSet {
-        source: observed.content_digest.clone(),
-        lock: observed.environment_digest.clone(),
-        toolchain: observed.tool_version.clone().unwrap_or_default(),
-        env: observed.environment_digest.clone(),
-        exe: observed.content_digest.clone(),
-        profile: sha256_hex(instrument.as_bytes()),
-        parser: sha256_hex(normative_pair.as_bytes()),
-    }
-}
-
 /// The invocation admitted for the post-cutover launch.
 ///
-/// Identities arrive with the recorded bundle; the fence carries the recorded
-/// authority epoch plus the receipt generation, and the clock carries the
-/// observed admission instant.
+/// The request metadata and clock are retained unchanged from the original
+/// Kernel identity. Only the instrument shape is projected from the current
+/// canonical registry stage; the caller's target and declared scope remain
+/// the original request data and are checked by the live owner gate.
 fn launch_invocation(
     launch: &LaunchCommand,
-    observed: &ChildObservation,
-    generation: u64,
-    epoch: EpochId,
-    clock: ClockReading,
+    planned: &PlannedStage,
+    identity: &RequestIdentity,
 ) -> Result<InstrumentInvocation, CliError> {
-    let request_id = format!(
-        "self-change-launch-{}",
-        &sha256_hex(observed.argv.join("\u{1}").as_bytes())[..24]
-    );
+    let request = identity.request.metadata.clone();
     let invocation = InstrumentInvocation {
-        request: RequestMetadata {
-            request_id: RequestId::new(request_id)?,
-            session_id: None,
-            task_id: None,
-            product_id: ProductId::new(launch.product.clone())?,
-            source_id: SourceId::new(launch.source.clone())?,
-            state_fence: StateFence::new(epoch, ResourceGeneration::new(generation)?),
-            clock,
-        },
-        instrument: ContractId::new(launch.instrument.clone())?,
-        kind: launch.kind,
-        profile: launch.profile.clone(),
+        request,
+        instrument: planned.stage.spec.clone(),
+        kind: planned.stage.kind,
+        profile: planned.stage.profile.clone(),
         target: launch.target.clone(),
-        arguments: launch.arguments.clone(),
+        arguments: planned.stage.argument_template.clone(),
         input_artifacts: Vec::new(),
         declared_scope: launch.declared_scope.clone(),
-        requested_at: clock,
+        requested_at: identity.request.metadata.clock,
     };
     invocation.validate()?;
     Ok(invocation)

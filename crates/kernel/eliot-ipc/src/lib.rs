@@ -9,6 +9,7 @@ use std::time::Duration;
 use std::{cmp::Ordering, future::Future};
 
 use eliot_contracts::EpochId;
+pub use eliot_protocol::RequestIdentity;
 use eliot_protocol::{
     AgentBridgeClientDeclaration, AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge,
     ClientHello, EncodingProfile, EventEnvelope, Frame, FrameKind, MessageType, ProtocolError,
@@ -20,6 +21,7 @@ use thiserror::Error;
 mod control_reserve;
 mod frame_codec;
 mod host_conformance;
+pub mod kernel_client;
 mod role_lease;
 mod session_lifecycle;
 
@@ -33,6 +35,7 @@ pub use host_conformance::{
     RouteMismatchDisposition, admit_coverage, admit_coverage_for_claim, reconcile_attempt_route,
     require_verified_capability, require_verified_capability_for_claim,
 };
+pub use kernel_client::{KernelClient, KernelClientConfig, KernelClientError};
 pub use role_lease::{
     AgentRole, CapabilityContext, CapabilityToken, DelegatedAuthority, IndependenceDowngrade,
     IndependenceProfile, RoleLeaseError, RoleTransitionRecord, ScopeBinding, WorkScopePolicy,

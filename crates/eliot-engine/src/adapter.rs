@@ -1345,3 +1345,223 @@ fn millis(duration: Duration) -> u64 {
 fn uuid_like(prefix: &str) -> String {
     format!("{prefix}:{}", eliot_types::OperationId::new_v7())
 }
+
+#[cfg(test)]
+mod supervisor_isolation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout;
+
+    struct GatedEchoAdapter {
+        manifest: CapabilityManifest,
+        delegate: TestEchoAdapter,
+        entered: Arc<AtomicUsize>,
+        release: Arc<Semaphore>,
+        fail_next: Arc<AtomicBool>,
+    }
+
+    impl GatedEchoAdapter {
+        fn new(adapter_id: &str, concurrency: usize) -> Self {
+            let mut manifest = TestEchoAdapter::new().manifest;
+            adapter_id.clone_into(&mut manifest.adapter_id);
+            adapter_id.clone_into(&mut manifest.name);
+            manifest.limits.max_concurrent_requests = concurrency;
+            manifest.limits.circuit_breaker_failures = 1;
+            manifest.limits.timeout_ms = 5_000;
+            Self {
+                manifest,
+                delegate: TestEchoAdapter::new(),
+                entered: Arc::new(AtomicUsize::new(0)),
+                release: Arc::new(Semaphore::new(0)),
+                fail_next: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Adapter for GatedEchoAdapter {
+        fn id(&self) -> &str {
+            &self.manifest.adapter_id
+        }
+
+        fn manifest(&self) -> &CapabilityManifest {
+            &self.manifest
+        }
+
+        fn health(&self) -> BoxAdapterFuture<'_, AdapterHealth> {
+            Box::pin(
+                async move { Ok(healthy(&self.manifest, "gated echo test adapter available")) },
+            )
+        }
+
+        fn execute(
+            &self,
+            request: AdapterRequest,
+            context: AdapterExecutionContext,
+        ) -> BoxAdapterFuture<'_, AdapterResult> {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            let fail_next = Arc::clone(&self.fail_next);
+            let delegate = &self.delegate;
+            Box::pin(async move {
+                entered.fetch_add(1, Ordering::AcqRel);
+                let _permit = release.acquire().await.map_err(|error| {
+                    EngineError::RuntimeSupervision(format!("test gate closed: {error}"))
+                })?;
+                if fail_next.swap(false, Ordering::AcqRel) {
+                    Ok(rejected_result(
+                        &request,
+                        AdapterResultStatus::TransportFailure,
+                        "test_transport_failure",
+                        "intentional supervisor isolation probe",
+                    ))
+                } else {
+                    delegate.execute(request, context).await
+                }
+            })
+        }
+
+        fn shutdown(&self) -> BoxAdapterFuture<'_, ()> {
+            self.delegate.shutdown()
+        }
+    }
+
+    async fn wait_for_entries(entered: &AtomicUsize, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::Acquire) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("adapter executions entered the real supervisor path");
+    }
+
+    #[tokio::test]
+    async fn registered_adapters_keep_separate_concurrency_and_circuit_state()
+    -> Result<(), EngineError> {
+        let adapter_one = GatedEchoAdapter::new("isolation-one", 1);
+        let adapter_two = GatedEchoAdapter::new("isolation-two", 2);
+        let one_release = Arc::clone(&adapter_one.release);
+        let two_release = Arc::clone(&adapter_two.release);
+        let one_entered = Arc::clone(&adapter_one.entered);
+        let two_entered = Arc::clone(&adapter_two.entered);
+        let one_fail_next = Arc::clone(&adapter_one.fail_next);
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter_one)?;
+        registry.register(adapter_two)?;
+        let supervisor = Arc::new(AdapterSupervisor::new(registry));
+
+        let one = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor
+                    .execute(
+                        "isolation-one",
+                        test_request("isolation-one", AdapterCapability::ExecuteTest),
+                        None,
+                    )
+                    .await
+            })
+        };
+        wait_for_entries(&one_entered, 1).await;
+
+        let one_saturated = supervisor
+            .execute(
+                "isolation-one",
+                test_request("isolation-one", AdapterCapability::ExecuteTest),
+                None,
+            )
+            .await
+            .expect("saturated adapter returns a refusal result");
+        assert_eq!(one_saturated.status, AdapterResultStatus::Unavailable);
+
+        let two_a = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor
+                    .execute(
+                        "isolation-two",
+                        test_request("isolation-two", AdapterCapability::ExecuteTest),
+                        None,
+                    )
+                    .await
+            })
+        };
+        let two_b = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor
+                    .execute(
+                        "isolation-two",
+                        test_request("isolation-two", AdapterCapability::ExecuteTest),
+                        None,
+                    )
+                    .await
+            })
+        };
+        wait_for_entries(&two_entered, 2).await;
+        let two_saturated = supervisor
+            .execute(
+                "isolation-two",
+                test_request("isolation-two", AdapterCapability::ExecuteTest),
+                None,
+            )
+            .await
+            .expect("second adapter returns a refusal only at its own ceiling");
+        assert_eq!(two_saturated.status, AdapterResultStatus::Unavailable);
+
+        one_release.add_permits(1);
+        two_release.add_permits(2);
+        assert_eq!(
+            one.await
+                .expect("adapter one task")
+                .expect("adapter one execution")
+                .status,
+            AdapterResultStatus::Succeeded
+        );
+        assert_eq!(
+            two_a
+                .await
+                .expect("adapter two task A")
+                .expect("adapter two execution A")
+                .status,
+            AdapterResultStatus::Succeeded
+        );
+        assert_eq!(
+            two_b
+                .await
+                .expect("adapter two task B")
+                .expect("adapter two execution B")
+                .status,
+            AdapterResultStatus::Succeeded
+        );
+
+        one_fail_next.store(true, Ordering::Release);
+        one_release.add_permits(1);
+        let opened = supervisor
+            .execute(
+                "isolation-one",
+                test_request("isolation-one", AdapterCapability::ExecuteTest),
+                None,
+            )
+            .await
+            .expect("transport failure is represented as an adapter result");
+        assert_eq!(opened.status, AdapterResultStatus::TransportFailure);
+        assert_eq!(
+            supervisor.health_probe("isolation-one").await.state,
+            AdapterState::CircuitOpen
+        );
+
+        two_release.add_permits(1);
+        let still_usable = supervisor
+            .execute(
+                "isolation-two",
+                test_request("isolation-two", AdapterCapability::ExecuteTest),
+                None,
+            )
+            .await
+            .expect("other registered adapter remains usable");
+        assert_eq!(still_usable.status, AdapterResultStatus::Succeeded);
+        Ok(())
+    }
+}

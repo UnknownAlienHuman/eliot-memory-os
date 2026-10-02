@@ -23,12 +23,12 @@ use eliot_contracts::sha256_hex;
 use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
 use eliot_instrument_runner::registry::RegistryFreshness;
 use eliot_instrument_runner::{
-    AggregateStatus, CacheLaneAttestations, CompiledProfile, InstrumentBinding,
-    InstrumentObservation, InstrumentRegistry, InstrumentRequestPort, InstrumentRunner,
-    KernelInstrumentAdmission, KernelInstrumentRequestPort, ProfileAggregate, ProfileCompiler,
-    ProviderRegistry, RegistryEntry, ResolvedExecutableIdentity, RunnerError, StageLauncher,
-    StageOrchestrator, StagePlan, TestdAdmission, TestdAdmissionPort, TestdPlaneAdmission,
-    TestdPortError,
+    AdmissionSubmissionProofPort, AggregateStatus, CacheLaneAttestations, CompiledProfile,
+    InstrumentBinding, InstrumentObservation, InstrumentRegistry, InstrumentRequestPort,
+    InstrumentRunner, KernelInstrumentAdmission, KernelInstrumentRequestPort, ProfileAggregate,
+    ProfileCompiler, ProviderRegistry, RegistryEntry, ResolvedExecutableIdentity, ResolvedProfile,
+    RunnerError, StageLauncher, StageOrchestrator, StagePlan, TestdAdmission, TestdAdmissionPort,
+    TestdPlaneAdmission, TestdPortError,
 };
 use eliot_process::{OperationId, ProcessEvidenceSink, ProcessExecutor};
 use thiserror::Error;
@@ -226,16 +226,26 @@ pub enum GovernedBuildError {
 pub struct GovernedBuildRuntime<E> {
     runner: InstrumentRunner<E>,
     cache: CachedDerivationService,
+    instrument_registry: InstrumentRegistry,
+    admission_proof: Arc<dyn AdmissionSubmissionProofPort>,
 }
 
 impl<E> GovernedBuildRuntime<E> {
     /// Creates a runtime caller over the composition root's process executor
     /// and explicit cache policy.
     #[must_use]
-    pub fn new(executor: Arc<E>, store: DerivedCacheStore, trust: TrustPolicy) -> Self {
+    pub fn new(
+        executor: Arc<E>,
+        store: DerivedCacheStore,
+        trust: TrustPolicy,
+        instrument_registry: InstrumentRegistry,
+        admission_proof: Arc<dyn AdmissionSubmissionProofPort>,
+    ) -> Self {
         Self {
             runner: InstrumentRunner::new(executor),
             cache: CachedDerivationService::new(store, trust),
+            instrument_registry,
+            admission_proof,
         }
     }
 
@@ -291,7 +301,7 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         }
 
         let invocation = request.invocation.clone();
-        let (compiled, stage_plan) = compile_build_plan(&invocation)?;
+        let (compiled, stage_plan) = compile_build_plan(&invocation, &self.instrument_registry)?;
         let mut attestations = request.attestations.clone();
         let expected =
             valid_digest(&attestations.content_digest).then(|| attestations.content_digest.clone());
@@ -340,7 +350,14 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         // (#1813). Non-test classes keep their registry resolution and record
         // the typed testd refusal; nothing here gates the governed launch.
         let testd_admission = Some(TestdPlaneAdmission.admit(&invocation, entry));
-        let (operation_id, observation, bytes) = self.execute_build(&request, entry).await?;
+        let stage_plan = stage_plan
+            .as_ref()
+            .ok_or_else(|| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: "build invocation has no admitted profile stage".to_owned(),
+            })?;
+        let (operation_id, observation, bytes) =
+            self.execute_build(&request, entry, stage_plan).await?;
         let observed_digest = sha256_hex(&bytes);
         match expected.as_deref() {
             Some(expected) if expected != observed_digest => {
@@ -411,23 +428,34 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
     pub async fn run_profile(
         &self,
         profile: &str,
+        resolved: &ResolvedProfile,
         launcher: &dyn StageLauncher,
     ) -> Result<ProfileAggregate, GovernedBuildError> {
-        let instrument_registry =
-            InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
-                EngineError::ServiceNotReady {
-                    service: "instrument-profile".to_owned(),
-                    reason: format!("builtin profile registry is unavailable: {error}"),
-                }
-            })?;
-        let compiled = ProfileCompiler::new(&instrument_registry).compile(profile);
+        let compiled = ProfileCompiler::new(&self.instrument_registry).compile(profile);
         let admitted = compiled
             .admitted()
             .map_err(|error| EngineError::ServiceNotReady {
                 service: "instrument-profile".to_owned(),
                 reason: format!("profile execution requires a governed admission: {error}"),
             })?;
-        let aggregate = self.runner.run_profile_stages(admitted, launcher).await;
+        StageOrchestrator::plan_resolved(admitted, resolved).map_err(|error| {
+            EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!(
+                    "profile execution requires its exact retained resolution: {error}"
+                ),
+            }
+        })?;
+        let aggregate = self
+            .runner
+            .run_profile_stages_live_with_proof(
+                &self.instrument_registry,
+                admitted,
+                resolved,
+                launcher,
+                self.admission_proof.as_ref(),
+            )
+            .await;
         if aggregate.is_success() {
             Ok(aggregate)
         } else {
@@ -443,6 +471,7 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
         &self,
         request: &GovernedBuildRequest<'_>,
         entry: &RegistryEntry,
+        plan: &StagePlan,
     ) -> Result<(OperationId, InstrumentObservation, Vec<u8>), GovernedBuildError> {
         let artifact_path = &request.artifact_path;
         if !artifact_path.is_absolute() {
@@ -452,16 +481,68 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
             });
         }
 
-        // Binding is done through the existing request port; no command is
-        // constructed or launched directly in this owner.
+        let mut matching = plan.stages.iter().filter(|planned| {
+            planned.stage.spec.as_str() == request.invocation.instrument.as_str()
+                && planned.stage.kind == request.invocation.kind
+        });
+        let planned = matching
+            .next()
+            .ok_or_else(|| EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!(
+                    "profile '{}' has no admitted stage for instrument '{}' and kind {:?}",
+                    request.invocation.profile,
+                    request.invocation.instrument.as_str(),
+                    request.invocation.kind,
+                ),
+            })?;
+        if matching.next().is_some() {
+            return Err(EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!(
+                    "profile '{}' has an ambiguous admitted stage for instrument '{}' and kind {:?}",
+                    request.invocation.profile,
+                    request.invocation.instrument.as_str(),
+                    request.invocation.kind,
+                ),
+            }
+            .into());
+        }
+        if !planned.stage.external {
+            return Err(EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: "governed build invocation resolves to a non-process profile stage"
+                    .to_owned(),
+            }
+            .into());
+        }
+        if !planned.stage.depends_on.is_empty() {
+            return Err(EngineError::ServiceNotReady {
+                service: "instrument-profile".to_owned(),
+                reason: format!(
+                    "profile stage '{}' has required dependencies and must run through the full admitted profile plan",
+                    planned.stage.stage_id,
+                ),
+            }
+            .into());
+        }
+
+        // The profile's exact admitted stage supplies executable, argv,
+        // parser, and supply-chain constraints; Kernel still supplies the
+        // one-shot process request through this existing port.
         let process_request = request.request_port.bind(&request.invocation)?;
         let mut binding =
             InstrumentBinding::from_request(request.invocation.clone(), process_request)?;
         binding.verify_executable(entry, request.executable)?;
-        let receipt = self
-            .runner
-            .launch(&mut binding, Arc::clone(&request.sink))
-            .await?;
+        let receipt = StageOrchestrator::launch_admitted_stage_live(
+            &self.runner,
+            &self.instrument_registry,
+            planned,
+            &mut binding,
+            self.admission_proof.as_ref(),
+            Arc::clone(&request.sink),
+        )
+        .await?;
         let operation_id = receipt.process.operation_id().clone();
         let deadline = tokio::time::Instant::now() + request.options.timeout;
 
@@ -501,18 +582,13 @@ impl<E: ProcessExecutor + 'static> GovernedBuildRuntime<E> {
 /// graph and keeps its current behavior with no governed claim.
 fn compile_build_plan(
     invocation: &InstrumentInvocation,
+    instrument_registry: &InstrumentRegistry,
 ) -> Result<(CompiledProfile, Option<StagePlan>), GovernedBuildError> {
     // Route the invocation profile through the single profile compiler
     // (#1813). Governed admissions pin the exact revision and stage graph
     // and reject foreign invocation classes; quarantined legacy text
     // keeps its current behavior with no governed claim.
-    let instrument_registry = InstrumentRegistry::with_builtin_profiles(1).map_err(|error| {
-        EngineError::ServiceNotReady {
-            service: "instrument-profile".to_owned(),
-            reason: format!("builtin profile registry is unavailable: {error}"),
-        }
-    })?;
-    let compiled = ProfileCompiler::new(&instrument_registry).compile(&invocation.profile);
+    let compiled = ProfileCompiler::new(instrument_registry).compile(&invocation.profile);
     let admitted =
         compiled
             .require_kind(invocation.kind)
@@ -754,7 +830,14 @@ mod tests {
                 std::io::Error::other(format!("preload verified artifact: {error:?}"))
             })?;
 
-        let mut runtime = GovernedBuildRuntime::new(Arc::new(NeverExecutor), store, trust);
+        let instrument_registry = InstrumentRegistry::with_builtin_profiles(1)?;
+        let mut runtime = GovernedBuildRuntime::new(
+            Arc::new(NeverExecutor),
+            store,
+            trust,
+            instrument_registry,
+            Arc::new(eliot_instrument_runner::UnprovisionedAdmissionProofPort),
+        );
         let outcome = runtime
             .run(GovernedBuildRequest {
                 invocation,

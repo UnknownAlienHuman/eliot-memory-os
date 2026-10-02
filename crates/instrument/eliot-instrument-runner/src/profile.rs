@@ -14,22 +14,30 @@
 //! record that carries no governed revision, stage graph, or receipt.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 
-use eliot_contracts::{ContractError, ContractId, ContractVersion, StateFence, sha256_hex};
+use eliot_contracts::{ContractId, ContractVersion, StateFence, sha256_hex};
+pub use eliot_instrument_api::registry::{
+    FixedArgumentSchema, InstrumentClass, InstrumentKindId, InstrumentProfile, InstrumentSpec,
+    InstrumentSpecParams, ProfileError, ProfileScopeClasses, ResourceLimits, StageDag, StageDecl,
+};
 use eliot_instrument_api::{
     BuildClass, InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentKind,
 };
 use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
 use eliot_instrument_nextest::{
     MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT, NEXTEST_LIBTEST_JSON_FORMAT_VERSION,
+    NextestCommand, NextestScope,
 };
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::registry::{ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable};
+use crate::registry::{
+    ExecutableIdentity, RegistryEntry, ResolvedExecutableIdentity, SupplyChainReceipt,
+    SupplyChainTable,
+};
+use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
 
 /// Admitted `compiler` profile name (I10.8.7).
 pub const COMPILER_PROFILE: &str = "compiler";
@@ -89,148 +97,12 @@ pub const BUILTIN_MAX_CONCURRENCY: u32 = 1;
 /// explicit declared dependency instead of an invisible ambient fact, and
 /// `EnvironmentInheritance::None` is kept so no other variable leaks in.
 pub const TOOLCHAIN_PATH_ENV: &str = "PATH";
-/// Stable schema name of the canonical registry snapshot.
-pub const REGISTRY_SNAPSHOT_SCHEMA: &str = "eliot.instrument.registry-snapshot";
-/// Exact schema wire version of the canonical registry snapshot.
-pub const REGISTRY_SNAPSHOT_SCHEMA_VERSION: &str = "1.0.0";
 
-/// Failures raised while admitting, resolving, or compiling profiles.
-///
-/// Every variant is typed and fail-closed: no stringly-typed catch-all drives
-/// control flow.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ProfileError {
-    /// A required text value is blank or contains a control character.
-    #[error("{field} must be non-blank and free of control characters")]
-    InvalidText {
-        /// Field that failed validation.
-        field: &'static str,
-    },
-    /// A profile revision is zero, which never names an admitted revision.
-    #[error("profile '{profile}' revision must be non-zero")]
-    InvalidRevision {
-        /// Profile that named the revision.
-        profile: String,
-    },
-    /// No profile is admitted under the requested name.
-    #[error("no admitted instrument profile named '{profile}'")]
-    UnknownProfile {
-        /// Requested profile name.
-        profile: String,
-    },
-    /// The profile exists but the exact revision is not admitted.
-    #[error("profile '{profile}' has no admitted revision {revision}")]
-    UnknownRevision {
-        /// Requested profile name.
-        profile: String,
-        /// Requested revision.
-        revision: u64,
-    },
-    /// A requested alias is outside the closed [`PROFILE_ALIASES`] table.
-    #[error("'{alias}' is not an admitted profile alias")]
-    UnknownAlias {
-        /// Requested alias name.
-        alias: String,
-    },
-    /// A stage references an [`InstrumentSpec`] the registry never admitted.
-    #[error("profile '{profile}' stage '{stage}' references unknown spec '{spec}'")]
-    UnknownSpec {
-        /// Profile carrying the dangling reference.
-        profile: String,
-        /// Stage carrying the dangling reference.
-        stage: String,
-        /// Referenced spec identity.
-        spec: String,
-    },
-    /// Two specs claim the same kind identity.
-    #[error("duplicate instrument spec '{spec}'")]
-    DuplicateSpec {
-        /// Conflicting kind identity.
-        spec: String,
-    },
-    /// Two profiles claim the same name and revision.
-    #[error("duplicate instrument profile '{profile}' revision {revision}")]
-    DuplicateProfile {
-        /// Conflicting profile name.
-        profile: String,
-        /// Conflicting revision.
-        revision: u64,
-    },
-    /// Two stages claim the same durable stage identity.
-    #[error("duplicate stage '{stage}'")]
-    DuplicateStage {
-        /// Conflicting stage identity.
-        stage: String,
-    },
-    /// A stage depends on a stage the profile never declares.
-    #[error("stage '{stage}' depends on unknown stage '{dependency}'")]
-    UnknownStageDependency {
-        /// Dependent stage.
-        stage: String,
-        /// Missing dependency.
-        dependency: String,
-    },
-    /// The declared stage graph is not acyclic.
-    #[error("stage graph contains a dependency cycle through '{stage}'")]
-    StageCycle {
-        /// Stage where the cycle was detected.
-        stage: String,
-    },
-    /// A profile declares no stages, so there is nothing to orchestrate.
-    #[error("profile '{profile}' declares no stages")]
-    EmptyDag {
-        /// Profile without stages.
-        profile: String,
-    },
-    /// A stage kind does not match its bound spec class.
-    #[error("stage '{stage}' kind {kind:?} does not match spec '{spec}' class")]
-    SpecKindMismatch {
-        /// Offending stage.
-        stage: String,
-        /// Referenced spec identity.
-        spec: String,
-        /// Declared stage class.
-        kind: InstrumentKind,
-    },
-    /// The invocation class is outside the admitted profile classes.
-    #[error("profile '{profile}' revision {revision} does not admit {kind:?} invocations")]
-    UnsupportedKind {
-        /// Admitted profile name.
-        profile: String,
-        /// Admitted revision.
-        revision: u64,
-        /// Requested invocation class.
-        kind: InstrumentKind,
-    },
-    /// A legacy profile bypassed the compiler and carries no governed admission.
-    #[error("profile '{profile}' is quarantined: it bypasses the profile compiler")]
-    Quarantined {
-        /// Bypassed profile name.
-        profile: String,
-    },
-    /// Two target roots collide; layout roots must be pairwise distinct.
-    #[error("target layout roots must be pairwise distinct")]
-    LayoutCollision,
-    /// The attested environment class differs from the admitted profile class.
-    #[error("environment class '{observed}' does not match profile '{profile}' class '{expected}'")]
-    EnvironmentMismatch {
-        /// Profile whose class was expected.
-        profile: String,
-        /// Admitted class.
-        expected: String,
-        /// Attested class.
-        observed: String,
-    },
-    /// A contract identity failed validation while assembling definitions.
-    #[error(transparent)]
-    Contract(#[from] ContractError),
-    /// A registry snapshot is malformed or names an unsupported schema.
-    #[error("registry snapshot is malformed: {detail}")]
-    Snapshot {
-        /// How the snapshot fails shape or schema validation.
-        detail: String,
-    },
-}
+/// Stable schema name of the canonical registry snapshot.
+pub const REGISTRY_SNAPSHOT_SCHEMA: &str = eliot_instrument_api::registry::REGISTRY_SNAPSHOT_SCHEMA;
+/// Exact schema wire version of the canonical registry snapshot.
+pub const REGISTRY_SNAPSHOT_SCHEMA_VERSION: &str =
+    eliot_instrument_api::registry::REGISTRY_SNAPSHOT_SCHEMA_VERSION;
 
 /// Validates one required text value.
 fn validate_text(value: &str, field: &'static str) -> Result<(), ProfileError> {
@@ -252,674 +124,164 @@ const fn kind_rank(kind: InstrumentKind) -> u8 {
     }
 }
 
-/// Stable semantic instrument class set (I10.8.3).
+/// Closed in-process operation admitted by one pure-transform registry entry.
 ///
-/// The class distinguishes long-lived semantics from the replaceable
-/// concrete kind: a new kind is admitted through a versioned
-/// Module/Instrument manifest without changing this enum, the Kernel, or
-/// any coarse invocation class. Each class projects to exactly one coarse
-/// [`InstrumentKind`] for stage binding.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum InstrumentClass {
-    /// Source identity and version-control observation.
-    SourceIdentity,
-    /// Compilation and build.
-    Compiler,
-    /// Source formatting checks.
-    Formatter,
-    /// Test execution.
-    Test,
-    /// Semantic index decoding and projection.
-    SemanticIndex,
-    /// Heuristic analysis and scout observations.
-    HeuristicAnalysis,
-    /// Runtime diagnostics capture.
-    RuntimeDiagnostic,
-    /// Dependency and supply-chain hygiene.
-    SecurityDependency,
-    /// Concurrency model checking and simulation.
-    Concurrency,
-    /// Unsafe/FFI boundary verification.
-    UnsafeFfi,
-    /// Benchmark and performance probes.
-    Performance,
-}
-
-impl InstrumentClass {
-    /// Coarse invocation class this semantic class binds stages under.
-    ///
-    /// Observation classes bind under `Inspect`, static checks under `Lint`,
-    /// formatting under `Format`, executable test-like harnesses (including
-    /// concurrency, unsafe, and performance rigs) under `Test`, and build
-    /// compilers under `Build`.
-    pub const fn coarse_kind(self) -> InstrumentKind {
-        match self {
-            Self::SourceIdentity | Self::SemanticIndex | Self::RuntimeDiagnostic => {
-                InstrumentKind::Inspect
-            }
-            Self::Compiler => InstrumentKind::Build,
-            Self::Formatter => InstrumentKind::Format,
-            Self::Test | Self::Concurrency | Self::UnsafeFfi | Self::Performance => {
-                InstrumentKind::Test
-            }
-            Self::HeuristicAnalysis | Self::SecurityDependency => InstrumentKind::Lint,
-        }
-    }
-}
-
-/// Opaque versioned instrument kind identifier (I10.8.3).
-///
-/// The name is opaque to every consumer except the admitting registry: no
-/// caller parses, trims, or aliases it. The version identifies the
-/// replaceable concrete kind, so a new kind generation is admitted as a new
-/// identifier rather than a mutation. Unregistered kind IDs fail before
-/// launch.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstrumentKindId {
-    /// Opaque kind name, keyed by the admitting registry.
-    name: ContractId,
-    /// Replaceable kind generation.
-    version: ContractVersion,
-}
-
-impl InstrumentKindId {
-    /// Admits one versioned kind identifier.
-    ///
-    /// The name is opaque but never blank: an empty or control-carrying name
-    /// is refused here so an unregistered kind can never be keyed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProfileError::InvalidText`] when the kind name is blank or
-    /// carries control characters.
-    pub fn new(name: ContractId, version: ContractVersion) -> Result<Self, ProfileError> {
-        validate_text(name.as_str(), "kind_id")?;
-        Ok(Self { name, version })
-    }
-
-    /// Opaque kind name for registry keying.
-    pub fn as_str(&self) -> &str {
-        self.name.as_str()
-    }
-
-    /// Replaceable kind generation.
-    pub const fn version(&self) -> ContractVersion {
-        self.version
-    }
-
-    /// Deterministic identity over name and version.
-    pub fn digest(&self) -> String {
-        let material = format!("{}\0{}", self.name.as_str(), self.version);
-        sha256_hex(material.as_bytes())
-    }
-}
-
-/// Admitted resource ceiling bound into the process grant (I10.8.3).
-///
-/// `None` leaves the ceiling to the owning execution plane or the
-/// composition-root port: the cargo adapter, for example, defines no capture
-/// bound of its own. A present value is the admitted ceiling the grant binds;
-/// enforcement stays with the plane that owns the process, never with a
-/// global pool.
+/// These handlers are compiled implementations, not registry-authored code or
+/// executable names. Adding another handler requires a matching registered
+/// transform contract and a typed dispatcher branch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceLimits {
-    /// Admitted wall-clock ceiling in milliseconds, when the spec sets one.
-    pub timeout_ms: Option<u64>,
-    /// Admitted raw-output capture ceiling in bytes, when the spec sets one.
-    pub max_output_bytes: Option<u64>,
+#[serde(rename_all = "kebab-case")]
+pub enum PureTransformHandler {
+    /// Decode retained SCIP index bytes and project one typed graph query.
+    ScipGraphQuery,
 }
 
-impl ResourceLimits {
-    /// Records the admitted ceiling; `None` defers to the owning plane.
-    pub const fn new(timeout_ms: Option<u64>, max_output_bytes: Option<u64>) -> Self {
-        Self {
-            timeout_ms,
-            max_output_bytes,
-        }
-    }
-
-    /// Deterministic identity over the admitted ceiling.
-    pub fn digest(&self) -> String {
-        let material = format!(
-            "{}\0{}",
-            self.timeout_ms
-                .map(|timeout| timeout.to_string())
-                .unwrap_or_default(),
-            self.max_output_bytes
-                .map(|limit| limit.to_string())
-                .unwrap_or_default(),
-        );
-        sha256_hex(material.as_bytes())
-    }
-}
-
-/// Caller-supplied fields for one [`InstrumentSpec`] admission.
+/// Admitted metadata for one bounded deterministic in-process transform.
 ///
-/// Bundled so admission stays a single validated constructor; every field is
-/// bound into the spec digest and, through compilation, into the process
-/// grant digest sealed at launch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InstrumentSpecParams {
-    /// Opaque versioned kind identity.
-    pub kind: InstrumentKindId,
-    /// Stable semantic class.
-    pub class: InstrumentClass,
-    /// Spec revision.
-    pub revision: ContractVersion,
-    /// Exact executable file identity bound by the registry.
-    pub executable: String,
-    /// Admitted tool version requirement, when the manifest pins one.
-    pub executable_version: Option<String>,
-    /// Parser/normalizer authority for the instrument output.
-    pub parser: ContractId,
-    /// Admitted parser generation; replaceable through module cutover.
-    pub parser_generation: u64,
-    /// Admitted environment class.
-    pub environment_profile: String,
-    /// Invocation schema authority: the contract that validates arguments.
-    pub schema: ContractId,
-    /// Fixed command template; empty when the manifest declares none, in
-    /// which case only the empty argument vector is admitted.
-    pub argument_template: Vec<String>,
-    /// The real verification argv this kind runs, declared by the spec that
-    /// owns it.
-    ///
-    /// `argument_template` bounds what a CALLER may request; it admits only
-    /// the empty vector for every builtin. This field is the complementary
-    /// half: the argv the admitted profile revision actually executes. It is
-    /// declared here, on the one admitted-spec registry that both a local
-    /// entrypoint and CI resolve, rather than in a second command list beside
-    /// it, and it is bound into [`InstrumentSpec::digest`] like every other
-    /// admitted field.
-    pub verification_command: Vec<String>,
-    /// Admitted credential policy identity.
-    pub credential_policy: ContractId,
-    /// Admitted network policy identity.
-    pub network_policy: ContractId,
-    /// Admitted resource ceiling.
-    pub limits: ResourceLimits,
-    /// Declared per-adapter maximum concurrency; enforced by the owning
-    /// plane with its own semaphore and circuit state, never by a global
-    /// pool.
-    pub max_concurrency: u32,
-}
-
-/// Versioned executable authority for one instrument kind (I10.8.3).
-///
-/// The spec names the exact executable identity, argument schema and fixed
-/// template, parser generation, environment/resource/credential/network
-/// policy, and declared concurrency an admitted stage may use. It never
-/// carries command text or agent-supplied combinations: stages resolve to
-/// typed invocations validated against this admission before any child
-/// process is created.
+/// Unlike [`InstrumentSpec`], this contract has no executable, argv, or
+/// supply-chain receipt. Its metadata is copied only from the existing
+/// decoder-only [`RegistryEntry`] and validated against that closed contract
+/// when a snapshot is rebuilt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InstrumentSpec {
-    /// Opaque versioned kind identity.
-    pub kind: InstrumentKindId,
-    /// Semantic class of the instrument.
-    pub class: InstrumentClass,
-    /// Spec revision.
-    pub revision: ContractVersion,
-    /// Exact executable file identity bound by the registry.
-    pub executable: String,
-    /// Admitted tool version requirement, when the manifest pins one.
-    pub executable_version: Option<String>,
-    /// Parser/normalizer authority for the instrument output.
+pub struct PureTransformSpec {
+    /// Existing decoder/instrument contract identity.
+    pub instrument: ContractId,
+    /// Existing registered profile identity.
+    pub profile: ContractId,
+    /// Existing profile contract version.
+    pub profile_version: ContractVersion,
+    /// Exact profile revision selected by the current registry owner.
+    pub profile_revision: u64,
+    /// Existing adapter identity.
+    pub adapter: String,
+    /// Existing adapter contract version.
+    pub adapter_version: ContractVersion,
+    /// Existing parser contract identity.
     pub parser: ContractId,
-    /// Admitted parser generation.
+    /// Existing normalizer contract identity.
+    pub normalizer: ContractId,
+    /// Existing evaluator contract identity.
+    pub evaluator: ContractId,
+    /// Parser/provider generation captured by the owning registry.
     pub parser_generation: u64,
-    /// Admitted environment class.
+    /// Admitted offline decoder environment.
     pub environment_profile: String,
-    /// Invocation schema authority.
-    pub schema: ContractId,
-    /// Fixed command template; empty admits only the empty argument vector.
-    pub argument_template: Vec<String>,
-    /// The real verification argv this kind runs, declared by this spec.
-    ///
-    /// The admitted argv a launched stage runs, as opposed to
-    /// [`Self::argument_template`], which is the fixed template a caller's
-    /// own arguments must equal. An empty verification command is refused at
-    /// construction rather than shipped: a kind that performs real package
-    /// verification runs its tool with the arguments that ARE the
-    /// verification, and a tool invoked with none is help/version output, not
-    /// a compilation.
-    pub verification_command: Vec<String>,
-    /// Admitted credential policy identity.
-    pub credential_policy: ContractId,
-    /// Admitted network policy identity.
-    pub network_policy: ContractId,
-    /// Admitted resource ceiling.
-    pub limits: ResourceLimits,
-    /// Declared per-adapter maximum concurrency.
-    pub max_concurrency: u32,
+    /// Maximum retained input byte length.
+    pub max_input_bytes: usize,
+    /// Closed code handler selected by the admitted contract.
+    pub handler: PureTransformHandler,
 }
 
-impl InstrumentSpec {
-    /// Records one instrument spec, validating every field.
+impl PureTransformSpec {
+    /// Copies the existing SCIP decoder registration into the profile
+    /// admission snapshot after checking every identity-bearing field.
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError::InvalidText`] when the executable name, the
-    /// environment class, a pinned version, or a template argument is blank
-    /// or carries control characters.
-    pub fn new(params: InstrumentSpecParams) -> Result<Self, ProfileError> {
-        validate_text(&params.executable, "executable")?;
-        validate_text(&params.environment_profile, "environment_profile")?;
-        if let Some(version) = params.executable_version.as_deref() {
-            validate_text(version, "executable_version")?;
-        }
-        for argument in &params.argument_template {
-            validate_text(argument, "argument_template")?;
-        }
-        for argument in &params.verification_command {
-            validate_text(argument, "verification_command")?;
-        }
-        if params.verification_command.is_empty() {
-            return Err(ProfileError::InvalidText {
-                field: "verification_command",
+    /// Returns [`ProfileError::Snapshot`] when the entry is not the current
+    /// decoder-only SCIP registration.
+    pub fn from_registry_entry(entry: &RegistryEntry) -> Result<Self, ProfileError> {
+        let expected_resource =
+            format!("SCIP decode bounded at {MAX_SCIP_BYTES} bytes (MAX_SCIP_BYTES)");
+        if entry.profile.as_str() != SCIP_INSTRUMENT
+            || entry.profile_version != ContractVersion::new(1, 0, 0)
+            || entry.instrument.as_str() != SCIP_INSTRUMENT
+            || entry.kinds.as_slice() != [InstrumentKind::Inspect]
+            || entry.adapter != SCIP_INSTRUMENT
+            || entry.adapter_version != ContractVersion::new(1, 0, 0)
+            || !entry.executable.is_decoder_only()
+            || entry.toolchain != "scip-indexer"
+            || entry.environment_class != crate::registry::OFFLINE_DECODE
+            || entry.resource_contract != expected_resource
+            || entry.parser.as_str() != SCIP_INSTRUMENT
+            || entry.normalizer.as_str() != SCIP_INSTRUMENT
+            || entry.evaluator.as_str() != SCIP_INSTRUMENT
+            || entry.generation == 0
+        {
+            return Err(ProfileError::Snapshot {
+                detail: "pure transform metadata differs from the registered SCIP decoder"
+                    .to_owned(),
             });
         }
         Ok(Self {
-            kind: params.kind,
-            class: params.class,
-            revision: params.revision,
-            executable: params.executable,
-            executable_version: params.executable_version,
-            parser: params.parser,
-            parser_generation: params.parser_generation,
-            environment_profile: params.environment_profile,
-            schema: params.schema,
-            argument_template: params.argument_template,
-            verification_command: params.verification_command,
-            credential_policy: params.credential_policy,
-            network_policy: params.network_policy,
-            limits: params.limits,
-            max_concurrency: params.max_concurrency,
+            instrument: entry.instrument.clone(),
+            profile: entry.profile.clone(),
+            profile_version: entry.profile_version,
+            // The profile contract revision and its parser/provider
+            // generation cut over independently. The SCIP profile shipped
+            // here is the builtin profile revision; the parser generation
+            // below comes from the registered decoder entry.
+            profile_revision: BUILTIN_PROFILE_REVISION,
+            adapter: entry.adapter.clone(),
+            adapter_version: entry.adapter_version,
+            parser: entry.parser.clone(),
+            normalizer: entry.normalizer.clone(),
+            evaluator: entry.evaluator.clone(),
+            parser_generation: entry.generation,
+            environment_profile: entry.environment_class.clone(),
+            max_input_bytes: MAX_SCIP_BYTES,
+            handler: PureTransformHandler::ScipGraphQuery,
         })
     }
 
-    /// Registry key: the admitted kind identity.
-    pub fn kind_key(&self) -> &str {
-        self.kind.as_str()
+    /// Validates recovered metadata against the one compiled SCIP decoder.
+    fn validate(&self) -> Result<(), ProfileError> {
+        let expected = Self {
+            instrument: ContractId::new(SCIP_INSTRUMENT.to_owned())?,
+            profile: ContractId::new(SCIP_INSTRUMENT.to_owned())?,
+            profile_version: ContractVersion::new(1, 0, 0),
+            profile_revision: self.profile_revision,
+            adapter: SCIP_INSTRUMENT.to_owned(),
+            adapter_version: ContractVersion::new(1, 0, 0),
+            parser: ContractId::new(SCIP_INSTRUMENT.to_owned())?,
+            normalizer: ContractId::new(SCIP_INSTRUMENT.to_owned())?,
+            evaluator: ContractId::new(SCIP_INSTRUMENT.to_owned())?,
+            parser_generation: self.parser_generation,
+            environment_profile: crate::registry::OFFLINE_DECODE.to_owned(),
+            max_input_bytes: MAX_SCIP_BYTES,
+            handler: PureTransformHandler::ScipGraphQuery,
+        };
+        if self.parser_generation == 0
+            || self.profile_revision == 0
+            || self.instrument != expected.instrument
+            || self.profile != expected.profile
+            || self.profile_version != expected.profile_version
+            || self.adapter != expected.adapter
+            || self.adapter_version != expected.adapter_version
+            || self.parser != expected.parser
+            || self.normalizer != expected.normalizer
+            || self.evaluator != expected.evaluator
+            || self.environment_profile != expected.environment_profile
+            || self.max_input_bytes != expected.max_input_bytes
+            || self.handler != expected.handler
+        {
+            return Err(ProfileError::Snapshot {
+                detail: "recovered pure transform metadata is stale or unsupported".to_owned(),
+            });
+        }
+        Ok(())
     }
 
-    /// Deterministic identity over every spec field.
-    pub fn digest(&self) -> String {
+    /// Digest of the exact admitted decoder contract and parser generation.
+    pub fn spec_digest(&self) -> String {
         let material = format!(
-            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            self.kind.digest(),
-            self.class,
-            self.revision,
-            self.executable,
-            self.executable_version.as_deref().unwrap_or(""),
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.instrument.as_str(),
+            self.profile.as_str(),
+            self.profile_version,
+            self.profile_revision,
+            self.adapter,
+            self.adapter_version,
             self.parser.as_str(),
+            self.normalizer.as_str(),
+            self.evaluator.as_str(),
             self.parser_generation,
             self.environment_profile,
-            self.schema.as_str(),
-            self.argument_template.join("\0"),
-            self.verification_command.join("\0"),
-            self.credential_policy.as_str(),
-            self.network_policy.as_str(),
-            self.limits.digest(),
-            self.max_concurrency,
-        );
-        sha256_hex(material.as_bytes())
-    }
-}
-
-/// One declared profile stage with durable identity and dependencies.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StageDecl {
-    /// Durable stage identity within the profile revision.
-    pub stage_id: String,
-    /// Bound [`InstrumentSpec`] kind identity.
-    pub spec: ContractId,
-    /// Stage class; must equal the bound spec class.
-    pub kind: InstrumentKind,
-    /// Prerequisite stage identities, sorted and deduplicated.
-    pub depends_on: Vec<String>,
-    /// Whether the aggregate fails without a successful run of this stage.
-    pub required: bool,
-    /// Whether the stage dispatches through `TestExecutionPlane`.
-    pub external: bool,
-}
-
-impl StageDecl {
-    /// Declares one stage, validating identities and ordering dependencies.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProfileError::InvalidText`] when the stage identity or a
-    /// dependency is blank or carries control characters.
-    pub fn new(
-        stage_id: String,
-        spec: ContractId,
-        kind: InstrumentKind,
-        mut depends_on: Vec<String>,
-        required: bool,
-        external: bool,
-    ) -> Result<Self, ProfileError> {
-        validate_text(&stage_id, "stage_id")?;
-        for dependency in &depends_on {
-            validate_text(dependency, "depends_on")?;
-        }
-        depends_on.sort();
-        depends_on.dedup();
-        Ok(Self {
-            stage_id,
-            spec,
-            kind,
-            depends_on,
-            required,
-            external,
-        })
-    }
-}
-
-/// Declared bounded stage DAG (I10.8.4).
-///
-/// Stages are keyed by durable identity in a [`BTreeMap`], so iteration order
-/// is sorted and stable. Construction rejects duplicates, dangling
-/// dependencies, self-dependencies, and cycles before anything executes.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StageDag {
-    stages: BTreeMap<String, StageDecl>,
-}
-
-impl StageDag {
-    /// Assembles a stage DAG from caller-supplied declarations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProfileError::EmptyDag`] when no stage is declared,
-    /// [`ProfileError::DuplicateStage`] on a conflicting identity,
-    /// [`ProfileError::UnknownStageDependency`] on a dangling edge, or
-    /// [`ProfileError::StageCycle`] when the graph is not acyclic.
-    pub fn build(profile: &str, stages: Vec<StageDecl>) -> Result<Self, ProfileError> {
-        if stages.is_empty() {
-            return Err(ProfileError::EmptyDag {
-                profile: profile.to_owned(),
-            });
-        }
-        let mut map = BTreeMap::new();
-        for stage in stages {
-            let key = stage.stage_id.clone();
-            if map.insert(key.clone(), stage).is_some() {
-                return Err(ProfileError::DuplicateStage { stage: key });
-            }
-        }
-        for stage in map.values() {
-            for dependency in &stage.depends_on {
-                if dependency == &stage.stage_id {
-                    return Err(ProfileError::StageCycle {
-                        stage: stage.stage_id.clone(),
-                    });
-                }
-                if !map.contains_key(dependency) {
-                    return Err(ProfileError::UnknownStageDependency {
-                        stage: stage.stage_id.clone(),
-                        dependency: dependency.clone(),
-                    });
-                }
-            }
-        }
-        let dag = Self { stages: map };
-        dag.check_acyclic()?;
-        Ok(dag)
-    }
-
-    /// Rejects cyclic graphs with a deterministic witness stage.
-    fn check_acyclic(&self) -> Result<(), ProfileError> {
-        let mut visiting = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        for stage_id in self.stages.keys() {
-            self.visit(stage_id, &mut visiting, &mut visited)?;
-        }
-        Ok(())
-    }
-
-    /// Depth-first cycle check over sorted stage identities.
-    fn visit(
-        &self,
-        stage_id: &str,
-        visiting: &mut BTreeSet<String>,
-        visited: &mut BTreeSet<String>,
-    ) -> Result<(), ProfileError> {
-        if !visited.insert(stage_id.to_owned()) {
-            return Ok(());
-        }
-        if !visiting.insert(stage_id.to_owned()) {
-            return Err(ProfileError::StageCycle {
-                stage: stage_id.to_owned(),
-            });
-        }
-        if let Some(stage) = self.stages.get(stage_id) {
-            for dependency in &stage.depends_on {
-                if visiting.contains(dependency) {
-                    return Err(ProfileError::StageCycle {
-                        stage: dependency.clone(),
-                    });
-                }
-                self.visit(dependency, visiting, visited)?;
-            }
-        }
-        visiting.remove(stage_id);
-        Ok(())
-    }
-
-    /// Deterministic topological order: Kahn over lexicographic identities.
-    ///
-    /// Independent stages surface in sorted identity order; dependents always
-    /// follow their prerequisites. Identical declarations always yield the
-    /// identical order.
-    pub fn topological_order(&self) -> Vec<&StageDecl> {
-        let mut remaining: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for stage in self.stages.values() {
-            remaining.insert(
-                stage.stage_id.as_str(),
-                stage.depends_on.iter().map(String::as_str).collect(),
-            );
-        }
-        let mut order = Vec::with_capacity(self.stages.len());
-        while !remaining.is_empty() {
-            let ready: Vec<&str> = remaining
-                .iter()
-                .filter_map(|(stage_id, dependencies)| {
-                    if dependencies.is_empty() {
-                        Some(*stage_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for stage_id in ready {
-                remaining.remove(stage_id);
-                for dependencies in remaining.values_mut() {
-                    dependencies.remove(stage_id);
-                }
-                if let Some(stage) = self.stages.get(stage_id) {
-                    order.push(stage);
-                }
-            }
-        }
-        order
-    }
-
-    /// Stages in sorted identity order.
-    pub fn iter(&self) -> std::collections::btree_map::Values<'_, String, StageDecl> {
-        self.stages.values()
-    }
-
-    /// Number of declared stages.
-    pub fn len(&self) -> usize {
-        self.stages.len()
-    }
-
-    /// Whether the DAG declares no stages.
-    pub fn is_empty(&self) -> bool {
-        self.stages.is_empty()
-    }
-
-    /// Deterministic identity over the topological stage sequence.
-    pub fn digest(&self) -> String {
-        let mut material = String::new();
-        for stage in self.topological_order() {
-            material.push_str(&stage.stage_id);
-            material.push('\0');
-            material.push_str(stage.spec.as_str());
-            material.push('\0');
-            let _ = write!(material, "{:?}", stage.kind);
-            material.push('\0');
-            material.push_str(&stage.depends_on.join(","));
-            material.push('\0');
-            material.push_str(if stage.required {
-                "required"
-            } else {
-                "optional"
-            });
-            material.push('\0');
-            material.push_str(if stage.external { "external" } else { "pure" });
-            material.push('\0');
-        }
-        sha256_hex(material.as_bytes())
-    }
-}
-
-impl<'a> IntoIterator for &'a StageDag {
-    type Item = &'a StageDecl;
-    type IntoIter = std::collections::btree_map::Values<'a, String, StageDecl>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-/// Declared scope classes carried by one [`InstrumentProfile`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProfileScopeClasses {
-    /// Target layout class; exact roots bind at resolve time.
-    pub target_layout: String,
-    /// Environment class; the concrete projection binds at resolve time.
-    pub environment: String,
-    /// Workscope class; the declared scope and fence bind at resolve time.
-    pub workscope: String,
-}
-
-impl ProfileScopeClasses {
-    /// Records the scope classes, validating every value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProfileError::InvalidText`] when a class is blank or carries
-    /// control characters.
-    pub fn new(
-        target_layout: String,
-        environment: String,
-        workscope: String,
-    ) -> Result<Self, ProfileError> {
-        validate_text(&target_layout, "target_layout_class")?;
-        validate_text(&environment, "environment_class")?;
-        validate_text(&workscope, "workscope_class")?;
-        Ok(Self {
-            target_layout,
-            environment,
-            workscope,
-        })
-    }
-}
-
-/// A versioned deterministic verification recipe (I10.8.7).
-///
-/// The profile declares admitted invocation classes, the stage DAG, and scope
-/// classes. Exact revisions, roots, fences, and environment projections bind
-/// at resolve time through [`InstrumentProfileResolver`]; the profile text
-/// itself never names a concrete path, command, or task.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstrumentProfile {
-    /// Canonical profile name, such as `compiler` or `test`.
-    pub name: String,
-    /// Exact admitted revision.
-    pub revision: u64,
-    /// Revision of the bound [`InstrumentSpec`] set.
-    pub spec_revision: ContractVersion,
-    /// Admitted invocation classes, sorted and deduplicated.
-    pub kinds: Vec<InstrumentKind>,
-    /// Declared stage DAG.
-    pub dag: StageDag,
-    /// Declared scope classes.
-    pub classes: ProfileScopeClasses,
-}
-
-impl InstrumentProfile {
-    /// Records one profile, validating identity, revision, and classes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProfileError::InvalidText`] when the name is blank,
-    /// [`ProfileError::InvalidRevision`] when the revision is zero, or
-    /// [`ProfileError::UnsupportedKind`] when no invocation class is admitted.
-    pub fn new(
-        name: String,
-        revision: u64,
-        spec_revision: ContractVersion,
-        mut kinds: Vec<InstrumentKind>,
-        dag: StageDag,
-        classes: ProfileScopeClasses,
-    ) -> Result<Self, ProfileError> {
-        validate_text(&name, "profile_name")?;
-        if revision == 0 {
-            return Err(ProfileError::InvalidRevision { profile: name });
-        }
-        kinds.sort_by_key(|kind| kind_rank(*kind));
-        kinds.dedup();
-        if kinds.is_empty() {
-            return Err(ProfileError::UnsupportedKind {
-                profile: name,
-                revision,
-                kind: InstrumentKind::Build,
-            });
-        }
-        Ok(Self {
-            name,
-            revision,
-            spec_revision,
-            kinds,
-            dag,
-            classes,
-        })
-    }
-
-    /// Whether the profile admits the invocation class.
-    pub fn admits_kind(&self, kind: InstrumentKind) -> bool {
-        self.kinds.contains(&kind)
-    }
-
-    /// Deterministic identity over revision, classes, and stage graph.
-    pub fn digest(&self) -> String {
-        let kinds = self
-            .kinds
-            .iter()
-            .map(|kind| format!("{kind:?}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            self.name,
-            self.revision,
-            self.spec_revision,
-            kinds,
-            self.dag.digest(),
-            self.classes.target_layout,
-            self.classes.environment,
-            self.classes.workscope,
+            self.max_input_bytes,
+            match self.handler {
+                PureTransformHandler::ScipGraphQuery => "scip-graph-query",
+            },
         );
         sha256_hex(material.as_bytes())
     }
@@ -961,12 +323,20 @@ impl InstrumentProfile {
 /// `--locked` is on every Cargo invocation because I18.21 and I2.22 make a
 /// locked resolution the precondition for a verification result, and
 /// `--all-targets` is on the two builds and the test run because the
-/// `MergeCompile` ceiling compiles every target. No machine observation exists
-/// at registry construction, so builtins ship no supply-chain receipt and
-/// pin no tool version.
+/// `MergeCompile` ceiling compiles every target. Registry construction records
+/// the exact owner-observed toolchain PATH in the admitted environment policy;
+/// it has no executable observation, so builtins ship no supply-chain receipt
+/// and pin no tool version.
 pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
     let credential = ContractId::new(ISOLATED_CREDENTIAL_POLICY)?;
     let network = ContractId::new(ISOLATED_NETWORK_POLICY)?;
+    let permitted_path = std::env::var(TOOLCHAIN_PATH_ENV).map_err(|_| ProfileError::Snapshot {
+        detail: format!(
+            "owner-observed {TOOLCHAIN_PATH_ENV} is required for admitted toolchain policy"
+        ),
+    })?;
+    validate_text(&permitted_path, "permitted_toolchain_path")?;
+    let toolchain_environment_policy = EnvironmentPolicy::ToolchainPath { permitted_path };
     // The two compilation projections share one locked all-target build spine;
     // only the JSON message format and the subcommand differ, because those
     // are what select the admitted parser.
@@ -985,12 +355,14 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
                 BUILTIN_KIND_VERSION,
             )?,
             class: InstrumentClass::Compiler,
+            invocation_kind: InstrumentKind::Build,
             revision: BUILTIN_SPEC_VERSION,
             executable: "cargo".to_owned(),
             executable_version: None,
             parser: ContractId::new(DIAGNOSTIC_PARSER_CONTRACT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            environment_policy: toolchain_environment_policy.clone(),
             schema: ContractId::new(CARGO_CONTRACT_NAME)?,
             argument_template: Vec::new(),
             verification_command: build_spine("build"),
@@ -1002,6 +374,7 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
         InstrumentSpec::new(InstrumentSpecParams {
             kind: InstrumentKindId::new(ContractId::new(RUSTC_INSTRUMENT)?, BUILTIN_KIND_VERSION)?,
             class: InstrumentClass::Compiler,
+            invocation_kind: InstrumentKind::Build,
             revision: BUILTIN_SPEC_VERSION,
             // The compilation runs through the cargo subcommand surface of the
             // same toolchain whose `rustc` is the semantic subject: I18.6 says
@@ -1015,6 +388,7 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser: ContractId::new(RUSTC_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            environment_policy: toolchain_environment_policy.clone(),
             schema: ContractId::new(RUSTC_INSTRUMENT)?,
             argument_template: Vec::new(),
             // The admitted parser is the Clippy JSON stream, and this is the
@@ -1031,12 +405,14 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
                 BUILTIN_KIND_VERSION,
             )?,
             class: InstrumentClass::Test,
+            invocation_kind: InstrumentKind::Test,
             revision: BUILTIN_SPEC_VERSION,
             executable: "cargo".to_owned(),
             executable_version: None,
             parser: ContractId::new(NEXTEST_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            environment_policy: toolchain_environment_policy.clone(),
             schema: ContractId::new(NEXTEST_INSTRUMENT)?,
             argument_template: Vec::new(),
             // `cargo nextest` is the admitted executable's subcommand surface,
@@ -1060,7 +436,7 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             limits: ResourceLimits::new(None, Some(MAX_NEXTEST_OUTPUT_BYTES as u64)),
             max_concurrency: BUILTIN_MAX_CONCURRENCY,
         })?,
-        builtin_rustfmt_spec(&credential, &network)?,
+        builtin_rustfmt_spec(&credential, &network, toolchain_environment_policy)?,
     ])
 }
 
@@ -1076,16 +452,22 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
 fn builtin_rustfmt_spec(
     credential: &ContractId,
     network: &ContractId,
+    environment_policy: EnvironmentPolicy,
 ) -> Result<InstrumentSpec, ProfileError> {
     InstrumentSpec::new(InstrumentSpecParams {
         kind: InstrumentKindId::new(ContractId::new(RUSTFMT_INSTRUMENT)?, BUILTIN_KIND_VERSION)?,
-        class: InstrumentClass::Formatter,
+        // Assumption for this mapping: formatting is a deterministic static
+        // source check under the documented semantic class; Format remains
+        // its typed invocation category.
+        class: InstrumentClass::HeuristicAnalysis,
+        invocation_kind: InstrumentKind::Format,
         revision: BUILTIN_SPEC_VERSION,
         executable: "cargo".to_owned(),
         executable_version: None,
         parser: ContractId::new(RUSTFMT_INSTRUMENT)?,
         parser_generation: BUILTIN_PARSER_GENERATION,
         environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+        environment_policy,
         schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
         argument_template: Vec::new(),
         verification_command: vec![
@@ -1185,14 +567,85 @@ pub fn test_profile() -> Result<InstrumentProfile, ProfileError> {
     )
 }
 
+fn testd_productive_binding_and_command(
+    nextest_sha256: &str,
+    target: &str,
+) -> Result<(eliot_testd_core::TestdExecutableBinding, NextestCommand), ProfileError> {
+    let binding = eliot_testd_core::testd_profile_binding_with_slots(
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
+        nextest_sha256,
+        &[],
+    )
+    .map_err(|_| ProfileError::TestdProductiveBindingMismatch)?;
+    let command = NextestCommand::run_scoped(
+        target.to_owned(),
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
+        &NextestScope::default(),
+    )
+    .map_err(|_| ProfileError::TestdProductiveBindingMismatch)?;
+    Ok((binding, command))
+}
+
+fn testd_productive_nextest_spec(
+    binding: &eliot_testd_core::TestdExecutableBinding,
+    command: &NextestCommand,
+) -> Result<InstrumentSpec, ProfileError> {
+    InstrumentSpec::new(InstrumentSpecParams {
+        kind: InstrumentKindId::new(ContractId::new(NEXTEST_INSTRUMENT)?, BUILTIN_KIND_VERSION)?,
+        class: InstrumentClass::Test,
+        invocation_kind: InstrumentKind::Test,
+        revision: BUILTIN_SPEC_VERSION,
+        executable: binding.program_path.clone(),
+        executable_version: None,
+        parser: ContractId::new(NEXTEST_INSTRUMENT)?,
+        parser_generation: BUILTIN_PARSER_GENERATION,
+        environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+        environment_policy: EnvironmentPolicy::TestdProductive,
+        schema: ContractId::new(NEXTEST_INSTRUMENT)?,
+        argument_template: Vec::new(),
+        verification_command: command.arguments.clone(),
+        credential_policy: ContractId::new(ISOLATED_CREDENTIAL_POLICY)?,
+        network_policy: ContractId::new(ISOLATED_NETWORK_POLICY)?,
+        limits: ResourceLimits::new(Some(binding.wall_timeout_ms), Some(binding.stdout_bytes)),
+        max_concurrency: BUILTIN_MAX_CONCURRENCY,
+    })
+}
+
+fn testd_productive_profile() -> Result<InstrumentProfile, ProfileError> {
+    let profile_name = eliot_testd_core::TESTD_PRODUCTIVE_PROFILE;
+    let dag = StageDag::build(
+        profile_name,
+        vec![StageDecl::new(
+            profile_name.to_owned(),
+            ContractId::new(NEXTEST_INSTRUMENT)?,
+            InstrumentKind::Test,
+            Vec::new(),
+            true,
+            true,
+        )?],
+    )?;
+    InstrumentProfile::new(
+        profile_name.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![InstrumentKind::Test],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
 /// Builds the versioned `package-verification` profile (issue #1914 W1).
 ///
 /// I18.33's crate-local route is `eliot dev crate check <package>`: it resolves
 /// the one `ModuleTestCapsule` and runs the applicable contract/schema/format
 /// checks, the exact-package compilation, the selected unit/property/model/
 /// golden tests, and the separately reported format check. The stage graph
-/// declares only what the governing documents already fix — the compilation
-/// class, the test class, and the format class — over the same builtin specs
+/// declares only what the governing documents already fix â€” the compilation
+/// class, the test class, and the format class â€” over the same builtin specs
 /// `compiler`, `test`, and `dev-fast` already bind, so the route reuses admitted
 /// executable identity instead of naming a command, a path, or a package.
 ///
@@ -1263,8 +716,8 @@ pub fn package_verification_profile() -> Result<InstrumentProfile, ProfileError>
 /// as a new admitted revision of this name, never as an undeclared extra stage
 /// or a second profile type.
 ///
-/// The bundle identity itself — the published artifact set, its digests, and
-/// its provenance — is not profile text. It is caller-attested and compared,
+/// The bundle identity itself â€” the published artifact set, its digests, and
+/// its provenance â€” is not profile text. It is caller-attested and compared,
 /// and the same `require_provenance` gate that refuses a missing tool identity
 /// refuses a bundle stage whose recorded executable digest does not equal its
 /// admitted supply-chain receipt.
@@ -1309,6 +762,37 @@ pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> 
     )
 }
 
+/// Builds the registered SCIP profile as one pure inspection stage.
+///
+/// The profile and stage use the exact existing SCIP contract identity and
+/// owner revision; the stage does not bind an executable or process policy.
+pub fn scip_profile(spec: &PureTransformSpec) -> Result<InstrumentProfile, ProfileError> {
+    spec.validate()?;
+    let dag = StageDag::build(
+        spec.profile.as_str(),
+        vec![StageDecl::new(
+            spec.instrument.as_str().to_owned(),
+            spec.instrument.clone(),
+            InstrumentKind::Inspect,
+            Vec::new(),
+            true,
+            false,
+        )?],
+    )?;
+    InstrumentProfile::new(
+        spec.profile.as_str().to_owned(),
+        spec.profile_revision,
+        spec.profile_version,
+        vec![InstrumentKind::Inspect],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            spec.environment_profile.clone(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
 /// Alias naming the package-verification route at its shipped revision.
 ///
 /// An alias is a stable, closed name a thin invoker (a workflow, a wrapper
@@ -1336,7 +820,7 @@ pub struct ProfileAlias {
 /// I18.21 requires "there is no hidden CI-only verifier command list". A
 /// command list is unverifiable precisely because it is a second copy of an
 /// order the shared owner already defines: it drifts without failing anything.
-/// An alias is the opposite of a command list — it is a name, resolved through
+/// An alias is the opposite of a command list â€” it is a name, resolved through
 /// the same registry both a local entrypoint and CI admit, so a run cannot
 /// execute a stage the registry never admitted.
 ///
@@ -1346,7 +830,7 @@ pub struct ProfileAlias {
 /// alias outside this slice is refused with
 /// [`ProfileError::UnknownAlias`], never normalized, trimmed, case-folded, or
 /// mapped to a neighbouring route. There is no default alias and no
-/// head-revision resolution — each entry pins one exact revision, so an alias
+/// head-revision resolution â€” each entry pins one exact revision, so an alias
 /// that a registry does not admit at that revision fails closed rather than
 /// resolving to whatever revision happens to be the highest.
 pub const PROFILE_ALIASES: &[ProfileAlias] = &[
@@ -1366,8 +850,8 @@ pub const PROFILE_ALIASES: &[ProfileAlias] = &[
 /// revision (issue #1914 W4).
 ///
 /// This is the one entry a thin invoker uses to name a verification route. The
-/// name is matched exactly against [`PROFILE_ALIASES`] — no trimming, case
-/// folding, prefix match, or alias-of-alias — and the pinned revision is then
+/// name is matched exactly against [`PROFILE_ALIASES`] â€” no trimming, case
+/// folding, prefix match, or alias-of-alias â€” and the pinned revision is then
 /// resolved through the registry at that exact revision, so a registry that
 /// does not admit it fails closed with [`ProfileError::UnknownRevision`]
 /// instead of falling back to the route's head revision or to another route.
@@ -1403,6 +887,7 @@ pub fn admitted_profile_for_alias<'a>(
 #[derive(Clone, Debug)]
 pub struct InstrumentRegistry {
     specs: BTreeMap<String, InstrumentSpec>,
+    pure_transforms: BTreeMap<String, PureTransformSpec>,
     profiles: BTreeMap<(String, u64), InstrumentProfile>,
     supply_chain: SupplyChainTable,
     generation: u64,
@@ -1427,6 +912,18 @@ impl InstrumentRegistry {
         generation: u64,
         receipts: Vec<SupplyChainReceipt>,
     ) -> Result<Self, ProfileError> {
+        Self::build_with_pure_transforms(specs, profiles, generation, receipts, Vec::new())
+    }
+
+    /// Assembles external specs and explicitly registered pure transforms in
+    /// one profile registry generation.
+    pub fn build_with_pure_transforms(
+        specs: Vec<InstrumentSpec>,
+        profiles: Vec<InstrumentProfile>,
+        generation: u64,
+        receipts: Vec<SupplyChainReceipt>,
+        pure_transforms: Vec<PureTransformSpec>,
+    ) -> Result<Self, ProfileError> {
         let mut spec_map = BTreeMap::new();
         for spec in specs {
             let key = spec.kind_key().to_owned();
@@ -1434,22 +931,56 @@ impl InstrumentRegistry {
                 return Err(ProfileError::DuplicateSpec { spec: key });
             }
         }
+        let mut pure_map = BTreeMap::new();
+        for pure in pure_transforms {
+            pure.validate()?;
+            // These dimensions have distinct owners. Registry generation
+            // versions the complete snapshot; profile revision and parser
+            // generation are validated against the profile stage below and
+            // must remain independently replaceable.
+            let key = pure.instrument.as_str().to_owned();
+            if spec_map.contains_key(&key) || pure_map.insert(key.clone(), pure).is_some() {
+                return Err(ProfileError::DuplicateSpec { spec: key });
+            }
+        }
         let mut profile_map = BTreeMap::new();
         for profile in profiles {
             for stage in &profile.dag {
-                let Some(spec) = spec_map.get(stage.spec.as_str()) else {
-                    return Err(ProfileError::UnknownSpec {
-                        profile: profile.name.clone(),
-                        stage: stage.stage_id.clone(),
-                        spec: stage.spec.as_str().to_owned(),
-                    });
-                };
-                if spec.class.coarse_kind() != stage.kind {
-                    return Err(ProfileError::SpecKindMismatch {
-                        stage: stage.stage_id.clone(),
-                        spec: stage.spec.as_str().to_owned(),
-                        kind: stage.kind,
-                    });
+                if stage.external {
+                    let Some(spec) = spec_map.get(stage.spec.as_str()) else {
+                        return Err(ProfileError::UnknownSpec {
+                            profile: profile.name.clone(),
+                            stage: stage.stage_id.clone(),
+                            spec: stage.spec.as_str().to_owned(),
+                        });
+                    };
+                    if spec.invocation_kind != stage.kind {
+                        return Err(ProfileError::SpecKindMismatch {
+                            stage: stage.stage_id.clone(),
+                            spec: stage.spec.as_str().to_owned(),
+                            kind: stage.kind,
+                        });
+                    }
+                } else {
+                    let Some(pure) = pure_map.get(stage.spec.as_str()) else {
+                        return Err(ProfileError::UnknownSpec {
+                            profile: profile.name.clone(),
+                            stage: stage.stage_id.clone(),
+                            spec: stage.spec.as_str().to_owned(),
+                        });
+                    };
+                    if stage.kind != InstrumentKind::Inspect
+                        || pure.profile.as_str() != profile.name
+                        || pure.profile_revision != profile.revision
+                        || pure.profile_version != profile.spec_revision
+                    {
+                        return Err(ProfileError::Snapshot {
+                            detail: format!(
+                                "pure stage '{}' differs from its registered transform profile/version",
+                                stage.stage_id
+                            ),
+                        });
+                    }
                 }
             }
             let key = (profile.name.clone(), profile.revision);
@@ -1473,7 +1004,7 @@ impl InstrumentRegistry {
                 return Err(ProfileError::SpecKindMismatch {
                     stage: "<supply-chain>".to_owned(),
                     spec: receipt.instrument_key().to_owned(),
-                    kind: spec.class.coarse_kind(),
+                    kind: spec.invocation_kind,
                 });
             }
             if receipt.generation != generation {
@@ -1492,6 +1023,7 @@ impl InstrumentRegistry {
         }
         Ok(Self {
             specs: spec_map,
+            pure_transforms: pure_map,
             profiles: profile_map,
             supply_chain,
             generation,
@@ -1528,8 +1060,8 @@ impl InstrumentRegistry {
     /// A receipt is validated against the admitted spec digest at exactly this
     /// generation, so a drifted or orphan receipt fails closed here and the
     /// routes refuse to resolve at all. Passing no receipt is admitted as an
-    /// explicit absence — the pre-launch gate then binds the admitted
-    /// executable file and schema without a pinned digest — and
+    /// explicit absence â€” the pre-launch gate then binds the admitted
+    /// executable file and schema without a pinned digest â€” and
     /// `require_provenance` is what later refuses a receipted route whose
     /// stages carry no recorded identity.
     ///
@@ -1552,6 +1084,96 @@ impl InstrumentRegistry {
             ],
             generation,
             receipts,
+        )
+    }
+
+    /// Builds the builtin registry with TestD's owner-observed productive
+    /// `cargo-nextest` definition and exact profile. The command and TestD
+    /// binding must come from the same current owner composition; the supplied
+    /// tool observation is the only source for the supply-chain digest.
+    pub fn with_testd_productive_profile(
+        generation: u64,
+        observation: &eliot_testd_core::TestdToolObservation,
+        binding: &eliot_testd_core::TestdExecutableBinding,
+        command: &NextestCommand,
+    ) -> Result<Self, ProfileError> {
+        observation
+            .validate()
+            .map_err(|_| ProfileError::TestdProductiveBindingMismatch)?;
+        binding
+            .validate()
+            .map_err(|_| ProfileError::TestdProductiveBindingMismatch)?;
+        if binding.profile != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+            || binding.program_path != eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
+            || binding.package_artifact_digest != observation.nextest_sha256
+            || command.executable != binding.program_path
+            || command.arguments != binding.fixed_argv
+            || std::path::Path::new(&observation.nextest_path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| {
+                    !name.eq_ignore_ascii_case(eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM)
+                })
+        {
+            return Err(ProfileError::TestdProductiveBindingMismatch);
+        }
+        let (expected_binding, expected_command) = testd_productive_binding_and_command(
+            observation.nextest_sha256.as_str(),
+            command.target.as_str(),
+        )?;
+        if &expected_binding != binding || &expected_command != command {
+            return Err(ProfileError::TestdProductiveBindingMismatch);
+        }
+
+        let spec = testd_productive_nextest_spec(binding, command)?;
+        let receipt = SupplyChainReceipt::new(
+            ContractId::new(NEXTEST_INSTRUMENT)?,
+            binding.program_path.clone(),
+            observation.nextest_sha256.clone(),
+            None,
+            spec.digest(),
+            generation,
+        )
+        .map_err(|_| ProfileError::TestdProductiveBindingMismatch)?;
+        let mut specs = builtin_specs()?;
+        specs.retain(|registered| registered.kind_key() != NEXTEST_INSTRUMENT);
+        specs.push(spec);
+
+        Self::build(
+            specs,
+            vec![
+                compiler_profile()?,
+                test_profile()?,
+                package_verification_profile()?,
+                bundle_verification_profile()?,
+                testd_productive_profile()?,
+            ],
+            generation,
+            vec![receipt],
+        )
+    }
+
+    /// Builds the ordinary builtin profile set plus the current registered
+    /// decoder-only SCIP inspection profile.
+    pub fn with_registered_scip_profile(
+        generation: u64,
+        receipts: Vec<SupplyChainReceipt>,
+        scip_entry: &RegistryEntry,
+    ) -> Result<Self, ProfileError> {
+        let pure = PureTransformSpec::from_registry_entry(scip_entry)?;
+        let scip = scip_profile(&pure)?;
+        Self::build_with_pure_transforms(
+            builtin_specs()?,
+            vec![
+                compiler_profile()?,
+                test_profile()?,
+                package_verification_profile()?,
+                bundle_verification_profile()?,
+                scip,
+            ],
+            generation,
+            receipts,
+            vec![pure],
         )
     }
 
@@ -1606,6 +1228,12 @@ impl InstrumentRegistry {
         self.specs.get(kind_id)
     }
 
+    /// Returns the exact admitted in-process transform under its registered
+    /// decoder identity.
+    pub fn pure_transform(&self, spec_id: &str) -> Option<&PureTransformSpec> {
+        self.pure_transforms.get(spec_id)
+    }
+
     /// Looks up the admitted supply-chain receipt for one kind identity.
     ///
     /// `None` means no machine observation was admitted for the kind at this
@@ -1638,6 +1266,10 @@ impl InstrumentRegistry {
             material.push_str(&spec.digest());
             material.push('\0');
         }
+        for pure in self.pure_transforms.values() {
+            material.push_str(&pure.spec_digest());
+            material.push('\0');
+        }
         for profile in self.profiles.values() {
             material.push_str(&profile.digest());
             material.push('\0');
@@ -1665,6 +1297,7 @@ impl InstrumentRegistry {
             version: REGISTRY_SNAPSHOT_SCHEMA_VERSION.to_owned(),
             generation: self.generation,
             specs: self.specs.values().cloned().collect(),
+            pure_transforms: self.pure_transforms.values().cloned().collect(),
             profiles: self.profiles.values().cloned().collect(),
             receipts: self.supply_chain.receipts().into_iter().cloned().collect(),
         };
@@ -1716,50 +1349,43 @@ impl InstrumentRegistry {
         for receipt in snapshot.receipts {
             receipts.push(rebuild_receipt(receipt)?);
         }
-        Self::build(specs, profiles, snapshot.generation, receipts)
+        let mut pure_transforms = Vec::with_capacity(snapshot.pure_transforms.len());
+        for pure in snapshot.pure_transforms {
+            pure.validate()?;
+            pure_transforms.push(pure);
+        }
+        Self::build_with_pure_transforms(
+            specs,
+            profiles,
+            snapshot.generation,
+            receipts,
+            pure_transforms,
+        )
     }
 }
 
-/// Versioned durable form of the canonical admission registry (I10.8.1).
-///
-/// The snapshot persists the admitted [`InstrumentSpec`] definitions,
-/// [`InstrumentProfile`] definitions, and executable
-/// [`SupplyChainReceipt`]s at one registry generation. Profiles travel
-/// alongside specs and receipts because recovery re-admits the whole
-/// registry through [`InstrumentRegistry::build`]: without the profiles the
-/// recovered registry could admit no stage graph at generation N+1.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstrumentRegistrySnapshot {
-    /// Stable snapshot schema name.
-    pub schema: String,
-    /// Exact snapshot schema wire version.
-    pub version: String,
-    /// Registry generation the admission was validated against.
-    pub generation: u64,
-    /// Admitted spec definitions in sorted kind-identity order.
-    pub specs: Vec<InstrumentSpec>,
-    /// Admitted profile definitions in sorted name/revision order.
-    pub profiles: Vec<InstrumentProfile>,
-    /// Admitted supply-chain receipts in sorted instrument-identity order.
-    pub receipts: Vec<SupplyChainReceipt>,
-}
+/// Runner-typed view of the neutral canonical registry snapshot.
+pub type InstrumentRegistrySnapshot =
+    eliot_instrument_api::registry::InstrumentRegistrySnapshot<PureTransformSpec>;
 
 /// Rebuilds one deserialized spec through its validated constructor.
 fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
+    let fixed_argument_schema = spec.fixed_argument_schema.clone();
     let kind = InstrumentKindId::new(
         ContractId::new(spec.kind.as_str().to_owned())?,
         spec.kind.version(),
     )?;
-    InstrumentSpec::new(InstrumentSpecParams {
+    let mut rebuilt = InstrumentSpec::new(InstrumentSpecParams {
         kind,
         class: spec.class,
+        invocation_kind: spec.invocation_kind,
         revision: spec.revision,
         executable: spec.executable,
         executable_version: spec.executable_version,
         parser: spec.parser,
         parser_generation: spec.parser_generation,
         environment_profile: spec.environment_profile,
+        environment_policy: spec.environment_policy,
         schema: spec.schema,
         argument_template: spec.argument_template,
         verification_command: spec.verification_command,
@@ -1767,12 +1393,28 @@ fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
         network_policy: spec.network_policy,
         limits: spec.limits,
         max_concurrency: spec.max_concurrency,
-    })
+    })?;
+    if fixed_argument_schema.as_ref().is_some_and(|schema| {
+        !schema.validates(
+            &rebuilt.schema,
+            &rebuilt.argument_template,
+            &rebuilt.verification_command,
+        )
+    }) {
+        return Err(ProfileError::Snapshot {
+            detail: "instrument fixed argument schema differs from its declared templates"
+                .to_owned(),
+        });
+    }
+    // Historical snapshots intentionally keep the absent field and digest;
+    // external admission checks require a current owner-resolved schema.
+    rebuilt.fixed_argument_schema = fixed_argument_schema;
+    Ok(rebuilt)
 }
 
 /// Rebuilds one deserialized profile through its validated constructors.
 fn rebuild_profile(profile: InstrumentProfile) -> Result<InstrumentProfile, ProfileError> {
-    let stages: Vec<StageDecl> = profile.dag.stages.into_values().collect();
+    let stages: Vec<StageDecl> = profile.dag.into_stages();
     let mut decls = Vec::with_capacity(stages.len());
     for stage in stages {
         decls.push(StageDecl::new(
@@ -1920,6 +1562,10 @@ pub struct StageEnvironment {
     pub class: String,
     /// Lowercase SHA-256 over the attested environment material.
     pub digest: String,
+    /// Exact owner-produced projection retained for external-stage policy checks.
+    /// Legacy digest-only callers retain no projection and cannot launch an
+    /// externally admitted stage.
+    pub projection: Option<eliot_process::EnvironmentProjection>,
 }
 
 impl StageEnvironment {
@@ -1934,6 +1580,47 @@ impl StageEnvironment {
         Ok(Self {
             class,
             digest: sha256_hex(material.as_bytes()),
+            projection: None,
+        })
+    }
+
+    /// Retains an already-computed owner digest for the exact declared process
+    /// environment projection. The digest is not hashed a second time.
+    pub fn attest_digest(class: String, digest: String) -> Result<Self, ProfileError> {
+        validate_text(&class, "environment_class")?;
+        if digest.len() != 64
+            || digest
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(ProfileError::Snapshot {
+                detail: "environment projection digest is not lowercase SHA-256".to_owned(),
+            });
+        }
+        Ok(Self {
+            class,
+            digest,
+            projection: None,
+        })
+    }
+
+    /// Retains the exact process environment projection produced by the
+    /// environment owner and hashes it with the executor's canonical digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::InvalidText`] when the class is blank or
+    /// carries control characters.
+    pub fn attest_projection(
+        class: String,
+        projection: eliot_process::EnvironmentProjection,
+    ) -> Result<Self, ProfileError> {
+        validate_text(&class, "environment_class")?;
+        let digest = eliot_process_executor::environment_projection_digest(&projection);
+        Ok(Self {
+            class,
+            digest,
+            projection: Some(projection),
         })
     }
 }
@@ -2031,19 +1718,42 @@ impl<'a> InstrumentProfileResolver<'a> {
     ) -> Result<ResolvedProfile, ProfileError> {
         let profile = self.registry.admitted(name, revision)?;
         for stage in &profile.dag {
-            let spec = self.registry.spec(stage.spec.as_str()).ok_or_else(|| {
-                ProfileError::UnknownSpec {
-                    profile: profile.name.clone(),
-                    stage: stage.stage_id.clone(),
-                    spec: stage.spec.as_str().to_owned(),
+            if stage.external {
+                let spec = self.registry.spec(stage.spec.as_str()).ok_or_else(|| {
+                    ProfileError::UnknownSpec {
+                        profile: profile.name.clone(),
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
+                    }
+                })?;
+                if spec.invocation_kind != stage.kind {
+                    return Err(ProfileError::SpecKindMismatch {
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
+                        kind: stage.kind,
+                    });
                 }
-            })?;
-            if spec.class.coarse_kind() != stage.kind {
-                return Err(ProfileError::SpecKindMismatch {
-                    stage: stage.stage_id.clone(),
-                    spec: stage.spec.as_str().to_owned(),
-                    kind: stage.kind,
-                });
+            } else {
+                let pure = self
+                    .registry
+                    .pure_transform(stage.spec.as_str())
+                    .ok_or_else(|| ProfileError::UnknownSpec {
+                        profile: profile.name.clone(),
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
+                    })?;
+                if stage.kind != InstrumentKind::Inspect
+                    || pure.profile.as_str() != profile.name
+                    || pure.profile_revision != profile.revision
+                    || pure.profile_version != profile.spec_revision
+                {
+                    return Err(ProfileError::Snapshot {
+                        detail: format!(
+                            "pure stage '{}' differs from its registered transform profile/version",
+                            stage.stage_id
+                        ),
+                    });
+                }
             }
         }
         if layout.source_root == layout.target_root
@@ -2102,7 +1812,17 @@ impl<'a> InstrumentProfileResolver<'a> {
     }
 }
 
-/// One admitted compiler stage in topological order.
+/// Execution contour selected by the admitted profile registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum StageExecution {
+    /// External stage dispatched through the process execution plane.
+    External,
+    /// Registered deterministic in-process transform at this parser generation.
+    Pure { parser_generation: u64 },
+}
+
+/// One admitted profile stage in topological order.
 ///
 /// The stage carries the full admission the pre-launch gate validates the
 /// invocation against: exact executable identity, argument schema and fixed
@@ -2121,6 +1841,8 @@ pub struct AdmittedStage {
     pub required: bool,
     /// Whether the stage dispatches through `TestExecutionPlane`.
     pub external: bool,
+    /// Registry-derived execution contour. It must agree with `external`.
+    pub execution: StageExecution,
     /// Prerequisite stage identities.
     pub depends_on: Vec<String>,
     /// Admitted profile name this stage was compiled from.
@@ -2138,7 +1860,7 @@ pub struct AdmittedStage {
     /// Admitted kind version bound to this stage.
     pub kind_version: ContractVersion,
     /// Exact admitted executable file identity.
-    pub executable: String,
+    pub executable: Option<String>,
     /// Admitted tool version requirement, when the spec pins one.
     pub executable_version: Option<String>,
     /// Admitted supply-chain receipt for the kind, when a machine
@@ -2154,13 +1876,15 @@ pub struct AdmittedStage {
     /// under an argv the admitted spec did not declare.
     pub verification_command: Vec<String>,
     /// Invocation schema authority.
-    pub schema: ContractId,
+    pub schema: Option<ContractId>,
+    /// Owner-resolved fixed argument schema; absent in historical snapshots.
+    pub fixed_argument_schema: Option<FixedArgumentSchema>,
     /// Admitted environment class.
     pub environment_class: String,
     /// Admitted credential policy identity.
-    pub credential_policy: ContractId,
+    pub credential_policy: Option<ContractId>,
     /// Admitted network policy identity.
-    pub network_policy: ContractId,
+    pub network_policy: Option<ContractId>,
     /// Admitted parser identity.
     pub parser: ContractId,
     /// Admitted parser generation.
@@ -2171,15 +1895,16 @@ pub struct AdmittedStage {
     pub timeout_ms: Option<u64>,
     /// Declared per-adapter maximum concurrency, bound into the process
     /// grant and enforced by the owning plane, never by a global pool.
-    pub max_concurrency: u32,
+    pub max_concurrency: Option<u32>,
 }
 
 /// Typed pre-launch admission failure (I10.8.3).
 ///
-/// Every variant refuses the invocation before any child process is created:
-/// unregistered kind IDs, raw shell text, unknown executable identities, and
-/// agent-provided executable/argument combinations never reach the execution
-/// plane. The failure carries no process, no permit, and no retry directive.
+/// These failures refuse the invocation before child creation: an unregistered
+/// kind, an argument vector outside the owner-resolved schema, an unknown
+/// executable identity, or an agent-provided executable/argument combination
+/// never reaches the execution plane. The failure carries no process, no
+/// permit, and no retry directive.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AdmissionError {
     /// No admitted spec is registered under the requested instrument identity.
@@ -2196,7 +1921,8 @@ pub enum AdmissionError {
         /// Requested invocation class.
         observed: InstrumentKind,
     },
-    /// One argument carries raw shell text and is refused before launch.
+    /// Legacy diagnostic retained for callers; current fixed-schema admission
+    /// reports an unmatched argument vector as [`Self::ArgumentMismatch`].
     #[error("argument {index} carries raw shell text and is refused before launch")]
     ShellText {
         /// Position of the offending argument.
@@ -2230,22 +1956,6 @@ pub enum AdmissionError {
         /// How the request fails shape validation.
         detail: String,
     },
-}
-
-/// Refuses raw shell text before launch (I10.8.3).
-///
-/// Arguments are exact argv elements, never a shell line: any element
-/// carrying shell operators or expansions fails closed with its position.
-/// Admitted fixed templates bypass this scan by matching exactly against the
-/// manifest template instead.
-fn reject_shell_text(arguments: &[String]) -> Result<(), AdmissionError> {
-    const SHELL_OPERATORS: &[char] = &[';', '|', '&', '`', '$', '>', '<'];
-    for (index, argument) in arguments.iter().enumerate() {
-        if argument.chars().any(|cell| SHELL_OPERATORS.contains(&cell)) {
-            return Err(AdmissionError::ShellText { index });
-        }
-    }
-    Ok(())
 }
 
 impl AdmittedStage {
@@ -2294,7 +2004,7 @@ impl AdmittedStage {
         request: &InstrumentAdmissionRequest,
         observed: &ResolvedExecutableIdentity,
     ) -> Result<String, AdmissionError> {
-        ResolvedExecutableIdentity::new(
+        let _validated = ResolvedExecutableIdentity::new(
             self.spec.as_str(),
             observed.canonical_path.clone(),
             observed.content_digest.clone(),
@@ -2305,6 +2015,12 @@ impl AdmittedStage {
         .map_err(|error| AdmissionError::ExecutableMismatch {
             detail: error.to_string(),
         })?;
+        let Some(file_identity) = observed.file_identity else {
+            return Err(AdmissionError::ExecutableMismatch {
+                detail: "new external admission requires the owner-observed file identity"
+                    .to_owned(),
+            });
+        };
         if request.executable_path.as_deref() != Some(observed.canonical_path.as_str())
             || request.executable_digest.as_deref() != Some(observed.content_digest.as_str())
             || request.executable_version != observed.tool_version
@@ -2313,11 +2029,16 @@ impl AdmittedStage {
                 detail: "request executable snapshot differs from machine observation".to_owned(),
             });
         }
-        if observed.executable_file_name() != self.executable.to_ascii_lowercase() {
+        let Some(executable) = self.executable.as_deref() else {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "external admission has no executable identity".to_owned(),
+            });
+        };
+        if observed.executable_file_name() != executable.to_ascii_lowercase() {
             return Err(AdmissionError::ExecutableMismatch {
                 detail: format!(
                     "observed '{}' is not the admitted executable '{}'",
-                    observed.canonical_path, self.executable,
+                    observed.canonical_path, executable,
                 ),
             });
         }
@@ -2341,37 +2062,49 @@ impl AdmittedStage {
                 detail: format!("observed version differs from the admitted version '{pinned}'"),
             });
         }
-        if let Some(receipt) = &self.supply_receipt {
-            receipt.check_observation(observed).map_err(|error| {
-                AdmissionError::ExecutableMismatch {
-                    detail: error.to_string(),
-                }
+        let Some(receipt) = &self.supply_receipt else {
+            return Err(AdmissionError::ExecutableMismatch {
+                detail: "external stage has no registered executable supply-chain receipt"
+                    .to_owned(),
+            });
+        };
+        receipt
+            .check_observation(
+                &eliot_instrument_api::registry::ExternalExecutableObservation {
+                    canonical_path: observed.canonical_path.clone(),
+                    executable_file_name: observed.executable_file_name(),
+                    content_digest: observed.content_digest.clone(),
+                    file_identity,
+                    tool_version: observed.tool_version.clone(),
+                },
+            )
+            .map_err(|error| AdmissionError::ExecutableMismatch {
+                detail: error.to_string(),
             })?;
-        }
         Ok(observed.content_digest.clone())
     }
 
     /// Admits one typed invocation against this stage before process creation.
     ///
     /// This is the shared pre-launch admission boundary (I10.8.3): the
-    /// request carries only typed invocation facts plus the
-    /// launcher-observed machine identity, never shell text or an
-    /// agent-composed command. The admitted profile, spec, fixed argument
-    /// template, supply-chain receipt, and `profile_revision` come from the
-    /// planned stage and the owning route; the caller never supplies them.
+    /// request carries typed invocation facts and exact argv elements plus the
+    /// launcher-observed machine identity. The admitted profile, spec, fixed
+    /// argument template, supply-chain receipt, and `profile_revision` come
+    /// from the planned stage and the owning route; the caller never supplies
+    /// them.
     /// Pure in-process stages take no process grant here: they stay on the
     /// non-process path and are refused. Every external stage requires the
     /// owner-observed executable identity; an empty content digest never
-    /// yields a launchable grant. The requested arguments must equal the
-    /// admitted fixed template exactly; an empty admitted template admits
-    /// only the empty argument vector.
+    /// yields a launchable grant. Both the caller argument vector and the
+    /// executed argv must match the owner-resolved fixed schema exactly.
+    /// Punctuation is accepted when that schema declares the exact argument.
     ///
     /// The sealed `grant.arguments` is the stage's admitted verification
     /// command, NOT `request.arguments`. Those are different facts: a
     /// caller's `InstrumentInvocation.arguments` is an instrument-level filter
     /// that every builtin admits only as the empty vector, while the argv the
     /// stage actually runs is the spec's `verification_command` (issue #1914,
-    /// audit 5918718113 item 3 — "an empty argument template or a tool's
+    /// audit 5918718113 item 3 â€” "an empty argument template or a tool's
     /// default/help output is not package verification"). Sealing the request's
     /// empty vector into the grant left
     /// `InstrumentRunner::launch_admitted` comparing the sealed request's real
@@ -2392,9 +2125,9 @@ impl AdmittedStage {
     ///
     /// Returns [`AdmissionError`] when the stage is pure, the caller labels
     /// (profile, revision) differ from the admitted stage identity, the kind
-    /// ID is unregistered, the class differs, an argument carries shell text
-    /// or leaves the fixed template, or the executable identity is unknown,
-    /// changed, malformed, or unobserved.
+    /// ID is unregistered, the class differs, the fixed schema is absent or
+    /// mismatched against the caller arguments or executed argv, or the
+    /// executable identity is unknown, changed, malformed, or unobserved.
     pub fn admit(
         &self,
         request: &InstrumentAdmissionRequest,
@@ -2432,23 +2165,39 @@ impl AdmittedStage {
                 observed: request.kind,
             });
         }
-        if request.arguments != self.argument_template {
-            reject_shell_text(&request.arguments)?;
+        if self.fixed_argument_schema.as_ref().is_none_or(|schema| {
+            self.schema.as_ref() != Some(&schema.schema_ref)
+                || !schema.validates(
+                    &schema.schema_ref,
+                    &request.arguments,
+                    &self.verification_command,
+                )
+        }) {
             return Err(AdmissionError::ArgumentMismatch {
-                detail: "requested arguments differ from the admitted fixed template".to_owned(),
+                detail: "request or executable argv differs from the owner-resolved fixed argument schema".to_owned(),
             });
         }
-        // The argv this stage is ADMITTED to run is the spec's declared
-        // verification command, validated here exactly as `request.arguments`
-        // is: it is sealed into the grant, so a value carrying shell text must
-        // fail closed here rather than reach a sealed process request.
-        reject_shell_text(&self.verification_command)?;
         let Some(identity) = observed else {
             return Err(AdmissionError::UnresolvedObservation {
                 instrument: self.spec.as_str().to_owned(),
             });
         };
         let content_digest = self.check_executable(request, identity)?;
+        let Some(executable) = self.executable.clone() else {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "external admission has no executable identity".to_owned(),
+            });
+        };
+        let Some(credential_policy) = self.credential_policy.clone() else {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "external admission has no credential policy".to_owned(),
+            });
+        };
+        let Some(network_policy) = self.network_policy.clone() else {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "external admission has no network policy".to_owned(),
+            });
+        };
         let mut grant = InstrumentAdmissionGrant {
             kind_id: self.spec.as_str().to_owned(),
             kind_version: self.kind_version,
@@ -2456,10 +2205,11 @@ impl AdmittedStage {
             profile: self.profile.clone(),
             profile_revision: self.profile_revision,
             spec_digest: self.spec_digest.clone(),
-            executable: self.executable.clone(),
+            executable,
             executable_version: self.executable_version.clone(),
             content_digest,
             executable_path: identity.canonical_path.clone(),
+            executable_file_identity: identity.file_identity,
             supply_digest: self
                 .supply_receipt
                 .as_ref()
@@ -2468,12 +2218,18 @@ impl AdmittedStage {
             arguments: self.verification_command.clone(),
             environment_class: self.environment_class.clone(),
             scope_class: ADMITTED_SCOPE_CLASS.to_owned(),
-            credential_policy: self.credential_policy.clone(),
-            network_policy: self.network_policy.clone(),
+            source_root: None,
+            declared_scope: None,
+            environment_digest: None,
+            authority_epoch: None,
+            resource_generation: None,
+            credential_policy,
+            network_policy,
             timeout_ms: self.timeout_ms,
             max_output_bytes: self.max_output_bytes,
             parser: self.parser.clone(),
             parser_generation: self.parser_generation,
+            max_concurrency: self.max_concurrency,
             grant_digest: String::new(),
         };
         grant.grant_digest = grant.digest();
@@ -2495,49 +2251,87 @@ impl AdmittedStage {
     /// longer admits the spec, or [`AdmissionError::InvalidRequest`] when the
     /// spec, parser, receipt, or route was replaced since compilation.
     pub fn refuse_if_revoked(&self, registry: &InstrumentRegistry) -> Result<(), AdmissionError> {
-        let Some(live) = registry.spec(self.spec.as_str()) else {
-            return Err(AdmissionError::UnknownKind {
-                instrument: self.spec.as_str().to_owned(),
-            });
-        };
-        if live.digest() != self.spec_digest {
-            return Err(AdmissionError::InvalidRequest {
-                detail: "admitted spec was replaced since compilation".to_owned(),
-            });
+        match self.execution {
+            StageExecution::External => {
+                if !self.external {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "external execution contour differs from the profile stage"
+                            .to_owned(),
+                    });
+                }
+                let Some(live) = registry.spec(self.spec.as_str()) else {
+                    return Err(AdmissionError::UnknownKind {
+                        instrument: self.spec.as_str().to_owned(),
+                    });
+                };
+                if live.digest() != self.spec_digest {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "admitted spec was replaced since compilation".to_owned(),
+                    });
+                }
+                if live.parser.as_str() != self.parser.as_str()
+                    || live.parser_generation != self.parser_generation
+                {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "admitted parser was replaced since compilation".to_owned(),
+                    });
+                }
+                let live_supply = registry
+                    .supply_chain(self.spec.as_str())
+                    .map(SupplyChainReceipt::digest)
+                    .unwrap_or_default();
+                let admitted_supply = self
+                    .supply_receipt
+                    .as_ref()
+                    .map(SupplyChainReceipt::digest)
+                    .unwrap_or_default();
+                if live_supply != admitted_supply {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "admitted supply-chain receipt was replaced since compilation"
+                            .to_owned(),
+                    });
+                }
+            }
+            StageExecution::Pure { parser_generation } => {
+                if self.external || parser_generation != self.parser_generation {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "pure execution contour differs from the profile stage/parser generation".to_owned(),
+                    });
+                }
+                let Some(live) = registry.pure_transform(self.spec.as_str()) else {
+                    return Err(AdmissionError::UnknownKind {
+                        instrument: self.spec.as_str().to_owned(),
+                    });
+                };
+                if live.spec_digest() != self.spec_digest
+                    || live.parser_generation != parser_generation
+                    || self.executable.is_some()
+                    || self.executable_version.is_some()
+                    || self.supply_receipt.is_some()
+                    || self.credential_policy.is_some()
+                    || self.network_policy.is_some()
+                {
+                    return Err(AdmissionError::InvalidRequest {
+                        detail: "pure transform contract or process-free contour was replaced"
+                            .to_owned(),
+                    });
+                }
+            }
         }
-        if live.parser.as_str() != self.parser.as_str()
-            || live.parser_generation != self.parser_generation
-        {
-            return Err(AdmissionError::InvalidRequest {
-                detail: "admitted parser was replaced since compilation".to_owned(),
-            });
-        }
-        let live_supply = registry
-            .supply_chain(self.spec.as_str())
-            .map(SupplyChainReceipt::digest)
-            .unwrap_or_default();
-        let admitted_supply = self
-            .supply_receipt
-            .as_ref()
-            .map(SupplyChainReceipt::digest)
-            .unwrap_or_default();
-        if live_supply != admitted_supply {
-            return Err(AdmissionError::InvalidRequest {
-                detail: "admitted supply-chain receipt was replaced since compilation".to_owned(),
-            });
-        }
-        let route_live = registry
-            .admitted(&self.profile, self.profile_revision)
+        let exact_stage = ProfileCompiler::new(registry)
+            .compile_exact(&self.profile, self.profile_revision)
             .ok()
             .and_then(|profile| {
-                profile.dag.topological_order().into_iter().find(|stage| {
-                    stage.stage_id == self.stage_id && stage.spec.as_str() == self.spec.as_str()
-                })
-            })
-            .is_some();
-        if !route_live {
+                profile
+                    .stages
+                    .into_iter()
+                    .find(|stage| stage.stage_id == self.stage_id)
+            });
+        if exact_stage.as_ref() != Some(self) {
             return Err(AdmissionError::InvalidRequest {
-                detail: "admitted route was replaced since compilation".to_owned(),
+                detail:
+                    "admitted stage fields differ from the exact live profile/spec registry entry"
+                        .to_owned(),
             });
         }
         Ok(())
@@ -2737,40 +2531,128 @@ impl<'a> ProfileCompiler<'a> {
         let admitted = self.registry.admitted(profile, revision)?;
         let mut stages = Vec::with_capacity(admitted.dag.len());
         for stage in admitted.dag.topological_order() {
-            let spec = self.registry.spec(stage.spec.as_str()).ok_or_else(|| {
-                ProfileError::UnknownSpec {
-                    profile: admitted.name.clone(),
-                    stage: stage.stage_id.clone(),
-                    spec: stage.spec.as_str().to_owned(),
+            let (
+                execution,
+                spec_revision,
+                spec_digest,
+                kind_version,
+                executable,
+                executable_version,
+                supply_receipt,
+                argument_template,
+                verification_command,
+                schema,
+                fixed_argument_schema,
+                environment_class,
+                credential_policy,
+                network_policy,
+                parser,
+                parser_generation,
+                max_output_bytes,
+                timeout_ms,
+                max_concurrency,
+            ) = if stage.external {
+                let spec = self.registry.spec(stage.spec.as_str()).ok_or_else(|| {
+                    ProfileError::UnknownSpec {
+                        profile: admitted.name.clone(),
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
+                    }
+                })?;
+                (
+                    StageExecution::External,
+                    spec.revision,
+                    spec.digest(),
+                    spec.kind.version(),
+                    Some(spec.executable.clone()),
+                    spec.executable_version.clone(),
+                    self.registry.supply_chain(stage.spec.as_str()).cloned(),
+                    spec.argument_template.clone(),
+                    spec.verification_command.clone(),
+                    Some(spec.schema.clone()),
+                    spec.fixed_argument_schema.clone(),
+                    spec.environment_profile.clone(),
+                    Some(spec.credential_policy.clone()),
+                    Some(spec.network_policy.clone()),
+                    spec.parser.clone(),
+                    spec.parser_generation,
+                    spec.limits.max_output_bytes,
+                    spec.limits.timeout_ms,
+                    Some(spec.max_concurrency),
+                )
+            } else {
+                let pure = self
+                    .registry
+                    .pure_transform(stage.spec.as_str())
+                    .ok_or_else(|| ProfileError::UnknownSpec {
+                        profile: admitted.name.clone(),
+                        stage: stage.stage_id.clone(),
+                        spec: stage.spec.as_str().to_owned(),
+                    })?;
+                if stage.kind != InstrumentKind::Inspect
+                    || pure.profile.as_str() != admitted.name
+                    || pure.profile_revision != admitted.revision
+                    || pure.profile_version != admitted.spec_revision
+                {
+                    return Err(ProfileError::Snapshot {
+                        detail: format!(
+                            "pure stage '{}' differs from its registered transform profile/version",
+                            stage.stage_id
+                        ),
+                    });
                 }
-            })?;
-            let supply_receipt = self.registry.supply_chain(stage.spec.as_str()).cloned();
+                (
+                    StageExecution::Pure {
+                        parser_generation: pure.parser_generation,
+                    },
+                    pure.profile_version,
+                    pure.spec_digest(),
+                    pure.adapter_version,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    pure.environment_profile.clone(),
+                    None,
+                    None,
+                    pure.parser.clone(),
+                    pure.parser_generation,
+                    Some(pure.max_input_bytes as u64),
+                    None,
+                    None,
+                    None,
+                )
+            };
             stages.push(AdmittedStage {
                 stage_id: stage.stage_id.clone(),
                 spec: stage.spec.clone(),
                 kind: stage.kind,
                 required: stage.required,
                 external: stage.external,
+                execution,
                 depends_on: stage.depends_on.clone(),
                 profile: admitted.name.clone(),
                 profile_revision: admitted.revision,
-                spec_revision: spec.revision,
-                spec_digest: spec.digest(),
-                kind_version: spec.kind.version(),
-                executable: spec.executable.clone(),
-                executable_version: spec.executable_version.clone(),
+                spec_revision,
+                spec_digest,
+                kind_version,
+                executable,
+                executable_version,
                 supply_receipt,
-                argument_template: spec.argument_template.clone(),
-                verification_command: spec.verification_command.clone(),
-                schema: spec.schema.clone(),
-                environment_class: spec.environment_profile.clone(),
-                credential_policy: spec.credential_policy.clone(),
-                network_policy: spec.network_policy.clone(),
-                parser: spec.parser.clone(),
-                parser_generation: spec.parser_generation,
-                max_output_bytes: spec.limits.max_output_bytes,
-                timeout_ms: spec.limits.timeout_ms,
-                max_concurrency: spec.max_concurrency,
+                argument_template,
+                verification_command,
+                schema,
+                fixed_argument_schema,
+                environment_class,
+                credential_policy,
+                network_policy,
+                parser,
+                parser_generation,
+                max_output_bytes,
+                timeout_ms,
+                max_concurrency,
             });
         }
         Ok(AdmittedProfile {
@@ -2849,7 +2731,7 @@ impl<'a> ProfileCompiler<'a> {
     ///
     /// I18.21 requires "CI builds the ELIOT verifier/runner bootstrap and then
     /// calls the same versioned profiles used locally", and I10.8.10 requires
-    /// "Justfile and CI → thin invokers of the same named profile". Both
+    /// "Justfile and CI â†’ thin invokers of the same named profile". Both
     /// requirements are satisfied by exactly this one call: there is no second
     /// gate-order source, no CI-only stage list, and no per-entrypoint profile
     /// choice, because the caller names only the route and supplies only the

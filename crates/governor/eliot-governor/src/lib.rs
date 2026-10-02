@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+mod action_lease_admission;
 mod activation_outcome;
 mod attention_evaluation_commit;
 mod campaign_source_publishers;
@@ -48,6 +49,9 @@ mod epistemic_composition;
 mod experience_commit;
 mod finish_attempt;
 mod governor_authority_projection;
+mod instrument_registry_registration;
+mod instrument_registry_use_site;
+pub use action_lease_admission::CurrentGrantActivationEvidence;
 pub use attention_evaluation_commit::{
     ATTENTION_EVALUATION_OPERATION_PREFIX, AttentionEvaluationCommitError,
     AttentionEvaluationCommitIdentity, AttentionEvaluationInvalidatedRecord,
@@ -79,6 +83,9 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
+pub use instrument_registry_registration::{
+    InstrumentRegistryRegistrationError, InstrumentRegistryRegistrationProof,
+};
 pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,

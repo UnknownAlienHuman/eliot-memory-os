@@ -29,6 +29,11 @@
 //! [`NamedReadOperation::GetNotificationState`], the `#2100` owner-feed
 //! [`NamedReadOperation::GetAuthorityRevocationHistory`], and — since #1780 —
 //! [`NamedReadOperation::GetOrderingHeads`], pass
+//! [`NamedReadOperation::ResolveWriteReceipt`] (scope-free, exact-fence,
+//! original operation ID only) and #1814's
+//! [`NamedReadOperation::GetInstrumentRegistryState`] (exact scope,
+//! exact-fence,
+//! no parameters) also pass
 //! [`CanonicalReadClient::execute_named`]; every other named operation fails
 //! closed as [`StoreError::UnknownOperation`] before any transport.
 //!
@@ -191,7 +196,9 @@ impl KernelContextReadClient {
     /// `origin_ref`/`max_records` selectors), or the #1780
     /// `GetOrderingHeads` compare-and-swap source (scope-free,
     /// `ExactFence`, parameter-free, exactly as the store catalogue
-    /// declares it).
+    /// declares it), `ResolveWriteReceipt` (scope-free, `ExactFence`, and the
+    /// original operation ID only), or #1814's `GetInstrumentRegistryState`
+    /// (exact scope, `ExactFence`, and no parameters).
     fn check_execute_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
         match request.operation {
             NamedReadOperation::GetEvidencePack => {
@@ -245,6 +252,46 @@ impl KernelContextReadClient {
             // parameters) and binds the caller's fence, so the head observed is
             // the head the write is asserted against.
             NamedReadOperation::GetOrderingHeads => Self::check_ordering_heads_capability(request),
+            NamedReadOperation::ResolveWriteReceipt => {
+                if request.scope_id.is_some() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "ResolveWriteReceipt is scope-free",
+                    });
+                }
+                if request.consistency != ReadConsistency::ExactFence {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.consistency",
+                        reason: "ResolveWriteReceipt requires ExactFence",
+                    });
+                }
+                eliot_store_api::validate_typed_read_parameters(
+                    request.operation,
+                    &request.parameters,
+                )?;
+                request.validate()?;
+                Ok(())
+            }
+            NamedReadOperation::GetInstrumentRegistryState => {
+                if request.scope_id.is_none() {
+                    return Err(StoreError::InvalidField {
+                        field: "scope_id",
+                        reason: "GetInstrumentRegistryState requires an exact scope",
+                    });
+                }
+                if request.consistency != ReadConsistency::ExactFence {
+                    return Err(StoreError::InvalidField {
+                        field: "operation.consistency",
+                        reason: "GetInstrumentRegistryState requires ExactFence",
+                    });
+                }
+                eliot_store_api::validate_typed_read_parameters(
+                    request.operation,
+                    &request.parameters,
+                )?;
+                request.validate()?;
+                Ok(())
+            }
             NamedReadOperation::GetAuditRange => {
                 if request.scope_id.is_some() {
                     return Err(StoreError::InvalidField {
@@ -3120,11 +3167,93 @@ mod tests {
             KernelContextReadClient::check_execute_capability(&admitted)?;
         }
 
-        let mut receipt = evidence_request(&fence)?;
-        receipt.operation = NamedReadOperation::ResolveWriteReceipt;
+        let receipt = NamedReadRequest {
+            operation: NamedReadOperation::ResolveWriteReceipt,
+            scope_id: None,
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters: BTreeMap::from([(
+                "operation_id".to_owned(),
+                json!("operation-original-1"),
+            )]),
+        };
+        KernelContextReadClient::check_execute_capability(&receipt)?;
+
+        let mut scoped_receipt = receipt.clone();
+        scoped_receipt.scope_id = Some(ScopeId::new("governor")?);
         assert!(matches!(
-            KernelContextReadClient::check_execute_capability(&receipt),
-            Err(StoreError::UnknownOperation)
+            KernelContextReadClient::check_execute_capability(&scoped_receipt),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        let mut eventual_receipt = receipt.clone();
+        eventual_receipt.consistency = ReadConsistency::Eventual;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&eventual_receipt),
+            Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                ..
+            })
+        ));
+        let mut missing_receipt_id = receipt.clone();
+        missing_receipt_id.parameters.clear();
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&missing_receipt_id),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+        let mut malformed_receipt = receipt.clone();
+        malformed_receipt
+            .parameters
+            .insert("extra".to_owned(), json!("x"));
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&malformed_receipt),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
+        ));
+
+        let registry = NamedReadRequest {
+            operation: NamedReadOperation::GetInstrumentRegistryState,
+            scope_id: Some(ScopeId::new("scope-original")?),
+            consistency: ReadConsistency::ExactFence,
+            state_fence: fence.clone(),
+            parameters: BTreeMap::new(),
+        };
+        KernelContextReadClient::check_execute_capability(&registry)?;
+        let mut unscoped_registry = registry.clone();
+        unscoped_registry.scope_id = None;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&unscoped_registry),
+            Err(StoreError::InvalidField {
+                field: "scope_id",
+                ..
+            })
+        ));
+        let mut eventual_registry = registry.clone();
+        eventual_registry.consistency = ReadConsistency::Eventual;
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&eventual_registry),
+            Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                ..
+            })
+        ));
+        let mut parameterized_registry = registry.clone();
+        parameterized_registry
+            .parameters
+            .insert("selector".to_owned(), json!("x"));
+        assert!(matches!(
+            KernelContextReadClient::check_execute_capability(&parameterized_registry),
+            Err(StoreError::InvalidField {
+                field: "operation.parameter",
+                ..
+            })
         ));
 
         let mut mailbox = reconstruction_request(NamedReadOperation::GetTaskState, &fence)?;

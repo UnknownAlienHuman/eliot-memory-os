@@ -51,11 +51,13 @@ use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
-    AgentActivationResultSubmit, EncodingProfile, FinishResultBody, Frame, FrameKind,
+    AgentActivationResultSubmit, COMMITTED_GRANT_ACTIVATION_READ_OPERATION,
+    CommittedGrantActivationReadResult, EncodingProfile, FinishResultBody, Frame, FrameKind,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestResultBody, HostRequestResultLineage, LocalReadAttempt, LocalReadExecutionEvidence,
-    MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    HostRequestResultBody, HostRequestResultLineage, InstrumentRegistryRegistrationInvocation,
+    LocalReadAttempt, LocalReadExecutionEvidence, MessageType, ProtocolPayload, ProtocolVersion,
+    RequestIdentity, TaskControllerAttempt, TaskControllerInvocation, TaskControllerResultBody,
+    host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
 #[cfg(windows)]
@@ -1030,6 +1032,101 @@ pub fn parse_local_read_claimed_pair(
     }
 }
 
+/// Original authenticated instrument-registry operation retained by Kernel.
+/// The typed ORS operation ID is carried separately from the attempt's opaque
+/// routing handle so Governor receives the admitted identity, not a rebuilt
+/// value from request metadata.
+pub struct InstrumentRegistryRegistrationClaimedPair {
+    pub envelope: HostRequestEnvelope,
+    pub invocation: InstrumentRegistryRegistrationInvocation,
+    pub request_identity: RequestIdentity,
+    pub operation_id: OperationIdentity,
+    pub attempt: LocalReadAttempt,
+}
+
+/// Decodes the closed Kernel registration claim response without deriving an
+/// operation identity from the request id.
+pub fn parse_instrument_registry_registration_claim(
+    value: &serde_json::Value,
+) -> Result<Option<InstrumentRegistryRegistrationClaimedPair>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel registration claim answer omits pair".to_owned())?;
+    match pair {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(object) => {
+            if object.len() != 5 {
+                return Err("Kernel registration claim pair has an invalid closed shape".to_owned());
+            }
+            let envelope: HostRequestEnvelope = serde_json::from_value(
+                object
+                    .get("envelope")
+                    .cloned()
+                    .ok_or_else(|| "Kernel registration claim pair omits envelope".to_owned())?,
+            )
+            .map_err(|error| format!("Kernel registration envelope does not decode: {error}"))?;
+            envelope
+                .validate()
+                .map_err(|error| format!("Kernel registration envelope is invalid: {error}"))?;
+            if envelope.identity.capability != "instrument_registry.register" {
+                return Err("Kernel registration claim returned another capability".to_owned());
+            }
+            let invocation: InstrumentRegistryRegistrationInvocation = serde_json::from_value(
+                object
+                    .get("invocation")
+                    .cloned()
+                    .ok_or_else(|| "Kernel registration claim pair omits invocation".to_owned())?,
+            )
+            .map_err(|error| format!("Kernel registration invocation does not decode: {error}"))?;
+            invocation
+                .validate_for_envelope(&envelope)
+                .map_err(|error| format!("Kernel registration invocation is invalid: {error}"))?;
+            let request_identity: RequestIdentity = serde_json::from_value(
+                object.get("request_identity").cloned().ok_or_else(|| {
+                    "Kernel registration claim pair omits original identity".to_owned()
+                })?,
+            )
+            .map_err(|error| format!("Kernel registration identity does not decode: {error}"))?;
+            if request_identity != invocation.request_identity {
+                return Err("Kernel registration identity differs from invocation".to_owned());
+            }
+            let operation_id: OperationIdentity =
+                serde_json::from_value(object.get("operation_id").cloned().ok_or_else(|| {
+                    "Kernel registration claim pair omits original operation id".to_owned()
+                })?)
+                .map_err(|error| {
+                    format!("Kernel registration operation id does not decode: {error}")
+                })?;
+            let attempt: LocalReadAttempt = serde_json::from_value(
+                object
+                    .get("attempt")
+                    .cloned()
+                    .ok_or_else(|| "Kernel registration claim pair omits attempt".to_owned())?,
+            )
+            .map_err(|error| format!("Kernel registration attempt does not decode: {error}"))?;
+            attempt
+                .validate()
+                .map_err(|error| format!("Kernel registration attempt is invalid: {error}"))?;
+            let expected_operation_id = host_request_operation_id(&envelope);
+            if operation_id.as_str() != expected_operation_id
+                || attempt.operation_id != operation_id.as_str()
+            {
+                return Err(
+                    "Kernel registration claim substituted the admitted operation id".to_owned(),
+                );
+            }
+            Ok(Some(InstrumentRegistryRegistrationClaimedPair {
+                envelope,
+                invocation,
+                request_identity,
+                operation_id,
+                attempt,
+            }))
+        }
+        _ => Err("Kernel registration claim pair is neither object nor null".to_owned()),
+    }
+}
+
 /// Parses one unwrapped `local_read_result` answer value into the typed
 /// submit outcome.
 ///
@@ -1444,6 +1541,74 @@ pub fn parse_observe_defer_outcome(
 }
 
 impl DaemonKernelClient {
+    /// Reads one exact current committed activation and its original compiled
+    /// subset from the authenticated Kernel P-07 owner. This method is
+    /// read-only: absence remains `None`, and the Kernel does not activate or
+    /// synthesize a tuple for the caller.
+    #[cfg(windows)]
+    pub async fn committed_grant_activation(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<eliot_governor::CurrentGrantActivationEvidence>, super::DaemonError> {
+        if grant_id.trim().is_empty()
+            || grant_id.len() > 256
+            || grant_id.chars().any(char::is_whitespace)
+        {
+            return Err(super::DaemonError::Kernel(
+                "grant activation read requires a valid exact grant id".to_owned(),
+            ));
+        }
+        let expected_fence = self.snapshot.state_fence();
+        let value = self
+            .transact_async(
+                COMMITTED_GRANT_ACTIVATION_READ_OPERATION,
+                serde_json::json!({ "grant_id": grant_id }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = super::kind_value(&value, "committed_grant_activation")
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let readback: CommittedGrantActivationReadResult = serde_json::from_value(value)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        readback
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if readback.grant_id != grant_id || readback.state_fence != expected_fence {
+            return Err(super::DaemonError::Kernel(
+                "grant activation readback does not match the requested grant and live fence"
+                    .to_owned(),
+            ));
+        }
+        let Some(pair) = readback.pair else {
+            return Ok(None);
+        };
+        let subset: eliot_authority::MechanicalAuthoritySubset =
+            serde_json::from_value(pair.mechanical_subset)
+                .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if subset.grant_id != grant_id
+            || subset.content_commitment != pair.mechanical_subset_commitment
+            || subset.governor_snapshot_id != pair.receipt.snapshot_id
+        {
+            return Err(super::DaemonError::Kernel(
+                "grant activation subset disagrees with its original owner projection".to_owned(),
+            ));
+        }
+        subset
+            .verify_recorded_commitment()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        Ok(Some(eliot_governor::CurrentGrantActivationEvidence {
+            activation: eliot_kernel_core::CommittedAuthorityActivation {
+                receipt: pair.receipt,
+                ors_record_id: pair.ors_record_id,
+                ors_subject_id: pair.ors_subject_id,
+                mechanical_subset_commitment: pair.mechanical_subset_commitment,
+                grant_graph_revision: pair.grant_graph_revision,
+            },
+            mechanical_subset: subset,
+            current_revocation_revision: pair.current_revocation_revision,
+        }))
+    }
+
     #[cfg(windows)]
     pub async fn claim_agent_activation_ticket(
         &self,
@@ -2942,6 +3107,53 @@ impl DaemonKernelClient {
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
+    /// Claims one admitted Instrument Registry registration from its
+    /// dedicated Kernel queue. The result preserves the original ORS
+    /// `OperationIdentity`, request identity, exact invocation bytes and the
+    /// current Kernel attempt; no operation ID is rebuilt from request_id.
+    #[cfg(windows)]
+    pub async fn claim_instrument_registry_registration_async(
+        &self,
+    ) -> Result<Option<InstrumentRegistryRegistrationClaimedPair>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "instrument_registry_registration_claim",
+                serde_json::json!({ "operation": "instrument_registry_registration_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_instrument_registry_registration_claim(&value)
+            .map_err(super::DaemonError::Kernel)?;
+        if let Some(pair) = &pair {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                pair.envelope.identity.request_id.as_str(),
+                pair.operation_id.as_str(),
+            )
+            .emit();
+        }
+        Ok(pair)
+    }
+
+    /// Submits the terminal response for the exact claimed registration
+    /// attempt. Kernel verifies the original operation/envelope and attempt
+    /// against its retained durable queue record.
+    #[cfg(windows)]
+    pub async fn submit_instrument_registry_registration_result_async(
+        &self,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
+        body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = self
+            .transact_async(
+                "instrument_registry_registration_result",
+                serde_json::json!({ "result": body }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
+    }
+
     /// Claims one queued admitted `eliot.observe` pair for the outbound-only
     /// observe poller (issue #2565).
     ///
@@ -3810,6 +4022,7 @@ mod tests {
             state_fence: fence.clone(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

@@ -1,6 +1,8 @@
 use std::fmt;
 
 use eliot_receipts::{AuthorityBinding, EffectClass, SessionBinding, WorkScopeBinding};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::grants::{AuthoritySet, LogicalTime, PrincipalRef, ReceiptObligation, effect_rank};
 use crate::{AuthorityError, ProposedEffect, validate_text};
@@ -164,6 +166,36 @@ impl CapabilityToken {
 }
 
 /// Short-lived authority for one exact effect identity and bounded use count.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritySetRecoveryRecord {
+    /// Exact named operation set retained by the lease.
+    pub operations: Vec<String>,
+    /// Exact resource set retained by the lease.
+    pub resources: Vec<String>,
+    /// Effect ceiling retained by the lease.
+    pub max_effect: EffectClass,
+}
+
+/// Complete durable state of one Governor-issued exact-operation lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionLeaseRecoveryRecord {
+    pub lease_id: String,
+    pub holder: String,
+    pub exact_idempotency_key: String,
+    pub authority_set: AuthoritySetRecoveryRecord,
+    pub authority_binding: AuthorityBinding,
+    pub work_scope: WorkScopeBinding,
+    pub session: SessionBinding,
+    pub expires_at: u64,
+    pub max_uses: u32,
+    pub remaining_uses: u32,
+    pub receipt_obligations: Vec<ReceiptObligation>,
+    pub revoked: bool,
+}
+
+/// Short-lived authority for one exact effect identity and bounded use count.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionLease {
     pub lease_id: LeaseId,
@@ -174,6 +206,7 @@ pub struct ActionLease {
     pub work_scope: WorkScopeBinding,
     pub session: SessionBinding,
     pub expires_at: LogicalTime,
+    pub max_uses: u32,
     pub remaining_uses: u32,
     pub receipt_obligations: Vec<ReceiptObligation>,
     revoked: bool,
@@ -214,9 +247,83 @@ impl ActionLease {
             work_scope,
             session,
             expires_at,
+            max_uses,
             remaining_uses: max_uses,
             receipt_obligations,
             revoked: false,
+        })
+    }
+
+    /// Returns a closed durable projection of this lease, including its
+    /// original ceiling and remaining uses. This projection retains issuance
+    /// and use accounting across registration retries and owner restarts.
+    #[must_use]
+    pub fn recovery_record(&self) -> ActionLeaseRecoveryRecord {
+        ActionLeaseRecoveryRecord {
+            lease_id: self.lease_id.as_str().to_owned(),
+            holder: self.holder.as_str().to_owned(),
+            exact_idempotency_key: self.exact_idempotency_key.clone(),
+            authority_set: AuthoritySetRecoveryRecord {
+                operations: self.authority_set.operations().iter().cloned().collect(),
+                resources: self.authority_set.resources().iter().cloned().collect(),
+                max_effect: self.authority_set.max_effect(),
+            },
+            authority_binding: self.authority_binding.clone(),
+            work_scope: self.work_scope.clone(),
+            session: self.session.clone(),
+            expires_at: self.expires_at.value(),
+            max_uses: self.max_uses,
+            remaining_uses: self.remaining_uses,
+            receipt_obligations: self.receipt_obligations.clone(),
+            revoked: self.revoked,
+        }
+    }
+
+    /// Restores one complete retained lease record. A recovered lease is
+    /// historical/current state as recorded; it is never renewed by restore.
+    pub fn from_recovery_record(record: ActionLeaseRecoveryRecord) -> Result<Self, AuthorityError> {
+        if record.max_uses == 0 || record.remaining_uses > record.max_uses {
+            return Err(AuthorityError::InvalidField("action_lease_recovery.budget"));
+        }
+        if record.receipt_obligations.is_empty() {
+            return Err(AuthorityError::InvalidField(
+                "action_lease_recovery.receipt_obligations",
+            ));
+        }
+        for obligation in &record.receipt_obligations {
+            obligation.validate()?;
+        }
+        validate_bindings(
+            &record.authority_binding,
+            &record.work_scope,
+            &record.session,
+        )?;
+        let authority_set = AuthoritySet::new(
+            record.authority_set.operations,
+            record.authority_set.resources,
+            record.authority_set.max_effect,
+        )?;
+        if effect_rank(authority_set.max_effect())
+            > effect_rank(record.authority_binding.allowed_effect)
+        {
+            return Err(AuthorityError::EffectCeilingExceeded);
+        }
+        Ok(Self {
+            lease_id: LeaseId::new(record.lease_id)?,
+            holder: PrincipalRef::new(record.holder)?,
+            exact_idempotency_key: {
+                validate_text(&record.exact_idempotency_key, "exact_idempotency_key")?;
+                record.exact_idempotency_key
+            },
+            authority_set,
+            authority_binding: record.authority_binding,
+            work_scope: record.work_scope,
+            session: record.session,
+            expires_at: LogicalTime::new(record.expires_at),
+            max_uses: record.max_uses,
+            remaining_uses: record.remaining_uses,
+            receipt_obligations: record.receipt_obligations,
+            revoked: record.revoked,
         })
     }
 

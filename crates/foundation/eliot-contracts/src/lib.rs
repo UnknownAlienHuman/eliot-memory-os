@@ -210,6 +210,8 @@ pub const HOST_REQUEST_LEGACY_PRESENCE_NAMESPACE: &str = "eliot.host-request.leg
 pub enum HostRequestLogicalKind {
     /// A request invocation occurrence.
     Invocation,
+    /// A typed Instrument Registry registration occurrence.
+    InstrumentRegistryRegistration,
     /// A cancellation-intent occurrence.
     Cancellation,
 }
@@ -220,6 +222,7 @@ impl HostRequestLogicalKind {
     pub const fn marker(self) -> &'static str {
         match self {
             Self::Invocation => "INVOCATION",
+            Self::InstrumentRegistryRegistration => "INSTRUMENT_REGISTRY_REGISTRATION",
             Self::Cancellation => "CANCELLATION",
         }
     }
@@ -233,6 +236,7 @@ impl HostRequestLogicalKind {
     pub fn parse(marker: &str) -> Option<Self> {
         match marker {
             "INVOCATION" => Some(Self::Invocation),
+            "INSTRUMENT_REGISTRY_REGISTRATION" => Some(Self::InstrumentRegistryRegistration),
             "CANCELLATION" => Some(Self::Cancellation),
             _ => None,
         }

@@ -229,8 +229,9 @@ pub use cue_activation_route::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationReconcileError, ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome,
-    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationReconcileError, ActivationSubmitError, DaemonKernelClient,
+    InstrumentRegistryRegistrationClaimedPair, LocalReadSubmitOutcome, ObserveDeferOutcome,
+    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -724,6 +725,12 @@ pub struct DaemonComposition {
     /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed);
     /// nothing is derived here and no coverage is synthesized.
     governor_authority: eliot_governor::LiveGovernorAuthority,
+    /// Original Governor-issued Instrument Registry registration proof for
+    /// this daemon lifetime. The persisted canonical registry remains the
+    /// durable owner; this is only the retained receipt/readback association
+    /// used by launch admission while this composition is live.
+    instrument_registry_registration_proof:
+        Option<Arc<eliot_governor::InstrumentRegistryRegistrationProof>>,
     /// Retained ingress record for an attach of an already-running
     /// external agent (issue #1782, I11.11 lines 27-42).
     ///
@@ -1071,6 +1078,7 @@ impl DaemonComposition {
             capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
+            instrument_registry_registration_proof: None,
             external_attach: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
             swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
@@ -1740,6 +1748,65 @@ impl DaemonComposition {
     #[must_use]
     pub fn kernel_snapshot(&self) -> &eliot_governor::KernelGenerationSnapshot {
         self.governor.kernel_snapshot()
+    }
+
+    /// Consumes the original authenticated Kernel registration queue item,
+    /// asks Governor to re-resolve its task/scope/session/grant owners, and
+    /// retains the exact original receipt/readback after the canonical commit.
+    /// Per-grant activation reads go through the same authenticated Kernel
+    /// client; the named registry/receipt reads go through the existing
+    /// `KernelContextReadClient` allowlist.
+    #[cfg(windows)]
+    pub async fn register_instrument_registry_from_claim(
+        &mut self,
+        pair: &InstrumentRegistryRegistrationClaimedPair,
+        kernel: &Arc<DaemonKernelClient>,
+        reads: &KernelContextReadClient,
+    ) -> Result<eliot_governor::InstrumentRegistryRegistrationProof, CompositionError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready
+            || pair.request_identity != pair.invocation.request_identity
+            || pair.request_identity.request.state_fence != pair.envelope.state_fence
+            || pair.operation_id.as_str() != pair.attempt.operation_id.as_str()
+        {
+            return Err(CompositionError::Recovery(
+                "queued Instrument Registry identity is stale or inconsistent".to_owned(),
+            ));
+        }
+        let scope_selector = pair
+            .envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "queued Instrument Registry operation has no WorkScope selector".to_owned(),
+                )
+            })?;
+        let kernel_for_reads = Arc::clone(kernel);
+        let proof = self
+            .governor
+            .register_instrument_registry_from_claim(
+                pair.request_identity.clone(),
+                pair.operation_id.clone(),
+                &pair.invocation.authenticated_owner_ref,
+                scope_selector,
+                &pair.invocation.action_contract_json,
+                &pair.invocation.cold_start_claim_json,
+                &pair.invocation.snapshot_json,
+                reads,
+                move |grant_id| {
+                    let kernel = Arc::clone(&kernel_for_reads);
+                    async move {
+                        kernel
+                            .committed_grant_activation(&grant_id)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                },
+            )
+            .await?;
+        self.instrument_registry_registration_proof = Some(Arc::new(proof.clone()));
+        Ok(proof)
     }
 
     /// Returns the ProductProof/FinishService acceptance owner's terminal

@@ -49,8 +49,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::profile::{AdmittedProfile, ProfileError, ProfileScopeClasses, StageEnvironment};
-use crate::profile_run::{AggregateStatus, ProfileAggregate, RetainedToolIdentity, StageEvidence};
+use crate::profile_run::{
+    AggregateStatus, ProfileAggregate, PureTransformAdmission, RetainedToolIdentity, StageEvidence,
+};
 use crate::registry::SupplyChainReceipt;
+use eliot_instrument_api::InstrumentAdmissionGrant;
 
 /// Stable verifier identity recorded in every profile verification receipt.
 ///
@@ -146,6 +149,14 @@ pub enum VerificationProfileError {
         stage: String,
         /// How the identity and receipt differ.
         detail: String,
+    },
+    /// Receipt schema is neither the preserved historical format nor the current format.
+    #[error("unsupported verification profile receipt schema '{schema}@{version}'")]
+    UnsupportedReceiptSchema {
+        /// Stable receipt schema name.
+        schema: String,
+        /// Exact receipt schema version.
+        version: String,
     },
     /// A PASS receipt records a stage run with no retained evidence.
     #[error("stage '{stage}' has no retained evidence, so the receipt cannot be PASS")]
@@ -325,6 +336,12 @@ pub struct ProfileRunEvidence {
     pub executable_digest: Option<String>,
     /// Pre-launch admission grant digest, when the stage was admitted.
     pub grant_digest: Option<String>,
+    /// Original external admission grant, retained unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_grant: Option<InstrumentAdmissionGrant>,
+    /// Distinct process-free profile/spec/parser pins for a pure transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pure_admission: Option<PureTransformAdmission>,
 }
 
 /// Raw evidence state for one receipt-recorded stage run.
@@ -358,26 +375,59 @@ pub enum StageEvidenceRecord {
         /// Exact missing proof.
         reason: String,
     },
+    /// Deterministic in-process transform with retained source and result.
+    Transformed {
+        /// Exact source artifact retained by the canonical owner.
+        source_artifact: String,
+        /// Byte length of the exact retained source.
+        source_byte_len: u64,
+        /// Original source content digest.
+        source_sha256: String,
+        /// Exact source resource revision.
+        source_revision: u64,
+        /// Digest of the deterministic transform output.
+        result_digest: String,
+        /// Exact historical transform output bytes.
+        result_bytes: Vec<u8>,
+    },
 }
 
-impl From<&StageEvidence> for StageEvidenceRecord {
-    fn from(evidence: &StageEvidence) -> Self {
+impl StageEvidenceRecord {
+    fn from_external(
+        evidence: &StageEvidence,
+        _stage: &str,
+    ) -> Result<Self, VerificationProfileError> {
         match evidence {
             StageEvidence::Retained {
                 artifact,
                 byte_len,
                 tool,
-            } => Self::Retained {
+            } => Ok(Self::Retained {
                 artifact: artifact.as_str().to_owned(),
                 byte_len: *byte_len,
                 tool: tool.clone(),
-            },
-            StageEvidence::Omitted { reason } => Self::Omitted {
+            }),
+            StageEvidence::Transformed {
+                source_artifact,
+                source_byte_len,
+                source_sha256,
+                source_revision,
+                result_digest,
+                result_bytes,
+            } => Ok(Self::Transformed {
+                source_artifact: source_artifact.as_str().to_owned(),
+                source_byte_len: *source_byte_len,
+                source_sha256: source_sha256.clone(),
+                source_revision: *source_revision,
+                result_digest: result_digest.clone(),
+                result_bytes: result_bytes.clone(),
+            }),
+            StageEvidence::Omitted { reason } => Ok(Self::Omitted {
                 reason: reason.clone(),
-            },
-            StageEvidence::Missing { reason } => Self::Missing {
+            }),
+            StageEvidence::Missing { reason } => Ok(Self::Missing {
                 reason: reason.clone(),
-            },
+            }),
         }
     }
 }
@@ -395,16 +445,64 @@ impl ProfileRunEvidence {
             }
             StageEvidenceRecord::Omitted { reason } => format!("omitted\0{reason}"),
             StageEvidenceRecord::Missing { reason } => format!("missing\0{reason}"),
+            StageEvidenceRecord::Transformed {
+                source_artifact,
+                source_byte_len,
+                source_sha256,
+                source_revision,
+                result_digest,
+                result_bytes,
+            } => format!(
+                "transformed\0{source_artifact}\0{source_byte_len}\0{source_sha256}\0{source_revision}\0{result_digest}\0{}",
+                sha256_hex(result_bytes),
+            ),
         };
         let material = format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.stage_id,
             self.execution,
             evidence,
             self.executable_digest.as_deref().unwrap_or(""),
             self.grant_digest.as_deref().unwrap_or(""),
+            self.admission_grant
+                .as_ref()
+                .map(InstrumentAdmissionGrant::digest)
+                .unwrap_or_default(),
+            self.pure_admission
+                .as_ref()
+                .map(PureTransformAdmission::digest)
+                .unwrap_or_default(),
         );
         sha256_hex(material.as_bytes())
+    }
+
+    fn digest_for_receipt_version(&self, version: &str) -> String {
+        if version == HISTORICAL_RECEIPT_SCHEMA_VERSION {
+            let evidence = match &self.evidence {
+                StageEvidenceRecord::Retained {
+                    artifact,
+                    byte_len,
+                    tool,
+                } => {
+                    format!("retained\0{artifact}\0{byte_len}\0{}", tool.digest())
+                }
+                StageEvidenceRecord::Omitted { reason } => format!("omitted\0{reason}"),
+                StageEvidenceRecord::Missing { reason } => format!("missing\0{reason}"),
+                StageEvidenceRecord::Transformed { .. } => return self.digest(),
+            };
+            return sha256_hex(
+                format!(
+                    "{}\0{}\0{}\0{}\0{}",
+                    self.stage_id,
+                    self.execution,
+                    evidence,
+                    self.executable_digest.as_deref().unwrap_or(""),
+                    self.grant_digest.as_deref().unwrap_or(""),
+                )
+                .as_bytes(),
+            );
+        }
+        self.digest()
     }
 }
 
@@ -482,6 +580,8 @@ pub struct ReceiptSchemaIdentity {
 
 /// Stable schema name of the shared profile verification receipt.
 pub const RECEIPT_SCHEMA: &str = "eliot.instrument.verification-profile-receipt";
+/// Historical receipt version before original admission grants became required.
+pub const HISTORICAL_RECEIPT_SCHEMA_VERSION: &str = "2.0.0";
 /// Exact schema wire version of the shared profile verification receipt.
 ///
 /// The version is the schema revision, deliberately independent of the
@@ -489,14 +589,11 @@ pub const RECEIPT_SCHEMA: &str = "eliot.instrument.verification-profile-receipt"
 /// does not change the receipt schema, and a schema change is exactly what a
 /// local/CI pair must refuse.
 ///
-/// `2.0.0` makes the retained-evidence change wire-breaking on purpose: a
-/// `StageEvidenceRecord::Retained` value now carries the required tool identity
-/// (executable, argument vector, environment projection digest, exit outcome),
-/// so a `1.x` retained record that names no tool identity can no longer be read
-/// as a retained run. It is refused rather than upgraded, because inventing the
-/// missing identity after the fact is exactly the reconstruction this schema
-/// exists to prevent.
-pub const RECEIPT_SCHEMA_VERSION: &str = "2.0.0";
+/// `2.0.0` remains the historical retained-evidence schema and is validated
+/// with its original run digest and structural requirements. `3.0.0` adds the
+/// original admission grant to every external retained run; old evidence is
+/// never assigned a grant or reinterpreted under a newer profile or spec.
+pub const RECEIPT_SCHEMA_VERSION: &str = "3.0.0";
 
 /// The one receipt schema shared by local and CI profile runs (I18.21).
 ///
@@ -545,9 +642,13 @@ impl VerificationProfileReceipt {
     /// The shared receipt schema identity every profile receipt carries.
     #[must_use]
     pub fn schema_identity() -> ReceiptSchemaIdentity {
+        Self::schema_identity_for(RECEIPT_SCHEMA_VERSION)
+    }
+
+    fn schema_identity_for(version: &str) -> ReceiptSchemaIdentity {
         ReceiptSchemaIdentity {
             schema: RECEIPT_SCHEMA.to_owned(),
-            version: RECEIPT_SCHEMA_VERSION.to_owned(),
+            version: version.to_owned(),
             verifier: VERIFICATION_PROFILE_VERIFIER.to_owned(),
             verifier_revision: format!(
                 "{}.{}.{}",
@@ -577,24 +678,149 @@ impl VerificationProfileReceipt {
     /// [`VerificationProfileError::MissingExecutableIdentity`] when a PASS
     /// receipt records a run with no tool identity.
     pub fn validate(&self) -> Result<(), VerificationProfileError> {
+        let historical =
+            self.schema == Self::schema_identity_for(HISTORICAL_RECEIPT_SCHEMA_VERSION);
+        if !historical && self.schema != Self::schema_identity() {
+            return Err(VerificationProfileError::UnsupportedReceiptSchema {
+                schema: self.schema.schema.clone(),
+                version: self.schema.version.clone(),
+            });
+        }
         if self.proof_ceiling != PROFILE_PROOF_CEILING {
             return Err(VerificationProfileError::ProofCeilingMismatch {
                 observed: self.proof_ceiling,
             });
         }
+        for run in &self.runs {
+            if historical
+                && (run.admission_grant.is_some()
+                    || run.pure_admission.is_some()
+                    || matches!(&run.evidence, StageEvidenceRecord::Transformed { .. }))
+            {
+                return Err(VerificationProfileError::ProvenanceMismatch {
+                    stage: run.stage_id.clone(),
+                    detail: "historical receipt contains fields outside its recorded schema"
+                        .to_owned(),
+                });
+            }
+            if let Some(grant) = &run.admission_grant {
+                validate_digest(&grant.grant_digest, "grant_digest")?;
+                let retained_tool_matches = match &run.evidence {
+                    StageEvidenceRecord::Retained { tool, .. } => {
+                        (grant.executable == tool.executable
+                            || grant.executable_path == tool.executable)
+                            && grant.arguments == tool.arguments
+                    }
+                    _ => false,
+                };
+                if grant.digest() != grant.grant_digest
+                    || grant.profile != self.profile
+                    || grant.profile_revision != self.profile_revision
+                    || run.grant_digest.as_deref() != Some(grant.grant_digest.as_str())
+                    || run.executable_digest.as_deref() != Some(grant.content_digest.as_str())
+                    || !retained_tool_matches
+                    || run.pure_admission.is_some()
+                {
+                    return Err(VerificationProfileError::ProvenanceMismatch {
+                        stage: run.stage_id.clone(),
+                        detail: "retained admission grant differs from the recorded launch pins"
+                            .to_owned(),
+                    });
+                }
+            }
+            if let Some(pure) = &run.pure_admission {
+                validate_digest(&pure.spec_digest, "pure_spec_digest")?;
+                if pure.profile != self.profile
+                    || pure.profile_revision != self.profile_revision
+                    || pure.profile.trim().is_empty()
+                    || pure.profile_revision == 0
+                    || pure.stage_id != run.stage_id
+                    || pure.instrument.trim().is_empty()
+                    || pure.parser.trim().is_empty()
+                    || pure.parser_generation == 0
+                    || run.admission_grant.is_some()
+                    || run.grant_digest.is_some()
+                    || run.executable_digest.is_some()
+                    || self
+                        .tool_identities
+                        .iter()
+                        .any(|identity| identity.stage_id == run.stage_id)
+                {
+                    return Err(VerificationProfileError::ProvenanceMismatch {
+                        stage: run.stage_id.clone(),
+                        detail: "retained pure admission metadata is inconsistent".to_owned(),
+                    });
+                }
+            }
+            if !historical
+                && matches!(&run.evidence, StageEvidenceRecord::Retained { .. })
+                && run.admission_grant.is_none()
+            {
+                return Err(VerificationProfileError::ProvenanceMismatch {
+                    stage: run.stage_id.clone(),
+                    detail: "retained external evidence has no original admission grant".to_owned(),
+                });
+            }
+            if let StageEvidenceRecord::Transformed {
+                source_byte_len,
+                source_sha256,
+                source_revision,
+                result_digest,
+                result_bytes,
+                ..
+            } = &run.evidence
+            {
+                validate_digest(source_sha256, "source_sha256")?;
+                validate_digest(result_digest, "transform_result_digest")?;
+                if *source_byte_len == 0
+                    || *source_revision == 0
+                    || sha256_hex(result_bytes) != *result_digest
+                    || run.pure_admission.is_none()
+                {
+                    return Err(VerificationProfileError::ProvenanceMismatch {
+                        stage: run.stage_id.clone(),
+                        detail: "retained transform evidence differs from its admission pins"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
         if !self.outcome.is_pass() {
             return Ok(());
         }
         for run in &self.runs {
-            if !matches!(run.evidence, StageEvidenceRecord::Retained { .. }) {
+            let pure_pass = matches!(&run.evidence, StageEvidenceRecord::Transformed { .. })
+                && run.pure_admission.is_some();
+            if !pure_pass && !matches!(&run.evidence, StageEvidenceRecord::Retained { .. }) {
                 return Err(VerificationProfileError::PassWithoutRetainedEvidence {
                     stage: run.stage_id.clone(),
                 });
             }
-            let identified = run.executable_digest.is_some()
-                && self.tool_identities.iter().any(|identity| {
-                    identity.stage_id == run.stage_id && identity.executable_digest.is_some()
-                });
+            if pure_pass {
+                continue;
+            }
+            let identified = if historical {
+                run.executable_digest.is_some()
+                    && self.tool_identities.iter().any(|identity| {
+                        identity.stage_id == run.stage_id && identity.executable_digest.is_some()
+                    })
+            } else {
+                run.admission_grant.as_ref().is_some_and(|grant| {
+                    self.tool_identities.iter().any(|identity| {
+                        identity.stage_id == run.stage_id
+                            && identity.instrument == grant.kind_id
+                            && (identity.executable == grant.executable
+                                || identity.executable == grant.executable_path)
+                            && identity.executable_digest.as_deref()
+                                == Some(grant.content_digest.as_str())
+                            && identity.grant_digest.as_deref() == Some(grant.grant_digest.as_str())
+                            && identity.provenance.as_ref().is_some_and(|provenance| {
+                                provenance.content_digest == grant.content_digest
+                                    && provenance.spec_digest == grant.spec_digest
+                            })
+                    })
+                })
+            };
             if !identified {
                 return Err(VerificationProfileError::MissingExecutableIdentity {
                     stage: run.stage_id.clone(),
@@ -658,7 +884,7 @@ impl VerificationProfileReceipt {
                 .join(","),
             self.runs
                 .iter()
-                .map(ProfileRunEvidence::digest)
+                .map(|run| run.digest_for_receipt_version(&self.schema.version))
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -776,6 +1002,37 @@ pub fn require_provenance(
             .ok_or_else(|| VerificationProfileError::UndeclaredStage {
                 stage: stage.stage_id.clone(),
             })?;
+        if !stage.external {
+            let pure = run.pure_admission.as_ref().ok_or_else(|| {
+                VerificationProfileError::ProvenanceMismatch {
+                    stage: stage.stage_id.clone(),
+                    detail: "pure transform has no retained admission metadata".to_owned(),
+                }
+            })?;
+            if run.admission_grant.is_some()
+                || run.grant_digest.is_some()
+                || run.executable_digest.is_some()
+                || pure.profile != stage.profile
+                || pure.profile_revision != stage.profile_revision
+                || pure.stage_id != stage.stage_id
+                || pure.instrument != stage.spec.as_str()
+                || pure.spec_digest != stage.spec_digest
+                || pure.parser != stage.parser.as_str()
+                || pure.parser_generation != stage.parser_generation
+                || !matches!(run.evidence, StageEvidence::Transformed { .. })
+            {
+                return Err(VerificationProfileError::ProvenanceMismatch {
+                    stage: stage.stage_id.clone(),
+                    detail: "pure transform evidence differs from its admitted stage".to_owned(),
+                });
+            }
+            continue;
+        }
+        let Some(executable) = stage.executable.clone() else {
+            return Err(VerificationProfileError::MissingExecutableIdentity {
+                stage: stage.stage_id.clone(),
+            });
+        };
         let Some(executable_digest) = run.executable_digest.as_deref() else {
             return Err(VerificationProfileError::MissingExecutableIdentity {
                 stage: stage.stage_id.clone(),
@@ -785,31 +1042,61 @@ pub fn require_provenance(
         if let Some(grant_digest) = run.grant_digest.as_deref() {
             validate_digest(grant_digest, "grant_digest")?;
         }
-        let provenance = match stage.supply_receipt.as_ref() {
-            Some(receipt) => {
-                if receipt.content_digest != executable_digest {
-                    return Err(VerificationProfileError::ProvenanceMismatch {
-                        stage: stage.stage_id.clone(),
-                        detail: format!(
-                            "receipt pins '{}', run recorded '{executable_digest}'",
-                            receipt.content_digest
-                        ),
-                    });
-                }
-                Some(ExternalToolProvenance::from(receipt))
+        let grant = run.admission_grant.as_ref().ok_or_else(|| {
+            VerificationProfileError::ProvenanceMismatch {
+                stage: stage.stage_id.clone(),
+                detail: "external run has no retained admission grant".to_owned(),
             }
-            None if stage.external => {
-                return Err(VerificationProfileError::MissingProvenanceReceipt {
-                    stage: stage.stage_id.clone(),
-                    instrument: stage.spec.as_str().to_owned(),
-                });
-            }
-            None => None,
+        })?;
+        let Some(receipt) = stage.supply_receipt.as_ref() else {
+            return Err(VerificationProfileError::MissingProvenanceReceipt {
+                stage: stage.stage_id.clone(),
+                instrument: stage.spec.as_str().to_owned(),
+            });
         };
+        if grant.digest() != grant.grant_digest
+            || run.grant_digest.as_deref() != Some(grant.grant_digest.as_str())
+            || grant.kind_id != stage.spec.as_str()
+            || grant.kind_version != stage.kind_version
+            || grant.kind != stage.kind
+            || grant.profile != stage.profile
+            || grant.profile_revision != stage.profile_revision
+            || grant.spec_digest != stage.spec_digest
+            || grant.executable != executable
+            || grant.executable_version != stage.executable_version
+            || grant.content_digest != executable_digest
+            || grant.supply_digest != receipt.digest()
+            || grant.arguments != stage.verification_command
+            || grant.environment_class != stage.environment_class
+            || grant.scope_class != admitted.classes.workscope
+            || Some(&grant.credential_policy) != stage.credential_policy.as_ref()
+            || Some(&grant.network_policy) != stage.network_policy.as_ref()
+            || grant.timeout_ms != stage.timeout_ms
+            || grant.max_output_bytes != stage.max_output_bytes
+            || Some(grant.max_concurrency) != stage.max_concurrency
+            || grant.parser != stage.parser
+            || grant.parser_generation != stage.parser_generation
+        {
+            return Err(VerificationProfileError::ProvenanceMismatch {
+                stage: stage.stage_id.clone(),
+                detail: "retained admission grant differs from the admitted external stage"
+                    .to_owned(),
+            });
+        }
+        if receipt.content_digest != executable_digest {
+            return Err(VerificationProfileError::ProvenanceMismatch {
+                stage: stage.stage_id.clone(),
+                detail: format!(
+                    "receipt pins '{}', run recorded '{executable_digest}'",
+                    receipt.content_digest
+                ),
+            });
+        }
+        let provenance = Some(ExternalToolProvenance::from(receipt));
         identities.push(ToolIdentityRecord {
             stage_id: stage.stage_id.clone(),
             instrument: stage.spec.as_str().to_owned(),
-            executable: stage.executable.clone(),
+            executable,
             executable_digest: Some(executable_digest.to_owned()),
             grant_digest: run.grant_digest.clone(),
             provenance,
@@ -910,7 +1197,7 @@ pub fn issue_receipt_envelope(
                 "profile-evidence-{}-{}-{}",
                 receipt.profile, receipt.profile_revision, run.stage_id
             ))?,
-            sha256: run.digest(),
+            sha256: run.digest_for_receipt_version(&receipt.schema.version),
             role: ReceiptKind::Verification,
             source_revision: Some(receipt.profile_revision.to_string()),
         });
@@ -1014,7 +1301,7 @@ fn disposition_for(
     let unretained = receipt
         .runs
         .iter()
-        .filter(|run| !matches!(run.evidence, StageEvidenceRecord::Retained { .. }))
+        .filter(|run| !matches!(&run.evidence, StageEvidenceRecord::Retained { .. }))
         .collect::<Vec<_>>();
     let unresolved = unretained
         .iter()
@@ -1084,14 +1371,18 @@ pub fn build_verification_profile_receipt(
     let runs = aggregate
         .runs
         .iter()
-        .map(|run| ProfileRunEvidence {
-            stage_id: run.stage.stage_id.clone(),
-            execution: format!("{:?}", run.execution),
-            evidence: StageEvidenceRecord::from(&run.evidence),
-            executable_digest: run.executable_digest.clone(),
-            grant_digest: run.grant_digest.clone(),
+        .map(|run| {
+            Ok(ProfileRunEvidence {
+                stage_id: run.stage.stage_id.clone(),
+                execution: format!("{:?}", run.execution),
+                evidence: StageEvidenceRecord::from_external(&run.evidence, &run.stage.stage_id)?,
+                executable_digest: run.executable_digest.clone(),
+                grant_digest: run.grant_digest.clone(),
+                admission_grant: run.admission_grant.clone(),
+                pure_admission: run.pure_admission.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, VerificationProfileError>>()?;
     Ok(VerificationProfileReceipt {
         schema: VerificationProfileReceipt::schema_identity(),
         profile: admitted.name.clone(),
@@ -1340,5 +1631,180 @@ pub fn parity_summary(verdict: &ParityVerdict) -> String {
             let _ = write!(line, "{reason}");
             line
         }
+    }
+}
+
+#[cfg(test)]
+mod historical_schema_tests {
+    use super::*;
+    use crate::profile_run::RetainedExitOutcome;
+    use eliot_contracts::ContractVersion;
+    use eliot_instrument_api::InstrumentKind;
+
+    #[allow(clippy::expect_used)] // Fixed historical fixture constructors must remain strict.
+    fn legacy_receipt() -> VerificationProfileReceipt {
+        let digest = "a".repeat(64);
+        let spec_digest = "b".repeat(64);
+        let tool = RetainedToolIdentity::sealed(
+            "cargo",
+            &["test".to_owned()],
+            &"c".repeat(64),
+            RetainedExitOutcome {
+                disposition: eliot_process::ExitDisposition::Completed,
+                code: Some(0),
+            },
+        )
+        .expect("valid retained historical tool identity");
+        VerificationProfileReceipt {
+            schema: VerificationProfileReceipt::schema_identity_for(
+                HISTORICAL_RECEIPT_SCHEMA_VERSION,
+            ),
+            profile: "profile:historical".to_owned(),
+            profile_revision: 4,
+            profile_digest: "d".repeat(64),
+            dag_digest: "e".repeat(64),
+            aggregate_digest: "f".repeat(64),
+            environment_dependencies: Vec::new(),
+            tool_identities: vec![ToolIdentityRecord {
+                stage_id: "stage:historical".to_owned(),
+                instrument: "eliot.instrument.fixture".to_owned(),
+                executable: "cargo".to_owned(),
+                executable_digest: Some(digest.clone()),
+                grant_digest: Some("9".repeat(64)),
+                provenance: Some(ExternalToolProvenance {
+                    content_digest: digest.clone(),
+                    tool_version: Some("1.0.0".to_owned()),
+                    spec_digest,
+                    generation: 5,
+                }),
+            }],
+            runs: vec![ProfileRunEvidence {
+                stage_id: "stage:historical".to_owned(),
+                execution: "Succeeded".to_owned(),
+                evidence: StageEvidenceRecord::Retained {
+                    artifact: "artifact:historical".to_owned(),
+                    byte_len: 4,
+                    tool,
+                },
+                executable_digest: Some(digest),
+                grant_digest: Some("9".repeat(64)),
+                admission_grant: None,
+                pure_admission: None,
+            }],
+            outcome: AggregateOutcome::Pass,
+            proof_ceiling: PROFILE_PROOF_CEILING,
+        }
+    }
+
+    #[allow(clippy::expect_used)] // Fixed grant fixture constructors must remain strict.
+    fn current_grant() -> InstrumentAdmissionGrant {
+        let identity =
+            ContractId::new("eliot.instrument.fixture").expect("valid instrument identity");
+        let mut grant = InstrumentAdmissionGrant {
+            kind_id: identity.as_str().to_owned(),
+            kind_version: ContractVersion::new(1, 0, 0),
+            kind: InstrumentKind::Test,
+            profile: "profile:historical".to_owned(),
+            profile_revision: 4,
+            spec_digest: "b".repeat(64),
+            executable: "cargo".to_owned(),
+            executable_version: Some("1.0.0".to_owned()),
+            content_digest: "a".repeat(64),
+            executable_path: "C:\\tools\\cargo.exe".to_owned(),
+            supply_digest: "8".repeat(64),
+            arguments: vec!["test".to_owned()],
+            environment_class: "isolated-process".to_owned(),
+            scope_class: "admitted-scope".to_owned(),
+            source_root: Some("C:\\work".to_owned()),
+            declared_scope: Some("workspace".to_owned()),
+            environment_digest: Some("c".repeat(64)),
+            authority_epoch: None,
+            resource_generation: Some(5),
+            credential_policy: ContractId::new("eliot.credentials.none")
+                .expect("valid credential policy"),
+            network_policy: ContractId::new("eliot.network.disabled")
+                .expect("valid network policy"),
+            timeout_ms: None,
+            max_output_bytes: None,
+            max_concurrency: 1,
+            parser: ContractId::new("eliot.parser.fixture").expect("valid parser"),
+            parser_generation: 1,
+            grant_digest: String::new(),
+        };
+        grant.grant_digest = grant.digest();
+        grant
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // Serialization and validation failures invalidate this proof.
+    fn historical_receipt_keeps_its_v2_run_hash_and_new_receipt_requires_grant() {
+        let historical = legacy_receipt();
+        let mut unknown_version = historical.clone();
+        unknown_version.schema = VerificationProfileReceipt::schema_identity_for("999.0.0");
+        assert!(matches!(
+            unknown_version.validate(),
+            Err(VerificationProfileError::UnsupportedReceiptSchema { schema, version })
+                if schema == RECEIPT_SCHEMA && version == "999.0.0"
+        ));
+
+        let bytes = serde_json::to_vec(&historical).expect("serialize historical receipt");
+        let decoded: VerificationProfileReceipt =
+            serde_json::from_slice(&bytes).expect("read historical receipt shape");
+        decoded
+            .validate()
+            .expect("v2 receipt keeps its historical requirements");
+
+        let run = &decoded.runs[0];
+        let StageEvidenceRecord::Retained {
+            artifact,
+            byte_len,
+            tool,
+        } = &run.evidence
+        else {
+            panic!("historical run evidence remains retained");
+        };
+        let old_evidence = format!("retained\0{artifact}\0{byte_len}\0{}", tool.digest());
+        let expected_old_hash = sha256_hex(
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                run.stage_id,
+                run.execution,
+                old_evidence,
+                run.executable_digest.as_deref().unwrap_or(""),
+                run.grant_digest.as_deref().unwrap_or(""),
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            run.digest_for_receipt_version(HISTORICAL_RECEIPT_SCHEMA_VERSION),
+            expected_old_hash,
+            "the v2 artifact hash keeps the historical digest formula",
+        );
+
+        let mut current = decoded.clone();
+        current.schema = VerificationProfileReceipt::schema_identity();
+        assert!(matches!(
+            current.validate(),
+            Err(VerificationProfileError::ProvenanceMismatch { .. })
+        ));
+        let grant = current_grant();
+        current.runs[0].admission_grant = Some(grant.clone());
+        current.runs[0].grant_digest = Some(grant.grant_digest.clone());
+        current.tool_identities[0].instrument = grant.kind_id.clone();
+        current.tool_identities[0].executable = grant.executable.clone();
+        current.tool_identities[0].grant_digest = Some(grant.grant_digest.clone());
+        current.tool_identities[0].provenance = Some(ExternalToolProvenance {
+            content_digest: grant.content_digest.clone(),
+            tool_version: grant.executable_version.clone(),
+            spec_digest: grant.spec_digest.clone(),
+            generation: 5,
+        });
+        current
+            .validate()
+            .expect("v3 receipt carries its original grant");
+        assert!(matches!(
+            verify_profile_parity(&decoded, &current),
+            Ok(ParityVerdict::NonPass { reason }) if reason.contains("2.0.0") && reason.contains("3.0.0")
+        ));
     }
 }

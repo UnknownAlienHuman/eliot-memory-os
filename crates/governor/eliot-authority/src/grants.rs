@@ -25,7 +25,8 @@ use crate::root_transition::{
     AdmittedRootTransition, AdmittedRootTransitionRecord, RootTransitionDisposition,
 };
 use crate::{
-    AuthorityError, GrantRestoreOutcome, RevocationHistoryError, validate_digest, validate_text,
+    ActionLease, AuthorityError, GrantRestoreOutcome, LeaseId, RevocationHistoryError,
+    validate_digest, validate_text,
 };
 
 const REVOCATION_PAGE_EDGE_LIMIT: u64 = 256;
@@ -831,6 +832,12 @@ fn migrate_to_quarantine(
 pub struct EffectiveCapabilityPath {
     pub grant_path: Vec<GrantId>,
     pub authority: AuthoritySet,
+    /// Binding read from the validated leaf grant on this path. Kept
+    /// path-local so a lease cannot combine authority from one delegation
+    /// line with the binding from another.
+    pub authority_binding: AuthorityBinding,
+    /// Earliest expiry across every grant in this validated path.
+    pub expires_at: LogicalTime,
 }
 
 /// Derived holder view. Authorization checks exact paths to avoid unsafe
@@ -864,6 +871,57 @@ impl EffectiveCapabilitySnapshot {
     /// Number of independently supporting effective paths in this snapshot.
     pub fn path_count(&self) -> usize {
         self.paths.len()
+    }
+
+    /// Grant graph revision whose active paths produced this snapshot.
+    #[must_use]
+    pub const fn grant_graph_revision(&self) -> u64 {
+        self.grant_graph_revision
+    }
+
+    /// Returns the one exact path that independently supports this operation,
+    /// resource, and effect tuple.
+    pub fn supporting_path(
+        &self,
+        operation: &str,
+        resource: &str,
+        effect: EffectClass,
+    ) -> Result<&EffectiveCapabilityPath, AuthorityError> {
+        self.paths
+            .iter()
+            .find(|path| path.authority.allows(operation, resource, effect))
+            .ok_or(AuthorityError::NoEffectivePath)
+    }
+
+    /// Issues one exact-operation `ActionLease` from the original validated
+    /// capability path. Holder, binding, scope, session and expiry all come
+    /// from the same path and snapshot; the caller only supplies the lease ID,
+    /// exact operation identity, and receipt obligation.
+    pub fn issue_action_lease(
+        &self,
+        lease_id: LeaseId,
+        exact_idempotency_key: impl Into<String>,
+        operation: impl Into<String>,
+        resource: impl Into<String>,
+        effect: EffectClass,
+        receipt_obligations: Vec<ReceiptObligation>,
+    ) -> Result<ActionLease, AuthorityError> {
+        let operation = operation.into();
+        let resource = resource.into();
+        let path = self.supporting_path(&operation, &resource, effect)?;
+        let authority_set = AuthoritySet::new([operation], [resource], effect)?;
+        ActionLease::new(
+            lease_id,
+            self.holder.clone(),
+            exact_idempotency_key,
+            authority_set,
+            path.authority_binding.clone(),
+            self.work_scope.clone(),
+            self.session.clone(),
+            path.expires_at,
+            1,
+            receipt_obligations,
+        )
     }
 
     pub fn validate_context(
@@ -3569,8 +3627,10 @@ impl GrantGraph {
         let mut cursor = leaf;
         let mut path = Vec::new();
         let mut effective = leaf.authority.clone();
+        let mut expires_at = leaf.expires_at;
         loop {
             self.validate_active(cursor, work_scope, session, now)?;
+            expires_at = expires_at.min(cursor.expires_at);
             path.push(cursor.grant_id.clone());
             let Some(parent_id) = &cursor.parent_grant_id else {
                 break;
@@ -3593,6 +3653,8 @@ impl GrantGraph {
         Ok(EffectiveCapabilityPath {
             grant_path: path,
             authority: effective,
+            authority_binding: leaf.binding.clone(),
+            expires_at,
         })
     }
 

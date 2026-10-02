@@ -21,7 +21,9 @@ use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
 use eliot_receipts::{ProofCeiling, ReceiptEnvelope, ReceiptKind, RequestBinding};
 pub use eliot_runtime_contracts::ModuleGeneration as ProtocolModuleGeneration;
-use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, RecoveryDirective};
+use eliot_runtime_contracts::{
+    AuthorityActivationReceipt, ModuleContract, ModuleGeneration, RecoveryDirective,
+};
 use eliot_security_contracts::{
     InfluenceState, InstructionTaint, PolicyFence, TransformationLineage,
 };
@@ -3798,6 +3800,9 @@ pub enum HostRequestKind {
     Activation,
     /// Invocation of an exact admitted capability under a bound Session.
     Invocation,
+    /// Typed instrument-registry registration admitted as a distinct owner
+    /// mutation on the `HostRequest` transport.
+    InstrumentRegistryRegistration,
     /// Cancellation of one exact previously admitted operation.
     Cancellation,
     /// Observation-only status read of one exact admitted operation.
@@ -3813,11 +3818,351 @@ impl HostRequestKind {
         match self {
             Self::Activation => "ACTIVATION",
             Self::Invocation => "INVOCATION",
+            Self::InstrumentRegistryRegistration => "INSTRUMENT_REGISTRY_REGISTRATION",
             Self::Cancellation => "CANCELLATION",
             Self::Status => "STATUS",
             Self::Reconciliation => "RECONCILIATION",
         }
     }
+}
+
+/// Closed `HostRequest` body for an explicitly admitted Instrument Registry
+/// registration. The body names exact snapshot bytes; it does not itself
+/// grant mutation authority. Governor must issue the matching current
+/// AuthorityOwner/GrantGraph admission before committing them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryRegistrationInvocation {
+    /// Stable closed payload wire identity.
+    pub wire_id: String,
+    /// Payload contract version.
+    pub wire_version: u16,
+    /// Exact authenticated request identity retained from the outer Host
+    /// frame. Kernel binds this byte-for-byte before queueing so the daemon
+    /// does not reconstruct original request metadata from the envelope.
+    pub request_identity: RequestIdentity,
+    /// Original authenticated operating-system user captured from the
+    /// presenting Kernel session. This is owner context, not a caller field;
+    /// Kernel constructs it at the authenticated operator ingress and retains
+    /// it with this exact ORS payload for Governor admission.
+    pub authenticated_owner_ref: String,
+    /// Exact `InstrumentRegistry` snapshot bytes to register.
+    pub snapshot_json: String,
+    /// Exact existing `ActionContract` bytes selected by the caller. These are
+    /// a candidate only; the Governor re-resolves the contract against its
+    /// canonical task and authority owners before admission.
+    pub action_contract_json: String,
+    /// Existing complete owner claim carried as an explicit selector. It is
+    /// not authority until the Governor validates it against ORS and the live
+    /// task acceptance-set owner.
+    pub cold_start_claim_json: String,
+}
+
+impl InstrumentRegistryRegistrationInvocation {
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration";
+    pub const WIRE_VERSION: u16 = 1;
+    pub const PAYLOAD_SCHEMA_ID: &'static str = "eliot.instrument-registry-registration.v1";
+    pub const MAX_SNAPSHOT_BYTES: usize = 1_048_576;
+
+    pub fn validate_for_envelope(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<(), ProtocolError> {
+        self.request_identity.validate()?;
+        if self.authenticated_owner_ref.trim().is_empty()
+            || self.authenticated_owner_ref.chars().any(char::is_control)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.authenticated_owner_ref",
+                reason: "authenticated owner identity is empty or contains control characters",
+            });
+        }
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.wire",
+                reason: "unsupported registration payload",
+            });
+        }
+        if self.snapshot_json.is_empty() || self.snapshot_json.len() > Self::MAX_SNAPSHOT_BYTES {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.snapshot_json",
+                reason: "snapshot bytes are empty or exceed the registration bound",
+            });
+        }
+        let _: Value =
+            serde_json::from_str(&self.snapshot_json).map_err(|_| ProtocolError::InvalidField {
+                field: "instrument_registry_registration.snapshot_json",
+                reason: "snapshot is not valid JSON",
+            })?;
+        if self.action_contract_json.is_empty()
+            || self.action_contract_json.len() > Self::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.action_contract_json",
+                reason: "action contract bytes are empty or exceed the registration bound",
+            });
+        }
+        let _: Value = serde_json::from_str(&self.action_contract_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration.action_contract_json",
+                reason: "action contract is not valid JSON",
+            }
+        })?;
+        if self.cold_start_claim_json.is_empty()
+            || self.cold_start_claim_json.len() > Self::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.cold_start_claim_json",
+                reason: "readiness claim bytes are empty or exceed the registration bound",
+            });
+        }
+        let _: Value = serde_json::from_str(&self.cold_start_claim_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration.cold_start_claim_json",
+                reason: "readiness claim is not valid JSON",
+            }
+        })?;
+        let expected_session = self
+            .request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(ToString::to_string);
+        let expected_task = self
+            .request_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string);
+        if envelope.kind != HostRequestKind::InstrumentRegistryRegistration
+            || envelope.identity.capability != "instrument_registry.register"
+            || envelope.identity.payload_schema_id != Self::PAYLOAD_SCHEMA_ID
+            || envelope.identity.request_id.as_str()
+                != self.request_identity.request.metadata.request_id.as_str()
+            || envelope.identity.idempotency_key != self.request_identity.idempotency_key
+            || envelope.identity.cancellation_id != self.request_identity.cancellation_id
+            || envelope.identity.deadline_unix_ms != self.request_identity.deadline_unix_ms
+            || envelope.identity.session_id.as_ref() != expected_session.as_ref()
+            || envelope.identity.task_id.as_ref() != expected_task.as_ref()
+            || envelope.identity.work_scope_id.is_none()
+            || envelope.state_fence != self.request_identity.request.state_fence
+            || envelope.identity.payload_sha256 != self.action_payload_sha256()?
+            || !matches!(
+                &envelope.authenticated_source,
+                Some(HostRequestAuthenticatedSource::Operator { request_identity })
+                    if request_identity == &self.request_identity
+            )
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration.envelope",
+                reason: "registration body differs from its typed HostRequest identity",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn action_payload_sha256(&self) -> Result<String, ProtocolError> {
+        let payload = serde_json::json!({
+            "wire_id": Self::WIRE_ID,
+            "wire_version": Self::WIRE_VERSION,
+            "request_identity": self.request_identity,
+            "authenticated_owner_ref": self.authenticated_owner_ref,
+            "snapshot_json": self.snapshot_json,
+            "action_contract_json": self.action_contract_json,
+            "cold_start_claim_json": self.cold_start_claim_json,
+        });
+        let bytes = eliot_contracts::canonical_json_bytes(&payload)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+}
+
+/// Closed CLI request body for an Instrument Registry registration. The
+/// enclosing authenticated EBP frame remains the source of `RequestIdentity`;
+/// the caller supplies only the explicit `WorkScope` selector and inert typed
+/// snapshot candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryRegistrationOperatorRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub work_scope_id: String,
+    pub snapshot_json: String,
+    /// Existing `ActionContract` bytes are an inert candidate until the
+    /// Governor joins them to the current task, session, scope and grant graph.
+    pub action_contract_json: String,
+    pub cold_start_claim_json: String,
+}
+
+pub const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
+    "instrument_registry_registration.operator";
+
+/// Authenticated daemon selector for a read-only view of one current
+/// committed P-07 grant activation. It returns the Kernel owner's original
+/// committed activation fields and original mechanical-subset commitment;
+/// it does not activate, renew, or create authority.
+pub const COMMITTED_GRANT_ACTIVATION_READ_OPERATION: &str = "committed_grant_activation";
+
+/// One original committed activation and its original mechanical subset,
+/// projected for transport without changing either recorded identity or
+/// commitment. The daemon parses the subset into its owner type and compares
+/// its original commitment before using it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedGrantActivationProjection {
+    /// Original Kernel activation receipt.
+    pub receipt: AuthorityActivationReceipt,
+    /// Original ORS activation record identity.
+    pub ors_record_id: String,
+    /// Original ORS activated grant subject.
+    pub ors_subject_id: String,
+    /// Original recorded digest over the mechanical subset.
+    pub mechanical_subset_commitment: String,
+    /// Grant-graph revision committed by the activation.
+    pub grant_graph_revision: u64,
+    /// Current per-grant revocation watermark read from the same held P-07
+    /// owner as the activation tuple. Zero is the owner's actual absence value.
+    pub current_revocation_revision: u64,
+    /// Exact original `MechanicalAuthoritySubset` JSON from the Kernel owner.
+    pub mechanical_subset: Value,
+}
+
+/// Typed response to `committed_grant_activation`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedGrantActivationReadResult {
+    /// Grant selector echoed from the exact request.
+    pub grant_id: String,
+    /// Current fence of the authenticated Kernel read operation.
+    pub state_fence: StateFence,
+    /// Absent only when the Kernel P-07 owner has no current committed active
+    /// activation for this exact grant selector.
+    pub pair: Option<CommittedGrantActivationProjection>,
+}
+
+impl CommittedGrantActivationReadResult {
+    /// Validates response bindings without deriving or repairing owner data.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        bounded_text(&self.grant_id, "committed_grant_activation.grant_id", 256)?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "committed_grant_activation.state_fence",
+                reason: "must be a valid Kernel State Fence",
+            })?;
+        if let Some(pair) = &self.pair {
+            pair.receipt
+                .validate()
+                .map_err(|_| ProtocolError::InvalidField {
+                    field: "committed_grant_activation.receipt",
+                    reason: "must be the original active Kernel receipt",
+                })?;
+            bounded_text(
+                &pair.ors_record_id,
+                "committed_grant_activation.ors_record_id",
+                256,
+            )?;
+            if pair.ors_subject_id != self.grant_id {
+                return Err(ProtocolError::InvalidField {
+                    field: "committed_grant_activation.ors_subject_id",
+                    reason: "must equal the exact requested grant selector",
+                });
+            }
+            if !pair
+                .receipt
+                .authority_epoch
+                .is_same_authority(&self.state_fence.authority_epoch)
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "committed_grant_activation.receipt.authority_epoch",
+                    reason: "must match the authenticated read fence",
+                });
+            }
+            lowercase_sha256(
+                &pair.mechanical_subset_commitment,
+                "committed_grant_activation.mechanical_subset_commitment",
+            )?;
+            if pair.grant_graph_revision == 0 || !pair.mechanical_subset.is_object() {
+                return Err(ProtocolError::InvalidField {
+                    field: "committed_grant_activation.pair",
+                    reason: "requires the original revision and subset object",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl InstrumentRegistryRegistrationOperatorRequest {
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration.operator";
+    pub const WIRE_VERSION: u16 = 1;
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.wire",
+                reason: "unsupported operator registration request",
+            });
+        }
+        bounded_text(
+            &self.work_scope_id,
+            "instrument_registry_registration_operator.work_scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.snapshot_json.is_empty()
+            || self.snapshot_json.len()
+                > InstrumentRegistryRegistrationInvocation::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.snapshot_json",
+                reason: "candidate snapshot is empty or exceeds the registration bound",
+            });
+        }
+        let _: Value =
+            serde_json::from_str(&self.snapshot_json).map_err(|_| ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.snapshot_json",
+                reason: "candidate snapshot is not valid JSON",
+            })?;
+        if self.action_contract_json.is_empty()
+            || self.action_contract_json.len()
+                > InstrumentRegistryRegistrationInvocation::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.action_contract_json",
+                reason: "action contract candidate is empty or exceeds the registration bound",
+            });
+        }
+        let _: Value = serde_json::from_str(&self.action_contract_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.action_contract_json",
+                reason: "action contract candidate is not valid JSON",
+            }
+        })?;
+        if self.cold_start_claim_json.is_empty()
+            || self.cold_start_claim_json.len()
+                > InstrumentRegistryRegistrationInvocation::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.cold_start_claim_json",
+                reason: "readiness claim bytes are empty or exceed the registration bound",
+            });
+        }
+        let _: Value = serde_json::from_str(&self.cold_start_claim_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.cold_start_claim_json",
+                reason: "readiness claim is not valid JSON",
+            }
+        })?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostRequestAuthenticatedSource {
+    Operator { request_identity: RequestIdentity },
 }
 
 /// Exact request/idempotency/cancellation/parent/deadline/capability/
@@ -4061,7 +4406,7 @@ impl HostRequestIdentity {
                     });
                 }
             }
-            HostRequestKind::Invocation => {
+            HostRequestKind::Invocation | HostRequestKind::InstrumentRegistryRegistration => {
                 if self
                     .correlation_projection
                     .as_ref()
@@ -4175,6 +4520,11 @@ pub struct HostRequestEnvelope {
     pub descriptor_sha256: String,
     /// Digest of the exact Kernel-produced transport admission receipt.
     pub peer_admission_receipt_sha256: String,
+    /// Source-specific authentication for operator-owned registration.
+    /// Bridge-originated requests keep this absent and retain their existing
+    /// descriptor and admission-receipt requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_source: Option<HostRequestAuthenticatedSource>,
     /// Ticket/result binding, present only for Activation.
     pub activation_binding: Option<HostRequestActivationBinding>,
     /// Lowercase SHA-256 over every envelope field except this field.
@@ -4228,11 +4578,27 @@ impl HostRequestEnvelope {
                 reason: "pre-activation fence must not contain a task revision",
             });
         }
-        lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
-        lowercase_sha256(
-            &self.peer_admission_receipt_sha256,
-            "host_request.peer_admission_receipt_sha256",
-        )?;
+        match &self.authenticated_source {
+            None => {
+                lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
+                lowercase_sha256(
+                    &self.peer_admission_receipt_sha256,
+                    "host_request.peer_admission_receipt_sha256",
+                )?;
+            }
+            Some(HostRequestAuthenticatedSource::Operator { request_identity }) => {
+                request_identity.validate()?;
+                if self.kind != HostRequestKind::InstrumentRegistryRegistration
+                    || !self.descriptor_sha256.is_empty()
+                    || !self.peer_admission_receipt_sha256.is_empty()
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.authenticated_source",
+                        reason: "operator source is only valid for registration and carries no bridge descriptor or receipt",
+                    });
+                }
+            }
+        }
         match (&self.kind, &self.activation_binding) {
             (HostRequestKind::Activation, Some(binding)) => binding.validate()?,
             (HostRequestKind::Activation, None) => {
