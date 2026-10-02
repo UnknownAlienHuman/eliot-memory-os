@@ -2365,24 +2365,20 @@ kind = "entrypoint"
 operation = "previous authority phase detail"
 phase = "phase-detail"
 scope = "wired"
-status = "proven"
-detail = "Phase-detail emitter; failures propagate to the designated outer terminal (see terminals). In-file phase callsites; no terminal emitted here (verified)."
+status = "incomplete"
+reason = "missing_test_binding"
+detail = "Phase-detail emitter; failures propagate to the designated outer terminal (see terminals). In-file phase callsites; no terminal emitted here (verified). The frozen helper this boundary recorded, phase_b_previous_authority_observe, is gone: production grew it into phase_b_previous_authority_observe_bound (63-74), which reaches the #889 facade through phase_b_observe_authority and adds the owner-held identity slots. That bound entrypoint is the real site below; the test bindings this boundary previously carried are dropped, because the recorded ones do not exercise this contour."
 ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.site]]
-start = 43
-end = 49
-digest = "ef16a9e8e2d5273581d5b49dd9585020241c0b82be5e4c529bf6ac3486c10f69"
-markers = ["observe_entrypoint"]
-terminals = ["B-lib-phase-b-handle"]
-[[boundary.test]]
-file = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-case = "projection_01_propagation_single_terminal"
-fixture = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
-[[boundary.test]]
-file = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-case = "projection_02_redaction_noninterference_rollback"
-fixture = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
+start = 62
+end = 74
+digest = "b4d4651802673a1daf2e7c641b3ecd29f6af0ebd04a4674b892b2c98fbfddf3e"
+markers = ["phase_b_observe_authority"]
+[[boundary.caller]]
+file = "bins/eliot-host/src/phase_b_previous_authority.rs"
+line = 129
+text = "phase_b_previous_authority_observe_bound("
 
 [[boundary]]
 id = "B-leaf-prev-proj"
