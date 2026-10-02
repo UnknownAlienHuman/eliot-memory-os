@@ -5771,10 +5771,7 @@ impl OpenCodeSecretBoundary for OpenCodeRouteCredentials {
 
     fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, BrokerError> {
         self.live
-            .get(&(
-                handle.provider().to_owned(),
-                handle.key().to_owned(),
-            ))
+            .get(&(handle.provider().to_owned(), handle.key().to_owned()))
             .map(|credential| Box::<str>::from(credential.as_ref()))
             .ok_or(BrokerError::StaleLease)
     }
@@ -6107,6 +6104,300 @@ pub struct OpenCodeOneUseIntroduction {
     pub process_binding: OpenCodeProcessBinding,
     /// The current short-lived request credential. Never logged or persisted.
     pub credential: Box<str>,
+}
+
+/// The OS-observed identity of the process at the other end of one
+/// [`OPENCODE_BOOTSTRAP_PIPE_NAME`] connection (issue #2898, step 4).
+///
+/// This is *observation*, not a claim: the physical broker composes it from a
+/// sealed named-pipe peer observation plus the bytes it opened and hashed
+/// itself, and [`OpenCodeBootstrapRoute::redeem_peer`] compares it against the
+/// introduction the broker itself installed. Nothing on the wire can construct
+/// it, so a presented name, port, or process id is never identity here.
+///
+/// Every field is required and every comparison is exact. A blank SID or
+/// session, a zero process id, or a zero start instant is refused rather than
+/// compared, because "unobserved" and "observed and matched" are different
+/// states and only the second one may release a credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeBootstrapPeer {
+    /// Windows user SID observed from the connected peer process token.
+    pub windows_sid: String,
+    /// Interactive logon session observed from that same token.
+    pub interactive_session_id: String,
+    /// OS-observed peer process id. Zero is not an observation.
+    pub process_id: u32,
+    /// OS-observed peer process start instant, in 100 ns units. Windows reuses
+    /// process ids, so the id alone is never a generation.
+    pub process_start_100ns: u64,
+    /// OS-observed running image path of that peer process.
+    pub image_path: String,
+    /// Lowercase SHA-256 hex of the exact running image bytes this broker
+    /// opened and hashed itself after the connection was authenticated.
+    pub image_digest: String,
+}
+
+impl OpenCodeBootstrapPeer {
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.windows_sid, "bootstrap_peer.windows_sid")?;
+        text(
+            &self.interactive_session_id,
+            "bootstrap_peer.interactive_session_id",
+        )?;
+        text(&self.image_path, "bootstrap_peer.image_path")?;
+        hex_digest(&self.image_digest, "bootstrap_peer.image_digest")?;
+        if self.process_id == 0 || self.process_start_100ns == 0 {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The live process identity this broker observed for the exact approved
+/// `OpenCode` child it launched, retained as the owner record the peer is
+/// authenticated against (issue #2898, step 4).
+///
+/// This is the half a presentation cannot supply: the pipe peer's own identity
+/// (the admitted child) paired with the bytes of the image that child was
+/// observed running. A peer running a different build of an approved image, or
+/// a recycled process id, fails both halves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeApprovedProcess {
+    /// OS-observed id of the launched child.
+    pub process_id: u32,
+    /// OS-observed start instant of that child, in 100 ns units.
+    pub process_start_100ns: u64,
+    /// OS-observed image path of that child.
+    pub image_path: String,
+    /// Lowercase SHA-256 hex of that image's bytes, hashed by this broker.
+    pub image_digest: String,
+}
+
+impl OpenCodeApprovedProcess {
+    fn validate(&self) -> Result<(), BrokerError> {
+        text(&self.image_path, "approved_process.image_path")?;
+        hex_digest(&self.image_digest, "approved_process.image_digest")?;
+        if self.process_id == 0 || self.process_start_100ns == 0 {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The live identity of the broker generation that introduced the route,
+/// re-observed at every redemption (issue #2898, steps 4 and 14).
+///
+/// The introduction's
+/// [`OpenCodeProcessBinding::parent_broker_process_id`] names the broker that
+/// launched the child, so a *replacement* broker process cannot inherit a
+/// route whose introduction, credential, and one-shot ticket were issued by the
+/// generation that died with its child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenCodeBrokerProcessBinding {
+    /// OS-observed id of the introducing broker generation.
+    pub process_id: u32,
+    /// OS-observed start instant of that generation, in 100 ns units.
+    pub process_start_100ns: u64,
+}
+
+impl OpenCodeBrokerProcessBinding {
+    fn validate(&self) -> Result<(), BrokerError> {
+        if self.process_id == 0 || self.process_start_100ns == 0 {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        Ok(())
+    }
+
+    fn is_same_generation(&self, other: &Self) -> bool {
+        self.process_id == other.process_id && self.process_start_100ns == other.process_start_100ns
+    }
+}
+
+/// The User Broker's retained one-shot `OpenCode` bootstrap route
+/// (issue #2898, step 4, mechanism (a): the protected named-pipe bootstrap).
+///
+/// This is the owner record that makes
+/// [`OpenCodeBootstrapAuthority::consume_with_credential`] reachable. It holds
+/// the current [`OpenCodeBridgeIntroduction`] in the broker's own
+/// [`OpenCodeBridgeIntroductionRegistry`], the live
+/// [`OpenCodeRouteCredentials`] table that resolves the introduction's opaque
+/// [`SecretRef`], the generation-bound [`OpenCodeBootstrapAuthority`], the
+/// broker-observed [`OpenCodeApprovedProcess`] the peer must be, the introducing
+/// broker generation, and exactly one unredeemed ticket.
+///
+/// Exactly one ticket exists. [`Self::redeem_peer`] authenticates the peer
+/// *before* the ticket is spent, so a foreign process never consumes the one
+/// authenticator, and takes the ticket when it succeeds — a second redemption,
+/// whether by the correct peer or a foreign one, has nothing left to redeem and
+/// is refused with [`BrokerError::ReplayConflict`]. Rotation replaces the whole
+/// route, which is what retires the previous credential with its generation.
+#[derive(Clone, Debug)]
+pub struct OpenCodeBootstrapRoute {
+    introduction: OpenCodeBridgeIntroduction,
+    registry: OpenCodeBridgeIntroductionRegistry,
+    credentials: OpenCodeRouteCredentials,
+    authority: OpenCodeBootstrapAuthority,
+    approved_process: OpenCodeApprovedProcess,
+    broker_process: OpenCodeBrokerProcessBinding,
+    ticket: Option<OpenCodeBootstrapTicket>,
+}
+
+impl OpenCodeBootstrapRoute {
+    /// Installs one current introduction and mints its single one-shot ticket.
+    ///
+    /// `credential` is the short-lived bytes this broker is minting for the
+    /// introduction's own [`SecretRef`]; they are held only in this table and
+    /// are resolved only by [`Self::redeem_peer`] after peer authentication.
+    /// The introduction, the approved child's live identity, and the broker's
+    /// own live generation must already agree: a route that cannot name the
+    /// broker that launched the child is not installed at all.
+    pub fn new(
+        introduction: OpenCodeBridgeIntroduction,
+        approved_process: OpenCodeApprovedProcess,
+        broker_process: OpenCodeBrokerProcessBinding,
+        credential: Box<str>,
+        observed_at: u64,
+    ) -> Result<Self, BrokerError> {
+        introduction.validate(observed_at)?;
+        approved_process.validate()?;
+        broker_process.validate()?;
+        if introduction.process_binding.executable_digest != approved_process.image_digest {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        if introduction.process_binding.parent_broker_process_id
+            != broker_process.process_id.to_string()
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        let mut authority = OpenCodeBootstrapAuthority::new(&introduction)?;
+        let mut credentials = OpenCodeRouteCredentials::new();
+        credentials.issue(
+            introduction.credential.provider(),
+            introduction.credential.key(),
+            credential,
+        )?;
+        let ticket = authority.issue(
+            &OpenCodeBootstrapRequest {
+                introduction_digest: introduction.introduction_digest.clone(),
+            },
+            observed_at,
+        )?;
+        let mut registry = OpenCodeBridgeIntroductionRegistry::new();
+        registry.install(introduction.clone());
+        Ok(Self {
+            introduction,
+            registry,
+            credentials,
+            authority,
+            approved_process,
+            broker_process,
+            ticket: Some(ticket),
+        })
+    }
+
+    /// Authenticates the connected peer, then redeems the one-shot bootstrap
+    /// exactly once and yields the endpoint plus the one-use credential
+    /// (issue #2898, step 4; acceptance A2).
+    ///
+    /// The order is the guarantee: the introduction is still the installed one
+    /// and still inside its own window, the introducing broker generation is
+    /// still the live one, the peer's SID and logon session equal the
+    /// introduction's, and the peer is still the exact approved process with
+    /// the exact image bytes this broker hashed at launch. Only then is the
+    /// ticket compared, spent, and the credential resolved. A foreign process
+    /// image, a wrong SID or session, a wrong generation, or a second
+    /// presentation of the spent one-shot credential is refused with a typed
+    /// [`BrokerError`] and never reaches the secret boundary.
+    pub fn redeem_peer(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+        peer: &OpenCodeBootstrapPeer,
+        broker_process: &OpenCodeBrokerProcessBinding,
+    ) -> Result<OpenCodeOneUseIntroduction, BrokerError> {
+        self.introduction.validate(now)?;
+        self.authenticate_installed_generation()?;
+        self.authenticate_peer(peer, broker_process)?;
+        let held = self.ticket.as_ref().ok_or(BrokerError::ReplayConflict)?;
+        if held != ticket {
+            return Err(BrokerError::ReplayConflict);
+        }
+        let ticket = self.ticket.take().ok_or(BrokerError::ReplayConflict)?;
+        self.authority
+            .consume_with_credential(&ticket, now, &self.credentials)
+    }
+
+    /// Returns the introduction digest this route is bound to.
+    #[must_use]
+    pub fn introduction_digest(&self) -> &str {
+        &self.introduction.introduction_digest
+    }
+
+    /// Returns the single unredeemed one-shot ticket, or `None` once it has
+    /// been spent.
+    ///
+    /// A ticket carries no bearer material — the introduction digest, the
+    /// broker-selected endpoint, generations, logon session and one
+    /// broker-minted nonce — so exposing it does not disclose a secret. What it
+    /// does carry is worth one use only, which is why a second presentation is
+    /// [`BrokerError::ReplayConflict`].
+    #[must_use]
+    pub fn pending_ticket(&self) -> Option<&OpenCodeBootstrapTicket> {
+        self.ticket.as_ref()
+    }
+
+    /// Returns the OS-observed image path of the exact approved child this route
+    /// was installed with.
+    ///
+    /// The physical broker compares the connected peer's OS-observed image path
+    /// against this value with the platform's ordinal (case-insensitive) path
+    /// comparison before it hashes those bytes: a peer running the same
+    /// executable under a different path, or a substituted file at the same
+    /// path, is refused on one of the two halves, never on a string prefix.
+    #[must_use]
+    pub fn approved_image_path(&self) -> &str {
+        &self.approved_process.image_path
+    }
+
+    /// Refuses when the retained introduction is no longer the installed one,
+    /// which is what revocation, rotation, and logout do.
+    fn authenticate_installed_generation(&self) -> Result<(), BrokerError> {
+        let digest = &self.introduction.introduction_digest;
+        if self
+            .registry
+            .current()
+            .is_some_and(|current| &current.introduction_digest == digest)
+        {
+            return Ok(());
+        }
+        Err(BrokerError::StaleRegistrationIdentity)
+    }
+
+    /// Compares the connected peer and the re-observed broker generation against
+    /// the owner records this route was installed with.
+    fn authenticate_peer(
+        &self,
+        peer: &OpenCodeBootstrapPeer,
+        broker_process: &OpenCodeBrokerProcessBinding,
+    ) -> Result<(), BrokerError> {
+        peer.validate()?;
+        broker_process.validate()?;
+        if !self.broker_process.is_same_generation(broker_process) {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        if peer.windows_sid != self.introduction.windows_sid
+            || peer.interactive_session_id != self.introduction.interactive_session_id
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        if peer.process_id != self.approved_process.process_id
+            || peer.process_start_100ns != self.approved_process.process_start_100ns
+            || peer.image_digest != self.approved_process.image_digest
+        {
+            return Err(BrokerError::ProcessBindingMismatch);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6895,6 +7186,16 @@ impl BrokerCutover {
         });
     }
 }
+/// Issue #2898 step 4 — the peer-authenticated one-shot bootstrap redemption
+/// proof. It lives in its own file because it is a separate proof obligation
+/// from the crate's other owner-record tests: one positive case (the correct
+/// peer obtains its introduction) and one refusal case (a foreign image, a
+/// wrong generation, a replayed one-shot credential, and a wrong SID are each
+/// refused with the existing typed error, before the secret boundary).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod opencode_bootstrap_route_tests;
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
