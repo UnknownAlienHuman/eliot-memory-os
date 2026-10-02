@@ -1,9 +1,26 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! F-LOG-HOST-5 (#980) focused projection diagnostics via #889 facade only.
-//! T1 covers issue cases 1/3/4/5/9 (propagation + single terminal through the
-//! real `materialize_phase_b` contour); T2 covers 6/7/8/10/11 (redaction +
-//! noninterference + rollback disposition). No matrix; Event Log stays
-//! typed-Unavailable (#984). Each proof names its actual caller.
+//! T1 covers the propagation + single-terminal case through the real
+//! `materialize_phase_b` contour; T2 covers the redaction + noninterference +
+//! rollback-disposition cases. No matrix; Event Log stays typed-Unavailable
+//! (#984). Each proof names its actual caller.
+//!
+//! Corrected case claim. This header used to name cases 1/3/4/5/9 and
+//! 6/7/8/10/11, but no marker in this file ever named 3, 4, 10 or 11, so the
+//! header counted four cases this file does not prove. The claim below is the
+//! truth this file can back: each `#[test] fn projection_<n>_..` in this file
+//! carries exactly one `WORK_UNIT_CASE` marker for the same case number.
+//! `marker_census_matches_the_header_claim` reads the single claim line below
+//! and the markers in this file and fails when they disagree in either
+//! direction, when a case is claimed twice, when a marker sits on a `#[test]`
+//! whose body asserts nothing, or when a `#[test]` exists that no claim and no
+//! named supporting proof accounts for.
+//!
+//! Claimed cases (one marker each): 980/1 980/2 980/5 980/6 980/7 980/8 980/9
+//!
+//! Named residual, not coverage: cases 3, 4, 10 and 11 of this issue have no
+//! marker in this file, so this header no longer counts them. Whoever proves
+//! them marks them in the file that does.
 //!
 //! Evidence contract after audit 5909832545 defect 6 and its refutation:
 //!
@@ -484,6 +501,9 @@ fn assert_facade_emits_one_record_per_detail_and_exactly_one_terminal(
     assert!(t.find(inner).expect("inner") < t.find(term).expect("term"));
 }
 
+// The file's own case convention, applied to every marked case here: the
+// `#[test] fn projection_<n>_..` owns case `n` of this issue. The census test
+// at the end of this file binds the two directions of that convention.
 // WORK_UNIT_CASE: 980/1
 #[test]
 fn projection_01_propagation_single_terminal() {
@@ -588,6 +608,8 @@ fn projection_02_redaction_noninterference_rollback() {
 // every Host request record is built from, so an unknown / unattributed
 // rollback outcome reaching it is projected as missing evidence, never as a
 // positive restoration, removal or cleanup claim.
+//
+// WORK_UNIT_CASE: 980/5
 #[test]
 fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
     let positives = [
@@ -765,6 +787,8 @@ fn assert_proven_projection_stays_reachable_and_free_of_rollback_detail() {
 // the redaction contract T2 asserts on source is also asserted on the record
 // production actually wrote. The oversized literal is truncated with an honest
 // byte count rather than dropped or emitted whole.
+//
+// WORK_UNIT_CASE: 980/6
 #[test]
 fn projection_06_detail_is_truncated_with_honest_byte_accounting() {
     let oversized = "host.phase-b rollback ".repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
@@ -882,6 +906,7 @@ fn assert_projection_reaches_the_event_log_only_when_the_owner_proof_exists(
 /// reachable claim gate and its Event Log wiring, and it cannot prove any
 /// particular rollback outcome; `mod rollback_contour_tests` drives the owner
 /// with real outcomes instead.
+// WORK_UNIT_CASE: 980/7
 #[test]
 fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
     const EVENTS: [AdmittedEvent; 3] = [
@@ -981,6 +1006,7 @@ fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
 /// crate, so no rollback record is produced here. The executed proof that those
 /// three contours stay distinct on real inputs is `mod rollback_contour_tests`
 /// beside the owner.
+// WORK_UNIT_CASE: 980/8
 #[test]
 fn projection_08_restoration_removal_and_cleanup_contours_stay_distinct_records() {
     let owner = src("src/phase_b_materialization/rollback_backup.rs");
@@ -1076,6 +1102,7 @@ fn projection_08_restoration_removal_and_cleanup_contours_stay_distinct_records(
 /// executed here; the owner's label projection is bound below and
 /// `mod rollback_contour_tests` beside the owner drives the cleanup path with
 /// real deletions.
+// WORK_UNIT_CASE: 980/9
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -1181,5 +1208,374 @@ fn projection_09_sidecar_cleanup_disposition_is_observable_and_claims_no_removal
                 "a cleanup disposition must never read as a restoration or a removal: {contour:?}"
             );
         }
+    }
+}
+
+/// One source line reduced to its CODE view: `//` and `///` comments dropped and
+/// every string-literal body replaced by an empty pair of quotes.
+///
+/// The census below counts braces and reads `#[test]` attributes, and this
+/// file's assertion messages contain both braces and the word "assertions", so
+/// the raw text of a line cannot be taken for its structure.
+fn code_view(line: &str) -> String {
+    let bytes: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == '/' && bytes.get(index + 1) == Some(&'/') {
+            break;
+        }
+        if bytes[index] == '"' {
+            out.push('"');
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == '\\' {
+                    index += 2;
+                    continue;
+                }
+                if bytes[index] == '"' {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            out.push('"');
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+/// The CODE-view body of the function whose `fn` signature line is `fn_line`,
+/// located by brace balance, excluding the signature and the closing brace.
+///
+/// An empty body yields an empty string, which is exactly the state a marker
+/// over a proof that does not exist would leave, so the census reads this
+/// rather than a raw slice.
+fn fn_body_code(lines: &[&str], fn_line: usize) -> String {
+    let mut depth = 0_i32;
+    let mut opened = false;
+    let mut body: Vec<String> = Vec::new();
+    for line in &lines[fn_line..] {
+        let code = code_view(line);
+        for character in code.chars() {
+            match character {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth == 0 {
+            return body.join("\n");
+        }
+        body.push(code);
+    }
+    String::new()
+}
+
+/// How many live `assert!` / `assert_eq!` / `assert_ne!` invocations a
+/// CODE-view body contains, plus those of every local helper it calls.
+///
+/// Only a macro head immediately followed by `(` counts, so a commented-out
+/// assertion and the word "assertions" inside an assertion message are not
+/// proof. The helper walk is one hop deep per round and runs to a fixed point,
+/// because the case bodies here legitimately delegate their assertions to named
+/// helpers: a marker on a case whose only assertion lives in a helper is still a
+/// real proof, and reading the direct body alone would call that false.
+fn assertion_count(lines: &[&str], fn_line: usize) -> usize {
+    let declared = declared_functions(lines);
+    let mut total = 0usize;
+    let mut pending = vec![fn_line];
+    let mut visited: Vec<usize> = Vec::new();
+    while let Some(current) = pending.pop() {
+        if visited.contains(&current) {
+            continue;
+        }
+        visited.push(current);
+        let body = fn_body_code(lines, current);
+        total += direct_assertion_count(&body);
+        for target in called_function_lines(&body, &declared) {
+            if !visited.contains(&target) {
+                pending.push(target);
+            }
+        }
+    }
+    total
+}
+
+/// Every `fn` this file declares, with the line its signature is on.
+fn declared_functions(lines: &[&str]) -> Vec<(String, usize)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let code = code_view(line);
+            let name = code.trim().strip_prefix("fn ")?;
+            Some((
+                name.split(['(', ' ']).next().unwrap_or(name).to_owned(),
+                index,
+            ))
+        })
+        .collect()
+}
+
+/// The signature lines of every declared function a CODE-view body calls,
+/// resolved on whole identifiers so `emit` never matches `emit_one`.
+fn called_function_lines(body: &str, declared: &[(String, usize)]) -> Vec<usize> {
+    declared
+        .iter()
+        .filter(|(name, _)| {
+            body.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|token| token == name)
+        })
+        .map(|(_, line)| *line)
+        .collect()
+}
+
+/// How many live `assert!` / `assert_eq!` / `assert_ne!` invocations one
+/// CODE-view body contains, without following any call.
+fn direct_assertion_count(body: &str) -> usize {
+    let bytes = body.as_bytes();
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let rest = &body[index..];
+        let head = if rest.starts_with("assert_eq!") || rest.starts_with("assert_ne!") {
+            "assert_eq!".len()
+        } else if rest.starts_with("assert!") {
+            "assert!".len()
+        } else {
+            index += 1;
+            continue;
+        };
+        let mut cursor = index + head;
+        while bytes.get(cursor) == Some(&b' ') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'(') {
+            total += 1;
+        }
+        index += head;
+    }
+    total
+}
+
+/// How many `[` minus how many `]` a CODE-view line opens by, so a multi-line
+/// attribute is consumed as one unit.
+fn bracket_delta(line: &str) -> i32 {
+    let mut delta = 0;
+    for character in line.chars() {
+        match character {
+            '[' => delta += 1,
+            ']' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+/// Every `WORK_UNIT_CASE: 980/<n>` marker in this file, with the name of the
+/// `#[test]` function it sits on and how many assertions that function makes.
+///
+/// A marker is only counted when the attribute block between it and the `fn`
+/// carries `#[test]` and no `#[ignore]`, so a marker on a helper, or on an
+/// ignored test, is not silently read as a claimed case.
+fn census_claims(lines: &[&str]) -> Vec<(u32, String, usize)> {
+    let mut claims: Vec<(u32, String, usize)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim().strip_prefix("// WORK_UNIT_CASE: 980/") else {
+            continue;
+        };
+        let number = rest.trim();
+        assert!(
+            !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()),
+            "a WORK_UNIT_CASE marker must name a bare case number, got {number:?}"
+        );
+        // The attribute block between the marker and the `fn` may span several
+        // lines (`#[allow(clippy::too_many_lines, reason = "..")]`), so it is
+        // consumed by bracket depth rather than line by line.
+        let mut is_test = false;
+        let mut ignored = false;
+        let mut signature = None;
+        let mut depth = 0_i32;
+        for next in &lines[index + 1..] {
+            let trimmed = code_view(next).trim().to_owned();
+            if depth > 0 {
+                depth += bracket_delta(&trimmed);
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                is_test |= trimmed == "#[test]";
+                ignored |= trimmed.contains("#[ignore");
+                depth += bracket_delta(&trimmed);
+                if depth <= 0 {
+                    depth = 0;
+                }
+                continue;
+            }
+            if let Some(name) = trimmed.strip_prefix("fn ") {
+                signature = Some(
+                    name.split(['(', ' '])
+                        .next()
+                        .unwrap_or(name)
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+        let name = signature.unwrap_or_else(|| {
+            panic!("the 980/{number} marker on line {} precedes no `fn`", index + 1)
+        });
+        assert!(
+            is_test,
+            "the 980/{number} marker on line {} must sit on a `#[test]`, got {name}",
+            index + 1
+        );
+        assert!(
+            !ignored,
+            "the 980/{number} marker sits on an ignored test {name}"
+        );
+        let body_line = lines
+            .iter()
+            .position(|line| code_view(line).trim_start().starts_with(&format!("fn {name}(")))
+            .unwrap_or_else(|| panic!("{name} must be a real `fn` in this file"));
+        let assertions = assertion_count(lines, body_line);
+        claims.push((
+            number
+                .parse()
+                .unwrap_or_else(|error| panic!("case {number:?} is not a number: {error}")),
+            name,
+            assertions,
+        ));
+    }
+    claims
+}
+
+/// The case numbers this file's header claims, read out of the single
+/// `Claimed cases (one marker each):` line in the `//!` header.
+///
+/// The header is the claim of record; reading it rather than restating it here
+/// is what makes a header that over- or under-claims turn this test red.
+fn header_claimed_cases(source: &str) -> Vec<u32> {
+    let mut claimed: Vec<u32> = Vec::new();
+    let mut lines = 0usize;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("//! Claimed cases (one marker each):") else {
+            continue;
+        };
+        lines += 1;
+        for token in rest.split_whitespace() {
+            let case = token.strip_prefix("980/").unwrap_or_else(|| {
+                panic!("the header must claim #980 cases as `980/<n>`, got {token:?}")
+            });
+            claimed.push(
+                case.parse()
+                    .unwrap_or_else(|error| panic!("claimed case {case:?}: {error}")),
+            );
+        }
+    }
+    assert_eq!(lines, 1, "the header must carry exactly one claim line");
+    assert!(!claimed.is_empty(), "the header must claim its cases");
+    claimed
+}
+
+/// The marker census: every case this file's header claims is claimed by
+/// EXACTLY ONE `#[test]` here, every marker sits on a real `#[test]` that
+/// asserts something, and every `#[test]` in the file is accounted for.
+///
+/// Before this existed, two defects were invisible. Cases 3, 4, 10 and 11 were
+/// claimed by the header and by nothing else, so deleting
+/// `projection_08_restoration_removal_and_cleanup_contours_stay_distinct_records`
+/// left the suite green while the header still claimed case 9. And cases 5, 6,
+/// 7 and 9 had live tests with no marker, so the claimed case count and the
+/// proof count were two different numbers that nothing compared.
+///
+/// The four properties, each of which the verifier's deletions now break:
+///
+/// 1. no case number is claimed twice (a doubled case is a phantom
+///    denominator);
+/// 2. every marker's function is a `#[test]` that makes at least one assertion
+///    (a marker over an empty or comment-only body is coverage that does not
+///    run);
+/// 3. the marker set equals the header claim set in both directions (no gap,
+///    no extra, no over-claim);
+/// 4. every `#[test]` in the file is either a marked case or this census, so
+///    no unmarked test can hide inside a file whose header claims cases.
+///
+/// PROOF CEILING, stated: this proves the DENOMINATOR is true - the claims and
+/// the tests are in exact correspondence. It does not prove any case body
+/// asserts the right thing, and the codec/rollback cases here bind owner
+/// vocabularies rather than executing their unreachable owners, exactly as each
+/// case's own documentation states.
+#[test]
+fn marker_census_matches_the_header_claim() {
+    let source = src("tests/host_projection_diagnostics.rs");
+    let lines: Vec<&str> = source.lines().collect();
+
+    let claims = census_claims(&lines);
+    assert!(
+        !claims.is_empty(),
+        "this file must carry at least one WORK_UNIT_CASE marker"
+    );
+
+    // 1. No case claimed twice.
+    let mut claimed_once: Vec<u32> = claims.iter().map(|(case, _, _)| *case).collect();
+    claimed_once.sort_unstable();
+    let unique = {
+        let mut copy = claimed_once.clone();
+        copy.dedup();
+        copy
+    };
+    assert_eq!(
+        unique, claimed_once,
+        "a case number is claimed by more than one test, so the denominator is inflated"
+    );
+
+    // 2. Every marker sits on a `#[test]` that asserts something.
+    for (case, name, assertions) in &claims {
+        assert!(
+            *assertions >= 1,
+            "case {case} is marked on {name}, whose body makes no assertion at all"
+        );
+    }
+
+    // 3. Markers and the header claim agree in both directions.
+    let mut from_header = header_claimed_cases(&source);
+    from_header.sort_unstable();
+    let mut from_markers = claimed_once.clone();
+    from_markers.sort_unstable();
+    assert_eq!(
+        from_markers, from_header,
+        "the cases marked in this file must be exactly the cases its header claims"
+    );
+
+    // 4. Every `#[test]` is a marked case or this census. The census is named
+    // here so a new unmarked test cannot slip in beside it.
+    for (index, line) in lines.iter().enumerate() {
+        if code_view(line).trim() != "#[test]" {
+            continue;
+        }
+        let name = lines
+            .iter()
+            .skip(index + 1)
+            .find_map(|next| {
+                code_view(next)
+                    .trim()
+                    .strip_prefix("fn ")
+                    .map(|rest| rest.split(['(', ' ']).next().unwrap_or(rest).to_owned())
+            })
+            .unwrap_or_else(|| panic!("the #[test] on line {} precedes no `fn`", index + 1));
+        let marked = claims.iter().any(|(_, marked, _)| *marked == name);
+        assert!(
+            marked || name == "marker_census_matches_the_header_claim",
+            "{name} is a #[test] that no WORK_UNIT_CASE marker claims, so it is invisible to the \
+             case denominator"
+        );
     }
 }
