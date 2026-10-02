@@ -1494,11 +1494,7 @@ fn decode_epistemic_payload(
 /// `<selector>`, and it is a binding check rather than a second decode: every
 /// value is compared as recorded, and the typed decode with the contracts' own
 /// `validate()` still decides whether the page is usable at all.
-fn bind_position_payload(
-    payload: &Value,
-    scope: &ScopeId,
-    position: &str,
-) -> Option<&'static str> {
+fn bind_position_payload(payload: &Value, scope: &ScopeId, position: &str) -> Option<&'static str> {
     let echoes = |pointer: &str, expected: &str| {
         payload.pointer(pointer).and_then(Value::as_str) == Some(expected)
     };
@@ -1521,9 +1517,10 @@ fn bind_position_payload(
     else {
         return Some("position readback served no admitted position");
     };
-    if admitted.iter().any(|view| {
-        view.pointer("/admission/position").and_then(Value::as_str) != Some(position)
-    }) {
+    if admitted
+        .iter()
+        .any(|view| view.pointer("/admission/position").and_then(Value::as_str) != Some(position))
+    {
         return Some("an admitted position does not repeat the requested position");
     }
     None
@@ -1704,10 +1701,7 @@ mod reconstruction_tests {
         // stage allowed to refuse it after that. The source's own empty answer
         // for that same `position_key` stays an authoritative `KnownEmpty`.
         let bound = echoed_position("scope-a", "position-a");
-        assert_eq!(
-            bind_position_payload(&bound, &scope, "position-a"),
-            None
-        );
+        assert_eq!(bind_position_payload(&bound, &scope, "position-a"), None);
         let (state, readback) = decode_epistemic_payload(&bound, &scope, "position-a");
         assert!(matches!(
             state,
