@@ -34,10 +34,12 @@ use super::super::HostError;
 // paths, digests, env, or arbitrary error text — so bounding limits size, not
 // sensitivity (I15.4). Sink outcome never alters result/order/status/cleanup.
 // There is no mutable global dedup cache and no terminal emission here: one
-// terminal per failed operation is owned by the single outermost contour
-// (`HostJobBranches::start_approved` guard owns `host-launch-failed`; lib.rs
-// `HostTerminalGuard` owns composition terminals), while these parse phases
-// correlate by stage order only. Typed rejections stay
+// terminal per failed operation is owned by the enclosing operation guard
+// (`host-start-failed`, `host-open-failed` or `host-resume-pending-failed`);
+// the `start_approved` launch leaf emits no terminal of its own, and that
+// guard is wrapped directly (`observe_launch_terminal`) only on the cutover
+// contour. These parse phases correlate by stage order only. Typed rejections
+// stay
 // `HostError::Platform` (case 978/2); admitted launches are distinct positive
 // observations (case 978/1).
 fn host_launch_options_note_event_log_unavailable() {
