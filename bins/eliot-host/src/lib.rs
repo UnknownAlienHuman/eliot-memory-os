@@ -7154,6 +7154,40 @@ impl HostComposition {
         // stay nonterminal and correlate beneath it. Operation failure stays
         // distinct from a separate process shutdown failure.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_PREPARE_TERMINAL);
+        // F-LOG-HOST-2 (#893): bind the ONE operation identity this boundary's
+        // owner input type actually carries.
+        //
+        // `PresentedPreparationRequest` holds exactly one identity handle —
+        // `operation_id`, documented at
+        // `backup_preparation.rs:3670` as the "Operation identity (bounded text,
+        // unique per preparation)" — and it keys this operation's durable
+        // journal record by it, which is exactly the per-operation role the
+        // `tx` slot holds for every sibling projection
+        // (`phase_b_terminal_correlation` binds `intent.transaction_id`,
+        // `credential_terminal_correlation` binds `intent.transaction_id`;
+        // `operation_id` is this owner's name for the same handle). So `tx` is
+        // filled and only `tx`.
+        //
+        // The other two slots stay missing because the owner never issued them:
+        // a presented preparation carries NO materialization effect id (the
+        // `effect` slot is a Phase-B/activation materialization effect — see the
+        // `HostTerminalCorrelation` docs) and NO request digest at all (there is
+        // no `request_digest` field on this type; the configuration manifest
+        // digest is deliberately absent per `backup_preparation.rs:3641`, and
+        // `operation_id` is a handle, not a digest of the request).
+        //
+        // Do NOT "fix" the two `None`s by deriving a digest from `operation_id`,
+        // copying a handle off the destination, or borrowing one from a later
+        // phase: that is precisely the fabrication the explicit `*_missing`
+        // dispositions exist to prevent, and it would render an identity the
+        // owner does not hold. They stay explicitly missing in the record.
+        host_terminal.bind_operation(
+            host_diagnostics::HostTerminalCorrelation::partially_bound(
+                Some(request.operation_id.as_str()),
+                None,
+                None,
+            ),
+        );
         // Route through the shared dispatch validation before delegating:
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
