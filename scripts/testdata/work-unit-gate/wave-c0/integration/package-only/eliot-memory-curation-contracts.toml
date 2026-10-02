@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-586"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 586}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-memory-curation-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-memory-curation-contracts/src"}, {value = "crates/smart/eliot-memory-curation-contracts/tests"}]
+matrix_cases = 6
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "89fcc453918fe2dfd2f3720bc98456ce99d6f886a23b371dd7f628b0a6e5d844"
+matrix_sha256 = "cefd8b354bc7933f9242cd740132b7718134976a5416e8ec1741e933dad4fbe9"
+require_workspace_member = false
+package = {name = "eliot-memory-curation-contracts"}
+module = {value = "smart.memory.curation_contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 6, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 6, child_processes = 64}

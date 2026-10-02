@@ -959,6 +959,13 @@ fn reconstruction_context(
 /// no semantic receipt: a retained source envelope is not an admitted
 /// `ActiveUnderstandingView`, admitted Cue array, capability qualification or
 /// action authority.
+///
+/// The closure's own structural content invariant is proved here, before
+/// anything is serialized. A role whose disposition admits no source records
+/// must retain none, so a refused selector/scope/version/provenance page cannot
+/// reach the requester through this body; the digest, lineage and validity
+/// guarantees below are unchanged, and this runs before them rather than
+/// replacing any of them.
 fn context_reconstruction_result_body(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -967,6 +974,9 @@ fn context_reconstruction_result_body(
     seven: &SevenRoleInputs,
     cue_activation: &CueActivationDisposition,
 ) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
+    seven
+        .validate_content_admission()
+        .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
     let closure = serde_json::to_value(seven)
         .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
     let response = json!({
@@ -1010,4 +1020,214 @@ fn context_reconstruction_result_body(
         ReconstructionPrerequisite::ReconstructionRefused("result body is not valid".to_owned())
     })?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_governor::RoleAcquisition;
+    use eliot_protocol::{HOST_REQUEST_WIRE_ID, HostRequestIdentity, HostRequestKind};
+    use eliot_store_api::{RevisionHead, ScopeRevisionView};
+    use std::num::NonZeroU64;
+
+    use crate::cue_activation_route::CueActivationSkip;
+
+    type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn test_fence() -> ProofResult<StateFence> {
+        let lineage = eliot_contracts::EpochLineageId::new(TEST_LINEAGE)?;
+        let epoch = eliot_contracts::EpochId::new(
+            lineage,
+            NonZeroU64::new(1).ok_or("non-zero test epoch sequence")?,
+        )?;
+        Ok(StateFence::new(
+            epoch,
+            eliot_contracts::ResourceGeneration::genesis(),
+        ))
+    }
+
+    fn test_heads(scope: &ScopeId, fence: &StateFence) -> ProofResult<ScopeRevisionView> {
+        let view = ScopeRevisionView {
+            scope_id: scope.clone(),
+            revision_heads: vec![RevisionHead {
+                key: RevisionKey::new(format!("scope:{scope}"))?,
+                revision: 1,
+                state_fence: fence.clone(),
+            }],
+            ordering_heads: Vec::new(),
+            state_fence: fence.clone(),
+        };
+        view.validate()?;
+        Ok(view)
+    }
+
+    fn test_envelope(fence: &StateFence) -> ProofResult<HostRequestEnvelope> {
+        Ok(HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::Invocation,
+            connection_id: "conn-test-1".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-1")?,
+                correlation_projection: None,
+                idempotency_key: "host-request-1:invoke".to_owned(),
+                cancellation_id: "host-request-1:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000,
+                capability: "eliot.query".to_owned(),
+                session_id: Some("scope-a".to_owned()),
+                task_id: Some("task-a".to_owned()),
+                work_scope_id: Some("scope-a".to_owned()),
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: "a".repeat(64),
+            },
+            state_fence: fence.clone(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: "b".repeat(64),
+        })
+    }
+
+    fn test_attempt(envelope: &HostRequestEnvelope) -> ProofResult<LocalReadAttempt> {
+        Ok(LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: host_request_operation_id(envelope),
+            attempt_id: "eliot.query:attempt:test-boot:7:1".to_owned(),
+            fencing_generation: 1,
+            session_id: "scope-a".to_owned(),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: "scope-a".to_owned(),
+            facet_method: "eliot.query".to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        })
+    }
+
+    /// One closure whose `task_frame` role carries exactly `payload`.
+    fn closure_with_task_frame(
+        payload: Option<Value>,
+        state: eliot_context_candidates::ProjectionState,
+    ) -> ProofResult<SevenRoleInputs> {
+        let fence = test_fence()?;
+        let scope = ScopeId::new("scope-a")?;
+        let heads = test_heads(&scope, &fence)?;
+        let refused = |operation: NamedReadOperation| RoleAcquisition {
+            operation,
+            state: eliot_context_candidates::ProjectionState::Unavailable {
+                reason: "store read failed: unknown operation".to_owned(),
+            },
+            payload: None,
+            revision_heads: Vec::new(),
+            identity: None,
+        };
+        Ok(SevenRoleInputs {
+            scope_id: scope,
+            state_fence: fence,
+            clock: ClockReading::default(),
+            heads_before: heads.clone(),
+            heads_after: heads,
+            task_frame: RoleAcquisition {
+                operation: NamedReadOperation::GetTaskState,
+                state,
+                payload,
+                revision_heads: Vec::new(),
+                identity: None,
+            },
+            attention: refused(NamedReadOperation::GetAttentionAndProblems),
+            problem_readback: None,
+            epistemic: refused(NamedReadOperation::GetCurrentEpistemicPosition),
+            epistemic_readback: None,
+            cue: refused(NamedReadOperation::GetUnderstandingProjectionInputs),
+            negative_memory: refused(NamedReadOperation::GetUnderstandingProjectionInputs),
+            evidence: refused(NamedReadOperation::GetEvidencePack),
+            affordances: refused(NamedReadOperation::GetCapabilityEvidenceState),
+        })
+    }
+
+    #[test]
+    fn a_bound_role_payload_reaches_the_requester() -> ProofResult {
+        let fence = test_fence()?;
+        let envelope = test_envelope(&fence)?;
+        let attempt = test_attempt(&envelope)?;
+        let skip = CueActivationDisposition::Skipped(CueActivationSkip::CueRoleNotReady);
+        let seven = closure_with_task_frame(
+            Some(json!({"version": 1, "scope_id": "scope-a", "task_id": "task-a", "records": []})),
+            eliot_context_candidates::ProjectionState::KnownEmpty,
+        )?;
+        let body = context_reconstruction_result_body(
+            &envelope,
+            &attempt,
+            &ScopeId::new("scope-a")?,
+            "task-a",
+            &seven,
+            &skip,
+        )?;
+        // The bound envelope still travels to the requester in full: the
+        // retention rule removes refused bytes, not admitted ones.
+        assert_eq!(
+            body.response["context_reconstruction"]["task_frame"]["payload"]["task_id"],
+            json!("task-a")
+        );
+        assert_eq!(
+            body.response["context_reconstruction"]["task_frame"]["state"]["state"],
+            json!("KNOWN_EMPTY")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_role_payload_never_reaches_the_requester() -> ProofResult {
+        let fence = test_fence()?;
+        let envelope = test_envelope(&fence)?;
+        let attempt = test_attempt(&envelope)?;
+        let skip = CueActivationDisposition::Skipped(CueActivationSkip::CueRoleNotReady);
+        // A closure that still holds the foreign page it classified as
+        // `Unavailable` is refused whole, before any byte of it is serialized.
+        let mut seven = closure_with_task_frame(
+            Some(
+                json!({"version": 1, "scope_id": "scope-a", "task_id": "task-b", "records": [{"revision": 1}]}),
+            ),
+            eliot_context_candidates::ProjectionState::Unavailable {
+                reason: "role payload fails its contract: role selector mismatch".to_owned(),
+            },
+        )?;
+        let refused = context_reconstruction_result_body(
+            &envelope,
+            &attempt,
+            &ScopeId::new("scope-a")?,
+            "task-a",
+            &seven,
+            &skip,
+        );
+        assert!(matches!(
+            refused,
+            Err(ReconstructionPrerequisite::ReconstructionRefused(_))
+        ));
+
+        // The same closure after the acquisition dropped the refused bytes
+        // serves the requester with the refusal and nothing else.
+        seven.task_frame.payload = None;
+        seven.task_frame.revision_heads.clear();
+        let body = context_reconstruction_result_body(
+            &envelope,
+            &attempt,
+            &ScopeId::new("scope-a")?,
+            "task-a",
+            &seven,
+            &skip,
+        )?;
+        assert_eq!(
+            body.response["context_reconstruction"]["task_frame"]["payload"],
+            Value::Null
+        );
+        assert_eq!(
+            body.response["context_reconstruction"]["task_frame"]["state"]["state"],
+            json!("UNAVAILABLE")
+        );
+        Ok(())
+    }
 }

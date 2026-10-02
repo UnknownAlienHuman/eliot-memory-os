@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-804"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 804}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-cue-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-cue-contracts/src"}, {value = "crates/smart/eliot-cue-contracts/tests"}]
+matrix_cases = 77
+proof_ceiling = {value = "workspace-integration"}
+revision = 1
+body_sha256 = "a339a9ce16414d0b09e403f78882d1b8a3ca366754bec4414ef735518c688c67"
+matrix_sha256 = "b070d57aa70cabf60c71786b8fecc48a436026d86fca60e8102da57f0a83afab"
+require_workspace_member = true
+package = {name = "eliot-cue-contracts"}
+module = {value = "smart.cue.contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 77, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 77, child_processes = 64}
