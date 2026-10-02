@@ -38,7 +38,7 @@ use crate::{
     AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffArtifactLease, HandoffCapture,
     HandoffCaptureBoundary, HandoffCaptureError, HandoffCaptureLedger, HandoffCaptureReadback,
     HandoffCaptureSource, HandoffCausalLink, HandoffCheckpointId, HandoffContinuity,
-    HandoffEffectRecord, HandoffId, HandoffLeaseRelease, PublicReference, RevisionId, TargetId,
+    HandoffId, HandoffLeaseRelease, PublicReference, RevisionId, TargetId,
     WorkItemId, validate_collection, validate_text,
 };
 
