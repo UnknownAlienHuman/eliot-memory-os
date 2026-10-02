@@ -114,13 +114,16 @@ pub(super) fn same_state_owner_receipt(
 )]
 mod state_read_wire_tests {
     use super::super::*;
+    use super::{check_state_result_receipt, same_state_owner_receipt};
     use crate::KernelConfig;
-    use eliot_contracts::StateFence;
-    use eliot_ipc::{PeerIdentityUnavailable, ServerHandshakePolicy, SessionState};
+    use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, StateFence};
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestIdentity, HostRequestResultClass,
         HostRequestResultLineage, HostRequestResultSourceRevision,
     };
+
+    /// The exact admitted Session identity every fixture binds.
+    const SESSION_ID: &str = "kernel-session-1";
 
     fn tool_digest(tool: &serde_json::Value) -> String {
         let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
@@ -136,6 +139,33 @@ mod state_read_wire_tests {
         }})
     }
 
+    /// Builds an HONESTLY admitted `eliot.state` `Invocation` envelope.
+    ///
+    /// The correlation projection is load-bearing, not decoration. An
+    /// `Invocation` is admitted only when its correlation is RESOLVED, and
+    /// three independent real gates enforce that:
+    ///
+    /// * `HostRequestIdentity::validate_for_kind` binds the projection's
+    ///   `occurrence_text()` to the exact `request_id`, refuses the
+    ///   `KernelOperational` profile on a host envelope, and requires the
+    ///   REQUEST domain on an invocation;
+    /// * `RedbRecoveryStore::stage_host_request` refuses to stage an
+    ///   `Invocation` row whose correlation is still unresolved
+    ///   (`OrsError::HostRequestLegacyCorrelationUnresolved`);
+    /// * the kernel-service `admit_and_stage` gate refuses the same shape as
+    ///   `PortFailure::LegacyCorrelationUnresolved`.
+    ///
+    /// A fixture with `correlation_projection: None` is therefore refused in
+    /// staging and never reaches the code under test — the projection is
+    /// what makes this envelope honestly admitted, and `None` is reserved for
+    /// historical rows.
+    ///
+    /// The host-native OPAQUE profile is the exact construction a non-MCP host
+    /// uses for its own occurrence, copied from the bridge's bounded request
+    /// decode (`bins/eliot-agent-bridge/src/main.rs` `decode_bounded_request`)
+    /// and from the bridge's own operational-envelope construction
+    /// (`bins/eliot-agent-bridge/src/kernel_host_request_client.rs`
+    /// `build_restore_envelope`).
     fn state_envelope(
         fence: &StateFence,
         deadline_unix_ms: u64,
@@ -149,13 +179,16 @@ mod state_read_wire_tests {
             connection_id: "conn-test-1".to_owned(),
             identity: HostRequestIdentity {
                 request_id: RequestId::new(request_id).expect("valid request id"),
-                correlation_projection: None,
+                correlation_projection: Some(HostCorrelationProjection::Opaque {
+                    domain: HostCorrelationDomain::Request,
+                    occurrence: request_id.to_owned(),
+                }),
                 idempotency_key: format!("{request_id}:invoke"),
                 cancellation_id: format!("{request_id}:invoke:cancel"),
                 parent_operation_id: None,
                 deadline_unix_ms,
                 capability: STATE_CAPABILITY.to_owned(),
-                session_id: Some("kernel-session-1".to_owned()),
+                session_id: Some(SESSION_ID.to_owned()),
                 task_id: None,
                 work_scope_id: None,
                 payload_schema_id: HOST_REQUEST_PAYLOAD_SCHEMA_ID.to_owned(),
@@ -171,31 +204,24 @@ mod state_read_wire_tests {
         .expect("envelope must digest")
     }
 
-    fn daemon_session(policy: &ServerHandshakePolicy) -> Session {
-        Session {
-            connection_id: "authenticated-eliotd-connection".to_owned(),
-            protocol_version: policy.protocol_range.maximum,
-            peer: PeerIdentity::Unavailable {
-                reason: PeerIdentityUnavailable::ProviderProofNotComposed,
-            },
-            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
-            module_generation: policy.module_generation.clone(),
-            launch_nonce: policy.launch_nonce.clone(),
-            capabilities: policy.allowed_capabilities.clone(),
-            privacy_classes: policy.allowed_privacy_classes.clone(),
-            effects: policy.allowed_effects.clone(),
-            session_epoch: 1,
-            state: SessionState::Open,
-        }
-    }
-
-    fn stage_admitted(kernel: &KernelComposition, envelope: &HostRequestEnvelope) {
+    /// Stages one envelope through the REAL ORS admission gate and advances it
+    /// to `Admitted`, then reads the durable row back.
+    ///
+    /// This is the proof that the fixture is honestly admitted rather than
+    /// merely well-shaped: ORS itself refuses an unresolved correlation, so a
+    /// regression that dropped the projection fails HERE with the typed
+    /// `HostRequestLegacyCorrelationUnresolved` instead of silently reaching
+    /// the receipt gate.
+    fn staged_admitted_record(
+        kernel: &KernelComposition,
+        envelope: &HostRequestEnvelope,
+    ) -> HostRequestRecord {
         let requested = requested_host_request_record(envelope).expect("record must build");
         kernel
             .generation_gateway
             .ors
             .stage_host_request(&requested)
-            .expect("stage must succeed");
+            .expect("an honestly correlated invocation must stage");
         let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
             .expect("operation identity");
         kernel
@@ -208,21 +234,32 @@ mod state_read_wire_tests {
                 None,
             )
             .expect("advance must succeed")
-            .expect("admitted record must read back");
+            .expect("admitted record must read back")
     }
 
-    fn stored_record(
-        kernel: &KernelComposition,
-        envelope: &HostRequestEnvelope,
-    ) -> HostRequestRecord {
-        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
-            .expect("operation identity");
-        kernel
-            .generation_gateway
-            .ors
-            .load_host_request(&operation_id, &envelope.envelope_sha256)
-            .expect("load must succeed")
-            .expect("staged record must exist")
+    /// The fenced attempt capability the Kernel would mint at the state claim.
+    ///
+    /// Shape-valid on its own terms (`attempt_id` distinct from the operation
+    /// handle, positive generation and use budget, the attempt epoch matching
+    /// the lineage's source fence), so a body carrying it clears every
+    /// pre-gate shape check in `submit_claimed_result` — including
+    /// `validate_for_submission`'s attempt requirement — and is refused, if at
+    /// all, by the owner-receipt gate this module owns.
+    fn owner_attempt(envelope: &HostRequestEnvelope, fence: &StateFence) -> LocalReadAttempt {
+        let operation_id = host_request_operation_id(envelope);
+        LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: LocalReadAttempt::CONTRACT_VERSION,
+            attempt_id: format!("{operation_id}:attempt:0000000000000001:1:1"),
+            operation_id,
+            fencing_generation: 1,
+            session_id: SESSION_ID.to_owned(),
+            authority_epoch: fence.authority_epoch.clone(),
+            scope_id: SESSION_ID.to_owned(),
+            facet_method: STATE_CAPABILITY.to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        }
     }
 
     /// The projection owner's answer for one claimed State pair.
@@ -234,7 +271,6 @@ mod state_read_wire_tests {
     /// read of already-retained owner state (I01-08 read path).
     fn owner_projection_body(
         envelope: &HostRequestEnvelope,
-        attempt: LocalReadAttempt,
         fence: &StateFence,
     ) -> HostRequestResultBody {
         let response = serde_json::json!({
@@ -258,7 +294,7 @@ mod state_read_wire_tests {
             request_sha256: envelope.envelope_sha256.clone(),
             result_digest: digest.clone(),
             response,
-            attempt: Some(attempt),
+            attempt: Some(owner_attempt(envelope, fence)),
             lineage: Some(HostRequestResultLineage {
                 output_artifact_ref: None,
                 output_digest: digest,
@@ -285,26 +321,54 @@ mod state_read_wire_tests {
             // explicit missing part by the trace manifest, never invented.
             evidence: None,
         };
+        // The control: this body clears EVERY shape check that runs before the
+        // owner-receipt gate in `submit_claimed_result`, so a refusal below is
+        // attributable to the receipt gate alone and not to a malformed body.
+        body.validate()
+            .expect("the owner's receipted result must be a valid result body");
         body.validate_for_submission()
-            .expect("the owner's receipted result must validate");
+            .expect("the owner's receipted result must be submittable");
         body
     }
 
-    /// Positive case for the wired state/read leg (#1739 W5): a real permitted
-    /// `eliot.state` request retains a State-form pair on the bounded carrier,
-    /// is claimed under a fenced attempt, is answered by the projection owner
-    /// with an owner-receipted result, that result PERSISTS, and the ordinary
-    /// readback serves it.
+    /// The durable row as the ORS persist path would retain it: the owner's
+    /// result digest, response, and the owner's receipt projected through the
+    /// one production mapping.
+    fn retained_owner_record(
+        envelope: &HostRequestEnvelope,
+        body: &HostRequestResultBody,
+    ) -> HostRequestRecord {
+        let provenance = super::super::retained_result_provenance(body)
+            .expect("retained projection must map");
+        let mut record = requested_host_request_record(envelope).expect("record must build");
+        record.state = HostRequestState::ResultReceived;
+        record.result_digest = Some(body.result_digest.clone());
+        record.result_response = Some(body.response.clone());
+        record.result_lineage = provenance.result_lineage;
+        record
+    }
+
+    /// Positive case for the wired state/read leg (#1739 W5): an honestly
+    /// admitted `eliot.state` request reaches its projection owner, and the
+    /// owner's receipted answer is ACCEPTED by the submission gate and is
+    /// recognised as the SAME retained receipt on exact replay.
     ///
-    /// The query claim is polled in the middle as the capability-confusion
-    /// proof: the retained State pair is not claimable on the query form, so
-    /// the two lanes can never complete each other's attempts.
+    /// What this deliberately does not drive is the bounded carrier's
+    /// enqueue/claim leg. That leg is gated by
+    /// `host_request_connection_gate_under_transition`, which requires a live,
+    /// authenticated AND activated agent-bridge transport in
+    /// `agent_bridge_connections`; a bare `KernelComposition` has
+    /// `agent_bridge_profile: None`, so that leg is unreachable from a unit
+    /// fixture without forging a transport receipt. Forging one here would
+    /// manufacture the very admission this lane is supposed to prove, so this
+    /// test starts at the last honestly reachable point: a really-admitted
+    /// operation, and the two receipt joins the submit gate runs on it.
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the roundtrip admits, retains, claims, answers, persists, reads back and replays one state pair in a single focused flow"
+        reason = "the flow admits one state envelope through the real staging gate, proves the carrier admission, and then proves both receipt joins on the owner's answer"
     )]
-    fn state_pair_reaches_its_owner_and_persists_an_owner_receipted_result() {
+    fn admitted_state_pair_reaches_the_projection_owner_receipt_gate() {
         let root =
             std::env::temp_dir().join(format!("eliot-kernel-state-wire-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("test work root");
@@ -315,7 +379,6 @@ mod state_read_wire_tests {
             .expect("front-door policy")
             .clone();
         let fence = policy.module_generation.state_fence.clone();
-        let session = daemon_session(&policy);
 
         let tool = state_tool();
         let envelope = state_envelope(
@@ -325,11 +388,22 @@ mod state_read_wire_tests {
             &tool_digest(&tool),
         );
 
-        // The linkage gate content-compares the presented bytes against the
-        // admitted payload digest and derives the closed selectors.
+        // The envelope satisfies the closed contract INCLUDING the per-kind
+        // identity rules, which is where a projection-less invocation is
+        // refused.
+        envelope
+            .validate()
+            .expect("the state envelope must satisfy the closed envelope contract");
+        envelope
+            .identity
+            .validate_for_kind(HostRequestKind::Invocation)
+            .expect("an invocation must carry a resolved request-domain correlation");
+
+        // The carrier admission gate content-compares the presented bytes
+        // against the admitted payload digest and derives the closed selectors.
         let selectors = check_local_state_admission(&envelope, &tool)
             .expect("the admitted state pair must validate");
-        assert_eq!(selectors.scope_id.as_str(), "kernel-session-1");
+        assert_eq!(selectors.scope_id.as_str(), SESSION_ID);
         assert_eq!(selectors.include, vec!["task", "attention"]);
         // A forged identity is refused by the same gate: a query's bytes under
         // a state envelope no longer bind the admitted payload digest.
@@ -342,100 +416,53 @@ mod state_read_wire_tests {
             "bytes that do not bind the admitted state payload must be refused"
         );
 
-        stage_admitted(&kernel, &envelope);
-        let retained = kernel
-            .enqueue_local_read_pair(&envelope, &tool)
-            .expect("the state pair must retain");
+        // The row is honestly admitted: ORS itself accepts the staging.
+        let admitted = staged_admitted_record(&kernel, &envelope);
+        assert_eq!(admitted.state, HostRequestState::Admitted);
         assert_eq!(
-            retained,
-            LocalReadPairKind::State,
-            "an admitted eliot.state pair retains under the State carrier form"
+            admitted.capability_ref.as_str(),
+            STATE_CAPABILITY,
+            "the admitted row is the state capability's own operation"
         );
+        assert_eq!(
+            admitted.correlation_projection,
+            envelope.identity.correlation_projection,
+            "the durable row retains the exact resolved correlation it was admitted with"
+        );
+
+        // The owner's answer is ACCEPTED by the submission gate.
+        let owner = owner_projection_body(&envelope, &fence);
+        assert_eq!(
+            check_state_result_receipt(&owner),
+            Ok(()),
+            "the owner's explicit receipt is what completes the state row"
+        );
+
+        // Exact replay presents the SAME retained receipt, so the replay gate
+        // recognises this retained outcome rather than declining it.
+        let retained = retained_owner_record(&envelope, &owner);
         assert!(
-            kernel
-                .claim_local_read_pair(&session)
-                .expect("query claim must not fail")
-                .is_none(),
-            "a State pair is never claimable on the query form"
+            same_state_owner_receipt(&retained, &owner),
+            "an exact replay under the same receipt is the same retained outcome"
         );
-
-        let claimed = kernel
-            .claim_local_state_pair(&session)
-            .expect("state claim must not fail")
-            .expect("the queued state pair must claim");
-        assert_eq!(claimed.form, LocalReadPairKind::State);
-        assert_eq!(claimed.envelope.envelope_sha256, envelope.envelope_sha256);
-        assert_eq!(claimed.tool, tool);
-        assert_eq!(
-            claimed.attempt.fencing_generation, 1,
-            "the first state claim mints fencing generation 1"
-        );
-
-        let body = owner_projection_body(&envelope, claimed.attempt.clone(), &fence);
-        let persisted = match kernel
-            .submit_local_state_result(&session, &body)
-            .expect("the owner's result must submit")
-        {
-            LocalReadSubmitDisposition::Persisted(record) => record,
-            LocalReadSubmitDisposition::StaleAttempt(observation) => {
-                panic!("the current attempt must persist, got stale: {observation:?}")
-            }
-        };
-        assert_eq!(persisted.state, HostRequestState::ResultReceived);
-        assert_eq!(
-            persisted.result_digest.as_deref(),
-            Some(body.result_digest.as_str())
-        );
-        assert_eq!(persisted.result_response.as_ref(), Some(&body.response));
-        assert!(
-            persisted.result_lineage.is_some(),
-            "the persisted state result carries the owner's receipt, so the bridge can read it back"
-        );
-
-        // The ordinary readback consumer serves the retained owner-backed
-        // result without re-dispatching anything.
-        let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
-        let replayed = local_read_replay_response(&receipt, &persisted, &envelope)
-            .expect("readback must not fail")
-            .expect("a resulted state row must read back");
-        assert_eq!(
-            replayed["value"]["record"]["result_response"], body.response,
-            "readback carries the exact owner projection"
-        );
-        assert_eq!(
-            replayed["value"]["record"]["result_lineage"]["result_class"], "EXISTING_EVIDENCE_READ",
-            "readback carries the owner's retained receipt class"
-        );
-
-        // Exact replay under the same identity is idempotent: the same retained
-        // outcome, no second completion, no duplicated effect.
-        let replay_submit = match kernel
-            .submit_local_state_result(&session, &body)
-            .expect("exact replay must not fail")
-        {
-            LocalReadSubmitDisposition::Persisted(record) => record,
-            LocalReadSubmitDisposition::StaleAttempt(observation) => {
-                panic!("exact replay must stay idempotent, got stale: {observation:?}")
-            }
-        };
-        assert_eq!(replay_submit.result_digest, persisted.result_digest);
 
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// Refusal case for the wired state/read leg (#1739 W5). A receiptless
-    /// state result, a laundered canonical-write-receipt class, and a
-    /// receiptless presentation of already-retained bytes are all refused,
-    /// and the digest-only submit entry no longer acknowledges a state
-    /// envelope at all — so no state row can become a durable answer nobody
-    /// is allowed to read.
+    /// state result and a laundered canonical-write-receipt class are both
+    /// refused by the submission gate, a receiptless presentation of
+    /// already-retained bytes does not replay, a foreign-receipt presentation
+    /// does not replay either, and the digest-only submit entry refuses a
+    /// state envelope outright — so no state row can become a durable answer
+    /// the bridge's owner-flight readback is forbidden to serve.
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the refusals cover the submit entry, the receipt gate, the laundered class and the replay gate on one admitted pair"
+        reason = "the refusals cover the receipt gate, the laundered class, the replay gate and the digest-only submit entry on one honestly admitted pair"
     )]
-    fn state_result_without_the_owner_receipt_is_refused_and_never_persists() {
+    fn state_result_without_the_owner_receipt_is_refused_by_the_submission_gate() {
         let root =
             std::env::temp_dir().join(format!("eliot-kernel-state-receipt-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("test work root");
@@ -446,7 +473,6 @@ mod state_read_wire_tests {
             .expect("front-door policy")
             .clone();
         let fence = policy.module_generation.state_fence.clone();
-        let session = daemon_session(&policy);
 
         let tool = state_tool();
         let envelope = state_envelope(
@@ -455,7 +481,7 @@ mod state_read_wire_tests {
             "host-request-state-2",
             &tool_digest(&tool),
         );
-        stage_admitted(&kernel, &envelope);
+        staged_admitted_record(&kernel, &envelope);
 
         // The digest-only submit entry is closed for this row: a state
         // envelope there retains no bytes, so it is refused rather than
@@ -468,85 +494,60 @@ mod state_read_wire_tests {
             "a state envelope on the digest-only submit entry must be refused"
         );
 
-        assert_eq!(
-            kernel
-                .enqueue_local_read_pair(&envelope, &tool)
-                .expect("the state pair must retain"),
-            LocalReadPairKind::State
-        );
-        let attempt = kernel
-            .claim_local_state_pair(&session)
-            .expect("state claim must not fail")
-            .expect("the queued state pair must claim")
-            .attempt;
-
-        let owner = owner_projection_body(&envelope, attempt.clone(), &fence);
+        let owner = owner_projection_body(&envelope, &fence);
 
         // A receiptless body over the owner's exact bytes: no lineage at all.
         let mut receiptless = owner.clone();
         receiptless.lineage = None;
         assert!(
             matches!(
-                kernel.submit_local_state_result(&session, &receiptless),
+                check_state_result_receipt(&receiptless),
                 Err(TransportError::SessionFenced)
             ),
             "a receiptless state result must not complete the row"
         );
-        assert!(
-            stored_record(&kernel, &envelope).result_digest.is_none(),
-            "a refused state result must leave the durable row clean"
-        );
 
         // A laundered canonical write receipt: a read projection may not be
-        // presented as an admitted canonical record.
+        // presented as an admitted canonical record. This body is otherwise
+        // SELF-CONSISTENT — `validate_class` accepts a canonical class that
+        // names its exact receipt — so the lane's own gate is the only thing
+        // that can refuse it.
         let mut laundered = owner.clone();
         if let Some(lineage) = laundered.lineage.as_mut() {
             lineage.result_class = HostRequestResultClass::CanonicalWriteReceipt;
             lineage.semantic_receipt_ref = Some("write-receipt-1".to_owned());
         }
+        laundered
+            .validate()
+            .expect("the laundered body is shape- and class-consistent by construction");
         assert!(
             matches!(
-                kernel.submit_local_state_result(&session, &laundered),
+                check_state_result_receipt(&laundered),
                 Err(TransportError::SessionFenced)
             ),
             "a state result claiming the canonical write-receipt class must be refused"
         );
-        assert!(
-            stored_record(&kernel, &envelope).result_digest.is_none(),
-            "a refused laundered result must leave the durable row clean"
-        );
 
-        // The owner-backed result is accepted and persists.
-        let persisted = match kernel
-            .submit_local_state_result(&session, &owner)
-            .expect("the owner's receipted result must submit")
-        {
-            LocalReadSubmitDisposition::Persisted(record) => record,
-            LocalReadSubmitDisposition::StaleAttempt(observation) => {
-                panic!("the current attempt must persist, got stale: {observation:?}")
-            }
-        };
-        assert!(
-            persisted.result_lineage.is_some(),
-            "only the owner-receipted result persists"
-        );
+        // The owner-backed answer is still the only accepted one.
+        assert_eq!(check_state_result_receipt(&owner), Ok(()));
 
-        // A receiptless presentation of the ALREADY retained bytes is not this
-        // retained outcome: the replay arm declines it and the submission gate
-        // fails closed, so identical bytes can never launder away the receipt.
-        let mut receiptless_replay = owner.clone();
-        receiptless_replay.lineage = None;
+        // The replay gate: only the SAME retained receipt replays. A receiptless
+        // presentation of the already-retained bytes and a foreign-receipt
+        // presentation of the same bytes are both different claims, so the
+        // replay arm declines them and the submission gate fails closed —
+        // identical bytes can never launder away the receipt.
+        let retained = retained_owner_record(&envelope, &owner);
         assert!(
-            matches!(
-                kernel.submit_local_state_result(&session, &receiptless_replay),
-                Err(TransportError::SessionFenced)
-            ),
-            "a receiptless replay over retained bytes must be refused"
+            !same_state_owner_receipt(&retained, &receiptless),
+            "a receiptless presentation is not the retained outcome"
         );
-        assert_eq!(
-            stored_record(&kernel, &envelope).result_digest,
-            persisted.result_digest,
-            "the refused replay must not alter the retained outcome"
+        assert!(
+            !same_state_owner_receipt(&retained, &laundered),
+            "a foreign-receipt presentation is not the retained outcome"
+        );
+        assert!(
+            same_state_owner_receipt(&retained, &owner),
+            "the owner's own receipt is the retained outcome"
         );
 
         drop(kernel);
