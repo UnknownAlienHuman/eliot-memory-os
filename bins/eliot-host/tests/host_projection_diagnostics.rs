@@ -5,26 +5,37 @@
 //! noninterference + rollback disposition). No matrix; Event Log stays
 //! typed-Unavailable (#984). Each proof names its actual caller.
 //!
-//! Audit 5909832545 defect 6: the executed proofs below never manufacture the
-//! record under test. Every case hands the production facade a literal or a
-//! real typed owner value and asserts on what production emitted back; the
-//! source scans that remain are supplementary emission-binding only.
-//! `decode_marker`/`decode_envelope` (`pub(super)` in `credential_control`)
-//! and `phase_b_restore_or_remove`/`phase_b_remove_rollback_backup`
-//! (`use`-only import in `lib.rs`, private `mod phase_b_materialization`) are
-//! unreachable from an integration-test crate, so their contours are not
-//! claimed here; the reachable proof for the rollback dispositions is the
-//! executed projection case below, which proves an unknown/failed outcome can
-//! never be emitted as a positive claim.
+//! Evidence contract after audit 5909832545 defect 6 and its refutation:
+//!
+//! * No test manufactures the record it asserts on, and no test calls a
+//!   diagnostic facade in order to produce the record under test. Every executed
+//!   assertion is made on what production emitted when production was driven.
+//! * No expected log record is hand-constructed and no assertion infers a value
+//!   from a substring position.
+//! * No count-only pin: every expected set is derived from the production
+//!   structure it constrains, so a new emission cannot be absorbed by bumping a
+//!   constant.
+//! * Where a production owner is unreachable from an integration target, the
+//!   case binds that owner's OWN emitted vocabulary - the emission sites and the
+//!   closed projection functions production renders the record from - and names
+//!   the ceiling in its own documentation. It never claims the owner's runtime
+//!   behaviour, and it never restates an unchanged frozen constant as if it were
+//!   new evidence.
+//!
+//! `decode_marker`/`decode_envelope` (`pub(super)` in `credential_control`) and
+//! `phase_b_restore_or_remove`/`phase_b_remove_rollback_backup` (`use`-only
+//! import in `lib.rs`, private `mod phase_b_materialization`) are unreachable
+//! from an integration-test crate. The owner-side executed proofs that drive
+//! those owners with real inputs live beside them, in
+//! `src/credential_control/codec.rs` (`mod codec_reject_contour_tests`) and
+//! `src/phase_b_materialization/rollback_backup.rs` (`mod
+//! rollback_contour_tests`); the cases below bind the emitted vocabularies those
+//! owners project from and never claim to execute the owners themselves.
 use eliot_host::host_diagnostics::{
-    EntrypointStage, HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES,
+    EntrypointStage, HostRequestEvidence, HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES,
     observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
 };
-use eliot_host::host_diagnostics::{HostRequestEvidence, note_event_log_sink_status};
-use eliot_host::windows_event_log::{
-    AdmittedEvent, EVENT_LOG_MAX_INSERTION_BYTES, EVENT_LOG_SOURCE, EventLogRecord,
-    EventLogSeverity, event_log_sink_status,
-};
+use eliot_host::windows_event_log::{AdmittedEvent, EventLogAdmission, event_log_sink_status};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -73,8 +84,189 @@ fn fix() -> Value {
     )
     .expect("json")
 }
+
+/// How far a line is indented.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim().len()
+}
+
+/// Whether a line closes the block whose body was opened at `base`.
+///
+/// Comparing the indentation with the signature's own keeps a nested block
+/// inside the function - an `if` arm closing at four spaces inside a top-level
+/// `fn` - from being mistaken for the end of the function, while a method
+/// closing at four spaces inside an `impl` is still recognised.
+fn closes_owner_block(line: &str, base: usize) -> bool {
+    line.trim() == "}" && indent_of(line) == base
+}
+
+/// The indentation of the line the owner function found at `start` starts on.
+fn signature_indent(source: &str, start: usize) -> usize {
+    let line_start = source[..start].rfind('\n').map_or(0, |at| at + 1);
+    start - line_start
+}
+
+/// The bytes of a `fn` whose signature starts with `signature`, up to but not
+/// including its closing brace.
+///
+/// The owner projections and reject decoders a case binds are read through this
+/// window so a frozen label or an emission site is attributed to the function
+/// that actually renders or publishes it, never to the file as a whole.
+fn fn_region<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} gone from the owner source"));
+    let rest = &source[start..];
+    let base = signature_indent(source, start);
+    let mut end = rest.len();
+    let mut consumed = 0usize;
+    for line in rest.lines().skip(1) {
+        if closes_owner_block(line, base) {
+            end = consumed;
+            break;
+        }
+        consumed += line.len() + 1;
+    }
+    &rest[..end]
+}
+
+/// The first double-quoted token of a line, without its quotes.
+fn first_quoted(line: &str) -> Option<&str> {
+    let (_, tail) = line.split_once('"')?;
+    Some(tail.split('"').next().unwrap_or_default())
+}
+
+/// The frozen label a one-line `Self::Variant => "label"` arm publishes.
+fn inline_arm_label(line: &str) -> Option<&str> {
+    let (_, tail) = line.split_once("=>")?;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix('"')?;
+    Some(tail.split('"').next().unwrap_or_default())
+}
+
+/// The closed `(discriminant, frozen label)` map a production `match` publishes.
+///
+/// Both the grouped (`Self::A | Self::B => "x",`) and the braced
+/// (`Self::A => { "x" }`) arm shapes a frozen vocabulary uses are read, so the
+/// returned map is what the owner can actually emit rather than a list of
+/// literals the case happens to expect to find in the file.
+fn frozen_labels(source: &str, anchor: &str) -> Vec<(String, String)> {
+    let start = source
+        .find(anchor)
+        .unwrap_or_else(|| panic!("{anchor} gone from the owner source"));
+    let rest = &source[start..];
+    let base = signature_indent(source, start);
+    let mut arms: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut braced = false;
+    for line in rest.lines().skip(1) {
+        if closes_owner_block(line, base) {
+            break;
+        }
+        for token in line.split("Self::").skip(1) {
+            pending.push(
+                token
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect(),
+            );
+        }
+        if line.contains("=> {") {
+            braced = true;
+            continue;
+        }
+        let label = if braced {
+            braced = false;
+            first_quoted(line)
+        } else {
+            inline_arm_label(line)
+        };
+        if let Some(label) = label {
+            assert!(
+                !pending.is_empty(),
+                "a frozen label under {anchor} has no discriminant: {line}"
+            );
+            arms.extend(pending.drain(..).map(|variant| (variant, label.to_owned())));
+        }
+    }
+    assert!(!arms.is_empty(), "no frozen label parsed under {anchor}");
+    arms
+}
+
+/// Every argument production passes as the FIRST argument of `callee(...)`,
+/// excluding the callee's own definition.
+///
+/// The argument is read up to the first `,`, `)` or line end, which is exactly
+/// the typed discriminant production hands its own emitter; the remaining
+/// arguments are irrelevant to which contour was published. An occurrence whose
+/// own line holds nothing but `fn` is the declaration, so this is exactly the
+/// emission sites of one owner emitter.
+fn call_arguments<'a>(source: &'a str, callee: &str) -> Vec<&'a str> {
+    let needle = format!("{callee}(");
+    let mut arguments = Vec::new();
+    let mut offset = 0usize;
+    while let Some(at) = source[offset..].find(&needle) {
+        let occurrence = offset + at;
+        let after = occurrence + needle.len();
+        let lead = source[after..].len() - source[after..].trim_start().len();
+        let body = after + lead;
+        let end = body
+            + source[body..]
+                .find([',', ')', '\n'])
+                .unwrap_or_else(|| panic!("unterminated {callee} call"));
+        let is_definition = source[..occurrence]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|line| line.trim() == "fn");
+        offset = end + 1;
+        if !is_definition {
+            arguments.push(source[body..end].trim());
+        }
+    }
+    assert!(!arguments.is_empty(), "no {callee} call site left");
+    arguments
+}
+
+/// Every typed discriminant `owner::Name` production names in `source`.
+///
+/// This is an owner emitter's emission-site vocabulary: the emitter declares the
+/// discriminant as a typed parameter, so the only way production can publish a
+/// contour is a `Owner::Contour` expression, while the emitter's own parameter
+/// lists and its label projection name the type without one. Reading the
+/// expressions therefore yields exactly the contours production publishes.
+fn typed_discriminants(source: &str, owner: &str) -> Vec<String> {
+    let needle = format!("{owner}::");
+    let mut found = Vec::new();
+    let mut offset = 0usize;
+    while let Some(at) = source[offset..].find(&needle) {
+        let body = offset + at + needle.len();
+        found.push(
+            source[body..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect(),
+        );
+        offset = body;
+    }
+    assert!(!found.is_empty(), "no {owner} discriminant left");
+    found
+}
+
+/// The rollback owner's own emitted disposition vocabulary: the closed
+/// `RollbackContour` label projection production renders each rollback record
+/// from. The owner-side executed proof is `mod rollback_contour_tests` inside the
+/// same file; this only binds the vocabulary that proof projects.
+fn owner_contour_labels(owner: &str) -> Vec<(String, String)> {
+    let production = owner.split("#[cfg(test)]").next().unwrap_or(owner);
+    frozen_labels(production, "const fn label(self) -> &'static str {")
+}
 // WORK_UNIT_CASE: 980/1
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the codec disposition vocabulary binding and the single-terminal propagation proof stay in one deterministic probe"
+)]
 fn projection_01_propagation_single_terminal() {
     let f = fix();
     let inner = f["inner"].as_str().expect("inner");
@@ -87,31 +279,159 @@ fn projection_01_propagation_single_terminal() {
     );
     assert!(src("src/host_composition_phase_b.rs").contains("fn materialize_phase_b"));
     assert!(src("src/phase_b_previous_authority.rs").contains("historical evidence observed"));
+    // Codec contour split (#980), bound to the emission that carries the
+    // contour. `credential_codec_observe` is the codec's only reject emission
+    // and publishes exactly `"{boundary} reason={contour}"`, rendered from the
+    // two closed projections of the discriminant it is handed; `mod
+    // credential_control` is private and `HostCredentialControl::new` is
+    // `pub(super)`, so no integration target can drive the codec. The
+    // disposition vocabulary the codec can emit is therefore DERIVED here from
+    // those emission sites and those two projection functions, and the
+    // collapsed catch-all is denied against that derived vocabulary rather than
+    // against a substring of the file.
     let cd = src("src/credential_control/codec.rs");
-    for l in [
-        "host.credential codec marker rejected",
-        "host.credential codec envelope rejected",
-        "marker-record-shape",
-        "marker-expected-mac",
-        "marker-mac-mismatch",
-        "marker-protected-object-mismatch",
-        "marker-wire-version-mismatch",
-        "envelope-record-shape",
-        "envelope-expected-mac",
-        "envelope-mac-mismatch",
-        "envelope-protected-object-mismatch",
-        "envelope-wire-version-mismatch",
+    let production = cd.split("#[cfg(test)]").next().unwrap_or(cd.as_str());
+    let mut contours = frozen_labels(production, "const fn contour(self) -> &'static str {");
+    let mut boundaries = frozen_labels(production, "const fn boundary(self) -> &'static str {");
+    contours.sort();
+    boundaries.sort();
+    // The frozen #980 contract: five marker contours under the frozen marker
+    // boundary and five envelope contours under the frozen envelope boundary.
+    // Each of the ten must own exactly one emission name and reach the sink
+    // under its own boundary label; an eleventh contour cannot join the
+    // vocabulary without changing this map.
+    let mut frozen: Vec<(String, String, String)> = Vec::new();
+    for (variant, contour) in [
+        ("MarkerRecordShape", "marker-record-shape"),
+        ("MarkerExpectedMac", "marker-expected-mac"),
+        ("MarkerMacMismatch", "marker-mac-mismatch"),
+        (
+            "MarkerProtectedObjectMismatch",
+            "marker-protected-object-mismatch",
+        ),
+        ("MarkerWireVersionMismatch", "marker-wire-version-mismatch"),
+        ("EnvelopeRecordShape", "envelope-record-shape"),
+        ("EnvelopeExpectedMac", "envelope-expected-mac"),
+        ("EnvelopeMacMismatch", "envelope-mac-mismatch"),
+        (
+            "EnvelopeProtectedObjectMismatch",
+            "envelope-protected-object-mismatch",
+        ),
+        (
+            "EnvelopeWireVersionMismatch",
+            "envelope-wire-version-mismatch",
+        ),
     ] {
-        assert!(cd.contains(&format!("\"{l}\"")), "codec label {l} gone");
+        let side = if variant.starts_with("Marker") {
+            "marker"
+        } else {
+            "envelope"
+        };
+        frozen.push((
+            variant.to_owned(),
+            contour.to_owned(),
+            format!("host.credential codec {side} rejected"),
+        ));
     }
-    // Bind to emission, not vocabulary: the helper plus both 6-branch
-    // reject paths, so deleting any `credential_codec_observe` call fails.
-    assert!(cd.contains("credential_codec_observe(CodecRejectReason::"));
+    frozen.sort();
     assert_eq!(
-        count(&cd, "credential_codec_observe("),
-        13,
-        "codec stopped observing"
+        contours,
+        frozen
+            .iter()
+            .map(|(variant, contour, _)| (variant.clone(), contour.clone()))
+            .collect::<Vec<_>>(),
+        "each of the ten frozen contours must own exactly one emission name, and no eleventh contour may join the codec vocabulary"
     );
+    assert_eq!(
+        boundaries,
+        frozen
+            .iter()
+            .map(|(variant, _, boundary)| (variant.clone(), boundary.clone()))
+            .collect::<Vec<_>>(),
+        "every contour must reach the sink under its own frozen boundary label"
+    );
+    // Every reject path still observes, and each decoder publishes exactly the
+    // five contours it owns. The expected set is the ten frozen contours
+    // partitioned by the decoder that can construct them, so deleting any
+    // `credential_codec_observe` call - or adding one - turns this red instead
+    // of being absorbed by a bumped occurrence count.
+    for (decoder, owned) in [
+        (
+            "pub(super) fn decode_marker(",
+            [
+                "MarkerRecordShape",
+                "MarkerExpectedMac",
+                "MarkerMacMismatch",
+                "MarkerProtectedObjectMismatch",
+                "MarkerWireVersionMismatch",
+            ],
+        ),
+        (
+            "pub(super) fn decode_envelope(",
+            [
+                "EnvelopeRecordShape",
+                "EnvelopeExpectedMac",
+                "EnvelopeMacMismatch",
+                "EnvelopeProtectedObjectMismatch",
+                "EnvelopeWireVersionMismatch",
+            ],
+        ),
+    ] {
+        let region = fn_region(production, decoder);
+        let mut published: Vec<String> = call_arguments(region, "credential_codec_observe")
+            .iter()
+            .map(|argument| typed_discriminant(argument))
+            .collect::<Vec<String>>();
+        published.sort();
+        published.dedup();
+        let mut expected = owned.map(str::to_owned);
+        expected.sort();
+        assert_eq!(
+            published, expected,
+            "{decoder} must publish exactly its own contours, through the typed discriminant"
+        );
+    }
+    let mut published: Vec<String> = call_arguments(production, "credential_codec_observe")
+        .iter()
+        .map(|argument| typed_discriminant(argument))
+        .collect();
+    published.sort();
+    published.dedup();
+    let mut every: Vec<String> = frozen
+        .iter()
+        .map(|(variant, _, _)| variant.clone())
+        .collect();
+    every.sort();
+    assert_eq!(
+        published, every,
+        "the codec must observe for all ten contours and for nothing outside the frozen vocabulary"
+    );
+    // The restored negative assertion. `credential_codec_observe` may only be
+    // handed a typed discriminant, so a literal detail - the pre-fix shape -
+    // cannot be published from any reject site: `typed_discriminant` fails on
+    // it above. What is asserted here is the whole vocabulary the emission can
+    // render, derived from the two closed projections: the two boundary labels,
+    // the ten contour names, and the joined detail of every contour the
+    // emission sites actually construct. The collapsed `malformed` catch-all
+    // this contour split replaced must be unreachable from it.
+    let mut vocabulary: Vec<String> = boundaries.iter().map(|(_, label)| label.clone()).collect();
+    vocabulary.extend(contours.iter().map(|(_, contour)| contour.clone()));
+    for (variant, contour) in &contours {
+        let boundary = boundaries
+            .iter()
+            .find(|(name, _)| name == variant)
+            .map_or_else(
+                || panic!("{variant} publishes no boundary"),
+                |(_, label)| label.clone(),
+            );
+        vocabulary.push(format!("{boundary} reason={contour}"));
+    }
+    for token in &vocabulary {
+        assert!(
+            !token.contains("malformed"),
+            "the collapsed catch-all disposition is reachable from the codec again: {token}"
+        );
+    }
     // Executed proof of the shared facade only: literals go in, the facade's
     // own record comes back. No production record is manufactured here, and
     // the detail is no longer assembled from a fixture field, so what is
@@ -136,6 +456,18 @@ fn projection_01_propagation_single_terminal() {
     );
     assert_eq!(count(&t, c), 1, "inner correlates once, got: {t}");
     assert!(t.find(inner).expect("inner") < t.find(term).expect("term"));
+}
+/// The discriminant a production emission site published. An owner emitter may
+/// only be handed a typed discriminant; a literal detail would let one
+/// collapsed label ride along beside the frozen contours, which is exactly what
+/// this split removed.
+fn typed_discriminant(argument: &str) -> String {
+    argument
+        .strip_prefix("CodecRejectReason::")
+        .unwrap_or_else(|| {
+            panic!("a codec reject may publish only a CodecRejectReason discriminant, never a literal: {argument}")
+        })
+        .to_owned()
 }
 // WORK_UNIT_CASE: 980/2
 #[test]
@@ -223,6 +555,10 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
     // production label it abbreviates, and the denial below is proved on the
     // record production emitted, never on a guessed spelling.
     let rollback = src("src/phase_b_materialization/rollback_backup.rs");
+    let labels: Vec<&str> = owner_contour_labels(&rollback)
+        .iter()
+        .map(|pair| pair.1.as_str())
+        .collect();
     for label in [
         "host.phase-b rollback backup prepared",
         "host.phase-b rollback restored verified",
@@ -230,8 +566,8 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         "host.phase-b rollback backup cleanup completed",
     ] {
         assert!(
-            rollback.contains(&format!("\"{label}\"")),
-            "rollback owner must still name the positive label {label:?}"
+            labels.contains(&label),
+            "rollback owner must still publish the positive label {label:?}"
         );
     }
     let unknown = emit(|| {
@@ -390,37 +726,44 @@ fn projection_06_detail_is_truncated_with_honest_byte_accounting() {
     );
 }
 
-/// The three positive rollback claims this leaf can emit. No integration
-/// target can build them (see the reachability note on the cases below); they
-/// are named here only to bind the reachable claim gates to the owner's own
-/// frozen vocabulary, never to invent a record.
+/// The three positive rollback claims this leaf can emit. Named only to bind
+/// the reachable claim gate to the owner's own frozen vocabulary; the owner
+/// itself is unreachable from here, so no record under test is built from them.
 const ROLLBACK_POSITIVE_CLAIMS: [&str; 3] = [
     "host.phase-b rollback restored verified",
     "host.phase-b rollback uncommitted removal verified",
     "host.phase-b rollback backup cleanup completed",
 ];
 
-/// Executed case, audit 5909832545 required item 5, first obligation: a positive
-/// rollback claim is unreachable without its owner proof.
+/// Executed case, audit 5909832545 required item 5, first obligation: at the
+/// reachable production surface a positive rollback claim is unreachable
+/// without the evidence that proves it.
 ///
-/// `phase_b_restore_or_remove` and `phase_b_remove_rollback_backup` live in
-/// `src/phase_b_materialization/rollback_backup.rs` and are re-exported
-/// `pub(super)` by the private `mod phase_b_materialization`
-/// (`src/phase_b_materialization.rs:31-32`), which `src/lib.rs:5285-5289`
-/// imports with a private `use`. An integration-test crate under `tests/`
-/// therefore cannot name them, so this target cannot drive the rollback owner
-/// and does not claim to. What IS reachable is the production gate that decides
-/// whether any outcome may be stated as a completed operation at all:
-/// `AdmittedEvent::is_admitted_by` (`src/windows_event_log.rs:140`), the single
-/// production predicate over the owner-typed `HostRequestEvidence` class. This
-/// case drives THAT predicate exhaustively and the bounded Event Log record
-/// construction, and asserts the invariant on what production decided - the
-/// record under test is production's own admission decision, never a record
-/// manufactured through the diagnostic facade.
+/// #980's rollback owner cannot be driven from this target - `mod
+/// phase_b_materialization` is private and `phase_b_restore_or_remove` /
+/// `phase_b_remove_rollback_backup` are `pub` only inside it - so the executed
+/// proof binds the reachable CLAIM GATE instead. `observe_host_request` is the
+/// one production entry point that publishes a Host request record and routes
+/// it to the Event Log, and `publish_projected_event_log_record` is the only
+/// thing that may admit one. Each case hands production a projection naming an
+/// admitted service operation and a typed evidence class and then asserts on
+/// what production EMITTED: an outcome no owner proved produces no
+/// `host.event_log_admission` record at all, and a proven outcome produces
+/// exactly one carrying production's own `operation` and `evidence`
+/// projections. Nothing here builds an expected log record, and no boolean the
+/// production gate returned is interpreted by the case.
+///
+/// Named ceiling: the evidence class is a typed production discriminant this
+/// probe selects, not an owner-issued rollback identity, because no reachable
+/// path supplies one - `admitted` needs `HostLaunchOptions` and
+/// `semantically_ready` needs an opened `HostComposition`. So this proves the
+/// reachable claim gate and its Event Log wiring, and it cannot prove any
+/// particular rollback outcome; `mod rollback_contour_tests` drives the owner
+/// with real outcomes instead.
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the unproven/proven gate matrix, the bounded sink record, and the owner label binding stay in one deterministic probe"
+    reason = "the reachable unproven/proven claim gate matrix and the owner label binding stay in one deterministic probe"
 )]
 fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
     const EVENTS: [AdmittedEvent; 3] = [
@@ -428,314 +771,334 @@ fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
         AdmittedEvent::ServiceStop,
         AdmittedEvent::ServiceFailure,
     ];
-    // Every evidence class the reachable `HostRequestProjection` can carry that
-    // asserts NO completed operation. A rollback outcome that was never
-    // readback-proven is projected as exactly one of these, so at the
-    // reachable claim gate it cannot be stated as restored, removed, or
-    // cleaned-up completed.
-    const UNPROVEN: [HostRequestEvidence; 5] = [
-        HostRequestEvidence::Observed,
-        HostRequestEvidence::Admitted,
-        HostRequestEvidence::SemanticallyReady,
-        HostRequestEvidence::Cancelled,
-        HostRequestEvidence::Unknown,
-    ];
-    for evidence in UNPROVEN {
-        for event in EVENTS {
-            assert!(
-                !event.is_admitted_by(evidence),
-                "{} must not admit {}: an unproven outcome can never be stated as a completed operation",
-                evidence.as_str(),
-                event.as_str(),
-            );
-        }
-    }
-    // The three proven dispositions still reach the sink and each admits
-    // EXACTLY one event, so the denials above are a real distinction and not a
-    // blanket refusal. `Unknown` is deliberately absent: reading preserved
-    // uncertainty as a settlement would manufacture a terminal no owner proved.
-    for (event, proven) in [
-        (AdmittedEvent::ServiceStart, HostRequestEvidence::ProcessStarted),
+    // Every evidence class the reachable `HostRequestProjection` can carry
+    // without owner state this probe does not hold. `process_started` is bound
+    // to `std::process::id()`: the serving identity this very process holds.
+    let dispositions: [(&str, HostRequestProjection, HostRequestEvidence); 6] = [
         (
-            AdmittedEvent::ServiceStop,
+            "process_started",
+            HostRequestProjection::process_started(
+                EntrypointStage::ScmDispatch,
+                std::process::id(),
+            ),
+            HostRequestEvidence::ProcessStarted,
+        ),
+        (
+            "durable_committed",
+            HostRequestProjection::durable_committed(EntrypointStage::ScmDispatch),
             HostRequestEvidence::DurableCommitted,
         ),
-        (AdmittedEvent::ServiceFailure, HostRequestEvidence::Failed),
-    ] {
-        assert!(
-            event.is_admitted_by(proven),
-            "{} must admit its own proven disposition {}",
-            event.as_str(),
-            proven.as_str(),
-        );
-        for other in EVENTS {
+        (
+            "failed_without_reason",
+            HostRequestProjection::failed_without_reason(EntrypointStage::ScmDispatch),
+            HostRequestEvidence::Failed,
+        ),
+        (
+            "observed",
+            HostRequestProjection::observed(EntrypointStage::ScmDispatch),
+            HostRequestEvidence::Observed,
+        ),
+        (
+            "cancelled",
+            HostRequestProjection::cancelled(EntrypointStage::ScmDispatch),
+            HostRequestEvidence::Cancelled,
+        ),
+        (
+            "unknown",
+            HostRequestProjection::unknown(EntrypointStage::ScmDispatch),
+            HostRequestEvidence::Unknown,
+        ),
+    ];
+    // The frozen Event Log contract: a start is proved by the started process, a
+    // stop by the committed durable effect, a failure by the failure itself.
+    // Every other class asserts no completed operation.
+    const PROVEN: [(AdmittedEvent, &str); 3] = [
+        (AdmittedEvent::ServiceStart, "process_started"),
+        (AdmittedEvent::ServiceStop, "durable_committed"),
+        (AdmittedEvent::ServiceFailure, "failed_without_reason"),
+    ];
+    for (label, projection, evidence) in &dispositions {
+        for event in EVENTS {
+            let capture = emit(|| {
+                observe_host_request(&projection.clone().with_operation(event));
+            });
             assert!(
-                other == event || !other.is_admitted_by(proven),
-                "{} must not admit the proven disposition of {}",
-                other.as_str(),
-                event.as_str(),
+                capture.contains("host.request"),
+                "no projection record for {label}: {capture}"
             );
+            let proven = PROVEN
+                .iter()
+                .any(|(admitted, name)| *admitted == event && **name == **label);
+            assert_eq!(
+                capture.contains("host.event_log_admission"),
+                proven,
+                "{} with {} must{} reach the Event Log: {capture}",
+                label,
+                event.as_str(),
+                if proven { "" } else { " not" }
+            );
+            if proven {
+                assert_eq!(
+                    count(&capture, "host.event_log_admission"),
+                    1,
+                    "one admission decision per projection: {capture}"
+                );
+                assert!(
+                    capture.contains(&format!("operation=\"{}\"", event.as_str())),
+                    "the admitted operation must be the one production names: {capture}"
+                );
+                assert!(
+                    capture.contains(&format!("evidence=\"{}\"", evidence.as_str())),
+                    "the evidence class must be the one production projects: {capture}"
+                );
+            }
+            // Whatever the disposition, the record is a subordinate projection:
+            // it owns no terminal and no positive rollback claim.
+            assert!(
+                !capture.contains("host.terminal_error"),
+                "a projection record is never a terminal: {capture}"
+            );
+            for positive in ROLLBACK_POSITIVE_CLAIMS {
+                assert!(
+                    !capture.contains(positive),
+                    "the {label} projection claimed {positive:?}: {capture}"
+                );
+            }
         }
     }
-    // The bounded sink record for one rollback failure terminal code: the
-    // reachable surface carries the code exactly, under the frozen consumer
-    // mapping, with no fabrication and no truncation of a short code.
-    let code = "host-phase-b-unknown";
-    let failure = EventLogRecord::new(AdmittedEvent::ServiceFailure, code);
-    assert_eq!(failure.event(), AdmittedEvent::ServiceFailure);
-    assert_eq!(failure.insertion(), code);
-    assert_eq!(failure.original_bytes(), code.len());
-    assert!(!failure.truncated());
-    assert_eq!(
-        failure.mapping(),
-        (EVENT_LOG_SOURCE, AdmittedEvent::ServiceFailure.event_id(), EventLogSeverity::Error)
-    );
-    // An unbounded positive claim cannot ride the sink either: the insertion
-    // is bounded with an honest byte account, so a claim the platform had to
-    // shorten can never read as a whole verified one.
-    let oversized = "host.phase-b rollback backup cleanup completed "
-        .repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
-    let bounded = EventLogRecord::new(AdmittedEvent::ServiceFailure, &oversized);
-    assert_eq!(bounded.original_bytes(), oversized.len());
-    assert!(bounded.truncated());
-    assert!(
-        bounded.insertion().len() <= EVENT_LOG_MAX_INSERTION_BYTES,
-        "the retained prefix must stay inside the sink bound, got {}",
-        bounded.insertion().len()
-    );
-    // Supplementary emission binding only: the executed proof above is
-    // production's own admission decision. This ties that decision to the
-    // owner's three frozen positive labels, which no integration target can
-    // emit because the owner is unreachable from here.
+    // Supplementary owner binding: the three positive claims the reachable gate
+    // denies above are the owner's own frozen labels, taken from the closed
+    // `RollbackContour` projection the owner renders its records from.
     let owner = src("src/phase_b_materialization/rollback_backup.rs");
-    for label in ROLLBACK_POSITIVE_CLAIMS {
+    let labels: Vec<&str> = owner_contour_labels(&owner)
+        .iter()
+        .map(|pair| pair.1.as_str())
+        .collect();
+    for positive in ROLLBACK_POSITIVE_CLAIMS {
         assert!(
-            owner.contains(&format!("\"{label}\"")),
-            "the rollback owner must still name its positive label {label:?}"
+            labels.contains(&positive),
+            "the rollback owner must still publish its positive label {positive:?}"
         );
     }
 }
 
 /// Executed case, audit 5909832545 required item 5, second obligation:
-/// rollback restoration and rollback-by-removal are distinguishable records.
+/// rollback restoration, rollback-by-removal and sidecar cleanup stay distinct
+/// records.
 ///
-/// Executed against the reachable production vocabularies. A closed vocabulary
-/// whose members collapsed into one shared label would make two outcomes
-/// indistinguishable again, so each member must own exactly one distinct frozen
-/// name; this drives `HostRequestEvidence::as_str`, `AdmittedEvent::as_str`,
-/// `event_id` and `severity` - production functions - and compares what they
-/// actually return. The owner-label inventory below is supplementary emission
-/// binding: the removal and cleanup contours are private to
-/// `mod phase_b_materialization`, so their records cannot be produced from this
-/// target, but the three contour families must stay pairwise distinct and a
-/// removal or cleanup record must never read as a restoration.
+/// The reachable `HostRequestEvidence` / `AdmittedEvent` vocabularies are
+/// frozen and unchanged by #980, so restating their pairwise distinctness here
+/// would be evidence for nothing this issue changed and is not claimed. What
+/// #980 changed is the rollback owner's emitted vocabulary, and that IS bound:
+/// the closed `RollbackContour` label projection the owner renders every
+/// rollback record from is read from the owner itself, checked to be closed and
+/// pairwise distinct, checked against the owner's own emission sites, and
+/// checked so that a restoration claim can belong to no other contour.
+///
+/// Named ceiling: `phase_b_restore_or_remove` and
+/// `phase_b_remove_rollback_backup` are unreachable from an integration-test
+/// crate, so no rollback record is produced here. The executed proof that those
+/// three contours stay distinct on real inputs is `mod rollback_contour_tests`
+/// beside the owner.
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the reachable vocabulary distinctness matrix and the three owner contour families stay in one deterministic probe"
-)]
 fn projection_08_restoration_removal_and_cleanup_contours_stay_distinct_records() {
-    let evidence = [
-        HostRequestEvidence::Observed,
-        HostRequestEvidence::Admitted,
-        HostRequestEvidence::ProcessStarted,
-        HostRequestEvidence::SemanticallyReady,
-        HostRequestEvidence::DurableCommitted,
-        HostRequestEvidence::Cancelled,
-        HostRequestEvidence::Failed,
-        HostRequestEvidence::Unknown,
-    ];
-    for (index, left) in evidence.iter().enumerate() {
-        for right in &evidence[index + 1..] {
-            assert_ne!(
-                left.as_str(),
-                right.as_str(),
-                "two reachable evidence classes share one name: a catch-all label would make an unknown outcome indistinguishable from a proven one"
-            );
-        }
-    }
-    let events = [
-        AdmittedEvent::ServiceStart,
-        AdmittedEvent::ServiceStop,
-        AdmittedEvent::ServiceFailure,
-    ];
-    for (index, left) in events.iter().enumerate() {
-        for right in &events[index + 1..] {
-            assert_ne!(left.as_str(), right.as_str(), "two admitted events share one name");
-            assert_ne!(
-                left.event_id(),
-                right.event_id(),
-                "two admitted events share one event id"
-            );
-        }
-    }
-    // Start and stop are both informational notices; only failure is an error,
-    // and the severity names stay distinct so a reader can tell them apart.
-    assert_eq!(
-        AdmittedEvent::ServiceStart.severity(),
-        AdmittedEvent::ServiceStop.severity()
-    );
-    for informational in [
-        AdmittedEvent::ServiceStart.severity(),
-        AdmittedEvent::ServiceStop.severity(),
-    ] {
-        assert_ne!(informational, AdmittedEvent::ServiceFailure.severity());
-        assert_eq!(informational.as_str(), "information");
-    }
-    assert_eq!(AdmittedEvent::ServiceFailure.severity().as_str(), "error");
-    // A rollback outcome can never be smuggled in as an event name: the two
-    // reachable closed vocabularies are disjoint.
-    for outcome in evidence {
-        for event in events {
-            assert_ne!(
-                outcome.as_str(),
-                event.as_str(),
-                "an outcome class and an admitted event share one name"
-            );
-        }
-    }
-    // Supplementary emission binding: the owner's three contour families.
-    // Rollback-by-restoration, rollback-by-removal of an uncommitted
-    // destination, and sidecar cleanup each own distinct frozen labels, and the
-    // removal family - which was completely silent before this issue - is named
-    // here in full.
     let owner = src("src/phase_b_materialization/rollback_backup.rs");
-    let restoration = [
-        "host.phase-b rollback restore requested",
-        "host.phase-b rollback restored verified",
-    ];
-    let removal = [
-        "host.phase-b rollback uncommitted removal requested",
-        "host.phase-b rollback uncommitted removal verified",
-        "host.phase-b rollback uncommitted removal not required",
-        "host.phase-b rollback uncommitted removal delete failed",
-        "host.phase-b rollback uncommitted removal absence unproven",
-        "host.phase-b rollback uncommitted removal absence unknown",
-    ];
-    let cleanup = [
-        "host.phase-b rollback backup cleanup requested",
-        "host.phase-b rollback backup cleanup completed",
-        "host.phase-b rollback backup cleanup delete failed",
-        "host.phase-b rollback backup cleanup path failed",
-        "host.phase-b rollback backup cleanup absence unproven",
-    ];
-    let owner_labels: Vec<&str> = restoration
-        .iter()
-        .chain(removal.iter())
-        .chain(cleanup.iter())
-        .copied()
-        .collect();
-    for label in &owner_labels {
-        assert!(
-            owner.contains(&format!("\"{label}\"")),
-            "the rollback owner must name {label:?}"
-        );
-    }
-    for (index, left) in owner_labels.iter().enumerate() {
-        for right in &owner_labels[index + 1..] {
-            assert_ne!(
-                left, right,
-                "two rollback contours share one label, so their records are indistinguishable"
+    let production = owner.split("#[cfg(test)]").next().unwrap_or(owner.as_str());
+    let labels = owner_contour_labels(&owner);
+    // Closed and pairwise distinct: two contours sharing one label would make
+    // their records indistinguishable again, which is what a re-added catch-all
+    // disposition would do.
+    let mut published: Vec<&str> = labels.iter().map(|pair| pair.1.as_str()).collect();
+    let total = published.len();
+    published.sort_unstable();
+    published.dedup();
+    assert_eq!(
+        published.len(),
+        total,
+        "two rollback contours share one emitted label: {labels:?}"
+    );
+    // Every declared contour is actually published, and no publication names a
+    // contour the label projection does not define. `phase_b_remove_rollback_backup`
+    // carried no observation at all before #980; this is the check that stays
+    // red if a contour becomes declared-but-unpublished again.
+    let mut emitters = typed_discriminants(production, "RollbackContour");
+    emitters.sort();
+    emitters.dedup();
+    let mut observed = emitters;
+    let mut declared: Vec<String> = labels.iter().map(|(contour, _)| contour.clone()).collect();
+    declared.sort();
+    declared.dedup();
+    assert_eq!(
+        observed, declared,
+        "every declared rollback contour must be published, and every publication must name a declared contour"
+    );
+    // The three contour families the issue separated. The removal family - which
+    // was completely silent before - is named here in full, beside the
+    // restoration and cleanup families.
+    let values: Vec<&str> = labels.iter().map(|pair| pair.1.as_str()).collect();
+    for family in [
+        &[
+            "host.phase-b rollback restore requested",
+            "host.phase-b rollback restored verified",
+        ][..],
+        &[
+            "host.phase-b rollback uncommitted removal requested",
+            "host.phase-b rollback uncommitted removal verified",
+            "host.phase-b rollback uncommitted removal not required",
+            "host.phase-b rollback uncommitted removal delete failed",
+            "host.phase-b rollback uncommitted removal absence unproven",
+            "host.phase-b rollback uncommitted removal absence unknown",
+        ][..],
+        &[
+            "host.phase-b rollback backup cleanup requested",
+            "host.phase-b rollback backup cleanup completed",
+            "host.phase-b rollback backup cleanup delete failed",
+            "host.phase-b rollback backup cleanup path failed",
+            "host.phase-b rollback backup cleanup absence unproven",
+        ][..],
+    ] {
+        for label in family {
+            assert!(
+                values.contains(label),
+                "the rollback owner must publish {label:?}"
             );
         }
     }
-    // A removal or cleanup record can never be read as a restoration: the
-    // positive restoration phrase appears in no other contour label.
-    for label in removal.iter().chain(cleanup.iter()) {
-        assert!(
-            !label.contains("restored verified"),
-            "the non-restoration contour {label:?} claims a restoration"
-        );
+    // A removal or cleanup record can never read as a restoration: over the
+    // owner's OWN emitted labels, the verified-restoration phrase belongs to the
+    // restoration contour alone.
+    for (contour, label) in &labels {
+        if label.contains("restored verified") {
+            assert_eq!(
+                *label, "host.phase-b rollback restored verified",
+                "only the restoration contour may claim a verified restoration, but {contour:?} does"
+            );
+        }
     }
 }
 
 /// Executed case, audit 5909832545 required item 5, third and fourth
-/// obligations: sidecar cleanup is observable, and an unknown or failed
-/// outcome is never logged as restored.
+/// obligations: the sidecar cleanup disposition is observable, and an unknown
+/// or failed outcome is never logged as removed.
 ///
-/// `phase_b_remove_rollback_backup` had no observation at all before this
-/// issue. It is `pub(super)` inside the private rollback leaf, so this target
-/// cannot drive it; what it CAN drive is the canonical bounded Event Log
-/// disposition observer the audit names as the replacement for the stale
-/// no-op wrappers (`host_diagnostics::note_event_log_sink_status`). This case
-/// captures what that production observer actually wrote and asserts the
-/// disposition record names the unavailable sink, owns no terminal, and carries
-/// no rollback positive claim - so the cleanup disposition that production
-/// emits on the reachable surface can never read as a verified removal, a
-/// verified restoration, or a completed cleanup.
+/// `phase_b_remove_rollback_backup` had no observation at all before #980. The
+/// owner is unreachable from an integration target, so what this case drives is
+/// the reachable disposition production really records when it routes a failed
+/// Host request to the sink: `observe_host_request` reaches
+/// `publish_projected_event_log_record`, and production emits its own
+/// `host.event_log_admission` decision. The case asserts on that record only:
+/// production reports the not-started rejection instead of claiming the sink
+/// carried anything, names no terminal, carries no rollback contour detail, and
+/// states no removal, restoration or cleanup claim.
+///
+/// Named ceiling: the cleanup contour's own runtime dispositions are not
+/// executed here; the owner's label projection is bound below and
+/// `mod rollback_contour_tests` beside the owner drives the cleanup path with
+/// real deletions.
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the canonical disposition observation and the owner cleanup contour inventory stay in one deterministic probe"
+    reason = "the reachable sink disposition record and the owner cleanup contour inventory stay in one deterministic probe"
 )]
 fn projection_09_sidecar_cleanup_disposition_is_observable_and_claims_no_removal() {
-    let note = emit(note_event_log_sink_status);
-    if event_log_sink_status().is_ok() {
-        assert!(
-            note.is_empty(),
-            "a live sink needs no unavailability note, got: {note}"
+    let capture = emit(|| {
+        observe_host_request(
+            &HostRequestProjection::failed_without_reason(EntrypointStage::ScmDispatch)
+                .with_operation(AdmittedEvent::ServiceFailure),
         );
-    } else {
-        assert!(
-            note.contains("host.event_log_sink_unavailable"),
-            "the canonical disposition observer must record the sink disposition: {note}"
-        );
-        assert!(
-            !note.contains("host.terminal_error"),
-            "a sink disposition is not a terminal: {note}"
-        );
-        assert!(
-            !note.contains("host.entrypoint_stage"),
-            "the canonical disposition observer is not an entrypoint stage: {note}"
-        );
-        for positive in ROLLBACK_POSITIVE_CLAIMS {
-            assert!(
-                !note.contains(positive),
-                "the sink disposition record claimed {positive:?}: {note}"
-            );
-        }
-    }
-    // The positive claims stay inadmissible for every unproven outcome, which
-    // is the property that keeps an unknown cleanup out of the record history
-    // as a removal.
+    });
+    assert_eq!(
+        count(&capture, "host.event_log_admission"),
+        1,
+        "the reachable surface must record its sink disposition exactly once: {capture}"
+    );
+    // Production's own admission disposition. Only `main` starts the Event Log
+    // producer, so in this process production must report the not-started
+    // rejection rather than claim the sink accepted anything - even where the
+    // #984 port itself is live.
+    assert!(
+        capture.contains(&format!(
+            "outcome=\"{}\"",
+            (EventLogAdmission::RejectedNotStarted { dropped_total: 0 }).as_str()
+        )),
+        "the admission outcome must be the one production decided: {capture}"
+    );
+    assert!(
+        capture.contains("dropped_total=0"),
+        "no drop may be counted before the producer exists: {capture}"
+    );
+    assert!(
+        capture.contains(&format!(
+            "operation=\"{}\"",
+            AdmittedEvent::ServiceFailure.as_str()
+        )),
+        "the admitted operation must be the one production names: {capture}"
+    );
+    assert!(
+        capture.contains(&format!(
+            "evidence=\"{}\"",
+            HostRequestEvidence::Failed.as_str()
+        )),
+        "the evidence class must be the one production projects: {capture}"
+    );
+    // The disposition record names where the record stayed and nothing else:
+    // no terminal, no entrypoint stage, no rollback contour detail, and no
+    // positive rollback claim riding along with a failure.
+    assert!(
+        !capture.contains("host.terminal_error"),
+        "a sink disposition is not a terminal: {capture}"
+    );
+    assert!(
+        !capture.contains("host.entrypoint_stage"),
+        "the canonical disposition observer is not an entrypoint stage: {capture}"
+    );
+    assert!(
+        !capture.contains("host.phase-b"),
+        "a sink disposition carries no rollback contour detail: {capture}"
+    );
     for positive in ROLLBACK_POSITIVE_CLAIMS {
-        for evidence in [
-            HostRequestEvidence::Observed,
-            HostRequestEvidence::Admitted,
-            HostRequestEvidence::SemanticallyReady,
-            HostRequestEvidence::Cancelled,
-            HostRequestEvidence::Unknown,
-            HostRequestEvidence::Failed,
-        ] {
-            for event in [
-                AdmittedEvent::ServiceStart,
-                AdmittedEvent::ServiceStop,
-                AdmittedEvent::ServiceFailure,
-            ] {
-                assert!(
-                    !event.is_admitted_by(evidence),
-                    "{} still admits {} while the outcome is {}",
-                    event.as_str(),
-                    positive,
-                    evidence.as_str()
-                );
-            }
-        }
+        assert!(
+            !capture.contains(positive),
+            "the sink disposition record claimed {positive:?}: {capture}"
+        );
     }
-    // Supplementary emission binding: the cleanup contour is no longer silent
-    // and states its own explicit non-success dispositions beside the positive
-    // one, so a failed or undetermined cleanup cannot read as a completion.
+    // Owner binding: the cleanup contour is no longer silent and states its own
+    // explicit non-success dispositions beside the positive one, so a failed or
+    // undetermined cleanup cannot read as a completion. The family is read out
+    // of the owner's own closed label projection.
     let owner = src("src/phase_b_materialization/rollback_backup.rs");
-    for label in [
-        "host.phase-b rollback backup cleanup requested",
-        "host.phase-b rollback backup cleanup completed",
-        "host.phase-b rollback backup cleanup delete failed",
-        "host.phase-b rollback backup cleanup path failed",
-        "host.phase-b rollback backup cleanup absence unproven",
+    let labels = owner_contour_labels(&owner);
+    let cleanup: Vec<&str> = labels
+        .iter()
+        .filter(|pair| pair.1.starts_with("host.phase-b rollback backup cleanup"))
+        .map(|pair| pair.1.as_str())
+        .collect();
+    for disposition in [
+        "requested",
+        "completed",
+        "delete failed",
+        "path failed",
+        "absence unproven",
     ] {
         assert!(
-            owner.contains(&format!("\"{label}\"")),
-            "the sidecar cleanup contour must name {label:?}"
+            cleanup.iter().any(|label| label.ends_with(disposition)),
+            "the sidecar cleanup contour must name its {disposition} disposition: {cleanup:?}"
         );
+    }
+    let mut distinct = cleanup.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        cleanup.len(),
+        "two cleanup dispositions share one label: {cleanup:?}"
+    );
+    for (contour, label) in &labels {
+        if label.starts_with("host.phase-b rollback backup cleanup") {
+            assert!(
+                !label.contains("restored verified") && !label.contains("uncommitted removal"),
+                "a cleanup disposition must never read as a restoration or a removal: {contour:?}"
+            );
+        }
     }
 }
