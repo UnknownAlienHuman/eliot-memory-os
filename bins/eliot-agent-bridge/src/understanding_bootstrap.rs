@@ -23,13 +23,18 @@
 //! the Governor-owned `TaskSelectionEvidence` where they overlap so the
 //! projection stays comparable without duplicating that contract.
 
+use eliot_agent_bridge_core::AttachBinding;
 use eliot_context_contracts::{MeasurementStatus, SerializedContextMeasurement};
-use eliot_governor::ColdStartSurfaceView;
+use eliot_governor::{
+    ColdStartOwnerBootstrapReadback, ColdStartSurfaceView, CurrentTaskSelection,
+};
+use eliot_contracts::fences_match_exact;
 use eliot_integration_coverage::{
     EventCompleteness, EventDisposition, GovernanceProfile, IntegrationCoverageProfile,
     LogicalEvent,
 };
-use eliot_workscope::TaskBindingState;
+pub use eliot_workscope::{BootDelta, MAX_BOOT_DELTA_HANDLES};
+use eliot_workscope::{OnboardingLease, OnboardingReadinessReceipt, TaskBindingState};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -50,10 +55,303 @@ pub const MAX_CANDIDATE_HANDLES: usize = 16;
 pub const MAX_HANDLES: usize = 32;
 /// Maximum limiting integration evidence handles.
 pub const MAX_EVIDENCE_HANDLES: usize = 8;
-/// Maximum changed handles carried in one bounded boot delta preview.
-pub const MAX_BOOT_DELTA_HANDLES: usize = 16;
 /// Maximum length of one opaque handle or reference.
 pub const MAX_HANDLE_LEN: usize = 256;
+
+/// One typed current `TaskContract` selection returned by the live Governor
+/// owner. This is used only for a direct owner-result join; callers must not
+/// construct it from a host selection string or a prior bootstrap.
+pub type OwnerCurrentTaskSelection = CurrentTaskSelection;
+
+/// Exact owner values joined before a #8 compiled-surface bootstrap can be
+/// retained as current. The owner readback and delta arrive in one Governor
+/// response; the bridge adds its retained authenticated attach binding and
+/// live task/profile observations.
+pub struct OwnerCompiledSurfaceInput<'a> {
+    /// Single validated owner readback containing the original ORS terminal
+    /// bytes and the owner-issued boot delta.
+    pub owner_bootstrap: &'a ColdStartOwnerBootstrapReadback,
+    /// Live attach binding retained by the bridge transport.
+    pub attach_binding: &'a AttachBinding,
+    /// Current TaskContract owner result, absent only for a non-current
+    /// selection state such as no task, ambiguity, or exploratory work.
+    pub current_selection: Option<&'a OwnerCurrentTaskSelection>,
+    /// Current integration coverage. Missing remains unknown and cannot make
+    /// a READY_MATERIAL response pass this admission.
+    pub coverage: Option<&'a IntegrationCoverageProfile>,
+    /// Current Governor-derived profile. Missing remains unknown.
+    pub governance_profile: Option<&'a GovernanceProfile>,
+}
+
+/// Private-field proof that one exact Governor readback is bound to the live
+/// bridge attach and its current owner task/profile values.
+#[derive(Clone, Debug)]
+pub struct OwnerCompiledSurfaceEvidence {
+    owner_bootstrap: ColdStartOwnerBootstrapReadback,
+    attach_binding: AttachBinding,
+    current_selection: Option<OwnerCurrentTaskSelection>,
+    governance: Option<GovernanceEvidence>,
+}
+
+impl OwnerCompiledSurfaceEvidence {
+    /// The exact owner surface retained by the original ORS terminal.
+    #[must_use]
+    pub const fn surface(&self) -> &ColdStartSurfaceView {
+        &self.owner_bootstrap.readback.surface
+    }
+
+    /// The exact boot delta returned beside the owner readback.
+    #[must_use]
+    pub const fn boot_delta(&self) -> &BootDelta {
+        &self.owner_bootstrap.delta
+    }
+
+    /// The live authenticated bridge attach binding used for this join.
+    #[must_use]
+    pub const fn attach_binding(&self) -> &AttachBinding {
+        &self.attach_binding
+    }
+
+    /// The exact owner task-contract selection, if one applies.
+    #[must_use]
+    pub const fn current_selection(&self) -> Option<&OwnerCurrentTaskSelection> {
+        self.current_selection.as_ref()
+    }
+
+    /// The actual paired owner profiles, absent when the owner returned them
+    /// unknown. Material admission requires the pair.
+    #[must_use]
+    pub const fn governance(&self) -> Option<&GovernanceEvidence> {
+        self.governance.as_ref()
+    }
+
+    /// The complete exact owner response, including the raw ORS row and
+    /// decoded receipt projection.
+    #[must_use]
+    pub const fn owner_bootstrap(&self) -> &ColdStartOwnerBootstrapReadback {
+        &self.owner_bootstrap
+    }
+}
+
+/// Validates the exact Governor owner response against the live attach and
+/// joins its real task, coverage, governance and boot-delta evidence.
+///
+/// This is the only path that creates [`OwnerCompiledSurfaceEvidence`]. It
+/// validates the original stored ORS terminal digest/bytes before decoding,
+/// keeps the canonical claim/lease bytes intact, checks the receipt against
+/// the projected compiled surface, compares the complete typed state fence
+/// with the retained live attach, and rechecks a current task against the
+/// owner-returned revision/digest/fence. Unknown profiles remain unknown for
+/// non-material readiness; READY_MATERIAL requires all W5 owner legs.
+pub fn admit_owner_compiled_surface(
+    input: &OwnerCompiledSurfaceInput<'_>,
+) -> Result<OwnerCompiledSurfaceEvidence, BootstrapError> {
+    let owner = &input.owner_bootstrap.readback;
+    owner
+        .record
+        .validate()
+        .map_err(|error| BootstrapError::new("BOOTSTRAP_OWNER_TERMINAL_INVALID", error.to_string()))?;
+    owner
+        .lease
+        .validate()
+        .map_err(|error| BootstrapError::new("BOOTSTRAP_OWNER_LEASE_INVALID", error.to_string()))?;
+    owner
+        .receipt
+        .validate()
+        .map_err(|error| BootstrapError::new("BOOTSTRAP_OWNER_RECEIPT_INVALID", error.to_string()))?;
+
+    if owner.record.claim.lease_ref != owner.lease.lease_ref
+        || owner.record.claim.lease_deadline != owner.lease.deadline
+    {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_LEASE_MISMATCH",
+            "owner lease projection differs from the exact validated ORS claim",
+        ));
+    }
+    let retained_lease: OnboardingLease = serde_json::from_str(&owner.record.claim.lease_bytes)
+        .map_err(|error| {
+            BootstrapError::new(
+                "BOOTSTRAP_OWNER_LEASE_BYTES_INVALID",
+                format!("original owner claim lease bytes are invalid: {error}"),
+            )
+        })?;
+    if retained_lease != owner.lease {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_LEASE_MISMATCH",
+            "decoded original claim lease bytes differ from the owner lease projection",
+        ));
+    }
+    let terminal = owner.record.terminal.as_ref().ok_or_else(|| {
+        BootstrapError::new(
+            "BOOTSTRAP_OWNER_TERMINAL_MISSING",
+            "owner record has no committed readiness terminal",
+        )
+    })?;
+    if terminal.receipt_ref != owner.receipt.receipt_ref
+        || terminal.receipt_revision != owner.receipt.receipt_revision
+    {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_RECEIPT_MISMATCH",
+            "decoded receipt does not name the exact owner terminal identity",
+        ));
+    }
+    let retained_receipt: OnboardingReadinessReceipt =
+        serde_json::from_str(&terminal.receipt_bytes).map_err(|error| {
+            BootstrapError::new(
+                "BOOTSTRAP_OWNER_RECEIPT_BYTES_INVALID",
+                format!("original owner terminal receipt bytes are invalid: {error}"),
+            )
+        })?;
+    if retained_receipt != owner.receipt {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_RECEIPT_MISMATCH",
+            "decoded owner receipt differs from the exact original terminal receipt bytes",
+        ));
+    }
+
+    let surface = &owner.surface;
+    let receipt = &owner.receipt;
+    if surface.receipt_ref != receipt.receipt_ref
+        || surface.lease_ref != receipt.lease_ref
+        || surface.principal_ref != receipt.principal_ref
+        || surface.session_ref != receipt.session_ref
+        || surface.scope != receipt.scope
+        || surface.scope_descriptor_revision != receipt.scope_descriptor_revision
+        || surface.instance != receipt.instance
+        || surface.lineage != receipt.lineage
+        || surface.task_binding != receipt.task_binding
+        || surface.state_fence != receipt.state_fence
+        || surface.governing_source_set_ref != receipt.governing_source_set_ref
+        || surface.governing_source_generation != receipt.governing_source_generation
+        || surface.governance_profile_ref != receipt.governance_profile_ref
+        || surface.limiting_integration_evidence != receipt.limiting_integration_evidence
+        || surface.route_profile_ref != receipt.route_profile_ref
+        || surface.serializer_id != receipt.serializer_id
+        || surface.serializer_version != receipt.serializer_version
+        || surface.serializer_options_digest != receipt.serializer_options_digest
+        || surface.tokenizer_id != receipt.tokenizer_id
+        || surface.tokenizer_version != receipt.tokenizer_version
+        || surface.tokenizer_hash != receipt.tokenizer_hash
+        || surface.lease_deadline != receipt.expiry_tick
+        || surface.receipt_revision != receipt.receipt_revision
+        || surface.projection_source_ref != receipt.projection_source_ref
+        || surface.projection_generation != receipt.projection_generation
+    {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_SURFACE_MISMATCH",
+            "compiled surface projection differs from the exact terminal owner receipt",
+        ));
+    }
+    if !fences_match_exact(&surface.state_fence, input.attach_binding.state_fence())
+        || surface.principal_ref != input.attach_binding.principal_id().as_str()
+        || surface.session_ref != input.attach_binding.session_id().as_str()
+        || surface.scope.scope_ref != input.attach_binding.task_binding().work_scope_id()
+        || surface.state_fence.task_revision.is_some_and(|revision| {
+            revision.value().to_string() != input.attach_binding.task_binding().task_revision()
+        })
+    {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_OWNER_BINDING_MISMATCH",
+            "owner surface principal/session/scope/task fence differs from the exact live attach binding",
+        ));
+    }
+
+    match &receipt.task_binding {
+        TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            ..
+        } => {
+            let current = input.current_selection.ok_or_else(|| {
+                BootstrapError::new(
+                    "BOOTSTRAP_CURRENT_SELECTION_MISSING",
+                    "READY_MATERIAL receipt has no current TaskContract owner read",
+                )
+            })?;
+            if current.task_ref != *task_ref
+                || current.task_revision != *task_revision
+                || current.acceptance_digest != *acceptance_digest
+                || current.work_scope_ref != receipt.scope.scope_ref
+                || !fences_match_exact(&current.state_fence, &surface.state_fence)
+                || current.task_ref != input.attach_binding.task_binding().task_id().as_str()
+                || current.task_revision.to_string()
+                    != input.attach_binding.task_binding().task_revision()
+            {
+                return Err(BootstrapError::new(
+                    "BOOTSTRAP_CURRENT_SELECTION_STALE",
+                    "live TaskContract owner read differs from the exact terminal selection or attach fence",
+                ));
+            }
+        }
+        TaskBindingState::None_
+        | TaskBindingState::Ambiguous { .. }
+        | TaskBindingState::Exploratory { .. }
+        | TaskBindingState::Stale { .. } => {
+            if input.current_selection.is_some() {
+                return Err(BootstrapError::new(
+                    "BOOTSTRAP_CURRENT_SELECTION_CONFLICT",
+                    "live current TaskContract owner read contradicts the terminal selection state",
+                ));
+            }
+            if receipt.readiness == eliot_workscope::ReadinessLifecycle::ReadyMaterial {
+                return Err(BootstrapError::new(
+                    "BOOTSTRAP_TASK_SELECTION_REQUIRED",
+                    "READY_MATERIAL receipt does not carry one current TaskContract selection",
+                ));
+            }
+        }
+    }
+
+    let governance = match (input.coverage, input.governance_profile) {
+        (Some(coverage), Some(profile)) => {
+            let evidence = GovernanceEvidence::from_owner_profiles(coverage, profile)?;
+            if coverage.fingerprint != surface.governance_profile_ref
+                || evidence.limiting_integration_evidence != surface.limiting_integration_evidence
+            {
+                return Err(BootstrapError::new(
+                    "BOOTSTRAP_GOVERNANCE_OWNER_MISMATCH",
+                    "owner coverage/governance profile differs from the exact receipt profile references",
+                ));
+            }
+            Some(evidence)
+        }
+        (None, None) if receipt.readiness != eliot_workscope::ReadinessLifecycle::ReadyMaterial => {
+            None
+        }
+        (None, None) => {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_GOVERNANCE_UNKNOWN",
+                "READY_MATERIAL receipt has no current owner coverage and governance profiles",
+            ));
+        }
+        _ => {
+            return Err(BootstrapError::new(
+                "BOOTSTRAP_GOVERNANCE_INCOMPLETE",
+                "coverage and derived governance profile must be present together",
+            ));
+        }
+    };
+
+    input
+        .owner_bootstrap
+        .delta
+        .validate(receipt.receipt_revision)
+        .map_err(|error| BootstrapError::new(error.code, error.detail))?;
+    if input.owner_bootstrap.delta.expansion_handle != receipt.receipt_ref {
+        return Err(BootstrapError::new(
+            "BOOTSTRAP_DELTA_EXPANSION_MISMATCH",
+            "delta expansion handle must name the exact owner receipt that contains its full content",
+        ));
+    }
+
+    Ok(OwnerCompiledSurfaceEvidence {
+        owner_bootstrap: input.owner_bootstrap.clone(),
+        attach_binding: input.attach_binding.clone(),
+        current_selection: input.current_selection.cloned(),
+        governance,
+    })
+}
 
 /// Deterministic task-selection outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -270,85 +568,6 @@ impl GovernanceEvidence {
             governance_profile: profile.clone(),
             limiting_integration_evidence: gaps,
         })
-    }
-}
-
-/// Bounded boot delta carried alongside the readiness surface (I7.8 step 4,
-/// issue #1746 W5).
-///
-/// A boot delta is additive only. It names the readiness receipt revision it is
-/// relative to and the owner-issued handles that changed, plus one expansion
-/// handle for the full delta; it never replaces the required selection,
-/// authority, or recovery information, which [`validate_context`] still demands
-/// in full. Budgeting the preview to a bounded handle list therefore cannot drop
-/// the floor: the expanded delta sits behind the handle while the floor stays
-/// inline.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootDelta {
-    /// Readiness receipt revision the last delivered bootstrap carried. `None`
-    /// for the first bootstrap of a session, where there is nothing to delta
-    /// against; it is never defaulted to zero.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_receipt_revision: Option<u64>,
-    /// Receipt revision this delta moves to.
-    pub receipt_revision: u64,
-    /// Bounded owner-issued change handles.
-    #[serde(default)]
-    pub changed_handles: Vec<String>,
-    /// Bounded owner handle that expands the full delta.
-    pub expansion_handle: String,
-}
-
-impl BootDelta {
-    /// Validates the delta's own shape and its relationship to the readiness
-    /// surface it accompanies.
-    ///
-    /// # Errors
-    ///
-    /// Returns `BOOT_DELTA_REVISION_MISSING` for a zero revision,
-    /// `BOOT_DELTA_REVISION_STALE` when the delta does not move the receipt
-    /// forward from the revision it names, `BOOT_DELTA_EXPANSION_MISSING` for a
-    /// blank or over-long expansion handle, and `BOOT_DELTA_BOUND` for a
-    /// changed-handle list that is not bounded.
-    pub fn validate(&self, receipt_revision: u64) -> Result<(), BootstrapError> {
-        if self.receipt_revision == 0 {
-            return Err(BootstrapError::new(
-                "BOOT_DELTA_REVISION_MISSING",
-                "boot delta carries a zero readiness receipt revision",
-            ));
-        }
-        if self.receipt_revision != receipt_revision {
-            return Err(BootstrapError::new(
-                "BOOT_DELTA_REVISION_STALE",
-                "boot delta names another readiness receipt revision than the surface it accompanies",
-            ));
-        }
-        if let Some(previous) = self.previous_receipt_revision
-            && previous >= self.receipt_revision
-        {
-            return Err(BootstrapError::new(
-                "BOOT_DELTA_REVISION_STALE",
-                "boot delta does not move the readiness receipt forward",
-            ));
-        }
-        if self.expansion_handle.trim().is_empty() {
-            return Err(BootstrapError::new(
-                "BOOT_DELTA_EXPANSION_MISSING",
-                "boot delta must carry a non-blank expansion handle",
-            ));
-        }
-        if self.expansion_handle.len() > MAX_HANDLE_LEN {
-            return Err(BootstrapError::new(
-                "BOOT_DELTA_EXPANSION_MISSING",
-                "boot delta expansion handle exceeds bound",
-            ));
-        }
-        bounded_list(
-            &self.changed_handles,
-            "BOOT_DELTA_BOUND",
-            MAX_BOOT_DELTA_HANDLES,
-        )
     }
 }
 
@@ -773,7 +992,8 @@ pub(crate) fn validate_task_inputs_match_surface(
     };
     let exact_task_candidate = |task_ref: &str,
                                 task_revision: u64,
-                                acceptance_digest: &str|
+                                acceptance_digest: &str,
+                                selection: Option<(&str, &str)>|
      -> Result<(), BootstrapError> {
         if tasks.scope_level != ScopeLevel::Task
             || tasks.candidates.len() != 1
@@ -786,11 +1006,18 @@ pub(crate) fn validate_task_inputs_match_surface(
         {
             return Err(task_mismatch());
         }
-        if tasks.authoritative_selection.is_some() {
-            return Err(BootstrapError::new(
-                "BOOTSTRAP_SELECTION_PROVENANCE_UNAVAILABLE",
-                "compiled owner task binding carries no authenticated selection source or reason for caller-provided authoritative selection",
-            ));
+        match (selection, tasks.authoritative_selection.as_ref()) {
+            (Some((owner_source, owner_evidence)), Some(presented))
+                if presented.selected_handle == task_ref
+                    && presented.source == owner_source
+                    && presented.reason == owner_evidence => {}
+            (None, None) => {}
+            _ => {
+                return Err(BootstrapError::new(
+                    "BOOTSTRAP_SELECTION_PROVENANCE_MISMATCH",
+                    "task selection source and evidence must exactly match the compiled owner receipt",
+                ));
+            }
         }
         Ok(())
     };
@@ -800,13 +1027,19 @@ pub(crate) fn validate_task_inputs_match_surface(
             task_ref,
             task_revision,
             acceptance_digest,
-            ..
-        }
-        | TaskBindingState::Exploratory {
+            selection_source_ref,
+            evidence_ref,
+        } => exact_task_candidate(
+            task_ref,
+            *task_revision,
+            acceptance_digest,
+            Some((selection_source_ref, evidence_ref)),
+        ),
+        TaskBindingState::Exploratory {
             task_ref,
             task_revision,
             acceptance_digest,
-        } => exact_task_candidate(task_ref, *task_revision, acceptance_digest),
+        } => exact_task_candidate(task_ref, *task_revision, acceptance_digest, None),
         TaskBindingState::Ambiguous { candidate_handles } => {
             if tasks.scope_level != ScopeLevel::Task
                 || candidate_handles.len() < 2
@@ -1274,7 +1507,9 @@ fn validate_context(context: &BootstrapContext) -> Result<(), BootstrapError> {
         MAX_EVIDENCE_HANDLES,
     )?;
     if let Some(delta) = &context.boot_delta {
-        delta.validate(context.receipt_revision)?;
+        delta
+            .validate(context.receipt_revision)
+            .map_err(|error| BootstrapError::new(error.code, error.detail))?;
     }
     validate_governance(&context.governance)
 }

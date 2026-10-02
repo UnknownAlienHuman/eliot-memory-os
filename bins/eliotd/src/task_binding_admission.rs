@@ -2033,6 +2033,260 @@ pub struct MaterialBootstrap {
     pub projection_generation: u64,
 }
 
+/// Complete owner evidence retained from attach through the task-bound
+/// dispatch boundary (issue #1746, W4/W5/W6).
+///
+/// This carrier owns the original attach tuple and the exact ORS row read back
+/// for its full claim. In particular, it retains the claim's canonical lease
+/// bytes and the terminal's original receipt bytes/digest; it never recreates
+/// a readiness claim from a subset of lease fields or synthesizes a terminal.
+/// The operation identity is carried alongside that owner evidence so a
+/// dispatch retry cannot silently adopt a newer selection or bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerBoundBootstrap {
+    /// Original full attach tuple, including the original claim and lease.
+    attach: ColdStartAttachInput,
+    /// Exact validated ORS row read back for attach.readiness_claim.
+    /// Its terminal receipt bytes and digest remain the owner-provided values.
+    owner_record: ColdStartReadinessOrsRecord,
+    /// Stable identity of the operation admitted against this bootstrap.
+    operation_id: String,
+    /// Bounded typed task/intake/bootstrap outcome for the same owner record.
+    bootstrap: BootstrapAdmission,
+}
+
+impl OwnerBoundBootstrap {
+    /// Returns the exact attach tuple retained from admission.
+    #[must_use]
+    pub const fn attach(&self) -> &ColdStartAttachInput {
+        &self.attach
+    }
+
+    /// Returns the exact ORS row, including the original terminal bytes.
+    #[must_use]
+    pub const fn owner_record(&self) -> &ColdStartReadinessOrsRecord {
+        &self.owner_record
+    }
+
+    /// Returns the operation identity bound at admission.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    /// Returns the typed bootstrap/intake outcome.
+    #[must_use]
+    pub const fn admission(&self) -> &BootstrapAdmission {
+        &self.bootstrap
+    }
+}
+
+/// Owner values needed to join the original cold-start claim to its terminal
+/// bootstrap and current task selection (issue #1746, W4/W5).
+///
+/// The caller obtains owner_readback in one
+/// GovernorComposition::cold_start_owner_readback_with_record_for_claim call,
+/// activation from current_task_selection_for_claim, and current_selection
+/// from the live Governor TaskContract owner at the same fence. These are
+/// owner outputs, not request fields. None profiles remain unknown and cannot
+/// be converted into readiness by this join.
+pub struct OwnerBoundBootstrapInput<'a> {
+    /// Original full attach input retaining the exact claim and lease.
+    pub attach: &'a ColdStartAttachInput,
+    /// One current owner readback of the validated record, receipt, lease,
+    /// and projection for the original full claim.
+    pub owner_readback: &'a eliot_governor::ColdStartOwnerReadback,
+    /// Owner-derived integration coverage, if available.
+    pub coverage: Option<&'a IntegrationCoverageProfile>,
+    /// Owner-derived governance profile, if available.
+    pub governance: Option<&'a GovernanceProfile>,
+    /// Governor activation tied to the current task receipt, when selected.
+    pub activation: Option<&'a eliot_governor::GovernorActivationSnapshot>,
+    /// Live Governor task selection at live_fence, when a current task exists.
+    pub current_selection: Option<&'a eliot_observation::CurrentTaskSelection>,
+    /// Stable operation identity carried unchanged through dispatch.
+    pub operation_id: &'a str,
+    /// Caller-observed freshness tick from the attach boundary.
+    pub now: u64,
+    /// Live Governor fence observed at this admission boundary.
+    pub live_fence: &'a StateFence,
+}
+
+/// Joins a real owner terminal to its original attach and current task
+/// selection before admitting a bootstrap for dispatch.
+///
+/// The exact stored claim must equal the original attach claim; the exact
+/// stored lease bytes must decode to the attach lease; and the exact terminal
+/// receipt bytes must decode to the supplied Governor receipt. This compares
+/// owner-produced values after validating the original stored claim, lease,
+/// row, and terminal bytes; no stored digest or source identity is replaced.
+/// A non-READY terminal can only produce a bounded diagnostic/intake result.
+/// Current task evidence additionally requires the activation and live
+/// task-selection owner result at the same fence. Missing/ambiguous task
+/// selection, unknown profiles, and the presently unavailable boot-delta and
+/// budget-preview owners remain diagnostic and never gain Material authority.
+pub fn admit_owner_bound_bootstrap(
+    input: &OwnerBoundBootstrapInput<'_>,
+) -> Result<OwnerBoundBootstrap, TaskBindingError> {
+    if input.operation_id.trim().is_empty()
+        || input.operation_id.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "bootstrap operation identity is absent or malformed",
+        ));
+    }
+    if input.now == 0
+        || input.attach.state_fence != *input.live_fence
+        || input.attach.readiness_claim.key.state_fence != *input.live_fence
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "original readiness claim is not bound to the live admission fence",
+        ));
+    }
+    input.attach.readiness_claim.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "original readiness claim failed validation: {error}"
+        ))
+    })?;
+    input.attach.lease.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "original attach lease failed validation: {error}"
+        ))
+    })?;
+    input.owner_readback.record.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "original owner terminal failed validation: {error}"
+        ))
+    })?;
+    if input.owner_readback.record.claim != input.attach.readiness_claim {
+        return Err(TaskBindingError::scope_incompatible(
+            "owner terminal belongs to another full readiness claim",
+        ));
+    }
+    if input.owner_readback.lease != input.attach.lease {
+        return Err(TaskBindingError::scope_incompatible(
+            "original attach lease differs from the single owner readback",
+        ));
+    }
+    let terminal = input.owner_readback.record.terminal.as_ref().ok_or_else(|| {
+        TaskBindingError::scope_incompatible(
+            "owner readiness record has no terminal receipt",
+        )
+    })?;
+    if terminal.receipt_ref != input.owner_readback.receipt.receipt_ref
+        || terminal.receipt_revision != input.owner_readback.receipt.receipt_revision
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "decoded readiness receipt does not name the original owner terminal",
+        ));
+    }
+    let retained_receipt: OnboardingReadinessReceipt =
+        serde_json::from_str(&terminal.receipt_bytes).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "owner terminal receipt bytes are invalid: {error}"
+            ))
+        })?;
+    if retained_receipt != input.owner_readback.receipt {
+        return Err(TaskBindingError::scope_incompatible(
+            "decoded readiness receipt differs from the original owner terminal bytes",
+        ));
+    }
+    let retained_lease: OnboardingLease = serde_json::from_str(
+        &input.owner_readback.record.claim.lease_bytes,
+    )
+    .map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "owner readiness lease bytes are invalid: {error}"
+        ))
+    })?;
+    if retained_lease != input.attach.lease {
+        return Err(TaskBindingError::scope_incompatible(
+            "original attach lease differs from the owner readiness claim bytes",
+        ));
+    }
+    if input.owner_readback.surface != input.attach.expected_surface {
+        return Err(TaskBindingError::scope_incompatible(
+            "current owner surface differs from the original attach projection",
+        ));
+    }
+
+    let receipt = &input.owner_readback.receipt;
+    let selection = selection_response_for_receipt(receipt)?;
+    match &selection {
+        TaskSelectionResponse::Current(evidence) => {
+            let activation = input.activation.ok_or_else(|| {
+                TaskBindingError::scope_incompatible(
+                    "current task receipt has no owner activation snapshot",
+                )
+            })?;
+            let current = input.current_selection.ok_or_else(|| {
+                TaskBindingError::scope_incompatible(
+                    "current task receipt has no live Governor TaskContract selection",
+                )
+            })?;
+            bind_current_task_selection(Some(activation), receipt, input.live_fence)?;
+            evidence
+                .recheck_against_current(current, input.live_fence)
+                .map_err(|error| match error {
+                    eliot_observation::GovernorObservationError::TaskSelectionRequired => {
+                        TaskBindingError::selection_required(
+                            "live Governor task selection is absent",
+                        )
+                    }
+                    eliot_observation::GovernorObservationError::TaskScopeIncompatible => {
+                        TaskBindingError::scope_incompatible(
+                            "live Governor task selection names another task or WorkScope",
+                        )
+                    }
+                    eliot_observation::GovernorObservationError::StaleTaskSelection => {
+                        TaskBindingError::scope_incompatible(
+                            "live Governor TaskContract revision or acceptance digest moved",
+                        )
+                    }
+                    eliot_observation::GovernorObservationError::FenceMismatch => {
+                        TaskBindingError::scope_incompatible(
+                            "live Governor task selection was admitted at another fence",
+                        )
+                    }
+                    error => TaskBindingError::scope_incompatible(format!(
+                        "live Governor task selection failed validation: {error}"
+                    )),
+                })?;
+        }
+        _ if input.activation.is_some() || input.current_selection.is_some() => {
+            return Err(TaskBindingError::scope_incompatible(
+                "owner returned a task activation for a non-current selection state",
+            ));
+        }
+        _ => {}
+    }
+
+    let mut bootstrap = admit_bootstrap_context(
+        receipt,
+        &input.owner_readback.surface,
+        input.coverage,
+        input.governance,
+        input.live_fence,
+        input.now,
+    )?;
+    if terminal.disposition != ColdStartReadinessTerminalDisposition::Ready {
+        bootstrap = match selection {
+            TaskSelectionResponse::Absent(intake) => BootstrapAdmission::IntakeRequired(intake),
+            selection => BootstrapAdmission::Diagnostic {
+                reason: "owner readiness terminal is not READY",
+                next_safe_action: receipt.next_safe_action.clone(),
+                selection,
+            },
+        };
+    }
+    Ok(OwnerBoundBootstrap {
+        attach: input.attach.clone(),
+        owner_record: input.owner_readback.record.clone(),
+        operation_id: input.operation_id.to_owned(),
+        bootstrap,
+    })
+}
+
 /// Assembles one bootstrap from its real owners and admits it for dispatch
 /// (issue #1746, W5; I7.8 step 4, I7.11).
 ///
@@ -2417,6 +2671,84 @@ pub fn require_material_bootstrap_for_task_bound(
 /// Anything else is `Incompatible` and therefore rejects the task-relative
 /// transition with `TASK_SCOPE_INCOMPATIBLE` instead of admitting it. This
 /// reads only caller-presented terms; it resolves no authority of its own.
+/// Exact admitted payload and owner claim retained together through dispatch
+/// (issue #1746, W6/A5).
+///
+/// Keeping the original envelope, owner bootstrap/ORS terminal, and sealed
+/// binding in one value preserves the operation/payload/task/scope/fence and
+/// profile identity for queued, launch, and effect checks. A caller must keep
+/// this value intact when an effect may already have happened so reconciliation
+/// can use the original identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerBoundDispatch {
+    /// Owner bootstrap plus original full attach and ORS terminal.
+    bootstrap: OwnerBoundBootstrap,
+    /// Exact canonical payload admitted under this operation.
+    envelope: eliot_canonical::CanonicalWriteEnvelope,
+    /// Exact task/scope/fence/bootstrap identity sealed for dispatch.
+    binding: DispatchedBinding,
+}
+
+impl OwnerBoundDispatch {
+    /// Returns the original owner bootstrap and ORS terminal.
+    #[must_use]
+    pub const fn bootstrap(&self) -> &OwnerBoundBootstrap {
+        &self.bootstrap
+    }
+
+    /// Returns the exact canonical payload.
+    #[must_use]
+    pub const fn envelope(&self) -> &eliot_canonical::CanonicalWriteEnvelope {
+        &self.envelope
+    }
+
+    /// Returns the sealed admission identity for the live-owner effect check.
+    #[must_use]
+    pub const fn binding(&self) -> &DispatchedBinding {
+        &self.binding
+    }
+}
+
+/// Carries one task-bound admission with the exact owner bootstrap and
+/// canonical payload it was admitted against.
+///
+/// Mismatched operation, payload task/scope/fence, or bootstrap identity fails
+/// with conflict/rebind. No field is refreshed from ambient selection and no
+/// operation identity is rewritten.
+pub fn carry_owner_bound_dispatch(
+    bootstrap: OwnerBoundBootstrap,
+    envelope: &eliot_canonical::CanonicalWriteEnvelope,
+    binding: DispatchedBinding,
+) -> Result<OwnerBoundDispatch, TaskBindingError> {
+    if bootstrap.operation_id != binding.operation_id
+        || envelope.operation_id.as_str() != binding.operation_id
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatch operation identity differs from its original bootstrap or payload",
+        ));
+    }
+    if envelope.scope_id.as_str() != binding.scope_ref
+        || envelope
+            .task_id
+            .as_deref()
+            .is_some_and(|task_ref| task_ref != binding.admitted_task_ref)
+        || !eliot_contracts::fences_match_exact(
+            &envelope.state_fence(),
+            &binding.presented_fence,
+        )
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "dispatch payload task, scope, or fence differs from its admitted binding",
+        ));
+    }
+    require_material_bootstrap_for_task_bound(&binding, &bootstrap.bootstrap)?;
+    Ok(OwnerBoundDispatch {
+        bootstrap,
+        envelope: envelope.clone(),
+        binding,
+    })
+}
+
 fn compatibility_for(
     receipt: &OnboardingReadinessReceipt,
     envelope: &CanonicalWriteEnvelope,
