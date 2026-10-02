@@ -671,8 +671,8 @@ mod tests {
         AuthorityBasis, ColdStartController, GenerationEvidence, GoverningSource,
         GoverningSourceRole, GoverningSourceSet, OnboardingLease, OnboardingLeaseState,
         PrivacyProfile, RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding,
-        ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus, TaskBindingInput,
-        WorkScopeCandidate, WorkspaceInstanceIdentity,
+        ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus,
+        TaskBindingInput, WorkScopeCandidate, WorkspaceInstanceIdentity,
     };
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
