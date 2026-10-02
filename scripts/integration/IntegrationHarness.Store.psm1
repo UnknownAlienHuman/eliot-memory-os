@@ -36,24 +36,43 @@
 #   binds the accepted set and Allocate re-validates it before deriving roots.
 # - Allocate creates unique owned data/log/secret roots under the admitted run
 #   root, writes the owner marker eliot-harness-owned-root-v1, derives
-#   namespace/database from the run identity, and reserves a loopback endpoint
-#   through an ownership-safe reservation->launch protocol. A root is reused
-#   only when the marker CONTENT re-states the complete claim (marker value,
-#   run, owner, generation) through the one predicate Test-StoreOwnedRootClaim
-#   that the removal path also uses, so re-allocation cannot adopt a root left
-#   under the same run name by another owner or generation. The reservation
-#   records which ownership proof it actually carries: 'held-socket' when a live
-#   TcpListener is positively proven to still own the loopback endpoint (so no
-#   other process can take that port), and 'seam-asserted' when the seam owns
-#   the atomic hold and this module's single-writer registration is the
-#   ownership record. Start re-proves that proof immediately before creating the
-#   child and then releases it exactly once, so a dropped registry entry
-#   (expired), a replaced binding (foreign), and an endpoint that left the
-#   reservation (port race) are distinct typed refusals raised before any
-#   process exists, while an endpoint that cannot be reserved at all is a typed
-#   port conflict rather than an ownership failure. The default reservation
-#   binds with ExclusiveAddressUse, so the hold is an exclusive bind that makes
-#   a competing bind fail outright instead of resting on a platform default.
+#   namespace/database from the run identity AND this allocation's own seed, and
+#   reserves a loopback endpoint through an ownership-safe reservation->launch
+#   protocol. A root is reused only when the marker CONTENT re-states the
+#   complete claim (marker value, run, owner, generation) through the one
+#   predicate Test-StoreOwnedRootClaim that the removal path also uses, so
+#   re-allocation cannot adopt a root left under the same run name by another
+#   owner or generation. The reservation is claimed by the ENDPOINT: two live
+#   reservations can never name one host:port whatever their runId, owner,
+#   generation or allocation seed are, so a racer holding a different run, a
+#   different owner, a different generation or a different seed for an endpoint
+#   another reservation still holds is refused as a genuine endpoint conflict,
+#   while this run's own duplicate request for an endpoint it already holds
+#   stays a distinct reused-reservation refusal. The reservation records which
+#   ownership proof it actually carries, and each proof class guarantees only
+#   what was measured:
+#   'held-socket'   the seam returned a live TcpListener whose bound endpoint was
+#                   re-read and still is this endpoint, so an exclusive bind is
+#                   held by this process right now and Start re-proves it by
+#                   re-reading that socket immediately before the child is
+#                   created. This is the only proof that authorizes a launch.
+#   'seam-asserted' the seam returned a port with no handle this module can
+#                   re-verify. Any hold exists only inside the seam and cannot
+#                   be observed, re-proven or released here, so this module holds
+#                   nothing physical for the endpoint. The record is still kept
+#                   and still keeps the endpoint claimed against every other
+#                   allocation in this registry, but the launch handoff refuses
+#                   it as STORE-RESERVATION-UNPROVEN instead of trusting the
+#                   seam's word.
+#   Start re-proves the proof immediately before creating the child and then
+#   releases it exactly once, so a dropped registry entry (expired), a replaced
+#   binding (foreign), a proof this module cannot re-verify (unproven), and an
+#   endpoint that left the reservation (port race) are distinct typed refusals
+#   raised before any process exists, while an endpoint that cannot be reserved
+#   at all is a typed port conflict rather than an ownership failure. The
+#   default reservation binds with ExclusiveAddressUse and returns its listener,
+#   so a production reservation carries 'held-socket', not the unverifiable
+#   'seam-asserted' class.
 #   Creation runs through the FileSystem seam (default real); re-allocation for
 #   the same run reuses the marker-verified roots and re-verifies the existing
 #   run-principal-only ACL instead of re-writing it, while a foreign or missing
@@ -221,9 +240,9 @@ function Get-StorePortReservationId {
 #   'held-socket'  the seam returned a live TcpListener positively proven to be
 #                  bound to the declared loopback endpoint right now, so no other
 #                  process can take that port before the handoff releases it;
-#   'seam-asserted' the seam owns the atomic hold itself and this module's
-#                  single-writer registration is the ownership record, so the
-#                  reservation is proven by identity, not by a held socket.
+#   'seam-asserted' the seam returned the endpoint with no handle this module can
+#                  re-verify, so nothing physical is held here and the launch
+#                  handoff refuses it as an unproven ownership proof.
 # A supplied handle that is absent, of the wrong type, already stopped, or bound
 # to another endpoint is a genuine port conflict and is refused as one; a live
 # reservation this run already holds is refused as a reused reservation. Those
@@ -270,12 +289,21 @@ function Register-StorePortReservation {
     if ($null -ne $existing -and [string]$existing['state'] -cne 'Released') {
         throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: a live reservation for this run already holds the reservation identity.')
     }
+    # An endpoint is claimed, not a name. While ANY live reservation in this
+    # registry still holds this host:port, no second registration may name it,
+    # whatever runId/owner/generation/seed the newcomer carries -- those fields
+    # are the OWNER record of a claim, never the identity OF the claim. The two
+    # refusals stay distinct: this run asking again for an endpoint it already
+    # holds is a reused reservation; anyone else racing for a held endpoint is a
+    # genuine port conflict.
     foreach ($other in $Script:StorePortReservations.Values) {
         if ([string]$other['state'] -ceq 'Released') { continue }
-        if ([string]$other['endpoint'] -ceq $endpoint -and [string]$other['runId'] -ceq $RunId -and
-            [string]$other['owner'] -ceq $Owner -and [int]$other['generation'] -eq $Generation) {
-            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: this run already holds a live reservation for the endpoint.')
+        if ([string]$other['endpoint'] -cne $endpoint) { continue }
+        if ([string]$other['runId'] -ceq $RunId -and [string]$other['owner'] -ceq $Owner -and
+            [int]$other['generation'] -eq $Generation) {
+            throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: this run already holds a live reservation for the endpoint.')
         }
+        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: another live reservation already holds the endpoint.')
     }
     $record = @{
         reservationId = $id
@@ -422,9 +450,11 @@ function Get-StorePortReservationReceipt {
 # Prove the reservation is still this run's at the instant the endpoint is
 # handed to the child, then release it exactly once. This is the step that makes
 # the reservation->launch window safe: a reservation whose registry entry was
-# dropped, whose binding was replaced, or whose held socket no longer owns the
-# loopback endpoint is refused as a lost/expired reservation or a port race
-# before any process is created, never released as if it were still ours.
+# dropped, whose binding was replaced, whose ownership proof this module cannot
+# re-verify, or whose held socket no longer owns the loopback endpoint is
+# refused as a lost/expired reservation, a foreign binding, an unproven proof, or
+# a port race before any process is created, never released as if it were still
+# ours.
 function Assert-StorePortReservationHandoff {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -452,7 +482,16 @@ function Assert-StorePortReservationHandoff {
         [string]$registered['reservationProof'] -cne $proof) {
         throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: the registered reservation no longer matches this run binding.')
     }
-    if ([string]$registered['state'] -ceq 'Pending' -and $proof -ceq 'held-socket') {
+    if ([string]$registered['state'] -ceq 'Pending') {
+        # A launch needs an ownership proof this module can positively re-verify
+        # now. 'held-socket' is that proof and it is re-read below; a
+        # 'seam-asserted' record carries no socket at all, so nothing here can be
+        # re-read and the seam's word alone must not authorize a child. It is a
+        # distinct typed refusal from the expired/foreign/port-race ones because
+        # its cause is an insufficient proof, not a lost or replaced claim.
+        if ($proof -cne 'held-socket') {
+            throw [System.InvalidOperationException]::new('STORE-RESERVATION-UNPROVEN: the reservation carries no re-verifiable ownership proof, so it cannot authorize a launch.')
+        }
         $listener = $registered['listener']
         if ($null -eq $listener) {
             throw [System.InvalidOperationException]::new('STORE-RESERVATION-EXPIRED: the held-socket reservation lost its listener before launch.')
@@ -1360,8 +1399,24 @@ function Invoke-StoreAllocate {
     [void](Resolve-StoreOwnedPath -RunRoot $runRoot -Path $dataRoot -ExpectedRunId $runId)
     [void](Resolve-StoreOwnedPath -RunRoot $runRoot -Path $logRoot -ExpectedRunId $runId)
     [void](Resolve-StoreOwnedPath -RunRoot $runRoot -Path $secretRoot -ExpectedRunId $runId)
-    $namespace = ('eliot_ns_' + $runId.Substring(0, 8))
-    $database = ('eliot_db_' + $runId.Substring(8, 8))
+    # Namespace and database are PER-ALLOCATION names, not per-run names. The
+    # entropy source is the same allocationSeed ($nonce) that already makes
+    # $runRoot unique above: the FIRST 8 hex chars of the runId give the run half
+    # (readable, stable) and the LAST 8 hex chars of that seed give the
+    # per-allocation half, so two allocations inside ONE run -- which this module
+    # explicitly supports and re-derives -- never collide on either name. The
+    # derivation is a pure function of (runId prefix, allocationSeed suffix), so
+    # re-running the same allocation re-derives the identical pair with no extra
+    # randomness. Entropy honestly stated: it is exactly the 32 bits of the
+    # injected entropy seam (or the runId-derived default when no seam is
+    # injected), which is ample against accidental collision inside one process
+    # but is NOT a cryptographic claim and is NOT unique across processes whose
+    # seeds coincide. The module still never adopts a name it did not win
+    # (STORE-NAMESPACE-FOREIGN); a name collision surfaces there rather than
+    # being silently shared.
+    $allocationTag = $nonce.Substring($nonce.Length - 8)
+    $namespace = ('eliot_ns_' + $runId.Substring(0, 8) + '_' + $allocationTag)
+    $database = ('eliot_db_' + $runId.Substring(0, 8) + '_' + $allocationTag)
     if ($namespace -cnotmatch '^[A-Za-z0-9_]{1,64}$' -or $database -cnotmatch '^[A-Za-z0-9_]{1,64}$') {
         throw [System.InvalidOperationException]::new('STORE-ALLOCATION-MISMATCH: derived namespace/database has an invalid shape.')
     }
