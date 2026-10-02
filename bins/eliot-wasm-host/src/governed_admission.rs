@@ -14,6 +14,7 @@
 //! → digest equality: caller-built verified handles must cite the exact
 //!   freshly minted issuance for this claim (no transplanted/stale permits)
 //! → produce → retrieve_governed → admit_context_with_learning
+//!   (this compilation declares `DownstreamReservation::NotReserved`)
 //!   → assemble_active_view_with_learning (or fail closed)
 //! ```
 //!
@@ -35,7 +36,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_context_admission::admit_context_with_learning;
+use eliot_context_admission::{DownstreamReservation, admit_context_with_learning};
 use eliot_context_assembly::{
     ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy,
     assemble_active_view_with_learning,
@@ -169,6 +170,15 @@ fn same_cross_task_carryover(
 /// is for a task other than the local admission's target — the same distinct
 /// owner-issued cross-task carryover on both the producer and the screens. Any
 /// failure refuses the whole compilation.
+///
+/// No owner-issued downstream reservation accompanies a compilation composed
+/// here: this entry takes no headroom request or result and neither
+/// `LearningProduction` nor `PresentedLearning` carries one, so the admission
+/// step DECLARES [`DownstreamReservation::NotReserved`] and the composed
+/// decision reports `HeadroomCheck::NotReserved`. This entry takes no
+/// reservation parameter of its own, so a caller holding one cannot reach this
+/// composition at all; a caller that does hold a reservation uses
+/// `eliot_context_admission::admit_context_governed`, which takes it.
 #[allow(clippy::too_many_arguments)]
 pub fn admit_governed_host<F>(
     governor: &Governor,
@@ -230,8 +240,14 @@ where
     .map_err(|error| HostAdmitError::Retrieval(error.to_string()))?;
     input.candidates.candidates.push(produced);
     input.learning_tickets.push(presented.ticket.clone());
-    let admission = admit_context_with_learning(&input, presented)
-        .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
+    // Nothing in this crate can carry an owner-issued downstream reservation:
+    // `admit_governed_host` takes no headroom request or result, and neither
+    // `LearningProduction` nor `PresentedLearning` has a headroom field. So the
+    // call below DECLARES `NotReserved`; the composed decision then reports
+    // `HeadroomCheck::NotReserved` instead of reading as a granted reservation.
+    let admission =
+        admit_context_with_learning(&input, presented, &DownstreamReservation::NotReserved)
+            .map_err(|error| HostAdmitError::Admission(error.to_string()))?;
     let view = match &admission.outcome {
         ContextOutcome::Complete(set) => Some(
             assemble_active_view_with_learning(
