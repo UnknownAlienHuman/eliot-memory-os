@@ -1998,7 +1998,10 @@ fn system_registration_transaction() -> InstallationTransaction {
 
     let (mut planned_changes, mut installer_effects) = installer_plan_parts(&roots);
     let staging_root = must(roots.expected_staging_root()).unwrap_or_else(|| unreachable!());
-    let package_manifest = must(PackageManifest::new(&manifest.generation, Vec::new()));
+    let package_manifest = must(PackageManifest::new(
+        manifest.generation.as_str(),
+        Vec::new(),
+    ));
     let package_effect = InstallerEffectPlan::StagePackage {
         effect_id: test_handle("effect:package-stage"),
         source_bundle: system_path("source-bundle"),

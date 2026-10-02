@@ -5030,7 +5030,7 @@ mod tests {
         let hashes = populate_source_with_roles(source_dir.path());
         let mut candidate = build_real_candidate(portable.clone(), roots.clone(), hashes.clone());
         let roles = expected_role_map(&candidate);
-        let mut specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
+        let specs = manifest_specs_with_staged_notify(&roles, source_dir.path());
         let manifest = PackageManifest::new("candidate", specs.clone()).unwrap();
         candidate.signature_ref = artifact_evidence_for_source(&manifest, source_dir.path());
         let (changes, effects) = installer_parts(&roots);
