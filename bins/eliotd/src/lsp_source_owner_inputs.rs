@@ -251,6 +251,7 @@ pub(crate) async fn capture_selected_source_snapshot<'runner>(
     if selected_relative_path.is_empty()
         || candidate.path.as_deref() != Some(selected_relative_path)
         || root.path() != selected.canonical_root
+        || root.owner().is_some()
         || Path::new(&candidate.workspace_root) != root.path()
     {
         return Err(SelectedSourceArtifactInputError::BindingMismatch);

@@ -119,7 +119,7 @@ pub enum OwnerKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepoRoot {
     path: PathBuf,
-    owner: OwnerKind,
+    owner: Option<OwnerKind>,
 }
 
 impl RepoRoot {
@@ -129,7 +129,24 @@ impl RepoRoot {
         if !path.is_absolute() {
             return Err(BridgeError::RootNotAbsolute(path));
         }
-        Ok(Self { path, owner })
+        Ok(Self {
+            path,
+            owner: Some(owner),
+        })
+    }
+
+    /// Declares a root whose reads will run only through a separately
+    /// admitted asynchronous process owner. This carries no Service/User
+    /// ownership classification; the synchronous runner refuses it unless
+    /// an explicit ACL admission supplies that existing authority.
+    pub fn new_for_original_async_process_owner(
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, BridgeError> {
+        let path = path.into();
+        if !path.is_absolute() {
+            return Err(BridgeError::RootNotAbsolute(path));
+        }
+        Ok(Self { path, owner: None })
     }
 
     /// Returns the declared root path.
@@ -137,8 +154,8 @@ impl RepoRoot {
         &self.path
     }
 
-    /// Returns the declared ownership.
-    pub fn owner(&self) -> OwnerKind {
+    /// Returns the declared ownership, when one was genuinely supplied.
+    pub fn owner(&self) -> Option<OwnerKind> {
         self.owner
     }
 }
@@ -1468,7 +1485,7 @@ impl<R: ProcessRunner> GitBridge<R> {
             return Err(BridgeError::RootNotFound(resolved));
         }
         let admitted = admission.is_some_and(|a| a.admits_service_identity);
-        if root.owner == OwnerKind::User && !admitted {
+        if root.owner == Some(OwnerKind::User) && !admitted {
             let lease = lease.ok_or(BridgeError::BrokerLeaseRequired)?;
             if lease.sid() != identity.sid() {
                 return Err(BridgeError::LeaseScopeMismatch(format!(
@@ -1505,6 +1522,9 @@ impl<R: ProcessRunner> GitBridge<R> {
             }
             Ok((resolved, Some(lease.clone())))
         } else {
+            if root.owner.is_none() && !admitted {
+                return Err(BridgeError::BrokerLeaseRequired);
+            }
             // A presented lease is receipt identity: it must belong to the
             // requesting SID even where no broker lease is required.
             if let Some(lease) = lease
@@ -2852,6 +2872,45 @@ mod unit_tests {
             panic!("lease")
         };
         assert_eq!(err, BridgeError::BrokerLeaseRequired);
+    }
+
+    #[test]
+    fn async_process_root_does_not_invent_owner_and_requires_admission() {
+        let bridge = GitBridge::new(FakeRunner::new("## main\n"));
+        let Ok(id) = ExecutionIdentity::new("sid-source") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new_for_original_async_process_owner(std::env::temp_dir()) else {
+            panic!("root")
+        };
+        assert_eq!(root.owner(), None);
+
+        let Err(err) = bridge.status(&id, &root, None, None) else {
+            panic!("unadmitted root")
+        };
+        assert_eq!(err, BridgeError::BrokerLeaseRequired);
+    }
+
+    #[test]
+    fn async_process_root_can_use_existing_explicit_acl_admission() {
+        let bridge = GitBridge::new(FakeRunner::new("## main\n"));
+        let Ok(id) = ExecutionIdentity::new("sid-source") else {
+            panic!("sid")
+        };
+        let Ok(root) = RepoRoot::new_for_original_async_process_owner(std::env::temp_dir()) else {
+            panic!("root")
+        };
+        let receipt = bridge
+            .status(
+                &id,
+                &root,
+                Some(AclAdmission {
+                    admits_service_identity: true,
+                }),
+                None,
+            )
+            .expect("explicit owner admission");
+        assert_eq!(receipt.branch_line.as_deref(), Some("## main"));
     }
 
     #[test]
