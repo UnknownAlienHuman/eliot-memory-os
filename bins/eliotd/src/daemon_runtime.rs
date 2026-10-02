@@ -4239,7 +4239,7 @@ async fn drive_admitted_canonical_revocations(
         let outcome = {
             let mut guard = composition.lock().await;
             guard
-                .governor
+                .governor_mut()
                 .apply_pending_canonical_revocation(
                     resume.request(),
                     resume.committed_closure(),
