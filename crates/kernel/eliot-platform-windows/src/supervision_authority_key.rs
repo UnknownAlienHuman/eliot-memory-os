@@ -1886,12 +1886,30 @@ mod tests {
         USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX,
     };
 
-    /// One exact `NT SERVICE\EliotHost` service SID, in the shape the DPAPI-NG
-    /// protection descriptor admits.
-    const EXACT_HOST_SERVICE_SID: &str = "S-1-5-80-1-2-3-4-5";
-    /// A different, equally well-formed service SID. It must never unseal a
-    /// blob the exact host service SID sealed.
-    const FOREIGN_SERVICE_SID: &str = "S-1-5-80-6-7-8-9-10";
+    /// The ciphertext payload these tests write into a real envelope.
+    ///
+    /// Nothing here claims these bytes are a DPAPI-NG ciphertext: producing one
+    /// needs the installed `EliotHost` service (`create_or_reconcile` refuses
+    /// at `supervision_authority_key.rs:1253` until `resolve_service_sid`
+    /// returns), and decrypting one needs a token that holds the sealing
+    /// service SID. They are nevertheless the real bytes the recorded
+    /// `sealed_blob_sha256` is taken over, exactly as `create_or_reconcile`
+    /// does at `supervision_authority_key.rs:1269`.
+    const SEALED_TEST_BLOB: &[u8] = b"eliot-supervision-authority-key-test-payload";
+
+    /// One well-formed service SID, used only where the recorded service SID is
+    /// provably never compared against a live SID.
+    ///
+    /// `unseal_for_kernel` evaluates its `||` chain left to right: the envelope
+    /// authority, then the file identity, then the sealed-blob digest, and only
+    /// then `resolve_service_sid` at `supervision_authority_key.rs:1376`. Every
+    /// refusal asserted for those first three operands is `InvalidBinding`; a
+    /// run that had reached the `resolve_service_sid` operand instead surfaces
+    /// that call's own `ProviderUnavailable` / `AccessDenied`, which is what
+    /// makes those typed assertions proof that this text was never compared.
+    /// The exact-service-SID operand is covered separately, against the SID this
+    /// machine actually resolves.
+    const UNRESOLVED_HOST_SERVICE_SID: &str = "S-1-5-80-1-1-1-1-1";
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join("eliot-supervision-authority-key")
@@ -1928,24 +1946,27 @@ mod tests {
         .unwrap_or_else(|error| panic!("anchor: {error}"))
     }
 
-    fn system_service_authority(
+    /// One `SystemService` authority over caller-supplied real values.
+    ///
+    /// Every field is an argument: the file identity and the blob digest are
+    /// observed from a real protected file by
+    /// [`RealUserModeKernelRoot::write_sealed_key`], never a constant.
+    fn sealed_key_authority(
         relative_path: &str,
         host_service_sid: &str,
+        retained_file_identity: SupervisionSealedKeyFileIdentity,
+        sealed_blob_sha256: &str,
+        supervision_lease_scope_id: &str,
     ) -> ProvisionedSupervisionAuthority {
         let reference = SupervisionSealedKeyReference::new(
             relative_path,
             host_service_sid,
-            SupervisionSealedKeyFileIdentity {
-                canonical_path_digest: "1".repeat(64),
-                volume_serial_number: 7,
-                file_index: 11,
-                security_descriptor_digest: "2".repeat(64),
-            },
-            "3".repeat(64),
+            retained_file_identity,
+            sealed_blob_sha256,
         )
         .unwrap_or_else(|error| panic!("sealed key reference: {error}"));
         ProvisionedSupervisionAuthority::new(
-            "lease-1",
+            supervision_lease_scope_id,
             "generation-1",
             ResourceGeneration::genesis(),
             reference,
@@ -1987,12 +2008,11 @@ mod tests {
         assert!(protection_descriptor("S-1-5-19").is_err());
     }
 
-    /// The production store admits only the exact `SystemService` binding. A
-    /// `UserMode` authority never reaches the physical provider, and a nested
-    /// key path is contract-legal but is not one file directly below the
-    /// Kernel work root, so both are refused before any ciphertext is opened.
+    /// A `UserMode` authority is not a `SystemService` one, so the store refuses
+    /// it while selecting the provider, before the root contour, the ciphertext
+    /// file or DPAPI-NG is touched.
     #[test]
-    fn kernel_unseal_admits_only_the_exact_system_service_binding() {
+    fn kernel_unseal_refuses_a_non_system_service_authority_before_the_provider() {
         let store = WindowsSupervisionAuthorityKeyStore::new();
         let root = test_root();
         let spec = test_spec(&root);
@@ -2004,36 +2024,417 @@ mod tests {
             Some(SupervisionAuthorityKeyError::InvalidBinding),
             "a non-SystemService authority must be refused before the physical provider"
         );
+    }
+
+    /// The single recorded comparison each test below perturbs.
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum IdentityMutation {
+        /// Record exactly what the OS reported.
+        None,
+        /// Record a `canonical_path_digest` the OS did not report.
+        CanonicalPathDigest,
+        /// Record a `sealed_blob_sha256` that is not the digest of the bytes.
+        SealedBlobSha256,
+    }
+
+    #[cfg(windows)]
+    /// One real envelope, the authority that reads it, and the identity and
+    /// digest values the OS reported while it was written.
+    struct WrittenSealedKey {
+        authority: ProvisionedSupervisionAuthority,
+        file_identity: SupervisionSealedKeyFileIdentity,
+        sealed_blob_sha256: String,
+    }
+
+    #[cfg(windows)]
+    /// One private installation contour below the real `LocalAppData` known
+    /// folder of the current user.
+    ///
+    /// `WindowsInstallerRootExecutor` publishes its root-policy override only
+    /// inside `installer_root`'s own test module, so a sealed-key envelope
+    /// written from here can only be created for real under the real `UserMode`
+    /// contour. The profile selects the ACL; the code path under test - a
+    /// `read_protected_file` followed by the envelope, file-identity, blob-digest
+    /// and service-SID comparisons - is the same one the `SystemService`
+    /// production caller at `bins/eliot-kernel/src/supervision_lease_authority.rs:375`
+    /// drives.
+    struct RealUserModeKernelRoot {
+        spec: InstallerRootPrimitiveSpec,
+        installations: PathBuf,
+        profile: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl Drop for RealUserModeKernelRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.spec.root);
+            let _ = std::fs::remove_dir(&self.spec.installation_root);
+            let _ = std::fs::remove_dir(&self.installations);
+            let _ = std::fs::remove_dir(&self.profile);
+        }
+    }
+
+    #[cfg(windows)]
+    impl RealUserModeKernelRoot {
+        fn new(leaf: &str) -> Self {
+            let anchor = crate::current_user_local_app_data_root()
+                .unwrap_or_else(|error| panic!("current user LocalAppData root: {error}"));
+            let profile = anchor.join("Eliot");
+            let installations = profile.join("installations");
+            let installation_root = installations.join(sha256_hex(leaf.as_bytes()));
+            let root = installation_root.join(leaf);
+            std::fs::create_dir_all(&root)
+                .unwrap_or_else(|error| panic!("failed to create {}: {error}", root.display()));
+            let spec = InstallerRootPrimitiveSpec {
+                root,
+                installation_root,
+                profile_anchor: anchor,
+                profile: crate::InstallerRootProfile::UserMode,
+            };
+            Self {
+                spec,
+                installations,
+                profile,
+            }
+        }
+
+        /// Writes one real sealed-key envelope the way `create_or_reconcile`
+        /// builds it at `supervision_authority_key.rs:1287`, and proves by
+        /// read-back that the file on disk really carries the authority that is
+        /// returned here.
+        #[allow(clippy::too_many_lines)]
+        fn write_sealed_key(
+            &self,
+            relative_path: &str,
+            host_service_sid: &str,
+            mutation: IdentityMutation,
+        ) -> WrittenSealedKey {
+            let blob = SEALED_TEST_BLOB.to_vec();
+            let path = self.spec.root.join(relative_path);
+            let mut written: Option<(
+                SupervisionSealedKeyFileIdentity,
+                String,
+                ProvisionedSupervisionAuthority,
+            )> = None;
+            let _snapshot = WindowsInstallerRootPrimitive::new()
+                .create_protected_file(&self.spec, &path, |object| {
+                    let mut identity = file_identity(object);
+                    let mut sealed_blob_sha256 = sha256_hex(&blob);
+                    match mutation {
+                        IdentityMutation::None => {}
+                        IdentityMutation::CanonicalPathDigest => {
+                            identity.canonical_path_digest =
+                                mutated_digest(&identity.canonical_path_digest);
+                        }
+                        IdentityMutation::SealedBlobSha256 => {
+                            sealed_blob_sha256 = mutated_digest(&sealed_blob_sha256);
+                        }
+                    }
+                    let authority = sealed_key_authority(
+                        relative_path,
+                        host_service_sid,
+                        identity.clone(),
+                        &sealed_blob_sha256,
+                        "lease-1",
+                    );
+                    let mut envelope = SealedKeyEnvelope {
+                        wire: SEALED_KEY_ENVELOPE_WIRE.to_owned(),
+                        transaction_id: "transaction-1".to_owned(),
+                        effect_id: "effect-1".to_owned(),
+                        installation_plan_digest: sha256_hex(
+                            b"eliot-supervision-authority-key-test-plan",
+                        ),
+                        authority: authority.clone(),
+                        sealed_blob: blob.clone(),
+                        ownership_mac: String::new(),
+                    };
+                    envelope.ownership_mac = hmac_sha256_hex(
+                        &[7_u8; 32],
+                        &envelope
+                            .mac_payload()
+                            .map_err(|_| InstallerRootError::ReceiptMismatch)?,
+                    );
+                    let bytes = serde_json::to_vec(&envelope)
+                        .map_err(|_| InstallerRootError::ReceiptMismatch)?;
+                    written = Some((identity, sealed_blob_sha256, authority));
+                    Ok(bytes)
+                })
+                .unwrap_or_else(|error| panic!("sealed-key write {relative_path}: {error}"));
+            let (identity, sealed_blob_sha256, authority) =
+                written.unwrap_or_else(|| panic!("the write closure never ran for {relative_path}"));
+
+            let readback = WindowsInstallerRootPrimitive::new()
+                .read_protected_file(&self.spec, &path, SEALED_KEY_FILE_LIMIT)
+                .unwrap_or_else(|error| panic!("sealed-key read-back {relative_path}: {error}"));
+            let round_trip: SealedKeyEnvelope = serde_json::from_slice(&readback.bytes)
+                .unwrap_or_else(|error| panic!("envelope wire read-back {relative_path}: {error}"));
+            assert_eq!(
+                round_trip.authority, authority,
+                "the authority written to {relative_path} must survive the wire unchanged, or a later refusal would prove nothing"
+            );
+            assert_eq!(
+                round_trip.sealed_blob, blob,
+                "the sealed blob written to {relative_path} must be the bytes its digest was taken over"
+            );
+            assert_ne!(
+                readback.object.volume_serial_number, 0,
+                "the file must be a real OS object"
+            );
+            assert_ne!(readback.object.file_index, 0, "the file must be a real OS object");
+            if matches!(mutation, IdentityMutation::None) {
+                assert_eq!(
+                    file_identity(&readback.object),
+                    identity,
+                    "an unmutated reference must record the identity the OS reported for this exact file"
+                );
+                assert_eq!(
+                    sealed_blob_sha256,
+                    sha256_hex(&blob),
+                    "an unmutated reference must record the digest of the sealed bytes"
+                );
+            }
+
+            WrittenSealedKey {
+                authority,
+                file_identity: identity,
+                sealed_blob_sha256,
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    /// One well-formed service SID derived from the live host service SID by
+    /// changing its last sub-authority, so the negative control is provably a
+    /// different `S-1-5-80-...` text and never the resolved host SID itself.
+    fn foreign_service_sid(live: &str) -> String {
+        let tail = live.strip_prefix("S-1-5-80-").unwrap_or_else(|| {
+            panic!("resolved host service SID {live} is not a service SID")
+        });
+        let mut parts = tail.split('-').map(str::to_owned).collect::<Vec<_>>();
+        let last = parts
+            .pop()
+            .unwrap_or_else(|| panic!("resolved host service SID {live} has no sub-authority"));
+        let mutated = last
+            .parse::<u32>()
+            .unwrap_or_else(|error| panic!("sub-authority {last}: {error}"))
+            .wrapping_add(1);
+        parts.push(mutated.to_string());
+        format!("S-1-5-80-{}", parts.join("-"))
+    }
+
+    #[cfg(windows)]
+    /// Flips the final hexadecimal digit of a SHA-256 digest. The result is
+    /// still a valid 64-digit lowercase digest, so only the compared value
+    /// differs.
+    fn mutated_digest(value: &str) -> String {
+        let mut bytes = value.as_bytes().to_vec();
+        let last = bytes
+            .len()
+            .checked_sub(1)
+            .unwrap_or_else(|| panic!("digest {value} is empty"));
+        bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| panic!("a mutated digest stays ASCII: {error}"))
+    }
+
+    /// The store compares the envelope it just read against the authority it was
+    /// handed, the identity the OS reported for that exact file, and the digest
+    /// of the sealed bytes it actually parsed.
+    ///
+    /// Each case writes a real protected file whose authority and digest are
+    /// observed values, then perturbs exactly one compared field. All three
+    /// operands are evaluated before `resolve_service_sid` at
+    /// `supervision_authority_key.rs:1376`, and a run that fell through to
+    /// DPAPI-NG admission would report `ProviderUnavailable` /
+    /// `AccessDenied` for these bytes - so every `InvalidBinding` assertion
+    /// below fails if its own operand is removed.
+    #[cfg(windows)]
+    #[test]
+    fn kernel_unseal_compares_the_envelope_authority_file_identity_and_blob_digest() {
+        let root = RealUserModeKernelRoot::new("identity-operands");
+        let store = WindowsSupervisionAuthorityKeyStore::new();
+        let spec = &root.spec;
+        let kernel_root = &root.spec.root;
+        let exact = root.write_sealed_key(
+            "authority-exact.sealed",
+            UNRESOLVED_HOST_SERVICE_SID,
+            IdentityMutation::None,
+        );
+
+        let nested = sealed_key_authority(
+            "supervision/authority-nested.sealed",
+            UNRESOLVED_HOST_SERVICE_SID,
+            exact.file_identity.clone(),
+            &exact.sealed_blob_sha256,
+            "lease-1",
+        );
+        assert_eq!(
+            store.unseal_for_kernel(spec, kernel_root, &nested).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "a nested sealed-key path is not one file directly below the work root and must be refused before any ciphertext is opened"
+        );
+
+        let substituted = sealed_key_authority(
+            "authority-exact.sealed",
+            UNRESOLVED_HOST_SERVICE_SID,
+            exact.file_identity.clone(),
+            &exact.sealed_blob_sha256,
+            "lease-2",
+        );
+        assert_eq!(
+            store.unseal_for_kernel(spec, kernel_root, &substituted).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "the authority the envelope records must be compared with the authority the caller supplied"
+        );
+
+        let mutated_identity = root.write_sealed_key(
+            "authority-identity.sealed",
+            UNRESOLVED_HOST_SERVICE_SID,
+            IdentityMutation::CanonicalPathDigest,
+        );
         assert_eq!(
             store
-                .unseal_for_kernel(
-                    &spec,
-                    &root,
-                    &system_service_authority(
-                        "supervision/authority-1.sealed",
-                        EXACT_HOST_SERVICE_SID
-                    ),
-                )
+                .unseal_for_kernel(spec, kernel_root, &mutated_identity.authority)
                 .err(),
             Some(SupervisionAuthorityKeyError::InvalidBinding),
-            "a nested sealed-key path must be refused by the production store"
+            "a recorded file identity that differs from the OS read-back must be refused"
+        );
+
+        let mutated_blob = root.write_sealed_key(
+            "authority-digest.sealed",
+            UNRESOLVED_HOST_SERVICE_SID,
+            IdentityMutation::SealedBlobSha256,
+        );
+        assert_eq!(
+            store.unseal_for_kernel(spec, kernel_root, &mutated_blob.authority).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "a recorded sealed-blob digest that differs from the parsed envelope bytes must be refused"
         );
     }
 
-    /// The production DPAPI-NG provider seals to the exact service-SID
-    /// descriptor and refuses every other token. Both refusals below are
-    /// unconditional: the alias, the non-service account SID and the empty
-    /// ciphertext are rejected before any DPAPI-NG call, and a different
-    /// well-formed service SID either fails token admission or fails the
-    /// descriptor read-back — never both being satisfied.
+    /// The exact-service-SID operand, against the SID this machine actually
+    /// resolves for `NT SERVICE\EliotHost`.
+    ///
+    /// Without the installed service `resolve_service_sid` fails and no
+    /// envelope can record the exact host SID, so the positive half is
+    /// unreachable. The test states that and stops; it never substitutes a
+    /// synthetic SID for the resolved one.
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires the installed EliotHost service-SID token; the DPAPI-NG provider refuses without it"]
-    fn physical_service_sid_token_seals_and_refuses_every_other_token() {
+    #[allow(clippy::print_stderr)]
+    fn kernel_unseal_admits_the_exact_live_host_service_sid_and_refuses_a_foreign_one() {
+        let root = RealUserModeKernelRoot::new("service-sid-operand");
+        let store = WindowsSupervisionAuthorityKeyStore::new();
+        let spec = &root.spec;
+        let kernel_root = &root.spec.root;
+        let Ok(live) = resolve_service_sid(SUPERVISION_AUTHORITY_HOST_SERVICE) else {
+            eprintln!(
+                "SKIP {}: resolve_service_sid(\"{SUPERVISION_AUTHORITY_HOST_SERVICE}\") returned an error, so no envelope can record the exact host service SID on this machine. The envelope-authority, file-identity and blob-digest operands are covered without the installed service.",
+                module_path!()
+            );
+            return;
+        };
+        let foreign = foreign_service_sid(&live);
+        assert_ne!(
+            foreign, live,
+            "the negative control must be a different service SID"
+        );
+
+        let exact = root.write_sealed_key("authority-live.sealed", &live, IdentityMutation::None);
+        let control = store
+            .unseal_for_kernel(spec, kernel_root, &exact.authority)
+            .err();
+        assert!(
+            matches!(
+                control,
+                None | Some(SupervisionAuthorityKeyError::AccessDenied)
+                    | Some(SupervisionAuthorityKeyError::ProviderUnavailable)
+            ),
+            "an envelope recording the live host service SID with the real file identity and blob digest must pass the whole comparison chain and reach DPAPI-NG, got {control:?}"
+        );
+
+        let foreign_authority =
+            root.write_sealed_key("authority-foreign.sealed", &foreign, IdentityMutation::None);
+        assert_eq!(
+            store
+                .unseal_for_kernel(spec, kernel_root, &foreign_authority.authority)
+                .err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "an envelope recording a different well-formed service SID must be refused as an invalid binding, not as a DPAPI token-admission failure"
+        );
+    }
+
+    /// Every token the provider is handed is admitted by shape before any
+    /// DPAPI-NG call: the SCM account alias, a user-account SID, a bare service
+    /// name and a service SID with too few sub-authorities are all refused as
+    /// bindings, and so is an empty ciphertext. A well-formed service SID is
+    /// the only shape that reaches DPAPI-NG token admission.
+    #[cfg(windows)]
+    #[test]
+    fn provider_refuses_every_token_that_is_not_a_well_formed_service_sid() {
+        let provider = WindowsSupervisionAuthorityKeyProvider::new();
+        for token in [
+            "NT SERVICE\\EliotHost",
+            "S-1-5-19",
+            "EliotHost",
+            "S-1-5-80-1-1-1-1",
+            "",
+        ] {
+            assert_eq!(
+                provider.unseal(token, SEALED_TEST_BLOB).err(),
+                Some(SupervisionAuthorityKeyError::InvalidBinding),
+                "only a well-formed service SID may reach DPAPI-NG; unseal({token:?}) must be refused"
+            );
+            assert_eq!(
+                provider
+                    .generate_and_seal(
+                        token,
+                        "installation-1",
+                        "eliot-kernel",
+                        "supervision-key-1",
+                    )
+                    .err(),
+                Some(SupervisionAuthorityKeyError::InvalidBinding),
+                "only a well-formed service SID may be sealed to; generate_and_seal({token:?}) must be refused"
+            );
+        }
+        assert_eq!(
+            provider.unseal(UNRESOLVED_HOST_SERVICE_SID, &[]).err(),
+            Some(SupervisionAuthorityKeyError::InvalidBinding),
+            "an empty ciphertext must be refused"
+        );
+        assert!(
+            matches!(
+                provider
+                    .unseal(UNRESOLVED_HOST_SERVICE_SID, SEALED_TEST_BLOB)
+                    .err(),
+                Some(SupervisionAuthorityKeyError::AccessDenied)
+                    | Some(SupervisionAuthorityKeyError::ProviderUnavailable)
+            ),
+            "a well-formed service SID must reach DPAPI-NG token admission instead of being refused as a binding"
+        );
+    }
+
+    /// Physical DPAPI-NG round trip against the real service-SID token.
+    ///
+    /// Ignored by default because it is only meaningful inside the installed
+    /// `EliotHost` service: DPAPI-NG unprotect admits a caller whose token
+    /// holds the sealing service SID, and the descriptor read-back at
+    /// `supervision_authority_key.rs:1847` is reached only after that admission
+    /// has already succeeded. Outside the service the foreign-SID case is
+    /// refused earlier, by DPAPI-NG token admission, as `ProviderUnavailable` /
+    /// `AccessDenied` rather than `InvalidBinding`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "physical gate: must run inside the installed EliotHost service process, whose token holds the sealing service SID"]
+    fn physical_dpapi_ng_service_sid_token_round_trip() {
+        let live = resolve_service_sid(SUPERVISION_AUTHORITY_HOST_SERVICE)
+            .unwrap_or_else(|error| panic!("resolve the installed host service SID: {error}"));
         let provider = WindowsSupervisionAuthorityKeyProvider::new();
         let sealed = provider
             .generate_and_seal(
-                EXACT_HOST_SERVICE_SID,
+                &live,
                 "installation-1",
                 "eliot-kernel",
                 "supervision-key-1",
@@ -2044,33 +2445,30 @@ mod tests {
             "the exact service SID must produce a real DPAPI-NG ciphertext"
         );
         assert_eq!(
-            sealed.trust_anchor.signer_id, "eliot-kernel",
+            sealed.trust_anchor.installation_id, "installation-1",
             "the sealed authority must carry the anchor derived from the sealed seed"
         );
+        assert_eq!(sealed.trust_anchor.signer_id, "eliot-kernel");
         assert_eq!(sealed.trust_anchor.key_id, "supervision-key-1");
 
-        assert_eq!(
-            provider
-                .unseal("NT SERVICE\\EliotHost", &sealed.sealed_blob)
-                .err(),
-            Some(SupervisionAuthorityKeyError::InvalidBinding),
-            "the SCM account alias is never a DPAPI-NG descriptor input"
+        let foreign = foreign_service_sid(&live);
+        assert_ne!(
+            foreign, live,
+            "the negative control must be a different service SID"
         );
         assert_eq!(
-            provider.unseal("S-1-5-19", &sealed.sealed_blob).err(),
+            provider.unseal(&foreign, &sealed.sealed_blob).err(),
             Some(SupervisionAuthorityKeyError::InvalidBinding),
-            "a non-service account SID must be refused"
+            "a well-formed foreign service SID must be refused by the DPAPI-NG descriptor read-back"
         );
+
+        let secret = provider
+            .unseal(&live, &sealed.sealed_blob)
+            .unwrap_or_else(|error| panic!("unseal with the exact host service SID: {error}"));
         assert_eq!(
-            provider.unseal(EXACT_HOST_SERVICE_SID, &[]).err(),
-            Some(SupervisionAuthorityKeyError::InvalidBinding),
-            "an empty ciphertext must be refused"
-        );
-        assert!(
-            provider
-                .unseal(FOREIGN_SERVICE_SID, &sealed.sealed_blob)
-                .is_err(),
-            "a foreign service SID must never unseal the host-service ciphertext"
+            secret.expose().len(),
+            32,
+            "the unsealed seed must be the 32-byte Ed25519 seed"
         );
     }
 }
