@@ -38,24 +38,31 @@
 //!
 //! **1. The Governor's producer has no production caller.**
 //! `eliot_governor::composition::GovernorComposition::canonical_projections`
-//! (crates/governor/eliot-governor/src/composition.rs:6166) is the documented
+//! (crates/governor/eliot-governor/src/composition.rs:6184) is the documented
 //! producer, and it composes the real owner set from the retained `task`,
 //! `session`, `work_scope` and `observation` owners. It has zero callers
-//! tree-wide: `git grep "canonical_projections("` matches only its own
-//! definition and the internal `compose_canonical_projections` call. Nothing in
-//! `eliotd` ever asks the composition for a projection set.
+//! tree-wide, and the grep that proves it is quoted here in full so a reader can
+//! re-run it and get the same list: `git grep "canonical_projections("` returns
+//! five hits, and not one of them calls it. They are its own definition
+//! (composition.rs:6184), the internal `compose_canonical_projections` call
+//! inside its own body (composition.rs:6206), that composer's definition
+//! (canonical_projections.rs:526), and the unrelated
+//! `derive_canonical_projections` definition and its single caller
+//! (eliot-context-candidates/src/derive.rs:744 and src/mapper.rs:500). Nothing
+//! in `eliotd` ever asks the composition for a projection set:
+//! `git grep "canonical_projections" -- bins/` matches only this module's prose.
 //!
 //! **2. The supply seam is unreachable from the production `submit` path.**
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! calls [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort::resolve_orientation_supply)
-//! at lib.rs:791, but only after two gates that refuse unconditionally:
-//! `controller::resolve_cycle_inputs` (controller.rs:78-82) and
-//! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) both end in a
+//! at lib.rs:802, but only after two gates that refuse unconditionally:
+//! `controller::resolve_cycle_inputs` (controller.rs:66-82) and
+//! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:27-35) both end in a
 //! bare `Err`. An `Ok(None)` from the owner channel is therefore not merely the
 //! current answer — on today's tree `resolve_supply` is never called at all on
 //! any production path. The crate's own
 //! `submit_orientation_stops_at_controller_gate` proof
-//! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
+//! (`pipeline_e2e.rs:844`) asserts exactly this: an Orientation `submit` stops at
 //! the controller gate. The blocked disposition published downstream is reached
 //! today only from the unit-level pipeline proofs, not from `main.rs`.
 //!

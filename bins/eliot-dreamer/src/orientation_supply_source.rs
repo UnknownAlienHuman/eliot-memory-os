@@ -6,15 +6,15 @@
 //! wires it, and
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! consults it for admitted `JobClass::Orientation` jobs through the existing
-//! `resolve_orientation_supply` seam at lib.rs:791.
+//! `resolve_orientation_supply` seam at lib.rs:802.
 //!
 //! # Reachability, measured rather than assumed
 //!
 //! `submit` is the only production caller of
 //! [`OrientationSupplySource::resolve_supply`], but on the current tree it
 //! never *reaches* that call. Two gates run first and both refuse
-//! unconditionally: `controller::resolve_cycle_inputs` (controller.rs:78-82)
-//! and `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) each end
+//! unconditionally: `controller::resolve_cycle_inputs` (controller.rs:66-82)
+//! and `bundle_stage::resolve_bundle_request` (bundle_stage.rs:27-35) each end
 //! in a bare `Err`. So this implementation is presently reachable only from the
 //! crate's unit-level pipeline proofs, not from `main.rs`. That is a property of
 //! the tree, stated here so the next attempt measures it rather than assuming
