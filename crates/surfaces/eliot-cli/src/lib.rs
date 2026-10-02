@@ -580,7 +580,7 @@ pub mod kernel_client {
     ///
     /// Broker-owned contract (`eliot.surfaces.user-broker-core/v1`) with the
     /// exact capability pair in
-    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29`
+    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43`
     /// (`OPERATOR_CAPABILITIES = ["controlboard.read", "operator.command"]`).
     /// The Kernel/User Broker lane serves and admits this operation; a typed
     /// provider rejection is the admission signal, never a local stub. This
@@ -588,6 +588,38 @@ pub mod kernel_client {
     /// [`KernelClient::set_request_identity`] carries the session, fence, and
     /// operation binding.
     pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
+
+    /// The operator-initiated ControlBoard status read this client sends.
+    ///
+    /// The wire identity is the runtime-status owner's
+    /// [`eliot_runtime_status::CONTROLBOARD_STATUS_OPERATION`]; it is re-declared
+    /// at the authenticated boundary because the CLI must not depend on the
+    /// runtime-status owner to name a Kernel operation, and the Kernel admission
+    /// owner admits it as a paired declaration.
+    pub const CONTROLBOARD_STATUS_OPERATION: &str = "controlboard.status";
+
+    /// Wire identity of the Kernel-owned per-operation request-identity
+    /// issuance request/grant pair (issue #4600).
+    ///
+    /// The Kernel is the semantic owner and mints the identity; this is the
+    /// paired client-side declaration of the same wire contract, mirroring how
+    /// the User Broker re-declares the operator session-token selector.
+    pub const OPERATOR_REQUEST_IDENTITY_WIRE_ID: &str = "eliot.operator.request-identity";
+    /// Wire version of [`OPERATOR_REQUEST_IDENTITY_WIRE_ID`].
+    pub const OPERATOR_REQUEST_IDENTITY_WIRE_VERSION: u16 = 1;
+
+    /// The broker-owned closed operator capability pair, in its exact order.
+    ///
+    /// `eliot_user_broker_core::OPERATOR_CAPABILITIES` is exactly
+    /// `["controlboard.read", "operator.command"]`; this is the same set read
+    /// through the owner that validates it, so the two cannot drift.
+    fn exact_operator_capabilities(capabilities: &[String]) -> bool {
+        capabilities.len() == eliot_user_broker_core::OPERATOR_CAPABILITIES.len()
+            && capabilities
+                .iter()
+                .zip(eliot_user_broker_core::OPERATOR_CAPABILITIES)
+                .all(|(actual, expected)| actual == expected)
+    }
 
     /// Closed launch disposition carried by the serving owner receipt.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +649,49 @@ pub mod kernel_client {
         pub receipt: Value,
     }
 
+    /// Closed request this client sends to the Kernel admission owner to obtain
+    /// one fresh, exact, operation-bound request identity (issue #4600).
+    ///
+    /// The Kernel is the owner and mints; this client only names *which*
+    /// operation it needs an identity for. It never supplies a principal, a
+    /// session, a generation, a State Fence, a role, a capability, a clock, or a
+    /// deadline — the owner takes every one of those from the admitted
+    /// front-door session it already holds.
+    #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct OperatorRequestIdentityRequest {
+        wire_id: String,
+        wire_version: u16,
+        operation: String,
+    }
+
+    /// Closed grant the Kernel admission owner returns for one operation.
+    ///
+    /// It carries the observed principal, session, generation, role and
+    /// capability set, the current State Fence, the lease, and the identity, so
+    /// this client compares each one against what it independently observed on
+    /// the same authenticated connection instead of trusting a bare identity.
+    #[derive(Clone, Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct OperatorRequestIdentityGrant {
+        wire_id: String,
+        wire_version: u16,
+        operation: String,
+        request_identity: RequestIdentity,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        authority_epoch: EpochId,
+        resource_generation: eliot_contracts::ResourceGeneration,
+        state_fence: eliot_contracts::StateFence,
+        role: String,
+        capabilities: Vec<String>,
+        principal_sid: String,
+        principal_session: String,
+        connection_id: String,
+        session_epoch: u64,
+        session_principal_binding: String,
+    }
+
     /// Exact server-owned configuration snapshot carried by `ServerHello`.
     /// This is deliberately closed: a plausible arbitrary JSON object cannot
     /// stand in for the Kernel's generation, authority and artifact binding.
@@ -635,6 +710,13 @@ pub mod kernel_client {
     pub struct KernelClient {
         config: KernelClientConfig,
         request_identity: Option<RequestIdentity>,
+        /// Operation the currently bound owner-issued identity was minted for.
+        ///
+        /// Set only by [`KernelClient::admit_operation_identity`]. A bound
+        /// identity issued for one operation is never sent for another: the
+        /// dispatch seam compares this against the operation it is about to
+        /// send, so a launch identity can never carry a status read.
+        admitted_operation: Option<String>,
         #[cfg(windows)]
         config_lease: ProtectedPathLease,
     }
@@ -667,6 +749,7 @@ pub mod kernel_client {
                 Ok(Self {
                     config,
                     request_identity: None,
+                    admitted_operation: None,
                     config_lease: lease,
                 })
             }
@@ -675,6 +758,46 @@ pub mod kernel_client {
         /// Binds the exact caller identity for the next application request.
         pub fn set_request_identity(&mut self, identity: RequestIdentity) {
             self.request_identity = Some(identity);
+        }
+
+        /// Obtains a fresh, exact, operation-bound [`RequestIdentity`] from the
+        /// Kernel admission owner and binds it for `operation`.
+        ///
+        /// This is the entrypoint join for issue #4600. The identity does not
+        /// come from this process: it is minted by the Kernel front door from
+        /// the session it already authenticated, over the same protected
+        /// declaration this client loaded, and it is compared here against the
+        /// live `ServerHello` before it is bound. A wrong principal, session,
+        /// generation, role, capability, State Fence, or lease is a typed
+        /// [`KernelClientError::Rejected`], never a bound identity.
+        ///
+        /// The owner is asked once per operation, so a launch, a status read, and
+        /// an exact retry or reconciliation each obtain their own identity: this
+        /// client never reuses one identity across two operations, and it never
+        /// extends a deadline.
+        pub fn admit_operation_identity(
+            &mut self,
+            operation: &str,
+        ) -> Result<(), KernelClientError> {
+            validate_operation(operation)?;
+            #[cfg(not(windows))]
+            {
+                let _ = operation;
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                let identity = runtime.block_on(self.admit_operation_identity_async(operation))?;
+                self.set_request_identity(identity);
+                self.admitted_operation = Some(operation.to_owned());
+                Ok(())
+            }
         }
 
         /// Requests the broker-owned Operator launch through the authenticated
@@ -702,7 +825,7 @@ pub mod kernel_client {
         ///
         /// The `"controlboard.read"` capability string is retained because the
         /// broker contract requires it: `OPERATOR_CAPABILITIES` in
-        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29` is exactly
+        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43` is exactly
         /// `["controlboard.read", "operator.command"]` (verified by grep for
         /// `controlboard.read`; #1213). It is a broker-owned capability name,
         /// not an `eliot-controlboard` crate binding.
@@ -719,6 +842,7 @@ pub mod kernel_client {
                     .request_identity
                     .clone()
                     .ok_or(KernelClientError::MissingRequestIdentity)?;
+                self.require_admitted_operation(OPERATOR_LAUNCH_OPERATION)?;
                 let request = OperatorLaunchRequest {
                     role: "human_operator".to_owned(),
                     capabilities: vec![
@@ -789,6 +913,7 @@ pub mod kernel_client {
                 .request_identity
                 .clone()
                 .ok_or(KernelClientError::MissingRequestIdentity)?;
+            self.require_admitted_operation(operation)?;
             #[cfg(not(windows))]
             {
                 let _ = (identity, payload);
@@ -810,6 +935,22 @@ pub mod kernel_client {
         async fn connect(
             &self,
         ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
+            let (transport, limits, _hello) = self.connect_with_hello().await?;
+            Ok((transport, limits))
+        }
+
+        /// Opens one authenticated connection and returns the validated
+        /// `ServerHello` alongside it.
+        ///
+        /// The hello is the only independent observation of the live authority
+        /// triple, generation, artifact and configuration snapshot this client
+        /// ever has, so the admission join compares a Kernel-issued identity
+        /// against *this* value rather than against the protected declaration
+        /// alone.
+        #[cfg(windows)]
+        async fn connect_with_hello(
+            &self,
+        ) -> Result<(NamedPipeTransport, TransportLimits, ServerHello), KernelClientError> {
             self.config_lease
                 .verify_stable_identity()
                 .and_then(|()| self.config_lease.verify_path_identity())
@@ -840,7 +981,55 @@ pub mod kernel_client {
             let hello = decode_server_hello_frame(&server, &self.config.connection_id)
                 .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
             validate_server_hello(&self.config, &hello)?;
-            Ok((transport, limits))
+            Ok((transport, limits, hello))
+        }
+
+        /// Asks the Kernel admission owner for one identity bound to
+        /// `operation` and compares the grant against the live handshake.
+        #[cfg(windows)]
+        async fn admit_operation_identity_async(
+            &self,
+            operation: &str,
+        ) -> Result<RequestIdentity, KernelClientError> {
+            let (mut transport, limits, hello) = self.connect_with_hello().await?;
+            let request = OperatorRequestIdentityRequest {
+                wire_id: OPERATOR_REQUEST_IDENTITY_WIRE_ID.to_owned(),
+                wire_version: OPERATOR_REQUEST_IDENTITY_WIRE_VERSION,
+                operation: operation.to_owned(),
+            };
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                // The issuance request carries no correlation identity and no
+                // authority of its own: it is the request *for* an identity.
+                request_id: None,
+                kind: FrameKind::Control,
+                message_type: MessageType::Challenge,
+                request_identity: None,
+                payload: ProtocolPayload::Json(
+                    serde_json::to_value(&request)
+                        .map_err(|error| KernelClientError::Rejected(error.to_string()))?,
+                ),
+                trace_context: BTreeMap::new(),
+            };
+            frame
+                .validate()
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "Kernel operation identity request",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+            verify_operation_identity_grant(
+                &self.config.connection_id,
+                &hello,
+                &response,
+                operation,
+            )
         }
 
         #[cfg(windows)]
@@ -901,6 +1090,163 @@ pub mod kernel_client {
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
             validate_result_response(&self.config.connection_id, &request_id, &response)
         }
+
+        /// Refuses a bound owner-issued identity that was minted for a different
+        /// operation.
+        ///
+        /// An identity admitted for `operator.launch` is a launch identity: sending
+        /// it for `controlboard.status` (or the reverse) is cross-operation reuse of
+        /// one operation identity, and it is refused here rather than at the far
+        /// side. A bound identity that did not come from
+        /// [`KernelClient::admit_operation_identity`] is not owner-issued and is
+        /// outside this check, exactly as before.
+        fn require_admitted_operation(&self, operation: &str) -> Result<(), KernelClientError> {
+            admitted_operation_admits(self.admitted_operation.as_deref(), operation)
+        }
+    }
+
+    /// Compares one Kernel-issued grant against the live handshake and returns
+    /// the bound identity.
+    ///
+    /// This is the whole of the #4600 client contract. It reads only the reply
+    /// and values this client already observed independently — the protected
+    /// declaration and the `ServerHello` from this same connection — and it
+    /// mints nothing. A grant that disagrees on the operation, the wire
+    /// contract, the session principal binding, the session, the generation, the
+    /// Authority Epoch, the role, the capability set, the State Fence, the
+    /// identity's own shape, or the lease is refused as
+    /// [`KernelClientError::Rejected`].
+    fn verify_operation_identity_grant(
+        connection_id: &str,
+        hello: &ServerHello,
+        response: &Frame,
+        operation: &str,
+    ) -> Result<RequestIdentity, KernelClientError> {
+        fn refused(detail: impl Into<String>) -> KernelClientError {
+            KernelClientError::Rejected(detail.into())
+        }
+        response
+            .validate()
+            .map_err(|error| refused(format!("identity grant frame is invalid: {error}")))?;
+        if response.kind != FrameKind::Control
+            || response.message_type != MessageType::Ready
+            || response.request_id.is_some()
+            || response.request_identity.is_some()
+            || response.connection_id != connection_id
+        {
+            return Err(refused(
+                "identity grant is not the Kernel's closed admission reply".to_owned(),
+            ));
+        }
+        let ProtocolPayload::Json(payload) = &response.payload else {
+            return Err(refused(
+                "identity grant payload is not typed JSON".to_owned(),
+            ));
+        };
+        let grant: OperatorRequestIdentityGrant = serde_json::from_value(payload.clone())
+            .map_err(|error| refused(format!("identity grant is not a closed grant: {error}")))?;
+        if grant.wire_id != OPERATOR_REQUEST_IDENTITY_WIRE_ID
+            || grant.wire_version != OPERATOR_REQUEST_IDENTITY_WIRE_VERSION
+            || grant.operation != operation
+        {
+            return Err(refused(
+                "identity grant does not name the requested operation".to_owned(),
+            ));
+        }
+        // Principal and session: the grant must be bound to the same
+        // server-owned session principal binding this client validated in the
+        // handshake it completed on this very connection, and it must name a
+        // non-empty, well-formed observed peer. A client cannot observe its own
+        // pipe peer from the far end, so the peer fields are shape-checked and
+        // the far side re-proves them on every frame it serves.
+        if grant.session_principal_binding != hello.session_principal_binding
+            || grant.principal_sid.trim().is_empty()
+            || grant.principal_sid.chars().any(char::is_control)
+            || grant.principal_session.trim().is_empty()
+            || grant.principal_session.chars().any(char::is_control)
+        {
+            return Err(refused(
+                "identity grant principal or session is not the admitted one".to_owned(),
+            ));
+        }
+        // Session: the grant must be bound to this exact protected connection.
+        if grant.connection_id != connection_id || grant.session_epoch == 0 {
+            return Err(refused(
+                "identity grant is not bound to this connection's session".to_owned(),
+            ));
+        }
+        grant.request_identity.validate().map_err(|error| {
+            refused(format!(
+                "issued identity failed its own validation: {error}"
+            ))
+        })?;
+        let metadata = &grant.request_identity.request.metadata;
+        if metadata.session_id.is_none()
+            || metadata.task_id.is_some()
+            || metadata.product_id.as_str() != KERNEL_SERVICE_NAME
+            || metadata.state_fence != grant.request_identity.request.state_fence
+            || metadata.state_fence != grant.state_fence
+        {
+            return Err(refused(
+                "issued identity is not bound to this Kernel's session and product".to_owned(),
+            ));
+        }
+        // Generation / Authority Epoch / State Fence: compared against the live
+        // `ServerHello`, not against the declaration alone, so a replaced or
+        // expired generation cannot be admitted here.
+        let live_generation = server_snapshot_generation(hello)?;
+        if !grant
+            .authority_epoch
+            .is_same_authority(&hello.authority_epoch)
+            || !grant
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&hello.authority_epoch)
+            || grant.resource_generation.value() != live_generation
+        {
+            return Err(refused(
+                "identity grant generation or authority epoch is not the live one".to_owned(),
+            ));
+        }
+        // Role / capability: the closed broker-owned operator pair, intersected
+        // with what the live `ServerHello` actually allowed this session.
+        if grant.role != eliot_user_broker_core::OPERATOR_ROLE
+            || !exact_operator_capabilities(&grant.capabilities)
+            || !grant
+                .capabilities
+                .iter()
+                .all(|capability| hello.allowed_capabilities.contains(capability))
+        {
+            return Err(refused(
+                "identity grant role or capability set is not the admitted operator set".to_owned(),
+            ));
+        }
+        // Deadline: the lease must be internally consistent, must match the
+        // identity's own deadline, and must still be live. This client never
+        // extends it and never substitutes its own clock reading for the
+        // owner's.
+        if grant.issued_at_unix_ms == 0
+            || grant.expires_at_unix_ms <= grant.issued_at_unix_ms
+            || grant.request_identity.deadline_unix_ms != grant.expires_at_unix_ms
+        {
+            return Err(refused(
+                "identity grant lease is not a bounded live lease".to_owned(),
+            ));
+        }
+        Ok(grant.request_identity)
+    }
+
+    /// Reads the live generation the `ServerHello` configuration snapshot
+    /// carries, after the snapshot has already been proven against the
+    /// protected declaration by `validate_server_hello`.
+    fn server_snapshot_generation(hello: &ServerHello) -> Result<u64, KernelClientError> {
+        let snapshot: KernelConfigSnapshot = serde_json::from_value(hello.config_snapshot.clone())
+            .map_err(|error| {
+                KernelClientError::Rejected(format!(
+                    "ServerHello configuration snapshot is unreadable: {error}"
+                ))
+            })?;
+        Ok(snapshot.generation)
     }
 
     fn validate_config(config: &KernelClientConfig) -> Result<(), KernelClientError> {
@@ -1118,6 +1464,25 @@ pub mod kernel_client {
         }
     }
 
+    /// Returns whether one owner-issued identity admitted for `admitted` may be
+    /// sent for `operation`.
+    ///
+    /// `None` means the bound identity did not come from
+    /// [`KernelClient::admit_operation_identity`], so this check does not apply
+    /// and the pre-existing behaviour is unchanged. `Some(other)` is the
+    /// cross-operation reuse of one operation identity, and it is refused.
+    fn admitted_operation_admits(
+        admitted: Option<&str>,
+        operation: &str,
+    ) -> Result<(), KernelClientError> {
+        match admitted {
+            Some(admitted) if admitted != operation => Err(KernelClientError::Rejected(format!(
+                "identity was admitted for operation {admitted}, not {operation}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn validate_operation(operation: &str) -> Result<(), KernelClientError> {
         if operation.trim().is_empty()
             || operation.len() > OPERATION_LIMIT
@@ -1254,6 +1619,554 @@ pub mod kernel_client {
                 rejection_reason: None,
                 authority_epoch: test_epoch(7),
             }
+        }
+
+        // --- Issue #4600: the owner-issued per-operation identity join. ---
+
+        const KERNEL_SID: &str = "S-1-5-18";
+        const KERNEL_SESSION_ID: &str = "0";
+        const LIVE_PRINCIPAL_BINDING: &str = "sid=S-1-5-18;session=0";
+        const CONNECTION_ID: &str = "cli-front-door-4600";
+        const LIVE_GENERATION: u64 = 11;
+        const LIVE_SEQUENCE: u64 = 7;
+
+        /// Runs the admission join exactly as the windows-only client does:
+        /// the same protected connection identity and the same live handshake
+        /// this client completed on that connection.
+        fn verify(
+            hello: &ServerHello,
+            response: &Frame,
+            operation: &str,
+        ) -> Result<RequestIdentity, KernelClientError> {
+            verify_operation_identity_grant(CONNECTION_ID, hello, response, operation)
+        }
+
+        fn live_hello() -> ServerHello {
+            ServerHello {
+                selected_protocol: ProtocolVersion::CURRENT,
+                session_principal_binding: LIVE_PRINCIPAL_BINDING.to_owned(),
+                allowed_capabilities: vec![
+                    "controlboard.read".to_owned(),
+                    "operator.command".to_owned(),
+                ],
+                allowed_effects: Vec::new(),
+                config_snapshot: serde_json::json!({
+                    "service": KERNEL_SERVICE_NAME,
+                    "protocol": KERNEL_PROTOCOL_VERSION,
+                    "generation": LIVE_GENERATION,
+                    "authority_epoch": epoch_json(LIVE_SEQUENCE),
+                    "artifact_digest": "a".repeat(64),
+                }),
+                heartbeat_ms: 1_000,
+                control_channel: KERNEL_FRONT_DOOR_PIPE.to_owned(),
+                rejection_reason: None,
+                authority_epoch: test_epoch(LIVE_SEQUENCE),
+            }
+        }
+
+        /// One owner grant, carrying the exact values the Kernel owner derives
+        /// from its admitted session. Nothing here is a hand-built identity the
+        /// client trusts: `verify_operation_identity_grant` compares every field
+        /// against the live handshake and refuses any disagreement.
+        fn owner_grant(operation: &str, ordinal: u64) -> Value {
+            let fence = eliot_contracts::StateFence::new(
+                test_epoch(LIVE_SEQUENCE),
+                eliot_contracts::ResourceGeneration::new(LIVE_GENERATION).expect("generation"),
+            );
+            let request_id = eliot_contracts::RequestId::new(format!(
+                "operator-request-identity:{CONNECTION_ID}:{operation}:{ordinal}"
+            ))
+            .expect("request id");
+            let idempotency_key = format!("{operation}:{CONNECTION_ID}:{ordinal}");
+            let issued_at = 1_700_000_000_000_u64;
+            let expires_at = issued_at + 30_000;
+            let observed_at = i64::try_from(issued_at).expect("observed instant");
+            let identity = RequestIdentity {
+                request: eliot_receipts::RequestBinding {
+                    metadata: eliot_contracts::RequestMetadata {
+                        request_id: request_id.clone(),
+                        session_id: Some(
+                            eliot_contracts::SessionId::new(format!("{CONNECTION_ID}:1"))
+                                .expect("session id"),
+                        ),
+                        task_id: None,
+                        product_id: eliot_contracts::ProductId::new(KERNEL_SERVICE_NAME)
+                            .expect("product id"),
+                        source_id: eliot_contracts::SourceId::new("operator-request-identity")
+                            .expect("source id"),
+                        state_fence: fence.clone(),
+                        clock: eliot_contracts::ClockReading {
+                            valid_time_ms: Some(observed_at),
+                            known_time_ms: Some(observed_at),
+                            transaction_sequence: None,
+                            monotonic_ns: None,
+                        },
+                    },
+                    state_fence: fence.clone(),
+                },
+                idempotency_key: idempotency_key.clone(),
+                deadline_unix_ms: expires_at,
+                cancellation_id: format!("{idempotency_key}:cancel"),
+            };
+            identity.validate().expect("owner identity validates");
+            serde_json::json!({
+                "wire_id": OPERATOR_REQUEST_IDENTITY_WIRE_ID,
+                "wire_version": OPERATOR_REQUEST_IDENTITY_WIRE_VERSION,
+                "operation": operation,
+                "request_identity": identity,
+                "issued_at_unix_ms": issued_at,
+                "expires_at_unix_ms": expires_at,
+                "authority_epoch": epoch_json(LIVE_SEQUENCE),
+                "resource_generation": LIVE_GENERATION,
+                "state_fence": fence,
+                "role": eliot_user_broker_core::OPERATOR_ROLE,
+                "capabilities": [
+                    "controlboard.read",
+                    "operator.command",
+                ],
+                "principal_sid": KERNEL_SID,
+                "principal_session": KERNEL_SESSION_ID,
+                "session_principal_binding": LIVE_PRINCIPAL_BINDING,
+                "connection_id": CONNECTION_ID,
+                "session_epoch": 1,
+            })
+        }
+
+        fn grant_frame(payload: Value) -> Frame {
+            Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: CONNECTION_ID.to_owned(),
+                request_id: None,
+                kind: FrameKind::Control,
+                message_type: MessageType::Ready,
+                request_identity: None,
+                payload: ProtocolPayload::Json(payload),
+                trace_context: std::collections::BTreeMap::new(),
+            }
+        }
+
+        /// The positive case for each public entry: an owner grant for
+        /// `eliot ui` and for `eliot controlboard status` both verify against
+        /// the live handshake and yield a real identity this client then carries.
+        #[test]
+        fn owner_grants_for_each_public_entry_verify_against_the_live_handshake() {
+            let hello = live_hello();
+            for operation in [OPERATOR_LAUNCH_OPERATION, CONTROLBOARD_STATUS_OPERATION] {
+                let identity = verify(&hello, &grant_frame(owner_grant(operation, 1)), operation)
+                    .expect("owner grant verifies against the live handshake");
+                assert_eq!(
+                    identity.request.metadata.product_id.as_str(),
+                    KERNEL_SERVICE_NAME
+                );
+                assert!(identity.request.metadata.session_id.is_some());
+                assert!(identity.request.metadata.task_id.is_none());
+            }
+        }
+
+        /// No-admission, wrong session and wrong generation: a grant that
+        /// disagrees with the live handshake on the principal, the connection,
+        /// the generation, the authority epoch, the role, the capability set, or
+        /// the lease is refused, and no identity is returned.
+        #[test]
+        fn owner_grants_that_disagree_with_the_live_handshake_are_refused() {
+            let hello = live_hello();
+            let refuse = |mutate: &dyn Fn(&mut serde_json::Map<String, Value>)| {
+                let mut payload = owner_grant(OPERATOR_LAUNCH_OPERATION, 1);
+                let object = payload.as_object_mut().expect("grant object");
+                mutate(object);
+                verify(&hello, &grant_frame(payload), OPERATOR_LAUNCH_OPERATION)
+            };
+            // Wrong principal: the grant is bound to another observed peer than
+            // the one this connection's handshake proved, and this client cannot
+            // observe its own pipe peer, so it refuses rather than guess.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert(
+                        "session_principal_binding".to_owned(),
+                        Value::String("sid=S-1-5-19;session=0".to_owned()),
+                    );
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // A peer that is not even nameable is refused too.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert("principal_sid".to_owned(), Value::String("  ".to_owned()));
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong session: the grant is bound to another connection.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert(
+                        "connection_id".to_owned(),
+                        Value::String("another-connection".to_owned()),
+                    );
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong generation: the grant is not the live one.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert("resource_generation".to_owned(), Value::from(12_u64));
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong authority epoch: an unrelated lineage never authorizes.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert(
+                        "authority_epoch".to_owned(),
+                        serde_json::json!({"lineage_id": OTHER_LINEAGE, "sequence": LIVE_SEQUENCE}),
+                    );
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong role: a caller-asserted role is never bound.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert("role".to_owned(), Value::String("root".to_owned()));
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong capability: a capability the live session was not allowed
+            // is never bound.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert(
+                        "capabilities".to_owned(),
+                        serde_json::json!(["controlboard.read", "store.write"]),
+                    );
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Stale lease: an expired grant is never bound, and this client
+            // never extends a deadline to make it live.
+            assert!(matches!(
+                refuse(&|object| {
+                    object.insert("issued_at_unix_ms".to_owned(), Value::from(2_u64));
+                    object.insert("expires_at_unix_ms".to_owned(), Value::from(1_u64));
+                }),
+                Err(KernelClientError::Rejected(_))
+            ));
+            // Wrong operation: one operation's grant is never bound for another.
+            assert!(matches!(
+                verify(
+                    &hello,
+                    &grant_frame(owner_grant(CONTROLBOARD_STATUS_OPERATION, 2)),
+                    OPERATOR_LAUNCH_OPERATION,
+                ),
+                Err(KernelClientError::Rejected(_))
+            ));
+        }
+
+        /// Reuse and consecutive distinct identities: a launch identity and a
+        /// status identity are distinct, and dispatching one for the other is
+        /// refused at the seam rather than at the far side.
+        #[test]
+        fn one_operation_identity_is_never_reused_for_another_operation() {
+            let hello = live_hello();
+            let launch = verify(
+                &hello,
+                &grant_frame(owner_grant(OPERATOR_LAUNCH_OPERATION, 1)),
+                OPERATOR_LAUNCH_OPERATION,
+            )
+            .expect("launch grant verifies");
+            let status = verify(
+                &hello,
+                &grant_frame(owner_grant(CONTROLBOARD_STATUS_OPERATION, 2)),
+                CONTROLBOARD_STATUS_OPERATION,
+            )
+            .expect("status grant verifies");
+            assert_ne!(
+                launch.request.metadata.request_id, status.request.metadata.request_id,
+                "two operations never share a request id"
+            );
+            assert_ne!(
+                launch.idempotency_key, status.idempotency_key,
+                "two operations never share an idempotency key"
+            );
+            assert_ne!(
+                launch.cancellation_id, status.cancellation_id,
+                "two operations never share a cancellation id"
+            );
+
+            // The dispatch seam refuses the launch identity for a status read,
+            // and leaves a non-owner-issued identity exactly as it found it.
+            assert!(
+                admitted_operation_admits(
+                    Some(OPERATOR_LAUNCH_OPERATION),
+                    OPERATOR_LAUNCH_OPERATION
+                )
+                .is_ok()
+            );
+            assert!(matches!(
+                admitted_operation_admits(
+                    Some(OPERATOR_LAUNCH_OPERATION),
+                    CONTROLBOARD_STATUS_OPERATION
+                ),
+                Err(KernelClientError::Rejected(_))
+            ));
+            assert!(
+                admitted_operation_admits(None, CONTROLBOARD_STATUS_OPERATION).is_ok(),
+                "an identity that did not come from the admission owner is unchanged"
+            );
+        }
+
+        // --- The five collision cases of the CLI half, carried onto the one
+        // surviving path. Half A minted this identity in the client from the
+        // `ServerHello`; the Kernel admission owner mints it here and the
+        // client only verifies the grant. Every case below therefore drives
+        // `verify_operation_identity_grant` and the dispatch seam, never a
+        // second, client-local issuer.
+
+        /// The launch entry (`eliot ui`) on the surviving path: the Kernel
+        /// admission owner issues the identity, this client verifies the grant
+        /// against the live handshake it completed, and the exact Execute frame
+        /// the dispatch seam then sends for it passes the protocol's own frame
+        /// validation. Nothing on this path is minted here.
+        #[test]
+        fn owner_granted_launch_identity_reaches_the_wire_path() {
+            let hello = live_hello();
+            let identity = verify(
+                &hello,
+                &grant_frame(owner_grant(OPERATOR_LAUNCH_OPERATION, 1)),
+                OPERATOR_LAUNCH_OPERATION,
+            )
+            .expect("owner grant verifies against the live handshake");
+            identity.validate().expect("issued identity validates");
+            // The correlation the owner minted names this operation, and this
+            // client never rewrites it: it is the operation identity the serving
+            // owner must echo back in the launch receipt.
+            let request_id = identity.request.metadata.request_id.as_str();
+            assert!(request_id.contains(OPERATOR_LAUNCH_OPERATION));
+            assert!(identity.idempotency_key.contains(OPERATOR_LAUNCH_OPERATION));
+            assert!(identity.cancellation_id.contains(OPERATOR_LAUNCH_OPERATION));
+            // The fence is the Kernel's live authority tuple, not a local guess:
+            // same lineage, same sequence, same generation.
+            assert_eq!(
+                identity.request.state_fence.authority_epoch,
+                test_epoch(LIVE_SEQUENCE)
+            );
+            assert_eq!(
+                identity.request.state_fence.resource_generation.value(),
+                LIVE_GENERATION
+            );
+            assert_eq!(
+                identity.request.state_fence,
+                identity.request.metadata.state_fence
+            );
+            // The owner bound its own transport session; this front door selects
+            // no task of its own.
+            assert!(identity.request.metadata.session_id.is_some());
+            assert!(identity.request.metadata.task_id.is_none());
+
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: CONNECTION_ID.to_owned(),
+                request_id: Some(identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: Some(identity),
+                payload: ProtocolPayload::Json(serde_json::json!({
+                    "operation": OPERATOR_LAUNCH_OPERATION,
+                })),
+                trace_context: std::collections::BTreeMap::new(),
+            };
+            frame
+                .validate()
+                .expect("frame carries the granted identity");
+        }
+
+        /// The status entry (`eliot controlboard status`, and the dashboard that
+        /// shares it) on the surviving path: its own owner grant verifies
+        /// against the same live handshake, binds exactly the capability set
+        /// the Kernel admitted for this session, and the Execute frame carrying
+        /// it reaches the wire.
+        #[test]
+        fn owner_granted_controlboard_status_identity_reaches_the_wire_path() {
+            let hello = live_hello();
+            let payload = owner_grant(CONTROLBOARD_STATUS_OPERATION, 1);
+            let identity = verify(
+                &hello,
+                &grant_frame(payload.clone()),
+                CONTROLBOARD_STATUS_OPERATION,
+            )
+            .expect("owner grant verifies against the live handshake");
+            identity.validate().expect("issued identity validates");
+            let request_id = identity.request.metadata.request_id.as_str();
+            assert!(request_id.contains(CONTROLBOARD_STATUS_OPERATION));
+            assert!(
+                identity
+                    .idempotency_key
+                    .contains(CONTROLBOARD_STATUS_OPERATION)
+            );
+            assert_eq!(
+                identity.request.state_fence.resource_generation.value(),
+                LIVE_GENERATION
+            );
+            // The grant's capability set is the closed broker-owned operator
+            // pair and this client admits it only because the live session was
+            // granted exactly that set.
+            let granted: Vec<String> = payload["capabilities"]
+                .as_array()
+                .expect("grant capability array")
+                .iter()
+                .map(|value| value.as_str().expect("capability text").to_owned())
+                .collect();
+            assert_eq!(
+                granted,
+                eliot_user_broker_core::OPERATOR_CAPABILITIES.map(String::from)
+            );
+            assert_eq!(granted, hello.allowed_capabilities);
+
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: CONNECTION_ID.to_owned(),
+                request_id: Some(identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: Some(identity),
+                payload: ProtocolPayload::Json(serde_json::json!({
+                    "operation": CONTROLBOARD_STATUS_OPERATION,
+                })),
+                trace_context: std::collections::BTreeMap::new(),
+            };
+            frame
+                .validate()
+                .expect("frame carries the granted identity");
+        }
+
+        /// No-admission refusal: a live session the serving Kernel did not
+        /// admit the broker-owned operator capability for is refused for every
+        /// operator grant, because a capability this connection's handshake
+        /// never proved is never bound into an identity.
+        #[test]
+        fn owner_grants_naming_a_capability_the_live_session_lacks_are_refused() {
+            let mut hello = live_hello();
+            hello.allowed_capabilities = vec!["worker.execute".to_owned()];
+            for operation in [OPERATOR_LAUNCH_OPERATION, CONTROLBOARD_STATUS_OPERATION] {
+                let admitted = verify(&hello, &grant_frame(owner_grant(operation, 1)), operation);
+                assert!(
+                    matches!(admitted, Err(KernelClientError::Rejected(_))),
+                    "{operation} must not be admitted without its capability"
+                );
+            }
+        }
+
+        /// The gates the join reads the live generation through: a snapshot that
+        /// is not the closed Kernel configuration snapshot yields no generation
+        /// at all, a snapshot naming no live generation admits no grant, and a
+        /// live generation the protected declaration does not approve is
+        /// refused by the snapshot binding itself.
+        #[test]
+        fn admission_reads_no_generation_from_an_unreadable_or_generationless_snapshot() {
+            let mut unreadable = live_hello();
+            unreadable.config_snapshot = serde_json::json!({"generation": LIVE_GENERATION});
+            assert!(matches!(
+                server_snapshot_generation(&unreadable),
+                Err(KernelClientError::Rejected(_))
+            ));
+            let admitted = verify(
+                &unreadable,
+                &grant_frame(owner_grant(OPERATOR_LAUNCH_OPERATION, 1)),
+                OPERATOR_LAUNCH_OPERATION,
+            );
+            assert!(matches!(admitted, Err(KernelClientError::Rejected(_))));
+
+            let mut generationless = live_hello();
+            generationless.config_snapshot = serde_json::json!({
+                "service": KERNEL_SERVICE_NAME,
+                "protocol": KERNEL_PROTOCOL_VERSION,
+                "generation": 0,
+                "authority_epoch": epoch_json(LIVE_SEQUENCE),
+                "artifact_digest": "a".repeat(64),
+            });
+            let generation = server_snapshot_generation(&generationless).expect("closed shape");
+            assert_eq!(generation, 0, "a snapshot may name no live generation");
+            let refused = validate_server_snapshot(
+                &generationless,
+                &test_epoch(LIVE_SEQUENCE),
+                LIVE_GENERATION,
+                &"a".repeat(64),
+            );
+            assert!(refused.is_err());
+            for operation in [OPERATOR_LAUNCH_OPERATION, CONTROLBOARD_STATUS_OPERATION] {
+                let admitted = verify(
+                    &generationless,
+                    &grant_frame(owner_grant(operation, 1)),
+                    operation,
+                );
+                assert!(
+                    matches!(admitted, Err(KernelClientError::Rejected(_))),
+                    "{operation} must not be admitted on a generationless handshake"
+                );
+            }
+
+            // A live generation the protected declaration does not approve is
+            // refused by the snapshot binding, before any grant is compared.
+            let moved = live_hello();
+            let approved_elsewhere = validate_server_snapshot(
+                &moved,
+                &test_epoch(LIVE_SEQUENCE),
+                LIVE_GENERATION + 1,
+                &"a".repeat(64),
+            );
+            assert!(approved_elsewhere.is_err());
+        }
+
+        /// Exact-retry reconciliation and cross-operation distinctness: one
+        /// operation has exactly one owner-issued handle, so reading the same
+        /// grant twice cannot manufacture a second identity for it, two
+        /// operations never share a correlation, and the dispatch seam refuses
+        /// one operation's identity for another.
+        #[test]
+        fn the_owner_issued_identity_is_the_only_handle_for_its_operation() {
+            let hello = live_hello();
+            let launch_grant = grant_frame(owner_grant(OPERATOR_LAUNCH_OPERATION, 1));
+            let launch = verify(&hello, &launch_grant, OPERATOR_LAUNCH_OPERATION)
+                .expect("launch grant verifies");
+            // This client mints nothing, so the whole reconciliation surface for
+            // an operation is the identity its owner issued: an exact retry
+            // reads back the same handle, and an unknown launch outcome is
+            // reconciled against it instead of against a second identity this
+            // surface could have invented for itself.
+            let retry = verify(&hello, &launch_grant, OPERATOR_LAUNCH_OPERATION)
+                .expect("the same grant verifies again");
+            assert_eq!(launch, retry, "one operation identity is the only handle");
+            assert_eq!(launch.idempotency_key, retry.idempotency_key);
+
+            let status = verify(
+                &hello,
+                &grant_frame(owner_grant(CONTROLBOARD_STATUS_OPERATION, 2)),
+                CONTROLBOARD_STATUS_OPERATION,
+            )
+            .expect("status grant verifies");
+            assert_ne!(
+                launch.request.metadata.request_id, status.request.metadata.request_id,
+                "two operations never share a request id"
+            );
+            assert_ne!(
+                launch.idempotency_key, status.idempotency_key,
+                "two operations never share an idempotency key"
+            );
+            assert_ne!(
+                launch.cancellation_id, status.cancellation_id,
+                "two operations never share a cancellation id"
+            );
+
+            // And the seam refuses the launch identity for the status read,
+            // rather than letting one operation identity answer for two.
+            assert!(matches!(
+                admitted_operation_admits(
+                    Some(OPERATOR_LAUNCH_OPERATION),
+                    CONTROLBOARD_STATUS_OPERATION
+                ),
+                Err(KernelClientError::Rejected(_))
+            ));
         }
 
         #[test]

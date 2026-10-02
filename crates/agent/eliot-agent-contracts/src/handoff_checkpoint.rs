@@ -26,16 +26,20 @@
 
 use std::collections::BTreeSet;
 
-use eliot_contracts::{ContractVersion, OperationId, ResourceGeneration, StateFence, TaskId};
+use eliot_contracts::{
+    ContractVersion, OperationId, ResourceGeneration, StateFence, TaskId, canonical_json_bytes,
+    sha256_hex,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureBoundary,
-    HandoffCaptureError, HandoffCaptureLedger, HandoffCausalLink, HandoffCheckpointId,
-    HandoffContinuity, HandoffId, PublicReference, RevisionId, TargetId, WorkItemId,
-    validate_collection, validate_text,
+    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffArtifactLease, HandoffCapture,
+    HandoffCaptureBoundary, HandoffCaptureError, HandoffCaptureLedger, HandoffCaptureReadback,
+    HandoffCaptureSource, HandoffCausalLink, HandoffCheckpointId, HandoffContinuity,
+    HandoffId, HandoffLeaseRelease, PublicReference, RevisionId, TargetId,
+    WorkItemId, validate_collection, validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
@@ -639,6 +643,139 @@ impl HandoffCheckpoint {
                 )
             })
     }
+
+    /// Content digest of the complete payload as it is recorded at capture.
+    ///
+    /// This is the digest the capture operation records once, at the boundary,
+    /// and the value a durable readback is later compared against. It is
+    /// derived from the canonical bytes of the whole payload, so a readback can
+    /// never be satisfied by a payload that differs in any field.
+    pub fn recorded_content_digest(&self) -> Result<String, HandoffCheckpointError> {
+        let bytes =
+            canonical_json_bytes(self).map_err(|_| HandoffCheckpointError::UndigestedPayload)?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Derives the bounded capture source for this payload at one boundary.
+    ///
+    /// Every member is taken from the payload itself, so a caller cannot
+    /// present a capture whose source snapshot disagrees with the checkpoint it
+    /// claims to capture: the fence, generations, cursors, frozen diff and both
+    /// digests are read off the payload, and the retained/pending sets are
+    /// exactly the payload's own artifacts, verifiers and in-flight operations.
+    /// The two recorded digests are computed here, once, from the exact bytes
+    /// this operation captured.
+    ///
+    /// The returned source still has to pass
+    /// [`HandoffCaptureSource::validate`], which re-proves coherence and refuses
+    /// a diff reference that is not a digest-bound immutable artifact.
+    pub fn capture_source(
+        &self,
+        operation_id: OperationId,
+        boundary: HandoffCaptureBoundary,
+    ) -> Result<HandoffCaptureSource, HandoffCheckpointError> {
+        self.validate()?;
+        let recorded_diff_digest = self
+            .diff_ref
+            .digest
+            .clone()
+            .ok_or(HandoffCheckpointError::DiffReferenceIsNotImmutable)?;
+        let source = HandoffCaptureSource {
+            capture_id: self.checkpoint_id.clone(),
+            operation_id,
+            boundary,
+            source_task_id: self.source_task_id.clone(),
+            source_attempt_id: self.source_attempt_id.clone(),
+            source_session_ref: self.source_session_ref.clone(),
+            source_plan_revision: self.source_plan_revision.clone(),
+            source_acceptance_revision: self.source_acceptance_revision.clone(),
+            source_fence: self.state_fence.clone(),
+            source_generations: self.source_generations,
+            source_cursors: self.source_cursors.clone(),
+            frozen_diff: self.diff_ref.clone(),
+            recorded_checkpoint_digest: self.recorded_content_digest()?,
+            recorded_diff_digest,
+            expected_retained_artifacts: self.retained_artifact_refs()?,
+            expected_pending_verifiers: self.pending_verifier_refs.clone(),
+            expected_pending_effects: self.pending_effect_refs()?,
+        };
+        Ok(source)
+    }
+
+    /// Builds the retention leases this capture owns for its own artifacts.
+    ///
+    /// Every lease names this checkpoint as the capture that owns the retention
+    /// and the supplied release condition, so a lease is never transferable to
+    /// another operation. The lease set covers exactly the payload's retained
+    /// artifacts, which is the independent denominator
+    /// [`HandoffCapture::validate`](crate::HandoffCapture::validate)
+    /// checks the expected set against.
+    pub fn artifact_leases(
+        &self,
+        release: HandoffLeaseRelease,
+    ) -> Result<Vec<HandoffArtifactLease>, HandoffCheckpointError> {
+        self.retained_artifact_refs().map(|artifacts| {
+            artifacts
+                .into_iter()
+                .map(|artifact_ref| HandoffArtifactLease {
+                    artifact_ref,
+                    retained_by_capture: self.checkpoint_id.clone(),
+                    release,
+                })
+                .collect()
+        })
+    }
+
+    /// The immutable artifact set this checkpoint retains across the boundary.
+    ///
+    /// The frozen diff comes first because it is the content compaction would
+    /// otherwise destroy, followed by the artifacts the boundary depends on. The
+    /// set is derived from the payload rather than supplied by a caller, so the
+    /// capture's expected set and the payload's artifacts cannot disagree.
+    fn retained_artifact_refs(&self) -> Result<Vec<PublicReference>, HandoffCheckpointError> {
+        let mut references = Vec::with_capacity(self.artifact_refs.len() + 1);
+        references.push(self.diff_ref.clone());
+        for reference in &self.artifact_refs {
+            let repeated = references.iter().any(|existing| {
+                existing.kind == reference.kind
+                    && existing.id == reference.id
+                    && existing.revision == reference.revision
+            });
+            if repeated {
+                return Err(HandoffCheckpointError::RetainedArtifactIsRepeated {
+                    artifact: reference.id.as_str().to_owned(),
+                });
+            }
+            references.push(reference.clone());
+        }
+        Ok(references)
+    }
+
+    /// The in-flight operation identities this payload retains, as effect
+    /// references.
+    ///
+    /// Each reference names the operation under
+    /// [`HANDOFF_EFFECT_REFERENCE_KIND`] and carries the disposition revision the
+    /// payload recorded, so the capture and the payload cannot disagree about
+    /// which effect survived and under which disposition.
+    fn pending_effect_refs(&self) -> Result<Vec<PublicReference>, HandoffCheckpointError> {
+        self.effects
+            .iter()
+            .map(effect_reference)
+            .collect::<Result<Vec<PublicReference>, HandoffCheckpointError>>()
+    }
+}
+
+/// Projects one recorded effect onto the reference a capture retains it under.
+fn effect_reference(
+    effect: &HandoffEffectRecord,
+) -> Result<PublicReference, HandoffCheckpointError> {
+    Ok(PublicReference {
+        kind: HANDOFF_EFFECT_REFERENCE_KIND.to_owned(),
+        id: TargetId::new(effect.operation_id.as_str())?,
+        revision: RevisionId::new(effect.disposition.revision_text())?,
+        digest: None,
+    })
 }
 
 /// Resume-time revalidation of one retained checkpoint (I12.17, I7.15).
@@ -836,6 +973,114 @@ impl RetainedHandoffCheckpoint {
     /// resume rather than issue an executable session.
     pub fn requires_fresh_authority_before_execution(&self) -> bool {
         self.revalidation.has_changed_generation() || self.revalidation.fence_changed
+    }
+}
+
+/// The durable binding one capture operation commits alongside a checkpoint
+/// (I12.17).
+///
+/// The governed transaction stores one text for a capture commit, and the
+/// checkpoint and its artifact references have to survive together or the
+/// binding proves nothing. This record is that one text: the checkpoint
+/// identity, the capture operation, the controlled boundary, both digests
+/// recorded at capture time, the frozen diff, and the retained artifacts,
+/// pending verifiers and in-flight operations the boundary depends on.
+///
+/// The committed form is canonical JSON, so the same binding always produces
+/// the same bytes and the stored text round-trips back into exactly this
+/// record. Nothing here is derived from the bytes a caller still holds: the
+/// readback is reconstructed from what the store returned, and
+/// [`HandoffCaptureReadback`] then compares that against the capture's own
+/// recorded values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffCaptureBinding {
+    /// Identity of the checkpoint this operation persists.
+    pub checkpoint_id: HandoffCheckpointId,
+    /// Identity of the one capture operation that persisted it.
+    pub operation_id: OperationId,
+    /// Controlled boundary the capture was taken at.
+    pub boundary: HandoffCaptureBoundary,
+    /// Digest of the checkpoint payload as recorded at capture time.
+    pub recorded_checkpoint_digest: String,
+    /// Digest of the frozen diff as recorded at capture time.
+    pub recorded_diff_digest: String,
+    /// Current diff, frozen as a digest-bound immutable artifact.
+    pub frozen_diff: PublicReference,
+    /// Immutable artifacts retained across the boundary under this capture.
+    pub retained_artifacts: Vec<PublicReference>,
+    /// Verifiers still pending at the boundary.
+    pub pending_verifiers: Vec<PublicReference>,
+    /// In-flight operations whose effects are still unreconciled.
+    pub pending_effects: Vec<PublicReference>,
+}
+
+impl HandoffCaptureBinding {
+    /// Serializes the binding into the exact text a capture commit stores.
+    ///
+    /// The encoding is canonical JSON, so the committed text is deterministic
+    /// and every field round-trips through [`Self::from_text`].
+    pub fn to_text(&self) -> Result<String, HandoffCheckpointError> {
+        let bytes =
+            canonical_json_bytes(self).map_err(|_| HandoffCheckpointError::UndigestedPayload)?;
+        String::from_utf8(bytes).map_err(|_| HandoffCheckpointError::UndigestedPayload)
+    }
+
+    /// Parses the text a store returned back into the binding it holds.
+    ///
+    /// A stored text that is not exactly a binding is refused instead of being
+    /// read as an empty or partial one, so a truncated commit can never satisfy
+    /// a readback.
+    pub fn from_text(text: &str) -> Result<Self, HandoffCheckpointError> {
+        serde_json::from_str(text).map_err(|_| HandoffCheckpointError::StoredBindingIsNotABinding)
+    }
+
+    /// Projects the stored binding onto the readback a store observation
+    /// reports.
+    ///
+    /// Every field is what the store returned. The capture compares it against
+    /// its own recorded values through
+    /// [`HandoffCapture::record_readback`](crate::HandoffCapture::record_readback);
+    /// nothing here is recomputed over the bytes the capture still holds.
+    pub fn to_readback(
+        &self,
+        read_generation: ResourceGeneration,
+    ) -> HandoffCaptureReadback {
+        HandoffCaptureReadback {
+            capture_id: self.checkpoint_id.clone(),
+            operation_id: self.operation_id.clone(),
+            boundary: self.boundary,
+            read_generation,
+            readback_checkpoint_digest: self.recorded_checkpoint_digest.clone(),
+            readback_diff_digest: self.recorded_diff_digest.clone(),
+            observed_retained_artifacts: self.retained_artifacts.clone(),
+            observed_pending_verifiers: self.pending_verifiers.clone(),
+            observed_pending_effects: self.pending_effects.clone(),
+        }
+    }
+}
+
+impl HandoffCapture {
+    /// Projects this capture onto the durable binding it commits.
+    ///
+    /// The binding carries the capture's own recorded digests, its frozen diff
+    /// and its declared retained/pending sets, so the text a capture commit
+    /// stores and the text a later read parses back describe the same
+    /// operation. The capture must already have validated: the binding is a
+    /// projection of a checked record, not an independent claim.
+    pub fn binding(&self) -> Result<HandoffCaptureBinding, HandoffCheckpointError> {
+        self.validate()?;
+        Ok(HandoffCaptureBinding {
+            checkpoint_id: self.capture_id.clone(),
+            operation_id: self.operation_id.clone(),
+            boundary: self.boundary,
+            recorded_checkpoint_digest: self.recorded_checkpoint_digest.clone(),
+            recorded_diff_digest: self.recorded_diff_digest.clone(),
+            frozen_diff: self.frozen_diff.clone(),
+            retained_artifacts: self.expected_retained_artifacts.clone(),
+            pending_verifiers: self.expected_pending_verifiers.clone(),
+            pending_effects: self.expected_pending_effects.clone(),
+        })
     }
 }
 
@@ -1277,4 +1522,24 @@ pub enum HandoffCheckpointError {
         /// Boundary that has no registered capture.
         boundary: HandoffCaptureBoundary,
     },
+    /// The complete payload could not be canonicalized for its content digest.
+    ///
+    /// The digest a capture records is taken over the canonical bytes of the
+    /// whole payload, so a payload that cannot be canonicalized cannot be
+    /// captured rather than being captured under an arbitrary digest.
+    #[error("the handoff checkpoint payload could not be canonicalized for its content digest")]
+    UndigestedPayload,
+    /// An immutable artifact is retained more than once in one payload.
+    #[error("immutable artifact {artifact} is retained more than once by this checkpoint")]
+    RetainedArtifactIsRepeated {
+        /// The repeated artifact.
+        artifact: String,
+    },
+    /// The stored capture-commit text is not a handoff capture binding.
+    ///
+    /// The readback parses the text the store returned; a text that is not
+    /// exactly a binding is refused rather than read as a partial one, so a
+    /// truncated or foreign commit can never satisfy a durable readback.
+    #[error("the stored capture-commit text is not a handoff capture binding")]
+    StoredBindingIsNotABinding,
 }

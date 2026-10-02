@@ -31,13 +31,16 @@
 //! are proved on the same code production executes.
 
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence};
+use eliot_dreamer_bundle::AssemblyRequest;
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ScreenBinding;
 use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
 use eliot_dreamer_curation::{NativeCurationPort, NativeCurationPortSet};
+use eliot_dreamer_cycle::{CyclePhase, CyclePolicy, DreamerCycleState};
 
 use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
@@ -57,9 +60,9 @@ use crate::model_stage::{resolve_model_inputs, run_admitted_model};
 use crate::result_stage::{project_result_view, render_jsonl};
 use crate::validation_stage::{resolve_validation_inputs, validate_admitted_draft};
 use crate::{
-    AuthenticatedKernelJobPort, CurationCarrierSource, DreamJobInput, DreamResult, DreamerError,
-    JobClass, JobState, KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort,
-    run_admitted_pipeline,
+    AdmittedStageMaterialSource, AuthenticatedKernelJobPort, ControllerSnapshot,
+    CurationCarrierSource, DreamJobInput, DreamResult, DreamerError, JobClass, JobState,
+    KERNEL_ADMISSION_REQUIRED, KernelJobAdmission, KernelJobPort, run_admitted_pipeline,
 };
 use eliot_dreamer_contracts::validation::structured::{
     GroundingValidationInput, ValidatedGroundingCandidate,
@@ -704,6 +707,7 @@ fn submit_curation_with_source_runs_a31_then_fails_closed_at_transport() {
         Box::new(ClosedTestTransport),
         Some(&source),
         None,
+        None,
     )
     .expect("test port must construct");
     let refused =
@@ -789,6 +793,7 @@ fn submit_curation_without_source_refuses_carrier_before_transport() {
         Box::new(ClosedTestTransport),
         None,
         None,
+        None,
     )
     .expect("test port must construct");
     let refused =
@@ -818,6 +823,7 @@ fn submit_refused_class_refuses_before_transport() {
         material,
         admission.clone(),
         Box::new(ClosedTestTransport),
+        None,
         None,
         None,
     )
@@ -850,6 +856,7 @@ fn submit_orientation_stops_at_controller_gate() {
         material,
         admission.clone(),
         Box::new(ClosedTestTransport),
+        None,
         None,
         None,
     )
@@ -1063,6 +1070,7 @@ fn submit_curation_with_source_succeeds_with_curation_result_view() {
         Box::new(SuccessClaimTransport::for_scope(&material.scope_id)),
         Some(&source),
         None,
+        None,
     )
     .expect("test port must construct");
     let view = <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job)
@@ -1109,5 +1117,238 @@ fn submit_curation_with_source_succeeds_with_curation_result_view() {
         source.calls(),
         1,
         "A-31 must invoke the routed handler exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Admitted-stage owner channels (issue #41 step 1).
+//
+// These two proofs drive the public `submit` path with the two admitted-stage
+// owner channels wired, and they are the reachability evidence for the
+// Orientation seam: on `main` the controller gate ended in a bare `Err(..)`, so
+// no run could reach `resolve_orientation_supply` at all. The production
+// instance of the channel still publishes nothing (there is no in-binary
+// producer of a `CyclePolicy`, a `PhasePolicyRule` or a `DreamJobRecipe` — see
+// `admitted_stage_source`), so `submit_orientation_stops_at_controller_gate`
+// above still holds; what these prove is that the gate is now ADDRESSABLE and
+// that a published record is admitted only after it is re-proved against the
+// exact claim.
+// ---------------------------------------------------------------------------
+
+/// The controller-gate refusal an unpopulated channel still publishes. Kept as
+/// one named constant so the reachability proof below asserts against the exact
+/// string rather than a substring.
+const CONTROLLER_GATE_REFUSAL: &str =
+    "admitted controller inputs require Governor-resolved material";
+
+/// Builds a controller snapshot an owner would have published for `admission`.
+///
+/// The embedded job is the real derived admission — the same value every other
+/// stage binds — so the gate's binding re-proof passes and the chain advances to
+/// the real owner transition. Everything the transition itself needs is
+/// deliberately left unsealed (`canonical_digest` empty, no phase rules): this
+/// fixture exists to prove the GATE admits a published record, and the owner
+/// entry is then free to refuse the unsealed snapshot on its own terms, which is
+/// exactly what the reachability proof below observes.
+fn published_controller_snapshot(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+) -> ControllerSnapshot {
+    let admitted = admission_of(admission, job).expect("e2e admission must derive");
+    ControllerSnapshot {
+        state: DreamerCycleState {
+            schema_version: 1,
+            cycle_id: ArtifactId::new(format!("{}:cycle", admitted.canonical_id()))
+                .expect("published cycle id"),
+            job: admitted,
+            bundle_digest: "a".repeat(64),
+            policy_id: ArtifactId::new("policy-e2e").expect("published policy id"),
+            policy_revision: PolicyRevision::genesis(),
+            policy_digest: "b".repeat(64),
+            phase: CyclePhase::Validated,
+            controller_revision: 0,
+            predecessor_digest: None,
+            pending: Vec::new(),
+            proposed_requests: Vec::new(),
+            outcomes: Vec::new(),
+            frontier: Vec::new(),
+            budget_usage: Default::default(),
+            cancellation_requested: false,
+            canonical_digest: String::new(),
+        },
+        observed: Vec::new(),
+        policy: CyclePolicy {
+            schema_version: 1,
+            policy_id: ArtifactId::new("policy-e2e").expect("published policy id"),
+            policy_revision: PolicyRevision::genesis(),
+            state_fence: admission.state_fence.clone(),
+            max_pending: 8,
+            max_outcomes: 32,
+            max_requests: 8,
+            max_transitions: 32,
+            max_bytes: 1_000_000,
+            deadline_ms: None,
+            cancellation_requested: false,
+            canonical_digest: String::new(),
+            phase_rules: Vec::new(),
+        },
+        observation_time_ms: Some(0),
+    }
+}
+
+/// Test admitted-stage owner channel: publishes the controller snapshot it was
+/// built with and counts both resolutions, so a proof can show that `submit`
+/// really consults the channel and which record the gate then admitted. The
+/// A-04 side publishes nothing, which keeps the bundle gate honest rather than
+/// letting an unproved recipe through.
+struct TestStageMaterialSource {
+    snapshot: Option<ControllerSnapshot>,
+    controller_calls: AtomicU64,
+    bundle_calls: AtomicU64,
+}
+
+impl TestStageMaterialSource {
+    /// Publishes one controller snapshot and no A-04 assembly request.
+    fn publishing(snapshot: ControllerSnapshot) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+            controller_calls: AtomicU64::new(0),
+            bundle_calls: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of controller-snapshot resolutions the channel was asked for.
+    fn controller_calls(&self) -> u64 {
+        self.controller_calls.load(Ordering::SeqCst)
+    }
+
+    /// Number of A-04 assembly-request resolutions the channel was asked for.
+    fn bundle_calls(&self) -> u64 {
+        self.bundle_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl AdmittedStageMaterialSource for TestStageMaterialSource {
+    fn resolve_controller_snapshot(
+        &self,
+        _admission: &KernelJobAdmission,
+        _job: &DreamJobInput,
+    ) -> Result<Option<ControllerSnapshot>, DreamerError> {
+        self.controller_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.snapshot.clone())
+    }
+
+    fn resolve_bundle_request(
+        &self,
+        _admission: &KernelJobAdmission,
+        _job: &DreamJobInput,
+    ) -> Result<Option<AssemblyRequest>, DreamerError> {
+        self.bundle_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+/// The controller gate is reachable: with a controller snapshot published for
+/// this exact claim, `submit` consults the owner channel, the gate ADMITS the
+/// published record, and the run advances past it to the real #806 owner
+/// transition — which refuses the deliberately unsealed snapshot on its own
+/// terms. The proof is the refusal reason: it is the owner's, never the
+/// controller gate's own "no published material" refusal, and the A-04 gate was
+/// never consulted because the owner transition refused first.
+#[test]
+fn submit_orientation_passes_the_controller_gate_on_a_published_snapshot() {
+    let job_id = "job-e2e-submit-stage-reach";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = job_with_handles(job_id, JobClass::Orientation);
+    let source =
+        TestStageMaterialSource::publishing(published_controller_snapshot(&admission, &job));
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        None,
+        Some(&source),
+        None,
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    assert_eq!(
+        source.controller_calls(),
+        1,
+        "submit must consult the admitted-stage owner channel exactly once"
+    );
+    let Err(error) = refused else {
+        panic!("an unsealed controller snapshot must still fail closed at the owner transition");
+    };
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    let still_at_the_gate =
+        matches!(&error, DreamerError::InvalidAdmission(reason) if *reason == CONTROLLER_GATE_REFUSAL);
+    assert!(
+        !still_at_the_gate,
+        "a published snapshot must not leave the controller gate refusing, got {error:?}"
+    );
+    assert!(
+        !matches!(error, DreamerError::UnsupportedJobClass(_)),
+        "orientation is admitted and must never refuse by class, got {error:?}"
+    );
+    assert_eq!(
+        source.bundle_calls(),
+        0,
+        "the owner transition refused before the A-04 gate was consulted"
+    );
+}
+
+/// The controller gate re-proves a published record against the exact claim: a
+/// snapshot whose embedded job is another scope's admitted job refuses at the
+/// binding check, before any owner transition, with the request-rejected code
+/// and never the Kernel-admission code. A published record is therefore not
+/// trusted merely because it was published, and it cannot be carried across
+/// claims to make one job's controller state serve another's.
+#[test]
+fn submit_orientation_refuses_a_foreign_published_controller_snapshot() {
+    let job_id = "job-e2e-submit-stage-foreign";
+    let material = submit_material(job_id);
+    let admission = submit_admission(&material);
+    let job = job_with_handles(job_id, JobClass::Orientation);
+    let mut foreign = published_controller_snapshot(&admission, &job);
+    // Same real shape, one scope off: the gate's re-proof compares the
+    // snapshot's embedded job against the admitted one, so this is the exact
+    // "another claim's record" condition.
+    foreign.state.job.scope_id = "scope-not-this-claim".to_owned();
+    let source = TestStageMaterialSource::publishing(foreign);
+    let mut port = AuthenticatedKernelJobPort::for_test(
+        material,
+        admission.clone(),
+        Box::new(ClosedTestTransport),
+        None,
+        Some(&source),
+        None,
+    )
+    .expect("test port must construct");
+    let refused =
+        <AuthenticatedKernelJobPort as KernelJobPort>::submit(&mut port, &admission, &job);
+    assert_eq!(
+        source.controller_calls(),
+        1,
+        "submit must consult the admitted-stage owner channel exactly once"
+    );
+    let Err(error) = refused else {
+        panic!("a foreign published controller snapshot must refuse at the binding check");
+    };
+    assert!(
+        matches!(error, DreamerError::InvalidAdmission("controller snapshot binding")),
+        "refusal must be exactly the controller snapshot binding reason, got {error:?}"
+    );
+    assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
+    assert!(
+        !matches!(error, DreamerError::KernelAdmissionRequired(_)),
+        "the binding re-proof must precede any transport contact, got {error:?}"
+    );
+    assert_eq!(
+        source.bundle_calls(),
+        0,
+        "a refused binding must never reach the A-04 gate"
     );
 }
