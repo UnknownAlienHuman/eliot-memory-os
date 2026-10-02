@@ -868,11 +868,11 @@ impl LiveArea {
         let LiveArea {
             lease,
             path,
-            _serial,
+            serial,
         } = self;
         drop(lease);
         let _ = std::fs::remove_dir_all(path);
-        drop(_serial);
+        drop(serial);
     }
 }
 
@@ -921,7 +921,7 @@ fn live_source_roots() -> (String, String) {
     let installation = must(crate::protected_program_data_root())
         .join("Eliot")
         .join("installations")
-        .join(&"a".repeat(64));
+        .join("a".repeat(64));
     let installation_root = installation.to_string_lossy().into_owned();
     let host_root = crate::joined_windows_path(&installation_root, "host");
     (installation_root, host_root)
@@ -946,7 +946,7 @@ fn live_admission(
     let mut admission = PreparedDestinationAdmission {
         wire: test_handle(PreparedDestinationAdmission::WIRE),
         operation_id: test_handle("operation:958-live-materialise"),
-        source_installation: test_handle(&"a".repeat(64)),
+        source_installation: test_handle("a".repeat(64)),
         destination_installation: destination.clone(),
         archive_id: test_handle("archive:958-live"),
         archive_digest: test_handle("b".repeat(64)),
@@ -968,9 +968,9 @@ fn live_admission(
             source_host_root,
             source_active_generation: source_active_generation.clone(),
             destination_leaf_observation: DestinationLeafObservation::Absent,
-            evidence_digest: test_handle(&"0".repeat(64)),
+            evidence_digest: test_handle("0".repeat(64)),
         },
-        admission_digest: test_handle(&"0".repeat(64)),
+        admission_digest: test_handle("0".repeat(64)),
     };
     admission.isolation.evidence_digest = must(admission.isolation.computed_digest());
     admission.admission_digest = must(admission.computed_digest());
