@@ -39,6 +39,7 @@ eliot-installation.workspace = true
 eliot-kernel-core.workspace = true
 eliot-kernel-service.workspace = true
 eliot-ipc.workspace = true
+eliot-instrument-api.workspace = true
 # Path edge (issue #1842, I16.3/I16.9): eliot-observability is a workspace
 # member but has no [workspace.dependencies] entry, so a path+version edge
 # keeps root Cargo.toml and workspace membership byte-identical, exactly as

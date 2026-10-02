@@ -238,6 +238,8 @@ use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
 /// unsafe stays inside this crate's identity owner; Host calls it under
 /// `#![forbid(unsafe_code)]`.
 pub use process_identity::directory_identity_for_path;
+#[cfg(windows)]
+pub(crate) use process_identity::inspect_parent_process_identity;
 pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
@@ -249,10 +251,10 @@ pub(crate) use process_identity::{
 pub use process_job::OuterKillDomain;
 pub use process_job::{
     ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
-    JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
-    RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
-    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    JobProcessHistory, JobWaitProjection, PinnedRuntimeFile, ProcessObservation,
+    RecoverableJobBinding, RecoverableJobObject, RunningExistingJobChild, RunningJobChild,
+    RunningJobObservation, SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild,
+    SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
     TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
     ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };

@@ -23,12 +23,16 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
-    EpochId::new(
-        EpochLineageId::new(lineage).expect("valid test lineage"),
-        std::num::NonZeroU64::new(sequence).expect("nonzero test sequence"),
-    )
-    .expect("valid test epoch")
+fn test_epoch(lineage: &str, sequence: u64) -> Result<EpochId, Box<dyn Error>> {
+    Ok(EpochId::new(
+        EpochLineageId::new(lineage)?,
+        std::num::NonZeroU64::new(sequence).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test epoch sequence must be nonzero",
+            )
+        })?,
+    )?)
 }
 
 fn digest(byte: char) -> String {
@@ -39,7 +43,7 @@ fn bindings(
     epoch: u64,
     generation: u64,
 ) -> Result<(WorkScopeBinding, SessionBinding, AuthorityBinding), Box<dyn Error>> {
-    let authority_epoch = test_epoch(TEST_LINEAGE_A, epoch);
+    let authority_epoch = test_epoch(TEST_LINEAGE_A, epoch)?;
     let state_fence = StateFence::new(
         authority_epoch.clone(),
         ResourceGeneration::new(generation)?,

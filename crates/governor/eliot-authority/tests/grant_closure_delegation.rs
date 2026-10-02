@@ -21,7 +21,12 @@ const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 fn test_binding() -> Result<AuthorityBinding, Box<dyn Error>> {
     let epoch = EpochId::new(
         EpochLineageId::new(TEST_LINEAGE)?,
-        std::num::NonZeroU64::new(7).expect("nonzero test sequence"),
+        std::num::NonZeroU64::new(7).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "test epoch sequence must be nonzero",
+            )
+        })?,
     )?;
     let fence = StateFence::new(epoch.clone(), ResourceGeneration::new(1)?);
     Ok(AuthorityBinding {
@@ -110,10 +115,9 @@ fn delegated_closure_covers_exact_descendants_in_parent_order() -> TestResult {
     let mut seen = std::collections::BTreeSet::new();
     seen.insert("grant-origin");
     for member in closure.members.iter().skip(1) {
-        let parent = member
-            .parent_grant_id
-            .as_ref()
-            .expect("child names a parent");
+        let parent = member.parent_grant_id.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "child names a parent")
+        })?;
         assert!(seen.contains(parent.as_str()));
         seen.insert(member.grant_id.as_str());
     }
@@ -134,7 +138,9 @@ fn delegated_closure_roots_mid_chain_subtree() -> TestResult {
         closure.members[0]
             .parent_grant_id
             .as_ref()
-            .expect("mid keeps its parent")
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "mid keeps its parent")
+            })?
             .as_str(),
         "grant-origin"
     );

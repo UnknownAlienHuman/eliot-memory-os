@@ -1737,6 +1737,7 @@ fn finish_envelope(
         state_fence: facts.state_fence.clone(),
         descriptor_sha256: facts.descriptor_sha256.clone(),
         peer_admission_receipt_sha256: facts.receipt_sha256.clone(),
+        authenticated_source: None,
         activation_binding: None,
         envelope_sha256: String::new(),
     }

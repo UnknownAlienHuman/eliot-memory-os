@@ -66,7 +66,8 @@
 //! `eliot_testd_core::KernelProcessAdmissionRequest` names that owner type.
 
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
-use eliot_process::FencingToken;
+use eliot_instrument_api::InstrumentAdmissionGrant;
+use eliot_process::{FencingToken, KernelDispatchGrant, ProcessIntent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -759,8 +760,137 @@ pub struct TestdAdmission {
     pub cancelled: bool,
     /// Admission time in Unix nanoseconds.
     pub admitted_at_unix_nanos: u64,
+    /// Original Kernel-issued instrument and dispatch bindings for one
+    /// claimed productive attempt. This appears only on the authenticated
+    /// per-attempt response after the durable owner and canonical registry
+    /// have revalidated the retained job binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_attempt_grant: Option<TestdProcessAttemptGrant>,
     /// Canonical digest over this admission envelope.
     pub admission_digest: String,
+}
+
+/// Kernel-authored binding consumed by the TestD private child issuer for
+/// exactly one already-claimed durable attempt. It carries the original
+/// registry admission and Kernel dispatch grant; it is not a process permit
+/// and does not replace the queued job's historical process digest.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdProcessAttemptGrant {
+    /// Exact authenticated request identity checked against the durable job.
+    pub request_identity: eliot_ipc::RequestIdentity,
+    /// Durable TestD job identity for this attempt.
+    pub job_id: String,
+    /// Exact claimed attempt sequence; late results remain attempt-local.
+    pub attempt_seq: u32,
+    /// Original process operation shared by the intent and outer admission.
+    pub operation_id: String,
+    /// Original retained process intent; never reconstructed from the request.
+    pub process_intent: ProcessIntent,
+    /// Original owner-read registry admission for this intent.
+    pub instrument_admission: InstrumentAdmissionGrant,
+    /// Original Kernel grant bound to `process_intent.effect_digest()`.
+    pub dispatch_grant: KernelDispatchGrant,
+}
+
+impl TestdProcessAttemptGrant {
+    /// Validates the intrinsic pins. The sealed transport and the consumer's
+    /// separately loaded durable admission remain the authority.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        self.request_identity
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant.request_identity",
+                reason: "request identity is invalid",
+            })?;
+        validate_wire_text(&self.job_id, "testd_admission.process_attempt_grant.job_id")?;
+        validate_wire_text(
+            &self.operation_id,
+            "testd_admission.process_attempt_grant.operation_id",
+        )?;
+        validate_wire_digest(
+            &self.dispatch_grant.grant_digest,
+            "testd_admission.process_attempt_grant.dispatch_grant_digest",
+        )?;
+        validate_wire_text(
+            &self.dispatch_grant.fence_nonce,
+            "testd_admission.process_attempt_grant.fence_nonce",
+        )?;
+        validate_wire_text(
+            &self.dispatch_grant.idempotency_key,
+            "testd_admission.process_attempt_grant.idempotency_key",
+        )?;
+        let owner_store_path = self
+            .dispatch_grant
+            .testd_owner_store_path
+            .as_deref()
+            .ok_or(KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant.testd_owner_store_path",
+                reason: "TestD attempt grants require the Kernel-selected durable owner path",
+            })?;
+        validate_wire_text(
+            owner_store_path,
+            "testd_admission.process_attempt_grant.testd_owner_store_path",
+        )?;
+        if self.dispatch_grant.expires_at == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant.expires_at",
+                reason: "dispatch grant expiry must be non-zero",
+            });
+        }
+        if self.attempt_seq == 0 {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant.attempt_seq",
+                reason: "attempt sequence must be non-zero",
+            });
+        }
+        self.process_intent
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant.process_intent",
+                reason: "original process intent is invalid",
+            })?;
+        if self.instrument_admission.grant_digest != self.instrument_admission.digest()
+            || self.instrument_admission.max_concurrency == 0
+            || self.instrument_admission.executable_file_identity.is_none()
+            || self.process_intent.instrument_admission_digest()
+                != Some(self.instrument_admission.grant_digest.as_str())
+            || self.process_intent.operation_id().as_str() != self.operation_id.as_str()
+            || self.process_intent.executable()
+                != self.instrument_admission.executable_path.as_str()
+            || self.process_intent.executable_sha256()
+                != self.instrument_admission.content_digest.as_str()
+            || self.process_intent.argv() != self.instrument_admission.arguments.as_slice()
+            || self.process_intent.executable_file_identity()
+                != self.instrument_admission.executable_file_identity.as_ref()
+            || self.instrument_admission.authority_epoch.as_ref()
+                != Some(&self.request_identity.request.state_fence.authority_epoch)
+            || self.instrument_admission.resource_generation
+                != Some(
+                    self.request_identity
+                        .request
+                        .state_fence
+                        .resource_generation
+                        .value(),
+                )
+            || self.dispatch_grant.authority_epoch
+                != self.request_identity.request.state_fence.authority_epoch
+            || self.dispatch_grant.fence_generation
+                != self
+                    .request_identity
+                    .request
+                    .state_fence
+                    .resource_generation
+                    .value()
+            || self.process_intent.generation().get() != self.dispatch_grant.fence_generation
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant",
+                reason: "original admission, intent, request fence, or dispatch grant differs",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl TestdAdmission {
@@ -794,7 +924,41 @@ impl TestdAdmission {
             cancelled: self.cancelled,
             admitted_at_unix_nanos: self.admitted_at_unix_nanos,
         };
-        canonical_json_bytes(&canonical)
+        let bytes = if let Some(process_attempt_grant) = &self.process_attempt_grant {
+            #[derive(Serialize)]
+            struct CanonicalAttempt<'a> {
+                wire_id: &'a str,
+                wire_version: u16,
+                job_id: &'a str,
+                request_digest: &'a str,
+                operation_id: &'a str,
+                profile: &'a str,
+                profile_binding_digest: &'a str,
+                environment: &'a [(String, String)],
+                cancelled: bool,
+                admitted_at_unix_nanos: u64,
+                process_attempt_grant: &'a TestdProcessAttemptGrant,
+            }
+            let canonical_attempt = CanonicalAttempt {
+                wire_id: &self.wire_id,
+                wire_version: self.wire_version,
+                job_id: &self.job_id,
+                request_digest: &self.request_digest,
+                operation_id: &self.operation_id,
+                profile: &self.profile,
+                profile_binding_digest: &self.profile_binding_digest,
+                environment: &self.environment,
+                cancelled: self.cancelled,
+                admitted_at_unix_nanos: self.admitted_at_unix_nanos,
+                process_attempt_grant,
+            };
+            canonical_json_bytes(&canonical_attempt)
+        } else {
+            // Keep the original canonical recipe byte-for-byte for retained
+            // admissions that predate the optional per-attempt grant.
+            canonical_json_bytes(&canonical)
+        };
+        bytes
             .map(|bytes| sha256_hex(&bytes))
             .map_err(|_| KernelServiceError::InvalidField {
                 field: "testd_admission.admission_digest",
@@ -805,6 +969,29 @@ impl TestdAdmission {
     /// Returns this admission with its canonical digest populated.
     pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
         self.admission_digest = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Adds the original Kernel-produced grant for one claimed attempt and
+    /// reseals the authenticated response without changing its job history.
+    /// The factory runs only after the original admission has validated, so
+    /// attaching an attempt cannot repair a mismatched historical digest.
+    pub fn with_process_attempt_grant(
+        mut self,
+        process_attempt_grant: impl FnOnce() -> TestdProcessAttemptGrant,
+    ) -> Result<Self, KernelServiceError> {
+        // The original response must already be valid. This additive current
+        // attempt binding cannot repair stale or mismatched admission bytes.
+        self.validate()?;
+        if self.process_attempt_grant.is_some() {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_admission.process_attempt_grant",
+                reason: "an attempt grant cannot be rebound",
+            });
+        }
+        self.process_attempt_grant = Some(process_attempt_grant());
+        self.admission_digest = self.compute_digest()?;
+        self.validate()?;
         Ok(self)
     }
 
@@ -874,6 +1061,19 @@ impl TestdAdmission {
                 field: "testd_admission.admitted_at_unix_nanos",
                 reason: "admission time must be non-zero",
             });
+        }
+        if let Some(process_attempt_grant) = &self.process_attempt_grant {
+            process_attempt_grant.validate()?;
+            if self.cancelled
+                || self.profile != TESTD_PRODUCTIVE_PROFILE
+                || process_attempt_grant.job_id != self.job_id
+                || process_attempt_grant.operation_id != self.operation_id
+            {
+                return Err(KernelServiceError::InvalidField {
+                    field: "testd_admission.process_attempt_grant",
+                    reason: "attempt grants require this exact non-cancelled productive admission",
+                });
+            }
         }
         if self.compute_digest()? != self.admission_digest {
             return Err(KernelServiceError::InvalidField {
@@ -1267,6 +1467,7 @@ fn build_testd_admission(
         },
         cancelled,
         admitted_at_unix_nanos,
+        process_attempt_grant: None,
         admission_digest: String::new(),
     }
     .with_computed_digest()
@@ -1499,6 +1700,91 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn historical_admission_without_attempt_grant_keeps_legacy_digest_recipe() {
+        #[derive(Serialize)]
+        struct HistoricalCanonical<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            job_id: &'a str,
+            request_digest: &'a str,
+            operation_id: &'a str,
+            profile: &'a str,
+            profile_binding_digest: &'a str,
+            environment: &'a [(String, String)],
+            cancelled: bool,
+            admitted_at_unix_nanos: u64,
+        }
+
+        let request = TestdAdmissionAttemptRequest {
+            wire_id: TESTD_ADMISSION_WIRE_ID.to_owned(),
+            wire_version: TESTD_ADMISSION_WIRE_VERSION,
+            job_id: "job-1814".to_owned(),
+            attempt_seq: 1,
+            closed_request_json: "{}".to_owned(),
+            target_resource_digest: "a".repeat(64),
+            request_digest: "b".repeat(64),
+        };
+        let admission = build_testd_admission(
+            &request,
+            TESTD_ADMITTED_PROFILE,
+            &[],
+            "operation-1814",
+            false,
+            1,
+        )
+        .expect("historical admission fixture is valid");
+        assert!(admission.process_attempt_grant.is_none());
+
+        let historical = HistoricalCanonical {
+            wire_id: &admission.wire_id,
+            wire_version: admission.wire_version,
+            job_id: &admission.job_id,
+            request_digest: &admission.request_digest,
+            operation_id: &admission.operation_id,
+            profile: &admission.profile,
+            profile_binding_digest: &admission.profile_binding_digest,
+            environment: &admission.environment,
+            cancelled: admission.cancelled,
+            admitted_at_unix_nanos: admission.admitted_at_unix_nanos,
+        };
+        let expected =
+            canonical_json_bytes(&historical).expect("historical canonical admission serializes");
+        assert_eq!(admission.admission_digest, sha256_hex(&expected));
+    }
+
+    #[test]
+    fn attempt_grant_cannot_refresh_a_tampered_original_admission_digest() {
+        let request = TestdAdmissionAttemptRequest {
+            wire_id: TESTD_ADMISSION_WIRE_ID.to_owned(),
+            wire_version: TESTD_ADMISSION_WIRE_VERSION,
+            job_id: "job-1814".to_owned(),
+            attempt_seq: 1,
+            closed_request_json: "{}".to_owned(),
+            target_resource_digest: "a".repeat(64),
+            request_digest: "b".repeat(64),
+        };
+        let mut admission = build_testd_admission(
+            &request,
+            TESTD_ADMITTED_PROFILE,
+            &[],
+            "operation-1814",
+            false,
+            1,
+        )
+        .expect("historical admission fixture is valid");
+        admission.admission_digest = "c".repeat(64);
+        let mut produced = false;
+
+        let result = admission.with_process_attempt_grant(|| {
+            produced = true;
+            unreachable!("a malformed original admission must be refused first")
+        });
+
+        assert!(result.is_err());
+        assert!(!produced);
+    }
 
     /// The inert default never flips in place: the composed-aware path
     /// advertises only through the composed contour cell.

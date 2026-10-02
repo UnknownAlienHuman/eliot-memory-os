@@ -220,6 +220,10 @@ pub fn restore_correlation(session_id: &str, fence: &StateFence) -> String {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "fixture constructors and assertions use expect for fixed valid test values"
+)]
 mod tests {
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};

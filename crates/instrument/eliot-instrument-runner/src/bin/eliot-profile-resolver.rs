@@ -1,99 +1,12 @@
-//! Production entry point that resolves one admitted verification route and
-//! issues its shared `VerificationProfileReceipt` (issue #1914 W2 + W4).
+//! Resolves an existing authenticated bootstrap selection through the current
+//! canonical instrument registry, obtains a fresh Kernel stage grant, and runs
+//! the selected stage through the shared InstrumentRunner gate. The selection
+//! is inert input: Kernel owner state, the original registration receipt, and
+//! current WorkScope bindings decide whether execution is admitted.
 //!
-//! I18.21 requires that "CI builds the ELIOT verifier/runner bootstrap and then
-//! calls the same versioned profiles used locally", that "local profile
-//! revision == CI profile revision", that "executable/tool identities are
-//! pinned or recorded", that "external binaries require digest/provenance
-//! receipt", and that there is "no CI-only hidden verifier command list". This
-//! binary is the one owner both sides execute, so the alias that names the
-//! route, the admitted revision, the profile and stage digests, the receipt
-//! schema, and the fail-closed identity/provenance checks are all decided by
-//! the same code on either side of the network boundary.
-//!
-//! "local profile revision == CI profile revision" is decided by that same code
-//! rather than asserted in prose. Given `--compare-against <receipt.json>`, this
-//! entry deserialises the counterpart `VerificationProfileReceipt` and hands
-//! both receipts to the one owner [`verify_profile_parity`], which refuses a
-//! changed profile revision, a divergent schema/definition/stage-graph digest, a
-//! missing declared environment dependency, a divergent tool identity, and a CI
-//! verifier command the local receipt never declared. A refused comparison is
-//! this entry's fail-closed nonzero exit, never a warning or a run that
-//! proceeds anyway. The comparison is not implicit: a run that supplies no
-//! `--compare-against` performs none, because the counterpart artifact is the
-//! caller's exactly as `--receipt-out` is.
-//!
-//! Everything the receipt records is machine-observed or registry-admitted:
-//!
-//! - the route is named by a closed [`PROFILE_ALIASES`] entry and resolved
-//!   through the shared [`InstrumentRegistry`]; it is never a command, a path,
-//!   or a stage list, so no caller can invoke a stage the resolver did not
-//!   admit;
-//! - the pinned executable identity of every external stage is the SHA-256 of
-//!   the real tool bytes on this machine, observed here, admitted as a
-//!   [`SupplyChainReceipt`] against the admitted spec digest, and re-checked by
-//!   `require_provenance` against the identity the launch itself recorded. A
-//!   tool whose bytes cannot be read, or whose observed bytes differ from the
-//!   admitted receipt, fails closed instead of yielding a receipt with a
-//!   defaulted identity;
-//! - an admitted spec names a toolchain MEMBER — every builtin declares the bare
-//!   name `cargo` — and that name is resolved through the selected toolchain
-//!   root by the one [`resolve_tool`] owner, never through a bare `PATH` lookup.
-//!   A `PATH` lookup returns the rustup PROXY (`~/.cargo/bin/cargo`, canonically
-//!   `rustup.exe`) on a normal install, which is a different FILE from the one
-//!   the profile declares, so the identity pinned here, the identity sealed into
-//!   the process intent, and the file actually launched would disagree. There is
-//!   no `PATH` fallback and no "resolve to whatever exists": a workspace with no
-//!   resolvable toolchain is refused rather than receipted against some ambient
-//!   binary;
-//! - every stage really starts as a real child through the sole
-//!   [`WindowsProcessExecutor`] under a Kernel-issued dispatch permit, so the
-//!   per-stage evidence the receipt carries came from a process this entry
-//!   executed rather than from a value it was handed. The `--version` read that
-//!   pins each tool's identity is launched the same way, under its own one-shot
-//!   permit, so this entry has no launch of any kind outside that single
-//!   executor. Each such child is observed to a terminal lifecycle before its
-//!   evidence is read, because the executor's `reconcile` is terminal-only: see
-//!   [`await_terminal_view`]. That stage launch is gated by
-//!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
-//!   compiled against a replaced registry generation and admits each stage
-//!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
-//!   this run assembled from the observed supply-chain receipts, so a spec,
-//!   parser, receipt, or route revoked since compilation fails closed before
-//!   any child exists;
-//! - the receipt itself is issued by the shared
-//!   [`build_verification_profile_receipt`] through
-//!   [`resolve_verification_route`], which refuses a missing executable
-//!   identity, a missing or mismatched supply-chain receipt, and an undeclared
-//!   stage before any receipt exists.
-//!
-//! This entry never decides a verdict of its own: the receipt's normalized
-//! outcome is the aggregate the admitted stages produced, a non-PASS outcome is
-//! written to the receipt and reflected in the exit code, and nothing is
-//! rounded up to PASS.
-//!
-//! Usage (I18.21:14 — the caller builds this binary as the one minimal
-//! bootstrap build, then calls it with the same alias locally and in CI):
-//!
-//! ```text
-//! eliot-profile-resolver --alias package-verification --source-root <abs> \
-//!     --target-root <abs> --cache-root <abs> [--declared-environment NAME]... \
-//!     [--receipt-out <path>] [--compare-against <counterpart-receipt.json>]
-//! ```
-//!
-//! `--compare-against` is the caller's counterpart receipt — the artifact the
-//! other side of the network boundary produced with the same alias. It is
-//! compared by the shared [`verify_profile_parity`] owner, so the revision
-//! equality is a computed verdict and a divergence refuses the run.
-//!
-//! Value discipline: `--alias` is matched exactly against the closed table
-//! rather than normalized; the three roots must be existing absolute,
-//! traversal-free, pairwise distinct paths or `TargetLayout` refuses them; the
-//! environment class is the admitted `isolated-process` class both routes
-//! declare, attested over the concrete material this process actually used; the
-//! authority epoch, the per-stage nonce, and the clock are observed or derived
-//! per process; and the pinned tool digests are read from the real executables,
-//! never supplied as text.
+//! Usage: `eliot-profile-resolver --bootstrap-evidence <evidence.json>` with
+//! optional receipt/parity arguments. No command, identity, epoch, executable
+//! version, or process permit is created by this binary.
 
 #![forbid(unsafe_code)]
 // The canonical receipt on stdout and its fail-closed refusal on stderr are
@@ -102,34 +15,34 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use eliot_contracts::{
-    ClockReading, ContractId, EpochContractError, EpochId, EpochLineageId, ProductId, RequestId,
-    RequestMetadata, ResourceGeneration, SourceId, StateFence, sha256_hex,
+use eliot_contracts::EpochContractError;
+use eliot_instrument_api::registry::{
+    EnvironmentInheritanceBinding, EnvironmentProjectionBinding, EnvironmentSecretReference,
+    ExternalExecutableObservation, ProcessExecutionProjection, ResolvedExecutionBinding,
+    validate_external_stage,
 };
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
-    ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
-    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageEvidence,
-    StageLauncher, StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
-    profile::{PROFILE_ALIASES, TOOLCHAIN_PATH_ENV, builtin_specs},
+    AdmittedProfile, CanonicalRegistryProofPort, DeclaredEnvironmentDependency, InstrumentRegistry,
+    InstrumentRegistryReadClient, InstrumentRequestPort, InstrumentRunner,
+    KernelInstrumentStageRuntimeObserver, ParityVerdict, PlannedStage, ProfileAggregate,
+    ProfileCompiler, RegistryLaunchSelection, RunnerError, StageEnvironment, StageEvidence,
+    StageLauncher, StageOrchestrator, TargetLayout, VerificationProfileReceipt,
+    VerificationRouteRequest, parity_summary, registry_launch_selection, registry_state_request,
     resolve_verification_route, verify_profile_parity,
 };
+use eliot_ipc::KernelClient;
+use eliot_kernel_service::{
+    INSTRUMENT_STAGE_GRANT_OPERATION, InstrumentStageGrantRequest, InstrumentStageGrantResponse,
+    KernelChildDispatchAuthority,
+};
 use eliot_process::{
-    ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
-    DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,
-    ExitDisposition, FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId,
-    PermitIssuance, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError,
-    ProcessExecutionView, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    CancellationReceipt, EnvironmentInheritance, EnvironmentProjection, EvidenceSinkError,
+    OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView,
+    ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
 };
 use eliot_process_executor::{
     DispatchValidationPort, ExecutableObservation, WindowsProcessExecutor,
@@ -145,101 +58,10 @@ const EXIT_PASS: i32 = 0;
 /// Exit code for any fail-closed refusal, including a non-PASS aggregate.
 const EXIT_REFUSED: i32 = 1;
 
-/// Validation revision pinned into every stored dispatch validation context.
-///
-/// The one-shot context shape the `eliot-verifier-selfchange` bootstrap stores;
-/// no other revision is ever admitted here.
-const VALIDATION_REVISION: u64 = 1;
-
-/// Registry generation the shared verification registry is admitted at.
-///
-/// The route profiles ship at revision 1, and a supply-chain receipt is validated
-/// against the admitted spec digest at exactly the generation the registry is
-/// assembled with, so one fixed generation keeps an attested receipt and its
-/// registry bound together on either side of a parity comparison.
-const VERIFICATION_REGISTRY_GENERATION: u64 = 1;
-
-/// Authority epoch lineage of this one-shot resolution process.
-///
-/// P-07 fences every permit of this run under the epoch it is activated with.
-/// The lineage names this process instance rather than a durable authority: the
-/// run holds one ephemeral authority and revokes nothing.
-const EPOCH_LINEAGE: &str = "eliot-verification-profile-resolver";
-
-/// Product identity every stage invocation of this run belongs to.
-const ADMITTED_PRODUCT: &str = "eliot";
-
-/// Ceiling on retained stdout bytes for one admitted stage child.
-///
-/// Bounded structurally: `ResourceLimits::new` refuses a zero ceiling, so a
-/// stage's evidence is bounded rather than unbounded, and the executor retains
-/// at most this much per stream.
-const STAGE_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
-
-/// Wall bound for one admitted stage child, in milliseconds.
-const STAGE_WALL_TIMEOUT_MS: u64 = 3_600_000;
-
-/// Ceiling on descendant processes for one admitted stage child.
-const STAGE_MAX_DESCENDANTS: u32 = 256;
-
-/// Ceiling on the retained bytes of one observed tool version line.
-///
-/// Bounded so a tool that answers `--version` with an unbounded stream cannot
-/// turn the version read into unbounded retention. It is far above any real
-/// tool's version line, so an ordinary version is recorded in full and only a
-/// runaway read is refused.
-const MAX_TOOL_VERSION_BYTES: usize = 4096;
-
-/// Wall bound for the permit-bound `--version` observation child, in milliseconds.
-///
-/// A version read is a short bounded probe, not a stage: this is deliberately
-/// far below [`STAGE_WALL_TIMEOUT_MS`] so a tool that hangs instead of answering
-/// its version is refused here rather than holding a stage-sized launch open.
-const VERSION_WALL_TIMEOUT_MS: u64 = 60_000;
-
-/// Per-stream capture ceiling for the permit-bound `--version` observation child.
-///
-/// Set above [`MAX_TOOL_VERSION_BYTES`] so an ordinary version is captured whole
-/// and still bounds what a runaway tool can write. Because the retained prefix
-/// preview omits any suffix past this ceiling, `observed_tool_version` refuses a
-/// read that hit it instead of reporting a truncated line as the version.
-const VERSION_STDOUT_BYTES: u64 = 64 * 1024;
-
-/// Ceiling on descendant processes for the permit-bound `--version` child.
-///
-/// A version read answers with a single line from the tool itself, so a wider
-/// descendant tree than [`STAGE_MAX_DESCENDANTS`] is not a normal observation.
-const VERSION_MAX_DESCENDANTS: u32 = 8;
-
-/// Bound on waiting for the permit-bound `--version` child to settle.
-///
-/// Set equal to [`VERSION_WALL_TIMEOUT_MS`], the wall bound that child was
-/// sealed with, because that deadline is what makes the wait finite: the
-/// executor's own operation-bound deadline watcher terminates the version child
-/// at it, so the view reaches a terminal lifecycle at or before this bound and
-/// this constant invents no timing policy of its own. A child still not settled
-/// at the bound is refused, never reported.
-const VERSION_OBSERVE_TIMEOUT: Duration = Duration::from_millis(VERSION_WALL_TIMEOUT_MS);
-
-/// Cadence for observing the permit-bound `--version` child's lifecycle.
-///
-/// Reused rather than introduced: the same 25ms bound is the executor's own
-/// terminal-wait poll, and the same cadence the two existing production callers
-/// of a real child already poll [`ProcessExecutor::inspect`] at — the
-/// `RECONCILE_OBSERVE_POLL` of `wasm_p03_adapter.rs` and `BOUND_RUN_POLL` of
-/// `eliot-git-bridge`.
-const VERSION_OBSERVE_POLL: Duration = Duration::from_millis(25);
-
 /// The exact invocation this binary reads.
 struct Request {
-    /// Closed profile alias naming the route to resolve.
-    alias: String,
-    /// Admitted source root; the stage working directory.
-    source_root: PathBuf,
-    /// Admitted external build target root.
-    target_root: PathBuf,
-    /// Admitted cache root.
-    cache_root: PathBuf,
+    /// Existing bootstrap carrier containing the authenticated current stage selection.
+    selection: RegistryLaunchSelection,
     /// Declared environment dependency names this run declares.
     declared_environments: Vec<String>,
     /// Caller-chosen receipt path, when the caller wants the receipt on disk.
@@ -450,138 +272,293 @@ fn require_receipt_parity(
     }
 }
 
-/// Resolves one aliased route end to end and issues its shared receipt.
+/// Resolves one bootstrap-selected, owner-admitted route and issues its shared receipt.
 fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliError> {
+    let selection = &request.selection;
+    let kernel = KernelClient::load()
+        .map_err(|error| CliError::Contract(format!("Kernel front door unavailable: {error}")))?;
+    let client = Arc::new(
+        InstrumentRegistryReadClient::new(
+            kernel,
+            selection.request_identity.clone(),
+            selection.scope_id.clone(),
+        )
+        .map_err(|error| {
+            CliError::Contract(format!("canonical registry client refused: {error}"))
+        })?,
+    );
+    let read_request = registry_state_request(
+        &selection.scope_id,
+        &selection.request_identity.request.state_fence,
+    );
+    let proof = block_on(CanonicalRegistryProofPort::retain_original(
+        Arc::clone(&client),
+        read_request,
+    ))
+    .map_err(|error| CliError::Contract(format!("original registry proof refused: {error}")))?;
+    let (_, _, current) = block_on(proof.current_owner_readback())
+        .map_err(|error| CliError::Contract(format!("current registry read refused: {error}")))?;
+    let encoded_snapshot = current
+        .payload
+        .get("snapshot_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Contract("current registry row omitted its snapshot".to_owned())
+        })?;
+    let registry = InstrumentRegistry::recover(encoded_snapshot)?;
+    let snapshot: eliot_instrument_api::registry::InstrumentRegistrySnapshot<serde_json::Value> =
+        serde_json::from_str(encoded_snapshot).map_err(|error| {
+            CliError::Contract(format!("current registry snapshot is invalid: {error}"))
+        })?;
+    let alias = PROFILE_ALIASES
+        .iter()
+        .find(|entry| {
+            entry.profile == selection.pin.profile
+                && entry.revision == selection.pin.profile_revision
+        })
+        .ok_or_else(|| {
+            CliError::Contract(
+                "selected profile revision has no verification receipt route".to_owned(),
+            )
+        })?;
+    let admitted = ProfileCompiler::new(&registry)
+        .compile_exact(&selection.pin.profile, selection.pin.profile_revision)?;
+    let profile = registry.admitted(&selection.pin.profile, selection.pin.profile_revision)?;
+    let environment = StageEnvironment::attest_projection(
+        profile.classes.environment.clone(),
+        selection.intent.environment().clone(),
+    )?;
     let layout = TargetLayout::new(
-        admitted_root(&request.source_root)?,
-        admitted_root(&request.target_root)?,
-        admitted_root(&request.cache_root)?,
+        selection.layout.source_root.clone(),
+        selection.layout.target_root.clone(),
+        selection.layout.cache_root.clone(),
     )?;
-    // The registry is assembled here from the builtin verification routes plus
-    // the supply-chain receipts this process observed, rather than supplied by
-    // the caller, because the registry is what decides which revision an alias
-    // admits and a caller-assembled registry could admit a different revision
-    // than the one CI resolves. It is built through the SAME shared owner
-    // `InstrumentRegistry::with_verification_route_profiles` that
-    // `resolve_verification_route` builds for the receipt below, so the
-    // admission this process performs on every stage and the admission the
-    // receipt builder performs are the same definitions at the same generation
-    // — the plan this process compiles therefore carries exactly the
-    // registry generation and digest `launch_plan_live` checks before it
-    // admits anything.
-    let specs = builtin_specs()?;
-    let receipts = observed_supply_chain(&specs, &layout.source_root)?;
-    let registry = InstrumentRegistry::with_verification_route_profiles(
-        VERIFICATION_REGISTRY_GENERATION,
-        receipts.clone(),
+    let resolved = ProfileCompiler::new(&registry).resolve_full(
+        &selection.pin.profile,
+        selection.pin.profile_revision,
+        layout.clone(),
+        selection.work_scope.clone(),
+        environment.clone(),
     )?;
-
-    // `admitted_profile_for_alias` is the same closed-table lookup
-    // `resolve_verification_route` performs. It runs first so an alias the table
-    // does not admit fails closed before any tool is launched, rather than
-    // after a whole run of the wrong stage set.
-    let route = admitted_profile_for_alias(&request.alias, &registry)?.clone();
-    let compiler = ProfileCompiler::new(&registry);
-    let admitted = compiler.compile_exact(&route.name, route.revision)?;
-
-    let epoch = process_epoch()?;
-    let clock = observation_clock(now_unix_ms());
-    // The workscope fence carries the same epoch and the same registry
-    // generation every stage launch is sealed under, so one run has exactly one
-    // admitted generation: a receipt whose scope fence and whose stage fences
-    // disagreed would name two generations for one run.
-    let scope = WorkScope::new(
-        ADMITTED_SCOPE_CLASS.to_owned(),
-        StateFence::new(
-            epoch.clone(),
-            ResourceGeneration::new(VERIFICATION_REGISTRY_GENERATION)?,
-        ),
+    let plan = StageOrchestrator::plan_resolved(&admitted, &resolved)?;
+    if plan.stages.len() != 1 || plan.stages[0].route.stage().stage_id != selection.pin.stage_id {
+        return Err(CliError::Contract(
+            "a single bootstrap ProcessIntent can resolve only a profile plan containing exactly its selected stage".to_owned(),
+        ));
+    }
+    let planned = plan
+        .stages
+        .iter()
+        .find(|stage| {
+            stage.stage.profile == selection.pin.profile
+                && stage.stage.profile_revision == selection.pin.profile_revision
+                && stage.stage.stage_id == selection.pin.stage_id
+        })
+        .ok_or_else(|| {
+            CliError::Contract(
+                "bootstrap selection does not match a current profile stage".to_owned(),
+            )
+        })?;
+    let resolution = planned.resolution.as_ref().ok_or_else(|| {
+        CliError::Contract("selected external stage omitted its resolved owner binding".to_owned())
+    })?;
+    if selection.intent.working_directory() != resolution.layout.source_root
+        || selection.work_scope.declared_scope != resolution.scope.declared_scope
+    {
+        return Err(CliError::Contract(
+            "bootstrap process intent differs from the retained profile resolution".to_owned(),
+        ));
+    }
+    let invocation = InstrumentInvocation {
+        request: selection.request_identity.request.metadata.clone(),
+        instrument: planned.stage.spec.clone(),
+        kind: planned.stage.kind,
+        profile: planned.stage.profile.clone(),
+        target: resolution.layout.source_root.clone(),
+        arguments: planned.stage.argument_template.clone(),
+        input_artifacts: Vec::new(),
+        declared_scope: resolution.scope.declared_scope.clone(),
+        requested_at: selection.request_identity.request.metadata.clock,
+    };
+    invocation.validate()?;
+    let observed =
+        ExecutableObservation::observe_from_intent(&selection.intent, None).map_err(|error| {
+            CliError::Contract(format!("external executable observation refused: {error}"))
+        })?;
+    let observed_file_identity = observed.file_identity.ok_or_else(|| {
+        CliError::Contract(
+            "external executable observation has no owner-observed file identity".to_owned(),
+        )
+    })?;
+    let mut identity = ResolvedExecutableIdentity::new(
+        invocation.instrument.as_str(),
+        observed.canonical_path,
+        observed.content_digest,
+        None,
+        environment_projection_digest(selection.intent.environment()),
+        selection.intent.argv().to_vec(),
     )?;
-    // The attested environment material is the concrete fact this process
-    // actually holds: the admitted worktree class, the environment class, the
-    // admitted source root, the resolved alias, and the admitted profile
-    // digest. It is recorded into the digest rather than sniffed from ambient
-    // CI variables, so a CI-only difference is a difference in this material and
-    // shows up as a different environment digest on both sides of a parity
-    // comparison instead of as an invisible one.
-    let environment = StageEnvironment::attest(
-        ISOLATED_PROCESS_CLASS.to_owned(),
-        &format!(
-            "{}\0{}\0{}\0{}\0{}",
-            ADMITTED_SCOPE_CLASS,
-            ISOLATED_PROCESS_CLASS,
-            layout.source_root,
-            request.alias,
-            admitted.profile_digest
-        ),
+    identity.file_identity = Some(observed_file_identity);
+    identity.tool_version =
+        StageOrchestrator::recorded_tool_version(&registry, &planned.stage, &identity)?;
+    let admission_intent = selection
+        .intent
+        .clone()
+        .with_executable_file_identity(observed_file_identity)?;
+    let expected_admission = validate_external_stage(
+        &snapshot,
+        &selection.pin,
+        &invocation,
+        &ExternalExecutableObservation {
+            canonical_path: identity.canonical_path.clone(),
+            executable_file_name: identity.executable_file_name(),
+            content_digest: identity.content_digest.clone(),
+            file_identity: observed_file_identity,
+            tool_version: identity.tool_version.clone(),
+        },
+        selection.intent.argv(),
+        &ResolvedExecutionBinding {
+            source_root: resolution.layout.source_root.clone(),
+            environment_class: resolution.environment.class.clone(),
+            environment_digest: resolution.environment.digest.clone(),
+            environment_projection: environment_projection_binding(
+                &resolution.environment.projection.clone().ok_or_else(|| {
+                    CliError::Contract("resolved environment projection is absent".to_owned())
+                })?,
+            ),
+            declared_scope: resolution.scope.declared_scope.clone(),
+            authority_epoch: resolution.scope.fence.authority_epoch.clone(),
+            resource_generation: resolution.scope.fence.resource_generation.value(),
+        },
+        &process_projection(selection, &admission_intent)?,
+    )
+    .map_err(|error| {
+        CliError::Contract(format!(
+            "canonical external-stage admission refused: {error}"
+        ))
+    })?;
+    let intent =
+        admission_intent.with_instrument_admission_digest(expected_admission.digest.clone())?;
+    let grant_request = InstrumentStageGrantRequest {
+        scope_id: selection.scope_id.clone(),
+        pin: selection.pin.clone(),
+        invocation: invocation.clone(),
+        resolution: ResolvedExecutionBinding {
+            source_root: resolution.layout.source_root.clone(),
+            environment_class: resolution.environment.class.clone(),
+            environment_digest: resolution.environment.digest.clone(),
+            environment_projection: environment_projection_binding(
+                &resolution.environment.projection.clone().ok_or_else(|| {
+                    CliError::Contract("resolved environment projection is absent".to_owned())
+                })?,
+            ),
+            declared_scope: resolution.scope.declared_scope.clone(),
+            authority_epoch: resolution.scope.fence.authority_epoch.clone(),
+            resource_generation: resolution.scope.fence.resource_generation.value(),
+        },
+        intent,
+    };
+    grant_request
+        .validate_admission_binding(&expected_admission)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "local Kernel stage request binding refused: {error}"
+            ))
+        })?;
+    let grant_value = serde_json::to_value(&grant_request)?;
+    let authenticated = block_on(client.transact_json_authenticated_async(
+        INSTRUMENT_STAGE_GRANT_OPERATION,
+        grant_value,
+        selection.request_identity.clone(),
+    ))
+    .map_err(|error| CliError::Contract(format!("Kernel stage grant refused: {error}")))?;
+    let response: InstrumentStageGrantResponse =
+        serde_json::from_value(authenticated.payload().clone())?;
+    if authenticated.operation() != INSTRUMENT_STAGE_GRANT_OPERATION
+        || authenticated.request_identity() != &selection.request_identity
+        || response.admission != expected_admission
+    {
+        return Err(CliError::Contract(
+            "authenticated Kernel stage grant differs from the exact canonical admission"
+                .to_owned(),
+        ));
+    }
+    let observation_client = KernelClient::load().map_err(|error| {
+        CliError::Contract(format!(
+            "Kernel instrument-stage runtime observer unavailable: {error}"
+        ))
+    })?;
+    let runtime_observer = Arc::new(KernelInstrumentStageRuntimeObserver::new(
+        observation_client,
+    ));
+    let authority = Arc::new(KernelChildDispatchAuthority::new_with_observation_port(
+        runtime_observer,
+    )?);
+    let process_request = authority.issue_authenticated(
+        &grant_request,
+        &selection.request_identity,
+        authenticated,
+        now_unix_ms().max(1),
     )?;
+    let process_operation_id = process_request.operation_id().clone();
+    let process_request_digest = process_request.invocation_digest().to_owned();
+    let port = StagePort::for_selection(&invocation, process_request);
+    let launcher = StageRoute {
+        invocation,
+        selected_stage_id: selection.pin.stage_id.clone(),
+        selected_profile_revision: selection.pin.profile_revision,
+        port,
+    };
+    let executor = Arc::new(StageExecutor::with_kernel_authority(Arc::clone(&authority)));
+    let runner = InstrumentRunner::new(Arc::clone(&executor));
+    let runs = block_on(StageOrchestrator::launch_plan_live(
+        &runner, &registry, &plan, &launcher, &proof,
+    ));
+    let aggregate = ProfileAggregate::assemble(&plan, runs);
+    require_launched_stage(&admitted, &aggregate)?;
+    let terminal_evidence = executor
+        .executor()
+        .wait_for_terminal_evidence(process_operation_id.clone())
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "instrument stage terminal supervision refused: {error}"
+            ))
+        })?;
+    if terminal_evidence.view().operation_id() != &process_operation_id
+        || terminal_evidence.view().request_digest() != process_request_digest.as_str()
+        || !eliot_instrument_runner::process_evidence_reports_terminal_or_transport_failure(
+            &terminal_evidence,
+        )
+    {
+        return Err(CliError::Contract(
+            "instrument stage terminal evidence differs from the original process request"
+                .to_owned(),
+        ));
+    }
+    authority
+        .report_terminal(&terminal_evidence)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "authenticated instrument stage terminal report refused: {error}"
+            ))
+        })?;
+    let scope = selection.work_scope.clone();
     let dependencies = request
         .declared_environments
         .iter()
         .map(|name| {
             Ok(DeclaredEnvironmentDependency::new(
                 name.clone(),
-                ISOLATED_PROCESS_CLASS.to_owned(),
+                profile.classes.environment.clone(),
                 &environment,
             )?)
         })
         .collect::<Result<Vec<_>, CliError>>()?;
-
-    // Resolve the exact admitted revision against the same bindings the receipt
-    // is built from, before a single stage launches, so a refused binding is a
-    // refusal rather than a run whose receipt is later refused.
-    compiler.resolve_full(
-        &admitted.name,
-        admitted.revision,
-        layout.clone(),
-        scope.clone(),
-        environment.clone(),
-    )?;
-
-    let cell = Arc::new(DispatchCell::activate()?);
-    let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
-    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
-    let launcher = StageRoute {
-        epoch,
-        clock,
-        layout: layout.clone(),
-        port,
-    };
-    // The live registry is REQUIRED here, not optional. `launch_plan_live`
-    // first checks that this plan was compiled against exactly this registry's
-    // generation and digest — and records every stage as an explicit missing
-    // proof if it was not, so a plan from a replaced generation can never
-    // launch under revoked admission. It then admits every stage through
-    // `AdmittedStage::admit_live`, which runs `refuse_if_revoked` against that
-    // live registry before sealing the grant, so a spec, parser, supply-chain
-    // receipt, or route replaced since this run's compilation fails closed here
-    // and the stage becomes a visible missing run rather than a child process.
-    // The registry-free `run_profile_stages` walks the same plan but passes
-    // `None` for the live registry, so it never performs either the
-    // generation/digest binding or the per-stage revocation check. Passing that
-    // registry in — the real one this run built from the observed supply-chain
-    // receipts, at the same generation the receipt builder uses — is what makes
-    // this resolver's stage admission a live admission rather than a walk over a
-    // stale compiled one.
-    let plan = StageOrchestrator::plan(&admitted);
-    let runs = block_on(StageOrchestrator::launch_plan_live(
-        &runner, &registry, &plan, &launcher,
-    ));
-    let aggregate = ProfileAggregate::assemble(&plan, runs);
-    require_launched_stage(&admitted, &aggregate)?;
-
-    // The same observed receipts travel into the receipt builder. It assembles
-    // its own registry from them, so `require_provenance` compares each run's
-    // recorded executable identity against the receipt that pins the real bytes
-    // of the tool this process launched. A receipt that did not travel here
-    // would leave every external stage with no admitted provenance, and the
-    // builder would refuse the receipt — which is the fail-closed behaviour
-    // I18.21:8 requires when the provenance data is absent.
     let receipt = resolve_verification_route(
-        VERIFICATION_REGISTRY_GENERATION,
+        registry.generation(),
         VerificationRouteRequest {
-            receipts,
-            route: request.alias.clone(),
+            receipts: snapshot.receipts.clone(),
+            route: alias.alias.to_owned(),
             layout,
             scope,
             environment,
@@ -593,6 +570,54 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         std::fs::write(path, serde_json::to_vec_pretty(&receipt)?)?;
     }
     Ok(receipt)
+}
+
+fn process_projection(
+    selection: &RegistryLaunchSelection,
+    intent: &ProcessIntent,
+) -> Result<ProcessExecutionProjection, CliError> {
+    let executable_file_identity = intent.executable_file_identity().copied().ok_or_else(|| {
+        CliError::Contract(
+            "process projection has no owner-observed executable file identity".to_owned(),
+        )
+    })?;
+    let limits = intent.resource_limits();
+    Ok(ProcessExecutionProjection {
+        working_directory: intent.working_directory().to_owned(),
+        environment_digest: environment_projection_digest(intent.environment()),
+        environment_projection: environment_projection_binding(intent.environment()),
+        executable_file_identity,
+        authority_epoch: selection
+            .request_identity
+            .request
+            .state_fence
+            .authority_epoch
+            .clone(),
+        resource_generation: intent.generation().get(),
+        wall_timeout_ms: limits.wall_timeout_ms(),
+        stdout_bytes: limits.stdout_bytes(),
+        stderr_bytes: limits.stderr_bytes(),
+    })
+}
+
+fn environment_projection_binding(
+    projection: &EnvironmentProjection,
+) -> EnvironmentProjectionBinding {
+    EnvironmentProjectionBinding {
+        non_secret: projection.non_secret().clone(),
+        secret_refs: projection
+            .secret_refs()
+            .iter()
+            .map(|reference| EnvironmentSecretReference {
+                provider: reference.provider().to_owned(),
+                key: reference.key().to_owned(),
+            })
+            .collect(),
+        inheritance: match projection.inheritance() {
+            EnvironmentInheritance::None => EnvironmentInheritanceBinding::None,
+            EnvironmentInheritance::Allowlisted => EnvironmentInheritanceBinding::Allowlisted,
+        },
+    }
 }
 
 /// Requires at least one admitted stage to have really launched.
@@ -655,549 +680,19 @@ fn stage_refusals(aggregate: &ProfileAggregate) -> String {
             StageEvidence::Retained { .. } => {
                 format!("launched (execution {:?})", run.execution)
             }
+            StageEvidence::Transformed {
+                source_artifact,
+                result_digest,
+                ..
+            } => format!(
+                "pure transform succeeded from retained artifact '{}' with result {}",
+                source_artifact.as_str(),
+                result_digest
+            ),
         };
         reported.push(format!("stage '{stage_id}' {reason}"));
     }
     format!("per-stage refusals: [{}]", reported.join("; "))
-}
-
-/// Pins every admitted external stage executable from the real bytes here.
-///
-/// I18.21 requires "executable/tool identities are pinned or recorded" and
-/// "external binaries require digest/provenance receipt". The digest below is the
-/// SHA-256 this process computed over the executable file the route will run, at
-/// the admitted spec digest, for the admitted generation. That receipt is what
-/// `require_provenance` compares the launch-recorded identity against, so a
-/// swapped tool fails closed instead of being receipted under a declared
-/// identity. An executable this process cannot read, or one the selected
-/// toolchain does not contain, is refused here rather than admitted with no
-/// digest.
-///
-/// One receipt is pinned per admitted spec, keyed by the spec's own kind
-/// identity — which is the key `SupplyChainTable` admits and `compile_exact`
-/// looks a stage's receipt up by — so the receipt set can never collide on two
-/// specs that happen to name the same executable.
-fn observed_supply_chain(
-    specs: &[InstrumentSpec],
-    source_root: &str,
-) -> Result<Vec<SupplyChainReceipt>, CliError> {
-    specs
-        .iter()
-        .map(|spec| {
-            let executable = resolve_tool(&spec.executable, source_root)?;
-            Ok(SupplyChainReceipt::new(
-                ContractId::new(spec.kind.as_str())?,
-                spec.executable.clone(),
-                file_digest(&executable)?,
-                // No version is attested on this path, so none is claimed; a spec
-                // that pinned a version still gates inside admission.
-                None,
-                spec.digest(),
-                VERIFICATION_REGISTRY_GENERATION,
-            )?)
-        })
-        .collect()
-}
-
-/// Requires one admitted root to be an existing, traversal-free absolute path.
-fn admitted_root(path: &Path) -> Result<String, CliError> {
-    if !path.is_absolute() {
-        return Err(CliError::Contract(format!(
-            "admitted root {} is not absolute",
-            path.display()
-        )));
-    }
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        CliError::Contract(format!(
-            "admitted root {} is unavailable: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(canonical.to_string_lossy().into_owned())
-}
-
-/// Resolves one admitted executable name to the real toolchain file it names.
-///
-/// An admitted spec names a TOOLCHAIN MEMBER, not a `PATH` entry: every
-/// builtin spec declares the bare name `cargo`, and the file that actually
-/// compiles the workspace is the `cargo` inside the selected rustup toolchain
-/// (issue #1914). A bare `PATH` lookup returns the FIRST `cargo` on `PATH`,
-/// which under a normal rustup install is `~/.cargo/bin/cargo` — a rustup
-/// PROXY, canonically `rustup.exe` itself. Pinning and launching that file
-/// made this process declare one identity (the proxy's bytes) while the
-/// profile declared another (the toolchain's `cargo`), and the executor
-/// correctly refused it as "not the admitted executable". The refusal was
-/// right; the resolution that produced the proxy was wrong.
-///
-/// So the admitted name is resolved through the SELECTED TOOLCHAIN ROOT, not
-/// through `PATH`. `eliot-testd` already owns this exact resolution
-/// (`resolve_selected_toolchain` in `bins/eliot-testd`), and this is the same
-/// rule rather than a second one: the workspace `rust-toolchain.toml` override
-/// wins, else the rustup default, else refusal. There is deliberately NO
-/// `PATH` fallback here — a fallback that resolved to whatever existed would
-/// reintroduce exactly the shim this defect is about, and "no toolchain" must
-/// read as a refusal rather than as a pass over some ambient binary.
-///
-/// Both identities therefore come from ONE owner function: the path this
-/// returns is the file that is hashed into the supply-chain receipt, the path
-/// `ExecutableObservation::observe_at_path` re-hashes into the sealed intent,
-/// and the path the child is launched as. The spec's declared name and the
-/// resolved file name are checked against each other by
-/// `AdmittedStage::check_executable`, so the two cannot silently disagree.
-fn resolve_tool(name: &str, source_root: &str) -> Result<PathBuf, CliError> {
-    let candidate = Path::new(name);
-    if candidate.is_absolute() || candidate.components().count() > 1 {
-        return Err(CliError::Contract(format!(
-            "admitted executable '{name}' must be a bare tool name resolved through the selected toolchain"
-        )));
-    }
-    let root = selected_toolchain_root(source_root)?;
-    for suffix in executable_suffixes() {
-        let candidate = root.join(format!("{name}{suffix}"));
-        if candidate.is_file() {
-            return std::fs::canonicalize(&candidate).map_err(|error| {
-                CliError::Contract(format!(
-                    "admitted executable {} is unavailable: {error}",
-                    candidate.display()
-                ))
-            });
-        }
-    }
-    Err(CliError::Contract(format!(
-        "admitted executable '{name}' is not a member of the selected toolchain {}; an unpinned tool cannot be receipted",
-        root.display()
-    )))
-}
-
-/// The `bin` directory of the ONE toolchain this workspace is verified with.
-///
-/// Selection reads the owner-published rustup metadata rather than probing for
-/// a directory that happens to contain a `cargo`: the workspace
-/// `rust-toolchain.toml` override names the channel the repo pins, and absent
-/// an override the rustup default is the toolchain the owner selected. Both
-/// are required to name exactly one INSTALLED toolchain — an ambiguous or
-/// absent selection fails closed rather than picking one.
-fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
-    let rustup_home = rustup_home()?;
-    let source_root = current_source_root(source_root)?;
-    let settings = read_bounded_metadata(
-        &Path::new(&rustup_home).join("settings.toml"),
-        "rustup settings",
-    )?;
-    let host = toml_string_value(&settings, "default_host_triple");
-    let requested = read_toolchain_override(Path::new(&source_root))
-        .or_else(|| toml_string_value(&settings, "default_toolchain"))
-        .ok_or_else(|| {
-            CliError::Contract(format!(
-                "no toolchain is selected: {source_root} pins none and {rustup_home} names no default"
-            ))
-        })?;
-    let toolchains = Path::new(&rustup_home).join("toolchains");
-    let mut candidates = std::fs::read_dir(&toolchains)
-        .map_err(|error| {
-            CliError::Contract(format!(
-                "toolchain root {} is unavailable: {error}",
-                toolchains.display()
-            ))
-        })?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(std::fs::FileType::is_dir)
-                .map(|_| entry.file_name().to_string_lossy().into_owned())
-        })
-        .filter(|name| name == &requested || name.starts_with(&format!("{requested}-")))
-        .collect::<Vec<_>>();
-    candidates.sort();
-    if let Some(host) = host.as_deref() {
-        let host_candidates = candidates
-            .iter()
-            .filter(|name| name.ends_with(host))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !host_candidates.is_empty() {
-            candidates = host_candidates;
-        }
-    }
-    let [selected] = candidates.as_slice() else {
-        return Err(CliError::Contract(format!(
-            "toolchain '{requested}' is not installed under {}; an unpinned toolchain cannot be receipted",
-            toolchains.display()
-        )));
-    };
-    Ok(toolchains.join(selected).join("bin"))
-}
-
-/// The owner-published rustup home, resolved without inventing a default.
-///
-/// `RUSTUP_HOME` wins when published; otherwise the per-user `.rustup`
-/// directory. A home that is absent, relative, or not an existing directory is
-/// a refusal: guessing a second location here would be the same
-/// "resolve to whatever exists" fallback this function exists to remove.
-fn rustup_home() -> Result<String, CliError> {
-    let candidate = std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .or_else(|| std::env::var_os("HOME"))
-                .map(|home| PathBuf::from(home).join(".rustup"))
-        })
-        .ok_or_else(|| {
-            CliError::Contract("toolchain root is unknown: RUSTUP_HOME is unset".to_owned())
-        })?;
-    if !candidate.is_absolute() || !candidate.is_dir() {
-        return Err(CliError::Contract(format!(
-            "toolchain root {} is not an existing absolute directory",
-            candidate.display()
-        )));
-    }
-    Ok(std::fs::canonicalize(&candidate)
-        .map_err(|error| {
-            CliError::Contract(format!(
-                "toolchain root {} cannot be canonicalized: {error}",
-                candidate.display()
-            ))
-        })?
-        .to_string_lossy()
-        .into_owned())
-}
-
-/// The workspace this run verifies, as an absolute path.
-///
-/// The toolchain override is read from the same admitted root the stages run
-/// in rather than from the process working directory, so which toolchain is
-/// selected is a property of the admitted layout and not of wherever the
-/// caller happened to invoke this binary.
-fn current_source_root(source_root: &str) -> Result<String, CliError> {
-    let root = PathBuf::from(source_root);
-    if !root.is_absolute() || !root.is_dir() {
-        return Err(CliError::Contract(format!(
-            "admitted source root {} is not an existing absolute directory",
-            root.display()
-        )));
-    }
-    Ok(std::fs::canonicalize(&root)
-        .map_err(|error| {
-            CliError::Contract(format!(
-                "admitted source root {} cannot be canonicalized: {error}",
-                root.display()
-            ))
-        })?
-        .to_string_lossy()
-        .into_owned())
-}
-
-/// The channel the admitted workspace root pins, when it pins one.
-///
-/// A workspace with no override is not an error: the rustup default is then the
-/// owner's selected toolchain. The same two override file names and the same
-/// `channel` key `eliot-testd` honours are used, so both surfaces select the
-/// same toolchain for the same workspace.
-fn read_toolchain_override(source_root: &Path) -> Option<String> {
-    for name in ["rust-toolchain.toml", "rust-toolchain"] {
-        let path = source_root.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        let text = read_bounded_metadata(&path, "rust-toolchain override").ok()?;
-        let value = if name.eq_ignore_ascii_case(".toml") {
-            toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
-        } else {
-            text.lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(ToOwned::to_owned)
-        };
-        return value
-            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control));
-    }
-    None
-}
-
-/// Reads one small owner metadata file under a fixed size bound.
-///
-/// The bound keeps an unreadable or substituted metadata file from being read
-/// into memory as part of identity selection; a file that is not UTF-8 or is
-/// implausibly large is refused rather than parsed leniently.
-fn read_bounded_metadata(path: &Path, what: &str) -> Result<String, CliError> {
-    const MAX_METADATA_BYTES: usize = 64 * 1024;
-    let bytes = std::fs::read(path).map_err(|error| {
-        CliError::Contract(format!("{what} {} is unreadable: {error}", path.display()))
-    })?;
-    if bytes.len() > MAX_METADATA_BYTES {
-        return Err(CliError::Contract(format!(
-            "{what} {} exceeds the bounded read size",
-            path.display()
-        )));
-    }
-    String::from_utf8(bytes)
-        .map_err(|_| CliError::Contract(format!("{what} {} is not UTF-8", path.display())))
-}
-
-/// One top-level `key = "value"` string from a small TOML metadata file.
-///
-/// This reads only the flat scalar keys the rustup metadata actually publishes
-/// (`default_toolchain`, `default_host_triple`, `channel`). It is a lookup,
-/// not a parser, so an unrecognised file shape yields "absent" and the caller
-/// fails closed on that absence rather than proceeding on a guess.
-fn toml_string_value(text: &str, key: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let (name, value) = line.split_once('=')?;
-        if name.trim() != key {
-            return None;
-        }
-        let value = value.trim().trim_matches('"');
-        (!value.is_empty()).then(|| value.to_owned())
-    })
-}
-
-/// The filename suffixes one bare tool name may resolve to on this host.
-///
-/// On a non-Windows host the name must already be complete, so only the empty
-/// suffix is admitted; on Windows the shell's own `PATHEXT` list is used when
-/// the host publishes it, so the file this entry pins and executes is the file
-/// the tool invocation would run. `PATHEXT` is a semicolon-separated list of
-/// bare suffixes rather than a path list, so it is split on `;` directly.
-fn executable_suffixes() -> Vec<String> {
-    let suffixes = std::env::var("PATHEXT")
-        .map(|pathext| {
-            pathext
-                .split(';')
-                .filter(|suffix| !suffix.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if suffixes.is_empty() {
-        return vec![String::new()];
-    }
-    suffixes
-}
-
-/// The SHA-256 over the exact bytes of one file on this machine.
-fn file_digest(path: &Path) -> Result<String, CliError> {
-    let bytes = std::fs::read(path).map_err(|error| {
-        CliError::Contract(format!(
-            "executable {} is unreadable: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(sha256_hex(&bytes))
-}
-
-/// The `--version` child through this ONE executor, bounded-poll until it settles.
-///
-/// `ProcessExecutor::reconcile` is TERMINAL-ONLY: `reconcile_inner` calls
-/// `join_streams` unconditionally (`eliot-process-executor/src/lib.rs`), which
-/// cancels the still-running capture thread's IO and can therefore quarantine
-/// this operation. `start` returns at child-CREATE, so the version child is
-/// still driving when the very next call lands — calling `reconcile` there is
-/// destructive, not merely early. So this wait observes the child the way the
-/// two existing production callers of a real child already do: bounded-poll the
-/// NON-DESTRUCTIVE `inspect` view of THIS operation on the executor that
-/// recorded the `start`, then perform the single terminal `reconcile`. Nothing
-/// here launches, cancels, re-permits, or retries anything, and the existing
-/// operation registry is the only state involved.
-///
-/// The bound is [`VERSION_OBSERVE_TIMEOUT`] and the cadence is
-/// [`VERSION_OBSERVE_POLL`]; both are justified on their constants. This returns
-/// only a TERMINAL view — the refusal is its own return type, so no caller can
-/// read an exit observation off a child that has not finished.
-fn await_terminal_view(
-    executor: &WindowsProcessExecutor,
-    operation: &OperationId,
-    executable: &Path,
-) -> Result<ProcessExecutionView, CliError> {
-    let started = Instant::now();
-    loop {
-        let view = block_on(executor.inspect(operation.clone()))?;
-        if view.lifecycle().is_terminal() {
-            return Ok(view);
-        }
-        if started.elapsed() >= VERSION_OBSERVE_TIMEOUT {
-            return Err(CliError::Contract(format!(
-                "tool {} was still {:?} after {}ms of governed observation; its version is unknown rather than unobserved",
-                executable.display(),
-                view.lifecycle(),
-                VERSION_OBSERVE_TIMEOUT.as_millis()
-            )));
-        }
-        std::thread::sleep(VERSION_OBSERVE_POLL);
-    }
-}
-
-/// Observes one tool's reported version by really running that tool.
-///
-/// `ExecutableObservation::is_complete` refuses an identity that carries no
-/// tool version, so the version is a required datum here rather than an
-/// optional decoration: I18.21 requires that "executable/tool identities are
-/// pinned or recorded", and a version nobody read is neither. The text is
-/// whatever the tool itself printed on its own `--version` invocation, bounded
-/// to the first non-empty line and to [`MAX_TOOL_VERSION_BYTES`]; a tool that
-/// does not exit normally, prints nothing, or overruns that bound is refused
-/// rather than receipted under a synthesized value, because a wrong version is a
-/// pinned identity that does not describe the bytes it is bound to.
-///
-/// The `--version` child is a real launch and crosses the same physical
-/// process boundary every other launch in this entry does: it is sealed with
-/// its own one-shot P-07 dispatch permit by [`seal_version_request`] and started
-/// through the sole [`WindowsProcessExecutor`], so I10.8.2's single-executor
-/// rule holds for the version read exactly as it does for an admitted stage.
-/// Reading the tool's version is observation, not a verdict: this runs before
-/// any stage and derives nothing about the route's outcome, so it stays separate
-/// from the admitted stage launch in [`seal_stage_request`]. What the governed
-/// path adds is that the text it returns is the stdout this process's own
-/// executor really captured under a Kernel-validated permit, not bytes an
-/// ungoverned child wrote.
-fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, CliError> {
-    // The read gets its own `DispatchCell` because a P-07 dispatch permit is
-    // one-shot: the `--version` child is a distinct launch from the stage that
-    // follows it, so it can never consume the stage's permit or its stored
-    // validation context. It is still the same authority composition, the same
-    // epoch, and the same generation, so this run has exactly one epoch.
-    let cell = Arc::new(DispatchCell::activate()?);
-    // ONE executor for the whole lifecycle of this read. Its registry is an
-    // instance field, so the `inspect` below must cross the same instance the
-    // `start` registered on; a second executor would read an empty registry and
-    // refuse `NotFound`, which says nothing about the operation.
-    let executor = StageExecutor::with(&cell);
-    let request = seal_version_request(&cell, epoch, executable)?;
-    let receipt = block_on(executor.start(
-        request,
-        Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
-    ))?;
-    // Settle first, then read the exit, then reconcile: the exit observation is
-    // only meaningful once the tree is closed, and the reconcile is the single
-    // terminal call the poll above was waiting to make safe.
-    let view = await_terminal_view(executor.executor(), receipt.operation_id(), executable)?;
-    // `ExitDisposition::Completed` is the executor's own observed terminal
-    // classification, so this is the governed equivalent of the old
-    // `output.status.success()` test: a signalled, resource-limited, cancelled,
-    // or unclassifiable tree is refused here exactly as a nonzero exit was.
-    let exit = view.exit().ok_or_else(|| {
-        CliError::Contract(format!(
-            "tool {} reported no exit observation while reading its version",
-            executable.display()
-        ))
-    })?;
-    if exit.disposition() != ExitDisposition::Completed {
-        return Err(CliError::Contract(format!(
-            "tool {} ended {exit:?} while reporting its version",
-            executable.display()
-        )));
-    }
-    let evidence = block_on(executor.reconcile(receipt.operation_id().clone()))?;
-    // The version text is the stdout this executor really captured for that
-    // exact permit-bound operation, read back out of the reconciled evidence's
-    // bounded prefix preview. The preview is the transport-level prefix, so a
-    // version line longer than the retained bound is still refused below rather
-    // than silently truncated into a shorter "version".
-    let stdout = evidence.stdout().ok_or_else(|| {
-        CliError::Contract(format!(
-            "tool {} retained no version output",
-            executable.display()
-        ))
-    })?;
-    if !stdout.preview().omitted_ranges().is_empty() {
-        return Err(CliError::Contract(format!(
-            "tool {} wrote more than the {VERSION_STDOUT_BYTES} byte version bound; its version line was truncated",
-            executable.display()
-        )));
-    }
-    let reported = String::from_utf8_lossy(stdout.preview().bytes());
-    let version = reported
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .ok_or_else(|| {
-            CliError::Contract(format!(
-                "tool {} printed no version line",
-                executable.display()
-            ))
-        })?;
-    if version.len() > MAX_TOOL_VERSION_BYTES {
-        return Err(CliError::Contract(format!(
-            "tool {} reported a {} byte version line, over the {MAX_TOOL_VERSION_BYTES} byte bound",
-            executable.display(),
-            version.len()
-        )));
-    }
-    Ok(version.to_owned())
-}
-
-/// Seals the one-shot permit-bound request for the `--version` observation read.
-///
-/// This is deliberately the same P-07 composition [`seal_stage_request`] uses —
-/// the same [`ProcessIntent`] fields, the same isolated [`isolated_projection`],
-/// the same fenced epoch and registry generation, and the same
-/// [`DispatchCell::issue`] one-shot issuance — so the read is a governed launch
-/// of the same kind the stage is, and the I10.8.2 single-executor rule covers it
-/// without exception. It differs only in what is being launched: the tool's own
-/// `--version` argv against the pinned executable, observed in the directory
-/// [`resolve_tool`] resolved it in, so a stage's working directory cannot change
-/// which bytes answer.
-fn seal_version_request(
-    cell: &DispatchCell,
-    epoch: &EpochId,
-    executable: &Path,
-) -> Result<ProcessRequest, CliError> {
-    let projection = isolated_projection()?;
-    let argv = vec!["--version".to_owned()];
-    // The operation identity is derived from the same real tool bytes the stage
-    // launch pins, so the read and the stage it precedes are bound to one
-    // concrete executable rather than to a name that could resolve elsewhere.
-    let operation = format!(
-        "verification-profile-version-{}",
-        &sha256_hex(format!("{}\0{}", executable.display(), argv.join("\u{1}")).as_bytes())[..24]
-    );
-    let intent = ProcessIntent::new(
-        OperationId::new(operation.clone())?,
-        ProcessTreeId::new(format!("{operation}-tree"))?,
-        JobId::new(format!("{operation}-job"))?,
-        ImageId::new(format!("{operation}-image"))?,
-        SessionId::new(format!("{EPOCH_LINEAGE}-{operation}"))?,
-        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
-        executable.to_string_lossy().into_owned(),
-        file_digest(executable)?,
-        argv.clone(),
-        // The tool's own resolved parent, not the admitted source root: this
-        // observes the tool where `resolve_tool` pinned it.
-        executable
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_string_lossy()
-            .into_owned(),
-        projection,
-        ResourceLimits::new(
-            VERSION_WALL_TIMEOUT_MS,
-            None,
-            None,
-            VERSION_STDOUT_BYTES,
-            VERSION_STDOUT_BYTES,
-            VERSION_MAX_DESCENDANTS,
-        )?,
-    )?;
-    let fence = FencingToken::new(
-        epoch.clone(),
-        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
-        format!("{operation}-fence"),
-    )?;
-    let heads = BTreeMap::from([(
-        "verification-profile-version".to_owned(),
-        sha256_hex(format!("{operation}\0{}", argv.join("\u{1}")).as_bytes()),
-    )]);
-    let issued_at = now_unix_ms().max(1);
-    cell.issue(
-        &intent,
-        fence,
-        heads,
-        issued_at,
-        issued_at.saturating_add(VERSION_WALL_TIMEOUT_MS),
-        ActionLeaseRef::new(format!("{operation}-lease"))?,
-        format!("{operation}-nonce"),
-    )
 }
 
 /// Reads the exact invocation text this binary accepts.
@@ -1206,10 +701,7 @@ fn seal_version_request(
 /// alias, or an unknown option is a refusal rather than a substituted value.
 fn read_request() -> Result<Request, CliError> {
     let mut args = std::env::args().skip(1);
-    let mut alias = None;
-    let mut source_root = None;
-    let mut target_root = None;
-    let mut cache_root = None;
+    let mut bootstrap_evidence = None;
     let mut declared_environments = Vec::new();
     let mut receipt_out = None;
     let mut compare_against = None;
@@ -1219,10 +711,9 @@ fn read_request() -> Result<Request, CliError> {
                 .ok_or_else(|| CliError::Usage(format!("{option} requires a value")))
         };
         match option.as_str() {
-            "--alias" => alias = Some(value("--alias")?),
-            "--source-root" => source_root = Some(PathBuf::from(value("--source-root")?)),
-            "--target-root" => target_root = Some(PathBuf::from(value("--target-root")?)),
-            "--cache-root" => cache_root = Some(PathBuf::from(value("--cache-root")?)),
+            "--bootstrap-evidence" => {
+                bootstrap_evidence = Some(PathBuf::from(value("--bootstrap-evidence")?))
+            }
             "--declared-environment" => {
                 declared_environments.push(value("--declared-environment")?);
             }
@@ -1233,33 +724,31 @@ fn read_request() -> Result<Request, CliError> {
             other => return Err(CliError::Usage(format!("unknown option '{other}'"))),
         }
     }
-    let alias = alias.ok_or_else(|| {
-        CliError::Usage(format!(
-            "--alias is required; it must name one of {}",
-            aliases()
+    let evidence_path = bootstrap_evidence.ok_or_else(|| {
+        CliError::Usage("--bootstrap-evidence is required; it must contain the existing launch.registry_selection carrier".to_owned())
+    })?;
+    let evidence_bytes = std::fs::read(&evidence_path).map_err(|error| {
+        CliError::Contract(format!(
+            "bootstrap evidence {} could not be read: {error}",
+            evidence_path.display()
         ))
     })?;
+    let evidence: serde_json::Value = serde_json::from_slice(&evidence_bytes)
+        .map_err(|error| CliError::Contract(format!("bootstrap evidence is invalid: {error}")))?;
+    let selection_value = evidence
+        .pointer("/launch/registry_selection")
+        .ok_or_else(|| {
+            CliError::Contract("bootstrap evidence omitted launch.registry_selection".to_owned())
+        })?;
+    let selection = registry_launch_selection(selection_value).map_err(|error| {
+        CliError::Contract(format!("bootstrap stage selection refused: {error}"))
+    })?;
     Ok(Request {
-        alias,
-        source_root: source_root
-            .ok_or_else(|| CliError::Usage("--source-root is required".to_owned()))?,
-        target_root: target_root
-            .ok_or_else(|| CliError::Usage("--target-root is required".to_owned()))?,
-        cache_root: cache_root
-            .ok_or_else(|| CliError::Usage("--cache-root is required".to_owned()))?,
+        selection,
         declared_environments,
         receipt_out,
         compare_against,
     })
-}
-
-/// The closed alias names, for the usage refusal only.
-fn aliases() -> String {
-    PROFILE_ALIASES
-        .iter()
-        .map(|entry| entry.alias)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Drives one already-resolved future on the calling thread.
@@ -1279,47 +768,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// The canonical one-shot authority epoch of this resolution process.
-///
-/// `EpochLineageId` is a closed contract: `new` accepts exactly a 36-character
-/// canonical lowercase hyphenated UUID and refuses anything else, so the lineage
-/// is DERIVED into that shape rather than assembled from readable text. A
-/// `"{name}-{pid}-{nanos}"` string is a readable label, not a lineage, and is
-/// refused on every run — so the identity is minted in the spelling the contract
-/// actually validates instead of one that reads nicely and never works.
-///
-/// `EPOCH_LINEAGE` names what this process is, and `SessionId` below carries it
-/// where a human-readable product identity belongs; the epoch itself is a
-/// derived UUID because that is the only shape its owner accepts.
-///
-/// Uniqueness is what the one-shot fence needs: the epoch never leaves this
-/// process and the run revokes nothing, so per-process key bytes plus the
-/// process id and clock reading are sufficient and no durability is implied.
-fn process_epoch() -> Result<EpochId, CliError> {
-    let mut material = fresh_key_bytes();
-    // Fold this process's own identity into the material so two resolutions
-    // that happened to draw the same bytes are still distinct. Each source is
-    // zero-extended into its own 8-byte lane, so the copy lengths match the
-    // destination exactly rather than panicking at runtime.
-    material[..8].copy_from_slice(&u64::from(std::process::id()).to_le_bytes());
-    material[8..16].copy_from_slice(&system_nanos().to_le_bytes());
-    let mut lineage = String::with_capacity(36);
-    for (index, byte) in material.iter().take(16).enumerate() {
-        if matches!(index, 4 | 6 | 8 | 10) {
-            lineage.push('-');
-        }
-        // `write!` into the same String rather than appending a `format!` result:
-        // one formatting call, no intermediate allocation, and no way for the
-        // formatted hex to differ from what was pushed.
-        write!(lineage, "{byte:02x}")
-            .map_err(|_| CliError::Contract("epoch lineage is not formattable".to_owned()))?;
-    }
-    let lineage = EpochLineageId::new(lineage)?;
-    let sequence = NonZeroU64::new(1)
-        .ok_or_else(|| CliError::Contract("epoch sequence is not one".to_owned()))?;
-    Ok(EpochId::new(lineage, sequence)?)
-}
-
 /// Machine clock reading in Unix milliseconds, observed now.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1329,246 +777,19 @@ fn now_unix_ms() -> u64 {
         })
 }
 
-/// Derives a process-unique nanosecond reading.
-fn system_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
-        })
-}
-
-/// Builds one clock observation from an observed millisecond reading.
-///
-/// The `ClockReading` field is a signed millisecond count, so a reading beyond
-/// `i64::MAX` cannot be represented and is clamped to the maximum rather than
-/// wrapping into a negative instant. `cast_unsigned` states the intended
-/// conversion: the ceiling is a positive constant, so the sign is not lost here.
-fn observation_clock(now: u64) -> ClockReading {
-    let ceiling = i64::MAX;
-    let now = i64::try_from(now.min(ceiling.cast_unsigned())).unwrap_or(i64::MAX);
-    ClockReading {
-        valid_time_ms: Some(now),
-        known_time_ms: Some(now),
-        transaction_sequence: None,
-        monotonic_ns: None,
-    }
-}
-
-/// Generates fresh per-process key bytes without adding a randomness dependency.
-///
-/// Per-process uniqueness, not unpredictability, is what the one-shot replay
-/// fence needs: the key never leaves this process, is never persisted, and binds
-/// only permits this authority instance issued.
-fn fresh_key_bytes() -> [u8; 32] {
-    static MIXER: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-
-    fn splitmix64(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    let probe = 0u64;
-    let stack = u64::try_from(std::ptr::addr_of!(probe).addr()).unwrap_or(0);
-    let pid = u64::from(std::process::id());
-    let count = MIXER.fetch_add(1, Ordering::Relaxed);
-    let mut state = system_nanos()
-        ^ pid.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-        ^ stack.rotate_left(17)
-        ^ count.wrapping_mul(0x94D0_49BB_1331_11EB);
-    let mut out = [0u8; 32];
-    for chunk in out.chunks_mut(8) {
-        chunk.copy_from_slice(&splitmix64(&mut state).to_le_bytes());
-    }
-    if out.iter().all(|byte| *byte == 0) {
-        out[31] = 1;
-    }
-    out
-}
-
-/// The single dispatch-authority cell every stage of one run seals under.
-///
-/// The cell issues one permit per admitted stage and stores the validation
-/// context of EACH of those stages, keyed by the exact operation identity the
-/// permit was issued against. Every stage of a run shares the same authority
-/// epoch and generation, but each stage is issued its OWN one-shot nonce, its
-/// own fence nonce, and its own revision heads — so one shared context slot
-/// would compare a sealed request against ANOTHER stage's material and refuse
-/// a launch that was correctly admitted. The map is what makes the
-/// correspondence one-to-one: the context consumed with a request is the
-/// context minted with that same request.
-///
-/// The permit authority is still ONE authority for the whole run, and
-/// consumption is still one-shot: [`DispatchPermitAuthority::validate_and_consume`]
-/// keeps its own issued/consumed nonce ledger, and it is the only thing that
-/// consumes a permit.
-struct DispatchCell {
-    authority: Mutex<DispatchPermitAuthority>,
-    /// One validation context per issued operation identity.
-    ///
-    /// Behind a mutex because the port that consumes it is shared, and because
-    /// a per-request entry is retained for the whole run so the context a
-    /// request is validated against is still resolvable after later requests
-    /// have been issued.
-    contexts: Mutex<BTreeMap<String, DispatchValidationContext>>,
-}
-
-impl DispatchCell {
-    /// Activates one ephemeral authority around fresh in-memory key material.
-    fn activate() -> Result<Self, CliError> {
-        let pid = std::process::id();
-        let nanos = system_nanos();
-        let authority_id =
-            DispatchAuthorityId::new(format!("profile-resolver-dispatch-{pid}-{nanos}"))?;
-        let key = KernelDispatchKey::from_secret_bytes(fresh_key_bytes())?;
-        Ok(Self {
-            authority: Mutex::new(DispatchPermitAuthority::activate(authority_id, key)),
-            contexts: Mutex::new(BTreeMap::new()),
-        })
-    }
-
-    /// Issues the single permit-bound process request for one admitted stage.
-    #[allow(clippy::too_many_arguments)]
-    fn issue(
-        &self,
-        intent: &ProcessIntent,
-        fence: FencingToken,
-        heads: BTreeMap<String, String>,
-        issued_at_unix_ms: u64,
-        expires_at_unix_ms: u64,
-        lease: ActionLeaseRef,
-        nonce: String,
-    ) -> Result<ProcessRequest, CliError> {
-        // The heads are cloned out BEFORE the issuance consumes them, and the
-        // validation context is built from that clone. This is the same value
-        // the permit was issued with, not a second source: the authority builds
-        // the permit from this exact `PermitIssuance` and re-proves the two
-        // against each other at consume time. `DispatchPermit` exposes no reader
-        // for its heads (that is deliberate — it is dispatch authority material),
-        // so the run context is pinned from the issuance the authority consumed.
-        let pinned_heads = heads.clone();
-        let issuance = PermitIssuance::new(
-            lease,
-            fence.clone(),
-            heads,
-            issued_at_unix_ms,
-            expires_at_unix_ms,
-            nonce,
-        )?;
-        let permit = self
-            .authority
-            .lock()
-            .map_err(|_| CliError::Contract("dispatch authority lock poisoned".to_owned()))?
-            .issue(intent, issuance)?;
-        // The stored context pins the exact material the permit was issued
-        // with — the same fence, its own authority epoch, and the same revision
-        // heads — so consume-time validation compares the permit against THIS
-        // request's own snapshot rather than against ambient state. It is
-        // keyed by the operation identity it was minted for, so the executor
-        // can resolve it back from the request being validated.
-        let context_epoch = fence.authority_epoch().clone();
-        let context = DispatchValidationContext::new(
-            observation_clock(issued_at_unix_ms),
-            fence,
-            context_epoch,
-            pinned_heads,
-            VALIDATION_REVISION,
-        )?;
-        self.contexts
-            .lock()
-            .map_err(|_| CliError::Contract("validation context lock poisoned".to_owned()))?
-            .insert(intent.operation_id().as_str().to_owned(), context);
-        Ok(ProcessRequest::new(intent.clone(), permit)?)
-    }
-
-    /// The validation context belonging to exactly the request being validated.
-    ///
-    /// The lookup key is the request's own operation identity, which is the same
-    /// key [`Self::issue`] stored its context under. A request this cell never
-    /// issued a permit for has no context and is refused here, before the
-    /// authority is consulted, so an unissued request can never be validated
-    /// against another request's material.
-    fn context(
-        &self,
-        request: &ProcessRequest,
-    ) -> Result<DispatchValidationContext, ProcessExecutionError> {
-        self.contexts
-            .lock()
-            .map_err(|_| {
-                ProcessExecutionError::Unavailable("validation context poisoned".to_owned())
-            })?
-            .get(request.operation_id().as_str())
-            .cloned()
-            .ok_or_else(|| {
-                ProcessExecutionError::Unavailable(format!(
-                    "validation context absent for operation '{}'",
-                    request.operation_id().as_str()
-                ))
-            })
-    }
-}
-
-impl DispatchValidationPort for DispatchCell {
-    fn validate_and_consume(
-        &self,
-        request: ProcessRequest,
-        observed: SuspendedProcessIdentity,
-    ) -> Result<ValidatedDispatch, ProcessExecutionError> {
-        // The context is resolved from the request itself, before the permit is
-        // consumed, so the one authority below compares the permit against the
-        // fence, epoch, and revision heads it was issued with and nothing else.
-        let context = self.context(&request)?;
-        self.authority
-            .lock()
-            .map_err(|_| ProcessExecutionError::Unavailable("authority lock poisoned".to_owned()))?
-            .validate_and_consume(request, observed, &context)
-            .map_err(ProcessExecutionError::from)
-    }
-}
-
-/// The physical process boundary every admitted stage of this run crosses.
-///
-/// Each stage really starts a child through the sole [`WindowsProcessExecutor`]
-/// under this run's own dispatch cell, so the identity the receipt records for
-/// that stage is the identity of bytes this process actually executed.
-///
-/// The permit-bound `--version` read uses this same owner over its own cell, so
-/// every child this entry starts — the version probes and the stages alike —
-/// crosses the one executor composition below.
 struct StageExecutor {
-    /// The ONE physical executor every lifecycle call of this owner crosses.
-    ///
-    /// `WindowsProcessExecutor` owns the operation registry as an instance
-    /// field, so the registry that records a `start` must be the same instance
-    /// a later `inspect`, `cancel` or `reconcile` reads. Constructing one per
-    /// call discards the registration with the temporary, and the follow-up
-    /// call is then refused as `NotFound` against an empty registry — which is
-    /// a true statement about the wrong executor, not about the operation.
-    ///
-    /// The cell reaches this owner through this one field: the executor holds
-    /// the `Arc<dyn DispatchValidationPort>` built from it, so the port the
-    /// executor validates against and the cell this owner's caller sealed its
-    /// one-shot permits under are the same value.
+    /// One executor retains the operation registry across the full lifecycle.
     executor: WindowsProcessExecutor,
 }
 
 impl StageExecutor {
-    fn with(cell: &Arc<DispatchCell>) -> Self {
+    fn with_kernel_authority(authority: Arc<KernelChildDispatchAuthority>) -> Self {
         Self {
-            executor: WindowsProcessExecutor::new(
-                Arc::clone(cell) as Arc<dyn DispatchValidationPort>
-            ),
+            executor: WindowsProcessExecutor::new(authority as Arc<dyn DispatchValidationPort>),
         }
     }
 
-    /// The P-07 authority composition every lifecycle call crosses.
-    ///
-    /// Borrowed by [`await_terminal_view`] so the version probe's bounded
-    /// inspect-poll observes THIS executor's registry — the one the `start`
-    /// registered on — rather than a second executor that never saw the child.
+    /// Lifecycle operations stay on the same executor that started the child.
     fn executor(&self) -> &WindowsProcessExecutor {
         &self.executor
     }
@@ -1580,6 +801,8 @@ impl ProcessExecutor for StageExecutor {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, ProcessExecutionError> {
+        #[cfg(all(test, windows))]
+        start_observer::record(request.operation_id().as_str());
         self.executor().start(request, sink).await
     }
 
@@ -1612,22 +835,13 @@ impl ProcessExecutor for StageExecutor {
 /// admitted plan the shared resolver produced, so a stage this launcher runs is
 /// exactly a stage the shared resolver admitted and no other.
 struct StageRoute {
-    /// Authority epoch every permit of this run is sealed under.
-    epoch: EpochId,
-    /// Observed admission instant carried by every stage invocation.
-    clock: ClockReading,
-    /// Admitted layout the stage working directory comes from.
-    layout: TargetLayout,
-    /// Admitted stage launch provisions the orchestrator binds each stage
-    /// through: the per-stage permit source, the evidence sink, and the exact
-    /// sealed request already issued for the stage being launched.
-    ///
-    /// The sealed request is stored per stage rather than derived inside
-    /// `bind` because a dispatch permit is one-shot and the orchestrator asks
-    /// for the port before it knows which stage it is binding. [`StageRoute`]
-    /// seals one request per planned stage up front, in admitted plan order, so
-    /// the port hands each stage the request that was sealed for it and refuses
-    /// a bind for any other stage.
+    /// Exact invocation sealed by the authenticated Kernel grant.
+    invocation: InstrumentInvocation,
+    /// One stage identity selected by the existing bootstrap carrier.
+    selected_stage_id: String,
+    /// Exact profile revision selected by the existing bootstrap carrier.
+    selected_profile_revision: u64,
+    /// Request port holding the exact one-shot request returned by Kernel.
     port: StagePort,
 }
 
@@ -1637,210 +851,26 @@ struct StageRoute {
 /// orchestrator walks, so a bind for a stage this run never sealed fails closed
 /// instead of producing a request for whatever stage happens to come next.
 struct StagePort {
-    /// One sealed, permit-bound request per admitted stage identity.
-    ///
-    /// Behind a mutex because `bind` takes `&self` (the port is shared) and
-    /// because removing the slot is what enforces one seal per stage.
+    /// One-shot Kernel request indexed by its original operation identity.
     sealed: std::sync::Mutex<BTreeMap<String, ProcessRequest>>,
     /// Evidence sink every stage launch retains through.
     sink: Arc<RetainedEvidenceSink>,
 }
 
 impl StagePort {
-    /// Seals one permit-bound request for every stage of the admitted plan.
-    ///
-    /// Sealing is a per-stage operation because the P-07 dispatch permit is
-    /// one-shot: one permit can never launch two children. Each stage's request
-    /// is bound to its own one-shot nonce, its own sealed intent, its own fence
-    /// nonce, and its own revision heads, and [`DispatchCell::issue`] stores the
-    /// matching validation context under that request's operation identity. The
-    /// stages of a run share one authority epoch and generation — so one
-    /// authority admits them all — but they do NOT share a fence or heads, so
-    /// they do not share a validation context either: each request is validated
-    /// against the context minted with it, and against no other request's.
-    fn seal_all(
-        cell: &DispatchCell,
-        epoch: &EpochId,
-        layout: &TargetLayout,
-        admitted: &AdmittedProfile,
-    ) -> Result<Self, CliError> {
-        let plan = StageOrchestrator::plan(admitted);
-        let mut sealed = BTreeMap::new();
-        for planned in &plan.stages {
-            let stage_id = planned.route.stage().stage_id.as_str();
-            let argv = stage_argv(planned);
-            let operation = operation_identity(stage_id, &argv);
-            let request = seal_stage_request(
-                cell,
-                epoch,
-                layout,
-                stage_id,
-                &planned.stage.executable,
-                &argv,
-            )?;
-            sealed.insert(operation, request);
-        }
-        Ok(Self {
-            sealed: std::sync::Mutex::new(sealed),
+    fn for_selection(invocation: &InstrumentInvocation, request: ProcessRequest) -> Self {
+        Self {
+            sealed: std::sync::Mutex::new(BTreeMap::from([(
+                invocation.request.request_id.as_str().to_owned(),
+                request,
+            )])),
             sink: Arc::new(RetainedEvidenceSink::default()),
-        })
+        }
     }
-}
-
-/// The exact process argv one admitted stage runs.
-///
-/// It is the stage's bound spec's declared [`InstrumentSpec::verification_command`]
-/// and nothing else: the real verification command the admitted profile
-/// revision executes, read from the one admitted registry a local entrypoint
-/// and CI both resolve. It is NOT derived from `argument_template` — that
-/// field bounds what a CALLER may contribute and admits only the empty vector
-/// for every builtin, which is why deriving argv from it ran each stage's
-/// executable with no arguments at all, producing a tool's default/help
-/// output rather than a package verification. An admitted verification
-/// command is non-empty by construction, so a stage can never again launch
-/// its executable with no command, and the argv is profile text read from the
-/// admitted registry rather than a command list restated here (I18.21:11).
-fn stage_argv(stage: &PlannedStage) -> Vec<String> {
-    stage.stage.verification_command.clone()
-}
-
-/// Seals the one permit-bound process request for one admitted stage.
-///
-/// The executable is the one the admitted spec names, resolved to the real file
-/// on this machine, and the digest bound into the sealed intent is the SHA-256
-/// the executor computed over that file's bytes — the same observation
-/// `ExecutableObservation::observe_from_intent` re-derives at launch. The request
-/// is therefore the one the admitted stage runs, and a tool swapped between
-/// sealing and launch fails the executor's own observation check.
-///
-/// The tool version is observed by really running the tool's own version flag
-/// through [`observed_tool_version`] and keeping the first line that launch
-/// printed. A complete identity requires a non-empty version (`is_complete`
-/// refuses an observation without one), and no version is invented from the file
-/// name: a tool that cannot report one is refused here rather than receipted with
-/// a placeholder. That read is itself a governed launch under its own one-shot
-/// permit, so both children this function causes to exist — the `--version` probe
-/// and the stage itself — cross the single [`WindowsProcessExecutor`] boundary.
-fn seal_stage_request(
-    cell: &DispatchCell,
-    epoch: &EpochId,
-    layout: &TargetLayout,
-    stage_id: &str,
-    executable_name: &str,
-    argv: &[String],
-) -> Result<ProcessRequest, CliError> {
-    let executable = resolve_tool(executable_name, &layout.source_root)?;
-    let projection = isolated_projection()?;
-    let observed = ExecutableObservation::observe_at_path(
-        &executable,
-        argv.to_vec(),
-        environment_projection_digest(&projection),
-        Some(observed_tool_version(&executable, epoch)?),
-    )
-    .map_err(|error| CliError::Contract(format!("executable observation refused: {error}")))?;
-    if !observed.is_complete() {
-        return Err(CliError::Contract(format!(
-            "executable {} observation is incomplete",
-            executable.display()
-        )));
-    }
-    let operation = operation_identity(stage_id, argv);
-    let intent = ProcessIntent::new(
-        OperationId::new(operation.clone())?,
-        ProcessTreeId::new(format!("{operation}-tree"))?,
-        JobId::new(format!("{operation}-job"))?,
-        ImageId::new(format!("{operation}-image"))?,
-        SessionId::new(format!("{EPOCH_LINEAGE}-{operation}"))?,
-        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
-        executable.to_string_lossy().into_owned(),
-        observed.content_digest.clone(),
-        argv.to_vec(),
-        layout.source_root.clone(),
-        projection,
-        ResourceLimits::new(
-            STAGE_WALL_TIMEOUT_MS,
-            None,
-            None,
-            STAGE_STDOUT_BYTES,
-            STAGE_STDOUT_BYTES,
-            STAGE_MAX_DESCENDANTS,
-        )?,
-    )?;
-    let fence = FencingToken::new(
-        epoch.clone(),
-        Generation::new(VERIFICATION_REGISTRY_GENERATION)?,
-        format!("{operation}-fence"),
-    )?;
-    let heads = BTreeMap::from([(
-        "verification-profile".to_owned(),
-        sha256_hex(format!("{stage_id}\0{operation}").as_bytes()),
-    )]);
-    let issued_at = now_unix_ms().max(1);
-    cell.issue(
-        &intent,
-        fence,
-        heads,
-        issued_at,
-        issued_at.saturating_add(STAGE_WALL_TIMEOUT_MS),
-        ActionLeaseRef::new(format!("{operation}-lease"))?,
-        format!("{operation}-nonce"),
-    )
-}
-
-/// The explicitly permitted toolchain environment every admitted stage child runs under.
-///
-/// `EnvironmentInheritance::None` is unchanged: the child receives no ambient
-/// variable and no inherited secret, and the executor still builds the child's
-/// environment block from exactly the names on this projection. What changed is
-/// that the projection is no longer EMPTY. A real admitted verification command
-/// — `cargo build`, `cargo clippy`, `cargo nextest run`, `cargo fmt --check` —
-/// locates its own `rustc`, its `rustup` shim, and any build-script interpreter
-/// through `PATH`, and `scripts/verify.ps1` already resolves the resolver's own
-/// executable through that same `PATH`; with nothing declared, such a command had
-/// no toolchain at all and could not be a verification. Only `PATH` is declared,
-/// and its value is read from the real process environment rather than
-/// synthesised, so the projection states a fact that already holds instead of
-/// inventing a search path.
-///
-/// This is the minimal set, not an inherited environment. I18.21:10 is why the
-/// value is named on the projection and hashed rather than leaked: the executor
-/// binds `environment_projection_digest` of exactly this projection as the
-/// stage's environment identity, so the permitted toolchain environment is now
-/// a declared, digest-bound, reviewable property of every admitted stage instead
-/// of an invisible ambient fact. Nothing switches to
-/// `EnvironmentInheritance::Allowlisted`, and every other ambient variable stays
-/// out.
-///
-/// A machine that publishes no `PATH` cannot run an admitted verification
-/// command at all, so that is refused here rather than sealed as a child that
-/// would fail for a reason the receipt could not explain.
-fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
-    let path = std::env::var(TOOLCHAIN_PATH_ENV).map_err(|error| {
-        CliError::Contract(format!(
-            "explicitly permitted toolchain environment is unavailable: {TOOLCHAIN_PATH_ENV} is unset ({error})"
-        ))
-    })?;
-    Ok(EnvironmentProjection::new(
-        BTreeMap::from([(TOOLCHAIN_PATH_ENV.to_owned(), path)]),
-        Vec::new(),
-        EnvironmentInheritance::None,
-    )?)
 }
 
 impl InstrumentRequestPort for StagePort {
-    /// Hands the stage the exact request this run sealed for it.
-    ///
-    /// The lookup key is the invocation's own request id, which is derived from
-    /// the admitted stage identity and the admitted argv, so a bind names the
-    /// stage it is for rather than consuming requests in plan order: a bind for
-    /// a stage this run never sealed finds nothing and is refused.
-    ///
-    /// The sealed slot is TAKEN, not copied. `ProcessRequest` deliberately does
-    /// not implement `Clone`: it holds the one-shot P-07 dispatch permit, so a
-    /// second bind for the same stage must fail here rather than hand the same
-    /// permit to a second child. Consuming the slot is what makes a
-    /// one-seal-per-stage run structural instead of a convention the caller has
-    /// to remember.
+    /// Consumes the exact Kernel-issued request once.
     fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError> {
         self.sealed
             .lock()
@@ -1858,48 +888,16 @@ impl InstrumentRequestPort for StagePort {
 impl StageLauncher for StageRoute {
     fn invocation(&self, stage: &PlannedStage) -> Result<InstrumentInvocation, RunnerError> {
         let stage_id = stage.route.stage().stage_id.as_str();
-        let target = format!(
-            "worktree:{}",
-            &sha256_hex(self.layout.source_root.as_bytes())[..16]
-        );
-        let request_id = operation_identity(stage_id, &stage_argv(stage));
-        let invocation = InstrumentInvocation {
-            request: RequestMetadata {
-                request_id: RequestId::new(request_id).map_err(|error| {
-                    RunnerError::Binding(format!("stage '{stage_id}' request refused: {error}"))
-                })?,
-                session_id: None,
-                task_id: None,
-                product_id: ProductId::new(ADMITTED_PRODUCT).map_err(|error| {
-                    RunnerError::Binding(format!("stage '{stage_id}' product refused: {error}"))
-                })?,
-                source_id: SourceId::new(self.layout.source_root.clone()).map_err(|error| {
-                    RunnerError::Binding(format!("stage '{stage_id}' source refused: {error}"))
-                })?,
-                state_fence: StateFence::new(
-                    self.epoch.clone(),
-                    ResourceGeneration::new(VERIFICATION_REGISTRY_GENERATION).map_err(|error| {
-                        RunnerError::Binding(format!("stage '{stage_id}' fence refused: {error}"))
-                    })?,
-                ),
-                clock: self.clock,
-            },
-            instrument: stage.stage.spec.clone(),
-            kind: stage.stage.kind,
-            profile: stage.route.stage().profile.clone(),
-            target,
-            // Instrument-level arguments are never argv: the process argv comes
-            // from the admitted argument template in `seal`, so a stage cannot
-            // smuggle a command through this field.
-            arguments: Vec::new(),
-            input_artifacts: Vec::new(),
-            declared_scope: ADMITTED_SCOPE_CLASS.to_owned(),
-            requested_at: self.clock,
-        };
-        invocation.validate().map_err(|error| {
-            RunnerError::Binding(format!("stage '{stage_id}' invocation refused: {error}"))
-        })?;
-        Ok(invocation)
+        if stage_id != self.selected_stage_id
+            || stage.route.stage().profile != self.invocation.profile
+            || stage.stage.spec != self.invocation.instrument
+            || stage.route.stage().profile_revision != self.selected_profile_revision
+        {
+            return Err(RunnerError::Binding(format!(
+                "bootstrap carries no Kernel request for profile stage '{stage_id}'"
+            )));
+        }
+        Ok(self.invocation.clone())
     }
 
     fn port(&self, _stage: &PlannedStage) -> &dyn InstrumentRequestPort {
@@ -1917,21 +915,6 @@ impl StageLauncher for StageRoute {
         // be dropped as soon as the stage returned.
         Arc::clone(&self.port.sink) as Arc<dyn ProcessEvidenceSink>
     }
-}
-
-/// The stable operation identity bound to one admitted stage and its argv.
-///
-/// Both the sealed request's operation id and the stage invocation's request id
-/// derive from it, which is what lets the request port hand each stage the exact
-/// request sealed for it. It names the admitted stage and the admitted argv, so
-/// two stages of the same profile never collide and a changed argument template
-/// changes the identity.
-fn operation_identity(stage_id: &str, argv: &[String]) -> String {
-    let material = format!("{stage_id}\0{}", argv.join("\u{1}"));
-    format!(
-        "verification-profile-stage-{}",
-        &sha256_hex(material.as_bytes())[..24]
-    )
 }
 
 /// Process-owned sink that retains every record the process owner publishes.
@@ -1959,6 +942,491 @@ impl ProcessEvidenceSink for RetainedEvidenceSink {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod start_observer {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+    static STARTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+
+    fn starts() -> &'static Mutex<BTreeMap<String, usize>> {
+        STARTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(super) fn serialize() -> MutexGuard<'static, ()> {
+        SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn clear(operation_id: &str) {
+        let _ = starts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(operation_id);
+    }
+
+    pub(super) fn record(operation_id: &str) {
+        let mut starts = starts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *starts.entry(operation_id.to_owned()).or_default() += 1;
+    }
+
+    pub(super) fn count(operation_id: &str) -> usize {
+        starts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(operation_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod live_acceptance_tests {
+    use super::{
+        CliError, InstrumentRegistry, InstrumentRegistryReadClient, KernelClient, ProfileCompiler,
+        RegistryLaunchSelection, Request, RunnerError, VerificationProfileReceipt, block_on,
+        environment_projection_digest, registry_launch_selection, registry_state_request,
+        resolve_route, start_observer,
+    };
+    use eliot_instrument_runner::CanonicalRegistryProofPort;
+    use eliot_process::ProcessIntent;
+    use std::sync::Arc;
+
+    const ACCEPTANCE_FIXTURE_ENV: &str = "ELIOT_PROFILE_RESOLVER_LIVE_ACCEPTANCE_FIXTURE";
+    const ARGUMENT_REFUSAL_FIXTURE_ENV: &str =
+        "ELIOT_PROFILE_RESOLVER_LIVE_ARGUMENT_REFUSAL_FIXTURE";
+    const EXECUTABLE_REFUSAL_FIXTURE_ENV: &str =
+        "ELIOT_PROFILE_RESOLVER_LIVE_EXECUTABLE_REFUSAL_FIXTURE";
+
+    /// Requires three original owner-issued current-stage bootstrap fixtures:
+    /// one positive and distinct-operation argument/executable refutations.
+    /// Each file is the production JSON carrier whose selection is at
+    /// `/launch/registry_selection` and has exactly `request_identity`,
+    /// `scope_id`, `pin`, `layout`, `work_scope`, and `intent`. All selections
+    /// must name the same current canonical profile/stage/fence; each operation
+    /// identity is owner-issued and distinct. The files are selected by
+    /// `ELIOT_PROFILE_RESOLVER_LIVE_ACCEPTANCE_FIXTURE`,
+    /// `ELIOT_PROFILE_RESOLVER_LIVE_ARGUMENT_REFUSAL_FIXTURE`, and
+    /// `ELIOT_PROFILE_RESOLVER_LIVE_EXECUTABLE_REFUSAL_FIXTURE`. This test uses
+    /// the same `registry_launch_selection` parser as `read_request`, which
+    /// consumes the operator's `--bootstrap-evidence` selection; each call to
+    /// `resolve_route` authenticates the current canonical registry read and
+    /// stage-grant exchange against the original Governor registration before
+    /// reaching the real `WindowsProcessExecutor`.
+    /// Missing or malformed evidence is an error, never a skipped assertion
+    /// or passing return.
+    #[test]
+    #[ignore = "requires OR-provisioned live Kernel registry, WorkScope, and admitted external-stage fixtures"]
+    fn live_registered_stage_acceptance_and_field_refusals() -> Result<(), String> {
+        let _serialized = start_observer::serialize();
+        let accepted = request_from_original_fixture(ACCEPTANCE_FIXTURE_ENV)?;
+        let mut changed_arguments = request_from_original_fixture(ARGUMENT_REFUSAL_FIXTURE_ENV)?;
+        let mut changed_executable = request_from_original_fixture(EXECUTABLE_REFUSAL_FIXTURE_ENV)?;
+        let original_argument_selection = changed_arguments.selection.clone();
+
+        assert_same_original_stage(
+            &accepted.selection,
+            &changed_arguments.selection,
+            &changed_executable.selection,
+        );
+        let accepted_operation = operation_id(&accepted.selection);
+        let arguments_operation = operation_id(&changed_arguments.selection);
+        let executable_operation = operation_id(&changed_executable.selection);
+        assert_ne!(accepted_operation, arguments_operation);
+        assert_ne!(accepted_operation, executable_operation);
+        assert_ne!(arguments_operation, executable_operation);
+
+        let canonical = current_registry(&accepted.selection)?;
+        let admitted = ProfileCompiler::new(&canonical)
+            .compile_exact(
+                &accepted.selection.pin.profile,
+                accepted.selection.pin.profile_revision,
+            )
+            .map_err(|error| error.to_string())?;
+        let admitted_stage = admitted
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == accepted.selection.pin.stage_id)
+            .ok_or("owner-pinned stage is missing from the current admitted profile")?;
+        assert!(admitted_stage.external);
+        assert!(!admitted_stage.parser.as_str().is_empty());
+        assert!(admitted_stage.parser_generation > 0);
+        let supply_receipt = admitted_stage
+            .supply_receipt
+            .as_ref()
+            .ok_or("owner-pinned stage omitted its supply-chain receipt")?;
+        assert_eq!(supply_receipt.generation, canonical.generation());
+        assert_eq!(
+            accepted.selection.intent.working_directory(),
+            accepted.selection.layout.source_root.as_str()
+        );
+
+        start_observer::clear(&accepted_operation);
+        let receipt = resolve_route(&accepted).map_err(|error| error.to_string())?;
+        assert_eq!(start_observer::count(&accepted_operation), 1);
+        assert_admission_receipt_matches(
+            &receipt,
+            &accepted.selection,
+            &canonical,
+            &admitted,
+            admitted_stage,
+            supply_receipt,
+        )?;
+
+        let unregistered_kind_operation = arguments_operation.clone();
+        start_observer::clear(&unregistered_kind_operation);
+        let mut unregistered_kind_evidence = fixture_evidence(ARGUMENT_REFUSAL_FIXTURE_ENV)?;
+        // The launch carrier has no caller-selected kind field: the live
+        // registry derives that identity from its pinned profile stage. Reject
+        // an attempted extra `kind_id` at the closed parser boundary instead
+        // of adding a synthetic field to the production carrier.
+        let selected_pin = unregistered_kind_evidence
+            .pointer_mut("/launch/registry_selection/pin")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("argument-refusal fixture pin is not an object")?;
+        assert!(
+            selected_pin
+                .insert(
+                    "kind_id".to_owned(),
+                    serde_json::Value::String("unregistered-kind".to_owned()),
+                )
+                .is_none()
+        );
+        let selected = unregistered_kind_evidence
+            .pointer("/launch/registry_selection")
+            .ok_or("argument-refusal fixture omitted its launch selection")?;
+        match registry_launch_selection(selected) {
+            Err(RunnerError::Binding(detail))
+                if detail.contains("pin") && detail.contains("kind_id") => {}
+            Err(error) => {
+                return Err(format!(
+                    "closed-schema kind-field refusal had the wrong reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("unsupported kind field was accepted".to_owned()),
+        }
+        assert_eq!(start_observer::count(&unregistered_kind_operation), 0);
+
+        changed_arguments.selection.intent = changed_intent(
+            &original_argument_selection,
+            original_argument_selection.intent.executable().to_owned(),
+            {
+                let mut argv = original_argument_selection.intent.argv().to_vec();
+                argv.push("--unadmitted-argument".to_owned());
+                argv
+            },
+        )?;
+        start_observer::clear(&arguments_operation);
+        match resolve_route(&changed_arguments) {
+            Err(CliError::Contract(detail))
+                if detail.contains(
+                    "canonical external-stage admission refused: arguments or executable argv differ from the canonical fixed template",
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "changed-argument request failed for the wrong reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("changed arguments were admitted".to_owned()),
+        }
+        assert_eq!(start_observer::count(&arguments_operation), 0);
+
+        changed_arguments.selection.intent = changed_intent(
+            &original_argument_selection,
+            original_argument_selection.intent.executable().to_owned(),
+            {
+                let mut argv = original_argument_selection.intent.argv().to_vec();
+                argv.push("&& whoami".to_owned());
+                argv
+            },
+        )?;
+        start_observer::clear(&arguments_operation);
+        match resolve_route(&changed_arguments) {
+            Err(CliError::Contract(detail))
+                if detail.contains(
+                    "canonical external-stage admission refused: arguments or executable argv differ from the canonical fixed template",
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "raw-shell request failed for the wrong reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("raw-shell argument was admitted".to_owned()),
+        }
+        assert_eq!(start_observer::count(&arguments_operation), 0);
+
+        let changed_path = format!(
+            "{}.unadmitted",
+            changed_executable.selection.intent.executable()
+        );
+        changed_executable.selection.intent = changed_intent(
+            &changed_executable.selection,
+            changed_path,
+            changed_executable.selection.intent.argv().to_vec(),
+        )?;
+        start_observer::clear(&executable_operation);
+        match resolve_route(&changed_executable) {
+            Err(CliError::Contract(detail))
+                if detail.starts_with("external executable observation refused:") => {}
+            Err(error) => {
+                return Err(format!(
+                    "changed-executable request failed for the wrong reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("changed executable identity was admitted".to_owned()),
+        }
+        assert_eq!(start_observer::count(&executable_operation), 0);
+
+        Ok(())
+    }
+
+    fn fixture_evidence(env_name: &str) -> Result<serde_json::Value, String> {
+        let path = std::env::var_os(env_name)
+            .ok_or_else(|| format!("required live fixture variable {env_name} is absent"))?;
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+
+    fn request_from_original_fixture(env_name: &str) -> Result<Request, String> {
+        let evidence = fixture_evidence(env_name)?;
+        let selection = evidence
+            .pointer("/launch/registry_selection")
+            .ok_or("bootstrap fixture omits /launch/registry_selection")?;
+        let selection = registry_launch_selection(selection).map_err(|error| error.to_string())?;
+        Ok(Request {
+            selection,
+            declared_environments: Vec::new(),
+            receipt_out: None,
+            compare_against: None,
+        })
+    }
+
+    fn current_registry(selection: &RegistryLaunchSelection) -> Result<InstrumentRegistry, String> {
+        let kernel = KernelClient::load().map_err(|error| error.to_string())?;
+        let client = Arc::new(
+            InstrumentRegistryReadClient::new(
+                kernel,
+                selection.request_identity.clone(),
+                selection.scope_id.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let read_request = registry_state_request(
+            &selection.scope_id,
+            &selection.request_identity.request.state_fence,
+        );
+        let proof = block_on(CanonicalRegistryProofPort::retain_original(
+            Arc::clone(&client),
+            read_request,
+        ))
+        .map_err(|error| error.to_string())?;
+        let (_, _, current) =
+            block_on(proof.current_owner_readback()).map_err(|error| error.to_string())?;
+        let encoded_snapshot = current
+            .payload
+            .get("snapshot_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "current canonical owner read has no registry snapshot".to_owned())?;
+        InstrumentRegistry::recover(encoded_snapshot).map_err(|error| error.to_string())
+    }
+
+    fn changed_intent(
+        selection: &RegistryLaunchSelection,
+        executable: String,
+        argv: Vec<String>,
+    ) -> Result<ProcessIntent, String> {
+        let original = &selection.intent;
+        ProcessIntent::new(
+            original.operation_id().clone(),
+            original.process_tree_id().clone(),
+            original.job_id().clone(),
+            original.image_id().clone(),
+            original.session_id().clone(),
+            original.generation(),
+            executable,
+            original.executable_sha256().to_owned(),
+            argv,
+            original.working_directory().to_owned(),
+            original.environment().clone(),
+            original.resource_limits().clone(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn operation_id(selection: &RegistryLaunchSelection) -> String {
+        selection.intent.operation_id().as_str().to_owned()
+    }
+
+    fn assert_same_original_stage(
+        accepted: &RegistryLaunchSelection,
+        changed_arguments: &RegistryLaunchSelection,
+        changed_executable: &RegistryLaunchSelection,
+    ) {
+        for candidate in [changed_arguments, changed_executable] {
+            assert_eq!(candidate.scope_id, accepted.scope_id);
+            assert_eq!(candidate.pin, accepted.pin);
+            assert_eq!(candidate.layout, accepted.layout);
+            assert_eq!(candidate.work_scope, accepted.work_scope);
+            assert_eq!(candidate.intent.executable(), accepted.intent.executable());
+            assert_eq!(
+                candidate.intent.executable_sha256(),
+                accepted.intent.executable_sha256()
+            );
+            assert_eq!(candidate.intent.argv(), accepted.intent.argv());
+            assert_eq!(
+                candidate.intent.working_directory(),
+                accepted.intent.working_directory()
+            );
+            assert_eq!(
+                candidate.intent.environment(),
+                accepted.intent.environment()
+            );
+            assert_eq!(
+                candidate.intent.resource_limits(),
+                accepted.intent.resource_limits()
+            );
+        }
+    }
+
+    fn assert_admission_receipt_matches(
+        receipt: &VerificationProfileReceipt,
+        selection: &RegistryLaunchSelection,
+        registry: &InstrumentRegistry,
+        admitted: &eliot_instrument_runner::AdmittedProfile,
+        stage: &eliot_instrument_runner::AdmittedStage,
+        supply_receipt: &eliot_instrument_api::registry::SupplyChainReceipt,
+    ) -> Result<(), String> {
+        assert_eq!(
+            receipt.outcome,
+            eliot_instrument_runner::AggregateOutcome::Unknown,
+            "a live launch without retained parser evidence remains Unknown"
+        );
+        assert_eq!(receipt.profile.as_str(), selection.pin.profile.as_str());
+        assert_eq!(receipt.profile_revision, selection.pin.profile_revision);
+        assert_eq!(receipt.profile_revision, admitted.revision);
+        assert_eq!(
+            receipt.profile_digest.as_str(),
+            admitted.profile_digest.as_str()
+        );
+        assert_eq!(receipt.dag_digest.as_str(), admitted.dag_digest.as_str());
+        assert_eq!(registry.generation(), selection.pin.registry_generation);
+        assert_eq!(receipt.runs.len(), 1);
+        let run = receipt
+            .runs
+            .first()
+            .ok_or_else(|| "accepted route has no stage receipt".to_owned())?;
+        assert_eq!(run.stage_id, selection.pin.stage_id);
+        assert_eq!(run.execution, "Accepted");
+        assert!(matches!(
+            &run.evidence,
+            eliot_instrument_runner::StageEvidenceRecord::Omitted { reason }
+                if reason == "launched; terminal observation is owned by the supervising lane"
+        ));
+        assert!(run.executable_digest.is_some());
+        assert!(run.grant_digest.is_some());
+        let tool = receipt
+            .tool_identities
+            .iter()
+            .find(|tool| tool.stage_id == selection.pin.stage_id)
+            .ok_or_else(|| "accepted receipt omitted the selected tool identity".to_owned())?;
+        assert_eq!(tool.instrument.as_str(), stage.spec.as_str());
+        assert_eq!(tool.executable.as_str(), selection.intent.executable());
+        assert_eq!(tool.executable_digest, run.executable_digest);
+        assert_eq!(tool.grant_digest, run.grant_digest);
+        let provenance = tool.provenance.as_ref().ok_or_else(|| {
+            "accepted receipt omitted the original supply-chain provenance".to_owned()
+        })?;
+        assert_eq!(provenance.spec_digest, stage.spec_digest);
+        assert_eq!(
+            provenance.content_digest.as_str(),
+            selection.intent.executable_sha256()
+        );
+        assert_eq!(provenance.generation, registry.generation());
+        assert_eq!(provenance.content_digest, supply_receipt.content_digest);
+        assert_eq!(provenance.tool_version, supply_receipt.tool_version);
+
+        let admission = run
+            .admission_grant
+            .as_ref()
+            .ok_or_else(|| "accepted run omitted the original admission grant".to_owned())?;
+        assert_eq!(admission.digest(), admission.grant_digest);
+        assert_eq!(
+            run.grant_digest.as_deref(),
+            Some(admission.grant_digest.as_str())
+        );
+        assert_eq!(admission.kind_id.as_str(), stage.spec.as_str());
+        assert_eq!(admission.kind, stage.kind);
+        assert_eq!(admission.profile.as_str(), selection.pin.profile.as_str());
+        assert_eq!(admission.profile_revision, selection.pin.profile_revision);
+        assert_eq!(admission.spec_digest.as_str(), stage.spec_digest.as_str());
+        assert_eq!(
+            admission.executable.as_str(),
+            supply_receipt.executable.as_str()
+        );
+        assert_eq!(
+            admission.content_digest.as_str(),
+            supply_receipt.content_digest.as_str()
+        );
+        assert_eq!(admission.executable_version, stage.executable_version);
+        assert_eq!(admission.executable_path, tool.executable);
+        assert_eq!(admission.supply_digest, supply_receipt.digest());
+        assert_eq!(admission.arguments.as_slice(), selection.intent.argv());
+        assert_eq!(admission.arguments.as_slice(), stage.verification_command);
+        assert_eq!(
+            admission.environment_class.as_str(),
+            stage.environment_class.as_str()
+        );
+        assert_eq!(
+            admission.source_root.as_deref(),
+            Some(selection.layout.source_root.as_str())
+        );
+        assert_eq!(
+            admission.declared_scope.as_deref(),
+            Some(selection.work_scope.declared_scope.as_str())
+        );
+        let expected_environment_digest =
+            environment_projection_digest(selection.intent.environment());
+        assert_eq!(
+            admission.environment_digest.as_deref(),
+            Some(expected_environment_digest.as_str())
+        );
+        assert_eq!(
+            admission.resource_generation,
+            Some(selection.work_scope.fence.resource_generation.value())
+        );
+        assert_eq!(
+            admission.authority_epoch.as_ref(),
+            Some(&selection.work_scope.fence.authority_epoch)
+        );
+        assert_eq!(admission.parser, stage.parser);
+        assert_eq!(admission.parser_generation, stage.parser_generation);
+        assert_eq!(admission.timeout_ms, stage.timeout_ms);
+        assert_eq!(admission.max_output_bytes, stage.max_output_bytes);
+        let credential_policy = stage
+            .credential_policy
+            .as_ref()
+            .ok_or_else(|| "admitted stage omitted its credential policy".to_owned())?;
+        assert_eq!(
+            admission.credential_policy.as_str(),
+            credential_policy.as_str()
+        );
+        let network_policy = stage
+            .network_policy
+            .as_ref()
+            .ok_or_else(|| "admitted stage omitted its network policy".to_owned())?;
+        assert_eq!(admission.network_policy.as_str(), network_policy.as_str());
+        let max_concurrency = stage
+            .max_concurrency
+            .ok_or_else(|| "admitted stage omitted its concurrency ceiling".to_owned())?;
+        assert_eq!(admission.max_concurrency, max_concurrency);
+        assert_eq!(supply_receipt.generation, selection.pin.registry_generation);
+        Ok(())
+    }
+}
+#[cfg(all(test, windows))]
 #[path = "eliot-profile-resolver/provider_registry_physical.rs"]
 mod provider_registry_physical;

@@ -60,7 +60,7 @@ use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile, host_request_operation_id,
+    AgentActivationResultReconcile, HostRequestResultBody, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -4671,6 +4671,75 @@ async fn run_local_read_poll(
     // #740: receipt span over the claim/forward/submit poll step. Pair
     // presence and submit outcome are named; payload bytes never are.
     let _span = tracing::info_span!("eliotd.local_read_poll").entered();
+    // Instrument Registry registration is a separate authenticated Kernel
+    // queue form. Resolve its original claim, task, scope, session, grant path,
+    // per-grant P-07 activation, and canonical owner receipt through the
+    // existing owners before acknowledging the exact admitted operation.
+    #[cfg(windows)]
+    if let Some(pair) = kernel
+        .claim_instrument_registry_registration_async()
+        .await
+        .map_err(|error| format!("Kernel Instrument Registry claim: {error}"))?
+    {
+        let reads = composition
+            .lock()
+            .await
+            .context_read_client(kernel)
+            .map_err(|error| format!("Instrument Registry Kernel read client: {error}"))?;
+        let registration = composition
+            .lock()
+            .await
+            .register_instrument_registry_from_claim(&pair, kernel, &reads)
+            .await;
+        let response = match registration {
+            Ok(proof) => serde_json::json!({
+                "status": "COMMITTED",
+                "receipt": proof.receipt(),
+                "registry_revision": proof.registry_revision(),
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    operation_id = %pair.operation_id.as_str(),
+                    error = %error,
+                    "Instrument Registry registration was refused by current owners"
+                );
+                serde_json::json!({
+                    "status": "REFUSED",
+                    "code": "REGISTRATION_ADMISSION_REFUSED",
+                })
+            }
+        };
+        let result_digest = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&response)
+                .map_err(|error| format!("Instrument Registry refusal encoding: {error}"))?,
+        );
+        let body = HostRequestResultBody {
+            wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+            wire_version: HostRequestResultBody::CONTRACT_VERSION,
+            operation_id: pair.operation_id.as_str().to_owned(),
+            request_sha256: pair.envelope.envelope_sha256.clone(),
+            result_digest,
+            response,
+            lineage: None,
+            attempt: Some(pair.attempt),
+            evidence: None,
+        };
+        body.validate()
+            .map_err(|error| format!("Instrument Registry refusal body: {error}"))?;
+        let outcome = match kernel
+            .submit_instrument_registry_registration_result_async(&body)
+            .await
+            .map_err(|error| format!("Kernel Instrument Registry result: {error}"))?
+        {
+            LocalReadSubmitOutcome::Accepted => LocalReadPollOutcome::Accepted,
+            LocalReadSubmitOutcome::Expired => LocalReadPollOutcome::Expired,
+            LocalReadSubmitOutcome::StaleAttempt => LocalReadPollOutcome::StaleAttempt,
+        };
+        return Ok(LocalReadStep {
+            outcome,
+            delta: None,
+        });
+    }
     let pair = kernel
         .claim_local_read_pair_async()
         .await

@@ -14,8 +14,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::EpochId;
+use eliot_contracts::{EpochId, canonical_json_bytes};
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
+#[cfg(windows)]
+use eliot_kernel_service::{InstrumentStageRuntimeObservationPort, TestdAdmissionResponse};
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_process::{
@@ -23,7 +25,8 @@ use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, FencingToken, Generation,
     ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink,
     ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessTreeId, ResourceLimits, SessionId, SuspendedLaunchEvidence, SuspendedProcessIdentity,
+    ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
@@ -487,6 +490,45 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     executor: &E,
     sink: Arc<dyn ProcessEvidenceSink>,
 ) -> Result<ProcessStartReceipt, TestdError> {
+    start_claimed_from_store_with_attempt(store, job, lease, now, permit, None, executor, sink)
+        .await
+}
+
+/// Starts one productive instrument request only when its separate immutable
+/// per-attempt record matches the actual Kernel-issued P-03 request.
+pub(crate) async fn start_claimed_instrument_from_store<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &Lease,
+    now: u64,
+    permit: ProcessAdmissionPermit,
+    attempt: &eliot_testd_core::TestdInstrumentProcessAttemptBinding,
+    executor: &E,
+    sink: Arc<dyn ProcessEvidenceSink>,
+) -> Result<ProcessStartReceipt, TestdError> {
+    start_claimed_from_store_with_attempt(
+        store,
+        job,
+        lease,
+        now,
+        permit,
+        Some(attempt),
+        executor,
+        sink,
+    )
+    .await
+}
+
+async fn start_claimed_from_store_with_attempt<E: ProcessExecutor + 'static>(
+    store: &TestdStore,
+    job: &TestJob,
+    lease: &Lease,
+    now: u64,
+    permit: ProcessAdmissionPermit,
+    instrument_attempt: Option<&eliot_testd_core::TestdInstrumentProcessAttemptBinding>,
+    executor: &E,
+    sink: Arc<dyn ProcessEvidenceSink>,
+) -> Result<ProcessStartReceipt, TestdError> {
     let current = store.get(&job.job_id)?.ok_or(TestdError::Invalid {
         field: "job_id",
         reason: "unknown job",
@@ -552,12 +594,58 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     let authority_epoch = request.fence().authority_epoch();
     let digest = request.invocation_digest().to_owned();
     let environment = request.environment().non_secret();
+    let attempt_binding_valid =
+        if eliot_testd_core::is_productive_testd_profile(&current.invocation.profile) {
+            let Some(attempt) = instrument_attempt else {
+                return Err(TestdError::InvalidBinding);
+            };
+            let retained = store.instrument_process_attempt(&current.job_id, current.attempts)?;
+            let retained_identity = store.admitted_request_identity(&current.job_id)?;
+            attempt.validate()?;
+            retained.as_ref() == Some(attempt)
+                && retained_identity.as_ref() == Some(&attempt.request_identity)
+                && attempt.job_id == current.job_id
+                && attempt.attempt_seq == current.attempts
+                && attempt.operation_id == request.operation_id().as_str()
+                && attempt
+                    .request_identity
+                    .request
+                    .metadata
+                    .request_id
+                    .as_str()
+                    == attempt.operation_id
+                && &attempt.request_identity.request.state_fence.authority_epoch
+                    == request.fence().authority_epoch()
+                && attempt
+                    .request_identity
+                    .request
+                    .state_fence
+                    .resource_generation
+                    .value()
+                    == request.generation().get()
+                && attempt.process_request_digest == request.invocation_digest()
+                && attempt.intent_effect_digest == request.intent().effect_digest()
+                && request.expected_revision_heads().get("launch-grant")
+                    == Some(&attempt.kernel_dispatch_grant_digest)
+                && current
+                    .instrument_admission
+                    .as_ref()
+                    .is_some_and(|binding| {
+                        binding.process_intent == *request.intent()
+                            && binding.admission_grant.grant_digest
+                                == attempt.instrument_admission_digest
+                            && request.intent().instrument_admission_digest()
+                                == Some(attempt.instrument_admission_digest.as_str())
+                    })
+        } else {
+            instrument_attempt.is_none() && digest == current.process.invocation_digest
+        };
     if request_job_id != current.process.job_id
         || operation_id.as_str() != current.process.operation_id
         || process_tree_id != current.process.process_tree_id
         || generation != current.process.generation
         || !authority_epoch.is_same_authority(&current.process.authority_epoch)
-        || digest != current.process.invocation_digest
+        || !attempt_binding_valid
         || request.working_directory() != current.target_roots.source_root
         || environment.get("CARGO_TARGET_DIR") != Some(&current.target_roots.target_root)
         || environment.get("CARGO_HOME") != Some(&current.target_roots.cache_root)
@@ -937,29 +1025,15 @@ fn resolve_source_observation_git() -> Result<ResolvedToolFile, TestdError> {
     resolve_tool_file(TESTD_SOURCE_OBSERVATION_GIT_PROGRAM, &path_var)
 }
 
-/// Ephemeral testd-owned dispatch authority (issue #20, DISPATCH-FINISH).
-///
-/// Local testd half of the merged User Broker pattern
-/// (`bins/eliot-user-broker/src/lib.rs:120-216`) via the doctor copy
-/// (`bins/eliot-doctor/src/dispatch_authority.rs:70-177`): the key is
-/// generated in memory at composition time and never crosses a boundary;
-/// `DispatchPermitAuthority` supplies the one-shot replay fence. It consumes
-/// a validated dispatch grant (see
-/// [`testd_material::DispatchGrant`], already proved fail-closed by the
-/// reader) to build the single in-process [`ProcessRequest`] via
-/// `FencingToken::new` + `PermitIssuance::new` +
-/// `DispatchValidationContext::new` over a real
-/// [`ClockObservation`](eliot_platform::ClockObservation) (never a native
-/// JSON workaround) + `ProcessRequest::new`, exactly like the
-/// broker/doctor, and it implements [`DispatchValidationPort`] so the real
-/// [`WindowsProcessExecutor`] (via [`compose_process_executor`]) can
-/// validate-and-consume behind it.
-///
-/// The [`ProcessIntent`] is derived only from the admitted profile binding
-/// (see [`derive_testd_intent`]), never from argv, stdin, or environment.
+/// TestD process authority composition. Closed source-observation work keeps
+/// its existing local one-shot authority. Productive instrument attempts use
+/// the private Kernel child authority, which consumes the sealed TestD attempt
+/// response and performs the authenticated pre-resume and terminal reports.
 pub struct TestdDispatchAuthority {
     authority: Mutex<DispatchPermitAuthority>,
     context: Mutex<Option<DispatchValidationContext>>,
+    #[cfg(windows)]
+    instrument_authority: Option<Arc<eliot_kernel_service::KernelChildDispatchAuthority>>,
 }
 
 impl TestdDispatchAuthority {
@@ -976,7 +1050,65 @@ impl TestdDispatchAuthority {
         Ok(Self {
             authority: Mutex::new(DispatchPermitAuthority::activate(authority_id, key)),
             context: Mutex::new(None),
+            #[cfg(windows)]
+            instrument_authority: None,
         })
+    }
+
+    /// Constructs the productive TestD authority with its authenticated
+    /// Kernel lifecycle observer.
+    #[cfg(windows)]
+    pub fn new_with_instrument_observer(
+        observer: Arc<dyn InstrumentStageRuntimeObservationPort>,
+    ) -> Result<Self, TestdError> {
+        let mut authority = Self::new()?;
+        authority.instrument_authority = Some(Arc::new(
+            eliot_kernel_service::KernelChildDispatchAuthority::new_with_observation_port(observer)
+                .map_err(|error| TestdError::Contract(error.to_string()))?,
+        ));
+        Ok(authority)
+    }
+
+    /// Consumes the authenticated Kernel-issued attempt response by value.
+    #[cfg(windows)]
+    fn issue_testd_authenticated(
+        &self,
+        identity: &eliot_ipc::RequestIdentity,
+        intent: &ProcessIntent,
+        admission: &eliot_instrument_api::InstrumentAdmissionGrant,
+        job_id: &str,
+        attempt_seq: u32,
+        response: eliot_ipc::kernel_client::AuthenticatedKernelResponse,
+        now_unix_ms: u64,
+    ) -> Result<ProcessRequest, TestdError> {
+        self.instrument_authority
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?
+            .issue_testd_authenticated(
+                identity,
+                intent,
+                admission,
+                job_id,
+                attempt_seq,
+                response,
+                now_unix_ms,
+            )
+            .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+
+    /// Reports validated terminal evidence to the shared owner. Without its
+    /// authenticated echo, the Kernel keeps the exact physical slot reserved.
+    #[cfg(windows)]
+    fn report_instrument_terminal(
+        &self,
+        evidence: &eliot_process::ProcessEvidence,
+    ) -> Result<(), ProcessExecutionError> {
+        self.instrument_authority
+            .as_ref()
+            .ok_or_else(|| {
+                ProcessExecutionError::Unavailable("missing Kernel instrument authority".to_owned())
+            })?
+            .report_terminal(evidence)
     }
 
     /// Issues the single permit-bound process request for one validated
@@ -1120,6 +1252,30 @@ impl DispatchValidationPort for TestdDispatchAuthority {
             })?
             .validate_and_consume(request, observed, &current)
             .map_err(ProcessExecutionError::from)
+    }
+
+    #[cfg(windows)]
+    fn validate_and_consume_instrument(
+        &self,
+        request: ProcessRequest,
+        observed: SuspendedProcessIdentity,
+        launch: SuspendedLaunchEvidence,
+        recoverable_job_binding: eliot_platform_windows::RecoverableJobBinding,
+    ) -> Result<ValidatedDispatch, ProcessExecutionError> {
+        // Governed Git/source observations use this same executor and
+        // authority, but are not instrument stages and must stay on their
+        // existing one-shot validation path.
+        if request.intent().instrument_admission_digest().is_none() {
+            return self.validate_and_consume(request, observed);
+        }
+        self.instrument_authority
+            .as_ref()
+            .ok_or_else(|| {
+                ProcessExecutionError::Unavailable(
+                    "missing authenticated Kernel instrument authority".to_owned(),
+                )
+            })?
+            .validate_and_consume_instrument(request, observed, launch, recoverable_job_binding)
     }
 }
 
@@ -1938,15 +2094,13 @@ pub enum ValidatedDispatchDriveOutcome {
 
 /// Drives one validated dispatch file through the bounded admitted probe.
 ///
-/// Broker pattern (mirroring `bins/eliot-user-broker` via the doctor copy):
-/// the grant digest/epoch/fence arrive in the validated material, the
-/// [`TestdDispatchAuthority`] issues from exactly that grant over a real
-/// [`ClockObservation`](eliot_platform::ClockObservation), the
-/// [`ProcessIntent`](eliot_process::ProcessIntent) derives only from the
-/// admitted profile binding plus the installed tool bytes (never from argv,
-/// stdin, or environment), the [`ProcessRequest`](eliot_process::ProcessRequest)
-/// is built in-process, and the real composed [`WindowsProcessExecutor`]
-/// runs exactly one start. No mock, fake, or canned digest participates.
+/// Productive execution reloads the retained intent and registry admission,
+/// submits the exact validated attempt request over the authenticated Kernel
+/// client, and consumes the sealed Kernel response through the private child
+/// authority. The resulting P-03 request is retained separately against the
+/// claimed `(job_id, attempt_seq)` before the real executor can start it; the
+/// original queued process digest remains unchanged. Closed source-observation
+/// work retains its existing local one-shot authority.
 ///
 /// DISPATCH-WIRE seam for W3 (`bins/eliot-kernel`, issue #461):
 /// - Kernel main (W3-owned; this crate never edits it) composes the testd
@@ -2134,6 +2288,55 @@ fn derive_dispatch_process_intent(
     derive_testd_intent(&params)
 }
 
+/// Reobserves the productive tool and its exact owner-derived environment
+/// without reconstructing a ProcessIntent. The returned value is always the
+/// original persisted intent, including its file object and admission digest.
+fn retained_productive_process_intent(
+    job: &TestJob,
+    source_root: &Path,
+    provider_intent: &ProcessIntent,
+) -> Result<ProcessIntent, TestdError> {
+    let binding = job
+        .instrument_admission
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    binding.validate_for_new_attempt()?;
+    let tool = resolve_testd_tool_at(
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM,
+        source_root,
+    )?;
+    let environment = bind_tool_environment_to_roots(
+        &job.invocation.profile,
+        tool.environment,
+        &job.target_roots.target_root,
+        &job.target_roots.cache_root,
+    )?;
+    let expected_environment = validate_productive_tool_environment(
+        &environment,
+        &tool.executable_absolute,
+        &job.target_roots.target_root,
+        &job.target_roots.cache_root,
+    )?;
+    let original = &binding.process_intent;
+    if original.executable() != tool.executable_absolute
+        || original.executable_sha256() != tool.executable_sha256
+        || original.argv() != binding.admission_grant.arguments
+        || original.environment() != &expected_environment
+        || original.working_directory() != job.target_roots.source_root
+        || original.working_directory() != binding.resolution.source_root
+        || original.operation_id().as_str() != job.process.operation_id
+        || original.executable() != provider_intent.executable()
+        || original.executable_sha256() != provider_intent.executable_sha256()
+        || original.argv() != provider_intent.argv()
+        || original.environment() != provider_intent.environment()
+        || original.working_directory() != provider_intent.working_directory()
+        || original.operation_id() != provider_intent.operation_id()
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    Ok(original.clone())
+}
+
 fn derive_productive_dispatch_process_intent(
     job: &TestJob,
     material: &crate::testd_material::ValidatedTestdMaterial,
@@ -2256,11 +2459,89 @@ fn present_dispatch_admission(
     material: &crate::testd_material::ValidatedTestdMaterial,
     intent: &ProcessIntent,
     authority: &TestdDispatchAuthority,
+    #[cfg(windows)] observer: Option<&crate::kernel_client::KernelTestdInstrumentObserver>,
+    #[cfg(windows)] identity: Option<&eliot_ipc::RequestIdentity>,
     now_unix_ms: u64,
 ) -> Result<crate::kernel_client::PresentedAdmission, TestdError> {
     let authority_epoch = material.epoch.clone();
-    let request = authority.issue(intent, &material.grant, now_unix_ms)?;
-    if request.invocation_digest() != job.process.invocation_digest {
+    let (request, instrument_attempt) =
+        if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+            #[cfg(windows)]
+            {
+                let binding = job
+                    .instrument_admission
+                    .as_ref()
+                    .ok_or(TestdError::InvalidBinding)?;
+                let attempt_seq = material.request.attempt_seq;
+                if attempt_seq == 0 || attempt_seq != job.attempts.saturating_add(1) {
+                    return Err(TestdError::InvalidBinding);
+                }
+                let identity = identity.ok_or(TestdError::InvalidBinding)?;
+                let observer = observer.ok_or(TestdError::InvalidBinding)?;
+                let response = observer
+                    .submit_process_attempt(identity, &material.request)
+                    .map_err(|error| TestdError::Contract(error.to_string()))?;
+                if response.operation() != crate::kernel_client::TESTD_ADMISSION_OPERATION
+                    || response.request_identity() != identity
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+                let decoded: TestdAdmissionResponse =
+                    serde_json::from_value(response.payload().clone())
+                        .map_err(|error| TestdError::Contract(error.to_string()))?;
+                decoded
+                    .validate()
+                    .map_err(|error| TestdError::Contract(error.to_string()))?;
+                let attempt_grant = match decoded {
+                    TestdAdmissionResponse::Admitted(admission) => admission
+                        .process_attempt_grant
+                        .clone()
+                        .ok_or(TestdError::InvalidBinding)?,
+                    TestdAdmissionResponse::Rejected(_) | TestdAdmissionResponse::Conflict(_) => {
+                        return Err(TestdError::InvalidBinding);
+                    }
+                };
+                if attempt_grant.request_identity != *identity
+                    || attempt_grant.job_id != job.job_id
+                    || attempt_grant.attempt_seq != attempt_seq
+                    || attempt_grant.operation_id != job.process.operation_id
+                    || attempt_grant.process_intent != *intent
+                    || attempt_grant.instrument_admission != binding.admission_grant
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+                let dispatch_grant_digest = attempt_grant.dispatch_grant.grant_digest.clone();
+                let request = authority.issue_testd_authenticated(
+                    identity,
+                    intent,
+                    &binding.admission_grant,
+                    &job.job_id,
+                    attempt_seq,
+                    response,
+                    now_unix_ms,
+                )?;
+                let attempt = TestdInstrumentProcessAttemptBinding {
+                    job_id: job.job_id.clone(),
+                    attempt_seq,
+                    request_identity: identity.clone(),
+                    operation_id: job.process.operation_id.clone(),
+                    intent_effect_digest: intent.effect_digest(),
+                    instrument_admission_digest: binding.admission_grant.grant_digest.clone(),
+                    kernel_dispatch_grant_digest: dispatch_grant_digest,
+                    process_request_digest: request.invocation_digest().to_owned(),
+                };
+                (request, Some(attempt))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (intent, authority, now_unix_ms);
+                return Err(TestdError::InvalidBinding);
+            }
+        } else {
+            (authority.issue(intent, &material.grant, now_unix_ms)?, None)
+        };
+    if instrument_attempt.is_none() && request.invocation_digest() != job.process.invocation_digest
+    {
         return Err(TestdError::InvalidBinding);
     }
     let invocation_digest = crate::kernel_client::canonical_invocation_digest(&job.invocation)
@@ -2281,6 +2562,7 @@ fn present_dispatch_admission(
         request: admission_request,
         invocation: job.invocation.clone(),
         process: request,
+        instrument_attempt,
         epoch: authority_epoch,
         evidence_ref: material.operation_id.clone(),
         cancelled: material.cancelled,
@@ -2410,14 +2692,33 @@ fn drive_validated_dispatch_material_inner(
         ));
     }
     let source_root = Path::new(source_root);
+    // Complete the protected Kernel bootstrap before opening the exclusive
+    // TestD redb owner handle used by the remainder of the local drive.
+    #[cfg(windows)]
+    let instrument_observer = if eliot_testd_core::is_productive_testd_profile(&material.profile) {
+        Some(Arc::new(
+            crate::kernel_client::KernelTestdInstrumentObserver::connect()
+                .map_err(|error| TestdError::Contract(error.to_string()))?,
+        ))
+    } else {
+        None
+    };
     let (store, job) = load_dispatch_job(material)?;
     let canonical_job_source = canonicalize_dispatch_roots(source_root, &job, material)?;
     // The governed contour is composed before any physical execution on
-    // this path. The Git source observation runs through the very same
-    // `WindowsProcessExecutor` instance and the very same
-    // `TestdDispatchAuthority` that later seals the productive tool
-    // request, so both launches share one Job Object contour, one permit
-    // authority, and one one-shot replay fence (issue #1140, AC3).
+    // this path. Git source observations and the productive tool use the
+    // same `WindowsProcessExecutor` and Job Object contour. The productive
+    // instrument request remains separately sealed by the authenticated
+    // Kernel admission path.
+    #[cfg(windows)]
+    let authority = if let Some(observer) = instrument_observer.as_ref() {
+        Arc::new(TestdDispatchAuthority::new_with_instrument_observer(
+            observer.clone(),
+        )?)
+    } else {
+        Arc::new(TestdDispatchAuthority::new()?)
+    };
+    #[cfg(not(windows))]
     let authority = Arc::new(TestdDispatchAuthority::new()?);
     let executor = Arc::new(compose_process_executor(authority.clone()));
     let git = Arc::new(GovernedGitSourceObservation::new(
@@ -2444,7 +2745,13 @@ fn drive_validated_dispatch_material_inner(
                     false,
                 ));
             }
-            ProductiveProviderDispatchResolution::Ready(intent) => *intent,
+            ProductiveProviderDispatchResolution::Ready(provider_intent) => {
+                // Keep the current-main provider registry/evidence decision,
+                // but execute only the original admitted intent. The provider
+                // result must agree on every launch-relevant value; it never
+                // replaces or reseals the retained file identity/admission.
+                retained_productive_process_intent(&job, &canonical_job_source, &provider_intent)?
+            }
         }
     } else {
         // Keep the harmless admitted cargo-test probe on its existing route.
@@ -2466,13 +2773,64 @@ fn drive_validated_dispatch_material_inner(
     // by the same `WindowsProcessExecutor`. Both permits carry distinct
     // one-shot nonces, so neither can be replayed, and both children are
     // owned by one Job Object contour.
-    let presented = present_dispatch_admission(&job, material, &intent, &authority, now_unix_ms)?;
+    #[cfg(windows)]
+    let (store, presented) =
+        if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+            let identity = store
+                .admitted_request_identity(&job.job_id)?
+                .ok_or(TestdError::InvalidBinding)?;
+            let original_job = serde_json::to_vec(&job)
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            // TestD owns an exclusive redb handle. Release it before the
+            // authenticated Kernel admission opens the same canonical owner DB.
+            drop(store);
+            let observer = instrument_observer
+                .as_deref()
+                .ok_or(TestdError::InvalidBinding)?;
+            let presented = present_dispatch_admission(
+                &job,
+                material,
+                &intent,
+                &authority,
+                Some(observer),
+                Some(&identity),
+                now_unix_ms,
+            )?;
+            let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
+            let current = store.get(&job.job_id)?.ok_or(TestdError::InvalidBinding)?;
+            let current_bytes = serde_json::to_vec(&current)
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if current_bytes != original_job
+                || store.admitted_request_identity(&job.job_id)?.as_ref() != Some(&identity)
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+            (store, presented)
+        } else {
+            let presented = present_dispatch_admission(
+                &job,
+                material,
+                &intent,
+                &authority,
+                None,
+                None,
+                now_unix_ms,
+            )?;
+            (store, presented)
+        };
+    #[cfg(not(windows))]
+    let (store, presented) = {
+        let presented =
+            present_dispatch_admission(&job, material, &intent, &authority, now_unix_ms)?;
+        (store, presented)
+    };
     let receipt = worker::drive_admitted_one_shot_from_store(
         &store,
         presented,
-        &worker::GovernedContour::new(
+        &worker::GovernedContour::with_instrument_authority(
             executor.as_ref(),
             Some(&*git as &dyn SourceObservationGitPort),
+            authority.as_ref(),
         ),
         SERVICE_NAME,
         ADMITTED_WORKER_LEASE_MS,
@@ -2555,9 +2913,27 @@ pub fn drive_validated_dispatch_material_with_terminal_publisher(
             unix_ms(),
         )?;
         drop(store);
-        client
+        let committed = client
             .publish_terminal_completion(&notice, &binding, &job)
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())?;
+        let current = store.get(&job.job_id)?.ok_or(TestdError::InvalidBinding)?;
+        let publication = current
+            .terminal_publication
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        let returned = serde_json::to_value(&committed)
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let returned = String::from_utf8(
+            canonical_json_bytes(&returned)
+                .map_err(|error| TestdError::Contract(error.to_string()))?,
+        )
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if publication.receipt_sha256 != notice.receipt_sha256
+            || publication.committed_receipt_json.as_deref() != Some(returned.as_str())
+        {
+            return Err(TestdError::InvalidBinding);
+        }
     }
     Ok(outcome)
 }
@@ -2754,6 +3130,7 @@ mod tests {
             verification_receipt: None,
             verifier_dispatch: None,
             source_observation_before: Some(source_observation.clone()),
+            instrument_admission: None,
             provider_registry_snapshot: None,
             terminal_publication: None,
             updated_at_ms: 1,
@@ -3160,6 +3537,7 @@ mod tests {
             request: envelope,
             invocation: fixture.invocation.clone(),
             process: external_process_request(&fixture.source, &fixture.build, &fixture.build),
+            instrument_attempt: None,
             epoch: test_epoch(7),
             evidence_ref: "evidence-1".to_owned(),
             cancelled,
@@ -3523,6 +3901,15 @@ mod tests {
         let generation = Generation::new(1).unwrap();
         let fence = FencingToken::new(epoch.clone(), generation, "fence-1").unwrap();
         let material = super::testd_material::ValidatedTestdMaterial {
+            request: super::testd_material::TestdMaterialRequest {
+                wire_id: super::testd_material::TESTD_MATERIAL_WIRE_ID.to_owned(),
+                wire_version: super::testd_material::TESTD_MATERIAL_WIRE_VERSION,
+                job_id: "job-testd-cancel-1".to_owned(),
+                attempt_seq: 1,
+                closed_request_json: "{}".to_owned(),
+                target_resource_digest: "e".repeat(64),
+                request_digest: "f".repeat(64),
+            },
             job_id: "job-testd-cancel-1".to_owned(),
             operation_id: "testd-op-1".to_owned(),
             profile: "cargo-test".to_owned(),
@@ -3560,6 +3947,125 @@ mod tests {
                 if job_id == "job-testd-cancel-1"
             ),
             "cancelled material must project cancellation without executing, got {outcome:?}"
+        );
+    }
+
+    /// Exercises the production Kernel-issued per-attempt grant, private P-03
+    /// issuer, durable bind-once record, and Windows process contour. The
+    /// fixture must be an actual owner-issued material file; missing or
+    /// malformed evidence is a failure, never a skipped acceptance.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a live owner-issued TestD material and authenticated Kernel"]
+    #[allow(
+        clippy::expect_used,
+        reason = "live acceptance requires explicit owner evidence"
+    )]
+    fn live_productive_attempt_preserves_original_queued_digest() {
+        use std::task::{Context, Poll, Waker};
+
+        fn block_on_live<F: std::future::Future>(future: F) -> F::Output {
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let mut pinned = Box::pin(future);
+            loop {
+                match pinned.as_mut().poll(&mut context) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => std::thread::yield_now(),
+                }
+            }
+        }
+
+        let material_path = std::env::var_os("ELIOT_TESTD_LIVE_ACCEPTANCE_MATERIAL")
+            .expect("live acceptance material path must be provided");
+        let material_path = PathBuf::from(material_path);
+        let material = super::testd_material::read_testd_material_from(&material_path)
+            .expect("owner-issued material must validate")
+            .expect("live acceptance material file must exist");
+        assert!(!material.cancelled);
+        assert!(eliot_testd_core::is_productive_testd_profile(
+            &material.profile
+        ));
+
+        let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())
+            .expect("open original TestD owner store");
+        let original_job = store
+            .get(&material.job_id)
+            .expect("read original durable job")
+            .expect("original durable job exists");
+        let original_identity = store
+            .admitted_request_identity(&material.job_id)
+            .expect("read original authenticated RequestIdentity")
+            .expect("original RequestIdentity exists");
+        let original_queued_digest = original_job.process.invocation_digest.clone();
+        let original_binding = original_job
+            .instrument_admission
+            .as_ref()
+            .expect("original job carries its admitted instrument binding")
+            .clone();
+        original_binding
+            .validate_for_new_attempt()
+            .expect("original binding admits a new attempt");
+        let source_root = original_job.target_roots.source_root.clone();
+        drop(store);
+
+        let outcome = block_on_live(super::drive_validated_dispatch_material(
+            &material,
+            &source_root,
+            super::unix_ms(),
+        ))
+        .expect("the real authenticated productive attempt must complete its drive");
+        assert!(matches!(
+            outcome,
+            super::ValidatedDispatchDriveOutcome::Completed { .. }
+                | super::ValidatedDispatchDriveOutcome::Failed { .. }
+        ));
+
+        let store = TestdStore::open(&material.owner_store_path, RetryPolicy::default())
+            .expect("reopen original TestD owner store after the Kernel RPC");
+        let finished = store
+            .get(&material.job_id)
+            .expect("read finished durable job")
+            .expect("finished durable job remains present");
+        assert_eq!(finished.process.invocation_digest, original_queued_digest);
+        assert_eq!(
+            finished.instrument_admission.as_ref(),
+            Some(&original_binding)
+        );
+        assert_eq!(finished.attempts, material.request.attempt_seq);
+        let attempt = store
+            .instrument_process_attempt(&material.job_id, material.request.attempt_seq)
+            .expect("read immutable physical attempt binding")
+            .expect("real start retained its P-03 attempt binding");
+        assert_eq!(attempt.request_identity, original_identity);
+        assert_eq!(attempt.job_id, original_job.job_id);
+        assert_eq!(attempt.attempt_seq, material.request.attempt_seq);
+        assert_eq!(attempt.operation_id, original_job.process.operation_id);
+        assert_eq!(
+            attempt.intent_effect_digest,
+            original_binding.process_intent.effect_digest()
+        );
+        assert_eq!(
+            attempt.instrument_admission_digest,
+            original_binding.admission_grant.grant_digest
+        );
+        assert_ne!(attempt.process_request_digest, original_queued_digest);
+        assert_eq!(finished.process.invocation_digest, original_queued_digest);
+        let receipt = finished
+            .verification_receipt
+            .as_ref()
+            .expect("real process evidence produced a verification receipt");
+        assert_eq!(receipt.job_id, original_job.job_id);
+        assert_eq!(receipt.operation_id, original_job.process.operation_id);
+        assert_eq!(receipt.tool_observation, original_binding.tool_observation);
+        assert!(receipt.started_at.valid_time_ms.is_some());
+        // The record remains byte-for-byte stable after the finished lease
+        // is gone. This checks persisted state, not duplicate-write refusal.
+        assert_eq!(
+            store
+                .instrument_process_attempt(&material.job_id, material.request.attempt_seq)
+                .expect("re-read immutable attempt binding"),
+            Some(attempt)
         );
     }
 }

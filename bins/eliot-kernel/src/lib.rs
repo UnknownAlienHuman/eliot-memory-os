@@ -344,6 +344,8 @@ pub use health_view::KernelActivationView;
 mod host_request_route;
 #[cfg(windows)]
 mod hot_path_runtime;
+mod instrument_registry_read_route;
+mod instrument_stage_dispatch_route;
 pub mod integration_bridge;
 pub mod integration_candidate;
 pub mod integration_lease;
@@ -452,6 +454,8 @@ use eliot_kernel_core::{
     GenerationRouter, GovernorClosureRestore, KernelError, ProcessDispatchAuthorityController,
     RouteScope, bind_canonical_owner, owner_bundle_digest,
 };
+#[cfg(windows)]
+use eliot_kernel_service::InstrumentStageRuntime;
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
 #[cfg(windows)]
@@ -716,6 +720,9 @@ pub struct KernelComposition {
     generation_poison: Mutex<Option<String>>,
     front_door_policy: Mutex<ServerHandshakePolicy>,
     process_gateway: Option<Arc<ProcessExecutionGateway>>,
+    /// Shared #1814 concurrency/circuit owner and exact live child Jobs.
+    #[cfg(windows)]
+    pub(crate) instrument_stage_runtime: InstrumentStageRuntime,
     store_bootstrap: Option<HostStoreBootstrapRequirement>,
     daemon_launch: Option<EliotdLaunchDescriptor>,
     eliotd_receipt_binding: Option<EliotdReceiptRootBinding>,

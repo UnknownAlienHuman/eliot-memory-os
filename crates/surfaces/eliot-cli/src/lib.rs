@@ -57,6 +57,7 @@ pub enum CommandId {
     DevTestChanged,
     DevPulse,
     InstrumentRun,
+    InstrumentRegistryRegister,
     ModuleValidate,
     ModuleTest,
     ModuleContractTest,
@@ -89,6 +90,7 @@ impl CommandId {
             Self::DevTestChanged => "dev-test-changed",
             Self::DevPulse => "dev-pulse",
             Self::InstrumentRun => "instrument-run",
+            Self::InstrumentRegistryRegister => "instrument-registry-register",
             Self::ModuleValidate => "module-validate",
             Self::ModuleTest => "module-test",
             Self::ModuleContractTest => "module-contract-test",
@@ -140,6 +142,14 @@ pub enum CommandArguments {
     InstrumentRun {
         profile: String,
         scope: Option<String>,
+    },
+    /// Submit an inert registry snapshot candidate for current Governor
+    /// admission under the authenticated operator request identity.
+    InstrumentRegistryRegister {
+        work_scope_id: String,
+        snapshot_json: String,
+        action_contract_json: String,
+        cold_start_claim_json: String,
     },
     ModuleValidate {
         module_id: String,
@@ -233,6 +243,7 @@ impl CommandArguments {
             Self::DevTestChanged => CommandId::DevTestChanged,
             Self::DevPulse { .. } => CommandId::DevPulse,
             Self::InstrumentRun { .. } => CommandId::InstrumentRun,
+            Self::InstrumentRegistryRegister { .. } => CommandId::InstrumentRegistryRegister,
             Self::ModuleValidate { .. } => CommandId::ModuleValidate,
             Self::ModuleTest { .. } => CommandId::ModuleTest,
             Self::ModuleContractTest { .. } => CommandId::ModuleContractTest,
@@ -288,6 +299,39 @@ impl CommandArguments {
                 Self::validate_text(profile, "profile")?;
                 if let Some(scope) = scope {
                     Self::validate_text(scope, "scope")?;
+                }
+                Ok(())
+            }
+            Self::InstrumentRegistryRegister {
+                work_scope_id,
+                snapshot_json,
+                action_contract_json,
+                cold_start_claim_json,
+            } => {
+                Self::validate_text(work_scope_id, "work_scope_id")?;
+                if snapshot_json.is_empty()
+                    || snapshot_json.len() > 1_048_576
+                    || serde_json::from_str::<Value>(snapshot_json).is_err()
+                {
+                    return Err(CliError::InvalidArgument {
+                        field: "snapshot_json",
+                    });
+                }
+                if action_contract_json.is_empty()
+                    || action_contract_json.len() > 1_048_576
+                    || serde_json::from_str::<Value>(action_contract_json).is_err()
+                {
+                    return Err(CliError::InvalidArgument {
+                        field: "action_contract_json",
+                    });
+                }
+                if cold_start_claim_json.is_empty()
+                    || cold_start_claim_json.len() > 1_048_576
+                    || serde_json::from_str::<Value>(cold_start_claim_json).is_err()
+                {
+                    return Err(CliError::InvalidArgument {
+                        field: "cold_start_claim_json",
+                    });
                 }
                 Ok(())
             }
@@ -491,651 +535,146 @@ pub enum CommandPortError {
 /// Kernel/installation owner and supplies the expected service SID/session as
 /// well as the exact EBP `ClientHello` binding.
 pub mod kernel_client {
-    use std::collections::BTreeMap;
-    use std::time::Duration;
-
-    use eliot_contracts::{EpochId, RequestId};
-    use eliot_ipc::{
-        DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
-        decode_server_hello_frame,
-    };
-    use eliot_platform_windows::{
-        NamedPipePeerExpectation, ProtectedPathLease, protected_program_data_path,
-    };
-    use eliot_protocol::{
-        ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-        ProtocolVersion, RequestIdentity, ServerHello,
-    };
-    pub use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
-    use serde::Deserialize;
+    use eliot_protocol::RequestIdentity;
+    use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
+    use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
-    use sha2::{Digest, Sha256};
     use thiserror::Error;
 
-    const KERNEL_FRONT_DOOR_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
-    const CONFIG_RELATIVE_PATH: &str = "Eliot/kernel/application-client.json";
-    const CONFIG_LIMIT: u64 = 64 * 1024;
-    const OPERATION_LIMIT: usize = 160;
-    const KERNEL_SERVICE_NAME: &str = "eliot-kernel";
-    const KERNEL_PROTOCOL_VERSION: &str = "eliot.kernel.v1";
+    pub use eliot_ipc::kernel_client::KernelClientConfig;
+    use eliot_ipc::kernel_client::{
+        KernelClient as AuthenticatedKernelClient, KernelClientError as TransportKernelClientError,
+    };
 
-    /// Protected installation-provided connection declaration.
-    #[derive(Clone, Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct KernelClientConfig {
-        /// Stable connection identity assigned by the Kernel owner.
-        pub connection_id: String,
-        /// SID of the Kernel service process expected at the pipe peer.
-        pub expected_kernel_sid: String,
-        /// Session id of the Kernel service process expected at the pipe peer.
-        pub expected_kernel_session_id: u32,
-        /// Exact client handshake declaration approved for this installation.
-        pub client_hello: ClientHello,
-        /// SHA-256 of canonical JSON `client_hello` bytes from the approved
-        /// installation manifest.
-        pub client_hello_sha256: String,
-        /// Protected principal binding selected by the Kernel owner.
-        pub expected_server_principal_binding: String,
-        /// Protected authority epoch for the configured module generation.
-        ///
-        /// Lineage-aware [`EpochId`] exact tuple installed by the Kernel owner;
-        /// matched via `is_same_authority` against the live Kernel `ServerHello`.
-        pub expected_authority_epoch: EpochId,
-        /// Numeric identity of the expected immutable module generation.
-        pub expected_generation: u64,
-        /// Digest/identity of the expected server artifact.
-        pub expected_artifact_digest: String,
-        /// SHA-256 of the exact canonical JSON `ServerHello.config_snapshot`.
-        pub expected_config_snapshot_sha256: String,
-    }
+    /// Operation selector for the broker-owned Operator launch route.
+    pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
 
     /// Failure at the authenticated application front door.
     #[derive(Clone, Debug, Eq, Error, PartialEq)]
     pub enum KernelClientError {
-        /// No protected front-door configuration is available on this host.
         #[error("kernel application front door is closed: {0}")]
         FrontDoorClosed(&'static str),
-        /// The protected configuration or operation was rejected locally.
         #[error("kernel client configuration rejected: {0}")]
         Configuration(String),
-        /// A request lacked the exact EBP identity required by the gateway.
         #[error("kernel request identity is missing")]
         MissingRequestIdentity,
-        /// The authenticated provider rejected or fenced the operation.
         #[error("kernel front door rejected the request: {0}")]
         Rejected(String),
-        /// The request may have reached the provider, but its outcome was not
-        /// proven by an exact typed reply and must be reconciled by operation.
         #[error("kernel front door outcome is unknown: {0}")]
         UnknownOutcome(String),
-        /// The serving owner invalidated the generation/session-bound handoff.
-        /// The caller must restart through a fresh broker-issued handoff; a
-        /// consumed endpoint, PID, pipe name, or cached environment value can
-        /// never re-establish continuity.
         #[error("kernel operator handoff requires a fresh broker binding: {0}")]
         RestartRequired(String),
     }
 
-    /// Operation selector for the broker-owned Operator launch route.
-    ///
-    /// Broker-owned contract (`eliot.surfaces.user-broker-core/v1`) with the
-    /// exact capability pair in
-    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29`
-    /// (`OPERATOR_CAPABILITIES = ["controlboard.read", "operator.command"]`).
-    /// The Kernel/User Broker lane serves and admits this operation; a typed
-    /// provider rejection is the admission signal, never a local stub. This
-    /// selector names no authority: the admitted `RequestIdentity` bound via
-    /// [`KernelClient::set_request_identity`] carries the session, fence, and
-    /// operation binding.
-    pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
-
-    /// Closed launch disposition carried by the serving owner receipt.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum OperatorLaunchStatus {
-        Admitted,
-        RestartRequired,
+    impl From<TransportKernelClientError> for KernelClientError {
+        fn from(error: TransportKernelClientError) -> Self {
+            match error {
+                TransportKernelClientError::FrontDoorClosed(reason) => {
+                    Self::FrontDoorClosed(reason)
+                }
+                TransportKernelClientError::Configuration(reason) => Self::Configuration(reason),
+                TransportKernelClientError::MissingRequestIdentity => Self::MissingRequestIdentity,
+                TransportKernelClientError::Rejected(reason) => Self::Rejected(reason),
+                TransportKernelClientError::UnknownOutcome(reason) => Self::UnknownOutcome(reason),
+            }
+        }
     }
 
-    /// Provider-neutral request for the interactive Operator contour.  The
-    /// Kernel must bind this request to its admitted handshake snapshot; the
-    /// CLI never supplies a path, image, digest, capability, fence, or clock.
-    #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    /// Provider-neutral request for the interactive Operator contour.
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct OperatorLaunchRequest {
         pub role: String,
         pub capabilities: Vec<String>,
     }
 
-    /// Closed outer envelope returned by the serving Kernel/User Broker owner.
-    /// The nested body is decoded into the broker-core owner projection below;
-    /// a non-empty JSON object is never sufficient.
-    #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     struct OperatorLaunchWireEnvelope {
-        pub operation_id: String,
-        pub status: String,
-        pub receipt: Value,
+        operation_id: String,
+        status: String,
+        receipt: Value,
     }
 
-    /// Exact server-owned configuration snapshot carried by `ServerHello`.
-    /// This is deliberately closed: a plausible arbitrary JSON object cannot
-    /// stand in for the Kernel's generation, authority and artifact binding.
-    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-    #[serde(deny_unknown_fields)]
-    struct KernelConfigSnapshot {
-        service: String,
-        protocol: String,
-        generation: u64,
-        authority_epoch: EpochId,
-        artifact_digest: String,
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OperatorLaunchStatus {
+        Admitted,
+        RestartRequired,
     }
 
-    /// One short-lived authenticated session. It is intentionally not a
-    /// durable authority token and reconnects for each operation.
+    /// Compatibility wrapper retaining the CLI's launch-receipt surface while
+    /// all protected configuration and authenticated EBP transport live in
+    /// `eliot-ipc`.
     pub struct KernelClient {
-        config: KernelClientConfig,
+        transport: AuthenticatedKernelClient,
         request_identity: Option<RequestIdentity>,
-        #[cfg(windows)]
-        config_lease: ProtectedPathLease,
     }
 
     impl KernelClient {
-        /// Loads the installation-owned protected client declaration.
         pub fn load() -> Result<Self, KernelClientError> {
-            #[cfg(not(windows))]
-            {
-                return Err(KernelClientError::FrontDoorClosed(
-                    "Windows authenticated Kernel front door",
-                ));
-            }
-            #[cfg(windows)]
-            {
-                let path = protected_program_data_path(CONFIG_RELATIVE_PATH)
-                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-                let lease = ProtectedPathLease::open_existing_absolute(&path)
-                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-                let bytes = lease
-                    .read_bounded(CONFIG_LIMIT)
-                    .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-                let config: KernelClientConfig =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        KernelClientError::Configuration(format!(
-                            "decode Kernel client configuration: {error}"
-                        ))
-                    })?;
-                validate_config(&config)?;
-                Ok(Self {
-                    config,
-                    request_identity: None,
-                    config_lease: lease,
-                })
-            }
+            Ok(Self {
+                transport: AuthenticatedKernelClient::load()?,
+                request_identity: None,
+            })
         }
 
-        /// Binds the exact caller identity for the next application request.
         pub fn set_request_identity(&mut self, identity: RequestIdentity) {
+            self.transport.set_request_identity(identity.clone());
             self.request_identity = Some(identity);
         }
 
-        /// Requests the broker-owned Operator launch through the authenticated
-        /// Kernel/User Broker EBP Execute seam.
-        ///
-        /// The admitted [`RequestIdentity`] bound via
-        /// [`KernelClient::set_request_identity`] carries the exact session,
-        /// fence, deadline, and operation binding from the admitted
-        /// host-request path; this front door never mints principal, session,
-        /// fence, clock, or idempotency identity. Without one the call fails
-        /// closed with [`KernelClientError::MissingRequestIdentity`] before
-        /// any byte is sent.
-        ///
-        /// The request transacts [`OPERATOR_LAUNCH_OPERATION`] with only the
-        /// broker-owned role/capability pair. The CLI supplies no path, image,
-        /// digest, fence, or clock: those bindings arrive with the admitted
-        /// identity and the Kernel handshake snapshot. The typed receipt is
-        /// decoded closed: `admitted` returns the owner receipt,
-        /// `restart_required` becomes the typed
-        /// [`KernelClientError::RestartRequired`] disposition (fresh
-        /// broker-issued handoff required; never PID, pipe-name, or
-        /// cached-environment continuity), and any other shape becomes
-        /// [`KernelClientError::UnknownOutcome`] for same-operation
-        /// reconciliation.
-        ///
-        /// The `"controlboard.read"` capability string is retained because the
-        /// broker contract requires it: `OPERATOR_CAPABILITIES` in
-        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29` is exactly
-        /// `["controlboard.read", "operator.command"]` (verified by grep for
-        /// `controlboard.read`; #1213). It is a broker-owned capability name,
-        /// not an `eliot-controlboard` crate binding.
         pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
-            #[cfg(not(windows))]
-            {
-                return Err(KernelClientError::FrontDoorClosed(
-                    "Windows authenticated Kernel front door",
-                ));
-            }
-            #[cfg(windows)]
-            {
-                let identity = self
-                    .request_identity
-                    .clone()
-                    .ok_or(KernelClientError::MissingRequestIdentity)?;
-                let request = OperatorLaunchRequest {
-                    role: "human_operator".to_owned(),
-                    capabilities: vec![
-                        "controlboard.read".to_owned(),
-                        "operator.command".to_owned(),
-                    ],
-                };
-                let payload = serde_json::to_value(&request).map_err(|error| {
-                    KernelClientError::Configuration(format!(
-                        "encode broker-owned operator launch request: {error}"
-                    ))
-                })?;
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-                let expected_operation_id = identity.idempotency_key.clone();
-                let served = runtime.block_on(self.transact_async(
-                    OPERATOR_LAUNCH_OPERATION,
-                    payload,
-                    identity,
-                ))?;
-                let (status, receipt) =
-                    decode_operator_launch_receipt(&served, &expected_operation_id)?;
-                match status {
-                    OperatorLaunchStatus::Admitted => Ok(receipt),
-                    OperatorLaunchStatus::RestartRequired => {
-                        Err(KernelClientError::RestartRequired(format!(
-                            "broker invalidated the generation/session-bound operator handoff for operation {}",
-                            receipt
-                                .get("operation_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown")
-                        )))
-                    }
+            let identity = self
+                .request_identity
+                .clone()
+                .ok_or(KernelClientError::MissingRequestIdentity)?;
+            let request = OperatorLaunchRequest {
+                role: "human_operator".to_owned(),
+                capabilities: vec![
+                    "controlboard.read".to_owned(),
+                    "operator.command".to_owned(),
+                ],
+            };
+            let payload = serde_json::to_value(&request).map_err(|error| {
+                KernelClientError::Configuration(format!(
+                    "encode broker-owned operator launch request: {error}"
+                ))
+            })?;
+            let served = self
+                .transport
+                .transact_json(OPERATOR_LAUNCH_OPERATION, payload)?;
+            let expected_operation_id = identity.idempotency_key.clone();
+            let (status, receipt) =
+                decode_operator_launch_receipt(&served, &expected_operation_id)?;
+            match status {
+                OperatorLaunchStatus::Admitted => Ok(receipt),
+                OperatorLaunchStatus::RestartRequired => {
+                    Err(KernelClientError::RestartRequired(format!(
+                        "broker invalidated the generation/session-bound operator handoff for operation {}",
+                        receipt
+                            .get("operation_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                    )))
                 }
             }
         }
 
-        /// Performs a bounded authenticated health exchange with Kernel.
         pub fn probe(&mut self) -> Result<Value, KernelClientError> {
-            #[cfg(not(windows))]
-            {
-                Err(KernelClientError::FrontDoorClosed(
-                    "Windows authenticated Kernel front door",
-                ))
-            }
-            #[cfg(windows)]
-            {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-                runtime.block_on(self.probe_async())
-            }
+            self.transport.probe().map_err(Into::into)
         }
 
-        /// Sends one exact provider operation through the authenticated EBP
-        /// Execute seam. The operation string is a contract selector, not a
-        /// local command authority.
         pub fn transact_json(
             &mut self,
             operation: &str,
             payload: Value,
         ) -> Result<Value, KernelClientError> {
-            validate_operation(operation)?;
-            let identity = self
-                .request_identity
-                .clone()
-                .ok_or(KernelClientError::MissingRequestIdentity)?;
-            #[cfg(not(windows))]
-            {
-                let _ = (identity, payload);
-                Err(KernelClientError::FrontDoorClosed(
-                    "Windows authenticated Kernel front door",
-                ))
-            }
-            #[cfg(windows)]
-            {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-                runtime.block_on(self.transact_async(operation, payload, identity))
-            }
-        }
-
-        #[cfg(windows)]
-        async fn connect(
-            &self,
-        ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
-            self.config_lease
-                .verify_stable_identity()
-                .and_then(|()| self.config_lease.verify_path_identity())
-                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-            let expectation = NamedPipePeerExpectation::new(
-                &self.config.expected_kernel_sid,
-                self.config.expected_kernel_session_id,
-            )
-            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-            let mut transport = NamedPipeTransport::connect_authenticated(
-                KERNEL_FRONT_DOOR_PIPE,
-                Duration::from_secs(5),
-                &expectation,
-            )
-            .await
-            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            let limits = TransportLimits::default();
-            let hello = client_hello_frame(&self.config.connection_id, &self.config.client_hello)
-                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            require_delivery(
-                transport.send_frame(&hello, limits).await,
-                "Kernel client hello",
-            )?;
-            let server = transport
-                .receive_frame(limits)
-                .await
-                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            let hello = decode_server_hello_frame(&server, &self.config.connection_id)
-                .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-            validate_server_hello(&self.config, &hello)?;
-            Ok((transport, limits))
-        }
-
-        #[cfg(windows)]
-        async fn probe_async(&self) -> Result<Value, KernelClientError> {
-            let (mut transport, limits) = self.connect().await?;
-            let frame = Frame {
-                protocol_version: ProtocolVersion::CURRENT,
-                encoding_profile: EncodingProfile::JsonV1,
-                connection_id: self.config.connection_id.clone(),
-                request_id: None,
-                kind: FrameKind::Heartbeat,
-                message_type: MessageType::Health,
-                request_identity: None,
-                payload: ProtocolPayload::Json(json!({"status": "probe"})),
-                trace_context: BTreeMap::new(),
-            };
-            require_delivery(
-                transport.send_frame(&frame, limits).await,
-                "Kernel health probe",
-            )?;
-            let response = transport
-                .receive_frame(limits)
-                .await
-                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-            validate_health_response(&self.config.connection_id, &response)
-        }
-
-        #[cfg(windows)]
-        async fn transact_async(
-            &self,
-            operation: &str,
-            payload: Value,
-            identity: RequestIdentity,
-        ) -> Result<Value, KernelClientError> {
-            let (mut transport, limits) = self.connect().await?;
-            let request_id = identity.request.metadata.request_id.clone();
-            let frame = Frame {
-                protocol_version: ProtocolVersion::CURRENT,
-                encoding_profile: EncodingProfile::JsonV1,
-                connection_id: self.config.connection_id.clone(),
-                request_id: Some(identity.request.metadata.request_id.clone()),
-                kind: FrameKind::Request,
-                message_type: MessageType::Execute,
-                request_identity: Some(identity),
-                payload: ProtocolPayload::Json(json!({
-                    "operation": operation,
-                    "payload": payload,
-                })),
-                trace_context: BTreeMap::new(),
-            };
-            require_delivery(
-                transport.send_frame(&frame, limits).await,
-                "Kernel application request",
-            )?;
-            let response = transport
-                .receive_frame(limits)
-                .await
-                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-            validate_result_response(&self.config.connection_id, &request_id, &response)
+            self.transport
+                .transact_json(operation, payload)
+                .map_err(Into::into)
         }
     }
 
-    fn validate_config(config: &KernelClientConfig) -> Result<(), KernelClientError> {
-        if config.connection_id.trim().is_empty()
-            || config.connection_id.chars().any(char::is_control)
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel connection identity is invalid".to_owned(),
-            ));
-        }
-        if config.expected_kernel_sid.trim().is_empty()
-            || config.expected_kernel_sid.chars().any(char::is_control)
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel service SID is invalid".to_owned(),
-            ));
-        }
-        NamedPipePeerExpectation::new(
-            &config.expected_kernel_sid,
-            config.expected_kernel_session_id,
-        )
-        .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-        config
-            .client_hello
-            .validate()
-            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-        if config.client_hello_sha256.len() != 64
-            || !config
-                .client_hello_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel client hello digest is invalid".to_owned(),
-            ));
-        }
-        let hello_bytes = serde_json::to_vec(&config.client_hello)
-            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
-        let expected = format!("{:x}", Sha256::digest(hello_bytes));
-        if !config.client_hello_sha256.eq_ignore_ascii_case(&expected) {
-            return Err(KernelClientError::Configuration(
-                "Kernel client hello digest does not match approved bytes".to_owned(),
-            ));
-        }
-        if config.expected_server_principal_binding.trim().is_empty()
-            || config
-                .expected_server_principal_binding
-                .chars()
-                .any(char::is_control)
-            || config.expected_artifact_digest.trim().is_empty()
-            || config
-                .expected_artifact_digest
-                .chars()
-                .any(char::is_control)
-            || config.expected_artifact_digest.len() != 64
-            || !config
-                .expected_artifact_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel server binding declaration is invalid".to_owned(),
-            ));
-        }
-        // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
-        // tuple by construction; only the generation and snapshot digest need
-        // nonzero/shape checks here.
-        if config.expected_generation == 0
-            || config.expected_config_snapshot_sha256.len() != 64
-            || !config
-                .expected_config_snapshot_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel server binding digest/epoch is invalid".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_server_hello(
-        config: &KernelClientConfig,
-        hello: &ServerHello,
-    ) -> Result<(), KernelClientError> {
-        hello
-            .validate()
-            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-        if hello.rejection_reason.is_some()
-            || hello.selected_protocol != ProtocolVersion::CURRENT
-            || hello.session_principal_binding != config.expected_server_principal_binding
-            || !hello
-                .authority_epoch
-                .is_same_authority(&config.expected_authority_epoch)
-        {
-            return Err(KernelClientError::Rejected(
-                "Kernel ServerHello is not bound to the protected authority".to_owned(),
-            ));
-        }
-        validate_server_snapshot(
-            hello,
-            &config.expected_authority_epoch,
-            config.expected_generation,
-            &config.expected_artifact_digest,
-        )?;
-        let snapshot_bytes = serde_json::to_vec(&hello.config_snapshot)
-            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-        let snapshot_digest = format!("{:x}", Sha256::digest(snapshot_bytes));
-        if !snapshot_digest.eq_ignore_ascii_case(&config.expected_config_snapshot_sha256) {
-            return Err(KernelClientError::Rejected(
-                "Kernel ServerHello configuration snapshot digest mismatch".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_server_snapshot(
-        hello: &ServerHello,
-        expected_authority_epoch: &EpochId,
-        expected_generation: u64,
-        expected_artifact_digest: &str,
-    ) -> Result<(), KernelClientError> {
-        let snapshot: KernelConfigSnapshot = serde_json::from_value(hello.config_snapshot.clone())
-            .map_err(|error| {
-                KernelClientError::Rejected(format!(
-                    "Kernel ServerHello configuration snapshot shape is invalid: {error}"
-                ))
-            })?;
-        if snapshot.service != KERNEL_SERVICE_NAME
-            || snapshot.protocol != KERNEL_PROTOCOL_VERSION
-            || snapshot.generation == 0
-            || snapshot.generation != expected_generation
-            || !snapshot
-                .authority_epoch
-                .is_same_authority(expected_authority_epoch)
-            || !hello
-                .authority_epoch
-                .is_same_authority(&snapshot.authority_epoch)
-            || snapshot.artifact_digest.len() != 64
-            || !snapshot
-                .artifact_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || snapshot.artifact_digest != expected_artifact_digest
-        {
-            return Err(KernelClientError::Rejected(
-                "Kernel ServerHello generation/authority/artifact binding mismatch".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_health_response(
-        connection_id: &str,
-        response: &Frame,
-    ) -> Result<Value, KernelClientError> {
-        response
-            .validate()
-            .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-        if response.protocol_version != ProtocolVersion::CURRENT
-            || response.connection_id != connection_id
-            || response.kind != FrameKind::Heartbeat
-            || response.message_type != MessageType::Health
-            || response.request_id.is_some()
-            || response.request_identity.is_some()
-        {
-            return Err(KernelClientError::UnknownOutcome(
-                "Kernel health reply binding mismatch".to_owned(),
-            ));
-        }
-        match &response.payload {
-            ProtocolPayload::Json(value) if value.get("rejection_reason").is_none() => {
-                Ok(value.clone())
-            }
-            ProtocolPayload::Json(_) => Err(KernelClientError::Rejected(
-                "Kernel health reply was rejected".to_owned(),
-            )),
-            _ => Err(KernelClientError::UnknownOutcome(
-                "Kernel health response was not typed JSON".to_owned(),
-            )),
-        }
-    }
-
-    fn validate_result_response(
-        connection_id: &str,
-        request_id: &RequestId,
-        response: &Frame,
-    ) -> Result<Value, KernelClientError> {
-        response
-            .validate()
-            .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
-        if response.protocol_version != ProtocolVersion::CURRENT
-            || response.connection_id != connection_id
-            || response.request_id.as_ref() != Some(request_id)
-            || response.kind != FrameKind::Response
-            || response.message_type != MessageType::Result
-            || response.request_identity.is_some()
-        {
-            return Err(KernelClientError::UnknownOutcome(
-                "Kernel result reply binding mismatch".to_owned(),
-            ));
-        }
-        match &response.payload {
-            ProtocolPayload::Json(value) => {
-                if value.get("rejection_reason").is_some() {
-                    return Err(KernelClientError::Rejected(
-                        "Kernel result reply was rejected".to_owned(),
-                    ));
-                }
-                Ok(value.clone())
-            }
-            _ => Err(KernelClientError::UnknownOutcome(
-                "Kernel result response was not typed JSON".to_owned(),
-            )),
-        }
-    }
-
-    fn validate_operation(operation: &str) -> Result<(), KernelClientError> {
-        if operation.trim().is_empty()
-            || operation.len() > OPERATION_LIMIT
-            || operation.chars().any(char::is_control)
-        {
-            return Err(KernelClientError::Configuration(
-                "Kernel operation selector is invalid".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Decodes the serving owner's launch receipt closed: the operation
-    /// identity is the exact admitted request identity, the status is one of
-    /// the two admitted dispositions, and the receipt body is the closed
-    /// broker-core owner projection. Anything else is an unknown outcome for
-    /// same-operation reconciliation, never a rejection and never an
-    /// admission.
     fn decode_operator_launch_receipt(
         served: &Value,
         expected_operation_id: &str,
@@ -1174,8 +713,7 @@ pub mod kernel_client {
                 })?;
                 if receipt.operation_id.as_str() != expected_operation_id {
                     return Err(KernelClientError::UnknownOutcome(
-                        "Kernel operator launch admitted receipt identity does not match the request"
-                            .to_owned(),
+                        "Kernel operator launch admitted receipt identity does not match the request".to_owned(),
                     ));
                 }
                 let projected = serde_json::to_value(receipt).map_err(|error| {
@@ -1210,259 +748,26 @@ pub mod kernel_client {
                 })?;
                 Ok((OperatorLaunchStatus::RestartRequired, projected))
             }
-            _ => {
-                return Err(KernelClientError::UnknownOutcome(
-                    "Kernel operator launch disposition is not a closed receipt".to_owned(),
-                ));
-            }
+            _ => Err(KernelClientError::UnknownOutcome(
+                "Kernel operator launch disposition is not a closed receipt".to_owned(),
+            )),
         }
     }
 
     #[cfg(test)]
-    // The platform delivery helper must remain cfg-gated beside production code;
-    // fixtures intentionally fail immediately for invalid static identities.
-    #[allow(clippy::expect_used, clippy::items_after_test_module)]
     mod tests {
         use super::*;
-        use eliot_contracts::{EpochId, EpochLineageId};
-        use std::num::NonZeroU64;
-
-        const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
-        const OTHER_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440001";
-
-        fn test_epoch(sequence: u64) -> EpochId {
-            EpochId::new(
-                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
-                NonZeroU64::new(sequence).expect("nonzero test sequence"),
-            )
-            .expect("valid test epoch")
-        }
-
-        fn epoch_json(sequence: u64) -> Value {
-            serde_json::json!({"lineage_id": TEST_LINEAGE, "sequence": sequence})
-        }
-
-        fn server_hello(snapshot: Value) -> ServerHello {
-            ServerHello {
-                selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "local-user".to_owned(),
-                allowed_capabilities: vec!["interactive-user-broker".to_owned()],
-                allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
-                config_snapshot: snapshot,
-                heartbeat_ms: 1_000,
-                control_channel: KERNEL_FRONT_DOOR_PIPE.to_owned(),
-                rejection_reason: None,
-                authority_epoch: test_epoch(7),
-            }
-        }
 
         #[test]
-        fn server_hello_fixture_binds_numeric_generation_authority_and_artifact() {
-            let artifact_digest = "a".repeat(64);
-            let expected = test_epoch(7);
-            let hello = server_hello(serde_json::json!({
-                "service": KERNEL_SERVICE_NAME,
-                "protocol": KERNEL_PROTOCOL_VERSION,
-                "generation": 11,
-                "authority_epoch": epoch_json(7),
-                "artifact_digest": artifact_digest,
-            }));
-            assert_eq!(
-                validate_server_snapshot(&hello, &expected, 11, &"a".repeat(64)),
-                Ok(())
-            );
-        }
-
-        #[test]
-        fn server_hello_fixture_rejects_numeric_or_artifact_substitution() {
-            let expected = test_epoch(7);
-            let hello = server_hello(serde_json::json!({
-                "service": KERNEL_SERVICE_NAME,
-                "protocol": KERNEL_PROTOCOL_VERSION,
-                "generation": 11,
-                "authority_epoch": epoch_json(7),
-                "artifact_digest": "a".repeat(64),
-            }));
-            assert!(validate_server_snapshot(&hello, &expected, 12, &"a".repeat(64)).is_err());
-            assert!(validate_server_snapshot(&hello, &expected, 11, &"b".repeat(64)).is_err());
-            let wrong_sequence = test_epoch(8);
-            assert!(
-                validate_server_snapshot(&hello, &wrong_sequence, 11, &"a".repeat(64)).is_err()
-            );
-            let wrong_lineage = EpochId::new(
-                EpochLineageId::new(OTHER_LINEAGE).expect("valid test lineage"),
-                NonZeroU64::new(7).expect("nonzero test sequence"),
-            )
-            .expect("valid test epoch");
-            assert!(validate_server_snapshot(&hello, &wrong_lineage, 11, &"a".repeat(64)).is_err());
-        }
-
-        #[test]
-        fn server_hello_fixture_rejects_current_open_kernel_snapshot_until_n4_binds_artifact() {
-            let expected = test_epoch(1);
-            let hello = server_hello(serde_json::json!({
-                "service": KERNEL_SERVICE_NAME,
-                "protocol": KERNEL_PROTOCOL_VERSION,
-                "generation": 1,
-            }));
-            assert!(validate_server_snapshot(&hello, &expected, 1, &"a".repeat(64)).is_err());
-        }
-
-        #[test]
-        fn operator_launch_receipt_decodes_closed_admitted_and_restart_required() {
-            let admitted = serde_json::json!({
-                "operation_id": "op-launch-1",
-                "status": "admitted",
-                "receipt": valid_operator_launch_receipt("op-launch-1"),
-            });
-            let (status, receipt) =
-                decode_operator_launch_receipt(&admitted, "op-launch-1").expect("admitted receipt");
-            assert_eq!(status, OperatorLaunchStatus::Admitted);
-            assert_eq!(receipt, admitted["receipt"]);
-            let restart = serde_json::json!({
-                "operation_id": "op-launch-2",
-                "status": "restart_required",
-                "receipt": valid_operator_restart_receipt("op-launch-2"),
-            });
-            let (status, receipt) =
-                decode_operator_launch_receipt(&restart, "op-launch-2").expect("restart receipt");
-            assert_eq!(status, OperatorLaunchStatus::RestartRequired);
-            assert_eq!(receipt, restart["receipt"]);
-        }
-
-        #[test]
-        fn operator_launch_receipt_refuses_open_shapes_as_unknown_outcome() {
-            for served in [
-                serde_json::json!({
-                    "operation_id": "op-launch-3",
-                    "status": "pending",
-                    "receipt": {},
-                }),
-                serde_json::json!({
-                    "operation_id": "",
-                    "status": "admitted",
-                    "receipt": {},
-                }),
-                serde_json::json!({
-                    "operation_id": "op-launch-4",
-                    "status": "admitted",
-                    "receipt": "flat-string-is-not-a-receipt",
-                }),
-                serde_json::json!({
-                    "operation_id": "op-launch-5",
-                    "status": "admitted",
-                    "receipt": {"handoff": "unbound-object"},
-                }),
-                serde_json::json!({"status": "admitted", "receipt": {}}),
-            ] {
-                assert!(
-                    matches!(
-                        decode_operator_launch_receipt(
-                            &served,
-                            served
-                                .get("operation_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("missing"),
-                        ),
-                        Err(KernelClientError::UnknownOutcome(_))
-                    ),
-                    "open launch shape must stay unknown: {served}"
-                );
-            }
-        }
-
-        fn valid_operator_launch_receipt(operation_id: &str) -> Value {
-            serde_json::json!({
-                "wire_id": "eliot.user-broker.operator-launch-receipt",
-                "wire_version": 1,
-                "operation_id": operation_id,
-                "request_digest": "a".repeat(64),
-                "registration_digest": "b".repeat(64),
-                "user_broker_epoch": 1,
-                "fence_id": "operator-fence",
-                "process_receipt": {
-                    "binding": {
-                        "operation_id": operation_id,
-                        "process_tree_id": "operator-tree",
-                        "job_id": "operator-job",
-                        "image_id": "operator-image",
-                        "session_id": "operator-session",
-                        "generation": 1,
-                        "action_lease_ref": "operator-lease",
-                        "authority_id": "eliot",
-                        "authority_epoch": {
-                            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
-                            "sequence": 1
-                        },
-                        "state_fence": {
-                            "authority_epoch": {
-                                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
-                                "sequence": 1
-                            },
-                            "generation": 1,
-                            "nonce": "operator-fence-nonce"
-                        },
-                        "request_digest": "a".repeat(64),
-                        "permit_digest": "b".repeat(64),
-                        "effect_digest": "c".repeat(64),
-                        "validation_revision": 1
-                    },
-                    "identity": {
-                        "suspended": {
-                            "process_id": "operator-process",
-                            "process_tree_id": "operator-tree",
-                            "job_id": "operator-job",
-                            "image_id": "operator-image",
-                            "session_id": "operator-session",
-                            "generation": 1,
-                            "physical": {
-                                "process_id": 1,
-                                "start_time_100ns": 1,
-                                "image_path": "C:\\ProgramData\\Eliot\\operator.exe",
-                                "executor_job_name": "Local\\Eliot-Operator"
-                            },
-                            "created_suspended_at_unix_ms": 1,
-                            "executable_sha256": "a".repeat(64)
-                        },
-                        "resumed_at_unix_ms": 2
-                    },
-                    "lifecycle": "running"
-                },
-                "proof_ceiling": "OBSERVATION",
-                "lineage_verified": true,
-                "disposition": "ACTIVE"
-            })
-        }
-
-        fn valid_operator_restart_receipt(operation_id: &str) -> Value {
-            serde_json::json!({
-                "wire_id": "eliot.user-broker.operator-restart-receipt",
-                "wire_version": 1,
-                "operation_id": operation_id,
-                "registration_digest": "b".repeat(64),
-                "user_broker_epoch": 1,
-                "fence_id": "operator-fence"
-            })
-        }
-    }
-
-    #[cfg(windows)]
-    fn require_delivery(
-        result: Result<DeliveryOutcome, eliot_ipc::TransportError>,
-        operation: &str,
-    ) -> Result<(), KernelClientError> {
-        match result {
-            Ok(DeliveryOutcome::Delivered) => Ok(()),
-            Ok(DeliveryOutcome::UnknownOutcome) => Err(KernelClientError::UnknownOutcome(format!(
-                "{operation} delivery outcome is unknown"
-            ))),
-            Err(error) => Err(KernelClientError::UnknownOutcome(format!(
-                "{operation}: {error}"
-            ))),
+        fn operator_launch_receipt_refuses_open_shape_as_unknown_outcome() {
+            let served = json!({"operation_id": "op-launch-1", "status": "pending", "receipt": {}});
+            assert!(matches!(
+                decode_operator_launch_receipt(&served, "op-launch-1"),
+                Err(KernelClientError::UnknownOutcome(_))
+            ));
         }
     }
 }
-
 /// One generated command row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct CommandSpec {
@@ -1487,6 +792,7 @@ pub enum ArgumentKind {
     Objective,
     Profile,
     ProfileScope,
+    RegistryCandidate,
     Module,
     ModuleAgainst,
     Edge,
@@ -1662,6 +968,17 @@ static COMMANDS: &[CommandSpec] = &[
             missing_work_id: "A-06",
             dependency: "no admitted Kernel/Governor provider is injected",
         },
+    },
+    CommandSpec {
+        id: CommandId::InstrumentRegistryRegister,
+        usage: "eliot instrument registry register --work-scope <scope> --snapshot-json <json> --action-contract <json> --cold-start-claim <json>",
+        summary: "submit an explicit registry candidate for admitted registration",
+        owner: "eliot-cli",
+        required_work_id: "W1.2",
+        argument_kind: ArgumentKind::RegistryCandidate,
+        effect: EffectClass::ReversibleMutation,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        availability: CommandAvailability::Admitted,
     },
     CommandSpec {
         id: CommandId::ModuleValidate,

@@ -50,7 +50,10 @@ pub use grants::{
     RevocationOperationIdentity, RevocationTransitionDisposition, RevocationTransitionRequest,
     RevocationWriteReceipt, SnapshotId,
 };
-pub use leases::{ActionLease, CapabilityToken, LeaseId, TokenId};
+pub use leases::{
+    ActionLease, ActionLeaseRecoveryRecord, AuthoritySetRecoveryRecord, CapabilityToken, LeaseId,
+    TokenId,
+};
 pub use mechanical_subset::{
     ApprovalReference, AuthorityUseSite, CanonicalSourceCommitment,
     MECHANICAL_SUBSET_DIGEST_DOMAIN, MECHANICAL_SUBSET_SCHEMA, MECHANICAL_SUBSET_VERSION,

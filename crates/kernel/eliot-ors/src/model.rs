@@ -6910,6 +6910,7 @@ impl<'a> From<&'a BackupVerifyRequestIdentity> for BackupVerifyIdentityPreimage<
 pub enum HostRequestKind {
     Activation,
     Invocation,
+    InstrumentRegistryRegistration,
     Cancellation,
     Status,
     Reconciliation,
@@ -8610,6 +8611,9 @@ impl HostRequestRecord {
             (self.kind, projection.domain()),
             (
                 HostRequestKind::Invocation,
+                eliot_contracts::HostCorrelationDomain::Request
+            ) | (
+                HostRequestKind::InstrumentRegistryRegistration,
                 eliot_contracts::HostCorrelationDomain::Request
             ) | (
                 HostRequestKind::Cancellation,

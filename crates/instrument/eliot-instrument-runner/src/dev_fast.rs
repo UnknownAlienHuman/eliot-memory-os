@@ -1237,10 +1237,11 @@ pub async fn run_dev_fast_profile<E: ProcessExecutor + 'static>(
     receipts: Vec<SupplyChainReceipt>,
     candidate: &DevFastCandidate,
     launcher: &dyn StageLauncher,
+    proof: &dyn crate::AdmissionSubmissionProofPort,
 ) -> Result<ProfileAggregate, DevFastError> {
     let registry = dev_fast_registry(generation, receipts)?;
     let plan = dev_fast_caller_plan(&registry, candidate)?;
-    let runs = StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher).await;
+    let runs = StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher, proof).await;
     Ok(ProfileAggregate::assemble(&plan, runs))
 }
 
@@ -1274,6 +1275,9 @@ pub fn confirm_dev_fast_finish(
         .iter()
         .filter_map(|run| match &run.evidence {
             StageEvidence::Retained { artifact, .. } => Some(artifact.as_str().to_owned()),
+            StageEvidence::Transformed {
+                source_artifact, ..
+            } => Some(source_artifact.as_str().to_owned()),
             StageEvidence::Omitted { .. } | StageEvidence::Missing { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -1325,15 +1329,17 @@ pub fn require_dev_fast_parity(
 /// no invocation, process, or verdict.
 pub async fn dev_fast_execute<E: ProcessExecutor + 'static>(
     runner: &InstrumentRunner<E>,
+    registry: &crate::InstrumentRegistry,
     plan: &StagePlan,
     launcher: &dyn StageLauncher,
+    proof: &dyn crate::AdmissionSubmissionProofPort,
 ) -> Result<ProfileAggregate, DevFastError> {
     if plan.profile != DEV_FAST_PROFILE || plan.revision != DEV_FAST_PROFILE_REVISION {
         return Err(DevFastError::Admission(
             "stage plan is not the admitted dev-fast revision".to_owned(),
         ));
     }
-    let runs = StageOrchestrator::launch_plan(runner, plan, launcher).await;
+    let runs = StageOrchestrator::launch_plan_live(runner, registry, plan, launcher, proof).await;
     Ok(ProfileAggregate::assemble(plan, runs))
 }
 

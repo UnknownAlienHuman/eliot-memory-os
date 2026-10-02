@@ -8,6 +8,7 @@ description = "ELIOT instrument invocation, evidence, and verification contracts
 
 [dependencies]
 eliot-contracts.workspace = true
+eliot-runtime-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

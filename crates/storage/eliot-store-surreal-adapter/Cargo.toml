@@ -28,6 +28,11 @@ eliot-epistemic-contracts = { path = "../../smart/eliot-epistemic-contracts", ve
 eliot-evidence.workspace = true
 eliot-receipts.workspace = true
 eliot-contracts.workspace = true
+eliot-graph-api.workspace = true
+eliot-instrument-api.workspace = true
+eliot-instrument-runner = { path = "../../instrument/eliot-instrument-runner", version = "0.1.0" }
+eliot-instrument-scip.workspace = true
+eliot-process.workspace = true
 
 [lints]
 workspace = true

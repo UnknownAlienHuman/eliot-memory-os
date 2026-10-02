@@ -97,37 +97,49 @@
 //! outstanding identity.
 
 use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use eliot_contracts::{ArtifactId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ipc::ProcessBinding;
+use eliot_instrument_api::registry::{
+    EnvironmentInheritanceBinding, EnvironmentProjectionBinding, EnvironmentSecretReference,
+    ExternalExecutableObservation, ExternalStagePin, InstrumentRegistrySnapshot, InstrumentSpec,
+    ProcessExecutionProjection, ResolvedExecutionBinding, validate_testd_productive_stage,
+};
+use eliot_ipc::{ProcessBinding, Session};
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
     DoctorRecipeRegistry, DoctorRepairAdmission, DoctorRepairAttemptRequest, DoctorRepairResponse,
     KernelService, KernelServiceError, KernelServiceState, NATIVE_WORKER_CLAIM_WIRE_ID,
     NativeWorkerClaimReceipt, NativeWorkerClaimRequest, NativeWorkerClaimResponse, TestdAdmission,
     TestdAdmissionAttemptRequest, TestdAdmissionEnvelope, TestdAdmissionResponse,
-    advertise_doctor_repair, advertise_testd_admission_when_composed, handle_doctor_repair_attempt,
-    handle_doctor_repair_cancellation, handle_testd_admission_attempt, handle_testd_cancellation,
-    reconcile_testd_admission,
+    TestdProcessAttemptGrant, advertise_doctor_repair, advertise_testd_admission_when_composed,
+    handle_doctor_repair_attempt, handle_doctor_repair_cancellation,
+    handle_testd_admission_attempt, handle_testd_cancellation, reconcile_testd_admission,
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
     NativeWorkerClaimRecord, OperationIdentity, StateFenceSnapshot, epoch_lineage_for,
 };
 use eliot_process::{OperationId, ProcessRequest};
+use eliot_process_executor::environment_projection_digest;
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
-use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
+use eliot_store_api::{
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency, ScopeId,
+    WriteReceipt, WriteReceiptStatus,
+};
 use eliot_testd_core::{
     BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
     JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
-    TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
+    TestResourceProfile, TestdInstrumentAdmissionBinding, TestdOwnerSubmitDirective,
+    TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdProcessToolIntent, TestdStore,
+    TestdToolObservation, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
     issue_process_admission, testd_profile_binding, verification_receipt_sha256,
     verify_envelope_layout_binding,
 };
@@ -317,69 +329,41 @@ impl DispatchedWorkerKind {
 /// * `expires_at: u64` — Unix milliseconds
 ///   (`admitted_at_ms.saturating_add(60_000)`); the child passes it as
 ///   `PermitIssuance::new(..., issued_at = now_ms, expires_at, ...)`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DispatchGrant {
-    /// Lowercase SHA-256 binding the grant fields plus the admission
-    /// identity digest.
-    pub grant_digest: String,
-    /// Live authority epoch bound at admission (canonical `EpochId`).
-    pub authority_epoch: EpochId,
-    /// Live activation generation bound at admission (non-zero).
-    pub fence_generation: u64,
-    /// Deterministic per-identity fence nonce for `FencingToken::new`.
-    pub fence_nonce: String,
-    /// Deterministic per-identity lease for `ActionLeaseRef::new`.
-    pub idempotency_key: String,
-    /// Grant expiry in Unix milliseconds for `PermitIssuance::new`.
-    pub expires_at: u64,
-    /// Kernel-selected `TestD` owner database carried in the protected dispatch
-    /// file. Other worker grants omit this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub testd_owner_store_path: Option<String>,
-}
+pub use eliot_process::KernelDispatchGrant as DispatchGrant;
 
-impl DispatchGrant {
-    /// Validates the grant shape through the exact broker types the child
-    /// uses: `FencingToken::new`, `ActionLeaseRef::new`, plus digest bounds.
-    /// Returns the fence and lease the child would build (the child
-    /// rebuilds them itself; this only proves the material is well-formed).
-    pub fn validate_for_child(
-        &self,
-    ) -> Result<(FencingToken, ActionLeaseRef), DispatchLaunchError> {
-        require_digest(
-            &self.grant_digest,
-            "grant digest must be a lowercase SHA-256 digest",
-        )?;
-        if self
-            .testd_owner_store_path
-            .as_ref()
-            .is_some_and(|path| path.trim().is_empty() || !Path::new(path).is_absolute())
-        {
-            return Err(DispatchLaunchError::InvalidMaterial(
-                "TestD owner store path must be a non-blank absolute path".to_owned(),
-            ));
-        }
-        if self.fence_generation == 0 {
-            return Err(DispatchLaunchError::InvalidMaterial(
-                "grant fence generation must be non-zero".to_owned(),
-            ));
-        }
-        if self.expires_at == 0 {
-            return Err(DispatchLaunchError::InvalidMaterial(
-                "grant expiry must be non-zero".to_owned(),
-            ));
-        }
-        let generation = Generation::new(self.fence_generation).map_err(gate_error)?;
-        let fence = FencingToken::new(
-            self.authority_epoch.clone(),
-            generation,
-            self.fence_nonce.clone(),
-        )
-        .map_err(gate_error)?;
-        let lease = ActionLeaseRef::new(self.idempotency_key.clone()).map_err(gate_error)?;
-        Ok((fence, lease))
+/// Validates the neutral Kernel grant through the same broker constructors
+/// used by the child. This checks shape only; authority comes from the
+/// original Kernel admission and the grant digest bound to the exact intent.
+pub fn validate_dispatch_grant_for_child(
+    grant: &DispatchGrant,
+) -> Result<(FencingToken, ActionLeaseRef), DispatchLaunchError> {
+    require_digest(
+        &grant.grant_digest,
+        "grant digest must be a lowercase SHA-256 digest",
+    )?;
+    if grant
+        .testd_owner_store_path
+        .as_ref()
+        .is_some_and(|path| path.trim().is_empty() || !Path::new(path).is_absolute())
+    {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "TestD owner store path must be a non-blank absolute path".to_owned(),
+        ));
     }
+    if grant.fence_generation == 0 || grant.expires_at == 0 {
+        return Err(DispatchLaunchError::InvalidMaterial(
+            "grant generation and expiry must be non-zero".to_owned(),
+        ));
+    }
+    let generation = Generation::new(grant.fence_generation).map_err(gate_error)?;
+    let fence = FencingToken::new(
+        grant.authority_epoch.clone(),
+        generation,
+        grant.fence_nonce.clone(),
+    )
+    .map_err(gate_error)?;
+    let lease = ActionLeaseRef::new(grant.idempotency_key.clone()).map_err(gate_error)?;
+    Ok((fence, lease))
 }
 
 /// Builds the deterministic launch grant for one admitted identity.
@@ -393,7 +377,7 @@ impl DispatchGrant {
 /// `admitted_at_unix_ms * 1_000_000`). Derivations are replay-stable, so an
 /// exact replay rebuilds byte-identical grant bytes and reconciles by the
 /// original identity instead of minting a second grant.
-fn dispatch_grant_for(
+pub(crate) fn dispatch_grant_for(
     kind: DispatchedWorkerKind,
     identity_digest: &str,
     authority_epoch: &EpochId,
@@ -456,7 +440,7 @@ fn dispatch_grant_for(
     };
     // Prove the material satisfies the exact broker constructors before it
     // is ever written: the child will call these same entries.
-    grant.validate_for_child()?;
+    validate_dispatch_grant_for_child(&grant)?;
     Ok(grant)
 }
 
@@ -1280,6 +1264,505 @@ pub(crate) fn testd_owner_store_path(work_root: &Path) -> PathBuf {
     work_root.join(".eliot").join("testd-state.redb")
 }
 
+/// Reads and validates the current canonical registration before TestD's
+/// productive process request is issued. The returned pins retain the
+/// original Store receipt/readback together with the exact resolved intent.
+#[cfg(windows)]
+async fn testd_instrument_admission(
+    kernel: &KernelComposition,
+    session: &Session,
+    identity: &RequestIdentity,
+    scope_id_text: &str,
+    profile_name: &str,
+    profile_revision: u64,
+    stage_id: &str,
+    source_root: &str,
+    work_envelope: &GovernedWorkEnvelope,
+    tool_observation: &TestdToolObservation,
+    invocation: &eliot_instrument_api::InstrumentInvocation,
+    intent: &eliot_process::ProcessIntent,
+) -> Result<TestdInstrumentAdmissionBinding, DispatchLaunchError> {
+    let expected_environment = TestdProcessToolIntent {
+        observation: tool_observation.clone(),
+    }
+    .validate_for_roots(work_envelope)
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if intent.environment() != &expected_environment || intent.working_directory() != source_root {
+        return Err(DispatchLaunchError::Gate(
+            "TestD process environment or source root differs from its retained governed envelope"
+                .to_owned(),
+        ));
+    }
+    let scope_id = ScopeId::new(scope_id_text.to_owned())
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let named_read = |operation, parameters| NamedReadRequest {
+        operation,
+        scope_id: (operation == NamedReadOperation::GetInstrumentRegistryState)
+            .then(|| scope_id.clone()),
+        consistency: ReadConsistency::ExactFence,
+        state_fence: identity.request.state_fence.clone(),
+        parameters,
+    };
+    let read_state = || {
+        let request = named_read(
+            NamedReadOperation::GetInstrumentRegistryState,
+            Default::default(),
+        );
+        kernel.instrument_registry_read_operation(
+            session,
+            identity,
+            serde_json::json!({"scope_id": scope_id.clone(), "request": request}),
+        )
+    };
+    let first_value = read_state().await.map_err(|_| {
+        DispatchLaunchError::Gate("canonical instrument registry read refused".to_owned())
+    })?;
+    let original_readback: NamedReadResponse = serde_json::from_value(first_value)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    original_readback
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let row = &original_readback.payload;
+    let snapshot_json = row
+        .get("snapshot_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("canonical registry snapshot is absent".to_owned())
+        })?;
+    let operation_id = row
+        .get("operation_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("canonical registry operation is absent".to_owned())
+        })?;
+    let receipt_request = named_read(
+        NamedReadOperation::ResolveWriteReceipt,
+        BTreeMap::from([("operation_id".to_owned(), serde_json::json!(operation_id))]),
+    );
+    let receipt_value = kernel
+        .instrument_registry_read_operation(
+            session,
+            identity,
+            serde_json::json!({"scope_id": scope_id.clone(), "request": receipt_request}),
+        )
+        .await
+        .map_err(|_| {
+            DispatchLaunchError::Gate("canonical registration receipt read refused".to_owned())
+        })?;
+    let receipt_response: NamedReadResponse = serde_json::from_value(receipt_value)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    receipt_response
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let receipt: Option<WriteReceipt> = serde_json::from_value(receipt_response.payload.clone())
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    let receipt = receipt.ok_or_else(|| {
+        DispatchLaunchError::Gate("canonical registration receipt is absent".to_owned())
+    })?;
+    receipt
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    eliot_store_api::validate_instrument_registry_registration_readback(
+        &original_readback,
+        &receipt,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if receipt.operation_id.as_str() != operation_id
+        || receipt.state_fence != identity.request.state_fence
+        || receipt.status != WriteReceiptStatus::Committed
+        || receipt.commit_id.is_none()
+    {
+        return Err(DispatchLaunchError::Gate(
+            "canonical registration receipt differs from the current owner row".to_owned(),
+        ));
+    }
+    let latest_value = read_state()
+        .await
+        .map_err(|_| DispatchLaunchError::Gate("canonical registry reread refused".to_owned()))?;
+    let latest: NamedReadResponse = serde_json::from_value(latest_value)
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    latest
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    if latest.payload != original_readback.payload
+        || latest.state_fence != original_readback.state_fence
+        || latest.revision_heads != original_readback.revision_heads
+    {
+        return Err(DispatchLaunchError::Gate(
+            "canonical registration changed during admission".to_owned(),
+        ));
+    }
+
+    let snapshot: InstrumentRegistrySnapshot<serde_json::Value> =
+        serde_json::from_str(snapshot_json)
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+
+    let pin = ExternalStagePin {
+        profile: profile_name.to_owned(),
+        profile_revision,
+        stage_id: stage_id.to_owned(),
+        registry_generation: snapshot.generation,
+    };
+    let profile = snapshot
+        .profiles
+        .iter()
+        .find(|profile| profile.name == pin.profile && profile.revision == pin.profile_revision)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("selected profile revision is not registered".to_owned())
+        })?;
+    let stage = profile
+        .dag
+        .iter()
+        .find(|stage| stage.stage_id == pin.stage_id)
+        .ok_or_else(|| DispatchLaunchError::Gate("selected stage is not registered".to_owned()))?;
+    let spec = snapshot
+        .specs
+        .iter()
+        .find(|spec| spec.kind == stage.spec)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("selected stage spec is not registered".to_owned())
+        })?;
+    let resolution = ResolvedExecutionBinding {
+        source_root: source_root.to_owned(),
+        environment_class: spec.environment_profile.clone(),
+        environment_digest: environment_projection_digest(intent.environment()),
+        environment_projection: process_environment_binding(&expected_environment),
+        declared_scope: invocation.declared_scope.clone(),
+        authority_epoch: identity.request.state_fence.authority_epoch.clone(),
+        resource_generation: identity.request.state_fence.resource_generation.value(),
+    };
+    let executable_path = Path::new(intent.executable());
+    let canonical_path = std::fs::canonicalize(executable_path)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if canonical_path != executable_path || !canonical_path.is_file() {
+        return Err(DispatchLaunchError::Gate(
+            "external stage executable is not the exact canonical file".to_owned(),
+        ));
+    }
+    let pinned_file = eliot_platform_windows::PinnedRuntimeFile::open(&canonical_path)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let file_identity = pinned_file.file_identity();
+    let file_intent = match intent.executable_file_identity() {
+        Some(existing) if existing == &file_identity => intent.clone(),
+        Some(_) => {
+            return Err(DispatchLaunchError::Gate(
+                "external stage executable is a different file object than the sealed intent"
+                    .to_owned(),
+            ));
+        }
+        None => intent
+            .clone()
+            .with_executable_file_identity(file_identity.clone())
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+    };
+    let mut read_handle = pinned_file
+        .try_clone_file()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let mut bytes = Vec::new();
+    read_handle
+        .read_to_end(&mut bytes)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let content_digest = sha256_hex(&bytes);
+    if content_digest != intent.executable_sha256() {
+        return Err(DispatchLaunchError::Gate(
+            "external stage executable changed after owner observation".to_owned(),
+        ));
+    }
+    let file_name = canonical_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("external stage executable has no file name".to_owned())
+        })?
+        .to_ascii_lowercase();
+    let executable_file_name = file_name
+        .strip_suffix(".exe")
+        .unwrap_or(&file_name)
+        .to_owned();
+    let tool_version =
+        recorded_tool_version(&snapshot, spec, &executable_file_name, &content_digest)?;
+    let admission_grant = validate_testd_productive_stage(
+        &snapshot,
+        &pin,
+        invocation,
+        &ExternalExecutableObservation {
+            canonical_path: canonical_path.to_string_lossy().into_owned(),
+            executable_file_name,
+            content_digest,
+            file_identity: file_identity.clone(),
+            tool_version,
+        },
+        file_intent.argv(),
+        &resolution,
+        &ProcessExecutionProjection {
+            working_directory: file_intent.working_directory().to_owned(),
+            environment_digest: environment_projection_digest(file_intent.environment()),
+            environment_projection: process_environment_binding(file_intent.environment()),
+            executable_file_identity: file_identity,
+            authority_epoch: identity.request.state_fence.authority_epoch.clone(),
+            resource_generation: file_intent.generation().get(),
+            wall_timeout_ms: file_intent.resource_limits().wall_timeout_ms(),
+            stdout_bytes: file_intent.resource_limits().stdout_bytes(),
+            stderr_bytes: file_intent.resource_limits().stderr_bytes(),
+        },
+        &process_environment_binding(&expected_environment),
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if file_intent
+        .instrument_admission_digest()
+        .is_some_and(|digest| digest != admission_grant.digest)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "ProcessIntent carries a different shared instrument admission digest".to_owned(),
+        ));
+    }
+    let admitted_intent = file_intent
+        .with_instrument_admission_digest(admission_grant.digest.clone())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let binding = TestdInstrumentAdmissionBinding {
+        scope_id: scope_id.as_str().to_owned(),
+        profile: pin.profile,
+        profile_revision: pin.profile_revision,
+        stage_id: pin.stage_id,
+        registry_generation: pin.registry_generation,
+        resolution,
+        tool_observation: Some(tool_observation.clone()),
+        process_intent: admitted_intent,
+        admission_grant,
+        original_receipt_json: serde_json::to_string(&receipt)
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+        original_readback_json: serde_json::to_string(&original_readback)
+            .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?,
+    };
+    binding
+        .validate_for_new_attempt()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    Ok(binding)
+}
+
+#[cfg(not(windows))]
+async fn testd_instrument_admission(
+    _kernel: &KernelComposition,
+    _session: &Session,
+    _identity: &RequestIdentity,
+    _scope_id_text: &str,
+    _profile_name: &str,
+    _profile_revision: u64,
+    _stage_id: &str,
+    _source_root: &str,
+    _work_envelope: &GovernedWorkEnvelope,
+    _tool_observation: &TestdToolObservation,
+    _invocation: &eliot_instrument_api::InstrumentInvocation,
+    _intent: &eliot_process::ProcessIntent,
+) -> Result<TestdInstrumentAdmissionBinding, DispatchLaunchError> {
+    Err(DispatchLaunchError::Gate(
+        "TestD executable identity admission requires the native pinned-file owner".to_owned(),
+    ))
+}
+
+/// Reuses the version observation retained by the canonical registry after
+/// the executable's path and bytes have been re-observed at this use site.
+fn process_environment_binding(projection: &EnvironmentProjection) -> EnvironmentProjectionBinding {
+    EnvironmentProjectionBinding {
+        non_secret: projection.non_secret().clone(),
+        secret_refs: projection
+            .secret_refs()
+            .iter()
+            .map(|reference| EnvironmentSecretReference {
+                provider: reference.provider().to_owned(),
+                key: reference.key().to_owned(),
+            })
+            .collect(),
+        inheritance: match projection.inheritance() {
+            EnvironmentInheritance::None => EnvironmentInheritanceBinding::None,
+            EnvironmentInheritance::Allowlisted => EnvironmentInheritanceBinding::Allowlisted,
+        },
+    }
+}
+
+pub(crate) fn recorded_tool_version(
+    snapshot: &InstrumentRegistrySnapshot<serde_json::Value>,
+    spec: &InstrumentSpec,
+    executable_file_name: &str,
+    content_digest: &str,
+) -> Result<Option<String>, DispatchLaunchError> {
+    let mut receipts = snapshot.receipts.iter().filter(|receipt| {
+        receipt.instrument.as_str() == spec.kind.as_str()
+            && receipt.executable == executable_file_name
+            && receipt.content_digest == content_digest
+            && receipt.spec_digest == spec.digest()
+            && receipt.generation == snapshot.generation
+    });
+    let receipt = receipts.next().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "canonical executable supply-chain observation is absent or stale".to_owned(),
+        )
+    })?;
+    if receipts.next().is_some() {
+        return Err(DispatchLaunchError::Gate(
+            "canonical executable supply-chain observation is ambiguous".to_owned(),
+        ));
+    }
+    Ok(receipt.tool_version.clone())
+}
+
+/// Rechecks the exact job identity and canonical instrument proof before a
+/// durable attempt reaches the P-07 TestD admission handler.
+pub(crate) async fn validate_testd_instrument_admission_current(
+    kernel: &KernelComposition,
+    session: &Session,
+    identity: &RequestIdentity,
+    request: &TestdAdmissionAttemptRequest,
+    response: &TestdAdmission,
+) -> Result<Option<TestdProcessAttemptGrant>, DispatchLaunchError> {
+    identity
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let owner_path = testd_owner_store_path(&kernel.work_root);
+    if !owner_path.is_file()
+        || std::fs::canonicalize(&owner_path).ok().as_deref() != Some(owner_path.as_path())
+    {
+        return Err(DispatchLaunchError::Gate(
+            "durable TestD owner store is unavailable or non-canonical".to_owned(),
+        ));
+    }
+    let store = TestdStore::open(&owner_path, RetryPolicy::default())
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .get(&request.job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate("TestD job is absent from the durable owner".to_owned())
+        })?;
+    // Git/source-observation work remains on its existing non-instrument
+    // execution path. Only a productive profile participates in the shared
+    // per-instrument Kernel runtime owner.
+    if !eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+        return Ok(None);
+    }
+    if store
+        .admitted_request_identity(&request.job_id)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?
+        .as_ref()
+        != Some(identity)
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD attempt does not carry the original admitted RequestIdentity".to_owned(),
+        ));
+    }
+    let binding = job.instrument_admission.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate(
+            "productive TestD job has no durable instrument admission".to_owned(),
+        )
+    })?;
+    let expected_attempt_seq = match job.state {
+        eliot_testd_core::JobState::Running => job.attempts,
+        eliot_testd_core::JobState::Queued | eliot_testd_core::JobState::RetryWait => {
+            job.attempts.saturating_add(1)
+        }
+        _ => 0,
+    };
+    binding
+        .validate_for_new_attempt()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if job.process.operation_id != identity.request.metadata.request_id.as_str()
+        || job.process.authority_epoch != identity.request.state_fence.authority_epoch
+        || job.process.generation != identity.request.state_fence.resource_generation.value()
+        || binding.resolution.authority_epoch != identity.request.state_fence.authority_epoch
+        || binding.resolution.resource_generation
+            != identity.request.state_fence.resource_generation.value()
+        || job.invocation.request != identity.request.metadata
+        || request.job_id != job.job_id
+        || request.attempt_seq == 0
+        || request.attempt_seq != expected_attempt_seq
+    {
+        return Err(DispatchLaunchError::Gate(
+            "TestD durable process, task, or fence pins differ from the attempt".to_owned(),
+        ));
+    }
+    let current = testd_instrument_admission(
+        kernel,
+        session,
+        identity,
+        &binding.scope_id,
+        &binding.profile,
+        binding.profile_revision,
+        &binding.stage_id,
+        &binding.resolution.source_root,
+        job.work_envelope.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD job has no retained governed envelope".to_owned(),
+            )
+        })?,
+        binding.tool_observation.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD job has no retained tool observation".to_owned(),
+            )
+        })?,
+        &job.invocation,
+        &binding.process_intent,
+    )
+    .await?;
+    if &current != binding {
+        return Err(DispatchLaunchError::Gate(
+            "TestD instrument registration or executable changed since durable admission"
+                .to_owned(),
+        ));
+    }
+    if response.cancelled
+        || response.profile != binding.profile
+        || response.job_id != job.job_id
+        || response.request_digest != request.request_digest
+        || response.operation_id != binding.process_intent.operation_id().as_str()
+    {
+        return Err(DispatchLaunchError::Gate(
+            "base TestD admission differs from its retained productive attempt".to_owned(),
+        ));
+    }
+    // The TestD attempt is still the original durable job/attempt, not a
+    // synthetic generic stage request. Derive a real Kernel grant from the
+    // retained original intent only after the durable row, current request
+    // identity, canonical registry proof, and owner-observed tool binding
+    // have all been revalidated.
+    let now_unix_nanos = super::unix_ms().saturating_mul(1_000_000);
+    if now_unix_nanos == 0 {
+        return Err(DispatchLaunchError::Gate(
+            "TestD attempt grant requires a non-zero Kernel observation time".to_owned(),
+        ));
+    }
+    let generation = Generation::new(binding.resolution.resource_generation)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let dispatch_grant = dispatch_grant_for(
+        DispatchedWorkerKind::Testd,
+        binding.process_intent.effect_digest(),
+        &identity.request.state_fence.authority_epoch,
+        generation,
+        now_unix_nanos,
+        Some(&owner_path),
+    )?;
+    kernel
+        .instrument_stage_runtime
+        .reserve_testd_attempt(
+            identity,
+            &session.peer,
+            &job.job_id,
+            request.attempt_seq,
+            &binding.process_intent,
+            &binding.admission_grant,
+            &dispatch_grant,
+        )
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    Ok(Some(TestdProcessAttemptGrant {
+        request_identity: identity.clone(),
+        job_id: job.job_id.clone(),
+        attempt_seq: request.attempt_seq,
+        operation_id: binding.process_intent.operation_id().as_str().to_owned(),
+        process_intent: binding.process_intent.clone(),
+        instrument_admission: binding.admission_grant.clone(),
+        dispatch_grant,
+    }))
+}
+
 /// Reuses the current composed `TestD` principal and live Kernel fence for
 /// owner-side submit, readback, and receipt acknowledgement operations.
 pub(crate) fn bind_testd_owner_session(
@@ -1302,6 +1785,7 @@ pub(crate) fn bind_testd_owner_session(
 )]
 pub(crate) async fn submit_testd_owner_job(
     kernel: &KernelComposition,
+    session: &Session,
     identity: &RequestIdentity,
     request: &TestdOwnerSubmitRequest,
     now_unix_ms: u64,
@@ -1625,6 +2109,22 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let instrument_admission = testd_instrument_admission(
+        kernel,
+        session,
+        identity,
+        &request.submission.scope_id,
+        &request.submission.invocation.profile,
+        request.submission.profile_revision,
+        &request.submission.stage_id,
+        &request.submission.source_root,
+        &lane_envelope,
+        &request.process_tool.observation,
+        &request.submission.invocation,
+        &intent,
+    )
+    .await?;
+    let intent = instrument_admission.process_intent.clone();
     let fence = FencingToken::new(
         authenticated.authority_epoch().clone(),
         generation,
@@ -1668,6 +2168,7 @@ pub(crate) async fn submit_testd_owner_job(
         job_id,
         project_id: request.submission.project_id.clone(),
         invocation: request.submission.invocation.clone(),
+        instrument_admission,
         target_roots,
         target_layout: Some(target_layout),
         // Issue #1897 (AUD1): the lane is now allocated from the admitted
@@ -6893,9 +7394,7 @@ mod tests {
             serde_json::from_value(testd_object["grant"].clone()).expect("testd grant parses");
         assert_eq!(testd_grant.authority_epoch, epoch);
         assert_eq!(testd_grant.fence_generation, 1);
-        testd_grant
-            .validate_for_child()
-            .expect("testd grant validates");
+        validate_dispatch_grant_for_child(&testd_grant).expect("testd grant validates");
         assert_eq!(
             testd_object["nonce"],
             serde_json::json!(first_ready.nonce),
@@ -7120,9 +7619,7 @@ mod tests {
         let native_grant: DispatchGrant =
             serde_json::from_value(native_object["grant"].clone()).expect("native grant parses");
         assert_eq!(native_grant.authority_epoch, epoch);
-        native_grant
-            .validate_for_child()
-            .expect("native grant validates");
+        validate_dispatch_grant_for_child(&native_grant).expect("native grant validates");
         assert_eq!(
             native_object["nonce"],
             serde_json::json!(native_ready.nonce),
@@ -7575,9 +8072,7 @@ mod tests {
         let live_grant: DispatchGrant =
             serde_json::from_value(live_object["grant"].clone()).expect("live grant parses");
         assert_eq!(live_grant.authority_epoch, epoch);
-        live_grant
-            .validate_for_child()
-            .expect("live grant validates");
+        validate_dispatch_grant_for_child(&live_grant).expect("live grant validates");
         // R1 owner record (Implements #22): the derivation every Governor
         // join publisher must source runs over the live admitted material
         // here. Deterministic: an exact recompute agrees bit-for-bit, so a
@@ -7759,9 +8254,7 @@ mod tests {
             serde_json::from_value(testd_live_object["grant"].clone())
                 .expect("live testd grant parses");
         assert_eq!(testd_live_grant.authority_epoch, epoch);
-        testd_live_grant
-            .validate_for_child()
-            .expect("live testd grant validates");
+        validate_dispatch_grant_for_child(&testd_live_grant).expect("live testd grant validates");
         // No admitted process authority in isolation: a first launch of a
         // fresh job fails closed at the spawn boundary (after its own
         // admit + material write), reaps the file, and releases the slot.
@@ -8406,7 +8899,8 @@ mod tests {
             serde_json::from_value(grant_value).expect("grant parses");
         assert_eq!(parsed_grant, grant);
         // The grant validates through the exact broker constructors.
-        let (fence, lease) = parsed_grant.validate_for_child().expect("grant validates");
+        let (fence, lease) =
+            validate_dispatch_grant_for_child(&parsed_grant).expect("grant validates");
         assert!(fence.authority_epoch().is_same_authority(&epoch));
         assert_eq!(fence.generation().get(), 7);
         assert_eq!(parsed_grant.fence_generation, 7);

@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 
 use eliot_instrument_api::EvidenceAxes;
+use eliot_platform_windows::FileIdentity;
+pub use eliot_process::DispatchValidationPort;
 use eliot_process::{
     CancellationReceipt, CancellationRequest, ContractError, DescendantEvidence,
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, ImageId, JobId,
@@ -45,7 +47,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use eliot_platform_windows::{
-    JobObjectIdentity, JobObjectLimits, RecoverableJobBinding, RunningJobChild,
+    JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RecoverableJobBinding, RunningJobChild,
     RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
     SuspendedValidationError, TerminatedJobChild, WindowsAdapterError, cancel_capture_thread_io,
 };
@@ -692,26 +694,6 @@ fn enforce_sink_terminal(
         return Err(ProcessExecutionError::UnknownOutcome);
     }
     Ok(())
-}
-
-/// P-07's injected process-authority seam.
-///
-/// Implementations must route this operation to the one active
-/// `ProcessDispatchAuthorityController`.  P-04 never receives a key, replay
-/// snapshot, or issuer capability and therefore cannot become a second
-/// authority owner.
-pub trait DispatchValidationPort: Send + Sync {
-    /// Consumes exactly one P-03 permit after fresh P-02 evidence has been
-    /// bound to the request.
-    ///
-    /// # Errors
-    /// Returns an error when the request or suspended identity is invalid, or
-    /// when the active authority cannot consume the one-shot permit.
-    fn validate_and_consume(
-        &self,
-        request: ProcessRequest,
-        observed: SuspendedProcessIdentity,
-    ) -> Result<ValidatedDispatch, ProcessExecutionError>;
 }
 
 /// Bounded stream projection retained by P-04 for diagnostics.
@@ -1918,6 +1900,64 @@ impl WindowsProcessExecutor {
         }
     }
 
+    /// Waits for this operation’s exact retained Job to become physically
+    /// empty within the original admitted wall-time deadline, then returns
+    /// the executor’s ordinary reconciled `ProcessEvidence`.
+    ///
+    /// The operation lock is held only long enough to duplicate the same Job
+    /// handle into a read-only wait projection. The projection shares the
+    /// existing Job observer state, while the original child, deadline
+    /// watcher, and operation remain owned here for the whole wait.
+    ///
+    /// # Errors
+    /// Returns `UnknownOutcome` when the Job is not observed empty, evidence
+    /// cannot be reconciled, or a terminal owner is unavailable.
+    pub fn wait_for_terminal_evidence(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<ProcessEvidence, ProcessExecutionError> {
+        #[cfg(windows)]
+        {
+            let operation = self.operation(&operation_id)?;
+            let (wait_projection, remaining) = {
+                let guard = operation
+                    .lock()
+                    .map_err(|_| operation_unavailable(&operation_id, "operation lock"))?;
+                let remaining = guard.deadline.saturating_duration_since(Instant::now());
+                let projection = if let Some(child) = guard.child.as_ref() {
+                    Some(child.job_wait_projection().map_err(unavailable)?)
+                } else {
+                    let history = guard
+                        .termination
+                        .as_ref()
+                        .map(TerminatedJobChild::history)
+                        .ok_or(ProcessExecutionError::UnknownOutcome)?;
+                    if !history.job_empty() {
+                        return Err(ProcessExecutionError::UnknownOutcome);
+                    }
+                    None
+                };
+                (projection, remaining)
+            };
+            if let Some(projection) = wait_projection {
+                let history = projection
+                    .wait_for_empty_history(remaining)
+                    .map_err(unavailable)?;
+                if !history.job_empty() {
+                    return Err(ProcessExecutionError::UnknownOutcome);
+                }
+            }
+            self.reconcile_inner(&operation_id)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = operation_id;
+            Err(unavailable(
+                "Windows ProcessExecutor is unavailable on this target",
+            ))
+        }
+    }
+
     /// Returns the retained non-authoritative stream projections.
     ///
     /// # Errors
@@ -2198,7 +2238,16 @@ impl WindowsProcessExecutor {
             // permit binding are already covered by `request.validate()`
             // above (the self-seal digest spans the whole intent).
             let executable = std::fs::canonicalize(request.executable()).map_err(unavailable)?;
-            let digest = sha256_file(&executable).map_err(unavailable)?;
+            let pinned_executable = PinnedRuntimeFile::open(&executable).map_err(unavailable)?;
+            let pinned_executable_identity = pinned_executable.file_identity();
+            if let Some(expected_identity) = request.intent().executable_file_identity() {
+                validate_request_executable_identity(
+                    *expected_identity,
+                    pinned_executable_identity,
+                )?;
+            }
+            let digest = sha256_open_file(pinned_executable.try_clone_file().map_err(unavailable)?)
+                .map_err(unavailable)?;
             if !digest.eq_ignore_ascii_case(request.executable_sha256()) {
                 return Err(unavailable(
                     "executable digest does not match ProcessRequest",
@@ -2294,6 +2343,10 @@ impl WindowsProcessExecutor {
             let launch_admission = self.launch_admission.as_ref().map(Arc::clone);
             let validated = child
                 .validate(|evidence| {
+                    validate_retained_executable_identity(
+                        pinned_executable_identity,
+                        evidence.executable_file_identity(),
+                    )?;
                     let observed = suspended_identity(&request, evidence)?;
                     let executable = evidence.executable_file_identity();
                     let launch = SuspendedLaunchEvidence::new(
@@ -2304,7 +2357,16 @@ impl WindowsProcessExecutor {
                     if let Some(admission) = &launch_admission {
                         admission.validate_launch(&request, &observed, &launch)?;
                     }
-                    authority.validate_and_consume(request, observed)
+                    if request.intent().instrument_admission_digest().is_some() {
+                        authority.validate_and_consume_instrument(
+                            request,
+                            observed,
+                            launch,
+                            evidence.recoverable_job_binding(),
+                        )
+                    } else {
+                        authority.validate_and_consume(request, observed)
+                    }
                 })
                 .map_err(validation_error)?;
             // `AuthorityValidation`: the one-shot permit was consumed against
@@ -2319,6 +2381,7 @@ impl WindowsProcessExecutor {
                 WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
                 error => unavailable(error),
             })?;
+            drop(pinned_executable);
             start_phase = StartPhase::Resumed;
             let now = now_ms();
             state.mark_resumed(
@@ -3000,6 +3063,36 @@ fn suspended_identity(
 }
 
 #[cfg(windows)]
+fn validate_retained_executable_identity(
+    retained: FileIdentity,
+    observed: FileIdentity,
+) -> Result<(), ContractError> {
+    if retained == observed {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidValue {
+            field: "suspended_executable_file_identity",
+            reason: "launched image differs from the retained hashed file",
+        })
+    }
+}
+
+#[cfg(windows)]
+fn validate_request_executable_identity(
+    expected: FileIdentity,
+    retained: FileIdentity,
+) -> Result<(), ContractError> {
+    if expected == retained {
+        Ok(())
+    } else {
+        Err(ContractError::InvalidValue {
+            field: "process_request.executable_file_identity",
+            reason: "opened executable differs from the file object admitted by Kernel",
+        })
+    }
+}
+
+#[cfg(windows)]
 fn validation_error<E: std::fmt::Display>(
     error: SuspendedValidationError<E>,
 ) -> ProcessExecutionError {
@@ -3670,7 +3763,9 @@ fn join_streams(operation: &mut Operation) -> bool {
             operation.capture_failures.push(failure.clone());
         }
     }
-    failures.is_empty()
+    failures
+        .iter()
+        .all(|failure| failure.disposition == CaptureFailureDisposition::ReadFailed)
 }
 
 #[cfg(windows)]
@@ -4004,8 +4099,8 @@ fn typed_stream_evidence(
         let disposition = guard.disposition();
         match disposition {
             CaptureDisposition::Eof | CaptureDisposition::CancelledBeforeEof => {}
-            CaptureDisposition::ReadFailed
-            | CaptureDisposition::CaptureUnavailable
+            CaptureDisposition::ReadFailed => {}
+            CaptureDisposition::CaptureUnavailable
             | CaptureDisposition::UnknownOutcome
             | CaptureDisposition::Draining => {
                 return Err(ProcessExecutionError::UnknownOutcome);
@@ -4062,6 +4157,9 @@ fn typed_stream_evidence(
     // carries the bounded retained prefix with its exact `[retained, observed)`
     // omission range.
     let mut gaps = vec![StreamEvidenceGap::PersistenceUnavailable];
+    if disposition == CaptureDisposition::ReadFailed {
+        gaps.push(StreamEvidenceGap::TransportReadFailed);
+    }
     if backpressured {
         gaps.push(StreamEvidenceGap::PersistenceBackpressure);
     }
@@ -4097,8 +4195,8 @@ fn sink_terminal_evidence(
     let terminal = match disposition {
         CaptureDisposition::Eof => pump.finalize_eof()?,
         CaptureDisposition::CancelledBeforeEof => pump.abort_cancelled()?,
-        CaptureDisposition::ReadFailed
-        | CaptureDisposition::CaptureUnavailable
+        CaptureDisposition::ReadFailed => pump.abort_transport_failure()?,
+        CaptureDisposition::CaptureUnavailable
         | CaptureDisposition::UnknownOutcome
         | CaptureDisposition::Draining => {
             return Err(ProcessExecutionError::UnknownOutcome);
@@ -4159,7 +4257,10 @@ fn retention(limit: u64, ceiling: usize) -> usize {
 }
 
 fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
-    let mut file = open_executable_for_hash(path)?;
+    sha256_open_file(open_executable_for_hash(path)?)
+}
+
+fn sha256_open_file(mut file: std::fs::File) -> Result<String, std::io::Error> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
     loop {
@@ -4263,6 +4364,10 @@ pub struct ExecutableObservation {
     pub canonical_path: String,
     /// Lowercase SHA-256 hex over the exact executable bytes.
     pub content_digest: String,
+    /// File identity read from the same retained handle used to hash bytes.
+    /// `None` means this platform did not expose the Windows file identity;
+    /// external admission requires an actual owner-observed identity.
+    pub file_identity: Option<FileIdentity>,
     /// Observed tool version text, or `None` when unobservable.
     pub tool_version: Option<String>,
     /// Lowercase SHA-256 hex over the resolved environment projection.
@@ -4302,6 +4407,13 @@ pub enum ExecutableIdentityError {
         /// Digest observed on the machine.
         observed: String,
     },
+    /// The open file object differs from the exact identity admitted by Kernel.
+    FileIdentityMismatch {
+        /// File object identity sealed in the original ProcessIntent.
+        expected: FileIdentity,
+        /// File object identity observed from the current pinned handle.
+        observed: Option<FileIdentity>,
+    },
     /// The observed argv no longer equals the admitted intent argv: a
     /// binding violation, never a transient I/O fault.
     ArgvMismatch {
@@ -4337,6 +4449,10 @@ impl std::fmt::Display for ExecutableIdentityError {
             Self::DigestMismatch { expected, observed } => write!(
                 f,
                 "executable digest mismatch: expected {expected}, observed {observed}"
+            ),
+            Self::FileIdentityMismatch { expected, observed } => write!(
+                f,
+                "executable file identity mismatch: expected {expected:?}, observed {observed:?}"
             ),
             Self::ArgvMismatch { .. } => {
                 f.write_str("executable arguments do not match the admitted intent")
@@ -4410,21 +4526,47 @@ impl ExecutableObservation {
                 }
             }
         })?;
-        let content_digest = sha256_file(&canonical).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ExecutableIdentityError::Missing {
-                    path: display.clone(),
-                }
-            } else {
+        #[cfg(windows)]
+        let (content_digest, file_identity) = {
+            let pinned = PinnedRuntimeFile::open(&canonical).map_err(|error| {
                 ExecutableIdentityError::Unreadable {
                     path: display.clone(),
                     reason: error.to_string(),
                 }
-            }
-        })?;
+            })?;
+            let file_identity = pinned.file_identity();
+            let content_digest = sha256_open_file(pinned.try_clone_file().map_err(|error| {
+                ExecutableIdentityError::Unreadable {
+                    path: display.clone(),
+                    reason: error.to_string(),
+                }
+            })?)
+            .map_err(|error| ExecutableIdentityError::Unreadable {
+                path: display.clone(),
+                reason: error.to_string(),
+            })?;
+            (content_digest, Some(file_identity))
+        };
+        #[cfg(not(windows))]
+        let (content_digest, file_identity) = (
+            sha256_file(&canonical).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ExecutableIdentityError::Missing {
+                        path: display.clone(),
+                    }
+                } else {
+                    ExecutableIdentityError::Unreadable {
+                        path: display.clone(),
+                        reason: error.to_string(),
+                    }
+                }
+            })?,
+            None,
+        );
         Self::from_parts(
             canonical.to_string_lossy().into_owned(),
             content_digest,
+            file_identity,
             tool_version,
             environment_digest,
             arguments,
@@ -4459,6 +4601,14 @@ impl ExecutableObservation {
                 observed: observation.content_digest,
             });
         }
+        if let Some(expected) = intent.executable_file_identity() {
+            if observation.file_identity.as_ref() != Some(expected) {
+                return Err(ExecutableIdentityError::FileIdentityMismatch {
+                    expected: *expected,
+                    observed: observation.file_identity,
+                });
+            }
+        }
         Ok(observation)
     }
 
@@ -4483,6 +4633,16 @@ impl ExecutableObservation {
             self.environment_digest.clone(),
             self.tool_version.clone(),
         )?;
+        if let Some(expected) = intent.executable_file_identity() {
+            if current.file_identity.as_ref() != Some(expected)
+                || self.file_identity.as_ref() != Some(expected)
+            {
+                return Err(ExecutableIdentityError::FileIdentityMismatch {
+                    expected: *expected,
+                    observed: current.file_identity,
+                });
+            }
+        }
         if current.content_digest != intent.executable_sha256()
             || self.content_digest != intent.executable_sha256()
         {
@@ -4523,7 +4683,7 @@ impl ExecutableObservation {
     #[must_use]
     pub fn identity_key(&self) -> String {
         let version = self.tool_version.as_deref().unwrap_or("");
-        let material = format!(
+        let mut material = format!(
             "{}\0{}\0{}\0{}\0{}",
             self.canonical_path,
             self.content_digest,
@@ -4531,12 +4691,19 @@ impl ExecutableObservation {
             self.environment_digest,
             self.arguments.join("\0")
         );
+        if let Some(identity) = self.file_identity {
+            material.push_str(&format!(
+                "\0{}:{}",
+                identity.volume_serial_number, identity.file_index
+            ));
+        }
         short_digest(material.as_bytes())
     }
 
     fn from_parts(
         canonical_path: String,
         content_digest: String,
+        file_identity: Option<FileIdentity>,
         tool_version: Option<String>,
         environment_digest: String,
         arguments: Vec<String>,
@@ -4570,6 +4737,7 @@ impl ExecutableObservation {
         Ok(Self {
             canonical_path,
             content_digest,
+            file_identity,
             tool_version,
             environment_digest,
             arguments,
@@ -4745,9 +4913,11 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     #[cfg(windows)]
-    use eliot_instrument_api::EvidenceAxes;
+    use eliot_instrument_api::{Assertability, EvidenceAxes};
     #[cfg(windows)]
     use eliot_platform::ClockObservation;
+    #[cfg(windows)]
+    use eliot_platform_windows::PinnedRuntimeFile;
     #[cfg(windows)]
     use eliot_process::{
         CancellationStatus, DispatchValidationContext, ExitDisposition, ProcessLifecycle,
@@ -4782,6 +4952,65 @@ mod tests {
             ("authority".to_owned(), "a".repeat(64)),
             ("state".to_owned(), "b".repeat(64)),
         ])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suspended_executable_identity_must_match_retained_hash_pin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let unique = super::JOB_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let first_path =
+            std::env::temp_dir().join(format!("eliot-executor-pinned-image-{unique}-first.bin"));
+        let second_path =
+            std::env::temp_dir().join(format!("eliot-executor-pinned-image-{unique}-second.bin"));
+        std::fs::write(&first_path, b"same pinned image bytes")?;
+        std::fs::write(&second_path, b"same pinned image bytes")?;
+        let first = PinnedRuntimeFile::open(&first_path)?;
+        let second = PinnedRuntimeFile::open(&second_path)?;
+        let retained = first.file_identity();
+        assert_ne!(retained, second.file_identity());
+        assert_eq!(
+            super::sha256_open_file(first.try_clone_file()?)?,
+            super::sha256_open_file(second.try_clone_file()?)?
+        );
+        let first_observation = super::ExecutableObservation::observe_at_path(
+            &first_path,
+            Vec::new(),
+            "a".repeat(64),
+            Some("1.0.0".to_owned()),
+        )?;
+        let second_observation = super::ExecutableObservation::observe_at_path(
+            &second_path,
+            Vec::new(),
+            "a".repeat(64),
+            Some("1.0.0".to_owned()),
+        )?;
+        assert_eq!(first_observation.file_identity, Some(retained));
+        assert_eq!(
+            first_observation.content_digest,
+            second_observation.content_digest
+        );
+        assert_ne!(
+            first_observation.file_identity,
+            second_observation.file_identity
+        );
+        assert_ne!(
+            first_observation.identity_key(),
+            second_observation.identity_key()
+        );
+        assert!(super::validate_retained_executable_identity(retained, retained).is_ok());
+        assert!(
+            super::validate_retained_executable_identity(retained, second.file_identity()).is_err()
+        );
+        assert!(super::validate_request_executable_identity(retained, retained).is_ok());
+        assert!(
+            super::validate_request_executable_identity(retained, second.file_identity()).is_err()
+        );
+        drop(second);
+        drop(first);
+        std::fs::remove_file(first_path)?;
+        std::fs::remove_file(second_path)?;
+        Ok(())
     }
 
     #[derive(Default)]
@@ -5500,6 +5729,139 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_for_terminal_evidence_keeps_original_request_and_refuses_foreign_operation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let argv = vec![
+            "/c".to_owned(),
+            "echo".to_owned(),
+            "job-wait-terminal".to_owned(),
+        ];
+        let (executor, operation_id, _sink) =
+            s04_start("job-wait-terminal", argv, 4_096, 4_096, 4)?;
+        let original = block_on(executor.inspect(operation_id.clone()))?;
+        let original_request_digest = original.request_digest().to_owned();
+
+        let evidence = executor.wait_for_terminal_evidence(operation_id.clone())?;
+        assert_eq!(evidence.operation_id(), &operation_id);
+        assert_eq!(evidence.request_digest(), original_request_digest);
+        assert!(evidence.view().lifecycle().is_terminal());
+        assert_eq!(
+            evidence.axes().assertability,
+            Assertability::NonAssertableUnverified
+        );
+
+        let foreign_operation = OperationId::new("op-t2-s04-job-wait-foreign")?;
+        assert!(matches!(
+            executor.wait_for_terminal_evidence(foreign_operation),
+            Err(ProcessExecutionError::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_for_terminal_evidence_keeps_actual_read_failure_partial_and_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_platform_windows::cancel_capture_thread_io;
+        use eliot_process::{
+            StreamEvaluationStatus, StreamEvidenceGap, StreamParsingStatus,
+            StreamPersistenceStatus, StreamTransportStatus,
+        };
+
+        let bat_path = std::env::temp_dir().join(format!(
+            "eliot-p04-job-wait-read-failure-{}.bat",
+            std::process::id()
+        ));
+        std::fs::write(
+            &bat_path,
+            "@echo off\r\necho OBSERVED-BEFORE-READ-FAILURE\r\nfor /L %%i in (1,0,2) do rem\r\n",
+        )?;
+        let argv = vec!["/c".to_owned(), bat_path.to_string_lossy().into_owned()];
+        let (executor, operation_id, _sink) =
+            s04_start("job-wait-read-failure", argv, 4_096, 4_096, 4)?;
+        let original = block_on(executor.inspect(operation_id.clone()))?;
+        let original_request_digest = original.request_digest().to_owned();
+        let operation = executor.operation(&operation_id)?;
+        let read_failure_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut cancelled_pending_read = false;
+        let (observed_bytes, observed_sha256) = loop {
+            let guard = operation.lock().map_err(|_| {
+                std::io::Error::other("operation lock poisoned while awaiting read failure")
+            })?;
+            let mut stdout = guard.stdout.lock().map_err(|_| {
+                std::io::Error::other("stdout lock poisoned while awaiting read failure")
+            })?;
+            let disposition = stdout.disposition();
+            let observed_bytes = stdout.total_bytes();
+            let observed_sha256 = stdout.observed_sha256();
+            drop(stdout);
+            if disposition == super::CaptureDisposition::ReadFailed {
+                break (observed_bytes, observed_sha256);
+            }
+            if observed_bytes > 0
+                && let Some(thread) = guard.stdout_thread.as_ref()
+            {
+                cancelled_pending_read |= cancel_capture_thread_io(thread)?;
+            }
+            drop(guard);
+            if std::time::Instant::now() >= read_failure_deadline {
+                let _ = std::fs::remove_file(&bat_path);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "capture owner did not observe the real cancelled read failure",
+                )
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            cancelled_pending_read,
+            "a pending OS read must be cancelled"
+        );
+
+        let cancellation = block_on(executor.cancel(operation_id.clone()))?;
+        assert_eq!(
+            cancellation.status(),
+            eliot_process::CancellationStatus::Completed
+        );
+        let evidence = executor.wait_for_terminal_evidence(operation_id.clone())?;
+        let _ = std::fs::remove_file(&bat_path);
+
+        assert_eq!(evidence.operation_id(), &operation_id);
+        assert_eq!(evidence.request_digest(), original_request_digest);
+        assert!(evidence.view().lifecycle().is_terminal());
+        assert_eq!(
+            evidence.axes().assertability,
+            Assertability::NonAssertableUnverified
+        );
+        let stdout = evidence
+            .stdout()
+            .expect("requested stdout must retain its typed transport evidence");
+        assert_eq!(stdout.transport(), StreamTransportStatus::ReadFailed);
+        assert_eq!(
+            stdout.persistence(),
+            StreamPersistenceStatus::SourceUnavailable
+        );
+        assert_eq!(stdout.observed_bytes(), observed_bytes);
+        assert_eq!(stdout.observed_sha256(), observed_sha256);
+        assert!(
+            stdout
+                .gaps()
+                .contains(&StreamEvidenceGap::TransportReadFailed)
+        );
+        assert!(
+            stdout
+                .gaps()
+                .contains(&StreamEvidenceGap::PersistenceUnavailable)
+        );
+        assert!(stdout.source().is_none());
+        assert_eq!(stdout.parsing(), StreamParsingStatus::Raw);
+        assert_eq!(stdout.evaluation(), StreamEvaluationStatus::Unassessed);
+        Ok(())
     }
 
     #[test]

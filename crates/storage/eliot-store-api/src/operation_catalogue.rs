@@ -17,7 +17,9 @@
 //! with the closed record-kind filter and proven adapter handlers in this
 //! slice), and the activated audit
 //! range read (`GetAuditRange`: fence-gated envelope-candidate range over
-//! durable capture evidence with proven adapter handlers in this slice), the four `CaptureObservation` /
+//! durable capture evidence with proven adapter handlers in this slice), plus
+//! issue #1814's `GetInstrumentRegistryState` / `ApplyInstrumentRegistryState`
+//! canonical snapshot owner pair, the four `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -60,9 +62,7 @@
 //! (issue #1779: closed query discriminator with exact selectors, no scope),
 //! plus the provider-independent genesis bootstrap entry sourced by
 //! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
-//! known-but-unsupported and unadvertised: this includes issue #1814's
-//! typed `GetInstrumentRegistryState` / `ApplyInstrumentRegistryState`
-//! contract until canonical read/write handlers are available. No other
+//! known-but-unsupported and unadvertised. No other
 //! mutation on base has a
 //! proven handler, schema, and consumer triple, so C1 advertises no other
 //! mutation entry and any transition carrying another named command fails
@@ -286,7 +286,7 @@ struct ActivatedReadDescriptor {
 /// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
 /// contract rather than to a caller's scope, and it must be read at one exact
 /// contract revision rather than at whatever happens to be current).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 24] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -402,11 +402,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetInstrumentRegistryState,
+        requires_scope_id: true,
+        scope_kind: SCOPE_KIND_SCOPE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 24] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -431,6 +436,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
         ACTIVATED_READS[22].operation,
+        ACTIVATED_READS[23].operation,
     ]
 }
 
@@ -494,11 +500,15 @@ struct ActivatedMutationDescriptor {
 /// record of one `TaskContract` revision's acceptance obligations, keyed by
 /// `(task_id, task_revision)` — committing it asserts only what the contract
 /// owner already required and grants no coverage, support, admission or
-/// completion). All
-/// activated mutation rows address no store scope, mirroring the scope-free read
-/// descriptors. Every
+/// completion); `ApplyInstrumentRegistryState` persists `ReversibleMutation`
+/// through the `InstrumentRegistry` family (issue #1814 W1.2: the original
+/// Governor registration action stores one bounded opaque registry snapshot
+/// and returns the exact receipt/readback to the read-only launch consumer).
+/// Activated mutation manifest rows remain scope-free; a canonical write
+/// transition still carries its owner `ScopeId` in the envelope. Read rows
+/// independently declare whether their read request requires a scope. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -668,6 +678,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // JSON inside the parameters object, so the bulk bound covers escaping
         // and the enclosing structure without loosening the record's own
         // closed validator.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyInstrumentRegistryState,
+        transition_classes: &[TransitionClass::InstrumentRegistry],
+        maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];

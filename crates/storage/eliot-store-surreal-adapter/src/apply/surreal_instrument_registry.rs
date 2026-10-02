@@ -9,8 +9,10 @@
 //! instrument admission).
 
 use eliot_store_api::{
-    NamedMutationOperation, PreparedTransition, StateFence, StoreError, TransitionClass,
-    decode_instrument_registry_mutation,
+    CanonicalRequestView, NamedMutationOperation, OrderingHeadExpectation, PreparedTransition,
+    RequestMeta, RevisionHeadExpectation, StateFence, StoreError, TransitionClass,
+    decode_instrument_registry_authority_ledger, decode_instrument_registry_expected_revision,
+    decode_instrument_registry_mutation, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -25,14 +27,28 @@ const INSTRUMENT_REGISTRY_HEAD_KEY: &str = "head";
 
 /// One durable instrument-registry head row.
 ///
-/// Row shape mirrors the writer (verbatim `snapshot_json`, `revision`,
-/// `state_fence`). The row is the singleton snapshot head; every apply
-/// replaces it verbatim with a bumped revision.
+/// Row shape mirrors the writer (verbatim `snapshot_json`, store-local
+/// `revision`, `state_fence`, original transition/request identity, and the
+/// byte-preserved request view used to verify its canonical hash). The row is
+/// the singleton snapshot head; every apply replaces it verbatim with a bumped
+/// revision. Historical rows may lack new identity fields; those remain
+/// explicit `None` so only a real re-registration can fill them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StoredInstrumentRegistryHead {
     pub(crate) snapshot_json: String,
     pub(crate) revision: u64,
     pub(crate) state_fence: StateFence,
+    pub(crate) scope_id: String,
+    pub(crate) task_id: Option<String>,
+    pub(crate) operation_id: Option<String>,
+    pub(crate) canonical_request_hash: Option<String>,
+    /// Governor-owned, closed registration authority ledger. `None` is kept
+    /// explicit for historical rows so callers can refuse migration rather
+    /// than fabricate a fresh use budget.
+    pub(crate) registration_authority_json: Option<String>,
+    /// Exact serialized original apply request used to admit this registration.
+    /// Historical rows remain `None`; the adapter never manufactures proof.
+    pub(crate) registration_request_json: Option<String>,
 }
 
 /// One computed instrument-registry head write: the verbatim snapshot bytes
@@ -44,6 +60,10 @@ pub(super) struct InstrumentRegistryHeadWrite {
     pub(super) state_fence: StateFence,
     pub(super) scope_id: String,
     pub(super) task_id: Option<String>,
+    pub(super) operation_id: String,
+    pub(super) canonical_request_hash: String,
+    pub(super) registration_authority_json: String,
+    pub(super) registration_request_json: String,
     pub(super) expected_revision: u64,
 }
 
@@ -63,7 +83,11 @@ async fn ensure_instrument_registry_table(
          DEFINE FIELD IF NOT EXISTS revision ON {INSTRUMENT_REGISTRY} TYPE int; \
          DEFINE FIELD IF NOT EXISTS state_fence ON {INSTRUMENT_REGISTRY} TYPE object; \
          DEFINE FIELD IF NOT EXISTS scope_id ON {INSTRUMENT_REGISTRY} TYPE string; \
-         DEFINE FIELD IF NOT EXISTS task_id ON {INSTRUMENT_REGISTRY} TYPE option<string>;"
+         DEFINE FIELD IF NOT EXISTS task_id ON {INSTRUMENT_REGISTRY} TYPE option<string>; \
+         DEFINE FIELD IF NOT EXISTS operation_id ON {INSTRUMENT_REGISTRY} TYPE option<string>; \
+         DEFINE FIELD IF NOT EXISTS canonical_request_hash ON {INSTRUMENT_REGISTRY} TYPE option<string>; \
+         DEFINE FIELD IF NOT EXISTS registration_authority_json ON {INSTRUMENT_REGISTRY} TYPE option<string>; \
+         DEFINE FIELD IF NOT EXISTS registration_request_json ON {INSTRUMENT_REGISTRY} TYPE option<string>;"
     );
     client::query(db, config, "schema.ensure", &ddl, Map::new())
         .await
@@ -81,7 +105,10 @@ async fn ensure_instrument_registry_table(
 pub(super) async fn prepare_instrument_registry_writes(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
+    context: &RequestMeta,
     transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<InstrumentRegistryWrites, AdapterError> {
     ensure_instrument_registry_table(db, config).await?;
     let mut matching = transition.named_operations.iter().filter(|command| {
@@ -98,10 +125,55 @@ pub(super) async fn prepare_instrument_registry_writes(
     if transition.transition_class != TransitionClass::InstrumentRegistry {
         return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
     }
+    let original_request = CanonicalRequestView::from_apply(
+        context,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    );
+    verify_canonical_request_hash(
+        &original_request,
+        &transition.identity.canonical_request_hash,
+    )
+    .map_err(AdapterError::Store)?;
+    let registration_request_json = serde_json::to_string(&original_request)
+        .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
     let snapshot_json =
         decode_instrument_registry_mutation(&command.parameters).map_err(AdapterError::Store)?;
+    let registration_authority_json =
+        decode_instrument_registry_authority_ledger(&command.parameters)
+            .map_err(AdapterError::Store)?;
+    let expected_revision = decode_instrument_registry_expected_revision(&command.parameters)
+        .map_err(AdapterError::Store)?;
     let current = read_instrument_registry_row(db, config).await?;
-    let expected_revision = current.as_ref().map_or(0, |row| row.revision);
+    let revision_matches = match current.as_ref() {
+        None => expected_revision == 0,
+        Some(row) => row.revision > 0 && row.revision == expected_revision,
+    };
+    if !revision_matches {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    if let Some(previous) = current.as_ref() {
+        if previous.registration_authority_json.is_none() {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "instrument_registry.registration_authority_json",
+                reason: "stored authority ledger is missing; explicit migration is required",
+            }));
+        }
+        let previous_ledger =
+            previous
+                .registration_authority_json
+                .as_ref()
+                .ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "instrument_registry.registration_authority_json",
+                    reason: "stored authority ledger is missing; explicit migration is required",
+                }))?;
+        decode_instrument_registry_authority_ledger(&std::collections::BTreeMap::from([(
+            "registration_authority_json".to_owned(),
+            serde_json::Value::String(previous_ledger.clone()),
+        )]))
+        .map_err(AdapterError::Store)?;
+    }
     if current
         .as_ref()
         .is_some_and(|row| row.state_fence != transition.state_fence)
@@ -122,6 +194,10 @@ pub(super) async fn prepare_instrument_registry_writes(
             state_fence: transition.state_fence.clone(),
             scope_id: transition.scope_id.to_string(),
             task_id: transition.task_id.clone(),
+            operation_id: transition.identity.operation_id.as_str().to_owned(),
+            canonical_request_hash: transition.identity.canonical_request_hash.clone(),
+            registration_authority_json,
+            registration_request_json,
             expected_revision,
         }],
     })
@@ -196,11 +272,38 @@ fn decode_instrument_registry_row(
     let state_fence: StateFence =
         serde_json::from_value(object.get("state_fence").cloned().unwrap_or(Value::Null))
             .map_err(|error| AdapterError::Store(StoreError::Serialization(error.to_string())))?;
+    let scope_id = text_row_field(object, "scope_id")?;
+    let task_id = optional_text_row_field(object, "task_id")?;
+    let operation_id = optional_text_row_field(object, "operation_id")?;
+    let canonical_request_hash = optional_text_row_field(object, "canonical_request_hash")?;
+    let registration_authority_json =
+        optional_text_row_field(object, "registration_authority_json")?;
+    let registration_request_json = optional_text_row_field(object, "registration_request_json")?;
     Ok(StoredInstrumentRegistryHead {
         snapshot_json,
         revision,
         state_fence,
+        scope_id,
+        task_id,
+        operation_id,
+        canonical_request_hash,
+        registration_authority_json,
+        registration_request_json,
     })
+}
+
+fn optional_text_row_field(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, AdapterError> {
+    match object.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(AdapterError::Store(StoreError::InvalidField {
+            field: "instrument_registry.row",
+            reason: "optional instrument registry row field must be a string",
+        })),
+    }
 }
 
 /// Renders canonical instrument-registry head writes (issue #1814 W1.2).
@@ -246,6 +349,10 @@ pub(super) fn instrument_registry_write_statements(
                 "state_fence": write.state_fence,
                 "scope_id": write.scope_id,
                 "task_id": write.task_id,
+                "operation_id": write.operation_id,
+                "canonical_request_hash": write.canonical_request_hash,
+                "registration_authority_json": write.registration_authority_json,
+                "registration_request_json": write.registration_request_json,
             }),
         );
     }

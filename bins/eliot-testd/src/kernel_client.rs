@@ -54,14 +54,171 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
+#[cfg(windows)]
+use eliot_kernel_service::{
+    INSTRUMENT_STAGE_STARTED_OPERATION, INSTRUMENT_STAGE_TERMINAL_OPERATION,
+    InstrumentStageRuntimeObservationPort, InstrumentStageStartedRequest,
+    InstrumentStageStartedResponse, InstrumentStageTerminalRequest,
+    InstrumentStageTerminalResponse,
+};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdError, TestdTerminalCompletionNotice, TestdTerminalPublication,
-    TestdVerifierDispatchBinding, verification_receipt_sha256,
+    TestJob, TestdError, TestdInstrumentProcessAttemptBinding, TestdTerminalCompletionNotice,
+    TestdTerminalPublication, TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
 use serde::{Deserialize, Serialize};
+
+/// Authenticated lifecycle observer for a productive TestD child. It uses
+/// the protected Kernel front door and returns the sealed response from that
+/// exact exchange to the consuming process authority.
+#[cfg(windows)]
+pub struct KernelTestdInstrumentObserver {
+    client: std::sync::Mutex<eliot_ipc::kernel_client::KernelClient>,
+}
+
+#[cfg(windows)]
+impl KernelTestdInstrumentObserver {
+    /// Opens the existing protected application-client route and verifies the
+    /// live Kernel health exchange before retaining it for lifecycle reports.
+    pub fn connect() -> Result<Self, TestdIpcError> {
+        let mut client = eliot_ipc::kernel_client::KernelClient::load()
+            .map_err(|error| TestdIpcError::Transport(error.to_string()))?;
+        let health = client
+            .probe()
+            .map_err(|error| TestdIpcError::Transport(error.to_string()))?;
+        require_health_open(&health)?;
+        Ok(Self {
+            client: std::sync::Mutex::new(client),
+        })
+    }
+
+    fn exchange<T: Serialize>(
+        &self,
+        identity: &eliot_ipc::RequestIdentity,
+        operation: &str,
+        request: &T,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, TestdIpcError> {
+        identity
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let payload = serde_json::to_value(request)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel observer lock poisoned".to_owned()))?;
+        client.set_request_identity(identity.clone());
+        client
+            .transact_json_authenticated(operation, payload)
+            .map_err(|error| TestdIpcError::Transport(error.to_string()))
+    }
+
+    /// Submits the unchanged, validated attempt envelope with the durable
+    /// Kernel identity. The returned response stays sealed for the private
+    /// child issuer; its JSON payload is never accepted as authority alone.
+    pub fn submit_process_attempt(
+        &self,
+        identity: &eliot_ipc::RequestIdentity,
+        request: &crate::testd_material::TestdMaterialRequest,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, TestdIpcError> {
+        if request.wire_id != TESTD_ADMISSION_OPERATION
+            || request.wire_version != TESTD_ADMISSION_OPERATION_VERSION
+        {
+            return Err(TestdIpcError::Contract(
+                "unsupported TestD attempt request wire".to_owned(),
+            ));
+        }
+        identity
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel observer lock poisoned".to_owned()))?;
+        client.set_request_identity(identity.clone());
+        client
+            .transact_json_authenticated(
+                TESTD_ADMISSION_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .map_err(|error| TestdIpcError::Transport(error.to_string()))
+    }
+}
+
+#[cfg(windows)]
+impl InstrumentStageRuntimeObservationPort for KernelTestdInstrumentObserver {
+    fn before_resume(
+        &self,
+        identity: &eliot_ipc::RequestIdentity,
+        request: InstrumentStageStartedRequest,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, ProcessExecutionError> {
+        let response = self
+            .exchange(identity, INSTRUMENT_STAGE_STARTED_OPERATION, &request)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let decoded: InstrumentStageStartedResponse =
+            serde_json::from_value(response.payload().clone()).map_err(|_| {
+                ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
+                    field: "instrument_stage.started.response",
+                    reason: "authenticated response does not match its closed schema",
+                })
+            })?;
+        if response.operation() != INSTRUMENT_STAGE_STARTED_OPERATION
+            || response.request_identity() != identity
+            || decoded.operation_id != request.operation_id
+            || decoded.admission_digest != request.admission_digest
+            || decoded.dispatch_grant_digest != request.dispatch_grant_digest
+            || decoded.job_id != request.job_id
+            || decoded.attempt_seq != request.attempt_seq
+            || decoded.process_request_digest != request.process_request_digest
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DigestMismatch {
+                    field: "instrument_stage.started.echo",
+                    expected: request.process_request_digest,
+                    observed: decoded.process_request_digest,
+                },
+            ));
+        }
+        Ok(response)
+    }
+
+    fn terminal(
+        &self,
+        identity: &eliot_ipc::RequestIdentity,
+        request: InstrumentStageTerminalRequest,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, ProcessExecutionError> {
+        let response = self
+            .exchange(identity, INSTRUMENT_STAGE_TERMINAL_OPERATION, &request)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let decoded: InstrumentStageTerminalResponse =
+            serde_json::from_value(response.payload().clone()).map_err(|_| {
+                ProcessExecutionError::Contract(eliot_process::ContractError::InvalidValue {
+                    field: "instrument_stage.terminal.response",
+                    reason: "authenticated response does not match its closed schema",
+                })
+            })?;
+        if response.operation() != INSTRUMENT_STAGE_TERMINAL_OPERATION
+            || response.request_identity() != identity
+            || decoded.operation_id != request.operation_id
+            || decoded.admission_digest != request.admission_digest
+            || decoded.dispatch_grant_digest != request.dispatch_grant_digest
+            || decoded.job_id != request.job_id
+            || decoded.attempt_seq != request.attempt_seq
+            || decoded.process_request_digest != request.process_request_digest
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DigestMismatch {
+                    field: "instrument_stage.terminal.echo",
+                    expected: request.process_request_digest,
+                    observed: decoded.process_request_digest,
+                },
+            ));
+        }
+        Ok(response)
+    }
+}
 
 /// Stable operation selector for the Kernel-owned testd admission wire.
 ///
@@ -477,6 +634,10 @@ pub struct TestdAdmission {
     pub cancelled: bool,
     /// Admission time in Unix milliseconds.
     pub admitted_at_unix_ms: u64,
+    /// Original Kernel-issued grant for one productive claimed attempt.
+    /// Historical admissions omit this field and retain their old digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_attempt_grant: Option<eliot_kernel_service::TestdProcessAttemptGrant>,
     /// Canonical digest over this admission envelope.
     pub admission_digest: String,
 }
@@ -510,13 +671,40 @@ impl TestdAdmission {
             cancelled: self.cancelled,
             admitted_at_unix_ms: self.admitted_at_unix_ms,
         };
-        canonical_json_bytes(&canonical)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|_| {
-                TestdIpcError::Contract(
-                    "testd_admission.admission_digest cannot canonicalize admission".to_owned(),
-                )
+        let bytes = if let Some(process_attempt_grant) = &self.process_attempt_grant {
+            #[derive(Serialize)]
+            struct CanonicalAttempt<'a> {
+                wire_id: &'a str,
+                wire_version: u16,
+                job_id: &'a str,
+                invocation_digest: &'a str,
+                authority_epoch: &'a EpochId,
+                generation: u64,
+                evidence_ref: &'a str,
+                cancelled: bool,
+                admitted_at_unix_ms: u64,
+                process_attempt_grant: &'a eliot_kernel_service::TestdProcessAttemptGrant,
+            }
+            canonical_json_bytes(&CanonicalAttempt {
+                wire_id: &self.wire_id,
+                wire_version: self.wire_version,
+                job_id: &self.job_id,
+                invocation_digest: &self.invocation_digest,
+                authority_epoch: &self.authority_epoch,
+                generation: self.generation,
+                evidence_ref: &self.evidence_ref,
+                cancelled: self.cancelled,
+                admitted_at_unix_ms: self.admitted_at_unix_ms,
+                process_attempt_grant,
             })
+        } else {
+            canonical_json_bytes(&canonical)
+        };
+        bytes.map(|bytes| sha256_hex(&bytes)).map_err(|_| {
+            TestdIpcError::Contract(
+                "testd_admission.admission_digest cannot canonicalize admission".to_owned(),
+            )
+        })
     }
 
     /// Returns this admission with its canonical digest populated.
@@ -1116,6 +1304,9 @@ pub struct PresentedAdmission {
     /// Concrete IPC-delivered process request for the single consuming
     /// start. An in-memory composition value, never deserialized.
     pub process: ProcessRequest,
+    /// Durable owner record for the exact per-attempt Kernel P-03 request.
+    /// The original queued process digest remains on `TestJob` separately.
+    pub instrument_attempt: Option<TestdInstrumentProcessAttemptBinding>,
     /// Live Kernel epoch from the authenticated bootstrap, used for the
     /// lineage-aware binding. Never envelope bytes.
     pub epoch: EpochId,
@@ -1244,11 +1435,26 @@ where
         request,
         invocation,
         process,
+        instrument_attempt,
         epoch,
         evidence_ref,
         cancelled,
     } = presented;
     validate_envelope_invocation_binding(&request, &invocation)?;
+    if let Some(attempt) = instrument_attempt.as_ref() {
+        attempt
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if attempt.job_id != request.job_id
+            || attempt.operation_id != process.operation_id().as_str()
+            || attempt.process_request_digest != process.invocation_digest()
+            || attempt.intent_effect_digest != process.intent().effect_digest()
+        {
+            return Err(TestdIpcError::Contract(
+                "productive process differs from its authenticated attempt binding".to_owned(),
+            ));
+        }
+    }
     validate_wire_text(&evidence_ref, "testd_admission.evidence_ref")?;
     if !epoch.is_same_authority(&request.authority_epoch) {
         return Err(TestdIpcError::Contract(
@@ -1689,6 +1895,7 @@ mod tests {
             evidence_ref: "evidence-1".to_owned(),
             cancelled: false,
             admitted_at_unix_ms: 1,
+            process_attempt_grant: None,
             admission_digest: String::new(),
         }
         .with_computed_digest()
@@ -1740,6 +1947,7 @@ mod tests {
                 evidence_ref: "evidence-1".to_owned(),
                 cancelled: false,
                 admitted_at_unix_ms: 1,
+                process_attempt_grant: None,
                 admission_digest: digest(0xd1),
             },
             &envelope.invocation_id,

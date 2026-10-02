@@ -44,6 +44,8 @@ use crate::WindowsAdapterError;
 use crate::command_environment;
 use crate::command_line;
 use crate::file_identity;
+#[cfg(windows)]
+use crate::inspect_parent_process_identity;
 use crate::inspect_process_handle;
 use crate::job_process_ids;
 use crate::last_windows_adapter_error;
@@ -966,6 +968,32 @@ impl RecoverableJobObject {
             .collect()
     }
 
+    /// Verifies that this exact retained Job root was created by one
+    /// authenticated peer process. The parent is observed from Windows while
+    /// the child identity is rechecked before and after the observation; no
+    /// caller-provided parent ID is trusted.
+    ///
+    /// # Errors
+    /// Returns `IdentityMismatch` when the root or actual parent differs from
+    /// the binding, and a typed adapter error when any observation fails.
+    pub fn validate_root_parent(
+        &self,
+        authenticated_peer: &ProcessIdentity,
+    ) -> Result<(), WindowsAdapterError> {
+        let root = self.binding.root();
+        if !self.live_processes()?.iter().any(|process| process == root) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        let observed_parent = inspect_parent_process_identity(root.process())?;
+        if &observed_parent != authenticated_peer {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        if !self.live_processes()?.iter().any(|process| process == root) {
+            return Err(WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
     /// Returns the current active member count.
     ///
     /// # Errors
@@ -1117,7 +1145,7 @@ fn cleanup_error(
 /// after digest verification.
 #[cfg(windows)]
 pub struct PinnedRuntimeFile {
-    _file: PinnedExecutable,
+    file: PinnedExecutable,
 }
 
 #[cfg(windows)]
@@ -1131,8 +1159,28 @@ impl PinnedRuntimeFile {
     /// a reparse point, or cannot be opened with replacement-blocking sharing.
     pub fn open(path: &Path) -> Result<Self, WindowsAdapterError> {
         Ok(Self {
-            _file: PinnedExecutable::open(path)?,
+            file: PinnedExecutable::open(path)?,
         })
+    }
+
+    /// Returns the identity observed from the retained no-follow handle.
+    #[must_use]
+    pub const fn file_identity(&self) -> FileIdentity {
+        self.file.identity
+    }
+
+    /// Duplicates the retained read-only handle without reopening its path.
+    /// The duplicate refers to the same file object and retains the original
+    /// deny-write/delete sharing posture.
+    ///
+    /// # Errors
+    /// Returns the mapped Windows adapter error when the handle cannot be
+    /// duplicated.
+    pub fn try_clone_file(&self) -> Result<std::fs::File, WindowsAdapterError> {
+        self.file
+            .file
+            .try_clone()
+            .map_err(|error| windows_adapter_from_io(&error))
     }
 }
 
@@ -1455,6 +1503,50 @@ struct JobProcessObserver {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Read-only wait projection over the exact Job handle and completion state
+/// retained by one running child. It owns a duplicated handle to the same
+/// native Job object; it does not reopen a name or acquire process authority.
+#[cfg(windows)]
+pub struct JobWaitProjection {
+    job: OwnedKernelHandle,
+    state: std::sync::Arc<(
+        std::sync::Mutex<JobProcessObserverState>,
+        std::sync::Condvar,
+    )>,
+}
+
+#[cfg(windows)]
+impl JobWaitProjection {
+    /// Waits for the exact retained Job to become empty and returns its
+    /// owner-observed process history.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Job membership or observer history
+    /// cannot be read.
+    pub fn wait_for_empty_history(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<JobProcessHistory, WindowsAdapterError> {
+        let started = std::time::Instant::now();
+        loop {
+            let job_empty = capture_live_members_in_state(&self.state, self.job.0)?;
+            let (state, notification) = &*self.state;
+            let state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
+            if job_empty && state.active_process_zero {
+                return Ok(history_from_observer_state(&state, true));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Ok(history_from_observer_state(&state, job_empty));
+            }
+            let wait_slice = remaining.min(std::time::Duration::from_millis(10));
+            let _ = notification
+                .wait_timeout(state, wait_slice)
+                .map_err(|_| WindowsAdapterError::Failed)?;
+        }
+    }
+}
+
 #[cfg(windows)]
 impl JobProcessObserver {
     fn attach(job: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, WindowsAdapterError> {
@@ -1521,15 +1613,7 @@ impl JobProcessObserver {
         &self,
         job: windows_sys::Win32::Foundation::HANDLE,
     ) -> Result<bool, WindowsAdapterError> {
-        let process_ids = job_process_ids(job).map_err(|error| windows_adapter_from_io(&error))?;
-        for process_id in &process_ids {
-            if self.capture_pid(*process_id).is_err() {
-                let (state, _) = &*self.state;
-                let mut state = state.lock().map_err(|_| WindowsAdapterError::Failed)?;
-                state.observation_incomplete = true;
-            }
-        }
-        Ok(process_ids.is_empty())
+        capture_live_members_in_state(&self.state, job)
     }
 
     fn snapshot(
@@ -1602,6 +1686,64 @@ impl JobProcessObserver {
             let _ = thread.join();
         }
     }
+}
+
+#[cfg(windows)]
+fn capture_live_members_in_state(
+    state: &std::sync::Arc<(
+        std::sync::Mutex<JobProcessObserverState>,
+        std::sync::Condvar,
+    )>,
+    job: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<bool, WindowsAdapterError> {
+    let process_ids = job_process_ids(job).map_err(|error| windows_adapter_from_io(&error))?;
+    for process_id in &process_ids {
+        let process = open_observed_job_process(*process_id);
+        let (shared, _) = &**state;
+        let mut shared = shared.lock().map_err(|_| WindowsAdapterError::Failed)?;
+        match process {
+            Ok(process) => {
+                if !shared
+                    .processes
+                    .iter()
+                    .any(|observed| observed.observation == process.observation)
+                {
+                    shared.processes.push(process);
+                }
+            }
+            Err(_) => shared.observation_incomplete = true,
+        }
+    }
+    Ok(process_ids.is_empty())
+}
+
+#[cfg(windows)]
+fn duplicate_job_handle(
+    job: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<OwnedKernelHandle, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate = std::ptr::null_mut();
+    // SAFETY: the source Job handle is retained by RunningJobChild, both
+    // process pseudo-handles are valid for this process, and the output slot
+    // is writable for the duration of the call.
+    if unsafe {
+        DuplicateHandle(
+            process,
+            job,
+            process,
+            &raw mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(last_windows_adapter_error());
+    }
+    OwnedKernelHandle::new(duplicate)
 }
 
 #[cfg(windows)]
@@ -2568,6 +2710,22 @@ pub struct RunningJobChild<V> {
     validation: V,
 }
 
+#[cfg(windows)]
+impl<V> RunningJobChild<V> {
+    /// Creates a read-only wait projection over this child’s same retained
+    /// Job handle and shared observer state.
+    ///
+    /// # Errors
+    /// Returns a typed adapter error when Windows cannot duplicate the live
+    /// Job handle.
+    pub fn job_wait_projection(&self) -> Result<JobWaitProjection, WindowsAdapterError> {
+        Ok(JobWaitProjection {
+            job: duplicate_job_handle(self.inner.job.handle)?,
+            state: std::sync::Arc::clone(&self.inner.observer.state),
+        })
+    }
+}
+
 /// Newly created suspended member of an already authenticated/reopened Job.
 ///
 /// The lifetime ties the candidate to the retained recovery capability. The
@@ -3340,4 +3498,37 @@ fn terminalize(
         job_empty: true,
         root_reaped: true,
     })
+}
+
+#[cfg(test)]
+mod pinned_runtime_file_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::io::Write as _;
+
+    #[test]
+    fn pinned_runtime_file_retains_identity_and_blocks_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-pinned-runtime-file-{}-{}.bin",
+            std::process::id(),
+            crate::unique_suffix()
+        ));
+        let mut source = std::fs::File::create(&path)?;
+        source.write_all(b"runtime bytes pinned before hashing")?;
+        drop(source);
+
+        let pinned = PinnedRuntimeFile::open(&path)?;
+        let identity = pinned.file_identity();
+        assert_eq!(crate::file_identity(&path)?, identity);
+        let mut cloned = pinned.try_clone_file()?;
+        let mut bytes = Vec::new();
+        cloned.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"runtime bytes pinned before hashing");
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+
+        drop(pinned);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }

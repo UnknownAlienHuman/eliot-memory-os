@@ -33,15 +33,9 @@ use serde::{Deserialize, Serialize};
 use crate::WindowsAdapterError;
 use crate::last_windows_adapter_error;
 use crate::sid_to_string;
-
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(deny_unknown_fields)]
-pub struct FileIdentity {
-    pub volume_serial_number: u32,
-    pub file_index: u64,
-}
+#[cfg(windows)]
+use crate::windows_adapter_from_io;
+pub use eliot_runtime_contracts::FileIdentity;
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -493,4 +487,87 @@ pub(crate) fn inspect_process_handle(
             image_path,
         })
     })()
+}
+
+/// Observes the actual parent of one exact process while retaining the child
+/// process handle so PID reuse cannot substitute another child during the
+/// snapshot. The caller must compare the result with its authenticated peer.
+#[cfg(windows)]
+pub(crate) fn inspect_parent_process_identity(
+    expected_child: &ProcessIdentity,
+) -> Result<ProcessIdentity, WindowsAdapterError> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    struct Handle(HANDLE);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    if !expected_child.is_usable() {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+
+    let child = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            expected_child.process_id,
+        )
+    };
+    if child.is_null() {
+        return Err(windows_adapter_from_io(&std::io::Error::last_os_error()));
+    }
+    let _child = Handle(child);
+    let observed_child = inspect_process_handle(expected_child.process_id, child)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    if &observed_child != expected_child {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == -1 {
+        return Err(windows_adapter_from_io(&std::io::Error::last_os_error()));
+    }
+    let _snapshot = Handle(snapshot);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(size_of::<PROCESSENTRY32W>())
+            .map_err(|_| WindowsAdapterError::Failed)?,
+        ..Default::default()
+    };
+    let mut found_parent = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
+    while has_entry {
+        if entry.th32ProcessID == expected_child.process_id {
+            found_parent = Some(entry.th32ParentProcessID);
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &raw mut entry) } != 0;
+    }
+    let parent_id = found_parent.ok_or(WindowsAdapterError::NotFound)?;
+    if parent_id == 0 || parent_id == expected_child.process_id {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    let parent = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent_id) };
+    if parent.is_null() {
+        return Err(windows_adapter_from_io(&std::io::Error::last_os_error()));
+    }
+    let _parent = Handle(parent);
+    let observed_parent = inspect_process_handle(parent_id, parent)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    let rechecked_child = inspect_process_handle(expected_child.process_id, child)
+        .map_err(|error| windows_adapter_from_io(&error))?;
+    if &rechecked_child != expected_child {
+        return Err(WindowsAdapterError::IdentityMismatch);
+    }
+    Ok(observed_parent)
 }

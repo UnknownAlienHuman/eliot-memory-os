@@ -850,14 +850,65 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         #[cfg(windows)]
-        self.require_current_daemon_session(session)?;
-        if let Some(identity) = &frame.request_identity
-            && !session
+        {
+            let may_reconcile_instrument_stage = frame.kind == FrameKind::Request
+                && frame.message_type == MessageType::Execute
+                && matches!(
+                    &frame.payload,
+                    ProtocolPayload::Json(payload)
+                        if matches!(
+                            payload.get("operation").and_then(serde_json::Value::as_str),
+                            Some(
+                                super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION
+                                    | eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+                            )
+                        )
+                );
+            if !may_reconcile_instrument_stage {
+                self.require_current_daemon_session(session)?;
+            }
+        }
+        if let Some(identity) = &frame.request_identity {
+            let fence_compatible = session
                 .module_generation
                 .state_fence
-                .is_compatible_with(&identity.request.state_fence)
-        {
-            return Err(TransportError::SessionFenced);
+                .is_compatible_with(&identity.request.state_fence);
+            #[cfg(windows)]
+            let historical_terminal = if !fence_compatible
+                && frame.kind == FrameKind::Request
+                && frame.message_type == MessageType::Execute
+            {
+                let ProtocolPayload::Json(payload) = &frame.payload else {
+                    return Err(TransportError::SessionFenced);
+                };
+                if !is_historical_instrument_terminal_selector(
+                    payload.get("operation").and_then(serde_json::Value::as_str),
+                ) {
+                    false
+                } else {
+                    let terminal_payload =
+                        super::daemon_request_dispatch::without_daemon_routing_key(
+                            payload.clone(),
+                        )?;
+                    let request = serde_json::from_value::<
+                        eliot_kernel_service::InstrumentStageTerminalRequest,
+                    >(terminal_payload);
+                    request.is_ok_and(|request| {
+                        self.instrument_stage_runtime.matches_terminal_binding(
+                            identity,
+                            &session.peer,
+                            &request,
+                        )
+                    })
+                }
+            } else {
+                false
+            };
+            #[cfg(not(windows))]
+            let historical_terminal = false;
+            if !fence_compatible && !historical_terminal {
+                return Err(TransportError::SessionFenced);
+            }
         }
 
         // User Broker Sessions have a dedicated, operation-scoped matrix.
@@ -893,6 +944,88 @@ impl KernelComposition {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
                 .ok_or(TransportError::SessionFenced)?;
+            if operation
+                == super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION
+            {
+                if !probe_ready_state_admitted(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let identity = frame
+                    .request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                if identity.request.metadata.request_id != request_id
+                    || identity.request.state_fence != session.module_generation.state_fence
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::Daemon {
+                    request_id,
+                    identity: identity.clone(),
+                    operation,
+                    payload: route_payload_for_daemon_operation(
+                        super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION,
+                        payload,
+                        identity,
+                    )?,
+                });
+            }
+            if matches!(
+                operation.as_str(),
+                super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION
+                    | eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+                    | eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+            ) {
+                if !probe_ready_state_admitted(
+                    self.service_state()
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ) {
+                    return Err(TransportError::SessionFenced);
+                }
+                let identity = frame
+                    .request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let historical_terminal =
+                    if operation == eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION {
+                        super::daemon_request_dispatch::without_daemon_routing_key(payload.clone())
+                            .ok()
+                            .and_then(|terminal_payload| {
+                                serde_json::from_value::<
+                                    eliot_kernel_service::InstrumentStageTerminalRequest,
+                                >(terminal_payload)
+                                .ok()
+                            })
+                            .is_some_and(|request| {
+                                self.instrument_stage_runtime.matches_terminal_binding(
+                                    identity,
+                                    &session.peer,
+                                    &request,
+                                )
+                            })
+                    } else {
+                        false
+                    };
+                if identity.request.metadata.request_id != request_id
+                    || (identity.request.state_fence != session.module_generation.state_fence
+                        && !historical_terminal)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::Daemon {
+                    request_id,
+                    identity: identity.clone(),
+                    operation: operation.clone(),
+                    payload: route_payload_for_daemon_operation(
+                        operation.as_str(),
+                        payload,
+                        identity,
+                    )?,
+                });
+            }
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
                 && is_daemon_operation(&operation)
             {
@@ -1500,6 +1633,10 @@ fn is_daemon_operation(operation: &str) -> bool {
             // the `UserAutomation` runtime dispatch, and admitting it twice in
             // this matcher would make the second arm unreachable.
             | super::daemon_request_dispatch::USER_AUTOMATION_RUNTIME_OPERATION
+            | super::daemon_request_dispatch::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+            | super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION
+            | eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+            | eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
             | "health"
             | "daemon_degraded"
             | "daemon_fatal"
@@ -1532,6 +1669,10 @@ fn is_daemon_operation(operation: &str) -> bool {
             // payload.
             | super::daemon_request_dispatch::GRANT_CLOSURE_RECEIPT_OPERATION
             | super::daemon_request_dispatch::LINK_GRANT_CLOSURE_RECEIPT_OPERATION
+            // #1814: read one original committed P-07 activation through the
+            // retained authenticated owner; this selector reaches only the
+            // matching closed daemon arm and never activates or mutates.
+            | eliot_protocol::COMMITTED_GRANT_ACTIVATION_READ_OPERATION
             // Issue #1694 W2: the persist-before-ack maintenance-trigger
             // intake. The marker is the one string the admitted dispatch arm
             // already serves
@@ -1639,6 +1780,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "task_controller_result"
             | "campaign_packet_claim"
             | "campaign_packet_result"
+            | "instrument_registry_registration_claim"
+            | "instrument_registry_registration_result"
             // Issue #1741: the finish claim/result legs are separate admitted
             // operations with their own queue and attempt type, so the frame
             // must reach their own dispatch instead of falling through to the
@@ -1646,6 +1789,10 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "finish_claim"
             | "finish_result"
     )
+}
+
+fn is_historical_instrument_terminal_selector(operation: Option<&str>) -> bool {
+    operation == Some(eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION)
 }
 
 /// Returns whether the operation string selects the authenticated
@@ -1703,6 +1850,19 @@ fn route_payload_for_daemon_operation(
     if operation == USER_AUTOMATION_RUNTIME_OPERATION {
         return with_user_automation_request_identity(payload, identity);
     }
+    if operation == super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION {
+        return super::daemon_request_dispatch::without_daemon_routing_key(payload);
+    }
+    if operation == super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION {
+        return super::daemon_request_dispatch::without_daemon_routing_key(payload);
+    }
+    if matches!(
+        operation,
+        eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+            | eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+    ) {
+        return super::daemon_request_dispatch::without_daemon_routing_key(payload);
+    }
     Ok(payload)
 }
 
@@ -1721,7 +1881,10 @@ pub(crate) fn is_wasm_port_grant_operation(operation: &str) -> bool {
 
 #[cfg(test)]
 mod daemon_operation_tests {
-    use super::{DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation};
+    use super::{
+        DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation,
+        is_historical_instrument_terminal_selector,
+    };
     use crate::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 
     #[test]
@@ -1733,10 +1896,36 @@ mod daemon_operation_tests {
         assert!(is_daemon_operation(
             super::super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
         ));
+        assert!(is_daemon_operation(
+            eliot_protocol::COMMITTED_GRANT_ACTIVATION_READ_OPERATION
+        ));
+        assert!(is_daemon_operation(
+            super::super::instrument_registry_read_route::INSTRUMENT_REGISTRY_READ_OPERATION
+        ));
+        assert!(is_daemon_operation(
+            eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+        ));
+        assert!(is_daemon_operation(
+            eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+        ));
         assert!(!is_daemon_operation(
             "daemon_generation_registry_active_query"
         ));
         assert!(!is_daemon_operation("unowned-operation"));
+    }
+
+    #[test]
+    fn historical_fence_exception_selects_terminal_only() {
+        assert!(is_historical_instrument_terminal_selector(Some(
+            eliot_kernel_service::INSTRUMENT_STAGE_TERMINAL_OPERATION
+        )));
+        assert!(!is_historical_instrument_terminal_selector(Some(
+            eliot_kernel_service::INSTRUMENT_STAGE_STARTED_OPERATION
+        )));
+        assert!(!is_historical_instrument_terminal_selector(Some(
+            super::super::instrument_stage_dispatch_route::INSTRUMENT_STAGE_GRANT_OPERATION
+        )));
+        assert!(!is_historical_instrument_terminal_selector(None));
     }
 }
 
@@ -2154,6 +2343,9 @@ impl KernelComposition {
                 return Err(TransportError::SessionFenced);
             }
         } else if operation == super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION {
+            if control {
+                return Err(TransportError::SessionFenced);
+            }
             let request =
                 super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                     .map_err(|_| TransportError::SessionFenced)?;
@@ -2213,7 +2405,7 @@ impl KernelComposition {
         payload: serde_json::Value,
     ) -> Result<Frame, TransportError> {
         self.execute_testd_request_with_control(
-            session, request_id, operation, payload, false, false,
+            session, None, request_id, operation, payload, false, false,
         )
         .await
     }
@@ -2225,6 +2417,7 @@ impl KernelComposition {
     pub async fn execute_testd_request_with_control(
         &self,
         session: &Session,
+        request_identity: Option<&super::RequestIdentity>,
         request_id: super::RequestId,
         operation: &str,
         payload: serde_json::Value,
@@ -2233,7 +2426,14 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_testd_execute", "attempt");
         let result = self
-            .execute_testd_request_inner(session, request_id, operation, &payload, control)
+            .execute_testd_request_inner(
+                session,
+                request_identity,
+                request_id,
+                operation,
+                &payload,
+                control,
+            )
             .await;
         match &result {
             Ok(_) => {
@@ -2265,6 +2465,7 @@ impl KernelComposition {
     async fn execute_testd_request_inner(
         &self,
         session: &Session,
+        request_identity: Option<&super::RequestIdentity>,
         request_id: super::RequestId,
         operation: &str,
         payload: &serde_json::Value,
@@ -2307,12 +2508,24 @@ impl KernelComposition {
         if control != cancellation {
             return Err(TransportError::SessionFenced);
         }
-        if !cancellation {
+        let identity = if !cancellation {
             self.admit_material_authority_for_governor_issued_fence(
                 &session.module_generation.state_fence,
             )
             .map_err(|_| TransportError::SessionFenced)?;
-        }
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            identity
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            Some(identity)
+        } else {
+            None
+        };
         let now_unix_nanos = unix_ms().saturating_mul(1_000_000);
         if now_unix_nanos == 0 {
             return Err(TransportError::SessionFenced);
@@ -2332,6 +2545,31 @@ impl KernelComposition {
                 super::dispatch_launch::admit_testd_attempt(&service, &request, now_unix_nanos)
             }
             .map_err(|_| TransportError::SessionFenced)?
+        };
+        let response = match (identity, response) {
+            (Some(identity), eliot_kernel_service::TestdAdmissionResponse::Admitted(admission)) => {
+                // First validate the unchanged base admission. Only after the
+                // existing TestD route has admitted the exact request do we
+                // reserve and add the retained Kernel attempt grant.
+                admission
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                match super::dispatch_launch::validate_testd_instrument_admission_current(
+                    self, session, identity, &request, &admission,
+                )
+                .await
+                .map_err(|_| TransportError::SessionFenced)?
+                {
+                    Some(process_attempt_grant) => {
+                        let admission = (*admission)
+                            .with_process_attempt_grant(|| process_attempt_grant)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                        eliot_kernel_service::TestdAdmissionResponse::Admitted(Box::new(admission))
+                    }
+                    None => eliot_kernel_service::TestdAdmissionResponse::Admitted(admission),
+                }
+            }
+            (_, response) => response,
         };
         let mut reply = status_frame(
             session,
@@ -2419,7 +2657,10 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_frame("kernel.frame_testd_owner_submit", "attempt");
         if operation != super::testd_terminal_completion_route::OWNER_SUBMIT_OPERATION
-            || session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+            || !matches!(
+                session.module_generation.module_id.as_str(),
+                TESTD_MODULE_ID | ACTIVE_DAEMON_CALLER
+            )
         {
             return Err(TransportError::SessionFenced);
         }
@@ -2446,10 +2687,15 @@ impl KernelComposition {
         let request =
             super::testd_terminal_completion_route::owner_submit_request_from_payload(&payload)
                 .map_err(|_| TransportError::SessionFenced)?;
-        let response =
-            super::dispatch_launch::submit_testd_owner_job(self, identity, &request, unix_ms())
-                .await
-                .map_err(|_| TransportError::SessionFenced)?;
+        let response = super::dispatch_launch::submit_testd_owner_job(
+            self,
+            session,
+            identity,
+            &request,
+            unix_ms(),
+        )
+        .await
+        .map_err(|_| TransportError::SessionFenced)?;
         let mut reply = status_frame(
             session,
             FrameKind::Response,

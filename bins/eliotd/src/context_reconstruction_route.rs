@@ -1086,6 +1086,7 @@ mod tests {
             state_fence: fence.clone(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: "b".repeat(64),
         })

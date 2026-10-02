@@ -126,12 +126,33 @@ pub struct GovernedContour<'a, E: ?Sized> {
     executor: &'a E,
     /// The same executor, presented as the physical Git port.
     git: Option<&'a dyn SourceObservationGitPort>,
+    /// The same authority that issued the tool request, when this shot
+    /// carries a productive instrument admission.
+    instrument_authority: Option<&'a crate::TestdDispatchAuthority>,
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// Binds one executor as both the launch contour and the Git port.
     pub const fn new(executor: &'a E, git: Option<&'a dyn SourceObservationGitPort>) -> Self {
-        Self { executor, git }
+        Self {
+            executor,
+            git,
+            instrument_authority: None,
+        }
+    }
+
+    /// Binds the productive attempt's original authority to this contour so
+    /// P-04 start and reconciled terminal evidence use one retained identity.
+    pub const fn with_instrument_authority(
+        executor: &'a E,
+        git: Option<&'a dyn SourceObservationGitPort>,
+        authority: &'a crate::TestdDispatchAuthority,
+    ) -> Self {
+        Self {
+            executor,
+            git,
+            instrument_authority: Some(authority),
+        }
     }
 
     /// The admitted executor that owns the Job Object contour.
@@ -142,6 +163,10 @@ impl<'a, E: ?Sized> GovernedContour<'a, E> {
     /// The same executor presented as the physical Git port.
     pub const fn git(&self) -> Option<&'a dyn SourceObservationGitPort> {
         self.git
+    }
+
+    const fn instrument_authority(&self) -> Option<&'a crate::TestdDispatchAuthority> {
+        self.instrument_authority
     }
 }
 
@@ -234,10 +259,10 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
         presented.request.generation,
     )
     .map_err(|error| ipc_to_contract(&error))?;
-    let claimed = store.claim_next(owner, now, lease_ms)?;
+    let claimed = store.claim_presented_job(&presented.request.job_id, owner, now, lease_ms)?;
     let job = claimed.ok_or_else(|| {
         TestdError::Contract(
-            "no claimable test job for the admitted presentation; nothing was executed".to_owned(),
+            "the exact presented test job is not claimable; nothing was executed".to_owned(),
         )
     })?;
     let mut lease = job
@@ -277,14 +302,10 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             || TestdError::Corrupt("job disappeared after cancellation".to_owned()),
         )?));
     }
-    // Fresh bound admission: rebuild the Kernel request from the CLAIMED
-    // durable job and seal it with the single-use replay of the presented
-    // concrete process. The durable roots are canonical strings and the seal
-    // plus `start_claimed` compare exact strings, so every party (submitter,
-    // issuer, and this drive) must seal the canonical form; deterministic
-    // re-issuance then reproduces the persisted invocation digest, which
-    // `start_claimed` re-proves. Any mismatch fails closed inside the seal
-    // and never executes.
+    // Bind the single-use presented request to this exact claimed durable
+    // job. Productive attempts carry a separate authenticated P-03 binding;
+    // their historical queued submission digest is never regenerated or
+    // replaced.
     let admission_request = KernelProcessAdmissionRequest {
         job_id: job.job_id.clone(),
         project_id: job.project_id.clone(),
@@ -297,6 +318,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // capture it before the concrete request moves into the single-use seal.
     let operation_id = presented.process.operation_id().clone();
     let evidence_ref = presented.evidence_ref.clone();
+    let instrument_attempt = presented.instrument_attempt.clone();
     let provider = PresentedProcessProvider::single_use(
         presented.process,
         job.target_roots.allowed_contour_root.clone(),
@@ -336,7 +358,42 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
                 )?));
             }
         };
+        if job
+            .instrument_admission
+            .as_ref()
+            .and_then(|binding| binding.tool_observation.as_ref())
+            != Some(&observation)
+        {
+            finish_unknown(
+                store,
+                job,
+                lease,
+                &collector,
+                "productive tool identity differs from the retained owner observation; no process started".to_owned(),
+            )?;
+            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                || TestdError::Corrupt("job disappeared after tool mismatch".to_owned()),
+            )?));
+        }
         collector.record_tool_observation(observation)?;
+        let attempt = instrument_attempt
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        if attempt.job_id != job.job_id || attempt.attempt_seq != job.attempts {
+            return Err(TestdError::InvalidBinding);
+        }
+        // This single write transaction binds the actual P-03 request issued
+        // from the sealed Kernel response to the already-claimed attempt.
+        // The historical queued ProcessAdmission digest remains untouched.
+        store.retain_claimed_instrument_process_attempt(
+            &job.job_id,
+            lease,
+            current_clock_ms(),
+            attempt,
+            permit.request(),
+        )?;
+    } else if instrument_attempt.is_some() {
+        return Err(TestdError::InvalidBinding);
     }
     let sink: Arc<dyn eliot_process::ProcessEvidenceSink> = collector.clone();
     // The consuming start proves nothing about the outcome by itself:
@@ -344,15 +401,28 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // executor-owned `UnknownOutcome`) onto `TestdError`, so the single
     // worker-owned `inspect` is the only observation that dispositions the
     // attempt.
-    let start_result = block_on_one_shot(crate::start_claimed_from_store(
-        store,
-        job,
-        lease,
-        current_clock_ms(),
-        permit,
-        contour.executor(),
-        sink,
-    ));
+    let start_result = if let Some(attempt) = instrument_attempt.as_ref() {
+        block_on_one_shot(crate::start_claimed_instrument_from_store(
+            store,
+            job,
+            lease,
+            current_clock_ms(),
+            permit,
+            attempt,
+            contour.executor(),
+            sink,
+        ))
+    } else {
+        block_on_one_shot(crate::start_claimed_from_store(
+            store,
+            job,
+            lease,
+            current_clock_ms(),
+            permit,
+            contour.executor(),
+            sink,
+        ))
+    };
     let started_at = start_result
         .as_ref()
         .ok()
@@ -461,6 +531,7 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
         job,
         lease,
         contour.executor(),
+        contour.instrument_authority(),
         collector,
         SupervisionInput {
             deadline_ms,
@@ -543,6 +614,7 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
     job: &TestJob,
     lease: &mut Lease,
     executor: &E,
+    instrument_authority: Option<&crate::TestdDispatchAuthority>,
     collector: &EvidenceCollector,
     input: SupervisionInput,
 ) -> Result<SupervisionOutcome, TestdError> {
@@ -595,7 +667,12 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
                 // executor's reconcile owner joins the real stdout/stderr
                 // capture sessions and publishes typed final evidence into
                 // this same collector.
-                reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                reconcile_note =
+                    reconcile_operation(executor, collector, &operation_id, instrument_authority);
+                if instrument_authority.is_some() && reconcile_note.is_some() {
+                    execution = ExecutionStatus::Unknown;
+                    reason = "Kernel did not acknowledge exact terminal instrument evidence; reconcile by the same attempt".to_owned();
+                }
                 break;
             }
             Ok(_) => {
@@ -610,7 +687,15 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
                 }
                 if cancel_requested && observed_now >= cancel_deadline_ms {
                     reason = "bounded terminal supervision expired after cancellation; reconcile by exact identity".to_owned();
-                    reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                    reconcile_note = reconcile_operation(
+                        executor,
+                        collector,
+                        &operation_id,
+                        instrument_authority,
+                    );
+                    if instrument_authority.is_some() && reconcile_note.is_some() {
+                        execution = ExecutionStatus::Unknown;
+                    }
                     break;
                 }
             }
@@ -625,7 +710,11 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
                         "observation failed ({error}) so the outcome is unproven; reconcile by exact identity"
                     )
                 };
-                reconcile_note = reconcile_operation(executor, collector, &operation_id);
+                reconcile_note =
+                    reconcile_operation(executor, collector, &operation_id, instrument_authority);
+                if instrument_authority.is_some() && reconcile_note.is_some() {
+                    execution = ExecutionStatus::Unknown;
+                }
                 break;
             }
         }
@@ -855,12 +944,25 @@ fn reconcile_operation<E: ProcessExecutor + 'static>(
     executor: &E,
     collector: &EvidenceCollector,
     operation_id: &OperationId,
+    instrument_authority: Option<&crate::TestdDispatchAuthority>,
 ) -> Option<String> {
     match block_on_one_shot(executor.reconcile(operation_id.clone())) {
-        Ok(evidence) => collector
-            .record(evidence)
-            .err()
-            .map(|error| format!("reconciliation evidence was rejected: {error}")),
+        Ok(evidence) => {
+            #[cfg(windows)]
+            if let Some(authority) = instrument_authority {
+                if let Err(error) = authority.report_instrument_terminal(&evidence) {
+                    return Some(format!(
+                        "Kernel did not accept terminal instrument evidence: {error}"
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = instrument_authority;
+            collector
+                .record(evidence)
+                .err()
+                .map(|error| format!("reconciliation evidence was rejected: {error}"))
+        }
         Err(error) => Some(format!("reconciliation failed: {error}")),
     }
 }
@@ -898,6 +1000,35 @@ fn check_presented_job_binding(
     }
     if job.process.process_tree_id != presented.process.process_tree_id().as_str() {
         return Err("claimed process tree disagrees with the presented process".to_owned());
+    }
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+        let Some(attempt) = presented.instrument_attempt.as_ref() else {
+            return Err("productive attempt has no authenticated per-attempt binding".to_owned());
+        };
+        attempt
+            .validate()
+            .map_err(|error| format!("productive attempt binding is invalid: {error}"))?;
+        if attempt.job_id != job.job_id
+            || attempt.attempt_seq != job.attempts
+            || attempt.operation_id != job.process.operation_id
+            || attempt.process_request_digest != presented.process.invocation_digest()
+            || attempt.intent_effect_digest != presented.process.intent().effect_digest()
+            || attempt.instrument_admission_digest
+                != job
+                    .instrument_admission
+                    .as_ref()
+                    .map(|binding| binding.admission_grant.grant_digest.as_str())
+                    .unwrap_or_default()
+            || presented
+                .process
+                .expected_revision_heads()
+                .get("launch-grant")
+                != Some(&attempt.kernel_dispatch_grant_digest)
+        {
+            return Err("productive process differs from its exact claimed attempt".to_owned());
+        }
+    } else if presented.instrument_attempt.is_some() {
+        return Err("nonproductive job carries a productive instrument attempt".to_owned());
     }
     Ok(())
 }

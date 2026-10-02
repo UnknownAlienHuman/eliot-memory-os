@@ -544,6 +544,7 @@ mod tests {
             state_fence: test_fence(),
             descriptor_sha256: "a".repeat(64),
             peer_admission_receipt_sha256: "b".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

@@ -22,11 +22,13 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use eliot_ipc::PeerIdentity;
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
-    TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
+    HostRequestInvokeReadPayload, HostRequestResultBody, InstrumentRegistryRegistrationInvocation,
+    LocalReadAttempt, RequestIdentity, TaskControllerAttempt, TaskControllerInvocation,
+    TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_store_api::ScopeId;
 
@@ -182,6 +184,10 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                instrument_registry_registration_envelope: None,
+                instrument_registry_registration_invocation: None,
+                instrument_registry_registration_identity: None,
+                instrument_registry_registration_attempt: LocalReadAttemptState::default(),
             });
         }
         // Issue #1745 R7 persistence tail: same dispatch-owned exposure
@@ -292,6 +298,10 @@ impl KernelComposition {
                 finish_envelope: None,
                 finish_tool: None,
                 finish_attempt: LocalReadAttemptState::default(),
+                instrument_registry_registration_envelope: None,
+                instrument_registry_registration_invocation: None,
+                instrument_registry_registration_identity: None,
+                instrument_registry_registration_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -362,6 +372,301 @@ impl KernelComposition {
                     &candidate.campaign_packet_attempt,
                 )?;
                 return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Admits and queues one exact Governor-owned Instrument Registry
+    /// registration invocation. The original full request identity is
+    /// checked against the authenticated frame before this method is called
+    /// and is also retained in the digest-bound payload body.
+    pub(super) fn admit_and_queue_instrument_registry_registration(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        invocation: &InstrumentRegistryRegistrationInvocation,
+        request_identity: &RequestIdentity,
+    ) -> Result<
+        (
+            eliot_protocol::HostRequestAdmissionReceipt,
+            eliot_ors::HostRequestRecord,
+        ),
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        invocation
+            .validate_for_envelope(envelope)
+            .map_err(|_| TransportError::SessionFenced)?;
+        if &invocation.request_identity != request_identity {
+            return Err(TransportError::IdentityConflict);
+        }
+        let authenticated_owner_ref = match &session.peer {
+            PeerIdentity::Authenticated { user_identity, .. }
+                if !user_identity.trim().is_empty()
+                    && !user_identity.chars().any(char::is_control) =>
+            {
+                user_identity.as_str()
+            }
+            PeerIdentity::Authenticated { .. } | PeerIdentity::Unavailable { .. } => {
+                return Err(TransportError::PeerIdentityUnavailable);
+            }
+        };
+        if invocation.authenticated_owner_ref != authenticated_owner_ref {
+            return Err(TransportError::IdentityConflict);
+        }
+        let admitted = if matches!(
+            envelope.authenticated_source.as_ref(),
+            Some(eliot_protocol::HostRequestAuthenticatedSource::Operator { .. })
+        ) {
+            self.admit_operator_registry_registration_under_transition(
+                envelope,
+                session,
+                request_identity,
+            )?
+        } else {
+            self.admit_host_request_envelope_under_transition(envelope)?
+        };
+        if admitted.1.state == HostRequestState::ResultReceived {
+            return Ok(admitted);
+        }
+        if !matches!(
+            admitted.1.state,
+            HostRequestState::Admitted | HostRequestState::Routed
+        ) || admitted.1.result_digest.is_some()
+            || admitted.1.result_response.is_some()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let original_operation_id = admitted.1.operation_id.clone();
+        let operation_id = original_operation_id.as_str().to_owned();
+        let payload =
+            serde_json::to_value(invocation).map_err(|_| TransportError::SessionFenced)?;
+        match self.generation_gateway.ors.bind_host_request_payload(
+            &admitted.1.operation_id,
+            &envelope.envelope_sha256,
+            &payload,
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(TransportError::UnknownRequest),
+            Err(OrsError::HostRequestIdentityConflict { .. }) => {
+                return Err(TransportError::IdentityConflict);
+            }
+            Err(_) => return Err(TransportError::SessionFenced),
+        }
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let existing_connection = index.iter().find_map(|(connection_id, refs)| {
+            refs.iter()
+                .find(|candidate| {
+                    candidate.operation_id == operation_id
+                        && candidate.request_digest == envelope.envelope_sha256
+                })
+                .map(|_| connection_id.as_str())
+        });
+        if existing_connection.is_some_and(|connection| connection != envelope.connection_id) {
+            return Err(TransportError::IdentityConflict);
+        }
+        let existing_pair = index.values().flatten().any(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+                && candidate
+                    .instrument_registry_registration_envelope
+                    .is_some()
+        });
+        if !existing_pair
+            && index
+                .values()
+                .flatten()
+                .filter(|candidate| {
+                    candidate
+                        .instrument_registry_registration_envelope
+                        .is_some()
+                })
+                .count()
+                >= MAX_QUEUED_LOCAL_READS
+        {
+            return Err(TransportError::Backpressure);
+        }
+        let attempt = LocalReadAttemptState {
+            enqueue_salt: LOCAL_READ_ENQUEUE_SALT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            ..LocalReadAttemptState::default()
+        };
+        let refs = index.entry(envelope.connection_id.clone()).or_default();
+        if let Some(candidate) = refs.iter_mut().find(|candidate| {
+            candidate.operation_id == operation_id
+                && candidate.request_digest == envelope.envelope_sha256
+        }) {
+            if let Some(existing) = candidate
+                .instrument_registry_registration_invocation
+                .as_ref()
+            {
+                if existing != invocation
+                    || candidate.instrument_registry_registration_identity.as_ref()
+                        != Some(request_identity)
+                    || candidate
+                        .instrument_registry_registration_operation_id
+                        .as_ref()
+                        != Some(&original_operation_id)
+                {
+                    return Err(TransportError::IdentityConflict);
+                }
+            } else {
+                candidate.instrument_registry_registration_envelope = Some(envelope.clone());
+                candidate.instrument_registry_registration_invocation = Some(invocation.clone());
+                candidate.instrument_registry_registration_identity =
+                    Some(request_identity.clone());
+                candidate.instrument_registry_registration_operation_id =
+                    Some(original_operation_id.clone());
+                candidate.instrument_registry_registration_attempt = attempt;
+            }
+        } else {
+            refs.push(HostRequestOperationRef {
+                operation_id,
+                request_digest: envelope.envelope_sha256.clone(),
+                local_read_envelope: None,
+                local_read_tool: None,
+                local_read_held_bytes: 0,
+                local_read_attempt: LocalReadAttemptState::default(),
+                observe_envelope: None,
+                observe_tool: None,
+                observe_reservation: None,
+                observe_attempt: LocalReadAttemptState::default(),
+                campaign_packet_envelope: None,
+                campaign_packet_tool: None,
+                campaign_packet_attempt: LocalReadAttemptState::default(),
+                task_controller_envelope: None,
+                task_controller_tool: None,
+                task_controller_attempt: LocalReadAttemptState::default(),
+                finish_envelope: None,
+                finish_tool: None,
+                finish_attempt: LocalReadAttemptState::default(),
+                instrument_registry_registration_envelope: Some(envelope.clone()),
+                instrument_registry_registration_invocation: Some(invocation.clone()),
+                instrument_registry_registration_identity: Some(request_identity.clone()),
+                instrument_registry_registration_operation_id: Some(original_operation_id),
+                instrument_registry_registration_attempt: attempt,
+            });
+        }
+        Ok(admitted)
+    }
+
+    /// Claims the exact retained registration carrier and its original
+    /// identity under the authenticated daemon session and a Kernel attempt.
+    pub(crate) fn claim_instrument_registry_registration_pair(
+        &self,
+        session: &Session,
+    ) -> Result<
+        Option<(
+            HostRequestEnvelope,
+            InstrumentRegistryRegistrationInvocation,
+            RequestIdentity,
+            OperationIdentity,
+            LocalReadAttempt,
+        )>,
+        TransportError,
+    > {
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let mut index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        for refs in index.values_mut() {
+            for candidate in refs.iter_mut() {
+                let (Some(envelope), Some(invocation), Some(identity), Some(original_operation_id)) = (
+                    candidate.instrument_registry_registration_envelope.as_ref(),
+                    candidate
+                        .instrument_registry_registration_invocation
+                        .as_ref(),
+                    candidate.instrument_registry_registration_identity.as_ref(),
+                    candidate
+                        .instrument_registry_registration_operation_id
+                        .as_ref(),
+                ) else {
+                    continue;
+                };
+                invocation
+                    .validate_for_envelope(envelope)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if &invocation.request_identity != identity
+                    || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
+                    || !self.application_binding_live_for_claim(envelope, &admission_owner, true)?
+                {
+                    continue;
+                }
+                let operation = original_operation_id;
+                if operation.as_str() != candidate.operation_id {
+                    return Err(TransportError::IdentityConflict);
+                }
+                let Some(stored) = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(operation, &candidate.request_digest)
+                    .map_err(|_| TransportError::SessionFenced)?
+                else {
+                    continue;
+                };
+                if stored.kind != eliot_ors::HostRequestKind::InstrumentRegistryRegistration
+                    || stored.capability_ref.as_str() != "instrument_registry.register"
+                    || stored.request_digest != envelope.envelope_sha256
+                    || stored.payload_digest != envelope.identity.payload_sha256
+                    || stored.payload_body.as_ref()
+                        != Some(
+                            &serde_json::to_value(invocation)
+                                .map_err(|_| TransportError::SessionFenced)?,
+                        )
+                    || !matches!(
+                        stored.state,
+                        HostRequestState::Admitted | HostRequestState::Routed
+                    )
+                    || stored.result_digest.is_some()
+                {
+                    continue;
+                }
+                if !candidate
+                    .instrument_registry_registration_attempt
+                    .is_owned_by(session)
+                {
+                    let generation = candidate
+                        .instrument_registry_registration_attempt
+                        .generation
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    candidate.instrument_registry_registration_attempt = LocalReadAttemptState {
+                        attempt_id: self.mint_local_read_attempt_id(
+                            &candidate.operation_id,
+                            candidate
+                                .instrument_registry_registration_attempt
+                                .enqueue_salt,
+                            generation,
+                        ),
+                        generation,
+                        enqueue_salt: candidate
+                            .instrument_registry_registration_attempt
+                            .enqueue_salt,
+                        owner_connection_id: session.connection_id.clone(),
+                        owner_launch_nonce: session.launch_nonce.clone(),
+                        owner_session_epoch: session.session_epoch,
+                    };
+                }
+                let attempt = self.local_read_attempt_capability(
+                    envelope,
+                    operation.as_str(),
+                    &candidate.instrument_registry_registration_attempt,
+                )?;
+                return Ok(Some((
+                    envelope.clone(),
+                    invocation.clone(),
+                    identity.clone(),
+                    operation.clone(),
+                    attempt,
+                )));
             }
         }
         Ok(None)
@@ -561,6 +866,10 @@ impl KernelComposition {
                 finish_envelope: Some(envelope.clone()),
                 finish_tool: Some(tool.clone()),
                 finish_attempt,
+                instrument_registry_registration_envelope: None,
+                instrument_registry_registration_invocation: None,
+                instrument_registry_registration_identity: None,
+                instrument_registry_registration_attempt: LocalReadAttemptState::default(),
             });
         }
         Ok(())
@@ -683,6 +992,48 @@ impl KernelComposition {
         }
     }
 
+    pub(super) fn live_instrument_registry_registration_attempt_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<Option<LocalReadAttemptState>, TransportError> {
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate
+                        .instrument_registry_registration_envelope
+                        .is_some()
+            })
+            .map(|candidate| candidate.instrument_registry_registration_attempt.clone())
+            .filter(LocalReadAttemptState::is_live))
+    }
+
+    pub(super) fn retire_instrument_registry_registration_pair_under_transition(
+        &self,
+        operation_id: &str,
+        request_digest: &str,
+    ) {
+        let Ok(mut index) = self.host_request_connection_index.lock() else {
+            return;
+        };
+        for refs in index.values_mut() {
+            refs.retain(|candidate| {
+                !(candidate.operation_id == operation_id
+                    && candidate.request_digest == request_digest
+                    && candidate
+                        .instrument_registry_registration_envelope
+                        .is_some())
+            });
+        }
+    }
+
     /// Submits a campaign packet result through its independent attempt and
     /// queue ledger. It cannot consume a query claim.
     pub(crate) fn submit_campaign_packet_result(
@@ -691,6 +1042,18 @@ impl KernelComposition {
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         self.submit_claimed_result(session, body, DaemonReadQueue::CampaignPacket)
+    }
+
+    pub(crate) fn submit_instrument_registry_registration_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        self.submit_claimed_result(
+            session,
+            body,
+            DaemonReadQueue::InstrumentRegistryRegistration,
+        )
     }
 
     /// Submits the result of one claimed Task Controller invocation. The

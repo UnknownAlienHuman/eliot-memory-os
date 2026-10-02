@@ -8,7 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use eliot_instrument_api::{ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation};
 use eliot_process::{
@@ -23,18 +24,23 @@ pub mod build_projection;
 pub mod cache_lane;
 pub mod capsule_binding;
 mod dev_fast;
+pub mod kernel_registry_read_client;
 pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
 pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
+pub mod registry_owner_readback;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
 pub mod testd_registry;
 pub mod verification_profile;
 
-pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
+pub use admission_submission::{
+    AdmissionSubmission, AdmissionSubmissionReadback, PureTransformSubmission,
+    prepare_admission_submission, prepare_pure_transform_submission,
+};
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
@@ -62,7 +68,239 @@ pub use eliot_build_test_graph::{
     BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
     GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
+pub use eliot_ipc::{KernelClient, KernelClientConfig, KernelClientError, RequestIdentity};
+
+/// Returns whether process evidence describes a terminal lifecycle or an
+/// unknown outcome attributable to a real stdout/stderr transport read failure.
+/// The Kernel still independently verifies physical Job closure before it
+/// releases an instrument slot.
+#[must_use]
+pub fn process_evidence_reports_terminal_or_transport_failure(evidence: &ProcessEvidence) -> bool {
+    let lifecycle = evidence.view().lifecycle();
+    lifecycle.is_terminal()
+        || (lifecycle == eliot_process::ProcessLifecycle::UnknownOutcome
+            && (evidence.stdout().is_some_and(|stream| {
+                stream.transport() == eliot_process::StreamTransportStatus::ReadFailed
+            }) || evidence.stderr().is_some_and(|stream| {
+                stream.transport() == eliot_process::StreamTransportStatus::ReadFailed
+            })))
+}
+
+/// Authenticated Kernel observation client used by the real wrapper runtimes.
+///
+/// This adapter preserves the original request identity retained by the
+/// dispatch authority and verifies the authenticated response selector,
+/// identity, and exact operation/admission/dispatch pins before returning it
+/// to P-04.
+#[cfg(windows)]
+pub struct KernelInstrumentStageRuntimeObserver {
+    client: Mutex<KernelClient>,
+}
+
+#[cfg(windows)]
+impl KernelInstrumentStageRuntimeObserver {
+    /// Creates a runtime observer over the protected authenticated Kernel
+    /// client used by the wrapper composition.
+    pub fn new(client: KernelClient) -> Self {
+        Self {
+            client: Mutex::new(client),
+        }
+    }
+
+    fn validate_runtime_key(
+        dispatch_grant_digest: Option<&str>,
+        attempt_seq: Option<u32>,
+        job_id: Option<&str>,
+    ) -> Result<(), ProcessExecutionError> {
+        let generic_stage =
+            dispatch_grant_digest.is_some() && attempt_seq.is_none() && job_id.is_none();
+        let testd_attempt =
+            dispatch_grant_digest.is_none() && attempt_seq.is_some() && job_id.is_some();
+        if generic_stage || testd_attempt {
+            Ok(())
+        } else {
+            Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::InvalidValue {
+                    field: "instrument_stage_runtime.owner_key",
+                    reason: "generic dispatch and durable TestD attempt pins cannot be mixed",
+                },
+            ))
+        }
+    }
+
+    fn exchange(
+        &self,
+        selector: &str,
+        identity: &RequestIdentity,
+        payload: serde_json::Value,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, ProcessExecutionError> {
+        let mut client = self.client.lock().map_err(|_| {
+            ProcessExecutionError::Unavailable(
+                "Kernel instrument-stage observer lock poisoned".to_owned(),
+            )
+        })?;
+        client.set_request_identity(identity.clone());
+        let response = client
+            .transact_json_authenticated(selector, payload)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if response.operation() != selector || response.request_identity() != identity {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DigestMismatch {
+                    field: "instrument_stage_runtime.authenticated_response",
+                    expected: format!(
+                        "{selector}:{}",
+                        identity.request.metadata.request_id.as_str()
+                    ),
+                    observed: format!(
+                        "{}:{}",
+                        response.operation(),
+                        response
+                            .request_identity()
+                            .request
+                            .metadata
+                            .request_id
+                            .as_str()
+                    ),
+                },
+            ));
+        }
+        Ok(response)
+    }
+}
+
+#[cfg(windows)]
+impl eliot_kernel_service::InstrumentStageRuntimeObservationPort
+    for KernelInstrumentStageRuntimeObserver
+{
+    fn before_resume(
+        &self,
+        identity: &RequestIdentity,
+        request: eliot_kernel_service::InstrumentStageStartedRequest,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, ProcessExecutionError> {
+        use eliot_kernel_service::{
+            INSTRUMENT_STAGE_STARTED_OPERATION, InstrumentStageStartedResponse,
+        };
+
+        Self::validate_runtime_key(
+            request.dispatch_grant_digest.as_deref(),
+            request.attempt_seq,
+            request.job_id.as_deref(),
+        )?;
+
+        let payload = serde_json::to_value(&request).map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "encode authenticated instrument-stage start observation: {error}"
+            ))
+        })?;
+        let response = self.exchange(INSTRUMENT_STAGE_STARTED_OPERATION, identity, payload)?;
+        let echoed: InstrumentStageStartedResponse =
+            serde_json::from_value(response.payload().clone()).map_err(|error| {
+                ProcessExecutionError::Unavailable(format!(
+                    "decode authenticated instrument-stage start response: {error}"
+                ))
+            })?;
+        if echoed.operation_id != request.operation_id
+            || echoed.admission_digest != request.admission_digest
+            || echoed.dispatch_grant_digest != request.dispatch_grant_digest
+            || echoed.attempt_seq != request.attempt_seq
+            || echoed.job_id != request.job_id
+            || echoed.process_request_digest != request.process_request_digest
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DigestMismatch {
+                    field: "instrument_stage_runtime.started_pins",
+                    expected: format!(
+                        "{}:{}:{:?}:{:?}:{:?}:{}",
+                        request.operation_id.as_str(),
+                        request.admission_digest,
+                        request.dispatch_grant_digest,
+                        request.attempt_seq,
+                        request.job_id,
+                        request.process_request_digest
+                    ),
+                    observed: format!(
+                        "{}:{}:{:?}:{:?}:{:?}:{}",
+                        echoed.operation_id.as_str(),
+                        echoed.admission_digest,
+                        echoed.dispatch_grant_digest,
+                        echoed.attempt_seq,
+                        echoed.job_id,
+                        echoed.process_request_digest
+                    ),
+                },
+            ));
+        }
+        Ok(response)
+    }
+
+    fn terminal(
+        &self,
+        identity: &RequestIdentity,
+        request: eliot_kernel_service::InstrumentStageTerminalRequest,
+    ) -> Result<eliot_ipc::kernel_client::AuthenticatedKernelResponse, ProcessExecutionError> {
+        use eliot_kernel_service::{
+            INSTRUMENT_STAGE_TERMINAL_OPERATION, InstrumentStageTerminalResponse,
+        };
+
+        Self::validate_runtime_key(
+            request.dispatch_grant_digest.as_deref(),
+            request.attempt_seq,
+            request.job_id.as_deref(),
+        )?;
+
+        let payload = serde_json::to_value(&request).map_err(|error| {
+            ProcessExecutionError::Unavailable(format!(
+                "encode authenticated instrument-stage terminal observation: {error}"
+            ))
+        })?;
+        let response = self.exchange(INSTRUMENT_STAGE_TERMINAL_OPERATION, identity, payload)?;
+        let echoed: InstrumentStageTerminalResponse =
+            serde_json::from_value(response.payload().clone()).map_err(|error| {
+                ProcessExecutionError::Unavailable(format!(
+                    "decode authenticated instrument-stage terminal response: {error}"
+                ))
+            })?;
+        if request.evidence.view().operation_id() != &request.operation_id
+            || request.evidence.view().request_digest() != request.process_request_digest.as_str()
+            || echoed.operation_id != request.operation_id
+            || echoed.admission_digest != request.admission_digest
+            || echoed.dispatch_grant_digest != request.dispatch_grant_digest
+            || echoed.attempt_seq != request.attempt_seq
+            || echoed.job_id != request.job_id
+            || echoed.process_request_digest != request.process_request_digest
+        {
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DigestMismatch {
+                    field: "instrument_stage_runtime.terminal_pins",
+                    expected: format!(
+                        "{}:{}:{:?}:{:?}:{:?}:{}",
+                        request.operation_id.as_str(),
+                        request.admission_digest,
+                        request.dispatch_grant_digest,
+                        request.attempt_seq,
+                        request.job_id,
+                        request.process_request_digest
+                    ),
+                    observed: format!(
+                        "{}:{}:{:?}:{:?}:{:?}:{}",
+                        echoed.operation_id.as_str(),
+                        echoed.admission_digest,
+                        echoed.dispatch_grant_digest,
+                        echoed.attempt_seq,
+                        echoed.job_id,
+                        request.evidence.view().request_digest()
+                    ),
+                },
+            ));
+        }
+        Ok(response)
+    }
+}
 pub use eliot_test_selection::{FrozenSelection, TestSelectionReceipt};
+pub use kernel_registry_read_client::{
+    INSTRUMENT_REGISTRY_READ_OPERATION, InstrumentRegistryReadClient,
+    InstrumentRegistryReadRequest, registration_receipt_request, registry_state_request,
+};
 pub use package_disposition::{
     CAPABILITY_OWNER_UNIVERSE, CONSUMER_CRATE_UNIVERSE, DISPOSITION_REVIEWED_ON, DispositionError,
     DispositionField, ExecutionContour, INSTRUMENT_PACKAGE_FAMILY, PACKAGE_DISPOSITIONS,
@@ -76,21 +314,25 @@ pub use process_owner::{
 pub use profile::{
     ADMITTED_SCOPE_CLASS, ADMITTED_WORKTREE_CLASS, AdmissionError, AdmittedProfile, AdmittedStage,
     BUILTIN_PROFILE_REVISION, BUILTIN_SPEC_VERSION, BUNDLE_VERIFICATION_ALIAS,
-    BUNDLE_VERIFICATION_ROUTE, COMPILER_PROFILE, CompiledProfile, ISOLATED_PROCESS_CLASS,
-    InstrumentClass, InstrumentKindId, InstrumentProfile, InstrumentProfileResolver,
-    InstrumentRegistry, InstrumentRegistrySnapshot, InstrumentSpec, InstrumentSpecParams,
-    PACKAGE_VERIFICATION_ALIAS, PACKAGE_VERIFICATION_ROUTE, PROFILE_ALIASES, ProfileAlias,
-    ProfileCompiler, ProfileError, ProfileScopeClasses, REGISTRY_SNAPSHOT_SCHEMA,
-    REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
-    StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope,
-    admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
-    package_verification_profile, test_profile,
+    BUNDLE_VERIFICATION_ROUTE, COMPILER_PROFILE, CompiledProfile, EnvironmentPolicy,
+    ISOLATED_PROCESS_CLASS, InstrumentClass, InstrumentKindId, InstrumentProfile,
+    InstrumentProfileResolver, InstrumentRegistry, InstrumentRegistrySnapshot, InstrumentSpec,
+    InstrumentSpecParams, PACKAGE_VERIFICATION_ALIAS, PACKAGE_VERIFICATION_ROUTE, PROFILE_ALIASES,
+    ProfileAlias, ProfileCompiler, ProfileError, ProfileScopeClasses, PureTransformHandler,
+    PureTransformSpec, REGISTRY_SNAPSHOT_SCHEMA, REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile,
+    ResolvedStage, ResourceLimits, StageDag, StageDecl, StageEnvironment, StageExecution,
+    TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope, admitted_profile_for_alias,
+    bundle_verification_profile, compiler_profile, package_verification_profile, scip_profile,
+    test_profile,
 };
 pub use profile_run::{
+    AdmissionSubmissionOwnerReadback, AdmissionSubmissionProofPort, AdmittedStageGrant,
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
+    ProfileRunError, ProviderDispatch, PureTransformAdmission, PureTransformInput,
+    RegistryLaunchSelection, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
     StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
-    TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
+    TestExecutionPlaneRoute, TestdPlaneAdmission, UnprovisionedAdmissionProofPort,
+    compose_provider_dispatch, registry_launch_selection,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
@@ -104,6 +346,7 @@ pub use registry::{
     ProfileIdentities, ProfileIdentityParams, ProviderRegistry, REQUIRED_IDENTITY_SLOTS,
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
 };
+pub use registry_owner_readback::CanonicalRegistryProofPort;
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
 };
@@ -158,9 +401,15 @@ pub enum RunnerError {
     /// The request port rejected the binding.
     #[error("instrument request binding failed: {0}")]
     Binding(String),
+    /// The shared canonical registry checker refused this external stage.
+    #[error(transparent)]
+    RegistryAdmission(#[from] eliot_instrument_api::registry::RegistryAdmissionError),
     /// The process implementation rejected the operation.
     #[error(transparent)]
     Process(#[from] ProcessExecutionError),
+    /// The exact instrument kind already has its declared number of live processes.
+    #[error("instrument kind '{kind}' reached its admitted concurrency limit ({limit})")]
+    AdmissionConcurrency { kind: String, limit: u32 },
     /// The process request was not correlated to the instrument request.
     #[error("instrument and process operation identities do not match")]
     IdentityMismatch,
@@ -366,6 +615,9 @@ pub struct InstrumentStartReceipt {
     pub invocation: InstrumentInvocation,
     /// P-03 acceptance receipt.
     pub process: ProcessStartReceipt,
+    /// Exact original pre-start admission grant, when the launch used the
+    /// shared profile gate.
+    pub admission_grant: Option<InstrumentAdmissionGrant>,
     /// Executable observation pinned before launch, if verified.
     pub executable: Option<ResolvedExecutableIdentity>,
     /// Exact process argv sealed from the request at launch.
@@ -575,13 +827,118 @@ impl EnvelopedInstrumentResult {
 /// The bounded facade over the injected physical process executor.
 pub struct InstrumentRunner<E> {
     executor: Arc<E>,
+    admission_state: Arc<InstrumentAdmissionState>,
+}
+
+/// Shared live-process accounting for clones of one runner owner.
+///
+/// Each slot is retained from admitted start until terminal inspection or
+/// successful reconciliation. Sharing this value is required when one
+/// executor owner is exposed through multiple Runner handles.
+#[derive(Debug, Default)]
+pub struct InstrumentAdmissionState {
+    inner: Mutex<InstrumentAdmissionStateInner>,
+}
+
+#[derive(Debug, Default)]
+struct InstrumentAdmissionStateInner {
+    active: BTreeMap<String, ActiveInstrumentOperation>,
+}
+
+#[derive(Debug)]
+struct ActiveInstrumentOperation {
+    kind: String,
+}
+
+impl InstrumentAdmissionState {
+    fn reserve(
+        &self,
+        operation: &OperationId,
+        grant: &InstrumentAdmissionGrant,
+    ) -> Result<(), RunnerError> {
+        let operation = operation.as_str().to_owned();
+        let kind = format!("{}@{}", grant.kind_id, grant.kind_version);
+        let mut inner = self.inner.lock().map_err(|_| {
+            RunnerError::Binding("instrument admission state is unavailable".to_owned())
+        })?;
+        if inner.active.contains_key(&operation) {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        let count = inner
+            .active
+            .values()
+            .filter(|active| active.kind == kind)
+            .count();
+        if count >= grant.max_concurrency as usize {
+            return Err(RunnerError::AdmissionConcurrency {
+                kind: grant.kind_id.clone(),
+                limit: grant.max_concurrency,
+            });
+        }
+        inner
+            .active
+            .insert(operation, ActiveInstrumentOperation { kind });
+        Ok(())
+    }
+
+    fn release(&self, operation: &OperationId) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active.remove(operation.as_str());
+        }
+    }
+
+    fn release_after_pre_resume_refusal(
+        &self,
+        operation: &OperationId,
+        error: &RunnerError,
+    ) -> bool {
+        if matches!(
+            error,
+            RunnerError::Process(ProcessExecutionError::Contract(_))
+        ) {
+            self.release(operation);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<E> Clone for InstrumentRunner<E> {
+    fn clone(&self) -> Self {
+        Self {
+            executor: Arc::clone(&self.executor),
+            admission_state: Arc::clone(&self.admission_state),
+        }
+    }
 }
 
 impl<E> InstrumentRunner<E> {
     /// Creates a runner around the active production process executor.
     #[must_use]
     pub fn new(executor: Arc<E>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            admission_state: Arc::new(InstrumentAdmissionState::default()),
+        }
+    }
+
+    /// Creates a runner using owner-shared per-kind live-process accounting.
+    #[must_use]
+    pub fn new_with_admission_state(
+        executor: Arc<E>,
+        admission_state: Arc<InstrumentAdmissionState>,
+    ) -> Self {
+        Self {
+            executor,
+            admission_state,
+        }
+    }
+
+    /// Returns the admission state that sibling runner handles must share.
+    #[must_use]
+    pub fn admission_state(&self) -> Arc<InstrumentAdmissionState> {
+        Arc::clone(&self.admission_state)
     }
 }
 
@@ -591,7 +948,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// # Errors
     /// Returns an error when binding or process launch fails, or when the
     /// returned receipt does not preserve the binding identity.
-    pub async fn launch_bound(
+    pub(crate) async fn launch_bound(
         &self,
         invocation: InstrumentInvocation,
         port: &dyn InstrumentRequestPort,
@@ -617,7 +974,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// Returns an error when binding, identity pinning, or process launch
     /// fails, or when the returned receipt does not preserve the binding
     /// identity.
-    pub async fn launch_verified(
+    pub(crate) async fn launch_verified(
         &self,
         invocation: InstrumentInvocation,
         port: &dyn InstrumentRequestPort,
@@ -649,7 +1006,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     ///
     /// Returns [`RunnerError::BootstrapRejected`] when the receipt covers a
     /// different surface, or the underlying launch error otherwise.
-    pub async fn launch_verified_with_bootstrap(
+    pub(crate) async fn launch_verified_with_bootstrap(
         &self,
         invocation: InstrumentInvocation,
         port: &dyn InstrumentRequestPort,
@@ -672,7 +1029,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// # Errors
     /// Returns an error when the binding is already consumed, process launch
     /// fails, or the returned receipt does not preserve its identity.
-    pub async fn launch(
+    pub(crate) async fn launch(
         &self,
         binding: &mut InstrumentBinding,
         sink: Arc<dyn ProcessEvidenceSink>,
@@ -704,6 +1061,7 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         Ok(InstrumentStartReceipt {
             invocation: binding.invocation.clone(),
             process,
+            admission_grant: None,
             executable,
             argv,
             working_directory,
@@ -725,13 +1083,17 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
     /// Returns [`RunnerError::ReceiptMismatch`] when the grant does not seal
     /// itself, the binding is already consumed, or the sealed request drifts
     /// from the grant, and the underlying launch error otherwise.
-    pub async fn launch_admitted(
+    pub(crate) async fn launch_admitted(
         &self,
         binding: &mut InstrumentBinding,
-        grant: &InstrumentAdmissionGrant,
+        admitted: &profile_run::AdmittedStageGrant,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<InstrumentStartReceipt, RunnerError> {
+        let grant = &admitted.grant;
         if grant.digest() != grant.grant_digest {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        if profile_run::admitted_binding_seal(binding)? != admitted.binding_seal {
             return Err(RunnerError::ReceiptMismatch);
         }
         let Some(request) = binding.process_request.as_ref() else {
@@ -743,7 +1105,38 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         if request.executable_sha256() != grant.content_digest.as_str() {
             return Err(RunnerError::ReceiptMismatch);
         }
-        self.launch(binding, sink).await
+        if grant.source_root.as_deref() != Some(request.working_directory())
+            || grant.declared_scope.as_deref() != Some(binding.invocation.declared_scope.as_str())
+            || grant.environment_digest.as_deref()
+                != Some(
+                    eliot_process_executor::environment_projection_digest(request.environment())
+                        .as_str(),
+                )
+            || grant.authority_epoch.as_ref() != Some(request.fence().authority_epoch())
+            || grant.resource_generation != Some(request.fence().generation().get())
+        {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        if request.intent().instrument_admission_digest() != Some(grant.digest().as_str()) {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        if request.intent().executable_file_identity() != grant.executable_file_identity.as_ref()
+            || grant.executable_file_identity.is_none()
+        {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        self.admission_state.reserve(&binding.operation_id, grant)?;
+        match self.launch(binding, sink).await {
+            Ok(mut receipt) => {
+                receipt.admission_grant = Some(grant.clone());
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.admission_state
+                    .release_after_pre_resume_refusal(&binding.operation_id, &error);
+                Err(error)
+            }
+        }
     }
 
     /// Inspects an operation and preserves the binding identity.
@@ -755,12 +1148,20 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         &self,
         binding: &InstrumentBinding,
     ) -> Result<InstrumentObservation, RunnerError> {
-        let view = self.executor.inspect(binding.operation_id.clone()).await?;
+        let view = match self.executor.inspect(binding.operation_id.clone()).await {
+            Ok(view) => view,
+            Err(error) => {
+                return Err(RunnerError::from(error));
+            }
+        };
         if view.operation_id() != &binding.operation_id
             || view.request_digest() != binding.request_digest
             || view.fence().generation().get() != binding.generation
         {
             return Err(RunnerError::ObservationMismatch);
+        }
+        if view.lifecycle().is_terminal() {
+            self.admission_state.release(&binding.operation_id);
         }
         Ok(InstrumentObservation {
             invocation: binding.invocation.clone(),
@@ -789,15 +1190,18 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
         &self,
         binding: &InstrumentBinding,
     ) -> Result<ProcessEvidence, RunnerError> {
-        let evidence = self
-            .executor
-            .reconcile(binding.operation_id.clone())
-            .await?;
+        let evidence = match self.executor.reconcile(binding.operation_id.clone()).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Err(RunnerError::from(error));
+            }
+        };
         if evidence.operation_id() != &binding.operation_id
             || evidence.request_digest() != binding.request_digest
         {
             return Err(RunnerError::ObservationMismatch);
         }
+        self.admission_state.release(&binding.operation_id);
         Ok(evidence)
     }
 }
@@ -805,8 +1209,9 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
 /// Converts an executor-side machine observation into the registry-bound
 /// identity form.
 ///
-/// Both records carry the same five machine-derived fields (canonical path,
-/// content digest, tool version, environment digest, exact argv); the
+/// Both records carry the same machine-derived fields (canonical path, exact
+/// file-object identity, content digest, tool version, environment digest,
+/// exact argv); the
 /// executor resolves them from the machine at launch while the registry
 /// checks them before launch and at verdict time. Validation is re-applied
 /// under the claiming `instrument` so a bridged observation can never carry
@@ -815,6 +1220,7 @@ impl From<eliot_process_executor::ExecutableObservation> for ResolvedExecutableI
     fn from(observation: eliot_process_executor::ExecutableObservation) -> Self {
         Self {
             canonical_path: observation.canonical_path,
+            file_identity: observation.file_identity,
             content_digest: observation.content_digest,
             tool_version: observation.tool_version,
             environment_digest: observation.environment_digest,
@@ -837,14 +1243,17 @@ pub fn bridge_executor_observation(
     instrument: &str,
     observation: eliot_process_executor::ExecutableObservation,
 ) -> Result<ResolvedExecutableIdentity, RegistryError> {
-    ResolvedExecutableIdentity::new(
+    let file_identity = observation.file_identity;
+    let mut resolved = ResolvedExecutableIdentity::new(
         instrument,
         observation.canonical_path,
         observation.content_digest,
         observation.tool_version,
         observation.environment_digest,
         observation.arguments,
-    )
+    )?;
+    resolved.file_identity = file_identity;
+    Ok(resolved)
 }
 
 /// Compatibility name for composition roots using the bounded terminology.
@@ -890,14 +1299,93 @@ fn successful_exit(exit: &ExitStatus) -> bool {
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ArtifactId, ClockReading, ContractId, EpochId, EpochLineageId, ProductId, RequestId,
-        RequestMetadata, SourceId, StateFence,
+        ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId,
+        RequestId, RequestMetadata, SourceId, StateFence,
     };
     use eliot_instrument_api::InstrumentKind;
     use eliot_instrument_rustc::RUSTC_INSTRUMENT;
     use std::num::NonZeroU64;
 
     use crate::registry::InvalidationSet;
+
+    #[test]
+    fn per_kind_concurrency_is_independent_and_released_only_for_the_terminal_operation() {
+        fn grant(kind: &str, max_concurrency: u32) -> InstrumentAdmissionGrant {
+            let identity = ContractId::new(kind.to_owned()).expect("kind identity");
+            InstrumentAdmissionGrant {
+                kind_id: kind.to_owned(),
+                kind_version: ContractVersion::new(1, 0, 0),
+                kind: InstrumentKind::Test,
+                profile: "profile:test".to_owned(),
+                profile_revision: 1,
+                spec_digest: "a".repeat(64),
+                executable: "test-runner.exe".to_owned(),
+                executable_version: None,
+                content_digest: "b".repeat(64),
+                executable_path: "C:\\tools\\test-runner.exe".to_owned(),
+                executable_file_identity: None,
+                supply_digest: "c".repeat(64),
+                arguments: vec!["test".to_owned()],
+                environment_class: "isolated-process".to_owned(),
+                scope_class: "admitted-scope".to_owned(),
+                source_root: Some("C:\\work".to_owned()),
+                declared_scope: Some("workspace".to_owned()),
+                environment_digest: Some("d".repeat(64)),
+                authority_epoch: None,
+                resource_generation: Some(1),
+                credential_policy: identity.clone(),
+                network_policy: identity.clone(),
+                timeout_ms: None,
+                max_output_bytes: None,
+                parser: identity,
+                parser_generation: 1,
+                max_concurrency,
+                grant_digest: String::new(),
+            }
+        }
+
+        let state = InstrumentAdmissionState::default();
+        let first = OperationId::new("operation:first").expect("operation");
+        let same_kind = OperationId::new("operation:same-kind").expect("operation");
+        let other_kind = OperationId::new("operation:other-kind").expect("operation");
+        let pre_resume_refused =
+            OperationId::new("operation:pre-resume-refused").expect("operation");
+        let unknown_outcome = OperationId::new("operation:unknown-outcome").expect("operation");
+        let kind_a = grant("eliot.instrument.testd.alpha", 1);
+        let kind_b = grant("eliot.instrument.testd.beta", 1);
+
+        assert!(state.reserve(&first, &kind_a).is_ok());
+        assert!(matches!(
+            state.reserve(&same_kind, &kind_a),
+            Err(RunnerError::AdmissionConcurrency { kind, limit: 1 })
+                if kind == kind_a.kind_id
+        ));
+        assert!(state.reserve(&other_kind, &kind_b).is_ok());
+        state.release(&first);
+        assert!(state.reserve(&same_kind, &kind_a).is_ok());
+
+        assert!(state.reserve(&pre_resume_refused, &kind_b).is_ok());
+        let contract_refusal = RunnerError::Process(ProcessExecutionError::Contract(
+            eliot_contracts::ContractError::InvalidValue {
+                field: "pre_resume_test",
+                reason: "validation refused before resume",
+            },
+        ));
+        assert!(state.release_after_pre_resume_refusal(&pre_resume_refused, &contract_refusal));
+        assert!(state.reserve(&pre_resume_refused, &kind_b).is_ok());
+
+        state.release(&other_kind);
+        assert!(state.reserve(&unknown_outcome, &kind_b).is_ok());
+        let uncertain_start = RunnerError::Process(ProcessExecutionError::UnknownOutcome);
+        assert!(!state.release_after_pre_resume_refusal(&unknown_outcome, &uncertain_start));
+        assert!(matches!(
+            state.reserve(
+                &OperationId::new("operation:still-full").expect("operation"),
+                &kind_b
+            ),
+            Err(RunnerError::AdmissionConcurrency { limit: 1, .. })
+        ));
+    }
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 

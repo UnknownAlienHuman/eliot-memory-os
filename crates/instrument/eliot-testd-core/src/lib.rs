@@ -16,11 +16,14 @@ use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
 };
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
+use eliot_instrument_api::registry::ResolvedExecutionBinding;
 use eliot_instrument_api::{
-    ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
+    ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation, InstrumentKind,
+    VerificationRun,
 };
 use eliot_process::{
-    EnvironmentInheritance, EnvironmentProjection, ProcessRequest, ResourceLimits,
+    EnvironmentInheritance, EnvironmentProjection, ProcessIntent, ProcessRequest, ResourceLimits,
+    StreamTransportStatus,
 };
 use eliot_protocol::RequestIdentity;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -954,6 +957,14 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1")
 /// rewriting job payloads.
 const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("testd_admitted_identities_v1");
+/// Immutable P-03 requests created from Kernel-issued productive TestD attempt
+/// grants. The original submission digest remains in `TestJob.process`.
+const INSTRUMENT_ATTEMPTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("testd_instrument_attempts_v1");
+
+fn instrument_attempt_key(job_id: &str, attempt_seq: u32) -> String {
+    format!("{}:{job_id}:{attempt_seq}", job_id.len())
+}
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -1415,6 +1426,10 @@ pub struct TestJob {
     /// never selects a fallback namespace.
     #[serde(default)]
     pub fixture_namespace: Option<String>,
+    /// Kernel-authored exact canonical Instrument admission and original
+    /// registration proof retained before productive execution.
+    #[serde(default)]
+    pub instrument_admission: Option<TestdInstrumentAdmissionBinding>,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Declared job class. The class, not the raw `priority` integer, is the
@@ -1898,6 +1913,9 @@ pub struct TestdVerifierJobSubmission {
     pub job_id: String,
     pub project_id: String,
     pub invocation: InstrumentInvocation,
+    /// Kernel-authored live profile/stage selection and original canonical
+    /// registration proof. Productive rows cannot be submitted without it.
+    pub instrument_admission: TestdInstrumentAdmissionBinding,
     pub target_roots: TargetRoots,
     /// Owner-issued layout binding the roots resolve from, when the
     /// submitting owner derived them from a workspace/checkout/class layout.
@@ -1918,6 +1936,166 @@ pub struct TestdVerifierJobSubmission {
     pub metadata: JobSubmissionMetadata,
 }
 
+/// Kernel-authored durable pins for one productive external Instrument stage.
+/// The profile/stage tuple selects the exact external stage; generation is
+/// read from the canonical registry snapshot. The original owner receipt and
+/// readback are retained verbatim for currentness checks on every attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdInstrumentAdmissionBinding {
+    pub scope_id: String,
+    pub profile: String,
+    pub profile_revision: u64,
+    pub stage_id: String,
+    pub registry_generation: u64,
+    /// Exact resolved WorkScope/environment/fence used to validate the stage.
+    pub resolution: ResolvedExecutionBinding,
+    /// Original owner-observed productive tool identities used to derive the
+    /// closed environment again at every durable attempt.
+    #[serde(default)]
+    pub tool_observation: Option<TestdToolObservation>,
+    /// Exact Kernel-authored ProcessIntent whose dispatch grant was issued.
+    pub process_intent: ProcessIntent,
+    pub admission_grant: InstrumentAdmissionGrant,
+    pub original_receipt_json: String,
+    pub original_readback_json: String,
+}
+
+/// Bind-once P-03 identity for one Kernel-admitted productive TestD attempt.
+/// This record supplements, and never replaces, the original queued
+/// `ProcessAdmission` stored on `TestJob`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdInstrumentProcessAttemptBinding {
+    /// Durable job whose original registered intent is being attempted.
+    pub job_id: String,
+    /// Exact physical claim sequence allocated by the TestD owner.
+    pub attempt_seq: u32,
+    /// Original authenticated Kernel identity for this TestD operation.
+    pub request_identity: RequestIdentity,
+    /// Original operation identity retained in the job and intent.
+    pub operation_id: String,
+    /// Intent digest admitted by the canonical instrument owner.
+    pub intent_effect_digest: String,
+    /// Digest of the original registered instrument admission.
+    pub instrument_admission_digest: String,
+    /// Digest of the Kernel-issued attempt dispatch grant.
+    pub kernel_dispatch_grant_digest: String,
+    /// Exact P-03 request digest produced by the private Kernel child issuer.
+    pub process_request_digest: String,
+}
+
+impl TestdInstrumentProcessAttemptBinding {
+    /// Validates the closed persisted identity and digest shape.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        validate_text(&self.job_id, "instrument_attempt.job_id")?;
+        validate_text(&self.operation_id, "instrument_attempt.operation_id")?;
+        self.request_identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if self.attempt_seq == 0
+            || self.request_identity.request.metadata.request_id.as_str() != self.operation_id
+            || !is_binding_digest(&self.intent_effect_digest)
+            || !is_binding_digest(&self.instrument_admission_digest)
+            || !is_binding_digest(&self.kernel_dispatch_grant_digest)
+            || !is_binding_digest(&self.process_request_digest)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
+
+impl TestdInstrumentAdmissionBinding {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("instrument_admission.scope_id", self.scope_id.as_str()),
+            ("instrument_admission.profile", self.profile.as_str()),
+            ("instrument_admission.stage_id", self.stage_id.as_str()),
+            (
+                "instrument_admission.original_receipt_json",
+                self.original_receipt_json.as_str(),
+            ),
+            (
+                "instrument_admission.original_readback_json",
+                self.original_readback_json.as_str(),
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.profile != TESTD_PRODUCTIVE_PROFILE
+            || self.profile_revision == 0
+            || self.registry_generation == 0
+            || self.admission_grant.profile != self.profile
+            || self.admission_grant.profile_revision != self.profile_revision
+            || self.admission_grant.grant_digest != self.admission_grant.digest()
+            || self.admission_grant.max_concurrency == 0
+        {
+            return Err(TestdError::Invalid {
+                field: "instrument_admission",
+                reason: "productive stage pins require exact registered profile revisions and valid instrument limits",
+            });
+        }
+        let observation = self.tool_observation.as_ref().ok_or(TestdError::Invalid {
+            field: "instrument_admission.tool_observation",
+            reason: "productive instrument admission requires the original owner observation",
+        })?;
+        observation.validate()?;
+        if observation.nextest_path != self.process_intent.executable()
+            || observation.nextest_sha256 != self.process_intent.executable_sha256()
+        {
+            return Err(TestdError::Invalid {
+                field: "instrument_admission.tool_observation",
+                reason: "observed nextest identity differs from the sealed process intent",
+            });
+        }
+        self.process_intent
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if self.process_intent.executable() != self.admission_grant.executable_path
+            || self.process_intent.executable_sha256() != self.admission_grant.content_digest
+            || self.process_intent.argv() != self.admission_grant.arguments
+            || self.admission_grant.executable_file_identity.as_ref()
+                != self.process_intent.executable_file_identity()
+            || self.process_intent.instrument_admission_digest()
+                != Some(self.admission_grant.digest.as_str())
+            || self.process_intent.working_directory() != self.resolution.source_root
+            || self.resolution.resource_generation != self.process_intent.generation().get()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let receipt: serde_json::Value = serde_json::from_str(&self.original_receipt_json)
+            .map_err(|_| TestdError::Invalid {
+                field: "instrument_admission.original_receipt_json",
+                reason: "must retain the original canonical owner receipt JSON",
+            })?;
+        let readback: serde_json::Value = serde_json::from_str(&self.original_readback_json)
+            .map_err(|_| TestdError::Invalid {
+                field: "instrument_admission.original_readback_json",
+                reason: "must retain the original canonical owner readback JSON",
+            })?;
+        if !receipt.is_object() || !readback.is_object() {
+            return Err(TestdError::Invalid {
+                field: "instrument_admission",
+                reason: "original canonical owner proof values must be JSON objects",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates a binding at a new submission or launch boundary.
+    pub fn validate_for_new_attempt(&self) -> Result<(), TestdError> {
+        self.validate()?;
+        if self.admission_grant.executable_file_identity.is_none() {
+            return Err(TestdError::Invalid {
+                field: "instrument_admission",
+                reason: "new attempts require the exact executable file identity",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Authenticated Kernel owner-submit operation for one productive verifier.
 /// The transport identity is carried by the enclosing Kernel frame; this
 /// payload contains only the Governor-resolved project/source binding, the
@@ -1926,7 +2104,7 @@ pub const TESTD_OWNER_SUBMIT_OPERATION: &str = "eliot.kernel.testd-owner-submit"
 /// Current TestD owner operation wire revision.
 pub const TESTD_OWNER_WIRE_VERSION: u16 = 1;
 /// Submit-specific wire revision. Other TestD owner routes remain at v1.
-pub const TESTD_OWNER_SUBMIT_WIRE_VERSION: u16 = 2;
+pub const TESTD_OWNER_SUBMIT_WIRE_VERSION: u16 = 3;
 
 /// Governor-resolved input to the Kernel-owned productive TestD owner.
 /// `source_root` is the TaskContract WorkScope result; `project_id` is an
@@ -1937,22 +2115,33 @@ pub struct TestdOwnerJobSubmission {
     pub project_id: String,
     pub invocation: InstrumentInvocation,
     pub source_root: String,
+    /// Exact current WorkScope selected by the authenticated owner.
+    /// This is an inert selector; Kernel resolves it against the live task and
+    /// canonical registry before it can authorize a process.
+    pub scope_id: String,
+    /// Immutable revision of the registered profile selected by the owner.
+    pub profile_revision: u64,
+    /// Exact stage selected from that registered profile.
+    pub stage_id: String,
 }
 
 impl TestdOwnerJobSubmission {
     pub fn validate(&self) -> Result<(), TestdError> {
         validate_text(&self.project_id, "project_id")?;
         validate_text(&self.source_root, "source_root")?;
+        validate_text(&self.scope_id, "scope_id")?;
+        validate_text(&self.stage_id, "stage_id")?;
         self.invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
         if self.invocation.kind != InstrumentKind::Test
             || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
             || !self.invocation.arguments.is_empty()
+            || self.profile_revision == 0
         {
             return Err(TestdError::Invalid {
-                field: "invocation",
-                reason: "productive submission requires the registered TestD profile and no caller arguments",
+                field: "selection",
+                reason: "productive submission requires the registered TestD profile revision, selected stage, and no caller arguments",
             });
         }
         Ok(())
@@ -2191,6 +2380,7 @@ impl TestdVerifierJobSubmission {
                 reason: "productive submission requires the registered TestD profile and no caller arguments",
             });
         }
+        self.instrument_admission.validate_for_new_attempt()?;
         if let Some(layout) = self.target_layout.as_ref() {
             layout.validate()?;
         }
@@ -2787,6 +2977,18 @@ impl VerificationReceipt {
         }
     }
 
+    fn has_transport_or_integrity_fault(&self) -> bool {
+        self.typed_evidence.iter().any(|bundle| {
+            [&bundle.stdout, &bundle.stderr].into_iter().any(|slot| {
+                slot.disposition == TestdStreamDisposition::IntegrityBroken
+                    || slot.binding.as_ref().is_some_and(|binding| {
+                        binding.disposition == TestdStreamDisposition::IntegrityBroken
+                            || binding.transport == StreamTransportStatus::ReadFailed
+                    })
+            })
+        })
+    }
+
     /// Validates identity and exact raw-handle lineage before publication.
     pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
         job.target_roots.validate()?;
@@ -2795,6 +2997,7 @@ impl VerificationReceipt {
             job.target_layout.as_ref(),
             job.work_envelope.as_ref(),
             job.fixture_namespace.as_deref(),
+            job.instrument_admission.as_ref(),
         )?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
@@ -3379,6 +3582,7 @@ impl TestdStore {
         // stores migrate idempotently without rewriting job payloads.
         let write = db.begin_write().map_err(database)?;
         drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
+        drop(write.open_table(INSTRUMENT_ATTEMPTS).map_err(database)?);
         write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
@@ -3399,6 +3603,26 @@ impl TestdStore {
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
             })
+    }
+
+    /// Returns the exact RequestIdentity committed with a productive job.
+    ///
+    /// Kernel admission uses this owner read to ensure a later attempt carries
+    /// the same original request identity instead of reusing a job id under a
+    /// foreign operation or task.
+    pub fn admitted_request_identity(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<RequestIdentity>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+        table
+            .get(job_id)
+            .map_err(database)?
+            .map(|value| serde_json::from_slice(value.value()))
+            .transpose()
+            .map_err(|error| TestdError::Corrupt(error.to_string()))
     }
 
     /// Attaches the exact Governor request and current plan before a
@@ -4086,6 +4310,7 @@ impl TestdStore {
             target_roots,
             None,
             None,
+            None,
             priority,
             metadata,
             at_ms,
@@ -4118,6 +4343,7 @@ impl TestdStore {
             target_roots,
             Some(target_layout),
             None,
+            None,
             priority,
             metadata,
             at_ms,
@@ -4138,6 +4364,7 @@ impl TestdStore {
         target_roots: TargetRoots,
         target_layout: Option<TargetLayoutBinding>,
         lane: Option<LaneIdentity>,
+        instrument_admission: Option<TestdInstrumentAdmissionBinding>,
         priority: i32,
         metadata: JobSubmissionMetadata,
         at_ms: u64,
@@ -4158,6 +4385,23 @@ impl TestdStore {
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
         grant.validate_for_process(&job_id, invocation.request.request_id.as_str(), &process)?;
+        if let Some(binding) = instrument_admission.as_ref() {
+            binding.validate_for_new_attempt()?;
+            if binding.process_intent != *process.intent()
+                || binding.process_intent.operation_id().as_str()
+                    != invocation.request.request_id.as_str()
+                || binding.admission_grant.profile != invocation.profile
+                || binding.admission_grant.kind != invocation.kind
+                || binding.resolution.declared_scope != invocation.declared_scope
+                || binding.resolution.resource_generation != process.generation().get()
+                || !binding
+                    .resolution
+                    .authority_epoch
+                    .is_same_authority(process.fence().authority_epoch())
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         if !matches!(invocation.kind, InstrumentKind::Test) {
             return Err(TestdError::WrongInstrumentKind);
         }
@@ -4223,6 +4467,12 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        if invocation.profile == TESTD_PRODUCTIVE_PROFILE && identity.is_some() {
+            instrument_admission
+                .as_ref()
+                .ok_or(TestdError::InvalidBinding)?
+                .validate()?;
+        }
         // Issue #1897 (W1): allocate the governed work-execution envelope
         // for the productive submission path. The claims are the job's own
         // declared exclusive resources — the submission carries no second
@@ -4284,6 +4534,7 @@ impl TestdStore {
             target_layout.as_ref(),
             work_envelope.as_ref(),
             fixture_namespace.as_deref(),
+            instrument_admission.as_ref(),
         )?;
         let digest = payload_digest(
             &invocation,
@@ -4294,6 +4545,7 @@ impl TestdStore {
             &resource_profile,
             work_envelope.as_ref(),
             fixture_namespace.as_deref(),
+            instrument_admission.as_ref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4396,6 +4648,7 @@ impl TestdStore {
             target_layout,
             work_envelope,
             fixture_namespace,
+            instrument_admission,
             priority,
             job_class,
             resource_profile,
@@ -4476,6 +4729,7 @@ impl TestdStore {
             submission.target_roots,
             submission.target_layout,
             submission.lane,
+            Some(submission.instrument_admission),
             submission.priority,
             submission.metadata,
             now,
@@ -4486,6 +4740,32 @@ impl TestdStore {
     /// Claims the oldest ready head of a project, with priority as a tie-breaker.
     pub fn claim_next(
         &self,
+        owner: impl Into<String>,
+        now: u64,
+        lease_ms: u64,
+    ) -> Result<Option<TestJob>, TestdError> {
+        self.claim_ready_job(None, owner, now, lease_ms)
+    }
+
+    /// Claims the exact presented job when it is currently eligible.
+    ///
+    /// This shares the ordinary claim path and its project-head, instrument,
+    /// resource, lease, and scheduling checks. A missing or ineligible job
+    /// returns `None`; it never falls back to another ready job.
+    pub fn claim_presented_job(
+        &self,
+        job_id: &str,
+        owner: impl Into<String>,
+        now: u64,
+        lease_ms: u64,
+    ) -> Result<Option<TestJob>, TestdError> {
+        validate_text(job_id, "job_id")?;
+        self.claim_ready_job(Some(job_id), owner, now, lease_ms)
+    }
+
+    fn claim_ready_job(
+        &self,
+        exact_job_id: Option<&str>,
         owner: impl Into<String>,
         now: u64,
         lease_ms: u64,
@@ -4504,44 +4784,76 @@ impl TestdStore {
         // it needs a fresh claim, lease, and permit binding.
         self.reconcile_expired_running_all(now)?;
         let running_weight = self.running_weight_units()?;
-        let candidates = self.ready_heads(now)?;
-        let Some(candidate) = candidates
-            .into_iter()
-            .filter(|candidate| {
-                candidate.invocation.profile != TESTD_PRODUCTIVE_PROFILE
-                    || candidate.verifier_dispatch.is_some()
-            })
-            .filter(|candidate| {
-                // A background job may not consume the capacity reserved for
-                // Kernel, Watchdog, Control Reserve, verification, and
-                // interactive product work. Under constrained capacity a
-                // background job waits rather than displacing a protected
-                // class, so a queued verification job still starts first.
-                !candidate.job_class.is_background() || running_weight < RESERVED_FOREGROUND_WEIGHT
-            })
-            .max_by(compare_ready)
-        else {
-            return Ok(None);
-        };
-        let mut job = candidate;
-        let write = self.database.begin_write().map_err(database)?;
-        let persisted = {
-            let table = write.open_table(JOBS).map_err(database)?;
-            let current = table
-                .get(job.job_id.as_str())
-                .map_err(database)?
-                .ok_or_else(|| TestdError::Corrupt("claimed job disappeared".to_owned()))?;
-            serde_json::from_slice::<TestJob>(current.value())
-                .map_err(|error| TestdError::Corrupt(error.to_string()))?
-        };
-        job = persisted;
-        job.target_roots.validate()?;
-        if !matches!(job.state, JobState::Queued | JobState::RetryWait)
-            || job.not_before_ms > now
-            || job.lease.is_some()
-        {
-            return Ok(None);
+        let mut candidates = self.ready_heads(now)?;
+        if let Some(exact_job_id) = exact_job_id {
+            candidates.retain(|candidate| candidate.job_id == exact_job_id);
         }
+        let write = self.database.begin_write().map_err(database)?;
+        let eligible = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let mut eligible = Vec::new();
+            for candidate in candidates {
+                let Some(current) = table.get(candidate.job_id.as_str()).map_err(database)? else {
+                    continue;
+                };
+                let current = serde_json::from_slice::<TestJob>(current.value())
+                    .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                if !matches!(current.state, JobState::Queued | JobState::RetryWait)
+                    || current.not_before_ms > now
+                    || current.lease.is_some()
+                    || (current.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+                        && current.verifier_dispatch.is_none())
+                    || (current.job_class.is_background()
+                        && running_weight >= RESERVED_FOREGROUND_WEIGHT)
+                {
+                    continue;
+                }
+                if let Some(binding) = current.instrument_admission.as_ref() {
+                    // A stale or malformed queued row is refused as a claim
+                    // candidate, but it must not prevent an independent
+                    // lawful instrument kind from being selected below.
+                    if binding.validate_for_new_attempt().is_err() {
+                        continue;
+                    }
+                    let grant = &binding.admission_grant;
+                    let mut running_same_instrument = 0usize;
+                    for entry in table.iter().map_err(database)? {
+                        let (_, value) = entry.map_err(database)?;
+                        let running = serde_json::from_slice::<TestJob>(value.value())
+                            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                        if running.state != JobState::Running {
+                            continue;
+                        }
+                        let Some(other) = running.instrument_admission.as_ref() else {
+                            if running.invocation.profile == TESTD_PRODUCTIVE_PROFILE {
+                                return Err(TestdError::Corrupt(
+                                    "running productive job has no instrument admission".to_owned(),
+                                ));
+                            }
+                            continue;
+                        };
+                        other.validate()?;
+                        if other.admission_grant.kind_id == grant.kind_id
+                            && other.admission_grant.kind_version == grant.kind_version
+                        {
+                            running_same_instrument = running_same_instrument.saturating_add(1);
+                        }
+                    }
+                    if running_same_instrument >= grant.max_concurrency as usize {
+                        continue;
+                    }
+                } else if current.invocation.profile == TESTD_PRODUCTIVE_PROFILE {
+                    continue;
+                }
+                eligible.push(current);
+            }
+            drop(table);
+            eligible
+        };
+        let Some(mut job) = eligible.into_iter().max_by(compare_ready) else {
+            return Ok(None);
+        };
+        job.target_roots.validate()?;
         let previous = job.state;
         // Allocate the runtime leases this job declared and record the
         // scheduling decision, so the work item execution record carries both
@@ -4644,6 +4956,7 @@ impl TestdStore {
             job.target_layout.as_ref(),
             job.work_envelope.as_ref(),
             job.fixture_namespace.as_deref(),
+            job.instrument_admission.as_ref(),
         )?;
         // Issue #1897 (AUD4): run the COMPLETE admission gate on the retained
         // envelope before this attempt starts, not the shape-only requalify.
@@ -4737,6 +5050,124 @@ impl TestdStore {
         };
         validate_claim_binding(&job, lease, now, &expected)?;
         Ok(permit.into_parts().0)
+    }
+
+    /// Returns the immutable attempt record for exact terminal reconciliation.
+    pub fn instrument_process_attempt(
+        &self,
+        job_id: &str,
+        attempt_seq: u32,
+    ) -> Result<Option<TestdInstrumentProcessAttemptBinding>, TestdError> {
+        validate_text(job_id, "instrument_attempt.job_id")?;
+        if attempt_seq == 0 {
+            return Err(TestdError::InvalidBinding);
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let table = read.open_table(INSTRUMENT_ATTEMPTS).map_err(database)?;
+        let Some(value) = table
+            .get(instrument_attempt_key(job_id, attempt_seq).as_str())
+            .map_err(database)?
+        else {
+            return Ok(None);
+        };
+        let attempt: TestdInstrumentProcessAttemptBinding =
+            serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        attempt.validate()?;
+        if attempt.job_id != job_id || attempt.attempt_seq != attempt_seq {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(Some(attempt))
+    }
+
+    /// Persists the exact P-03 digest returned by the private Kernel child
+    /// issuer under this live durable claim. The queued submission digest is
+    /// left unchanged.
+    pub fn retain_claimed_instrument_process_attempt(
+        &self,
+        job_id: &str,
+        lease: &Lease,
+        now: u64,
+        attempt: &TestdInstrumentProcessAttemptBinding,
+        request: &ProcessRequest,
+    ) -> Result<(), TestdError> {
+        attempt.validate()?;
+        request
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let write = self.database.begin_write().map_err(database)?;
+        let job = {
+            let jobs = write.open_table(JOBS).map_err(database)?;
+            let value = jobs
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let binding = job
+            .instrument_admission
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        binding.validate_for_new_attempt()?;
+        let identities = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+        let retained_identity = identities
+            .get(job_id)
+            .map_err(database)?
+            .map(|value| serde_json::from_slice::<RequestIdentity>(value.value()))
+            .transpose()
+            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        if job.state != JobState::Running
+            || attempt.job_id != job_id
+            || job.attempts != attempt.attempt_seq
+            || !lease_matches(&job, lease, now)
+            || retained_identity.as_ref() != Some(&attempt.request_identity)
+            || attempt.operation_id != job.process.operation_id
+            || attempt.operation_id != request.operation_id().as_str()
+            || attempt
+                .request_identity
+                .request
+                .metadata
+                .request_id
+                .as_str()
+                != attempt.operation_id
+            || &attempt.request_identity.request.state_fence.authority_epoch
+                != request.fence().authority_epoch()
+            || attempt
+                .request_identity
+                .request
+                .state_fence
+                .resource_generation
+                .value()
+                != request.generation().get()
+            || attempt.intent_effect_digest != binding.process_intent.effect_digest()
+            || attempt.intent_effect_digest != request.intent().effect_digest()
+            || attempt.instrument_admission_digest != binding.admission_grant.grant_digest
+            || attempt.instrument_admission_digest
+                != request
+                    .intent()
+                    .instrument_admission_digest()
+                    .unwrap_or_default()
+            || request.intent() != &binding.process_intent
+            || attempt.process_request_digest != request.invocation_digest()
+            || request.expected_revision_heads().get("launch-grant")
+                != Some(&attempt.kernel_dispatch_grant_digest)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let key = instrument_attempt_key(job_id, attempt.attempt_seq);
+        let mut attempts = write.open_table(INSTRUMENT_ATTEMPTS).map_err(database)?;
+        if attempts.get(key.as_str()).map_err(database)?.is_some() {
+            return Err(TestdError::InvalidBinding);
+        }
+        let encoded =
+            serde_json::to_vec(attempt).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        attempts
+            .insert(key.as_str(), encoded.as_slice())
+            .map_err(database)?;
+        drop(attempts);
+        write.commit().map_err(database)?;
+        Ok(())
     }
 
     /// Renews one live worker fence without changing its owner, token, or
@@ -5284,7 +5715,11 @@ fn verify_job_lane(
     layout: Option<&TargetLayoutBinding>,
     envelope: Option<&GovernedWorkEnvelope>,
     fixture_namespace: Option<&str>,
+    instrument_admission: Option<&TestdInstrumentAdmissionBinding>,
 ) -> Result<(), TestdError> {
+    if let Some(binding) = instrument_admission {
+        binding.validate()?;
+    }
     let lane = match (layout, envelope) {
         (Some(layout), Some(envelope)) => {
             verify_envelope_layout_binding(target_roots, layout, envelope).map(|_| ())
@@ -5344,6 +5779,7 @@ fn payload_digest(
     resource_profile: &TestResourceProfile,
     work_envelope: Option<&GovernedWorkEnvelope>,
     fixture_namespace: Option<&str>,
+    instrument_admission: Option<&TestdInstrumentAdmissionBinding>,
 ) -> Result<String, TestdError> {
     let bytes = serde_json::to_vec(&(
         invocation,
@@ -5354,6 +5790,7 @@ fn payload_digest(
         resource_profile,
         work_envelope,
         fixture_namespace,
+        instrument_admission,
     ))
     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
@@ -5652,7 +6089,18 @@ pub fn sha256_artifact(length: u64, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_contracts::{
+        ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId, RequestId,
+        ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision, sha256_hex,
+    };
+    use eliot_instrument_api::registry::{
+        EnvironmentInheritanceBinding, EnvironmentProjectionBinding,
+    };
+    use eliot_process::{
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, EnvironmentInheritance,
+        EnvironmentProjection, FencingToken, Generation, ImageId, JobId, KernelDispatchKey,
+        OperationId, PermitIssuance, ProcessIntent, ProcessTreeId, ResourceLimits, SessionId,
+    };
     use std::num::NonZeroU64;
 
     fn test_epoch(sequence: u64) -> EpochId {
@@ -5663,6 +6111,245 @@ mod tests {
             NonZeroU64::new(sequence).expect("non-zero test sequence"),
         )
         .expect("valid test epoch")
+    }
+
+    fn productive_binding(
+        job_id: &str,
+        kind_id: &str,
+        max_concurrency: u32,
+        source_root: &str,
+    ) -> (
+        InstrumentInvocation,
+        ProcessAdmission,
+        TestdInstrumentAdmissionBinding,
+    ) {
+        let epoch = test_epoch(7);
+        let generation = 3;
+        let operation_id = format!("{job_id}-operation");
+        let executable = std::env::temp_dir()
+            .join("testd-nextest")
+            .to_string_lossy()
+            .into_owned();
+        let digest = "a".repeat(64);
+        let executable_file_identity: _ = serde_json::from_value(serde_json::json!({
+            "volume_serial_number": 1,
+            "file_index": 1,
+        }))
+        .expect("test file identity");
+        let environment =
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .expect("empty sealed environment");
+        let mut grant = InstrumentAdmissionGrant {
+            kind_id: kind_id.to_owned(),
+            kind_version: ContractVersion::new(1, 0, 0),
+            kind: InstrumentKind::Test,
+            profile: TESTD_PRODUCTIVE_PROFILE.to_owned(),
+            profile_revision: 1,
+            spec_digest: "b".repeat(64),
+            executable: "cargo-nextest".to_owned(),
+            executable_version: None,
+            content_digest: digest.clone(),
+            executable_path: executable.clone(),
+            executable_file_identity: Some(executable_file_identity.clone()),
+            supply_digest: "c".repeat(64),
+            arguments: vec!["run".to_owned()],
+            environment_class: "isolated-process".to_owned(),
+            scope_class: "workspace".to_owned(),
+            source_root: Some(source_root.to_owned()),
+            declared_scope: Some("workspace".to_owned()),
+            environment_digest: Some(sha256_hex(b"{}")),
+            authority_epoch: Some(epoch.clone()),
+            resource_generation: Some(generation),
+            credential_policy: ContractId::new("credentials-none").expect("credential id"),
+            network_policy: ContractId::new("network-none").expect("network id"),
+            timeout_ms: Some(60_000),
+            max_output_bytes: Some(1024),
+            max_concurrency,
+            parser: ContractId::new("nextest-parser").expect("parser id"),
+            parser_generation: 1,
+            grant_digest: String::new(),
+        };
+        grant.grant_digest = grant.digest();
+        let process_intent = ProcessIntent::new(
+            OperationId::new(operation_id.clone()).expect("operation id"),
+            ProcessTreeId::new(format!("{job_id}-tree")).expect("tree id"),
+            JobId::new(job_id).expect("process job id"),
+            ImageId::new(format!("{job_id}-image")).expect("image id"),
+            SessionId::new(format!("{job_id}-session")).expect("session id"),
+            Generation::new(generation).expect("generation"),
+            executable.clone(),
+            digest.clone(),
+            vec!["run".to_owned()],
+            source_root.to_owned(),
+            environment,
+            ResourceLimits::new(60_000, None, None, 1024, 1024, 4).expect("limits"),
+        )
+        .expect("process intent")
+        .with_executable_file_identity(executable_file_identity)
+        .expect("bind executable file identity")
+        .with_instrument_admission_digest(grant.digest())
+        .expect("bind instrument admission");
+        let request = RequestMetadata {
+            request_id: RequestId::new(operation_id.clone()).expect("request id"),
+            session_id: None,
+            task_id: None,
+            product_id: ProductId::new("test-product").expect("product id"),
+            source_id: SourceId::new(source_root).expect("source id"),
+            state_fence: StateFence::new(
+                epoch.clone(),
+                ResourceGeneration::new(generation).expect("resource generation"),
+            ),
+            clock: ClockReading {
+                valid_time_ms: Some(1),
+                known_time_ms: Some(1),
+                transaction_sequence: None,
+                monotonic_ns: Some(1),
+            },
+        };
+        let invocation = InstrumentInvocation {
+            request: request.clone(),
+            instrument: ContractId::new(kind_id).expect("instrument id"),
+            kind: InstrumentKind::Test,
+            profile: TESTD_PRODUCTIVE_PROFILE.to_owned(),
+            target: source_root.to_owned(),
+            arguments: Vec::new(),
+            input_artifacts: Vec::new(),
+            declared_scope: "workspace".to_owned(),
+            requested_at: request.clock,
+        };
+        let process = ProcessAdmission {
+            job_id: job_id.to_owned(),
+            operation_id,
+            process_tree_id: format!("{job_id}-tree"),
+            generation,
+            authority_epoch: epoch.clone(),
+            invocation_digest: "d".repeat(64),
+        };
+        let observation = TestdToolObservation {
+            nextest_path: executable,
+            nextest_sha256: digest.clone(),
+            cargo_path: std::env::temp_dir()
+                .join("cargo")
+                .to_string_lossy()
+                .into_owned(),
+            cargo_sha256: "e".repeat(64),
+            rustc_path: std::env::temp_dir()
+                .join("rustc")
+                .to_string_lossy()
+                .into_owned(),
+            rustc_sha256: "f".repeat(64),
+            selected_toolchain: "test-toolchain".to_owned(),
+        };
+        let resolution = ResolvedExecutionBinding {
+            source_root: source_root.to_owned(),
+            environment_class: "isolated-process".to_owned(),
+            environment_digest: sha256_hex(b"{}"),
+            environment_projection: EnvironmentProjectionBinding {
+                non_secret: BTreeMap::new(),
+                secret_refs: Vec::new(),
+                inheritance: EnvironmentInheritanceBinding::None,
+            },
+            declared_scope: "workspace".to_owned(),
+            authority_epoch: epoch,
+            resource_generation: generation,
+        };
+        let binding = TestdInstrumentAdmissionBinding {
+            scope_id: "test-scope".to_owned(),
+            profile: TESTD_PRODUCTIVE_PROFILE.to_owned(),
+            profile_revision: 1,
+            stage_id: "cargo-nextest".to_owned(),
+            registry_generation: generation,
+            resolution,
+            tool_observation: Some(observation),
+            process_intent,
+            admission_grant: grant,
+            original_receipt_json: "{}".to_owned(),
+            original_readback_json: "{}".to_owned(),
+        };
+        (invocation, process, binding)
+    }
+
+    fn historical_binding_without_file_identity(
+        mut binding: TestdInstrumentAdmissionBinding,
+    ) -> TestdInstrumentAdmissionBinding {
+        binding.admission_grant.executable_file_identity = None;
+        binding.admission_grant.grant_digest = binding.admission_grant.digest();
+        let intent = &binding.process_intent;
+        let historical_intent = ProcessIntent::new(
+            intent.operation_id().clone(),
+            intent.process_tree_id().clone(),
+            intent.job_id().clone(),
+            intent.image_id().clone(),
+            intent.session_id().clone(),
+            intent.generation(),
+            intent.executable().to_owned(),
+            intent.executable_sha256().to_owned(),
+            intent.argv().to_vec(),
+            intent.working_directory().to_owned(),
+            intent.environment().clone(),
+            intent.resource_limits().clone(),
+        )
+        .expect("rebuild historical intent from unchanged owner fields");
+        binding.process_intent = historical_intent
+            .with_instrument_admission_digest(binding.admission_grant.digest())
+            .expect("bind the historical grant digest");
+        binding
+    }
+
+    fn capacity_job(
+        job_id: &str,
+        project_id: &str,
+        kind_id: &str,
+        state: JobState,
+        roots: &TargetRoots,
+        lease: Option<Lease>,
+    ) -> TestJob {
+        let (invocation, process, instrument_admission) =
+            productive_binding(job_id, kind_id, 1, &roots.source_root);
+        TestJob {
+            job_id: job_id.to_owned(),
+            project_id: project_id.to_owned(),
+            project_sequence: 1,
+            invocation,
+            process,
+            target_roots: roots.clone(),
+            target_layout: None,
+            work_envelope: None,
+            fixture_namespace: None,
+            instrument_admission: Some(instrument_admission),
+            priority: if state == JobState::Running { 100 } else { 1 },
+            job_class: JobClass::Verification,
+            resource_profile: TestResourceProfile::default(),
+            scheduling: None,
+            state,
+            attempts: if state == JobState::Running { 1 } else { 0 },
+            not_before_ms: 0,
+            lease,
+            execution: (state == JobState::Running).then_some(ExecutionStatus::Running),
+            verification: None,
+            receipt: None,
+            verification_receipt: None,
+            verifier_dispatch: None,
+            provider_registry_snapshot: None,
+            source_observation_before: None,
+            terminal_publication: None,
+            updated_at_ms: 0,
+            payload_digest: String::new(),
+        }
+    }
+
+    fn persist_capacity_test_job(store: &TestdStore, job: &TestJob) {
+        let write = store
+            .database
+            .begin_write()
+            .expect("begin job fixture write");
+        let mut table = write.open_table(JOBS).expect("open jobs table");
+        let bytes = serde_json::to_vec(job).expect("serialize job fixture");
+        table
+            .insert(job.job_id.as_str(), bytes.as_slice())
+            .expect("insert job fixture");
+        drop(table);
+        write.commit().expect("commit job fixture");
     }
 
     fn provider_registry_store(
@@ -5721,6 +6408,7 @@ mod tests {
             target_layout: None,
             work_envelope: None,
             fixture_namespace: None,
+            instrument_admission: None,
             priority: 0,
             job_class: JobClass::Verification,
             resource_profile: TestResourceProfile::default(),
@@ -5983,6 +6671,585 @@ mod tests {
             1,
             [("project-a", 2, JobState::Running)]
         ));
+    }
+
+    #[test]
+    fn presented_claim_binds_the_exact_job_before_priority_ranking() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-presented-claim-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        let contour = root.join("contour");
+        let source = root.join("source");
+        let target = contour.join("target");
+        std::fs::create_dir_all(&source).expect("create source root");
+        std::fs::create_dir_all(&target).expect("create contour target root");
+        let roots = TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .expect("valid isolated roots");
+        let store = TestdStore::open(root.join("testd.redb"), RetryPolicy::default())
+            .expect("open durable TestD store");
+        let mut presented = capacity_job(
+            "presented-a",
+            "project-presented-a",
+            "eliot.instrument.presented-a",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        presented.priority = 1;
+        let mut higher_priority = capacity_job(
+            "higher-priority-b",
+            "project-higher-priority-b",
+            "eliot.instrument.higher-priority-b",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        higher_priority.priority = 100;
+        persist_capacity_test_job(&store, &presented);
+        persist_capacity_test_job(&store, &higher_priority);
+
+        let claimed = store
+            .claim_presented_job("presented-a", "worker-a", 100, 500)
+            .expect("claim presented job")
+            .expect("presented job is ready");
+        assert_eq!(claimed.job_id, "presented-a");
+        let untouched = store
+            .get("higher-priority-b")
+            .expect("load higher priority job")
+            .expect("higher priority job remains durable");
+        assert_eq!(untouched.state, JobState::Queued);
+        assert_eq!(untouched.attempts, 0);
+        assert!(untouched.lease.is_none());
+    }
+
+    #[test]
+    fn missing_or_not_ready_presented_claim_never_falls_back_to_another_job() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-presented-claim-refusal-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        let contour = root.join("contour");
+        let source = root.join("source");
+        let target = contour.join("target");
+        std::fs::create_dir_all(&source).expect("create source root");
+        std::fs::create_dir_all(&target).expect("create contour target root");
+        let roots = TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .expect("valid isolated roots");
+        let store = TestdStore::open(root.join("testd.redb"), RetryPolicy::default())
+            .expect("open durable TestD store");
+        let mut not_ready = capacity_job(
+            "not-ready-a",
+            "project-not-ready-a",
+            "eliot.instrument.not-ready-a",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        not_ready.not_before_ms = 200;
+        let mut ready = capacity_job(
+            "ready-b",
+            "project-ready-b",
+            "eliot.instrument.ready-b",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        ready.priority = 100;
+        persist_capacity_test_job(&store, &not_ready);
+        persist_capacity_test_job(&store, &ready);
+
+        assert!(
+            store
+                .claim_presented_job("missing-a", "worker-a", 100, 500)
+                .expect("missing presented ID is a refusal")
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_presented_job("not-ready-a", "worker-a", 100, 500)
+                .expect("not-ready presented job is a refusal")
+                .is_none()
+        );
+        let untouched = store
+            .get("ready-b")
+            .expect("load unrelated ready job")
+            .expect("ready job remains durable");
+        assert_eq!(untouched.state, JobState::Queued);
+        assert_eq!(untouched.attempts, 0);
+        assert!(untouched.lease.is_none());
+    }
+
+    #[test]
+    fn claimed_instrument_attempt_retains_new_request_digest_once_without_rewriting_submission() {
+        fn issue_request(
+            intent: &ProcessIntent,
+            authority: &mut DispatchPermitAuthority,
+            issuance_id: &str,
+            launch_grant_digest: &str,
+        ) -> ProcessRequest {
+            let permit = authority
+                .issue(
+                    intent,
+                    PermitIssuance::new(
+                        ActionLeaseRef::new(format!("lease-{issuance_id}"))
+                            .expect("fixture action lease"),
+                        FencingToken::new(
+                            test_epoch(7),
+                            intent.generation(),
+                            format!("fence-{issuance_id}"),
+                        )
+                        .expect("fixture process fence"),
+                        BTreeMap::from([(
+                            "launch-grant".to_owned(),
+                            launch_grant_digest.to_owned(),
+                        )]),
+                        1,
+                        1_000,
+                        format!("nonce-{issuance_id}"),
+                    )
+                    .expect("fixture Kernel permit issuance"),
+                )
+                .expect("fixture Kernel permit");
+            ProcessRequest::new(intent.clone(), permit).expect("fixture process request")
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-instrument-attempt-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        let contour = root.join("contour");
+        let source = root.join("source");
+        let target = contour.join("target");
+        std::fs::create_dir_all(&source).expect("create source root");
+        std::fs::create_dir_all(&target).expect("create contour target root");
+        let roots = TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .expect("valid isolated roots");
+        let store = TestdStore::open(root.join("testd.redb"), RetryPolicy::default())
+            .expect("open durable TestD store");
+        let (mut invocation, process, instrument_admission) = productive_binding(
+            "attempt-job",
+            "eliot.instrument.attempt-retention",
+            1,
+            &roots.source_root,
+        );
+        invocation.request.task_id =
+            Some(TaskId::new("attempt-job-task").expect("fixture task identity"));
+        invocation.request.state_fence.task_revision =
+            Some(TaskRevision::new(1).expect("fixture task revision"));
+        let identity: RequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "metadata": &invocation.request,
+                "state_fence": &invocation.request.state_fence,
+            },
+            "idempotency_key": invocation.request.request_id.as_str(),
+            "deadline_unix_ms": 1_000,
+            "cancellation_id": "attempt-job-cancellation",
+        }))
+        .expect("fixture authenticated request identity");
+        let mut authority = DispatchPermitAuthority::activate(
+            DispatchAuthorityId::new("attempt-retention-authority")
+                .expect("fixture Kernel authority"),
+            KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("fixture Kernel dispatch key"),
+        );
+        let queued_request = issue_request(
+            &instrument_admission.process_intent,
+            &mut authority,
+            "queued",
+            &instrument_admission.admission_grant.grant_digest,
+        );
+        let queued_request_digest = queued_request.invocation_digest().to_owned();
+        let contour_grant = ExecutionContourGrant::issue(
+            roots.allowed_contour_root.clone(),
+            &process.job_id,
+            invocation.request.request_id.as_str(),
+            &queued_request,
+            "attempt-job-contour-grant",
+        )
+        .expect("fixture original contour grant");
+        let submission = TestdVerifierJobSubmission {
+            job_id: process.job_id.clone(),
+            project_id: "attempt-project".to_owned(),
+            invocation: invocation.clone(),
+            instrument_admission: instrument_admission.clone(),
+            target_roots: roots,
+            target_layout: None,
+            lane: None,
+            priority: 1,
+            metadata: JobSubmissionMetadata::verification(),
+        };
+        store
+            .submit_productive_verifier(
+                submission,
+                identity.clone(),
+                ProcessAdmissionPermit::issued(queued_request, contour_grant)
+                    .expect("original queued process admission"),
+                10,
+            )
+            .expect("submit canonical productive job");
+        let mut verifier = serde_json::to_value(&invocation).expect("serialize verifier request");
+        verifier["evaluator"] = serde_json::json!("attempt-verifier");
+        verifier["required_test_ids"] = serde_json::json!(["attempt-test-id"]);
+        verifier["planned"] = serde_json::json!({
+            "verifier_id": "attempt-verifier",
+            "scope": instrument_admission.resolution.declared_scope,
+            "verifier_config_hash": sha256_hex(
+                &serde_json::to_vec(&invocation).expect("serialize verifier configuration")
+            ),
+        });
+        let verifier_plan = serde_json::json!({
+            "task_id": identity.request.metadata.task_id.as_ref().expect("task-bound identity").as_str(),
+            "work_scope_id": instrument_admission.scope_id,
+            "verifier": verifier,
+        });
+        let verifier_plan_bytes =
+            canonical_json_bytes(&verifier_plan).expect("canonicalize verifier plan");
+        let verifier_dispatch = TestdVerifierDispatchBinding {
+            request_identity: identity.clone(),
+            operation_id: process.operation_id.clone(),
+            canonical_plan_json: String::from_utf8(verifier_plan_bytes.clone())
+                .expect("canonical verifier plan text"),
+            canonical_plan_sha256: sha256_hex(&verifier_plan_bytes),
+        };
+        store
+            .bind_verifier_dispatch_for_admitted_identity(&process.job_id, verifier_dispatch, 11)
+            .expect("bind canonical verifier plan before claim");
+        let claimed = store
+            .claim_presented_job(&process.job_id, "attempt-worker", 20, 1_000)
+            .expect("claim exact productive job")
+            .expect("productive job is ready");
+        let lease = claimed.lease.expect("claim retains its live lease");
+
+        let actual_request = issue_request(
+            &instrument_admission.process_intent,
+            &mut authority,
+            "attempt-1",
+            &instrument_admission.admission_grant.grant_digest,
+        );
+        let launch_grant_digest = actual_request
+            .expected_revision_heads()
+            .get("launch-grant")
+            .expect("Kernel fixture issued the launch grant head")
+            .clone();
+        let attempt = TestdInstrumentProcessAttemptBinding {
+            job_id: process.job_id.clone(),
+            attempt_seq: claimed.attempts,
+            request_identity: identity.clone(),
+            operation_id: process.operation_id.clone(),
+            intent_effect_digest: instrument_admission
+                .process_intent
+                .effect_digest()
+                .to_owned(),
+            instrument_admission_digest: instrument_admission.admission_grant.grant_digest.clone(),
+            kernel_dispatch_grant_digest: launch_grant_digest,
+            process_request_digest: actual_request.invocation_digest().to_owned(),
+        };
+        assert_ne!(
+            actual_request.invocation_digest(),
+            claimed.process.invocation_digest,
+            "the actual attempt request has a distinct permit-bound digest"
+        );
+        store
+            .retain_claimed_instrument_process_attempt(
+                &process.job_id,
+                &lease,
+                21,
+                &attempt,
+                &actual_request,
+            )
+            .expect("retain actual attempt request under its live claim");
+        assert_eq!(
+            store
+                .instrument_process_attempt(&process.job_id, claimed.attempts)
+                .expect("read retained attempt")
+                .expect("attempt record exists"),
+            attempt
+        );
+        let retained_job = store
+            .get(&process.job_id)
+            .expect("read original productive job")
+            .expect("original job remains durable");
+        assert_eq!(
+            retained_job.process.invocation_digest, claimed.process.invocation_digest,
+            "retaining an attempt never rewrites the queued submission digest"
+        );
+        assert_eq!(
+            retained_job.process.invocation_digest, queued_request_digest,
+            "the durable submission keeps its original permit-bound digest"
+        );
+
+        assert!(matches!(
+            store.retain_claimed_instrument_process_attempt(
+                &process.job_id,
+                &lease,
+                21,
+                &attempt,
+                &actual_request,
+            ),
+            Err(TestdError::InvalidBinding)
+        ));
+        let mut foreign_job = attempt.clone();
+        foreign_job.job_id.push_str("-foreign");
+        assert!(matches!(
+            store.retain_claimed_instrument_process_attempt(
+                &process.job_id,
+                &lease,
+                21,
+                &foreign_job,
+                &actual_request,
+            ),
+            Err(TestdError::InvalidBinding)
+        ));
+        let mut wrong_attempt = attempt.clone();
+        wrong_attempt.attempt_seq += 1;
+        assert!(matches!(
+            store.retain_claimed_instrument_process_attempt(
+                &process.job_id,
+                &lease,
+                21,
+                &wrong_attempt,
+                &actual_request,
+            ),
+            Err(TestdError::InvalidBinding)
+        ));
+        let mut wrong_identity = attempt.clone();
+        wrong_identity
+            .request_identity
+            .idempotency_key
+            .push_str("-foreign");
+        assert!(matches!(
+            store.retain_claimed_instrument_process_attempt(
+                &process.job_id,
+                &lease,
+                21,
+                &wrong_identity,
+                &actual_request,
+            ),
+            Err(TestdError::InvalidBinding)
+        ));
+        assert_eq!(
+            store
+                .instrument_process_attempt(&process.job_id, claimed.attempts)
+                .expect("read attempt after refused rebinds")
+                .expect("original attempt remains retained"),
+            attempt
+        );
+    }
+
+    #[test]
+    fn saturated_instrument_kind_does_not_block_another_kind_in_durable_claims() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-instrument-capacity-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        let contour = root.join("contour");
+        let source = root.join("source");
+        let target = contour.join("target");
+        std::fs::create_dir_all(&source).expect("create source root");
+        std::fs::create_dir_all(&target).expect("create contour target root");
+        let roots = TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .expect("valid isolated roots");
+        let store = TestdStore::open(root.join("testd.redb"), RetryPolicy::default())
+            .expect("open durable TestD store");
+        let running_a = capacity_job(
+            "running-a",
+            "project-running-a",
+            "eliot.instrument.nextest-a",
+            JobState::Running,
+            &roots,
+            Some(Lease {
+                owner: "worker-a".to_owned(),
+                token: "lease-a".to_owned(),
+                epoch: 1,
+                expires_at_ms: 1_000,
+            }),
+        );
+        let queued_a = capacity_job(
+            "queued-a",
+            "project-queued-a",
+            "eliot.instrument.nextest-a",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        let queued_b = capacity_job(
+            "queued-b",
+            "project-queued-b",
+            "eliot.instrument.nextest-b",
+            JobState::Queued,
+            &roots,
+            None,
+        );
+        persist_capacity_test_job(&store, &running_a);
+        persist_capacity_test_job(&store, &queued_a);
+        persist_capacity_test_job(&store, &queued_b);
+
+        let claimed_b = store
+            .claim_next("worker-b", 100, 500)
+            .expect("claim another instrument kind")
+            .expect("independent kind remains eligible");
+        assert_eq!(claimed_b.job_id, "queued-b");
+
+        let mut released_a = store
+            .get("running-a")
+            .expect("load running kind A")
+            .expect("running kind A remains durable");
+        released_a.state = JobState::Succeeded;
+        released_a.lease = None;
+        persist_capacity_test_job(&store, &released_a);
+        let claimed_a = store
+            .claim_next("worker-c", 200, 500)
+            .expect("claim released instrument kind")
+            .expect("kind A becomes eligible after terminal release");
+        assert_eq!(claimed_a.job_id, "queued-a");
+    }
+
+    #[test]
+    fn historical_grant_without_file_identity_cannot_start_a_new_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-historical-file-identity-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        std::fs::create_dir_all(&root).expect("create isolated historical state root");
+        let contour = root.join("contour");
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir_all(&contour).expect("create historical contour root");
+        std::fs::create_dir_all(&source).expect("create historical source root");
+        std::fs::create_dir_all(&target).expect("create historical target root");
+        let roots = TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            target.to_string_lossy(),
+            target.to_string_lossy(),
+        )
+        .expect("valid historical receipt roots");
+        let store = TestdStore::open(root.join("testd.redb"), RetryPolicy::default())
+            .expect("open historical TestD owner");
+        let mut job = capacity_job(
+            "historical-no-file-identity",
+            "historical-project",
+            "eliot.instrument.historical",
+            JobState::Running,
+            &roots,
+            Some(lease()),
+        );
+        let historical = historical_binding_without_file_identity(
+            job.instrument_admission
+                .take()
+                .expect("productive fixture binding"),
+        );
+        assert!(historical.validate().is_ok());
+        assert!(historical.validate_for_new_attempt().is_err());
+        job.instrument_admission = Some(historical.clone());
+        let clock = ClockReading {
+            valid_time_ms: Some(1),
+            known_time_ms: Some(1),
+            transaction_sequence: None,
+            monotonic_ns: Some(1),
+        };
+        let receipt = VerificationReceipt {
+            job_id: job.job_id.clone(),
+            operation_id: job.process.operation_id.clone(),
+            process_tree_id: job.process.process_tree_id.clone(),
+            generation: job.process.generation,
+            authority_epoch: job.process.authority_epoch.clone(),
+            invocation_id: job.invocation.request.request_id.as_str().to_owned(),
+            invocation_digest: job.process.invocation_digest.clone(),
+            allowed_contour_root: job.target_roots.allowed_contour_root.clone(),
+            source_root: job.target_roots.source_root.clone(),
+            target_root: job.target_roots.target_root.clone(),
+            cache_root: job.target_roots.cache_root.clone(),
+            execution: ExecutionStatus::Failed,
+            started_at: clock,
+            finished_at: clock,
+            tool_observation: historical.tool_observation.clone(),
+            source_observation: None,
+            raw_artifacts: Vec::new(),
+            normalized: Vec::new(),
+            typed_evidence: Vec::new(),
+            lane_identity: None,
+        };
+        assert!(receipt.validate(&job).is_ok());
+        persist_capacity_test_job(&store, &job);
+        let committed = store
+            .finish(
+                &job.job_id,
+                job.lease.as_ref().expect("running lease"),
+                ExecutionStatus::Failed,
+                None,
+                &receipt,
+                100,
+                None,
+            )
+            .expect("historical receipt remains readable after terminal execution");
+        assert_eq!(committed.execution, Some(ExecutionStatus::Failed));
+    }
+
+    #[test]
+    fn testd_binding_rejects_same_digest_from_a_different_file_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-testd-distinct-file-identity-{}",
+            uuid::Uuid::new_v4(),
+        ));
+        std::fs::create_dir_all(&root).expect("create isolated identity test root");
+        let (_, _, mut binding) = productive_binding(
+            "identity-bound-job",
+            "eliot.instrument.identity-bound",
+            1,
+            &root.to_string_lossy(),
+        );
+        let original_intent = binding.process_intent.clone();
+        let second_file_identity: _ = serde_json::from_value(serde_json::json!({
+            "volume_serial_number": 1,
+            "file_index": 2,
+        }))
+        .expect("second same-content file identity");
+        binding.process_intent = ProcessIntent::new(
+            original_intent.operation_id().clone(),
+            original_intent.process_tree_id().clone(),
+            original_intent.job_id().clone(),
+            original_intent.image_id().clone(),
+            original_intent.session_id().clone(),
+            original_intent.generation(),
+            original_intent.executable().to_owned(),
+            original_intent.executable_sha256().to_owned(),
+            original_intent.argv().to_vec(),
+            original_intent.working_directory().to_owned(),
+            original_intent.environment().clone(),
+            original_intent.resource_limits().clone(),
+        )
+        .expect("construct same-byte alternate-file intent")
+        .with_executable_file_identity(second_file_identity)
+        .expect("bind alternate file identity")
+        .with_instrument_admission_digest(binding.admission_grant.digest())
+        .expect("bind original admission digest");
+        assert_eq!(
+            binding.process_intent.executable_sha256(),
+            original_intent.executable_sha256(),
+            "the content digest remains identical"
+        );
+        assert!(binding.validate().is_err());
     }
 
     #[test]

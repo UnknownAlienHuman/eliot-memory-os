@@ -11,6 +11,9 @@
 mod process_contract_v3;
 pub use process_contract_v3::*;
 
+mod kernel_dispatch_grant;
+pub use kernel_dispatch_grant::{DispatchValidationPort, KernelDispatchGrant};
+
 mod stream_evidence;
 pub use stream_evidence::{
     DurableProcessStreamSource, DurableStreamLocatorKind, DurableStreamRepresentation,

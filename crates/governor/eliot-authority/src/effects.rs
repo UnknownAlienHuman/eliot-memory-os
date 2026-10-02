@@ -1033,12 +1033,15 @@ mod recovery_tests {
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
-    fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
-        EpochId::new(
-            EpochLineageId::new(lineage).expect("valid test lineage"),
-            NonZeroU64::new(sequence).expect("nonzero test sequence"),
-        )
-        .expect("valid test epoch")
+    fn test_epoch(lineage: &str, sequence: u64) -> Result<EpochId, Box<dyn Error>> {
+        let lineage = EpochLineageId::new(lineage)?;
+        let sequence = NonZeroU64::new(sequence).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nonzero test sequence required",
+            )
+        })?;
+        Ok(EpochId::new(lineage, sequence)?)
     }
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1051,7 +1054,7 @@ mod recovery_tests {
             operation_kind: "test.effect".to_owned(),
             effect: EffectClass::ReversibleMutation,
             state_fence: StateFence::new(
-                test_epoch(TEST_LINEAGE_A, 1),
+                test_epoch(TEST_LINEAGE_A, 1)?,
                 ResourceGeneration::new(1)?,
             ),
         })

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::authority_recovery::map_transition_receipt_error;
 use crate::activation_outcome::{
@@ -94,7 +95,9 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{
+    CurrentTaskSelection, ObservationJournal, ObservationJournalEntry, TaskSelectionEvidence,
+};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -1253,6 +1256,18 @@ fn product_proof_missing_evidence(
     missing.into_iter().collect()
 }
 
+/// Samples the wall clock in the same millisecond unit as durable readiness
+/// lease deadlines. A clock error is a refusal; callers cannot substitute an
+/// earlier admission timestamp after owner I/O.
+fn current_unix_ms() -> Result<u64, CompositionError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    u64::try_from(elapsed.as_millis()).map_err(|error| {
+        CompositionError::Recovery(format!("current Unix time is out of range: {error}"))
+    })
+}
+
 /// Errors raised before daemon readiness.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CompositionError {
@@ -1356,6 +1371,10 @@ pub enum CompositionError {
     /// The semantic owner read was fenced or no longer current.
     #[error("activation owner fence is stale")]
     ActivationStaleFence,
+    /// Request-supplied task-selection evidence did not match the live
+    /// Governor-selected TaskContract, WorkScope, or admission fence.
+    #[error("task selection revalidation: {0}")]
+    TaskSelection(#[from] eliot_observation::GovernorObservationError),
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
@@ -7566,6 +7585,670 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             | TaskBindingState::Stale { .. }
             | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
         }
+    }
+
+    /// Rechecks request-held selection evidence against the exact durable
+    /// readiness terminal and the live `TaskContract` owner at the current
+    /// Governor fence (issue #1746, W4).
+    ///
+    /// The terminal supplies the original selection source/evidence and the
+    /// task/scope/revision named at bootstrap. The Kernel `TaskContract`
+    /// owner supplies the current acceptance digest at the live fence. A
+    /// caller's `TaskSelectionEvidence` is admitted only when those owner
+    /// values still match it; no receipt field is copied into the current
+    /// selection projection and compared back to itself.
+    pub async fn recheck_task_selection_for_claim(
+        &self,
+        now: u64,
+        claim: &ColdStartReadinessClaim,
+        selection: &TaskSelectionEvidence,
+    ) -> Result<CurrentTaskSelection, CompositionError> {
+        let (activation, receipt) = self.current_task_selection_for_claim(now, claim)?;
+        let activation = activation.ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        let (
+            receipt_task_ref,
+            receipt_task_revision,
+            receipt_acceptance_digest,
+            receipt_selection_source_ref,
+            receipt_evidence_ref,
+        ) = match &receipt.task_binding {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } => (
+                task_ref.as_str(),
+                *task_revision,
+                acceptance_digest.as_str(),
+                selection_source_ref.as_str(),
+                evidence_ref.as_str(),
+            ),
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Stale { .. }
+            | TaskBindingState::Ambiguous { .. } => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+        };
+        if selection.acceptance_digest != receipt_acceptance_digest {
+            return Err(eliot_observation::GovernorObservationError::StaleTaskSelection.into());
+        }
+        if selection.selection_source_ref != receipt_selection_source_ref
+            || selection.evidence_ref != receipt_evidence_ref
+        {
+            return Err(eliot_observation::GovernorObservationError::TaskScopeIncompatible.into());
+        }
+
+        let live_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&activation.state_fence, &live_fence)
+            || activation.task_id.as_str() != receipt_task_ref
+            || activation.task_revision != receipt_task_revision
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let owner_set = self
+            .kernel
+            .task_contract_acceptance_set(
+                &activation.task_id,
+                activation.task_revision,
+                &live_fence,
+            )
+            .await?;
+        owner_set
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if owner_set.task_id != activation.task_id {
+            return Err(eliot_observation::GovernorObservationError::TaskScopeIncompatible.into());
+        }
+        if owner_set.task_revision != activation.task_revision {
+            return Err(eliot_observation::GovernorObservationError::StaleTaskSelection.into());
+        }
+        if !fences_match_exact(&owner_set.read_state_fence, &live_fence) {
+            return Err(eliot_observation::GovernorObservationError::FenceMismatch.into());
+        }
+        let current = CurrentTaskSelection {
+            task_ref: owner_set.task_id.as_str().to_owned(),
+            task_revision: owner_set.task_revision,
+            acceptance_digest: owner_set.acceptance_digest,
+            work_scope_ref: activation.work_scope_id,
+            state_fence: owner_set.read_state_fence,
+        };
+        selection.recheck_against_current(&current, &live_fence)?;
+        Ok(current)
+    }
+
+    /// Admits, commits, and retains one registration from the exact Kernel
+    /// queue operation. The only caller-provided data are the original
+    /// authenticated operation, its explicit ActionContract/readiness claim,
+    /// and the unchanged registry snapshot. Current task, WorkScope, session,
+    /// grants, per-grant Kernel activation evidence, receipt, and registry
+    /// readbacks are all re-resolved at their existing owners here.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_instrument_registry_from_claim<R, ActivationRead, ActivationFuture>(
+        &mut self,
+        identity: RequestIdentity,
+        operation_identity: eliot_ors::OperationIdentity,
+        authenticated_owner_ref: &str,
+        scope_selector: &str,
+        action_contract_json: &str,
+        claim_json: &str,
+        snapshot_json: &str,
+        read: &R,
+        mut read_activation: ActivationRead,
+    ) -> Result<InstrumentRegistryRegistrationProof, CompositionError>
+    where
+        R: CanonicalReadClient + ?Sized,
+        ActivationRead: FnMut(String) -> ActivationFuture,
+        ActivationFuture: Future<
+            Output = Result<
+                Option<crate::action_lease_admission::CurrentGrantActivationEvidence>,
+                String,
+            >,
+        >,
+    {
+        use crate::action_lease_admission::{
+            ActionLeaseAdmissionInput, RegistrationAuthorityLedger, RegistrationAuthorityOwnerRead,
+            RegistrationAuthorityOwnerReadRecord,
+        };
+        use crate::instrument_registry_registration::{
+            INSTRUMENT_REGISTRY_REGISTER_OPERATION, admit_instrument_registry_registration,
+            commit_instrument_registry_registration, parse_registration_owner_readback,
+            prove_original_registration_from_readback, registration_action_payload_sha256,
+            resolve_original_registration_receipt,
+        };
+        use eliot_authority::{GrantId, LogicalTime, PrincipalRef, SnapshotId};
+        use eliot_receipts::{
+            EffectClass, OperationBinding, SessionBinding, WorkScopeBinding, WorkScopeId,
+        };
+        use eliot_store_api::{NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeId};
+
+        let refuse = |detail: String| CompositionError::Recovery(detail);
+        identity
+            .validate()
+            .map_err(|error| refuse(format!("registration request identity: {error}")))?;
+        if operation_identity.as_str().trim().is_empty()
+            || authenticated_owner_ref.trim().is_empty()
+            || authenticated_owner_ref.chars().any(char::is_control)
+            || scope_selector.trim().is_empty()
+        {
+            return Err(refuse(
+                "original registration identity, authenticated owner, or scope selector is invalid"
+                    .to_owned(),
+            ));
+        }
+        let action_contract: eliot_authority::ActionContract =
+            serde_json::from_str(action_contract_json)
+                .map_err(|error| refuse(format!("original ActionContract is invalid: {error}")))?;
+        let claim: ColdStartReadinessClaim = serde_json::from_str(claim_json)
+            .map_err(|error| refuse(format!("original readiness claim is invalid: {error}")))?;
+        if snapshot_json.is_empty()
+            || snapshot_json.len() > 1_048_576
+            || serde_json::from_str::<serde_json::Value>(snapshot_json).is_err()
+        {
+            return Err(refuse(
+                "original registry snapshot is empty, invalid, or over its closed bound".to_owned(),
+            ));
+        }
+        let fence = self.snapshot.state_fence();
+        if identity.request.state_fence != fence
+            || identity.request.metadata.session_id.is_none()
+            || identity.request.metadata.task_id.is_none()
+            || identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                != Some(action_contract.task_id.clone())
+        {
+            return Err(refuse(
+                "original request is not task-bound at the current Governor fence".to_owned(),
+            ));
+        }
+
+        // Resolve task-selection evidence from the exact original terminal,
+        // then read the live Kernel TaskContract acceptance set. Partial or
+        // non-current selection is never widened into a registration.
+        let first_now = current_unix_ms()?;
+        let (first_activation, first_receipt) =
+            self.current_task_selection_for_claim(first_now, &claim)?;
+        let first_activation =
+            first_activation.ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        let task_selection = match &first_receipt.task_binding {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } => TaskSelectionEvidence {
+                task_ref: task_ref.clone(),
+                task_revision: *task_revision,
+                acceptance_digest: acceptance_digest.clone(),
+                work_scope_ref: first_receipt.scope.scope_ref.clone(),
+                selection_source_ref: selection_source_ref.clone(),
+                evidence_ref: evidence_ref.clone(),
+                contamination_flags: Vec::new(),
+            },
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Stale { .. }
+            | TaskBindingState::Ambiguous { .. } => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+        };
+        if first_activation.task_id.as_str() != task_selection.task_ref
+            || first_activation.task_revision != task_selection.task_revision
+            || first_activation.work_scope_id != task_selection.work_scope_ref
+            || first_receipt.principal_ref != first_activation.principal_id
+            || first_receipt.session_ref != first_activation.session_id
+            || first_receipt.scope.scope_ref != scope_selector
+        {
+            return Err(refuse(
+                "original readiness terminal, selected task, and authenticated WorkScope disagree"
+                    .to_owned(),
+            ));
+        }
+        let first_current = self
+            .recheck_task_selection_for_claim(first_now, &claim, &task_selection)
+            .await?;
+        if first_current.task_ref != task_selection.task_ref
+            || first_current.task_revision != task_selection.task_revision
+            || first_current.acceptance_digest != task_selection.acceptance_digest
+            || first_current.work_scope_ref != task_selection.work_scope_ref
+            || first_current.state_fence != fence
+        {
+            return Err(refuse(
+                "live TaskContract acceptance differs from the original readiness selection"
+                    .to_owned(),
+            ));
+        }
+
+        let session_id = identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        let agent_session = self
+            .owners
+            .session
+            .session(session_id)
+            .cloned()
+            .ok_or_else(|| {
+                refuse("original request session is absent from Session owner".to_owned())
+            })?;
+        let work_scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| refuse("current WorkScope owner is absent".to_owned()))?;
+        let work_scope_snapshot = work_scope_owner
+            .read_current(&fence)
+            .map_err(|error| refuse(format!("current WorkScope owner read: {error}")))?;
+        let owner_scope_ref = work_scope_snapshot.binding.scope.scope_ref.as_str();
+        if owner_scope_ref != scope_selector
+            || work_scope_snapshot.binding.scope.generation != fence.resource_generation.value()
+            || agent_session.session_id != *session_id
+            || agent_session.state_fence != fence
+            || agent_session.status.terminal()
+        {
+            return Err(refuse(
+                "current WorkScope or Session owner does not match the original operation"
+                    .to_owned(),
+            ));
+        }
+        let current_work_scope = WorkScopeBinding {
+            scope_id: WorkScopeId::new(owner_scope_ref.to_owned())
+                .map_err(|error| refuse(format!("current WorkScope identity: {error}")))?,
+            product_id: identity.request.metadata.product_id.clone(),
+            resource_generation: fence.resource_generation.clone(),
+            state_fence: fence.clone(),
+        };
+        let current_session = SessionBinding {
+            session_id: agent_session.session_id.clone(),
+            authority_epoch: agent_session.authority_epoch.clone(),
+            state_fence: fence.clone(),
+        };
+        if action_contract.work_scope != current_work_scope
+            || action_contract.work_scope.scope_id.as_str() != scope_selector
+            || action_contract.task_id != task_selection.task_ref
+            || action_contract.work_scope.product_id != identity.request.metadata.product_id
+        {
+            return Err(refuse(
+                "original ActionContract does not match current task, product, and WorkScope owners"
+                    .to_owned(),
+            ));
+        }
+
+        // First test the exact original receipt. A committed retry is a
+        // read-only proof lookup; it must never spend the lease or issue Apply
+        // again. The receipt/readback helper validates the persisted ledger
+        // entry against the original prepared transition.
+        let original_receipt =
+            resolve_original_registration_receipt(read, operation_identity.as_str(), &fence)
+                .await
+                .map_err(|error| {
+                    refuse(format!("original registration receipt lookup: {error}"))
+                })?;
+        let scope_id = ScopeId::new(current_work_scope.scope_id.to_string())
+            .map_err(|error| refuse(format!("current WorkScope store id: {error}")))?;
+        let original_readback = read
+            .execute_named(NamedReadRequest {
+                operation: NamedReadOperation::GetInstrumentRegistryState,
+                scope_id: Some(scope_id.clone()),
+                consistency: ReadConsistency::ExactFence,
+                state_fence: fence.clone(),
+                parameters: BTreeMap::new(),
+            })
+            .await
+            .map_err(|error| refuse(format!("current registry owner read: {error}")))?;
+        let (owner_read, owner_revision) = parse_registration_owner_readback(
+            &original_readback,
+            current_work_scope.scope_id.as_str(),
+            &fence,
+        )
+        .map_err(|error| refuse(format!("current registry owner read: {error}")))?;
+        if let Some(receipt) = original_receipt {
+            let retry_now = current_unix_ms()?;
+            let (retry_activation, retry_receipt) =
+                self.current_task_selection_for_claim(retry_now, &claim)?;
+            if retry_activation.as_ref() != Some(&first_activation)
+                || retry_receipt != first_receipt
+            {
+                return Err(refuse(
+                    "original task/readiness owner changed before registration retry readback"
+                        .to_owned(),
+                ));
+            }
+            let retry_current = self
+                .recheck_task_selection_for_claim(retry_now, &claim, &task_selection)
+                .await?;
+            let retry_final_now = current_unix_ms()?;
+            let retry_terminal = self
+                .cold_start_readiness_terminal_for_claim(&claim, retry_final_now)?
+                .1;
+            if retry_terminal != first_receipt
+                || retry_current.state_fence != fence
+                || retry_final_now >= identity.deadline_unix_ms
+                || self.snapshot.state_fence() != fence
+            {
+                return Err(refuse(
+                    "original registration retry expired or changed owners during revalidation"
+                        .to_owned(),
+                ));
+            }
+            let retry_readback = read
+                .execute_named(NamedReadRequest {
+                    operation: NamedReadOperation::GetInstrumentRegistryState,
+                    scope_id: Some(scope_id.clone()),
+                    consistency: ReadConsistency::ExactFence,
+                    state_fence: fence.clone(),
+                    parameters: BTreeMap::new(),
+                })
+                .await
+                .map_err(|error| refuse(format!("current registry retry read: {error}")))?;
+            let (retry_owner_read, _) = parse_registration_owner_readback(
+                &retry_readback,
+                current_work_scope.scope_id.as_str(),
+                &fence,
+            )
+            .map_err(|error| refuse(format!("current registry retry read: {error}")))?;
+            let RegistrationAuthorityOwnerReadRecord::Present(ledger_json) = retry_owner_read
+            else {
+                return Err(refuse(
+                    "original receipt exists but the current Registry owner row is absent"
+                        .to_owned(),
+                ));
+            };
+            let proof = prove_original_registration_from_readback(
+                &ledger_json,
+                operation_identity.as_str(),
+                task_selection.clone(),
+                retry_current,
+                current_session.clone(),
+                receipt,
+                retry_readback,
+            )
+            .map_err(|error| refuse(format!("original registration retry proof: {error}")))?;
+            if proof.request_identity() != &identity
+                || proof.action_contract() != &action_contract
+                || proof.snapshot_json() != snapshot_json
+                || proof.request_identity().request.state_fence != fence
+                || proof.receipt().operation_id.as_str() != operation_identity.as_str()
+            {
+                return Err(refuse(
+                    "original receipt does not match the exact queued request and content"
+                        .to_owned(),
+                ));
+            }
+            return Ok(proof);
+        }
+        if let RegistrationAuthorityOwnerReadRecord::Present(ledger_json) = &owner_read {
+            let ledger = RegistrationAuthorityLedger::from_current_owner_json(ledger_json)
+                .map_err(|error| {
+                    refuse(format!("current registration authority ledger: {error}"))
+                })?;
+            let retained_registry_revision = ledger
+                .retained_expected_registry_revision(&identity.idempotency_key)
+                .map_err(|error| refuse(format!("current registration retry ledger: {error}")))?;
+            if retained_registry_revision.is_some()
+                || original_readback
+                    .payload
+                    .get("operation_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(operation_identity.as_str())
+            {
+                return Err(refuse(
+                    "original registration may have committed but its immutable receipt is absent; reconcile the original operation"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        // Resolve the real effective delegation path from current Governor
+        // authority, then ask the authenticated Kernel owner for exactly one
+        // current committed activation/subset pair per grant on that path.
+        let authority_graph = &self.owners.authority.grants;
+        let graph_snapshot = authority_graph
+            .recovery_snapshot()
+            .map_err(|error| refuse(format!("current canonical grant graph: {error}")))?;
+        graph_snapshot
+            .validate()
+            .map_err(|error| refuse(format!("current canonical grant graph: {error}")))?;
+        let authority_ref = GrantId::new(action_contract.authority_ref.clone())
+            .map_err(|error| refuse(format!("ActionContract grant reference: {error}")))?;
+        let canonical_grant = graph_snapshot
+            .grants
+            .iter()
+            .find(|grant| grant.grant_id == authority_ref.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                refuse("ActionContract grant is absent from current GrantGraph".to_owned())
+            })?;
+        if canonical_grant.holder != authenticated_owner_ref {
+            return Err(refuse(
+                "authenticated OS owner does not match the current canonical grant holder"
+                    .to_owned(),
+            ));
+        }
+        let holder = PrincipalRef::new(authenticated_owner_ref.to_owned())
+            .map_err(|error| refuse(format!("authenticated owner identity: {error}")))?;
+        let operation = OperationBinding {
+            operation_id: eliot_contracts::OperationId::new(operation_identity.as_str().to_owned())
+                .map_err(|error| refuse(format!("original operation id: {error}")))?,
+            request_id: identity.request.metadata.request_id.clone(),
+            idempotency_key: identity.idempotency_key.clone(),
+            operation_kind: INSTRUMENT_REGISTRY_REGISTER_OPERATION.to_owned(),
+            effect: EffectClass::ReversibleMutation,
+            state_fence: fence.clone(),
+        };
+        let operation_time = LogicalTime::new(first_now);
+        let effective_capabilities = authority_graph
+            .snapshot(
+                SnapshotId::new(operation_identity.as_str().to_owned())
+                    .map_err(|error| refuse(format!("effective snapshot identity: {error}")))?,
+                &holder,
+                &current_work_scope,
+                &current_session,
+                operation_time,
+            )
+            .map_err(|error| refuse(format!("effective capability snapshot: {error}")))?;
+        let path = effective_capabilities
+            .supporting_path(
+                INSTRUMENT_REGISTRY_REGISTER_OPERATION,
+                current_work_scope.scope_id.as_str(),
+                EffectClass::ReversibleMutation,
+            )
+            .map_err(|error| refuse(format!("registration grant path: {error}")))?;
+        if path.grant_path.last().map(GrantId::as_str) != Some(authority_ref.as_str()) {
+            return Err(refuse(
+                "ActionContract grant is not the current effective path leaf".to_owned(),
+            ));
+        }
+        let mut activation_evidence = Vec::with_capacity(path.grant_path.len());
+        for grant_id in &path.grant_path {
+            let evidence = read_activation(grant_id.as_str().to_owned())
+                .await
+                .map_err(|error| refuse(format!("current Kernel grant activation read: {error}")))?
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "current Kernel activation/subset is absent for grant {}",
+                        grant_id.as_str()
+                    ))
+                })?;
+            if evidence.activation.ors_subject_id != grant_id.as_str() {
+                return Err(refuse(
+                    "Kernel activation response substituted a path grant".to_owned(),
+                ));
+            }
+            activation_evidence.push(evidence);
+        }
+
+        // Any Kernel owner await may cross expiry or a state transition.
+        // Refresh time, task acceptance, session, WorkScope and grant path at
+        // the actual admission boundary, then require the evidence path read
+        // above to still name that same immutable path.
+        let now = current_unix_ms()?;
+        let (final_activation, final_receipt) =
+            self.current_task_selection_for_claim(now, &claim)?;
+        let final_activation =
+            final_activation.ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        if final_activation != first_activation || final_receipt != first_receipt {
+            return Err(refuse(
+                "original task/session/scope readiness terminal changed during Kernel reads"
+                    .to_owned(),
+            ));
+        }
+        let _owner_selection_after_activation_reads = self
+            .recheck_task_selection_for_claim(now, &claim, &task_selection)
+            .await?;
+        let final_owner_read_time = current_unix_ms()?;
+        let current_task_selection = self
+            .recheck_task_selection_for_claim(final_owner_read_time, &claim, &task_selection)
+            .await?;
+        let final_now = current_unix_ms()?;
+        if final_now >= identity.deadline_unix_ms || self.snapshot.state_fence() != fence {
+            return Err(refuse(
+                "registration deadline or Governor fence changed before effect admission"
+                    .to_owned(),
+            ));
+        }
+        let final_receipt = self
+            .cold_start_readiness_terminal_for_claim(&claim, final_now)
+            .map_err(|error| refuse(format!("final readiness claim recheck: {error}")))?
+            .1;
+        if final_receipt != first_receipt
+            || current_task_selection.state_fence != fence
+            || current_task_selection.task_ref != task_selection.task_ref
+            || current_task_selection.task_revision != task_selection.task_revision
+            || current_task_selection.acceptance_digest != task_selection.acceptance_digest
+        {
+            return Err(refuse(
+                "original readiness/task contract changed before registration effect".to_owned(),
+            ));
+        }
+        let final_scope_snapshot = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| refuse("current WorkScope owner disappeared".to_owned()))?
+            .read_current(&fence)
+            .map_err(|error| refuse(format!("final WorkScope owner recheck: {error}")))?;
+        let final_session = self
+            .owners
+            .session
+            .session(session_id)
+            .cloned()
+            .ok_or_else(|| refuse("current Session owner disappeared".to_owned()))?;
+        if final_scope_snapshot != work_scope_snapshot
+            || final_session != agent_session
+            || current_unix_ms()? >= identity.deadline_unix_ms
+        {
+            return Err(refuse(
+                "current WorkScope, Session, or operation deadline changed before registration effect"
+                    .to_owned(),
+            ));
+        }
+        let final_effective_capabilities = self
+            .owners
+            .authority
+            .grants
+            .snapshot(
+                SnapshotId::new(operation_identity.as_str().to_owned())
+                    .map_err(|error| refuse(format!("effective snapshot identity: {error}")))?,
+                &holder,
+                &current_work_scope,
+                &current_session,
+                LogicalTime::new(final_now),
+            )
+            .map_err(|error| refuse(format!("final effective capability snapshot: {error}")))?;
+        let final_path = final_effective_capabilities
+            .supporting_path(
+                INSTRUMENT_REGISTRY_REGISTER_OPERATION,
+                current_work_scope.scope_id.as_str(),
+                EffectClass::ReversibleMutation,
+            )
+            .map_err(|error| refuse(format!("final registration grant path: {error}")))?;
+        if final_path.grant_path != path.grant_path {
+            return Err(refuse(
+                "current effective grant path changed during Kernel activation reads".to_owned(),
+            ));
+        }
+        let final_action_payload_sha256 =
+            registration_action_payload_sha256(&identity, snapshot_json, owner_revision)
+                .map_err(|error| refuse(format!("registration action payload digest: {error}")))?;
+        let authority_read = match &owner_read {
+            RegistrationAuthorityOwnerReadRecord::Absent => RegistrationAuthorityOwnerRead::Absent,
+            RegistrationAuthorityOwnerReadRecord::Present(value) => {
+                RegistrationAuthorityOwnerRead::Present(value)
+            }
+        };
+        let candidate =
+            crate::action_lease_admission::admit_registration_action(ActionLeaseAdmissionInput {
+                holder_principal: authenticated_owner_ref,
+                request_identity: &identity,
+                operation_identity: &operation_identity,
+                operation,
+                expected_registry_revision: owner_revision,
+                action_contract: &action_contract,
+                operation_name: INSTRUMENT_REGISTRY_REGISTER_OPERATION,
+                resource_ref: current_work_scope.scope_id.as_str(),
+                canonical_payload_sha256: &final_action_payload_sha256,
+                executor_boundary: eliot_store_api::named_mutation_operation_name(
+                    eliot_store_api::NamedMutationOperation::ApplyInstrumentRegistryState,
+                ),
+                authority_owner: &self.owners.authority,
+                effective_capabilities: &final_effective_capabilities,
+                activation_evidence: &activation_evidence,
+                work_scope: &current_work_scope,
+                work_scope_binding_snapshot: &final_scope_snapshot,
+                session: &current_session,
+                agent_session: &final_session,
+                now: LogicalTime::new(final_now),
+                registration_authority_owner_read: authority_read,
+                effect_authorizer: &self.owners.authority.effects,
+            })
+            .map_err(|error| {
+                refuse(format!("original Governor action lease admission: {error}"))
+            })?;
+        if candidate.operation_identity() != &operation_identity
+            || candidate.expected_registry_revision() != owner_revision
+        {
+            return Err(refuse(
+                "action-lease candidate changed the original operation or local registry revision"
+                    .to_owned(),
+            ));
+        }
+        let next_effect_authorizer = candidate.next_effect_authorizer().clone();
+        let admitted = admit_instrument_registry_registration(
+            candidate,
+            identity.clone(),
+            action_contract,
+            &current_work_scope,
+            &current_session,
+            LogicalTime::new(final_now),
+            snapshot_json.to_owned(),
+            task_selection,
+            current_task_selection,
+        )
+        .map_err(|error| refuse(format!("Governor registration effect join: {error}")))?;
+        let proof = commit_instrument_registry_registration(self, &admitted, read)
+            .await
+            .map_err(|error| refuse(format!("canonical registry registration commit: {error}")))?;
+        if proof.request_identity() != &identity
+            || proof.receipt().operation_id.as_str() != operation_identity.as_str()
+            || proof.request_identity().request.state_fence != self.snapshot.state_fence()
+        {
+            return Err(refuse(
+                "committed original registration proof no longer matches its live Governor owner"
+                    .to_owned(),
+            ));
+        }
+        self.owners.authority.effects = next_effect_authorizer;
+        Ok(proof)
     }
 
     /// Admits one scope-sensitive canonical write whose observed binding and

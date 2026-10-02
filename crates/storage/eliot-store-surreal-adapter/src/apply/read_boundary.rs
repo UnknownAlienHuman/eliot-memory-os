@@ -2251,12 +2251,12 @@ async fn resource_snapshot_payload(
 /// Reads the instrument-registry head row and projects the same-fence
 /// canonical snapshot view (issue #1814 W1.2).
 ///
-/// Row shape mirrors the writer (verbatim opaque `snapshot_json`,
-/// `revision`, `state_fence`). An absent head (or a head from another
-/// fence) projects explicit absence (null snapshot, revision 0) — never
-/// fabricated bytes. Digest agreement was proven at write time and is
-/// re-checked by the consumer (`InstrumentRegistry::recover`) against
-/// the returned bytes.
+/// Row shape mirrors the writer (verbatim opaque `snapshot_json`, store-local
+/// `revision`, fence, scope, task, original operation identity and canonical
+/// request hash, and the verbatim Governor registration-authority ledger). An
+/// absent head (or a head from another fence) projects
+/// explicit absence; historical rows without the owner identity fail closed
+/// instead of fabricating it.
 async fn instrument_registry_payload(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -2271,16 +2271,77 @@ async fn instrument_registry_payload(
     if query.state_fence != *state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
+    let requested_scope =
+        query
+            .scope_id
+            .as_ref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "instrument registry read requires scope_id",
+            }))?;
     let row = super::surreal_instrument_registry::read_head_for_read(db, config).await?;
-    let (snapshot_json, revision) = match row {
-        Some(row) if row.state_fence == *state_fence => (json!(row.snapshot_json), row.revision),
-        _ => (Value::Null, 0),
-    };
-    Ok(json!({
-        "snapshot_json": snapshot_json,
-        "revision": revision,
-        "state_fence": state_fence,
-    }))
+    match row {
+        Some(row)
+            if row.state_fence == *state_fence && row.scope_id == requested_scope.as_str() =>
+        {
+            let operation_id = row.operation_id.ok_or(AdapterError::Store(
+                StoreError::InvalidField {
+                    field: "instrument_registry.operation_id",
+                    reason: "stored registry owner identity is missing; re-registration is required",
+                },
+            ))?;
+            let canonical_request_hash = row.canonical_request_hash.ok_or(
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "instrument_registry.canonical_request_hash",
+                    reason: "stored registry owner identity is missing; re-registration is required",
+                }),
+            )?;
+            let task_id = row
+                .task_id
+                .ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "instrument_registry.task_id",
+                    reason: "stored registration task is missing; re-registration is required",
+                }))?;
+            let registration_authority_json = row.registration_authority_json.ok_or(
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "instrument_registry.registration_authority_json",
+                    reason: "stored authority ledger is missing; explicit migration is required",
+                }),
+            )?;
+            // Preserve this exact persisted serialization. Historical rows
+            // remain explicitly absent and are never reconstructed here.
+            let registration_request_json = row.registration_request_json;
+            eliot_store_api::decode_instrument_registry_authority_ledger(
+                &std::collections::BTreeMap::from([(
+                    "registration_authority_json".to_owned(),
+                    json!(registration_authority_json),
+                )]),
+            )
+            .map_err(AdapterError::Store)?;
+            Ok(json!({
+                "snapshot_json": row.snapshot_json,
+                "registration_authority_json": registration_authority_json,
+                "revision": row.revision,
+                "state_fence": row.state_fence,
+                "scope_id": row.scope_id,
+                "task_id": task_id,
+                "operation_id": operation_id,
+                "canonical_request_hash": canonical_request_hash,
+                "registration_request_json": registration_request_json,
+            }))
+        }
+        _ => Ok(json!({
+            "snapshot_json": Value::Null,
+            "registration_authority_json": Value::Null,
+            "revision": 0,
+            "state_fence": state_fence,
+            "scope_id": Value::Null,
+            "task_id": Value::Null,
+            "operation_id": Value::Null,
+            "canonical_request_hash": Value::Null,
+            "registration_request_json": Value::Null,
+        })),
+    }
 }
 
 /// Reads automation rows and projects the same-fence canonical views

@@ -1703,6 +1703,16 @@ impl GrantActivationPort {
         ))
     }
 
+    /// Reads the current durable revocation watermark for this exact grant
+    /// from the same P-07 owner ledger used by `committed_activation`.
+    ///
+    /// Zero is the ledger's explicit owner-verified absence value; this is not
+    /// inferred from the grant graph or supplied by the caller.
+    #[must_use]
+    pub fn current_grant_revocation_revision(&self, grant_id: &str) -> u64 {
+        self.lock_ledger().revocation_revision(grant_id)
+    }
+
     /// Returns `true` only when the grant is recorded as revoked.
     ///
     /// An unknown grant is not assumed fenced; it stays reconciling until an

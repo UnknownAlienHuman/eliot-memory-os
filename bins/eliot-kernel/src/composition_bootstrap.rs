@@ -2153,6 +2153,8 @@ impl KernelComposition {
             generation_poison: Mutex::new(None),
             front_door_policy: Mutex::new(policy),
             process_gateway,
+            #[cfg(windows)]
+            instrument_stage_runtime: eliot_kernel_service::InstrumentStageRuntime::new(),
             store_bootstrap,
             daemon_active_launch: Mutex::new(daemon_launch.clone()),
             daemon_launch,

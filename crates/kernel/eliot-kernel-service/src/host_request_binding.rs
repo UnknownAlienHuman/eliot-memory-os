@@ -1681,6 +1681,7 @@ mod local_read_result_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }
@@ -1920,6 +1921,7 @@ mod local_read_build_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

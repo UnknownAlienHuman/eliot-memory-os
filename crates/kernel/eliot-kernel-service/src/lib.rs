@@ -26,10 +26,14 @@ pub use commit_recovery::{
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
 mod capacity_evidence;
+mod child_dispatch_authority;
 mod contract_rejection_gate;
 mod doctor;
 mod doctor_front_door;
 mod host_request_binding;
+mod instrument_stage_front_door;
+#[cfg(windows)]
+mod instrument_stage_runtime;
 mod lifecycle;
 mod lifecycle_admission;
 mod lifecycle_persist;
@@ -78,6 +82,7 @@ pub use capacity_evidence::{
     CapacityEnvelope, CapacityEvidenceError, CorpusScaleProfile, EvidenceClass,
     LatencyDistribution, MIN_PERCENTILE_SAMPLES, OptimizationQualification, UnqualifiedReason,
 };
+pub use child_dispatch_authority::KernelChildDispatchAuthority;
 pub use contract_rejection_gate::{
     PRE_STAGE_RETRY_RULE, PreStageDecision, PreStageIdentityCache, PreStageIdentitySnapshot,
     PreStageJournalReadiness, PreStageRejection, PreStageState, VerifiedCorrectionLink,
@@ -103,6 +108,19 @@ pub use eliot_protocol::{
     AgentBridgeClientDeclaration,
 };
 pub use host_request_binding::{AuthenticatedHostSession, KernelHostRequestBinder};
+pub use instrument_stage_front_door::{
+    INSTRUMENT_STAGE_GRANT_OPERATION, INSTRUMENT_STAGE_STARTED_OPERATION,
+    INSTRUMENT_STAGE_TERMINAL_OPERATION, InstrumentStageGrantRequest, InstrumentStageGrantResponse,
+};
+#[cfg(windows)]
+pub use instrument_stage_front_door::{
+    InstrumentStageStartedRequest, InstrumentStageStartedResponse, InstrumentStageTerminalRequest,
+    InstrumentStageTerminalResponse,
+};
+#[cfg(windows)]
+pub use instrument_stage_runtime::{
+    InstrumentStageRuntime, InstrumentStageRuntimeError, InstrumentStageRuntimeObservationPort,
+};
 pub use lifecycle::{
     AdmissionLease, KernelService, KernelServiceError, KernelServiceState, ServiceFailure,
 };
@@ -280,9 +298,10 @@ pub use testd_front_door::{
     TESTD_ADMISSION_WIRE_VERSION, TESTD_CONFLICT_MAX_FIELDS, TESTD_MAX_ENVELOPE_BYTES,
     TestdAdmission, TestdAdmissionAttemptRequest, TestdAdmissionConflict, TestdAdmissionContext,
     TestdAdmissionEnvelope, TestdAdmissionRejection, TestdAdmissionRejectionReason,
-    TestdAdmissionResponse, advertise_testd_admission, advertise_testd_admission_when_composed,
-    handle_testd_admission_attempt, handle_testd_cancellation, is_testd_diagnosis_only_envelope,
-    reconcile_testd_admission, reconcile_testd_delivery, route_testd_admission,
+    TestdAdmissionResponse, TestdProcessAttemptGrant, advertise_testd_admission,
+    advertise_testd_admission_when_composed, handle_testd_admission_attempt,
+    handle_testd_cancellation, is_testd_diagnosis_only_envelope, reconcile_testd_admission,
+    reconcile_testd_delivery, route_testd_admission,
 };
 pub use user_automation::{
     USER_AUTOMATION_SERVICE_CONTRACT_NAME, USER_AUTOMATION_SERVICE_CONTRACT_VERSION,

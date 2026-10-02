@@ -11,12 +11,15 @@ eliot-build-test-graph = { path = "../eliot-build-test-graph", version = "0.1.0"
 eliot-bootstrap.workspace = true
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
+eliot-graph-api.workspace = true
 eliot-instrument-cargo = { path = "../eliot-instrument-cargo", version = "0.1.0" }
 eliot-instrument-dotnet = { path = "../eliot-instrument-dotnet", version = "0.1.0" }
 eliot-instrument-nextest = { path = "../eliot-instrument-nextest", version = "0.1.0" }
 eliot-instrument-rustc = { path = "../eliot-instrument-rustc", version = "0.1.0" }
 eliot-instrument-rustfmt = { path = "../eliot-instrument-rustfmt", version = "0.1.0" }
 eliot-instrument-scip = { path = "../eliot-instrument-scip", version = "0.1.0" }
+eliot-ipc.workspace = true
+eliot-kernel-service.workspace = true
 eliot-process.workspace = true
 eliot-process-executor = { path = "../eliot-process-executor", version = "0.1.0" }
 eliot-receipts.workspace = true
