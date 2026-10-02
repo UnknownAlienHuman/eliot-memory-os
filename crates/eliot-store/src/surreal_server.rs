@@ -49,7 +49,7 @@ pub struct ReadySurrealServer {
     /// `Debug` - printing a live job handle would invite formatting it as if it
     /// were a plain value. The field therefore carries a hand-written `Debug`
     /// that reports only whether a job is held, never the handle itself.
-    _kill_on_close_job: Option<JobObject>,
+    kill_on_close_job: Option<JobObject>,
     // Probe handle on the bridge data-root lease, held for the session so a
     // bridge generation cannot claim the same production root mid-session
     // (I5.2/A5). `std::fs::File` is `Send + Debug`; released on drop.
@@ -69,10 +69,7 @@ impl std::fmt::Debug for ReadySurrealServer {
             .debug_struct("ReadySurrealServer")
             .field("started_pid", &self.started_pid)
             .field("lease_path", &self.lease_path)
-            .field(
-                "holds_kill_on_close_job",
-                &self._kill_on_close_job.is_some(),
-            )
+            .field("holds_kill_on_close_job", &self.kill_on_close_job.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -941,7 +938,7 @@ impl SurrealServerSupervisor {
             started_pid,
             lease_path: Some(self.create_client_lease()?),
             supervisor: self.clone(),
-            _kill_on_close_job: kill_on_close_job,
+            kill_on_close_job,
             _data_root_guard: data_root_guard,
         })
     }

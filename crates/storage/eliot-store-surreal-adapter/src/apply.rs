@@ -1123,6 +1123,13 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
         AdapterError::AllocationContention { .. }
         | AdapterError::MigrationRequired
         | AdapterError::Config(_)
+        // A provider that could not be assigned to its kill-on-close Job is a
+        // PRE-EFFECT refusal of exactly the same class as `Config`: the launch
+        // was refused before any provider send, so this identity proved no
+        // commit and is safe to resubmit. It must NOT become `Unknown` - that
+        // disposition exists for possible-submission inside the attempt window,
+        // and a refused launch never enters it.
+        | AdapterError::LaunchJobAssignmentFailed { .. }
         | AdapterError::Serialization(_)
         | AdapterError::NamedOperationUnavailable { .. } => AttemptOutcome::Cancelled,
         AdapterError::UnknownOutcome { .. }

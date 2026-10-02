@@ -37,9 +37,27 @@ pub(crate) struct ProviderOwner {
     /// Sole owning handle of the kill-on-close Job Object the provider child is
     /// assigned to (#1888, K-STORE). Held for the child's whole life, so the
     /// provider ends with this owner even when the owner is terminated from
-    /// outside and no `Drop` runs. `_kill_on_close` is retained for its `Drop`,
-    /// not read.
-    pub(crate) kill_on_close_job: ProviderKillOnCloseLease,
+    /// outside and no `Drop` runs.
+    ///
+    /// It is held in a `Mutex` for a type reason, not for concurrency: the
+    /// owning crate declares `JobObject` `Send` but deliberately NOT `Sync`
+    /// (`crates/kernel/eliot-platform-windows/src/process_job.rs:326-328`,
+    /// "a Job Object handle is process-global and uniquely owned here"). This
+    /// owner must be `Sync` because `Arc<ProviderOwner>` reaches the adapter's
+    /// port bounds, so the lease is wrapped exactly as `provider_child: Mutex<Child>`
+    /// is - the same treatment the same owner already gives its other
+    /// process-owned handle.
+    ///
+    /// The lease is never READ; it is held for its `Drop`, and that `Drop` is
+    /// the whole mechanism - closing the last handle to a kill-on-close Job
+    /// terminates every process assigned to it. Taking it away or forgetting it
+    /// would defeat the guarantee, so it is stored unconditionally for the
+    /// owner's whole life.
+    #[expect(
+        dead_code,
+        reason = "held for Drop: closing the kill-on-close Job ends the provider with its owner"
+    )]
+    pub(crate) kill_on_close_job: Mutex<ProviderKillOnCloseLease>,
     data_root_lease: StoreDataRootLease,
     /// Server version proved by the last ownership-verified authentication
     /// on this provider child (issue #1932). Set only after the full
@@ -121,7 +139,7 @@ impl ProviderOwner {
                 provider_child: Mutex::new(provider_child),
                 provider_process_id,
                 provider_process_identity: identity_before_listener,
-                kill_on_close_job,
+                kill_on_close_job: Mutex::new(kill_on_close_job),
                 data_root_lease,
                 authenticated_version: std::sync::Mutex::new(None),
             }),

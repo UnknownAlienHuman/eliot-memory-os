@@ -96,7 +96,12 @@ impl ProviderKillDomain {
     /// Returns the admitted provider process id, or `None` before admission.
     #[must_use]
     pub fn process_id(&self) -> Option<u32> {
-        self.admitted.map(|(process_id, _)| process_id)
+        // `ProcessIdentity` is not `Copy`, so the tuple cannot be copied out of
+        // the option behind a shared reference. Only the pid is needed, and it
+        // is the `Copy` half of the pair.
+        self.admitted
+            .as_ref()
+            .map(|(process_id, _identity)| *process_id)
     }
 
     /// Returns the exact process identity Windows re-observed through
@@ -144,7 +149,12 @@ where
     F: FnOnce(&C) -> Option<u32>,
     X: FnOnce(&mut C),
 {
-    let kill_domain = ProviderKillDomain::create()?;
+    // The kill domain is created and admitted as ONE step by
+    // `ProviderKillDomain::admit_spawned`, which owns both halves. Creating a
+    // Job here and letting it drop before that call would be worse than a
+    // wasted handle: a kill-on-close Job that is closed while the child is
+    // already running is a Job whose close would terminate an UNASSIGNED set,
+    // and it would leave the child governed by the SECOND Job alone.
     let mut child = spawn()
         .map_err(|_| AdapterError::Config("canonical provider process launch failed".to_owned()))?;
     match ProviderKillDomain::admit_spawned(child_process_id(&child)) {
@@ -214,8 +224,11 @@ pub fn fixture_provider_environment(
     bootstrap_username: &str,
     bootstrap_password: &str,
 ) -> Vec<(OsString, OsString)> {
-    let system_root = std::env::var_os("SystemRoot")
-        .map_or_else(|| OsString::from("C:\\Windows"), |value| value.into());
+    // `SystemRoot` is already an `OsString`, so the fallback arm needs no
+    // conversion: `.map_or_else` would add a redundant `Into::into` on a value
+    // that is already the target type.
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from("C:\\Windows"));
     vec![
         ("SystemRoot".into(), system_root.clone()),
         ("WINDIR".into(), system_root),
