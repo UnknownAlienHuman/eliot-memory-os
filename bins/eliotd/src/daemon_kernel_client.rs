@@ -2796,6 +2796,50 @@ impl DaemonKernelClient {
         parse_local_read_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
+    /// Claims one queued admitted `eliot.state` pair for the explicit
+    /// onboarding/bootstrap owner path (issue #1746). The state queue is
+    /// distinct from query and Skill claims; the original tool bytes carry
+    /// the explicit bootstrap input and are returned unchanged for the daemon
+    /// owner to decode and validate.
+    #[cfg(windows)]
+    pub async fn claim_local_state_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "local_state_claim",
+                serde_json::json!({ "operation": "local_state_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != "eliot.state"
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.state")
+        }) {
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel local_state_claim returned a non-state pair",
+            )
+            .emit();
+            return Err(super::DaemonError::Kernel(
+                "Kernel local_state_claim returned a pair outside the state tool".to_owned(),
+            ));
+        }
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
+        Ok(pair)
+    }
+
     /// Claims one queued admitted `eliot.observe` pair for the outbound-only
     /// observe poller (issue #2565).
     ///
