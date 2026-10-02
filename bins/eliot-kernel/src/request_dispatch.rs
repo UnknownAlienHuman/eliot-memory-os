@@ -3023,23 +3023,23 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, VerifyAd
 /// cannot drift between the two answers:
 ///
 /// 1. The ADMISSION REFERENCE must be the receipt this front door issues for
-///   this request. `BackupAdmissionRef::validate` decides the authority, scope
-///   and epoch bindings but deliberately leaves `admission_receipt` an opaque
-///   reference, so before #2862 that authority-bearing field was free text any
-///   caller could satisfy — the same "parallel shape with no owner behind it"
-///   defect one level below the payload.
-///   [`super::backup_verify_admission::check_admission_binding`] issues the
-///   receipt from the LIVE module scope, live fence and live authenticated
-///   principal — none of which is readable from the payload — and requires the
-///   presented reference to BE that receipt. A request admitted under another
-///   session, epoch, generation or principal is therefore the caller's payload
-///   and is answered `invalid` naming the field, rather than being told the ARM
-///   is unavailable for a request this boundary never admitted.
+///    this request. `BackupAdmissionRef::validate` decides the authority, scope
+///    and epoch bindings but deliberately leaves `admission_receipt` an opaque
+///    reference, so before #2862 that authority-bearing field was free text any
+///    caller could satisfy — the same "parallel shape with no owner behind it"
+///    defect one level below the payload.
+///    [`super::backup_verify_admission::check_admission_binding`] issues the
+///    receipt from the LIVE module scope, live fence and live authenticated
+///    principal — none of which is readable from the payload — and requires the
+///    presented reference to BE that receipt. A request admitted under another
+///    session, epoch, generation or principal is therefore the caller's payload
+///    and is answered `invalid` naming the field, rather than being told the ARM
+///    is unavailable for a request this boundary never admitted.
 /// 2. The ABSENT OWNER. The receipt admits the request; it does not resolve the
-///   retained handle into the bytes that handle names, and only a
-///   retained-archive owner can do that. None exists on this product, so the arm
-///   is refused BY NAME as `refused`/`plan_gap` + `missing_owner`, which
-///   `eliot_cli::backup::backup_verify` already projects on this route.
+///    retained handle into the bytes that handle names, and only a
+///    retained-archive owner can do that. None exists on this product, so the arm
+///    is refused BY NAME as `refused`/`plan_gap` + `missing_owner`, which
+///    `eliot_cli::backup::backup_verify` already projects on this route.
 ///
 /// `session` and `caller` are the LIVE admitted values, so this is reached only
 /// after [`admit_backup_caller`] has proved the peer identity and the
