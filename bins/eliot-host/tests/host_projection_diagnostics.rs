@@ -89,7 +89,11 @@ fn projection_01_propagation_single_terminal() {
     // Bind to emission, not vocabulary: the helper plus both 6-branch
     // reject paths, so deleting any `credential_codec_observe` call fails.
     assert!(cd.contains("credential_codec_observe(CodecRejectReason::"));
-    assert_eq!(count(&cd, "credential_codec_observe("), 13, "codec stopped observing");
+    assert_eq!(
+        count(&cd, "credential_codec_observe("),
+        13,
+        "codec stopped observing"
+    );
     let c = "corr-980-1";
     let t = emit(|| {
         observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, &format!("{inner} {c}"));
