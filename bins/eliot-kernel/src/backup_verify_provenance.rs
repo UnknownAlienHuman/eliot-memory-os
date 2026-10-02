@@ -143,17 +143,37 @@
 //!
 //! # WHAT IS DELIBERATELY NOT HERE
 //!
-//! - No `BackupArchiveVerification` is CONSTRUCTED here or anywhere else. This
-//!   route is the READER of the protocol request, never its author: the frame
-//!   admits the caller's value and the protocol's own `validate()` decides
-//!   whether it is well-formed. Building one would need a protocol
-//!   `BackupRole`, a protocol `RequestIdentity` and a `BackupAdmissionRef` (an
-//!   `AuthorityBinding`, a `WorkScopeBinding` and an owner-issued `ReceiptId`),
-//!   and none of those exists on the verify frame — minting them would fabricate
-//!   authority. So I2 is implemented in the direction the issue names: the
-//!   production payload of the retained-archive arm IS the existing
+//! - No `BackupArchiveVerification` is CONSTRUCTED here, and this route is still
+//!   the READER of the protocol request rather than its author: the frame admits
+//!   the caller's value and the protocol's own `validate()` decides whether it is
+//!   well-formed. Building one here would need a protocol `BackupRole`, a
+//!   protocol `RequestIdentity`, an archive-side `ContractIdentity` and the
+//!   archive's `schema_digest`/`build_digest`/`snapshot_digest`/
+//!   `member_digest`/`dest_installation`, and none of those has an owner value on
+//!   this product — the ECXF manifest carries only `backup_id`, `class`,
+//!   `source_adapter`, `schema_generation` and `export_fence_sha256`
+//!   (`crates/storage/eliot-backup/src/lib.rs:543`), and `BackupArtifactHandle`
+//!   needs an `ArtifactId` no backup-archive owner issues. Filling them in would
+//!   fabricate authority, so they are not filled in.
+//!
+//!   ONE PART OF THAT LIST IS NO LONGER TRUE, and the correction belongs here
+//!   rather than in the new file: the owner-issued `ReceiptId` in
+//!   `BackupAdmissionRef` DOES now have a producer. This Kernel front door is the
+//!   authority boundary that admits this route
+//!   (`request_dispatch::admit_backup_caller`), and
+//!   `elipt_receipts::ReceiptEnvelope::issue` is the repository's one `ReceiptId`
+//!   issuer, so [`super::backup_verify_admission`] issues the admission receipt
+//!   for a presented request from the live module scope, fence and authenticated
+//!   principal, and `request_dispatch::check_admission_binding` requires the
+//!   presented reference to BE that receipt. Before that, `admission_receipt` was
+//!   free text any caller could satisfy, which is the same "parallel shape with
+//!   no owner behind it" defect one level below the payload.
+//!
+//!   I2 is therefore implemented in the direction the issue names: the production
+//!   payload of the retained-archive arm IS the existing
 //!   `BackupArchiveVerification`, admitted verbatim through one closed wrapper
-//!   ([`BackupVerifyAdmittedRequest`]) and mapped into the existing
+//!   ([`BackupVerifyAdmittedRequest`]), its admission reference bound to this
+//!   boundary's own issued receipt, and mapped into the existing
 //!   `BackupVerifyRequestIdentity` by the exhaustive checked adapter
 //!   [`bind_protocol_request`].
 //! - No `BackupRole` is invented. The protocol states as its own invariant that
@@ -255,6 +275,20 @@ pub(crate) enum BackupProvenanceError {
         /// The store's own typed refusal, preserved verbatim.
         source: OrsError,
     },
+    /// The presented admission reference is not the one THIS admission boundary
+    /// issues for this request under this admitted session (issue #2862, item
+    /// I2).
+    ///
+    /// It is a separate variant rather than a fourth use of [`Self::NotBound`]
+    /// because the bounded reasons are different facts: `NotBound` says owner
+    /// evidence does not name THIS verification's archive, and this one says the
+    /// authority-bearing admission receipt is not a receipt this boundary
+    /// issued. Collapsing them would put a sentence on the wire that is wrong
+    /// for one of the two.
+    AdmissionNotBound {
+        /// Stable field path of the admission reference that diverged.
+        field: &'static str,
+    },
     /// The archive's own recorded `StateFence` value could not be re-encoded,
     /// so the fence relation between an owner-issued value and the archive
     /// could not be decided. Fails closed: an undecidable relation is a
@@ -269,7 +303,8 @@ impl BackupProvenanceError {
         match self {
             Self::NotBound { field }
             | Self::OwnerValueInvalid { field, .. }
-            | Self::ProjectionRefused { field, .. } => field,
+            | Self::ProjectionRefused { field, .. }
+            | Self::AdmissionNotBound { field } => field,
             Self::ArchiveFenceUndecidable => CAPTURE_RECEIPT_FIELD,
         }
     }
@@ -286,6 +321,9 @@ impl BackupProvenanceError {
         match self {
             Self::NotBound { .. } => {
                 "owner-issued evidence is not bound to this verification's archive".to_owned()
+            }
+            Self::AdmissionNotBound { .. } => {
+                "the admission receipt is not one this boundary issued for this request".to_owned()
             }
             Self::OwnerValueInvalid { field, source } => format!("{field}: {source}"),
             Self::ProjectionRefused { field, source } => format!("{field}: {source}"),
