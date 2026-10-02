@@ -57,6 +57,15 @@ Muse Code (MC, quota back 2026-10-05 00:00 UTC), Antigravity (little quota), Cla
    push per issue, BLOCKED instead of inventing, fmt + clippy in lanes, tests by the verifier/root), acceptance by
    `v2\Merge-Daemon-v8.sh`. Hourly report; closures, not PRs, measure progress.
 
+## Known problems to fix before step 7
+- `merge-compile` (`.github/workflows/ci.yml`) fails on every swarm PR at "Verify shared documentation evidence":
+  `scripts/work_unit_gate/doc_read_evidence.py` requires exactly one `<!-- eliot-doc-read-evidence:v2:start -->`
+  canonical-JSON block, while the acceptance script `Make-PR2.sh` still writes the old `eliot-doc-routing` block.
+  `main` has no required status checks, so merges went through anyway (#5016, #5017). Make the acceptance emit the v2
+  block (or decide the check's status) before the sprint.
+- The acceptance gate `v2\pr_evidence.py --open` was fixed on 2026-10-02 13:55 to accept BLOCKED items with
+  `MISSING-CONTRACT` / no owning issue; before that it refused such deliveries as unfinished ("merge failed").
+
 ## Done when
 - `BLOCKERS-AUDIT.tsv`, `PLAN.md` / `PLAN.tsv`, `STITCH-PLAN.md` are on this branch and pass the step 6 checks;
 - the owner decisions list in this PR's description is answered or explicitly deferred;
