@@ -13,7 +13,9 @@ mod sse;
 mod types;
 
 pub use bridge_contract::{
-    BridgeContractError, opencode_adapter_contract, validate_opencode_adapter_contract,
+    BridgeContractError, OPENCODE_DECLARATION_WIRE_ID, OPENCODE_DECLARATION_WIRE_VERSION,
+    OpenCodeBridgeDeclaration, issue_opencode_declaration, opencode_adapter_contract,
+    validate_opencode_declaration,
 };
 pub use catalogue::*;
 pub use client::{
