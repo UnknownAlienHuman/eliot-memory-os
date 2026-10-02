@@ -10,6 +10,19 @@
 //! proposed, and a recurring failure with the same causal hypothesis yields
 //! Mechanism Review rather than another equivalent retry.
 //!
+//! The exact deterministic trigger identity a candidate bears on travels as
+//! its own member ([`NegativeMemoryExtinctionCandidate::trigger`]), separate
+//! from the composite failure fingerprint, because the governing donor states
+//! the two apart: "Exact deterministic trigger can block/requires probe within
+//! matching scope. Semantic similarity only warns."
+//! (`docs/architecture/I12-19-negative-memory.md:3`, restated by
+//! `crates/smart/eliot-dreamer-memory-revision/module.toml:96` `omission_semantics`
+//! and its gate `W9-MR-EXACT-TRIGGER-VERSUS-SIMILARITY` at line 148). One
+//! opaque fingerprint string carries neither, so it could only ever prove
+//! shape; [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`] is the
+//! single place an exact-trigger requirement is decided, and it decides it on
+//! the trigger identity compared with the governing exact-trigger identities.
+//!
 //! There are no parallel observation, evidence, query, or projection types
 //! here: failure/revision shapes stay with `eliot-observation-contracts`,
 //! self-query/accepted-source shapes stay with `eliot-dreamer-contracts`,
@@ -21,6 +34,9 @@
 //! Governor transition path.
 
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+mod exact_trigger_gate_tests;
 
 use std::collections::BTreeSet;
 
@@ -170,7 +186,27 @@ pub struct NegativeMemoryExtinctionCandidate {
     pub candidate_id: ArtifactId,
     /// Observation handle this candidate bears on.
     pub observation_ref: ArtifactId,
-    /// Failure fingerprint echoed verbatim.
+    /// Exact deterministic trigger identity this candidate bears on, echoed
+    /// verbatim from [`FailureObservation::trigger`] — the member that member's
+    /// owner documents as "Exact deterministic trigger identity".
+    ///
+    /// This is the only member an exact-trigger requirement may be decided on,
+    /// and it is a separate member from `fingerprint` precisely so a composite
+    /// fingerprint cannot stand in for it: the governing donor
+    /// (`docs/architecture/I12-19-negative-memory.md:3`) states "Exact
+    /// deterministic trigger can block/requires probe within matching scope.
+    /// Semantic similarity only warns." See
+    /// [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`].
+    ///
+    /// No stored candidate exists to migrate: this cell declares
+    /// `owned_mutable_state = []` and `state_class = STATELESS`
+    /// (`module.toml:22` and `:185`), so the added required member is read
+    /// only from a candidate this crate just proposed.
+    pub trigger: String,
+    /// Failure fingerprint echoed verbatim. This is the semantic content of the
+    /// owner failure memory — the trigger, failed-action and outcome identity as
+    /// the owner admitted them — and never the exact trigger: a similarity of
+    /// this value only warns. Decide exact-trigger requirements on `trigger`.
     pub fingerprint: String,
     /// Posed self-query digest this candidate was assessed under.
     pub query_digest: String,
@@ -195,6 +231,7 @@ impl NegativeMemoryExtinctionCandidate {
             &self.contract_version,
             &self.candidate_id,
             &self.observation_ref,
+            &self.trigger,
             &self.fingerprint,
             &self.query_digest,
             &self.narrowing,
@@ -217,6 +254,16 @@ impl NegativeMemoryExtinctionCandidate {
         if self.missing.len() > MAX_MISSING_ENTRIES {
             return Err(RevisionError::Bounds {
                 field: "candidate.missing",
+            });
+        }
+        // The exact trigger is an identity, checked exactly like
+        // `intake.candidate_id`, and never folded into `fingerprint`.
+        if self.trigger.trim().is_empty()
+            || self.trigger.chars().any(char::is_control)
+            || self.trigger.chars().count() > MAX_ID_CHARS
+        {
+            return Err(RevisionError::DigestMismatch {
+                field: "candidate.trigger",
             });
         }
         if self.denominator.recheck_digest != self.denominator.compute_digest()? {
@@ -243,6 +290,56 @@ impl NegativeMemoryExtinctionCandidate {
         if self.digest != self.compute_digest()? {
             return Err(RevisionError::DigestMismatch {
                 field: "candidate.digest",
+            });
+        }
+        Ok(())
+    }
+
+    /// Recheck the exact-trigger requirement against the exact trigger
+    /// identities that govern it, never against the fingerprint's shape.
+    ///
+    /// `governing_triggers` is the verbatim exact-trigger set the Governor owner
+    /// supplies: `SafetyProjection::negative_memory_triggers` in
+    /// `eliot-context-contracts`, whose own owner states the entries "are copied
+    /// verbatim; this contract never invents trigger prose", and which the bound
+    /// freeze's `denominator_note` records as exact trigger identities copied
+    /// verbatim from the Governor owner
+    /// (`crates/smart/cognitive-rev12-contract-schema-freeze.toml:455`).
+    /// The slice is passed in rather than the projection so a holder can recheck
+    /// with the governing set it actually holds.
+    ///
+    /// The requirement is decided on exactly one comparison: verbatim equality
+    /// of [`Self::trigger`] with a member of `governing_triggers`. Neither the
+    /// presence nor the shape nor any containment or similarity of
+    /// [`Self::fingerprint`] is consulted, because the governing donor
+    /// (`docs/architecture/I12-19-negative-memory.md:3`) states "Exact
+    /// deterministic trigger can block/requires probe within matching scope.
+    /// Semantic similarity only warns."
+    ///
+    /// `classify` proposes [`CandidateState::Unsupported`] only when an exact
+    /// trigger fired, so both directions are refused here: a candidate recorded
+    /// `Unsupported` whose exact trigger is not in the governing set (a
+    /// near-match over otherwise valid content), and a candidate that is not
+    /// `Unsupported` while an exact trigger is in that set. The refusal is the
+    /// existing typed [`RevisionError::ScopeMismatch`] naming the exact field —
+    /// never a boolean, never a message string, and no tenth
+    /// [`RevisionError`] variant that `bins/eliotd`'s exhaustive
+    /// `From<RevisionError>` match would break.
+    ///
+    /// [`propose`] calls this once over the candidate it emits. A downstream
+    /// holder of the candidate calls it again with its own governing set, which
+    /// is what lets the consumer re-decide the exact-trigger requirement with
+    /// the operation instead of with the shape of one opaque string.
+    pub fn recheck_exact_trigger(
+        &self,
+        governing_triggers: &[String],
+    ) -> Result<(), RevisionError> {
+        let exact_trigger_fired = governing_triggers
+            .iter()
+            .any(|identity| identity == &self.trigger);
+        if exact_trigger_fired != (self.state == CandidateState::Unsupported) {
+            return Err(RevisionError::ScopeMismatch {
+                field: "candidate.exact_trigger",
             });
         }
         Ok(())
@@ -547,6 +644,13 @@ fn validate_intake(intake: &RevisionIntake<'_>) -> Result<String, RevisionError>
 /// state, and only a fully covered intake may propose suppressing advisory
 /// activation — an incomplete one names every missing evidence entry and
 /// suppresses nothing.
+///
+/// The first refusal is the only exact-trigger comparison in this crate and it
+/// is verbatim equality between the observation's exact trigger identity and a
+/// governing exact trigger identity. It never reads `fingerprint`, so a
+/// semantic near-match cannot make the candidate `Unsupported` here;
+/// [`NegativeMemoryExtinctionCandidate::recheck_exact_trigger`] then binds the
+/// recorded state to that same comparison.
 fn classify(intake: &RevisionIntake<'_>) -> ProposalOutcome {
     if intake
         .safety
@@ -678,6 +782,7 @@ fn finish(
         contract_version: CANDIDATE_CONTRACT_VERSION,
         candidate_id: intake.candidate_id.clone(),
         observation_ref: intake.observation.observation_id.clone(),
+        trigger: intake.observation.trigger.clone(),
         fingerprint: intake.observation.fingerprint.clone(),
         query_digest,
         narrowing,
@@ -700,5 +805,6 @@ fn finish(
     }
     candidate.digest = candidate.compute_digest()?;
     candidate.validate()?;
+    candidate.recheck_exact_trigger(&intake.safety.negative_memory_triggers)?;
     Ok(candidate)
 }
