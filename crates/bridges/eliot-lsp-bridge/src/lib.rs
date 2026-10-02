@@ -4670,7 +4670,7 @@ fn capture_live_raw_outputs(
                 .map_err(|error| BridgeError::SidecarUnreadable {
                     detail: error.to_string(),
                 })?;
-        let observed = source
+        let observed_before = source
             .observe()
             .map_err(|error| BridgeError::SidecarUnreadable {
                 detail: error.to_string(),
@@ -4679,27 +4679,55 @@ fn capture_live_raw_outputs(
             process_evidence_completed(process_evidence),
             process_evidence_exit_code(process_evidence),
         );
-        if observed.files.is_empty() && !process_succeeded {
+        if observed_before.files.is_empty() && !process_succeeded {
             return Ok(outputs);
         }
-        if observed.files.len() != 1
-            || observed.files[0].relative_path != LSP_SCIP_SIDECAR_FILE_NAME
+        if observed_before.files.len() != 1
+            || observed_before.files[0].relative_path != LSP_SCIP_SIDECAR_FILE_NAME
         {
             return Err(BridgeError::ScipArtifactNotInvocationOwned);
         }
-        if observed.files[0].size > MAX_SCIP_SIDECAR_BYTES {
+        if observed_before.files[0].size > MAX_SCIP_SIDECAR_BYTES {
             return Err(BridgeError::OutputTooLarge);
         }
+
+        // Pin the exact emitted file before trusting it. The file lease denies
+        // write/delete sharing; two directory observations must agree with
+        // that retained identity and digest, so a pathname replacement
+        // between enumeration and open cannot be captured as this invocation.
         let sidecar = source
             .retain_file(LSP_SCIP_SIDECAR_FILE_NAME)
             .map_err(|error| BridgeError::SidecarUnreadable {
                 detail: error.to_string(),
             })?;
+        let observed_while_pinned =
+            source
+                .observe()
+                .map_err(|error| BridgeError::SidecarUnreadable {
+                    detail: error.to_string(),
+                })?;
+        if observed_while_pinned != observed_before
+            || observed_while_pinned.files.len() != 1
+            || observed_while_pinned.files[0].identity != sidecar.identity()
+            || observed_while_pinned.files[0].size != sidecar.size()
+            || observed_while_pinned.files[0].sha256 != sidecar.sha256()
+        {
+            return Err(BridgeError::ScipArtifactNotInvocationOwned);
+        }
         let bytes = sidecar
             .read_bounded(MAX_SCIP_SIDECAR_BYTES)
             .map_err(|error| BridgeError::SidecarUnreadable {
                 detail: error.to_string(),
             })?;
+        let observed_after_read =
+            source
+                .observe()
+                .map_err(|error| BridgeError::SidecarUnreadable {
+                    detail: error.to_string(),
+                })?;
+        if observed_after_read != observed_while_pinned {
+            return Err(BridgeError::ScipArtifactNotInvocationOwned);
+        }
         outputs.push(live_raw_output(
             started,
             LspRawOutputKind::ScipSidecar,
