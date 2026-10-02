@@ -4,6 +4,7 @@
 //! Implementation: I5.1, I5.9, I5.22, I2.23.
 //! Ownership: pure `RpcResponse` envelope and `surrealdb-3.1`/`3.2` `ProviderVersion` parsing only; no transport, auth, handshake, process-spawn, or lifecycle ownership (see `crates/storage/eliot-store-surreal-adapter/src/client.rs`).
 
+use eliot_types::strict_json_has_no_duplicate_members;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -114,7 +115,39 @@ fn invalid_provider_version(reason: &str) -> AdapterError {
     ))
 }
 
+/// Decodes one RPC response frame, refusing a lexical duplicate object member
+/// before the response id is read (#937, #938, #940).
+///
+/// `serde_json::from_str` collapses a repeated member to last-wins the instant
+/// raw bytes become a `serde_json::Value`: this workspace builds
+/// `serde_json::Map` without the `preserve_order` feature, so `Map` is a
+/// `BTreeMap`. The call sites in `client/session.rs:190` and `:198` then compare
+/// `response.id` against the request id, so a duplicate-keyed frame was already
+/// an admission and routing decision by the time any closed record in this crate
+/// could be validated. `provider_version_from_rpc` below inherits that collapse
+/// through its `from_value`, so it could not distinguish a duplicate document
+/// from its last-wins equivalent either, even for the closed
+/// `ProviderVersionObject` shape it validates.
+///
+/// This is the single raw-ingress gate for both the text and the binary frame
+/// path, and it is a thin reuse of the shared `eliot_types::strict_json`
+/// decoder. It is not a second parser, and it is not an extra per-call-site
+/// check. The typed decode below is unchanged, so a duplicate member is refused
+/// and a duplicate-free document keeps every previously accepted byte.
+///
+/// Named absence: these frames have no ELIOT-owned byte ceiling. Nothing in this
+/// crate sets `WebSocketConfig`, `max_message_size` or `max_frame_size`, so only
+/// the tokio-tungstenite library default bounds a frame, and the read loop's
+/// `timeout` in `client/session.rs:168` is a time bound, not a byte ceiling.
+/// This gate therefore uses the shared decoder's no-ceiling entry point rather
+/// than inventing a `max_bytes` that no requirement states; the bytes are
+/// already received and resident here, so a ceiling at this point could only
+/// newly refuse large but legitimate query results. An ELIOT-owned response
+/// ceiling remains unowned.
 pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
+    strict_json_has_no_duplicate_members(text.as_bytes())
+        .map_err(|error| AdapterError::Serialization(error.kind.as_str().to_owned()))?;
+
     serde_json::from_str(text).map_err(|error| AdapterError::Serialization(error.to_string()))
 }
 
