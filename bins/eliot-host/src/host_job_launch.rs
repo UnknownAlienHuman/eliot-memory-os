@@ -92,9 +92,12 @@ use crate::store_kernel_launch_sequence::{
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner, so sink outcome never alters
 // result/order/count/handle/cleanup/timeout. There is no mutable global dedup
-// cache: one terminal emission per failed launch-owned operation is enforced
-// by the single outermost guard (`start_approved` owns `host-launch-failed`),
-// while inner phases are subordinate records. Typed rejections stay
+// cache: `start_approved` arms no guard and is phase-only (audit #5910159678
+// defect 2), because every enclosing #891 operation contour already owns that
+// operation's terminal. The one exception is a launch call no such contour
+// guard encloses — the cutover contour relaunches, which own their terminal
+// through [`observe_launch_terminal`] at the call site. Inner phases are
+// subordinate records. Typed rejections stay
 // `HostError::ProcessContour`/`RecoveryRequired` (cases 978/2/978/3);
 // admitted launches are distinct from readiness (case 978/4 — admitted here
 // is never readiness, which stays with the readiness contour).
@@ -349,15 +352,20 @@ fn host_launch_observe_terminal(code: &str) {
     crate::host_diagnostics::observe_terminal_error(code);
 }
 
+/// The frozen terminal code for one failed physical launch.
+#[cfg(windows)]
+const HOST_LAUNCH_FAILED: &str = "host-launch-failed";
+
 /// Single-terminal guard for one physical launch operation.
 ///
-/// Armed on entry; the single outermost boundary (`start_approved`) disarms on
-/// success. Any `Err` return (explicit or via `?`) drops armed and emits
-/// exactly one terminal record with the operation's frozen code. Emitting here
-/// never changes the `Result`: the guard only observes the already-produced
-/// outcome. No dedup cache, no lock, no second evaluation. This mirrors the
-/// `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891) without touching
-/// it.
+/// `start_approved` itself is phase-only: every enclosing #891 operation
+/// contour already owns its operation's terminal, so a guard armed inside the
+/// leaf would emit a second terminal record for one failed launch. Where a
+/// launch call is not enclosed by such a contour guard, its call site owns the
+/// terminal through [`observe_launch_terminal`]. Emitting here never changes
+/// the `Result`: the guard only observes the already-produced outcome. No dedup
+/// cache, no lock, no second evaluation. This mirrors the `HostTerminalGuard`
+/// model in `lib.rs` (F-LOG-HOST-1, #891) without touching it.
 #[cfg(windows)]
 struct HostLaunchTerminalGuard<'a> {
     code: &'a str,
@@ -382,6 +390,27 @@ impl Drop for HostLaunchTerminalGuard<'_> {
             host_launch_observe_terminal(self.code);
         }
     }
+}
+
+/// Runs exactly one physical launch under the calling contour's single
+/// terminal owner.
+///
+/// Used only where no enclosing #891 operation guard covers the launch call:
+/// the guard is armed around that one call, so any `Err` emits exactly one
+/// terminal record with [`HOST_LAUNCH_FAILED`], and the success path disarms
+/// it and emits none. `launch` is evaluated exactly once and its `Result` is
+/// returned unchanged, so the returned error, the call order, the launch count
+/// and the handle/cleanup behaviour are all the caller's own.
+#[cfg(windows)]
+pub(crate) fn observe_launch_terminal<T>(
+    launch: impl FnOnce() -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    let mut terminal = HostLaunchTerminalGuard::armed(HOST_LAUNCH_FAILED);
+    let outcome = launch();
+    if outcome.is_ok() {
+        terminal.disarm();
+    }
+    outcome
 }
 
 /// Verifies that the executable and config locators resolve to the exact
@@ -1520,10 +1549,13 @@ impl HostJobBranches {
             kernel_artifact_digest: kernel_artifact.as_str(),
             store_artifact_digest: store_artifact.as_str(),
         };
-        // WORK_UNIT_CASE: 978/1 — start requested, outermost contour owns the single terminal.
+        // WORK_UNIT_CASE: 978/1 — start requested; this leaf owns no terminal (audit #5910159678 defect 2).
         // WORK_UNIT_CASE: 978/4 — request distinct from process identity and readiness; admitted is never ready.
         host_launch_observe_bound("host.launch start requested", &start.base());
-        let mut launch_terminal = HostLaunchTerminalGuard::armed("host-launch-failed");
+        // Phase-only (audit #5910159678 defect 2): the enclosing #891 operation
+        // contour owns this operation's single terminal, and a launch call no
+        // such contour guard encloses owns it at its call site through
+        // `observe_launch_terminal`.
         if self.kernel.is_some() || self.store.is_some() {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
             host_launch_observe_bound("host.launch typed rejection", &start.base());
@@ -1858,7 +1890,6 @@ impl HostJobBranches {
                             "host.launch start admitted",
                             &start.with_processes(Some(&store_process), Some(&kernel_process)),
                         );
-                        launch_terminal.disarm();
                         Ok(())
                     }
                     Err(reason) => {
