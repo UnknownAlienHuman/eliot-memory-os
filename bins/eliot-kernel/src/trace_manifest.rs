@@ -47,7 +47,7 @@
 
 use eliot_contracts::StateFence;
 use eliot_ipc::Session;
-use eliot_ors::HostRequestRecord;
+use eliot_ors::{HostRequestKind as OrsHostRequestKind, HostRequestRecord};
 use eliot_protocol::{
     AgentActivationResolutionResult, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, LocalReadAttempt,
@@ -307,12 +307,7 @@ impl TraceManifest {
         let input_handle = evidence
             .and_then(|evidence| evidence.input_handle.as_deref())
             .filter(|handle| {
-                admitted_envelope
-                    .as_ref()
-                    .and_then(|envelope| envelope.compute_digest().ok())
-                    .as_deref()
-                    == Some(*handle)
-                    && *handle == persisted.request_digest
+                admitted_envelope.is_some() && *handle == persisted.request_digest.as_str()
             })
             .map(str::to_owned);
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
@@ -338,7 +333,11 @@ impl TraceManifest {
                 .then(|| persisted.payload_schema_id.as_ref())
                 .flatten()
                 .map(|schema| schema.as_str().to_owned()),
-            admitted_payload_retained: owner_row_valid && persisted.payload_body.is_some(),
+            admitted_payload_retained: exact_admitted_payload_retained(
+                owner_row_valid,
+                admitted_envelope.is_some(),
+                persisted.payload_body.is_some(),
+            ),
             payload_digest,
             state_fence,
             connection_id: owner_row_valid
@@ -395,22 +394,19 @@ impl TraceManifest {
             missing_parts: Vec::new(),
             unavailable: Vec::new(),
         };
-        if let Some(evidence) = evidence
-            && let Some(digest) = evidence.actual_route.as_deref()
-            && is_lowercase_sha256(digest)
-        {
-            manifest.actual_route = Some(digest.to_owned());
-            if let Some(receipt) = evidence.actual_route_receipt.as_ref()
-                && manifest.route_receipt_matches(digest, receipt)
-            {
-                manifest.actual_route_receipt = Some(receipt.clone());
-            }
+        if let Some(evidence) = evidence {
+            // Retain the owner's original fields verbatim. The slot validates
+            // the digest/body pair; a malformed present body stays visible and
+            // is refused during replay instead of being rewritten as absence.
+            manifest.actual_route.clone_from(&evidence.actual_route);
+            manifest
+                .actual_route_receipt
+                .clone_from(&evidence.actual_route_receipt);
         }
-        if let Some(receipt) = result_binding_receipt
-            && manifest.result_binding_receipt_matches(receipt)
-        {
-            manifest.result_binding_receipt = Some(receipt.clone());
-        }
+        // Keep any supplied original record verbatim. A contradictory record
+        // is a replay refusal, not an absent slot that can be downgraded into
+        // an apparently ordinary degraded manifest.
+        manifest.result_binding_receipt = result_binding_receipt.cloned();
         let missing = manifest.missing_parts();
         manifest.finish = if missing.is_empty() {
             TraceFinish::VerifiedComplete
@@ -918,11 +914,12 @@ fn original_admitted_envelope(persisted: &HostRequestRecord) -> Option<HostReque
     .ok()?;
     let identity = &envelope.identity;
     let same_optional = |observed: Option<&str>, expected: Option<&str>| observed == expected;
-    if envelope.kind != persisted.kind
+    if !request_kind_matches_row(envelope.kind, persisted.kind)
         || persisted.operation_id.as_str() != format!("hostreq:{}", persisted.request_digest)
         || identity.request_id.as_str() != persisted.request_id.as_str()
         || identity.idempotency_key != persisted.idempotency_key.as_str()
         || identity.cancellation_id != persisted.cancellation_id.as_str()
+        || identity.correlation_projection != persisted.correlation_projection
         || !same_optional(
             identity.parent_operation_id.as_deref(),
             persisted.parent_operation_id.as_ref().map(|value| value.as_str()),
@@ -961,6 +958,35 @@ fn original_admitted_envelope(persisted: &HostRequestRecord) -> Option<HostReque
         return None;
     }
     Some(envelope)
+}
+
+fn request_kind_matches_row(
+    request_kind: eliot_protocol::HostRequestKind,
+    row_kind: OrsHostRequestKind,
+) -> bool {
+    match request_kind {
+        eliot_protocol::HostRequestKind::Activation => {
+            row_kind == OrsHostRequestKind::Activation
+        }
+        eliot_protocol::HostRequestKind::Invocation => {
+            row_kind == OrsHostRequestKind::Invocation
+        }
+        eliot_protocol::HostRequestKind::Cancellation => {
+            row_kind == OrsHostRequestKind::Cancellation
+        }
+        eliot_protocol::HostRequestKind::Status => row_kind == OrsHostRequestKind::Status,
+        eliot_protocol::HostRequestKind::Reconciliation => {
+            row_kind == OrsHostRequestKind::Reconciliation
+        }
+    }
+}
+
+fn exact_admitted_payload_retained(
+    owner_row_valid: bool,
+    original_envelope_valid: bool,
+    payload_body_retained: bool,
+) -> bool {
+    owner_row_valid && original_envelope_valid && payload_body_retained
 }
 
 fn activation_result_matches_envelope(
@@ -1236,6 +1262,26 @@ mod tests {
     }
 
     #[test]
+    fn original_envelope_kind_must_match_the_durable_ors_kind() {
+        assert!(super::request_kind_matches_row(
+            eliot_protocol::HostRequestKind::Invocation,
+            eliot_ors::HostRequestKind::Invocation,
+        ));
+        assert!(!super::request_kind_matches_row(
+            eliot_protocol::HostRequestKind::Invocation,
+            eliot_ors::HostRequestKind::Activation,
+        ));
+    }
+
+    #[test]
+    fn admitted_payload_slot_requires_both_original_sources() {
+        assert!(super::exact_admitted_payload_retained(true, true, true));
+        assert!(!super::exact_admitted_payload_retained(true, false, true));
+        assert!(!super::exact_admitted_payload_retained(true, true, false));
+        assert!(!super::exact_admitted_payload_retained(false, true, true));
+    }
+
+    #[test]
     fn find_sealed_replays_actual_route_only_with_exact_fence_and_route_facts() {
         let mut manifest = absent_evidence_manifest();
         let (digest, receipt) = actual_route_receipt(&manifest);
@@ -1290,6 +1336,18 @@ mod tests {
             &wrong_adapter_digest,
             &caller_connection_substitution,
         ));
+
+        let mut invalid_manifest = manifest.clone();
+        invalid_manifest.actual_route = Some(wrong_adapter_digest);
+        invalid_manifest.actual_route_receipt = Some(caller_connection_substitution);
+        invalid_manifest.missing_parts = invalid_manifest.missing_parts();
+        invalid_manifest.unavailable = invalid_manifest.unavailable_parts();
+        invalid_manifest.finish = TraceFinish::DegradedNoProof;
+        assert!(TraceManifest::find_sealed(
+            &[seal_record(&invalid_manifest)],
+            &invalid_manifest.operation_id,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1337,11 +1395,36 @@ mod tests {
     }
 
     #[test]
+    fn find_sealed_refuses_a_present_binding_receipt_for_another_result() {
+        let mut manifest = absent_evidence_manifest();
+        let mut receipt = result_binding_record(&manifest);
+        receipt.event_body["result_digest"] = serde_json::json!("f".repeat(64));
+        manifest.result_binding_receipt = Some(receipt.clone());
+        manifest.missing_parts = manifest.missing_parts();
+        manifest.unavailable = manifest.unavailable_parts();
+        manifest.finish = TraceFinish::DegradedNoProof;
+        let seal = seal_record_after(&manifest, 2, receipt.current_hash.clone());
+
+        assert!(TraceManifest::find_sealed(
+            &[receipt, seal],
+            &manifest.operation_id,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn find_sealed_replays_degraded_manifest_with_exact_missing_evidence() {
         let mut manifest = absent_evidence_manifest();
+        // Without the validated original envelope bytes, the request selector
+        // and immutable input proof cannot be projected from row labels alone.
+        manifest.admitted_payload_retained = false;
+        manifest.requested_route = None;
+        // A digest without its original route body is explicitly unavailable.
+        manifest.actual_route = Some("d".repeat(64));
         manifest.missing_parts = manifest.missing_parts();
         manifest.unavailable = manifest.unavailable_parts();
         assert_eq!(manifest.unavailable, manifest.missing_parts.clone());
+        assert!(manifest.missing_parts.iter().any(|part| part == "actual_route"));
         let records = [seal_record(&manifest)];
 
         let replay = TraceManifest::find_sealed(&records, &manifest.operation_id)
@@ -1351,6 +1434,7 @@ mod tests {
         assert_eq!(replay, manifest);
         assert!(replay.state_fence.is_some());
         for required in [
+            "action_contract",
             "requested_route",
             "actual_route",
             "input_handle",
