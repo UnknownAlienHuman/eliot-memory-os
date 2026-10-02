@@ -4,12 +4,20 @@
 //! # Why this module exists
 //!
 //! Every negative-memory owner on the Governor side was, before this module, a
-//! definition without a production caller. This module is the missing caller:
-//! it performs the one bounded, exact-fence named read that resolves the
+//! definition without a production caller. This module was written to be that
+//! caller: it performs the one bounded, exact-fence named read that resolves the
 //! current rule set, hands the **store-observed** result to the pure gate,
 //! dispatches through
 //! [`commit_canonical_gated_by_negative_memory`], and appends the matched
 //! outcome to the existing observation path.
+//!
+//! It is not reached from a run of this daemon today. Every `pub` entry here is
+//! called only from inside this module or from the crate-root `pub use` block
+//! in `lib.rs`; the single reachable-from-elsewhere root,
+//! `commit_gated_action`, has zero call sites, so `project_action_response` —
+//! and with it the `eliot-dreamer-failure` matcher this module reaches — is
+//! transitively dead. See "Reachability" on `commit_gated_action` for the
+//! measured detail.
 //!
 //! # What it deliberately does not do
 //!
@@ -375,11 +383,16 @@ pub const fn gate_bound() -> NegativeMemoryMatchBound {
 /// Projects the same admitted-rule truth the gate decided on for the action
 /// response, and grades the caller's packet scorecard from it when one is held.
 ///
-/// This is the production caller of
-/// [`project_negative_memory_rules`] and [`apply_negative_memory_coverage`].
-/// The match is recomputed from the same subject, horizon and rule set the gate
-/// used, so the projection cannot describe a different rule revision than the
-/// one the effect was decided under.
+/// This is the **only** caller of [`project_negative_memory_rules`] and
+/// [`apply_negative_memory_coverage`] on the daemon side, and it reaches both
+/// through the Governor's re-export rather than owning either. The match is
+/// recomputed from the same subject, horizon and rule set the gate used, so the
+/// projection cannot describe a different rule revision than the one the effect
+/// was decided under.
+///
+/// It is not reached from a run of this daemon: its only call site is in
+/// `commit_gated_action`, which itself has none. See "Reachability" on
+/// `commit_gated_action`.
 ///
 /// # Errors
 ///
