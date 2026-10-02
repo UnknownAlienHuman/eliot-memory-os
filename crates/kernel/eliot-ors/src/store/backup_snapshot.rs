@@ -956,8 +956,7 @@ fn dispositioned_tables() -> Vec<DispositionedTable> {
 /// up as a test failure rather than as a silently stale sentence.
 pub(super) fn census_counts() -> (usize, usize, usize) {
     let declared = super::declared_ors_tables().len()
-        + super::restore_journal::declared_restore_journal_tables()
-            .len();
+        + super::restore_journal::declared_restore_journal_tables().len();
     let census = dispositioned_tables();
     let exclusions = census
         .iter()
@@ -4578,7 +4577,7 @@ pub(super) fn reconcile_lost_import_response(
 #[cfg(test)]
 mod census_tests {
     use super::{
-        RowFamilyDisposition, TableDisposition, check_declared_tables_are_censused, census_counts,
+        RowFamilyDisposition, TableDisposition, census_counts, check_declared_tables_are_censused,
         dispositioned_tables, row_family_denominator,
     };
     use crate::RedbRecoveryStore;
@@ -4633,7 +4632,10 @@ mod census_tests {
             .map(TableHandle::name)
             .chain(journal_declarations.iter().map(TableHandle::name))
             .collect();
-        let census: Vec<&str> = census_entries.iter().map(|entry| entry.table.name()).collect();
+        let census: Vec<&str> = census_entries
+            .iter()
+            .map(|entry| entry.table.name())
+            .collect();
         assert_eq!(
             declared.len(),
             census.len(),

@@ -308,8 +308,7 @@ fn nonempty_member_set_refuses_known_zero_for_an_untriaged_member() -> TestResul
     // issue repairs, restated in the test that proves the repair.
     let receipt_roster: BTreeSet<(RowFamilyKind, String)> =
         receipt.expected_members.iter().cloned().collect();
-    let snapshot_roster: BTreeSet<(RowFamilyKind, String)> =
-        expected.iter().cloned().collect();
+    let snapshot_roster: BTreeSet<(RowFamilyKind, String)> = expected.iter().cloned().collect();
     assert_eq!(
         receipt_roster, snapshot_roster,
         "the receipt must carry the snapshot's own declared roster verbatim, so the refusal is \
@@ -607,10 +606,7 @@ fn a_foreign_outcome_identifier_is_an_incomplete_coverage_verdict() -> TestResul
     let receipt = destination.reconcile_backup_import(&import, &snapshot, &outcomes, NOW_MS)?;
 
     assert!(
-        matches!(
-            receipt.known_zero_verdict,
-            KnownZeroVerdict::Refused { .. }
-        ),
+        matches!(receipt.known_zero_verdict, KnownZeroVerdict::Refused { .. }),
         "a foreign outcome id answers a question this receipt is not and must not report a \
          known zero even though the outcome count matches the roster count: {:?}",
         receipt.known_zero_verdict

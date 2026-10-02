@@ -3529,7 +3529,7 @@ const KERNEL_RESTART_RECONCILIATIONS: TableDefinition<&str, &str> =
 /// declared in a different module; `status.rs`'s four supervision tables and its
 /// `PURGE_LEDGER_META` are read-only MIRRORS of names owned here and are
 /// deliberately not repeated, because a mirror is not a second physical table.
-fn declared_ors_tables() -> Vec<TableDefinition<&'static str, &'static str>> {
+fn declared_ors_tables() -> Vec<TableDefinition<'static, &'static str, &'static str>> {
     vec![
         META,
         ENVELOPES,
