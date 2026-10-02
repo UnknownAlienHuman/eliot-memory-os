@@ -142,16 +142,31 @@ fn provider_is_running(process_id: u32) -> bool {
 
 /// Polls the operating system until it reports `process_id` absent.
 ///
-/// No bound is invented here; see the module docs.
+/// # Panics
+/// Panics when the process is still present after [`TERMINATION_BOUND`]. The
+/// bound is not optional: an unbounded poll here would mean that if the Job
+/// mechanism ever regressed - the exact failure this package exists to prevent -
+/// the test would BLOCK A TEST THREAD FOREVER instead of failing. The suite
+/// would then be killed by the runner's own timeout and report an unexplained
+/// red rather than a named assertion. A test that cannot fail is not a proof.
+///
+/// The value is the same 60 s this file already uses for provider readiness
+/// above, so it introduces no new policy number.
 fn poll_until_absent(process_id: u32) -> bool {
     let platform = WindowsPlatform::new(std::env::temp_dir())
         .unwrap_or_else(|error| panic!("process identity platform must bind: {error}"));
+    let deadline = Instant::now() + TERMINATION_BOUND;
     loop {
-        if platform.process_identity(process_id).is_ok() {
-            std::thread::sleep(PARENT_POLL_INTERVAL);
-        } else {
+        if platform.process_identity(process_id).is_err() {
             return true;
         }
+        assert!(
+            Instant::now() < deadline,
+            "provider {process_id} is still present {}ms after its owner was killed \
+             from outside: the kill-on-close Job did not terminate the assigned set",
+            TERMINATION_BOUND.as_millis(),
+        );
+        std::thread::sleep(PARENT_POLL_INTERVAL);
     }
 }
 
