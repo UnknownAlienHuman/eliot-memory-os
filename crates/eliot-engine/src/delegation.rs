@@ -18,6 +18,10 @@ use time::{Duration, OffsetDateTime};
 
 const PROVIDER_ID: &str = "antigravity";
 const CONSTRAINTS: [&str; 3] = ["candidate_only", "tainted", "disposable_worktree"];
+/// Where an explicit reconciliation preserves the original bytes of a refused
+/// provider-call ledger candidate. It is never one of the candidate names, so a
+/// preserved copy can never be read back as current or staged ledger state.
+const PROVIDER_CALL_LEDGER_QUARANTINE_DIR: &str = "provider-call-ledger-quarantine";
 
 #[derive(Clone, Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -471,6 +475,57 @@ impl ProviderCallReservationOwner {
         result
     }
 
+    /// The explicit, operator-authorized reconciliation of a preserved corrupt
+    /// provider-call ledger.
+    ///
+    /// This is the only path that ends the [`ProviderCallLedgerUnknown`] block,
+    /// and it can only end it through an explicit disposition of every
+    /// preserved candidate:
+    ///
+    /// * the ledger must currently be unknown, so a healthy ledger can never be
+    ///   downgraded to an older record here;
+    /// * `operator_ref` must be a bounded identity, because an authority field
+    ///   is never silently defaulted;
+    /// * every candidate the refusal enumerated must carry exactly one
+    ///   disposition. There is no default and no implied "the backup is the
+    ///   good one";
+    /// * [`ProviderCallLedgerCandidateAction::PreserveAsQuarantine`] copies a
+    ///   candidate's original bytes into the quarantine area and leaves the
+    ///   candidate refused in place. It admits nothing, so the outcome carries
+    ///   no ledger and the state stays unknown;
+    /// * [`ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord`] is
+    ///   the only disposition that unblocks. It is permitted at most once, it
+    ///   must name the current candidate, and it requires
+    ///   `recovered_record_from`: the operator's own copy of the ORIGINAL
+    ///   recorded bytes. A refused candidate can never be admitted on its own
+    ///   bytes, because a candidate whose bytes decode and validate is by
+    ///   definition not in the unknown state this reconciles.
+    ///
+    /// The admitted bytes are re-validated by the same
+    /// [`decode_provider_call_ledger`] and the same
+    /// [`validate_provider_call_ledger`] every candidate is held to, and they
+    /// are then installed verbatim: no digest is recomputed, no weaker second
+    /// validator runs, and no normalized re-serialization replaces them.
+    ///
+    /// The corrupt evidence is never deleted, truncated or overwritten in place.
+    /// The superseded candidate is renamed into the quarantine area and every
+    /// preserved candidate is copied byte-for-byte, and the copy is compared
+    /// with the original before it is reported.
+    ///
+    /// Nothing here produces `ProviderCallLedger::default()`: when no candidate
+    /// is admitted the state stays unknown and new provider calls stay blocked.
+    pub fn reconcile_provider_call_ledger(
+        &self,
+        reconciliation: &ProviderCallLedgerReconciliation,
+    ) -> Result<ProviderCallLedgerReconciliationOutcome, EngineError> {
+        if !protected_delegation_identity_is_valid(&reconciliation.operator_ref) {
+            return Err(rejected(
+                "provider call ledger reconciliation requires an explicit bounded operator identity",
+            ));
+        }
+        self.with_lock(|path| apply_provider_call_ledger_reconciliation(path, reconciliation))
+    }
+
     fn transition<F>(
         &self,
         reservation_id: &str,
@@ -593,7 +648,7 @@ fn refresh_provider_call_budget(ledger: &mut ProviderCallLedger, budget_index: u
 /// refusal can name which authoritative file was refused without echoing the
 /// filesystem or the ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderCallLedgerCandidate {
+pub enum ProviderCallLedgerCandidate {
     Current,
     Staged,
     Backup,
@@ -605,6 +660,17 @@ impl ProviderCallLedgerCandidate {
             Self::Current => "current",
             Self::Staged => "staged",
             Self::Backup => "backup",
+        }
+    }
+
+    /// The one file this candidate role names. The role-to-name mapping is
+    /// defined once so the loader, the read-only snapshot and the
+    /// reconciliation owner can never disagree about which file is which.
+    fn path(self, ledger_path: &Path) -> PathBuf {
+        match self {
+            Self::Current => ledger_path.to_path_buf(),
+            Self::Staged => ledger_path.with_extension("json.next"),
+            Self::Backup => ledger_path.with_extension("json.bak"),
         }
     }
 }
@@ -679,6 +745,66 @@ impl From<ProviderCallLedgerUnknown> for EngineError {
     fn from(unknown: ProviderCallLedgerUnknown) -> Self {
         EngineError::ProviderCallLedgerUnknown(unknown.to_string())
     }
+}
+
+/// What an operator explicitly decided to do with one preserved corrupt
+/// provider-call ledger candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderCallLedgerCandidateAction {
+    /// Keep this candidate's original bytes refused in place and take a
+    /// verified byte-identical copy into the quarantine area.
+    ///
+    /// It never moves the candidate, because moving the last refused candidate
+    /// would leave no candidate at all and the next load would silently produce
+    /// an empty ledger.
+    PreserveAsQuarantine,
+    /// Supersede this candidate: the record the operator authorizes through
+    /// [`ProviderCallLedgerReconciliation::recovered_record_from`] becomes the
+    /// current ledger, and this candidate's original bytes are preserved by
+    /// renaming them into the quarantine area.
+    SupersedeWithRecoveredRecord,
+}
+
+/// One explicitly named candidate and the explicitly chosen action for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCallLedgerCandidateDisposition {
+    pub candidate: ProviderCallLedgerCandidate,
+    pub action: ProviderCallLedgerCandidateAction,
+}
+
+/// The operator intent that a reconciliation requires. Every field is filled by
+/// the caller: nothing here has a default, and an absent field refuses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCallLedgerReconciliation {
+    /// One disposition per candidate the refusal enumerated, each exactly once.
+    /// There is no default disposition and no implied choice of candidate.
+    pub dispositions: Vec<ProviderCallLedgerCandidateDisposition>,
+    /// The operator's own copy of the ORIGINAL recorded ledger bytes. It is
+    /// required exactly when some candidate is superseded, and refused when
+    /// nothing is, because a recovered record nobody admitted changes nothing.
+    pub recovered_record_from: Option<PathBuf>,
+    /// The bounded identity of the operator authorizing this reconciliation.
+    pub operator_ref: String,
+}
+
+/// Where one preserved corrupt candidate's original bytes now live.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCallLedgerQuarantineEntry {
+    pub candidate: ProviderCallLedgerCandidate,
+    pub path: PathBuf,
+}
+
+/// The proven result of one reconciliation.
+///
+/// `admitted` is `None` whenever nothing was explicitly admitted, and then
+/// `still_unknown` is true and new provider calls stay blocked. An admitted
+/// ledger is never a default ledger: it is the operator's recovered record
+/// after the same decode and validation every candidate is held to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCallLedgerReconciliationOutcome {
+    pub admitted: Option<ProviderCallLedger>,
+    pub quarantined: Vec<ProviderCallLedgerQuarantineEntry>,
+    pub still_unknown: bool,
 }
 
 /// The complete relation every persisted provider-call ledger must prove.
@@ -934,25 +1060,20 @@ fn rejected(message: &str) -> EngineError {
 fn load_provider_call_ledger(path: &Path) -> Result<ProviderCallLedger, ProviderCallLedgerUnknown> {
     let mut existed = false;
     let mut faults = Vec::new();
-    for (candidate, role) in [
-        (path.to_path_buf(), ProviderCallLedgerCandidate::Current),
-        (
-            path.with_extension("json.next"),
-            ProviderCallLedgerCandidate::Staged,
-        ),
-        (
-            path.with_extension("json.bak"),
-            ProviderCallLedgerCandidate::Backup,
-        ),
+    for candidate in [
+        ProviderCallLedgerCandidate::Current,
+        ProviderCallLedgerCandidate::Staged,
+        ProviderCallLedgerCandidate::Backup,
     ] {
-        if !candidate.is_file() {
+        let candidate_path = candidate.path(path);
+        if !candidate_path.is_file() {
             continue;
         }
         existed = true;
-        match decode_provider_call_ledger(&candidate) {
+        match decode_provider_call_ledger(&candidate_path) {
             Ok(ledger) => return Ok(ledger),
             Err(fault) => faults.push(ProviderCallLedgerCandidateFault {
-                candidate: role,
+                candidate,
                 fault,
             }),
         }
@@ -977,6 +1098,177 @@ fn decode_provider_call_ledger(
         .map_err(|_| ProviderCallLedgerFault::Malformed)?;
     validate_provider_call_ledger(&ledger).map_err(|_| ProviderCallLedgerFault::Invalid)?;
     Ok(ledger)
+}
+
+/// Apply one explicit operator disposition of the preserved corrupt candidates.
+///
+/// The caller holds the ledger lock, so a reconciliation cannot race a
+/// concurrent campaign: the unknown state is re-read here and the whole
+/// disposition set is checked against it before a single byte moves.
+fn apply_provider_call_ledger_reconciliation(
+    path: &Path,
+    reconciliation: &ProviderCallLedgerReconciliation,
+) -> Result<ProviderCallLedgerReconciliationOutcome, EngineError> {
+    let unknown = load_provider_call_ledger(path).map_err(|_| {
+        rejected(
+            "provider call ledger is not in an unknown state; there is no preserved corrupt candidate to reconcile",
+        )
+    })?;
+    let refused = unknown
+        .faults
+        .iter()
+        .map(|fault| fault.candidate)
+        .collect::<Vec<_>>();
+    let mut actions = Vec::new();
+    for disposition in &reconciliation.dispositions {
+        if !refused.contains(&disposition.candidate) {
+            return Err(rejected(
+                "provider call ledger reconciliation names a candidate that is not a preserved corrupt candidate",
+            ));
+        }
+        if actions.contains(&disposition.candidate) {
+            return Err(rejected(
+                "provider call ledger reconciliation names one candidate twice",
+            ));
+        }
+        actions.push(disposition.candidate);
+    }
+    for candidate in &refused {
+        if !actions.contains(candidate) {
+            return Err(rejected(
+                "provider call ledger reconciliation leaves a preserved corrupt candidate without an explicit disposition",
+            ));
+        }
+    }
+    let superseded = reconciliation
+        .dispositions
+        .iter()
+        .filter_map(|disposition| {
+            (disposition.action == ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord)
+                .then_some(disposition.candidate)
+        })
+        .collect::<Vec<_>>();
+    if superseded.len() > 1 {
+        return Err(rejected(
+            "provider call ledger reconciliation supersedes more than one candidate",
+        ));
+    }
+    if superseded
+        .first()
+        .is_some_and(|candidate| *candidate != ProviderCallLedgerCandidate::Current)
+    {
+        return Err(rejected(
+            "the recovered provider call ledger record becomes the current ledger, so the superseded candidate must be the current one",
+        ));
+    }
+
+    let Some(runtime) = path.parent() else {
+        return Err(rejected("provider call ledger path has no runtime directory"));
+    };
+    let quarantine_dir = runtime.join(PROVIDER_CALL_LEDGER_QUARANTINE_DIR);
+
+    let Some(superseded) = superseded.first().copied() else {
+        if reconciliation.recovered_record_from.is_some() {
+            return Err(rejected(
+                "a recovered provider call ledger record was supplied without an explicit admission",
+            ));
+        }
+        // Nothing is admitted, so nothing is written: every refused candidate
+        // keeps its bytes in place and the state stays unknown.
+        let mut quarantined = Vec::new();
+        for candidate in &refused {
+            quarantined.push(preserve_provider_call_ledger_candidate(
+                &candidate.path(path),
+                &quarantine_dir,
+                *candidate,
+            )?);
+        }
+        return Ok(ProviderCallLedgerReconciliationOutcome {
+            admitted: None,
+            quarantined,
+            still_unknown: true,
+        });
+    };
+
+    let Some(recovered_from) = reconciliation.recovered_record_from.as_deref() else {
+        return Err(rejected(
+            "superseding a preserved provider call ledger candidate requires the operator's own copy of the original recorded bytes",
+        ));
+    };
+    fs::create_dir_all(&quarantine_dir)?;
+    let original_bytes = fs::read(recovered_from)?;
+    let admitted_path =
+        quarantine_dir.join(format!("admitted-{}.json", new_id("provider-call-ledger")));
+    fs::write(&admitted_path, &original_bytes)?;
+    // The admitted record is proven against the ORIGINAL recorded bytes with
+    // the one decoder and the one validator every candidate is held to.
+    let ledger = decode_provider_call_ledger(&admitted_path).map_err(|_| {
+        rejected("the recovered provider call ledger record does not decode and validate")
+    })?;
+    validate_provider_call_ledger(&ledger)?;
+    // The corrupt evidence moves aside with its bytes intact, so the install
+    // can neither truncate nor overwrite it.
+    let quarantined =
+        displace_provider_call_ledger_candidate(&superseded.path(path), &quarantine_dir, superseded)?;
+    if let Err(error) = fs::rename(&admitted_path, path) {
+        let _ = fs::rename(&quarantined.path, superseded.path(path));
+        return Err(error.into());
+    }
+    Ok(ProviderCallLedgerReconciliationOutcome {
+        admitted: Some(ledger),
+        quarantined: vec![quarantined],
+        still_unknown: false,
+    })
+}
+
+/// The one quarantine file name one preserved candidate gets on one
+/// reconciliation. The bounded identity suffix keeps a later reconciliation
+/// from overwriting an earlier preserved copy.
+fn provider_call_ledger_quarantine_path(
+    quarantine_dir: &Path,
+    candidate: ProviderCallLedgerCandidate,
+) -> PathBuf {
+    quarantine_dir.join(format!(
+        "{}-{}.corrupt",
+        candidate.code(),
+        new_id("provider-call-ledger-quarantine")
+    ))
+}
+
+/// Copy the original bytes of a refused candidate into the quarantine area and
+/// prove the copy is byte-identical. The candidate itself is left untouched.
+fn preserve_provider_call_ledger_candidate(
+    candidate_path: &Path,
+    quarantine_dir: &Path,
+    candidate: ProviderCallLedgerCandidate,
+) -> Result<ProviderCallLedgerQuarantineEntry, EngineError> {
+    let original = fs::read(candidate_path)?;
+    let copy = provider_call_ledger_quarantine_path(quarantine_dir, candidate);
+    fs::write(&copy, &original)?;
+    if fs::read(&copy)? != original {
+        return Err(rejected(
+            "provider call ledger quarantine copy is not byte-identical to the preserved candidate",
+        ));
+    }
+    Ok(ProviderCallLedgerQuarantineEntry {
+        candidate,
+        path: copy,
+    })
+}
+
+/// Rename a refused candidate into the quarantine area. A rename preserves the
+/// original bytes without rewriting them, so nothing is deleted or truncated.
+fn displace_provider_call_ledger_candidate(
+    candidate_path: &Path,
+    quarantine_dir: &Path,
+    candidate: ProviderCallLedgerCandidate,
+) -> Result<ProviderCallLedgerQuarantineEntry, EngineError> {
+    let preserved = provider_call_ledger_quarantine_path(quarantine_dir, candidate);
+    fs::rename(candidate_path, &preserved)?;
+    Ok(ProviderCallLedgerQuarantineEntry {
+        candidate,
+        path: preserved,
+    })
 }
 
 fn write_provider_call_ledger(path: &Path, ledger: &ProviderCallLedger) -> Result<(), EngineError> {
@@ -1413,4 +1705,220 @@ fn decision(
 
 fn new_id(prefix: &str) -> String {
     format!("{prefix}:{}", eliot_types::WorkLeaseId::new_v7())
+}
+
+#[cfg(test)]
+mod provider_call_ledger_reconciliation_tests {
+    use super::*;
+    use std::fs;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    const CAMPAIGN: &str = "provider-call-ledger-reconcile-campaign";
+    const SECOND_CAMPAIGN: &str = "provider-call-ledger-reconcile-second-campaign";
+    const OPERATOR: &str = "operator-936-reconcile";
+    const CORRUPT_CURRENT: &[u8] = b"{\"budgets\": not-json";
+    const CORRUPT_STAGED: &[u8] = b"{\"budgets\": [";
+    const CORRUPT_BACKUP: &[u8] = b"";
+
+    fn disposition(
+        candidate: ProviderCallLedgerCandidate,
+        action: ProviderCallLedgerCandidateAction,
+    ) -> ProviderCallLedgerCandidateDisposition {
+        ProviderCallLedgerCandidateDisposition { candidate, action }
+    }
+
+    fn preserved_bytes(candidate: ProviderCallLedgerCandidate) -> &'static [u8] {
+        match candidate {
+            ProviderCallLedgerCandidate::Current => CORRUPT_CURRENT,
+            ProviderCallLedgerCandidate::Staged => CORRUPT_STAGED,
+            ProviderCallLedgerCandidate::Backup => CORRUPT_BACKUP,
+        }
+    }
+
+    /// One owner whose ledger is unknown because every candidate is corrupt,
+    /// plus the original bytes an operator holds elsewhere as the record they
+    /// would authorize.
+    fn blocked_owner(
+        tag: &str,
+    ) -> TestResult<(PathBuf, ProviderCallReservationOwner, Vec<u8>, PathBuf)> {
+        let root = std::env::temp_dir()
+            .join(format!("eliot-936-ledger-reconcile-{tag}-{}", new_id("root")));
+        let owner = ProviderCallReservationOwner::new(&root);
+        owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: CAMPAIGN.to_owned(),
+            max_calls: 2,
+            closed: false,
+        })?;
+        let ledger_path = root.join("runtime").join("provider-call-ledger.json");
+        let recovered = fs::read(&ledger_path)?;
+        fs::write(&ledger_path, CORRUPT_CURRENT)?;
+        fs::write(ledger_path.with_extension("json.next"), CORRUPT_STAGED)?;
+        fs::write(ledger_path.with_extension("json.bak"), CORRUPT_BACKUP)?;
+        if !matches!(
+            owner.snapshot(),
+            Err(EngineError::ProviderCallLedgerUnknown(_))
+        ) {
+            return Err(Box::new(std::io::Error::other(
+                "a corrupt ledger must refuse before it is reconciled",
+            )));
+        }
+        Ok((root, owner, recovered, ledger_path))
+    }
+
+    #[test]
+    fn explicit_disposition_admits_the_operator_record_and_unblocks() -> TestResult {
+        let (root, owner, recovered, ledger_path) = blocked_owner("admit")?;
+        let operator_copy = root.join("operator-recovered-provider-call-ledger.json");
+        fs::write(&operator_copy, &recovered)?;
+
+        let outcome = owner.reconcile_provider_call_ledger(&ProviderCallLedgerReconciliation {
+            dispositions: vec![
+                disposition(
+                    ProviderCallLedgerCandidate::Current,
+                    ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord,
+                ),
+                disposition(
+                    ProviderCallLedgerCandidate::Staged,
+                    ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                ),
+                disposition(
+                    ProviderCallLedgerCandidate::Backup,
+                    ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                ),
+            ],
+            recovered_record_from: Some(operator_copy),
+            operator_ref: OPERATOR.to_owned(),
+        })?;
+
+        assert!(!outcome.still_unknown);
+        assert!(outcome.admitted.is_some());
+        // The admitted ledger is the operator's original bytes, verbatim.
+        assert_eq!(fs::read(&ledger_path)?, recovered);
+        // The corrupt evidence survives byte-for-byte at the reported paths.
+        let superseded = outcome
+            .quarantined
+            .iter()
+            .find(|entry| entry.candidate == ProviderCallLedgerCandidate::Current)
+            .ok_or_else(|| std::io::Error::other("the superseded candidate is not preserved"))?;
+        assert_eq!(
+            fs::read(&superseded.path)?,
+            preserved_bytes(ProviderCallLedgerCandidate::Current)
+        );
+        // The other refused candidates were never touched: they are still
+        // refused in place, and no ledger byte was rewritten for them.
+        assert_eq!(
+            fs::read(ledger_path.with_extension("json.next"))?,
+            preserved_bytes(ProviderCallLedgerCandidate::Staged)
+        );
+        assert_eq!(
+            fs::read(ledger_path.with_extension("json.bak"))?,
+            preserved_bytes(ProviderCallLedgerCandidate::Backup)
+        );
+        // New provider calls are unblocked, and the admitted campaign survives.
+        let second = owner.open_campaign(ProviderCallCampaignRequest {
+            campaign_id: SECOND_CAMPAIGN.to_owned(),
+            max_calls: 1,
+            closed: false,
+        })?;
+        assert_eq!(second.max_calls, 1);
+        assert!(
+            owner
+                .snapshot()?
+                .budgets
+                .iter()
+                .any(|budget| budget.campaign_id == CAMPAIGN)
+        );
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn absent_ambiguous_or_unauthorised_disposition_refuses_and_keeps_the_bytes() -> TestResult {
+        let (root, owner, _recovered, ledger_path) = blocked_owner("refusal")?;
+
+        // Absent intent: one refused candidate carries no disposition.
+        assert!(
+            owner
+                .reconcile_provider_call_ledger(&ProviderCallLedgerReconciliation {
+                    dispositions: vec![
+                        disposition(
+                            ProviderCallLedgerCandidate::Current,
+                            ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                        ),
+                        disposition(
+                            ProviderCallLedgerCandidate::Staged,
+                            ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                        ),
+                    ],
+                    recovered_record_from: None,
+                    operator_ref: OPERATOR.to_owned(),
+                })
+                .is_err()
+        );
+
+        // Ambiguous intent: two candidates superseded at once.
+        assert!(
+            owner
+                .reconcile_provider_call_ledger(&ProviderCallLedgerReconciliation {
+                    dispositions: vec![
+                        disposition(
+                            ProviderCallLedgerCandidate::Current,
+                            ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord,
+                        ),
+                        disposition(
+                            ProviderCallLedgerCandidate::Staged,
+                            ProviderCallLedgerCandidateAction::SupersedeWithRecoveredRecord,
+                        ),
+                    ],
+                    recovered_record_from: None,
+                    operator_ref: OPERATOR.to_owned(),
+                })
+                .is_err()
+        );
+
+        // Unauthorised intent: no bounded operator identity.
+        assert!(
+            owner
+                .reconcile_provider_call_ledger(&ProviderCallLedgerReconciliation {
+                    dispositions: vec![
+                        disposition(
+                            ProviderCallLedgerCandidate::Current,
+                            ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                        ),
+                        disposition(
+                            ProviderCallLedgerCandidate::Staged,
+                            ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                        ),
+                        disposition(
+                            ProviderCallLedgerCandidate::Backup,
+                            ProviderCallLedgerCandidateAction::PreserveAsQuarantine,
+                        ),
+                    ],
+                    recovered_record_from: None,
+                    operator_ref: String::new(),
+                })
+                .is_err()
+        );
+
+        // Nothing moved: every corrupt candidate is intact and the ledger is
+        // still unknown, so new provider calls stay blocked.
+        for (path, expected) in [
+            (ledger_path.clone(), CORRUPT_CURRENT),
+            (ledger_path.with_extension("json.next"), CORRUPT_STAGED),
+            (ledger_path.with_extension("json.bak"), CORRUPT_BACKUP),
+        ] {
+            assert_eq!(fs::read(&path)?, expected);
+        }
+        assert!(matches!(
+            owner.snapshot(),
+            Err(EngineError::ProviderCallLedgerUnknown(_))
+        ));
+        assert!(!root
+            .join("runtime")
+            .join(PROVIDER_CALL_LEDGER_QUARANTINE_DIR)
+            .exists());
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 }

@@ -46,7 +46,7 @@ pub(super) struct RpcResponse {
 ///
 /// `Option<Value>` cannot carry that distinction: `serde_json` reports a JSON
 /// `null` through `Deserializer::deserialize_option` as `visit_none`, so a
-/// `"result": null` frame — the wire form of a SurrealQL `NONE` value — decodes
+/// `"result": null` frame - the wire form of a `SurrealQL` `NONE` value - decodes
 /// exactly like a frame carrying no `result` member at all. `#[serde(default)]`
 /// is therefore required on the field: an absent member is filled from
 /// `Default` (no member), while a present `null` reaches this `Deserialize` impl
@@ -108,9 +108,9 @@ impl<'de> Deserialize<'de> for RpcResultMember {
 /// `#[surreal(tag = "kind", content = "details", skip_content_if =
 /// "Value::is_empty")]`, so `kind` is emitted on every error frame - only an
 /// empty `details` is skipped - and names the failure family
-/// (`ErrorDetails::kind_str`): "Validation", "Configuration", "Query",
-/// "Serialization", "NotAllowed", "NotFound", "AlreadyExists", "Connection",
-/// "Thrown", "Internal", "Context".
+/// (`ErrorDetails::kind_str`): `Validation`, `Configuration`, `Query`,
+/// `Serialization`, `NotAllowed`, `NotFound`, `AlreadyExists`, `Connection`,
+/// `Thrown`, `Internal`, `Context`.
 ///
 /// Deliberately NOT closed (`deny_unknown_fields`): `kind` is always present
 /// and `details` is present whenever non-empty, so closing this would refuse
@@ -280,7 +280,7 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
 ///   never promoted to an authentication, validation, query or internal
 ///   verdict.
 /// * `result` member present — that member's value, including a real JSON
-///   `null`, which is how a SurrealQL `NONE` value arrives on the wire. A
+///   `null`, which is how a `SurrealQL` `NONE` value arrives on the wire. A
 ///   genuine null payload is therefore an admitted `Ok(Value::Null)` here and
 ///   stays distinguishable from the refused case below before any caller
 ///   inspects the value.
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_naming_no_outcome_member_is_refused() -> Result<(), AdapterError> {
+    fn a_frame_naming_no_outcome_member_is_refused() {
         let frame = br#"{"id":7}"#;
         // Both the raw gate and the closed envelope admit these bytes, so the
         // missing `result` member is attributable as the whole cause: this is
@@ -363,7 +363,6 @@ mod tests {
             outcome(frame),
             Err(AdapterError::Serialization(_))
         ));
-        Ok(())
     }
 
     #[test]
@@ -402,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_frame_is_refused_not_read_as_a_null_success() -> Result<(), AdapterError> {
+    fn provider_error_frame_is_refused_not_read_as_a_null_success() {
         let frame = br#"{"id":7,"error":{"code":-32000,"message":"boom","kind":"Query"}}"#;
         // The vendor error object is admitted by the closed envelope, and this
         // frame names no `result` member at all, so the refusal below cannot be
@@ -418,6 +417,5 @@ mod tests {
                 code: -32000,
             })
         );
-        Ok(())
     }
 }

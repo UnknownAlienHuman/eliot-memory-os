@@ -58,7 +58,8 @@ mod stop_census;
 pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 
 use crate::cutover_ownership::{
-    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
+    DaemonCutoverOwnership, GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt,
+    StoredCutoverOwnership,
 };
 use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
@@ -470,6 +471,62 @@ impl OrsStoreIdentity {
 }
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
+/// Durable Kernel-owned daemon-generation cutover rows (issue #1952; I14.15).
+///
+/// One row per committed daemon cutover, keyed by its own cutover identity,
+/// holding the exact [`DaemonCutoverOwnership`] the Kernel committed: the prior
+/// and candidate daemon generations, the new authority epoch, the old proposal
+/// fence after which unstaged prior-daemon proposals are stale, the
+/// Kernel-staged operation identities, the old in-flight disposition set and
+/// the unresolved effect scopes. Replacing `eliotd` without this row would leave
+/// nothing durable that says which daemon generation owns new effect admission
+/// or which old generation is fenced, so a restarted Kernel could not
+/// reconstruct the fence. It is written only by
+/// [`RedbRecoveryStore::commit_daemon_cutover`] in the same single write
+/// transaction that mints its linearization identity. This is one more table in
+/// the existing ORS table family, owned by the same `RedbRecoveryStore` and
+/// written through the same `persistence_codec` as `CUTOVER_OWNERSHIP`; it is
+/// not a second cutover owner and it never claims to be a module cutover.
+const DAEMON_CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_daemon_cutover_ownership_v1");
+
+/// Durable stored form of one committed daemon cutover with its ORS order.
+///
+/// The sibling of [`StoredCutoverOwnership`] for the I14.15 daemon route: the
+/// row is the caller's own recorded [`DaemonCutoverOwnership`] under the
+/// commit's operation order, so a readback compares this commit's content with
+/// this commit's row. It rides the same `persistence_codec`, and
+/// `validate_persisted` re-establishes a nonzero durable order and then defers
+/// to the owner's own [`DaemonCutoverOwnership::validate`] rather than to a
+/// second validator.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDaemonCutoverOwnership {
+    /// Monotonic ORS operation order the commit assigned to the row.
+    operation_order: u64,
+    /// The committed daemon cutover exactly as recorded.
+    record: DaemonCutoverOwnership,
+}
+
+impl StoredDaemonCutoverOwnership {
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "daemon_cutover_ownership",
+                reason: "stored daemon cutover has no operation order".to_owned(),
+            });
+        }
+        self.record.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for StoredDaemonCutoverOwnership {
+    const RECORD_TYPE: &'static str = "daemon_cutover_ownership";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        StoredDaemonCutoverOwnership::validate_persisted(self)
+    }
+}
 /// Durable initial owner of one capability route scope (issue #1872; I5.11,
 /// I14.14).
 ///
@@ -31413,6 +31470,155 @@ impl RedbRecoveryStore {
         Ok((committed, receipt))
     }
 
+    /// Commits one Kernel-owned daemon cutover in a single write transaction
+    /// (issue #1952; I14.15: close old-daemon admission, commit the
+    /// `DaemonCutoverRecord` with the new route/epoch, the old proposal fence,
+    /// the exact Kernel-owned staged operations and the unresolved effect
+    /// scopes).
+    ///
+    /// This is the daemon route's counterpart of
+    /// [`Self::commit_cutover_ownership`] and reuses that mechanism exactly:
+    /// the row is validated by its owner's own
+    /// [`DaemonCutoverOwnership::validate`] on the caller's recorded values —
+    /// never a recomputed digest and never a second validator — the committed
+    /// row is written through the same `persistence_codec`, the single
+    /// `write.commit()` is the durable linearization point and the returned
+    /// record is the one read back from a fresh read transaction afterwards.
+    /// Crash before it leaves the prior daemon generation authoritative; crash
+    /// after it reconstructs the new route and the fence from the committed row
+    /// before accepting work, which is what makes an unstaged proposal from the
+    /// fenced prior generation stale.
+    ///
+    /// Two rules make the committed fence unforgeable. A cutover must continue
+    /// the committed daemon lineage: its prior generation must be the candidate
+    /// generation the last committed cutover installed, and its fence epoch
+    /// must be that cutover's new epoch, so no caller can fence a generation or
+    /// an epoch the durable row never granted. A commit without a prior row must
+    /// therefore declare no prior generation at all. Pinning the fence to the
+    /// committed row's own new epoch is also what makes the new epoch supersede
+    /// the committed maximum: an old epoch is never revived, because rollback is
+    /// another daemon cutover with a newer epoch.
+    ///
+    /// Re-committing the identical recorded cutover after a crash is idempotent:
+    /// it replays the committed row instead of minting a second epoch. Any other
+    /// record under a committed cutover identity is a durable conflict.
+    pub fn commit_daemon_cutover(
+        &self,
+        record: DaemonCutoverOwnership,
+    ) -> Result<DaemonCutoverOwnership, OrsError> {
+        record.validate()?;
+        if record.linearization_record_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_linearization",
+                reason: "a daemon cutover presented for commit has no linearization identity",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let prior = {
+            let current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            if let Some(existing) = current.get(record.cutover_id.as_str()).map_err(storage)? {
+                let stored: StoredDaemonCutoverOwnership =
+                    decode_named(existing.value(), "daemon_cutover_ownership")?;
+                if stored.record.linearization_record_id.is_some()
+                    && Self::same_daemon_cutover_content(&stored.record, &record)
+                {
+                    return Ok(stored.record);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+            // The newest committed row defines the daemon lineage that a new
+            // cutover has to continue. Its own `validate` already ran on decode,
+            // so the epoch compared against below is a durable value.
+            let mut newest: Option<DaemonCutoverOwnership> = None;
+            for row in current.iter().map_err(storage)? {
+                let (_, value) = row.map_err(storage)?;
+                let stored: StoredDaemonCutoverOwnership =
+                    decode_named(value.value(), "daemon_cutover_ownership")?;
+                if newest
+                    .as_ref()
+                    .is_none_or(|prior: &DaemonCutoverOwnership| {
+                        stored.record.new_epoch.value() > prior.new_epoch.value()
+                    })
+                {
+                    newest = Some(stored.record);
+                }
+            }
+            newest
+        };
+        if let Some(prior) = &prior {
+            if Some(prior.candidate_daemon_generation) != record.prior_daemon_generation
+                || prior.new_epoch != record.old_proposal_fence.epoch
+            {
+                return Err(OrsError::InvalidEpochLineage);
+            }
+        } else if record.prior_daemon_generation.is_some() {
+            return Err(OrsError::InvalidEpochLineage);
+        }
+        // `DaemonCutoverOwnership::validate` already refuses a new epoch that
+        // does not supersede the fenced one, and the lineage rule above pins the
+        // fence to the committed row's own new epoch, so the committed maximum
+        // is superseded here by construction; an old epoch is never revived.
+        let order = Self::next_operational_order(&write)?;
+        let committed = DaemonCutoverOwnership {
+            linearization_record_id: Some(format!(
+                "ors:daemon-cutover:{}#{order}",
+                record.cutover_id
+            )),
+            ..record
+        };
+        committed.validate()?;
+        let stored = StoredDaemonCutoverOwnership {
+            operation_order: order,
+            record: committed.clone(),
+        };
+        {
+            let mut current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .insert(
+                    committed.cutover_id.as_str(),
+                    encode(&stored)?.as_str(),
+                )
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        // Post-commit readback: the returned value is the durable row, and it
+        // is this commit's row because its content is compared with the record
+        // this call committed rather than merely checked for existence.
+        let readback = {
+            let read = self.database.begin_read().map_err(storage)?;
+            let current = read.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .get(committed.cutover_id.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<StoredDaemonCutoverOwnership>(value.value()))
+                .transpose()?
+        };
+        if readback.as_ref() != Some(&committed) {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "daemon_cutover_ownership",
+                reason: "committed daemon cutover row does not read back as this commit"
+                    .to_owned(),
+            });
+        }
+        Ok(committed)
+    }
+
+    /// Compares two daemon cutovers on everything this operation records,
+    /// excluding only the linearization identity the commit itself mints.
+    fn same_daemon_cutover_content(
+        committed: &DaemonCutoverOwnership,
+        staged: &DaemonCutoverOwnership,
+    ) -> bool {
+        committed.cutover_id == staged.cutover_id
+            && committed.prior_daemon_generation == staged.prior_daemon_generation
+            && committed.candidate_daemon_generation == staged.candidate_daemon_generation
+            && committed.new_epoch == staged.new_epoch
+            && committed.old_proposal_fence == staged.old_proposal_fence
+            && committed.staged_operation_ids == staged.staged_operation_ids
+            && committed.in_flight == staged.in_flight
+            && committed.unresolved_scopes == staged.unresolved_scopes
+    }
+
     /// Records the generation one capability route scope started at, once
     /// (issue #1872; I5.11, I14.14).
     ///
@@ -37882,6 +38088,155 @@ mod capability_grant_identity_tests {
         }
         drop(store);
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod daemon_cutover_ownership_tests {
+    use super::*;
+    use crate::cutover_ownership::{
+        InFlightDisposition, InFlightDispositionKind, OldDaemonProposalFence,
+    };
+    use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+    use std::path::PathBuf;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn daemon_cutover_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eliot-ors-daemon-cutover-{tag}-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    fn generation(sequence: u64) -> Result<ResourceGeneration, Box<dyn std::error::Error>> {
+        Ok(ResourceGeneration::new(sequence)?)
+    }
+
+    fn epoch(sequence: u64) -> Result<AuthorityEpoch, Box<dyn std::error::Error>> {
+        Ok(AuthorityEpoch::new(sequence)?)
+    }
+
+    fn fence_generation(
+        prior_generation: Option<u64>,
+    ) -> Result<ResourceGeneration, Box<dyn std::error::Error>> {
+        prior_generation
+            .map(generation)
+            .transpose()?
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                OrsError::IntegrityProblem {
+                    record_type: "test",
+                    reason: "the fixture fences the generation it replaces".to_owned(),
+                }
+                .into()
+            })
+    }
+
+    /// One recorded daemon cutover: prior/candidate daemon generations, the new
+    /// epoch, the proposal fence, one Kernel-staged operation, one old in-flight
+    /// disposition and one unresolved effect scope. Every field is the caller's
+    /// own recorded value; the store validates exactly this record.
+    fn daemon_cutover(
+        cutover_id: &str,
+        prior_generation: Option<u64>,
+        prior_epoch: u64,
+        candidate_generation: u64,
+        new_epoch: u64,
+    ) -> Result<DaemonCutoverOwnership, Box<dyn std::error::Error>> {
+        Ok(DaemonCutoverOwnership {
+            cutover_id: cutover_id.to_owned(),
+            prior_daemon_generation: prior_generation.map(generation).transpose()?,
+            candidate_daemon_generation: generation(candidate_generation)?,
+            new_epoch: epoch(new_epoch)?,
+            old_proposal_fence: OldDaemonProposalFence {
+                generation: fence_generation(prior_generation)?,
+                epoch: epoch(prior_epoch)?,
+            },
+            staged_operation_ids: vec![OperationIdentity::new(format!(
+                "staged-{cutover_id}"
+            ))?],
+            in_flight: vec![InFlightDisposition {
+                operation_id: format!("inflight-{cutover_id}"),
+                kind: InFlightDispositionKind::BlockScopeUnknownOutcome,
+            }],
+            unresolved_scopes: vec![format!("scope-{cutover_id}")],
+            linearization_record_id: None,
+        })
+    }
+
+    #[test]
+    fn committed_daemon_cutover_is_durable_and_fences_the_prior_generation() -> TestResult {
+        let path = daemon_cutover_path("commit");
+        let store = RedbRecoveryStore::open(&path)?;
+        let first = daemon_cutover("daemon-cutover-1", None, 1, 2, 2)?;
+        let committed = store.commit_daemon_cutover(first.clone())?;
+        // The returned record is this commit's durable row: every recorded field
+        // survives the commit unchanged, and only the store minted the
+        // linearization identity that binds it to the commit.
+        assert_eq!(committed.cutover_id, first.cutover_id);
+        assert_eq!(
+            committed.prior_daemon_generation,
+            first.prior_daemon_generation
+        );
+        assert_eq!(
+            committed.candidate_daemon_generation,
+            first.candidate_daemon_generation
+        );
+        assert_eq!(committed.new_epoch, first.new_epoch);
+        assert_eq!(committed.old_proposal_fence, first.old_proposal_fence);
+        assert_eq!(
+            committed.staged_operation_ids,
+            first.staged_operation_ids
+        );
+        assert_eq!(committed.in_flight, first.in_flight);
+        assert_eq!(committed.unresolved_scopes, first.unresolved_scopes);
+        let Some(linearization) = committed.linearization_record_id.clone() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "test",
+                reason: "a committed daemon cutover has no linearization identity".to_owned(),
+            }
+            .into());
+        };
+        assert!(linearization.starts_with("ors:daemon-cutover:daemon-cutover-1#"));
+        // Re-committing the identical recorded cutover replays that same row
+        // instead of minting a second epoch.
+        assert_eq!(store.commit_daemon_cutover(first.clone())?, committed);
+        // The successor cutover may only continue the lineage this commit wrote,
+        // which is knowable only from the durable row above.
+        let second = daemon_cutover("daemon-cutover-2", Some(2), 2, 3, 3)?;
+        let successor = store.commit_daemon_cutover(second)?;
+        assert_eq!(successor.prior_daemon_generation, Some(ResourceGeneration::new(2)?));
+        assert_ne!(
+            successor.linearization_record_id,
+            committed.linearization_record_id
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_cutover_that_does_not_continue_the_committed_row_is_refused() -> TestResult {
+        let path = daemon_cutover_path("refusal");
+        let store = RedbRecoveryStore::open(&path)?;
+        let first = daemon_cutover("daemon-cutover-1", None, 1, 2, 2)?;
+        let committed = store.commit_daemon_cutover(first.clone())?;
+        // The fence names a prior daemon generation the committed row never
+        // granted, so nothing durable supports rejecting that generation's
+        // proposals as stale.
+        let forged = daemon_cutover("daemon-cutover-2", Some(7), 2, 3, 3)?;
+        assert!(matches!(
+            store.commit_daemon_cutover(forged),
+            Err(OrsError::InvalidEpochLineage)
+        ));
+        // The refusal wrote nothing: the committed row is unchanged.
+        assert_eq!(store.commit_daemon_cutover(first)?, committed);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

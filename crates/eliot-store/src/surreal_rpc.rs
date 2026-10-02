@@ -474,6 +474,7 @@ mod tests {
             outcome("ping", br#"{"id":"r-1","result":null}"#)?,
             Value::Null
         );
+        Ok(())
     }
 
     #[test]
@@ -503,6 +504,7 @@ mod tests {
             outcome("query", twice),
             Err(StoreError::Decode(reason)) if reason == StrictJsonErrorKind::DuplicateKey.as_str()
         ));
+        Ok(())
     }
 
     #[test]
@@ -524,6 +526,7 @@ mod tests {
         // `session` member is attributable as the cause of the refusal.
         assert!(admitted(br#"{"id":"r-1","result":null}"#).is_ok());
         assert!(admitted(br#"{"id":"r-1","session":"s","result":null}"#).is_err());
+        Ok(())
     }
 
     #[test]

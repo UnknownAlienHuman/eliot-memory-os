@@ -1616,8 +1616,14 @@ impl RestorePlan {
                     record = intent_record;
 
                     let applied = apply_restore_phase(self, bundle, target, &intent)?;
-                    let final_receipt =
-                        validate_applied_effect(self, bundle, &transaction, &intent, &applied, target)?;
+                    let final_receipt = validate_applied_effect(
+                        self,
+                        bundle,
+                        &transaction,
+                        &intent,
+                        &applied,
+                        target,
+                    )?;
                     let mut observed = record.clone();
                     observed.revision = next_revision(record.revision)?;
                     observed.state = RestoreJournalState::ReceiptPersisted;

@@ -149,10 +149,16 @@ impl AdapterError {
     pub fn into_store_error(self) -> StoreError {
         match self {
             Self::Store(error) => error,
-            Self::ProviderUnavailable | Self::AllocationContention { .. } => {
-                StoreError::Unavailable
-            }
-            Self::ProviderRefused { .. } => StoreError::Unavailable,
+            // `ProviderRefused` shares this arm's body by construction, not by
+            // coincidence: the ceiling documented above it maps a provider
+            // refusal onto the same transport-loss disposition that
+            // `ProviderUnavailable` already produced for these frames. The two
+            // stay distinct VARIANTS - the provider's bounded `kind` and `code`
+            // remain readable above this seam - and only their disposition at
+            // `StoreError` coincides.
+            Self::ProviderUnavailable
+            | Self::AllocationContention { .. }
+            | Self::ProviderRefused { .. } => StoreError::Unavailable,
             Self::ProviderConflict => StoreError::RevisionConflict,
             Self::UnknownOutcome { .. } | Self::PartialOutcome => {
                 StoreError::MissingReceiptEnvelope

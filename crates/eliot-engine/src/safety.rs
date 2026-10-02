@@ -488,6 +488,13 @@ impl RestoreService {
             component: "restore".to_owned(),
             plan,
             receipt,
+            // #938: `null` is the honest value and the field's own contract
+            // requires it - no owner-issued isolated restore ran on this contour,
+            // so there is no artifact to name or bind, and a synthesised digest is
+            // forbidden. A consumer that would authorize from this evidence
+            // refuses a null naming before authorizing anything.
+            owner_receipt_ref: None,
+            owner_receipt_sha256: None,
             generated_at: OffsetDateTime::now_utc(),
         })
     }
@@ -531,6 +538,10 @@ impl RestoreService {
             component: "restore".to_owned(),
             plan,
             receipt,
+            // #938: same honest null as the sibling contour - no owner-issued
+            // isolated restore ran here, so no artifact exists to name or bind.
+            owner_receipt_ref: None,
+            owner_receipt_sha256: None,
             generated_at: OffsetDateTime::now_utc(),
         })
     }
@@ -675,6 +686,13 @@ impl RestoreService {
                 finished_at: OffsetDateTime::now_utc(),
                 errors,
             },
+            // #938: this contour hand-builds its restore root and never runs the
+            // owner-issued isolated restore, so no owner-issued artifact exists to
+            // name or bind. The field's own contract makes absent the honest value
+            // - `null` is what a consumer's refusal fires on - and forbids a
+            // synthesised digest, so nothing is defaulted here.
+            owner_receipt_ref: None,
+            owner_receipt_sha256: None,
             generated_at: OffsetDateTime::now_utc(),
         };
         if status == RestoreStatus::RestoredToNewRoot {

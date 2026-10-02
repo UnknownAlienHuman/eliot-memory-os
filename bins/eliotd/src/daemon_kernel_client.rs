@@ -7,23 +7,31 @@
 //! This module owns only the EBP transport/session proof; Kernel remains the
 //! sole process, Store, and canonical authority owner.
 //!
-//! Issue #1742 W4/W6 (caller STITCH, no fake consumer): this client owns one
-//! live claim/submit pair per lane — agent-activation, local-read,
-//! campaign-packet, task-controller, observe, finish — and there is no act
-//! claim pair and no retained-checkpoint resume pair, so neither gate below
-//! has a daemon-side call site yet:
+//! Issue #1742 W4/W6 (gate written, caller STITCH, no fake consumer): this
+//! client owns one live claim/submit pair per lane — agent-activation,
+//! local-read, campaign-packet, task-controller, observe, finish — and there is
+//! no act claim pair and no retained-checkpoint resume pair, so the act lane's
+//! claim leg and the resume dispatch leg have no daemon call site yet:
 //!
-//! - W4: the daemon-side `eliot-context-admission::admit_material_decision`
-//!   invocation over Governor owner-resolved inputs, with the dispatch
-//!   binding (`bind_material_dispatch`) and dispatch-time revalidation
-//!   (`revalidate_material_dispatch`) through a live act claim/flight, runs
-//!   at the Governor owner's future live act claim, never here. The Kernel
-//!   submit arm owns only the mechanical binding
+//! - W4: [`DaemonKernelClient::admit_material_act_dispatch`] is the daemon-side
+//!   material entrypoint gate. It runs the ONE existing shared check
+//!   (`eliot-context-admission::admit_material_decision`) over the
+//!   Governor/Task Controller owner-resolved inputs, binds the checked action
+//!   parameters and resources, the packet and output digests, the
+//!   recipe/task/source revisions, the phase-aware lineage and the authority
+//!   owner's effect ceiling into the admitted operation with
+//!   `bind_material_dispatch`, and revalidates the current owner evidence at
+//!   effect dispatch with `revalidate_material_dispatch`. It evaluates nothing
+//!   and grants no permit of its own. The Kernel submit arm owns only the
+//!   mechanical binding
 //!   (`bins/eliot-kernel/src/host_request_route.rs::check_act_submit_binding`)
 //!   and the bridge owns only linkage revalidation
 //!   (`bins/eliot-agent-bridge/src/kernel_host_request_client.rs::revalidate_act_dispatch`);
-//!   both live in sibling-writer files and are not touched here. Refusals
-//!   stay typed (`DECISION_CONTEXT_INCOMPLETE` / `MaterialDecisionRefusal`).
+//!   both live in sibling-writer files and are not touched here. Refusals stay
+//!   typed (`DECISION_CONTEXT_INCOMPLETE` / `MaterialDecisionRefusal`). The act
+//!   flight that must call this gate — a Kernel act claim/queue arm plus the
+//!   runtime act poll contour — does not exist yet, so the caller is named there
+//!   rather than faked here.
 //! - W6: the resume-dispatch `admit_material_resume` invocation over #1730's
 //!   retained checkpoint runs at the resume owner's join, never here: no
 //!   `RetainedHandoffCheckpoint` consumer exists under `bins/`, so there is
@@ -44,6 +52,14 @@ use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
 };
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_context_admission::{
+    DispatchOwnerState, FloorAtomPolicy, MaterialDecisionRefusal, MaterialDispatchBinding,
+    MaterialEntrypointKind, OperationOwnerInputs, admit_material_decision, bind_material_dispatch,
+    revalidate_material_dispatch,
+};
+use eliot_context_contracts::{
+    AdmissionInput, AdmittedContextSet, ContextError, DecisionExecutionLineageRefs,
+};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
@@ -58,6 +74,7 @@ use eliot_protocol::{
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
+use eliot_security_contracts::EffectCeiling;
 #[cfg(windows)]
 use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
@@ -3090,6 +3107,78 @@ impl DaemonKernelClient {
         parse_finish_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
+    /// Admits one material act dispatch against the shared Context gate.
+    ///
+    /// Issue #1742 W4 names every material entrypoint — direct action, delegated
+    /// worker, verifier-with-effects, resume dispatch — and requires all of them
+    /// to reach ONE existing suitability-and-authority check rather than a
+    /// per-route permit. This method is the daemon-side join for the act lane:
+    /// it calls the existing owner [`admit_material_decision`] to decide
+    /// suitability, binds that decision into the operation this dispatch will
+    /// actually run with [`bind_material_dispatch`], and then revalidates the
+    /// current owner evidence presented for this dispatch against that binding
+    /// with [`revalidate_material_dispatch`] before any effectful owner call.
+    ///
+    /// The checked facts are bound into the admitted operation, not merely
+    /// checked: the owner-resolved action parameters and resources, the packet
+    /// and output digests, the recipe, task and per-atom source revisions, the
+    /// phase-aware lineage, and the authority owner's effect ceiling. Presenting a
+    /// different packet at dispatch, a moved fence, a moved acceptance revision,
+    /// a changed ceiling, a changed authority reference, or a saved valid binding
+    /// from another operation each fails the revalidation, so none of them
+    /// bypasses the gate.
+    ///
+    /// This creates no second evaluator, no permit authority and no new policy
+    /// semantic. Suitability is decided by the Context admission owner; authority
+    /// stays with the Governor/Task Controller owners named in `owners`. The
+    /// refusal travels unchanged as the owner's own typed
+    /// [`MaterialDecisionRefusal`] — `DECISION_CONTEXT_INCOMPLETE` or the
+    /// preserved boundary failure — so the caller projects it without string
+    /// flattening and never treats a refusal as a narrower silent execution.
+    ///
+    /// Production callers: none yet, by measurement rather than by omission.
+    /// The `eliot.act` route has no daemon-owned claim/flight in this crate: the
+    /// Kernel admits `eliot.act` submits (`host_request_route.rs::check_act_submit_binding`)
+    /// and the agent bridge revalidates linkage at dispatch
+    /// (`kernel_host_request_client.rs::revalidate_act_dispatch`), but no act
+    /// pair is ever claimed by this daemon, so no live act dispatch exists here
+    /// to call it. This is the seam the act claim/flight owner
+    /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs`, alongside the six
+    /// existing `*_claim` operations) wires when the act claim pair lands; the
+    /// caller is named here instead of being faked with a self-call, a
+    /// `todo!`, or a `#[allow(dead_code)]` marker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_material_act_dispatch(
+        &self,
+        entrypoint: MaterialEntrypointKind,
+        owners: &OperationOwnerInputs<'_>,
+        policies: &[FloorAtomPolicy],
+        closure: &AdmissionInput,
+        lineage: &DecisionExecutionLineageRefs,
+        effect_ceiling: EffectCeiling,
+        admitted_packet: &AdmittedContextSet,
+        current: &DispatchOwnerState<'_>,
+    ) -> Result<MaterialDispatchBinding, MaterialDecisionRefusal> {
+        // The authenticated runtime caller. No validated Kernel owner session
+        // means this composition root is not an authenticated caller, so the
+        // shared check is not reached from here.
+        self.owner_session_facts().ok_or(
+            MaterialDecisionRefusal::Boundary(ContextError::InvalidField("material_act.session")),
+        )?;
+        let floor = admit_material_decision(owners, policies, closure, lineage)?;
+        let binding = bind_material_dispatch(
+            entrypoint,
+            owners,
+            effect_ceiling,
+            closure,
+            admitted_packet,
+            &floor,
+            lineage,
+        )?;
+        revalidate_material_dispatch(&binding, current)?;
+        Ok(binding)
+    }
+
     /// Executes one closed local read through the authenticated Kernel route.
     ///
     /// Twin of [`store_named_async`](Self::store_named_async): the admitted
@@ -3645,18 +3734,45 @@ impl DaemonKernelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::num::NonZeroU64;
 
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_agent_contracts::{AgentAttemptId, PublicReference, RevisionId, TargetId};
+    use eliot_authority::ImpactClass;
+    use eliot_context_admission::AllowedFloorAction;
+    use eliot_context_contracts::{
+        AdmissionMeasuredCost, AdmissionMeasurement, AdmissionMeasurementBinding,
+        AdmissionPriorityClass, AdmissionRuleIdentity, AtomAvailability, AtomRepresentation,
+        AuthorityClass, CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding, ContextCandidate,
+        ContextCandidateSet, ContextOutcome, ContextRecipe, DecisionLineageActionContractRef,
+        DecisionLineageAuthorization, DecisionLineageEffect, DecisionLineageEpochRefs,
+        DecisionLineageExpectedObservable, DecisionLineagePhase, DecisionLineageRef,
+        DecisionLineageReferenceKind, DecisionLineageSlot, DecisionLineageSupersession,
+        DecisionLineageVerifier, DecisionRevision, DecisionSafetyFloor, LossPolicy,
+        MeasurementAggregationMode, MeasurementCompositionProfile, MeasurementRef, MeasurementUnit,
+        NonRecoverableReason, PrivacyClass, PriorityPolicyIdentity, ProofBinding,
+        ProviderDisposition, ProviderId, ProviderRole, ProviderRoleDenominator,
+        RepresentationKind, RoleLossRule, SafetyFloorIdentity, SafetyFloorMember, SemanticRole,
+        SourceSnapshot, SuppliedOmissionBinding, canonical_digest,
+    };
+    use eliot_contracts::{
+        ArtifactId, ContractId, ContractVersion, DecisionId, EpochId, EpochLineageId, OperationId,
+        RequestId, ResourceGeneration, SourceId, StateFence, TaskId, TaskRevision,
+    };
     use eliot_governor::{
         GovernorLaunchConfig, KernelGenerationExpectation, KernelGenerationSnapshot,
         KernelPortError,
     };
+    use eliot_observation::{Assertability, EpistemicStatus};
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
     };
     use eliot_read::{
         ProvenanceDisposition, ReadError, ReadProvenance, ReadService, StoreReadFailure,
+    };
+    use eliot_receipts::{
+        AuthorityBinding, EffectClass, OperationBinding, ProofCeiling, TaskBinding, VerifierBinding,
+        WorkScopeId,
     };
     use eliot_store_api::{
         CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, RevisionHead,
@@ -3810,6 +3926,783 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             shutdown_rx: shutdown_rx.clone(),
         })
+    }
+
+    /// Issue #1742 W4 fixture: the complete owner-resolved evidence one
+    /// material act dispatch binds.
+    ///
+    /// Every value here is fixture data this test owns. The closure, its
+    /// admitted packet, the owner-issued floor policy and the `I12.31` lineage
+    /// are built once and reused verbatim by both cases, so the only difference
+    /// between the positive and the refusal case is the current owner evidence
+    /// presented at dispatch.
+    struct MaterialActFixture {
+        /// Retained fence the whole decision is taken at.
+        fence: StateFence,
+        /// Owner-resolved decision identity.
+        decision_id: DecisionId,
+        /// Owner-resolved task identity.
+        task_id: TaskId,
+        /// Owner-resolved task/acceptance revision.
+        acceptance_revision: TaskRevision,
+        /// Owner-resolved resources the operation may touch.
+        requested_resources: BTreeSet<String>,
+        /// Identity of the floor rule that issued the owner policy set.
+        rule_evidence: ArtifactId,
+        /// Owner-issued floor atom policy applicable to a material effect.
+        policies: Vec<FloorAtomPolicy>,
+        /// The prepared closure the Context compiler admitted.
+        closure: AdmissionInput,
+        /// The packet that compiler actually delivered for this operation.
+        packet: AdmittedContextSet,
+        /// The phase-aware decision lineage for this operation.
+        lineage: DecisionExecutionLineageRefs,
+    }
+
+    /// Owner-issued reference strings this fixture presents. They are fixture
+    /// identities, never a policy decision: the shared check reads them as the
+    /// owner-resolved text it compares, and decides nothing from their content.
+    const ACT_GOVERNANCE_PROFILE: &str = "act-governance-profile";
+    const ACT_AUTHORITY_REF: &str = "act-authority-grant";
+    const ACT_RULE_REASON: &str = "the applicable Decision Safety Floor owner declares no such link";
+
+    fn act_digest(byte: u8) -> String {
+        char::from(byte).to_string().repeat(64)
+    }
+
+    fn act_id(value: &str) -> Result<ArtifactId, Box<dyn std::error::Error>> {
+        Ok(ArtifactId::new(value)?)
+    }
+
+    /// The retained fence the fixture decision is bound to, carrying the
+    /// owner-resolved acceptance revision.
+    fn act_fence() -> Result<StateFence, Box<dyn std::error::Error>> {
+        let mut fence = test_fence(1)?;
+        fence.task_revision = Some(TaskRevision::new(1)?);
+        Ok(fence)
+    }
+
+    fn act_role(provider: &str, semantic: SemanticRole) -> Result<ProviderRole, Box<dyn std::error::Error>> {
+        Ok(ProviderRole {
+            provider: ProviderId::new(provider)?,
+            role: semantic,
+        })
+    }
+
+    fn act_decision(context: &ContextBinding) -> Result<DecisionRevision, Box<dyn std::error::Error>> {
+        Ok(DecisionRevision {
+            decision_id: context.decision_id.clone(),
+            recipe_revision: TaskRevision::new(1)?,
+            policy_sha256: act_digest(b'a'),
+        })
+    }
+
+    fn act_candidate(
+        context: &ContextBinding,
+        atom: &str,
+        provider_role: ProviderRole,
+        content: &str,
+        loss_policy: LossPolicy,
+        protected: bool,
+    ) -> Result<ContextCandidate, Box<dyn std::error::Error>> {
+        Ok(ContextCandidate {
+            binding: context.clone(),
+            atom_id: act_id(atom)?,
+            provider_role,
+            source_range: None,
+            source: SourceSnapshot {
+                source_id: SourceId::new(format!("source-{atom}"))?,
+                owner: ProviderId::new(format!("owner-{atom}"))?,
+                snapshot_id: act_id(&format!("snapshot-{atom}"))?,
+                revision: "r1".to_owned(),
+                content_sha256: act_digest(b'b'),
+                predecessor: None,
+            },
+            learning: None,
+            representation: AtomRepresentation::Whole {
+                content: content.to_owned(),
+            },
+            loss_policy,
+            availability: AtomAvailability::PresentCurrent,
+            protected,
+            privacy: PrivacyClass::Public,
+            authority: AuthorityClass::DecisionRelevant,
+            status: EpistemicStatus::Observed,
+            assertability: Assertability::NonAssertableUnverified,
+            measurement: MeasurementRef {
+                digest: act_digest(b'c'),
+                serializer: "json-v1".to_owned(),
+            },
+            dependencies: Vec::new(),
+            proof: ProofBinding {
+                evidence_id: act_id(&format!("evidence-{atom}"))?,
+                ceiling: ProofCeiling::Observation,
+            },
+        })
+    }
+
+    fn act_measurement(
+        context: &ContextBinding,
+        candidate: &ContextCandidate,
+        measurement_id: &str,
+        cost: AdmissionMeasuredCost,
+    ) -> Result<AdmissionMeasurement, Box<dyn std::error::Error>> {
+        Ok(AdmissionMeasurement {
+            measurement_id: act_id(measurement_id)?,
+            atom_id: candidate.atom_id.clone(),
+            representation: candidate.representation.kind(),
+            unit: MeasurementUnit::Utf8Bytes,
+            binding: AdmissionMeasurementBinding {
+                context: context.clone(),
+                schema_version: CONTEXT_CONTRACT_VERSION,
+                subject_digest: canonical_digest(candidate)?,
+                input_digest: candidate.measurement.digest.clone(),
+                output_digest: act_digest(b'e'),
+                serializer_id: "json-v1".to_owned(),
+                serializer_version: "1".to_owned(),
+                serializer_options_digest: act_digest(b'f'),
+                route_id: "route".to_owned(),
+                model_id: "model".to_owned(),
+            },
+            cost,
+            observation: None,
+        })
+    }
+
+    /// One lineage reference of the exact closed category the slot requires.
+    fn act_lineage_ref(
+        kind: DecisionLineageReferenceKind,
+        target: &str,
+    ) -> Result<DecisionLineageRef, Box<dyn std::error::Error>> {
+        Ok(DecisionLineageRef {
+            kind,
+            reference: PublicReference {
+                kind: act_wire_kind(kind).to_owned(),
+                id: TargetId::new(target)?,
+                revision: RevisionId::new("r1")?,
+                digest: Some(act_digest(b'9')),
+            },
+        })
+    }
+
+    /// The public reference category each closed lineage kind must be spelled
+    /// as. These are the contract's own category strings, not a renaming; the
+    /// match is exhaustive so a new kind cannot silently borrow another one's
+    /// category.
+    const fn act_wire_kind(kind: DecisionLineageReferenceKind) -> &'static str {
+        match kind {
+            DecisionLineageReferenceKind::Goal => "goal",
+            DecisionLineageReferenceKind::Acceptance => "acceptance",
+            DecisionLineageReferenceKind::Observation => "observation",
+            DecisionLineageReferenceKind::Evidence => "evidence",
+            DecisionLineageReferenceKind::EpistemicPosition => "epistemic_position",
+            DecisionLineageReferenceKind::MaterialUnknown => "material_unknown",
+            DecisionLineageReferenceKind::Rival => "rival",
+            DecisionLineageReferenceKind::RejectionReason => "rejection_reason",
+            DecisionLineageReferenceKind::SelectedOption => "selected_option",
+            DecisionLineageReferenceKind::Rationale => "rationale",
+            DecisionLineageReferenceKind::WhyNow => "why_now",
+            DecisionLineageReferenceKind::RevisitCondition => "revisit_condition",
+            DecisionLineageReferenceKind::ActionContract => "action_contract",
+            DecisionLineageReferenceKind::AuthoritySource => "authority",
+            DecisionLineageReferenceKind::ExpectedObservable => "expected_observable",
+            DecisionLineageReferenceKind::VerifierContract => "verifier",
+            DecisionLineageReferenceKind::Diff => "diff",
+            DecisionLineageReferenceKind::ChangeObservation => "change_observation",
+            DecisionLineageReferenceKind::ReviewItem => "review_item",
+            DecisionLineageReferenceKind::ReviewDisposition => "review_disposition",
+            DecisionLineageReferenceKind::ArtifactSource => "artifact_source",
+            DecisionLineageReferenceKind::Outcome => "outcome",
+            DecisionLineageReferenceKind::MemoryRevision => "memory_revision",
+            DecisionLineageReferenceKind::OmissionManifest => "omission_manifest",
+            DecisionLineageReferenceKind::HandoffArtifact => "handoff_artifact",
+            DecisionLineageReferenceKind::Policy => "policy",
+            DecisionLineageReferenceKind::UnknownEvidence => "evidence",
+            DecisionLineageReferenceKind::Successor => "successor",
+        }
+    }
+
+    fn act_present<T>(value: T) -> DecisionLineageSlot<T> {
+        DecisionLineageSlot::Present { value }
+    }
+
+    fn act_policy_slot<T>(
+        kind: DecisionLineageReferenceKind,
+        target: &str,
+        reason: &str,
+    ) -> Result<DecisionLineageSlot<T>, Box<dyn std::error::Error>> {
+        Ok(DecisionLineageSlot::NotApplicable {
+            policy: act_lineage_ref(kind, target)?,
+            reason: reason.to_owned(),
+        })
+    }
+
+    fn act_deferred_slot<T>(
+        kind: DecisionLineageReferenceKind,
+        target: &str,
+        reason: &str,
+    ) -> Result<DecisionLineageSlot<T>, Box<dyn std::error::Error>> {
+        Ok(DecisionLineageSlot::NotYetProduced {
+            policy: act_lineage_ref(kind, target)?,
+            due_by: DecisionLineagePhase::Verification,
+            reason: reason.to_owned(),
+        })
+    }
+
+    fn act_context_binding(
+        fence: &StateFence,
+    ) -> Result<ContextBinding, Box<dyn std::error::Error>> {
+        Ok(ContextBinding {
+            task_id: TaskId::new("act-task")?,
+            attempt_id: AgentAttemptId::new("act-attempt")?,
+            scope_id: WorkScopeId::new("act-scope")?,
+            state_fence: fence.clone(),
+            decision_id: DecisionId::new("act-decision")?,
+            operation_id: None,
+        })
+    }
+
+    /// The phase-aware lineage for one proposed effect before dispatch. Every
+    /// slot is an explicit disposition: present where the record exists,
+    /// policy-backed not-applicable where the owner declares it inapplicable,
+    /// and not-yet-produced for the execution and outcome receipts that are due
+    /// at verification — never a default and never a fabricated receipt.
+    #[allow(clippy::too_many_lines)]
+    fn act_lineage(
+        context: &ContextBinding,
+        fence: &StateFence,
+    ) -> Result<DecisionExecutionLineageRefs, Box<dyn std::error::Error>> {
+        let proposal = OperationBinding {
+            operation_id: OperationId::new("act-operation")?,
+            request_id: RequestId::new("act-request")?,
+            idempotency_key: "act-request:invoke".to_owned(),
+            operation_kind: "eliot.act".to_owned(),
+            effect: EffectClass::ReversibleMutation,
+            state_fence: fence.clone(),
+        };
+        let expected = DecisionLineageExpectedObservable {
+            observable: act_lineage_ref(
+                DecisionLineageReferenceKind::ExpectedObservable,
+                "act-observable",
+            )?,
+            verifier: act_lineage_ref(
+                DecisionLineageReferenceKind::VerifierContract,
+                "act-verifier-contract",
+            )?,
+        };
+        Ok(DecisionExecutionLineageRefs {
+            goal: act_present(act_lineage_ref(
+                DecisionLineageReferenceKind::Goal,
+                "act-goal",
+            )?),
+            acceptance: act_present(vec![act_lineage_ref(
+                DecisionLineageReferenceKind::Acceptance,
+                "act-acceptance",
+            )?]),
+            task: act_present(TaskBinding {
+                task_id: context.task_id.clone(),
+                task_revision: TaskRevision::new(1)?,
+                state_fence: fence.clone(),
+            }),
+            observations: act_present(vec![act_lineage_ref(
+                DecisionLineageReferenceKind::Observation,
+                "act-observation",
+            )?]),
+            evidence: act_present(vec![act_lineage_ref(
+                DecisionLineageReferenceKind::Evidence,
+                "act-evidence",
+            )?]),
+            epistemic_position: act_present(act_lineage_ref(
+                DecisionLineageReferenceKind::EpistemicPosition,
+                "act-epistemic-position",
+            )?),
+            material_unknowns: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-material-unknowns",
+                ACT_RULE_REASON,
+            )?,
+            rivals: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-rivals",
+                ACT_RULE_REASON,
+            )?,
+            selected_option: act_present(act_lineage_ref(
+                DecisionLineageReferenceKind::SelectedOption,
+                "act-selected-option",
+            )?),
+            rationale: act_present(act_lineage_ref(
+                DecisionLineageReferenceKind::Rationale,
+                "act-rationale",
+            )?),
+            why_now: act_present(act_lineage_ref(
+                DecisionLineageReferenceKind::WhyNow,
+                "act-why-now",
+            )?),
+            revisit_conditions: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-revisit-conditions",
+                ACT_RULE_REASON,
+            )?,
+            context: context.clone(),
+            action_contract: act_present(DecisionLineageActionContractRef {
+                reference: act_lineage_ref(
+                    DecisionLineageReferenceKind::ActionContract,
+                    "act-action-contract",
+                )?,
+            }),
+            effects: vec![DecisionLineageEffect {
+                proposal: act_present(proposal.clone()),
+                authorization: act_present(DecisionLineageAuthorization {
+                    source: act_lineage_ref(
+                        DecisionLineageReferenceKind::AuthoritySource,
+                        "act-authority-source",
+                    )?,
+                    binding: AuthorityBinding {
+                        authority_id: ContractId::new("act-authority-contract")?,
+                        authority_owner: "governor-action-model".to_owned(),
+                        authority_epoch: fence.authority_epoch.clone(),
+                        state_fence: fence.clone(),
+                        allowed_effect: EffectClass::ReversibleMutation,
+                        proof_ceiling: ProofCeiling::Observation,
+                    },
+                }),
+                expected_observable: act_present(expected.clone()),
+                execution: act_deferred_slot(
+                    DecisionLineageReferenceKind::Policy,
+                    "act-policy-execution",
+                    "the operation receipt is due once the effect has been issued",
+                )?,
+                outcome: act_deferred_slot(
+                    DecisionLineageReferenceKind::Policy,
+                    "act-policy-outcome",
+                    "the outcome receipt is due at verification",
+                )?,
+            }],
+            operations: act_present(vec![proposal]),
+            diffs: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-diffs",
+                ACT_RULE_REASON,
+            )?,
+            change_observations: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-change-observations",
+                ACT_RULE_REASON,
+            )?,
+            anchors: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-anchors",
+                ACT_RULE_REASON,
+            )?,
+            reviews: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-reviews",
+                ACT_RULE_REASON,
+            )?,
+            artifacts: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-artifacts",
+                ACT_RULE_REASON,
+            )?,
+            verifiers: act_present(vec![DecisionLineageVerifier {
+                binding: VerifierBinding {
+                    verifier_id: ContractId::new("act-verifier")?,
+                    verifier_revision: ContractVersion::new(1, 0, 0),
+                    artifact_ids: vec![act_id("act-verifier-artifact")?],
+                    proof_ceiling: ProofCeiling::Observation,
+                    state_fence: fence.clone(),
+                },
+                source: expected.verifier,
+            }]),
+            outcomes: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-outcomes",
+                ACT_RULE_REASON,
+            )?,
+            memory_revisions: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-memory-revisions",
+                ACT_RULE_REASON,
+            )?,
+            omissions: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-omissions",
+                ACT_RULE_REASON,
+            )?,
+            handoff: act_policy_slot(
+                DecisionLineageReferenceKind::Policy,
+                "act-policy-handoff",
+                ACT_RULE_REASON,
+            )?,
+            epoch: DecisionLineageEpochRefs {
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                supersession: DecisionLineageSupersession::Current {
+                    policy: act_lineage_ref(
+                        DecisionLineageReferenceKind::Policy,
+                        "act-policy-no-supersession",
+                    )?,
+                },
+            },
+        })
+    }
+
+    /// The prepared closure plus the packet the Context compiler delivered for
+    /// it. The floor policy is the owner-issued `I7.11` atom policy for the one
+    /// atom that owner declares applicable to a material effect.
+    #[allow(clippy::too_many_lines)]
+    fn act_closure_and_packet(
+        context: &ContextBinding,
+        rule_evidence: &ArtifactId,
+    ) -> Result<(AdmissionInput, AdmittedContextSet), Box<dyn std::error::Error>> {
+        let required_role = act_role("act-required-provider", SemanticRole::Goal)?;
+        let optional_role = act_role("act-optional-provider", SemanticRole::Optional)?;
+        let required = act_candidate(
+            context,
+            "act-required",
+            required_role.clone(),
+            "act required material",
+            LossPolicy::NonDroppable,
+            true,
+        )?;
+        let optional = act_candidate(
+            context,
+            "act-optional",
+            optional_role.clone(),
+            "act optional material",
+            LossPolicy::Summarizable,
+            false,
+        )?;
+        let requested = vec![required_role.clone(), optional_role.clone()];
+        let dispositions = requested
+            .iter()
+            .cloned()
+            .map(|slot| ProviderDisposition {
+                slot,
+                state: AtomAvailability::PresentCurrent,
+                evidence: None,
+            })
+            .collect::<Vec<_>>();
+        let denominator = ProviderRoleDenominator {
+            requested,
+            dispositions,
+        };
+        let capacity = CapacityLimits {
+            route_capacity: 100,
+            fixed_overhead: 10,
+            output_reserve: 10,
+            review_reserve: 10,
+        };
+        let mut recipe = ContextRecipe {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: context.clone(),
+            decision: act_decision(context)?,
+            recipe_sha256: act_digest(b'd'),
+            denominator: denominator.clone(),
+            mandatory_roles: vec![SemanticRole::Goal],
+            role_policies: vec![
+                RoleLossRule {
+                    role: SemanticRole::Goal,
+                    loss_policy: LossPolicy::NonDroppable,
+                    required: true,
+                    allowed_representations: vec![RepresentationKind::Whole],
+                },
+                RoleLossRule {
+                    role: SemanticRole::Optional,
+                    loss_policy: LossPolicy::Summarizable,
+                    required: false,
+                    allowed_representations: vec![
+                        RepresentationKind::Whole,
+                        RepresentationKind::Summary,
+                    ],
+                },
+            ],
+            capacity,
+            predecessor: None,
+            invalidation: None,
+        };
+        recipe.recipe_sha256 = recipe.canonical_policy_digest()?;
+        let floor = DecisionSafetyFloor {
+            binding: context.clone(),
+            mandatory_atoms: vec![required.atom_id.clone()],
+            mandatory_roles: vec![SemanticRole::Goal],
+            providers: ProviderRoleDenominator {
+                requested: vec![required_role.clone()],
+                dispositions: vec![ProviderDisposition {
+                    slot: required_role,
+                    state: AtomAvailability::PresentCurrent,
+                    evidence: None,
+                }],
+            },
+            members: vec![SafetyFloorMember {
+                atom_id: required.atom_id.clone(),
+                role: SemanticRole::Goal,
+                availability: AtomAvailability::PresentCurrent,
+                measurement: Some(required.measurement.clone()),
+                required_dependencies: Vec::new(),
+            }],
+            interpretation_dependencies: Vec::new(),
+            rule_evidence: rule_evidence.clone(),
+            capacity,
+        };
+        let closure = AdmissionInput {
+            schema_version: CONTEXT_CONTRACT_VERSION,
+            binding: context.clone(),
+            recipe: recipe.clone(),
+            candidates: ContextCandidateSet {
+                binding: context.clone(),
+                candidates: vec![required.clone(), optional.clone()],
+                denominator: denominator.clone(),
+            },
+            learning_tickets: Vec::new(),
+            floor: SafetyFloorIdentity {
+                floor_id: act_id("act-floor")?,
+                decision: recipe.decision.clone(),
+                floor,
+            },
+            priority: PriorityPolicyIdentity {
+                policy_id: act_id("act-priority")?,
+                decision: recipe.decision.clone(),
+                priorities: vec![
+                    CandidatePriority {
+                        atom_id: required.atom_id.clone(),
+                        class: AdmissionPriorityClass::Required,
+                        ordinal: 0,
+                    },
+                    CandidatePriority {
+                        atom_id: optional.atom_id.clone(),
+                        class: AdmissionPriorityClass::Normal,
+                        ordinal: 1,
+                    },
+                ],
+            },
+            rule: AdmissionRuleIdentity {
+                rule_id: act_id("act-rule")?,
+                decision: recipe.decision,
+                rule_sha256: act_digest(b'a'),
+            },
+            measurement_profile: MeasurementCompositionProfile {
+                profile_id: act_id("act-profile")?,
+                schema_version: CONTEXT_CONTRACT_VERSION,
+                serializer_id: "json-v1".to_owned(),
+                serializer_version: "1".to_owned(),
+                serializer_options_digest: act_digest(b'f'),
+                route_id: "route".to_owned(),
+                model_id: "model".to_owned(),
+                unit: MeasurementUnit::Utf8Bytes,
+                aggregation: MeasurementAggregationMode::QualifiedUtf8Contribution,
+                qualification: act_id("act-qualification")?,
+                capacity,
+            },
+            supplied_omissions: vec![SuppliedOmissionBinding {
+                atom_id: optional.atom_id.clone(),
+                policy: LossPolicy::Summarizable,
+                expansion: None,
+                non_recoverable_reason: Some(NonRecoverableReason::SourceUnavailable),
+                authorization_requirement: "owner".to_owned(),
+                privacy_requirement: "scoped".to_owned(),
+                proof_requirement: "observation".to_owned(),
+                expires: None,
+                invalidation: None,
+            }],
+            measurements: vec![
+                act_measurement(
+                    context,
+                    &required,
+                    "act-required-measurement",
+                    AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 },
+                )?,
+                act_measurement(
+                    context,
+                    &optional,
+                    "act-optional-measurement",
+                    AdmissionMeasuredCost::ExactUtf8Bytes { value: 20 },
+                )?,
+            ],
+        };
+        let admitted = eliot_context_admission::admit_context(&closure)?;
+        let ContextOutcome::Complete(packet) = admitted.outcome else {
+            return Err("the fixture closure must deliver one complete packet".into());
+        };
+        Ok((closure, packet))
+    }
+
+    fn material_act_fixture() -> Result<MaterialActFixture, Box<dyn std::error::Error>> {
+        let fence = act_fence()?;
+        let context = act_context_binding(&fence)?;
+        let rule_evidence = act_id("act-floor-rule")?;
+        let (closure, packet) = act_closure_and_packet(&context, &rule_evidence)?;
+        let lineage = act_lineage(&context, &fence)?;
+        Ok(MaterialActFixture {
+            decision_id: context.decision_id.clone(),
+            task_id: context.task_id.clone(),
+            acceptance_revision: TaskRevision::new(1)?,
+            requested_resources: BTreeSet::from(["act.resource".to_owned()]),
+            policies: vec![FloorAtomPolicy {
+                atom_id: act_id("act-required")?,
+                role: SemanticRole::Goal,
+                loss_policy: LossPolicy::NonDroppable,
+                allowed_representations: vec![RepresentationKind::Whole],
+                required_dependencies: Vec::new(),
+                applicable_impact_classes: vec![ImpactClass::Material],
+            }],
+            rule_evidence,
+            fence,
+            closure,
+            packet,
+            lineage,
+        })
+    }
+
+    /// The owner-resolved inputs the Governor action model, Task Controller and
+    /// policy owner supply for this fixture operation. Nothing here is derived
+    /// from the caller's request or from the packet.
+    fn act_owner_inputs<'a>(
+        fixture: &'a MaterialActFixture,
+    ) -> Result<OperationOwnerInputs<'a>, Box<dyn std::error::Error>> {
+        Ok(OperationOwnerInputs {
+            decision_id: &fixture.decision_id,
+            state_fence: &fixture.fence,
+            impact_class: ImpactClass::Material,
+            task_id: &fixture.task_id,
+            acceptance_revision: fixture.acceptance_revision,
+            requested_resources: &fixture.requested_resources,
+            governance_profile_ref: ACT_GOVERNANCE_PROFILE,
+            authority_ref: ACT_AUTHORITY_REF,
+            phase: DecisionLineagePhase::BeforeEffect,
+            rule_evidence: fixture.rule_evidence.clone(),
+        })
+    }
+
+    /// A daemon client that has completed the authenticated owner handshake.
+    /// Without a validated owner session the shared check is not reached.
+    fn act_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
+        let client = test_client(fence)?;
+        if let Ok(mut slot) = client.validated_session_binding.lock() {
+            *slot = Some("sid=kernel-test;session=kernel-test".to_owned());
+        }
+        Ok(client)
+    }
+
+    /// WORK_UNIT_CASE: 1742-W4/1 — a material act dispatch whose owner evidence
+    /// is current reaches the effect bound to the operation it checked.
+    #[test]
+    fn material_act_dispatch_binds_the_admitted_operation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = material_act_fixture()?;
+        let client = act_client(&fixture.fence)?;
+        let owners = act_owner_inputs(&fixture)?;
+        let current = DispatchOwnerState {
+            state_fence: &fixture.fence,
+            acceptance_revision: fixture.acceptance_revision,
+            effect_ceiling: EffectCeiling::CandidateOnly,
+            authority_ref: ACT_AUTHORITY_REF,
+            packet: &fixture.packet,
+            lineage: &fixture.lineage,
+        };
+        let binding = client.admit_material_act_dispatch(
+            MaterialEntrypointKind::DirectAction,
+            &owners,
+            &fixture.policies,
+            &fixture.closure,
+            &fixture.lineage,
+            EffectCeiling::CandidateOnly,
+            &fixture.packet,
+            &current,
+        )?;
+        binding
+            .validate()
+            .map_err(|error| format!("the admitted binding must re-resolve: {error}"))?;
+        assert_eq!(
+            binding.entrypoint,
+            MaterialEntrypointKind::DirectAction,
+            "the binding records the dispatch path it was issued for"
+        );
+        assert_eq!(
+            binding.impact_class,
+            ImpactClass::Material,
+            "a caller framing cannot lower the owner-resolved impact class"
+        );
+        assert_eq!(
+            binding.effect_ceiling,
+            EffectCeiling::CandidateOnly,
+            "the authority owner's checked ceiling is bound into the operation"
+        );
+        assert_eq!(
+            binding.requested_resources, fixture.requested_resources,
+            "the checked resources are bound into the operation"
+        );
+        assert_eq!(
+            binding.packet_digest,
+            fixture
+                .packet
+                .canonical_payload_digest()
+                .map_err(|error| format!("packet digest: {error}"))?,
+            "the bound digest is the admitted packet this dispatch runs under"
+        );
+        assert!(
+            binding
+                .sources
+                .iter()
+                .any(|source| source.atom_id.as_str() == "act-required"
+                    && source.revision == "r1"),
+            "the delivered atom's exact source revision is bound into the operation"
+        );
+        Ok(())
+    }
+
+    /// WORK_UNIT_CASE: 1742-W4/2 — a dispatch whose current owner evidence
+    /// drifted after admission is refused with the owner's typed limitation, and
+    /// the effect never runs.
+    #[test]
+    fn material_act_dispatch_refuses_a_ceiling_that_moved_at_dispatch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = material_act_fixture()?;
+        let client = act_client(&fixture.fence)?;
+        let owners = act_owner_inputs(&fixture)?;
+        // The authority owner narrowed its ceiling between admission and this
+        // dispatch. The saved binding is still internally valid; only the
+        // current owner evidence differs, so this is exactly the case a saved
+        // lease must not survive.
+        let current = DispatchOwnerState {
+            state_fence: &fixture.fence,
+            acceptance_revision: fixture.acceptance_revision,
+            effect_ceiling: EffectCeiling::ReadOnly,
+            authority_ref: ACT_AUTHORITY_REF,
+            packet: &fixture.packet,
+            lineage: &fixture.lineage,
+        };
+        let refusal = match client.admit_material_act_dispatch(
+            MaterialEntrypointKind::DirectAction,
+            &owners,
+            &fixture.policies,
+            &fixture.closure,
+            &fixture.lineage,
+            EffectCeiling::CandidateOnly,
+            &fixture.packet,
+            &current,
+        ) {
+            Ok(_) => return Err("a narrowed effect ceiling must refuse the dispatch".into()),
+            Err(refusal) => refusal,
+        };
+        let incomplete = refusal
+            .incomplete()
+            .ok_or("the ceiling drift must stay the typed DECISION_CONTEXT_INCOMPLETE")?;
+        assert_eq!(
+            incomplete.allowed_action,
+            AllowedFloorAction::Refresh,
+            "the refusal names the one allowed recovery action"
+        );
+        assert_eq!(
+            incomplete.phase,
+            DecisionLineagePhase::BeforeEffect,
+            "the refusal is reported at the decision phase it was taken at"
+        );
+        assert!(
+            !incomplete.incomplete.reopening_requirements.is_empty(),
+            "the typed limitation names how the caller may reopen the decision"
+        );
+        Ok(())
     }
 
     /// Minimal in-test evidence table. It stores captured subjects in capture

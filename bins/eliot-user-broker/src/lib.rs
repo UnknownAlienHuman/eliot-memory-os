@@ -557,11 +557,11 @@ impl HumanStateAuthority {
                 "redeemed binding retains no OS-observed Windows SID, so it can name no Human principal",
             )
         })?;
-        let interactive_session_id = row.redeemed_interactive_session_id.clone().ok_or_else(|| {
-            BrokerAdmissionRefusal::OperatorBindingCrossSession.with_platform(
-                "redeemed binding retains no OS-observed logon Session",
-            )
-        })?;
+        let interactive_session_id =
+            row.redeemed_interactive_session_id.clone().ok_or_else(|| {
+                BrokerAdmissionRefusal::OperatorBindingCrossSession
+                    .with_platform("redeemed binding retains no OS-observed logon Session")
+            })?;
         let authority = Self {
             principal,
             interactive_session_id,

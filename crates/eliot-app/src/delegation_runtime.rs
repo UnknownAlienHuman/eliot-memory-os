@@ -7,10 +7,11 @@ use eliot_engine::{
     AntigravityVersionGateService, CandidateDiffService, DelegationBudgetReservation,
     DelegationBudgetService, DelegationCalibrationCampaignService, DelegationExecutionService,
     DelegationHealth, DelegationOutcomeService, DelegationPolicyContext, DelegationPolicyService,
-    DelegationReportService, ExternalResultCompletenessService, ExternalReviewJobService,
-    IncidentService, ProviderCallCampaignRequest, ProviderCallReservationDecision,
-    ProviderCallReservationOwner, ProviderCallReservationRequest, ProviderCompletenessInput,
-    ProviderInvocationJournal, ProviderReviewPreRegistrationService, WorkState,
+    DelegationReportService, EngineError, ExternalResultCompletenessService,
+    ExternalReviewJobService, IncidentService, ProviderCallCampaignRequest,
+    ProviderCallReservationDecision, ProviderCallReservationOwner,
+    ProviderCallReservationRequest, ProviderCompletenessInput, ProviderInvocationJournal,
+    ProviderReviewPreRegistrationService, WorkState,
     antigravity_plan_route_policy, antigravity_review_request, external_review_request,
     work_lease_is_active,
 };
@@ -179,6 +180,81 @@ pub fn explain(origin: DelegationOrigin, kind: DelegationReviewKind, question: &
     json!({ "request": request, "decision": decision, "provider_process_started": false })
 }
 
+/// The machine-matchable disposition of an authoritative provider-call ledger
+/// whose historical coverage is unknown.
+const PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK: &str = "provider_call_ledger_unknown";
+
+/// The report pair an operator reads to see that new provider calls are held.
+const PROVIDER_CALL_LEDGER_UNKNOWN_REPORT: &str = "delegation-provider-call-ledger";
+
+/// The three persisted candidates exactly as
+/// `eliot_engine::delegation::load_provider_call_ledger` enumerates them: the
+/// current ledger, the staged `.next` file and the `.bak` backup. They are named
+/// here only so the operator block states which bytes are preserved; nothing in
+/// this module decodes, validates, rewrites or removes them.
+const PROVIDER_CALL_LEDGER_CANDIDATES: [&str; 3] = [
+    "runtime/provider-call-ledger.json",
+    "runtime/provider-call-ledger.json.next",
+    "runtime/provider-call-ledger.json.bak",
+];
+
+/// Render the operator-visible block for one unknown authoritative ledger.
+fn provider_call_ledger_unknown_block(root: &Path, refusal: &str) -> anyhow::Error {
+    let preserved = PROVIDER_CALL_LEDGER_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|relative| root.join(relative).is_file())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let preserved_list = preserved.join(", ");
+    let block = json!({
+        "component": "delegation_provider_call_ledger_block",
+        "block": PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK,
+        "ledger_state": "Unknown",
+        "new_provider_calls_allowed": false,
+        "silent_recovery_performed": false,
+        "ledger_candidates_rewritten": false,
+        "preserved_ledger_candidates": preserved,
+        "refusal": refusal,
+        "operator_reconciliation_required": true,
+        "reconciliation_entry_point_available": false,
+        "blocked_at": OffsetDateTime::now_utc(),
+    });
+    let persisted = write_report_pair(root, PROVIDER_CALL_LEDGER_UNKNOWN_REPORT, &block);
+    let mut message = format!(
+        "{PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK}: new provider calls are blocked because the \
+         authoritative provider-call ledger is unknown, not empty; preserved candidates \
+         [{preserved_list}] keep their original bytes and explicit operator reconciliation of \
+         those bytes is required before any new provider call ({refusal})"
+    );
+    if let Err(write_error) = persisted {
+        message.push_str(&format!(
+            "; the operator block report reports/{PROVIDER_CALL_LEDGER_UNKNOWN_REPORT}/latest.json \
+             could not be written: {write_error}"
+        ));
+    }
+    anyhow::Error::msg(message)
+}
+
+/// Convert one engine refusal into the refusal the operator actually sees.
+///
+/// `EngineError::ProviderCallLedgerUnknown` is the only refusal that becomes an
+/// operator-visible block: the authoritative provider-call ledger exists and none
+/// of its candidates decoded and validated, so its historical coverage is
+/// unknown. Absence and corruption are distinct, so this path never substitutes
+/// an empty ledger, never rewrites a candidate, never deletes and retries, and
+/// never resumes provider dispatch; it records the block, names the preserved
+/// bytes and keeps new provider calls held until they are explicitly
+/// reconciled. Every other engine refusal is passed through unchanged, so an
+/// ordinary rejected write stays an ordinary rejected write.
+fn provider_call_ledger_refusal(root: &Path, error: EngineError) -> anyhow::Error {
+    let refusal = match error {
+        EngineError::ProviderCallLedgerUnknown(refusal) => refusal,
+        other => return anyhow::Error::new(other),
+    };
+    provider_call_ledger_unknown_block(root, &refusal)
+}
+
 #[allow(clippy::if_not_else, clippy::too_many_lines)]
 pub async fn review(
     root: &Path,
@@ -188,7 +264,9 @@ pub async fn review(
     let mut delegation_state = load_state(root)?;
     let mut work_state = load_work_state(root)?;
     let reservation_owner = ProviderCallReservationOwner::new(root);
-    let provider_ledger_snapshot = reservation_owner.snapshot()?;
+    let provider_ledger_snapshot = reservation_owner
+        .snapshot()
+        .map_err(|error| provider_call_ledger_refusal(root, error))?;
     let work_lease_id = WorkLeaseId::from_str(&input.work_lease_id)
         .context("work_lease_id must be a valid WorkLeaseId")?;
     let matching_lease = work_state
@@ -1566,5 +1644,99 @@ mod outcome_recovery_tests {
         assert!(!should_recover_completed_transcript(true, 1));
         assert!(should_recover_completed_transcript(false, 1));
         assert!(!should_recover_completed_transcript(false, 0));
+    }
+}
+
+#[cfg(test)]
+mod provider_call_ledger_block_tests {
+    use super::{
+        PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK, PROVIDER_CALL_LEDGER_UNKNOWN_REPORT, Result, WorkLeaseId,
+        provider_call_ledger_refusal,
+    };
+    use eliot_engine::{EngineError, ProviderCallReservationOwner};
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    fn scratch_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "eliot-delegation-ledger-block-{}",
+            WorkLeaseId::new_v7()
+        ))
+    }
+
+    fn block_report_path(root: &Path) -> PathBuf {
+        root.join("reports")
+            .join(PROVIDER_CALL_LEDGER_UNKNOWN_REPORT)
+            .join("latest.json")
+    }
+
+    /// Absence is not corruption: with no persisted candidate the gate admits the
+    /// empty ledger, records no block, and an ordinary rejected write stays an
+    /// ordinary rejected write.
+    #[test]
+    fn absent_provider_call_ledger_admits_without_an_operator_block() -> Result<()> {
+        let root = scratch_root();
+        let owner = ProviderCallReservationOwner::new(&root);
+        let snapshot = owner.snapshot()?;
+        assert!(snapshot.budgets.is_empty());
+        assert!(snapshot.reservations.is_empty());
+        assert!(!block_report_path(&root).is_file());
+        let ordinary = provider_call_ledger_refusal(
+            &root,
+            EngineError::WriteRejected("provider call reservation not found".to_owned()),
+        );
+        assert_eq!(
+            ordinary.to_string(),
+            "write rejected: provider call reservation not found"
+        );
+        assert!(!block_report_path(&root).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// An existing ledger that cannot be decoded and validated is unknown, not
+    /// empty: new provider calls are blocked, the original bytes are preserved
+    /// and the block is operator-visible.
+    #[test]
+    fn corrupt_provider_call_ledger_blocks_and_preserves_original_bytes() -> Result<()> {
+        let root = scratch_root();
+        std::fs::create_dir_all(root.join("runtime"))?;
+        let ledger = root.join("runtime/provider-call-ledger.json");
+        let corrupt = b"{\"budgets\":[{\"campaign_id\":\"campaign:x\",".to_vec();
+        std::fs::write(&ledger, &corrupt)?;
+        let owner = ProviderCallReservationOwner::new(&root);
+        let refusal = match owner.snapshot() {
+            Ok(_) => panic!(
+                "a corrupt authoritative provider-call ledger must not load as current state"
+            ),
+            Err(error) => provider_call_ledger_refusal(&root, error),
+        };
+        let message = refusal.to_string();
+        assert!(message.contains(PROVIDER_CALL_LEDGER_UNKNOWN_BLOCK), "{message}");
+        assert!(message.contains("runtime/provider-call-ledger.json"), "{message}");
+        assert_eq!(std::fs::read(&ledger)?, corrupt);
+        let block: Value =
+            serde_json::from_str(&std::fs::read_to_string(block_report_path(&root))?)?;
+        assert_eq!(
+            block["component"],
+            Value::String("delegation_provider_call_ledger_block".to_owned())
+        );
+        assert_eq!(block["ledger_state"], Value::String("Unknown".to_owned()));
+        assert_eq!(block["new_provider_calls_allowed"], Value::Bool(false));
+        assert_eq!(block["silent_recovery_performed"], Value::Bool(false));
+        assert_eq!(block["ledger_candidates_rewritten"], Value::Bool(false));
+        assert_eq!(block["operator_reconciliation_required"], Value::Bool(true));
+        assert_eq!(
+            block["reconciliation_entry_point_available"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            block["preserved_ledger_candidates"],
+            Value::Array(vec![Value::String(
+                "runtime/provider-call-ledger.json".to_owned()
+            )])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }
