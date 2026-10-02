@@ -710,7 +710,7 @@ sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "ac7bb8ee8c75b3555c0c9e7d24675ca106b47817d81dc68e2f591c526a2d4cb7"
+sha256 = "47e388ace385a7c8b256e687c5f2c60a5a96a5ea8b7c65bef692a87fd641ccc6"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -766,9 +766,9 @@ end = 132
 digest = "e96f9150d22e0e5fc2a81c34338e51999a347223da3fef5c0792c2fde01b4e8d"
 markers = ["install_host_diagnostics", "try_init", "stderr", "AlreadyOwned"]
 [[boundary.site]]
-start = 103
-end = 108
-digest = "3bd66335a2cb5b09472be30bace183d17ef1b3c4d521a56e8b247e6cbb02a933"
+start = 244
+end = 251
+digest = "98c0f0d10c6311101cea76dbcc1836d3168819094dd7b841ebb915fc46e64b76"
 markers = ["sink_status", "EventLogUnavailable"]
 [[boundary.site]]
 start = 49
@@ -834,14 +834,9 @@ end = 418
 digest = "38799c1f1512a90e974d07573d97bd90518a47fd3638f8651208b0f509403a9e"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 326
-end = 329
-digest = "6cb7b87d7352bd352e72ee07a6d56615d9be9961d3cce7276bc2091e01a4e879"
-markers = ["observe_entrypoint"]
-[[boundary.site]]
-start = 336
-end = 339
-digest = "97fa96e3827ca95f62fdd574a0b654ee1dfae9afa81edbdd207b604cdbaef631"
+start = 456
+end = 463
+digest = "a456329f64a8c12e5dfed6641a0974e2d9688a238c98ad06672d966cd06f0bb7"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
 start = 667
@@ -884,19 +879,19 @@ end = 1303
 digest = "2b4e3731b13ff42d0c8519e5b42c8ad49fb841d788c96b90579da867c62744ee"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 674
-end = 677
-digest = "c694fb2aa9595a9b8b37e9d10a904863f7ad6cdc69e2153afea93d4e9b64d888"
+start = 1384
+end = 1387
+digest = "5da95c233d0bb312c9076bc9329370a48859c4f7fbe27b690970b84f9f686d0c"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 693
-end = 696
-digest = "e6eaf75ef5057c2c3eef832249bd90fa89efdec17c4fccea50b4f5bbfc69c3b4"
+start = 1403
+end = 1406
+digest = "faf6a914ab10fc591a98c6bf0d002d1fca0e499fb1984fde5fcb115b9a951011"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
-start = 713
-end = 716
-digest = "e6eaf75ef5057c2c3eef832249bd90fa89efdec17c4fccea50b4f5bbfc69c3b4"
+start = 1423
+end = 1426
+digest = "faf6a914ab10fc591a98c6bf0d002d1fca0e499fb1984fde5fcb115b9a951011"
 markers = ["observe_entrypoint"]
 [[boundary.site]]
 start = 1354
@@ -2652,8 +2647,8 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 145
-digest = "813939092580e5cb0f4230e14a655a6f515f7932841df0c6f1d08ce77cea073d"
+end = 153
+digest = "67c119e52f5a9565f451c19ee5dfebec8a2bbd2e7e1f233466f1a26b756874a6"
 [[boundary.caller]]
 file = "bins/eliot-host/src/readiness_gate.rs"
 line = 186
@@ -2724,8 +2719,8 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 998
-digest = "ada0bfdbd846bee76cd0fe8e243b0a8758d641ebd6284c1acd7d7ef6042df614"
+end = 1045
+digest = "cbe16be94d95934240dd10bfe6b35095f5d05959a4b9bab2c87b6aa56fe0c739"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
 line = 6938
@@ -3035,8 +3030,8 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 605
-digest = "e64aad1ca530b693e1fd2b936b5d96977d9d2cf6769e357ba65801d0da378c6e"
+end = 667
+digest = "4571d9a3a29771b763b7e47cb12f4751b9195e409430a2cc0b98fec5bd436248"
 [[boundary.caller]]
 file = "bins/eliot-host/src/main.rs"
 line = 2198
@@ -3061,8 +3056,8 @@ ceiling_field_bytes = 256
 ceiling_detail_bytes = 1024
 [[boundary.absence]]
 start = 1
-end = 453
-digest = "7a83c0d8e25b269e8f9b91bb84d076de38588faefb248788f4ddd51c0c1f8098"
+end = 611
+digest = "5d3f0766862fda27466dca6077bcbd45c984472daaf081941cfdcae25506332f"
 [[boundary.caller]]
 file = "bins/eliot-host/src/backup_cutover.rs"
 line = 2456
