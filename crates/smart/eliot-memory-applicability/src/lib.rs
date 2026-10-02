@@ -13,6 +13,11 @@
 //!   read, because the contract carries none;
 //! - exact negative-memory triggers match on equality against the request
 //!   task key; semantic similarity is never a block (A14.3);
+//! - the frozen [`ApplicableMemorySet`] shape carries only disposition
+//!   handles and the proof-ceiling flags; exact omission and frontier
+//!   identities stay on the input [`MemoryProjectionBatch`], and the result is
+//!   joined back to that batch through the owner's own validator rather than
+//!   leaving a shape-valid verdict free to describe another read;
 //! - evaluation order is deterministic input order; the output preserves it.
 //!
 //! Record checks run in a fixed documented order and the first failing rule
@@ -225,7 +230,9 @@ fn classify_preconditions(record: &MemoryProjectionRecord) -> Option<ExclusionRe
 ///
 /// The batch is validated, a known denominator is required, and every
 /// record receives either an applicable slot (roles preserved, cue flag
-/// noted) or an exclusion with its exact substantive rule.
+/// noted) or an exclusion with its exact substantive rule. The result is
+/// revalidated against the batch it was evaluated from, so the verdict
+/// leaves this function bound to one read rather than merely well shaped.
 pub fn evaluate_applicability(
     request: &ApplicabilityRequest,
 ) -> Result<ApplicableMemorySet, ApplicabilityError> {
@@ -270,6 +277,11 @@ pub fn evaluate_applicability(
         revalidation_required: request.batch.coverage.revalidation_required,
         cue_hits_considered: request.cue_hits.len(),
     };
-    set.validate()?;
+    // The batch owner already proved the exact projected/omitted/deferred
+    // partition before classification ran. This join is what keeps that
+    // proof attached to the verdict: an independently deserializable set
+    // cannot recheck a lossy remainder, because the omission and frontier
+    // identities stay on the batch.
+    set.validate_against_batch(&request.batch)?;
     Ok(set)
 }

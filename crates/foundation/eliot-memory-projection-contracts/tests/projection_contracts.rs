@@ -190,6 +190,91 @@ fn unknown_denominator_stays_representable() {
 }
 
 #[test]
+fn unaccounted_known_remainder_is_refused() {
+    // The control-flow counterexample: an empty batch that declares one
+    // observed record, projects none of it, omits none, defers none, and
+    // claims no truncation. Unclaimed completeness, refused at the owner.
+    let mut candidate = batch();
+    candidate.records.clear();
+    candidate.coverage = coverage_known(1);
+    let error = candidate
+        .validate()
+        .expect_err("an unaccounted known remainder must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+    ));
+}
+
+#[test]
+fn duplicate_omission_identities_are_refused() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 4 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions = vec![
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "fence-mismatch".to_owned(),
+        },
+        CoverageOmission {
+            handle: aid("mem-3"),
+            reason: "scope-mismatch".to_owned(),
+        },
+    ];
+    let error = candidate
+        .validate()
+        .expect_err("one observed record cannot be omitted twice");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate {
+            field: "coverage.omissions",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn projected_and_omitted_identities_cannot_overlap() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.omissions = vec![CoverageOmission {
+        handle: aid("mem-1"),
+        reason: "fence-mismatch".to_owned(),
+    }];
+    let error = candidate
+        .validate()
+        .expect_err("one observed record cannot be both returned and lost");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::Duplicate {
+            field: "coverage.omissions",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_truncated_batch_retains_its_exact_remainder() {
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Known { total: 3 };
+    candidate.coverage.truncated = true;
+    candidate.coverage.revalidation_required = true;
+    candidate.coverage.frontier = vec!["mem-3".to_owned()];
+    candidate
+        .validate()
+        .expect("one deferred identity with truncation is exact");
+    // Claiming truncation while returning nothing deferred is unclaimed
+    // volume rather than a truncation.
+    let mut unbacked = candidate.clone();
+    unbacked.coverage.frontier.clear();
+    assert!(matches!(
+        unbacked.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
+}
+
+#[test]
 fn unknown_wire_fields_are_rejected() {
     let json = serde_json::json!({
         "contract_version": {"major": 0, "minor": 1, "patch": 0},
