@@ -64,16 +64,73 @@ struct RpcResponse {
     error: Option<RpcErrorBody>,
 }
 
-// Deliberately NOT closed. SurrealDB's real error object is
-// `{code, message, kind, details?, cause?}` and its own source says the details
-// are flattened to the top level; `kind` is ALWAYS emitted (only an empty
-// `details` is skipped). Closing this would refuse every genuine provider error
-// frame and turn each auth, query or credential failure into a decode failure.
+// The provider's real error object, verified against the pinned `v3.1.4` tag's
+// `surrealdb/types/src/error.rs` rather than inferred:
+//
+//   pub struct Error {
+//       #[surreal(default = "default_code")] code: i64,
+//       message: String,
+//       #[surreal(flatten)] details: ErrorDetails,
+//       #[surreal(default)] cause: Option<Box<Error>>,
+//   }
+//
+// and that file's own doc comment, verbatim: "The `details` field is flattened
+// into the serialized object, so the wire format contains `kind` (string) and
+// optionally `details` (object) at the same level as `code` and `message`."
+// `ErrorDetails` derives `#[surreal(tag = "kind", content = "details",
+// skip_content_if = "Value::is_empty")]`, so `kind` is emitted on EVERY error
+// (only an empty `details` is skipped) and carries one of the eleven variant
+// tags `ErrorDetails::kind_str` returns: "Validation", "Configuration",
+// "Query", "Serialization", "NotAllowed", "NotFound", "AlreadyExists",
+// "Connection", "Thrown", "Internal", "Context".
+//
+// Deliberately NOT closed (`deny_unknown_fields`): with `kind` always present
+// and `details` present whenever it is non-empty, closing this would refuse
+// every genuine provider error frame and turn each auth, query and credential
+// failure into a decode failure that names no cause at all.
+//
+// `cause` is an optional nested error object there, and it is accepted and
+// ignored here rather than decoded: it is a recursive vendor chain of
+// unbounded prose that no ELIOT path consumes, so reading it into a `Value`
+// would retain that whole chain for nothing. The previously declared `data`
+// member is gone because the provider emits no such member at all - it was
+// carried by every error frame while nothing could ever set it.
 #[derive(Debug, Deserialize)]
 struct RpcErrorBody {
     code: i64,
     message: String,
-    data: Option<Value>,
+    // Upstream emits `kind` unconditionally, but an unrecognised frame must
+    // still reach an operator as the provider's own code and message rather
+    // than as a decode failure, so absence is admitted here and read as "the
+    // provider stated no kind" - never as a more specific verdict.
+    kind: Option<String>,
+    // The flattened `details` object, decoded as a vendor document: read only
+    // for the `kind` tag it carries (see `refused_authentication`) and never
+    // echoed into any message.
+    details: Option<Value>,
+}
+
+impl RpcErrorBody {
+    /// Whether the provider itself attributed this refusal to authentication.
+    ///
+    /// At the pinned tag a credential or permission refusal arrives as
+    /// `kind == "NotAllowed"` - upstream's `ErrorDetails::NotAllowed` tag - with
+    /// `details` carrying `{"kind": "Auth", ...}`, upstream's
+    /// `NotAllowedError::Auth` tag. A method, scripting, function or target
+    /// denial is the same top-level `kind` with a different `details.kind`, and
+    /// every other failure family carries a different top-level `kind`. So this
+    /// answers true only for the refusals the provider labelled `Auth`: an
+    /// absent `kind`, an absent `details`, a `details` that is not an object,
+    /// and any kind this client does not know are all NOT authentication. Only
+    /// the tag is read; no detail content is inspected or echoed.
+    fn refused_authentication(&self) -> bool {
+        self.kind.as_deref() == Some("NotAllowed")
+            && matches!(
+                &self.details,
+                Some(Value::Object(details))
+                    if details.get("kind").and_then(Value::as_str) == Some("Auth")
+            )
+    }
 }
 
 impl SurrealRpcTransport {
@@ -105,6 +162,14 @@ impl SurrealRpcTransport {
         })
     }
 
+    /// Signs in on this transport.
+    ///
+    /// No verdict is asserted here. A provider refusal on this path becomes
+    /// [`StoreError::ServerAuthFailed`] only when the provider itself labelled
+    /// the refusal an authentication one; the single mapping site is
+    /// `provider_error`. Every other provider refusal keeps the provider's own
+    /// code and message as [`StoreError::RpcError`], so an operator is not told
+    /// the credentials failed when the provider said something else.
     pub async fn signin(&self, user: &str, password: &SecretString) -> Result<(), StoreError> {
         self.request(
             "signin",
@@ -115,10 +180,6 @@ impl SurrealRpcTransport {
         )
         .await
         .map(|_| ())
-        .map_err(|error| match error {
-            StoreError::RpcError { .. } => StoreError::ServerAuthFailed(error.to_string()),
-            other => other,
-        })
     }
 
     pub async fn use_ns_db(&self, ns: &str, db: &str) -> Result<(), StoreError> {
@@ -175,7 +236,7 @@ impl SurrealRpcTransport {
                     Message::Text(text) => {
                         let response = parse_response(text.as_str())?;
                         if response.id.as_ref() == Some(&expected_id) {
-                            return rpc_result(response);
+                            return rpc_result(method, response);
                         }
                     }
                     Message::Binary(bytes) => {
@@ -183,7 +244,7 @@ impl SurrealRpcTransport {
                             .map_err(|error| StoreError::Decode(error.to_string()))?;
                         let response = parse_response(&text)?;
                         if response.id.as_ref() == Some(&expected_id) {
-                            return rpc_result(response);
+                            return rpc_result(method, response);
                         }
                     }
                     Message::Ping(payload) => socket
@@ -254,13 +315,15 @@ where
     Option::<Value>::deserialize(deserializer).map(Some)
 }
 
-fn rpc_result(response: RpcResponse) -> Result<Value, StoreError> {
+/// Reduces one admitted RPC envelope to the outcome it actually reports.
+///
+/// `method` is the method this client asked for, and it earns a refusal exactly
+/// one typed verdict: a provider error object names its own family in `kind`,
+/// so the mapping below is driven by what the provider stated, not by which
+/// operation happened to fail.
+fn rpc_result(method: &str, response: RpcResponse) -> Result<Value, StoreError> {
     if let Some(error) = response.error {
-        return Err(StoreError::RpcError {
-            code: error.code,
-            message: error.message,
-            data: error.data,
-        });
+        return Err(provider_error(method, error));
     }
 
     match response.result {
@@ -275,6 +338,41 @@ fn rpc_result(response: RpcResponse) -> Result<Value, StoreError> {
         None => Err(StoreError::Decode(
             "surreal rpc response carried neither a result nor an error member".to_owned(),
         )),
+    }
+}
+
+/// Maps one provider error object onto the store error this operation earns.
+///
+/// The credential verdict is read from the wire, never inferred from the
+/// operation. [`RpcErrorBody::refused_authentication`] is consulted only when
+/// `method` is `signin`, and only a provider object that labelled the refusal
+/// itself answers true, so a malformed request, a query failure, an internal
+/// fault, or a frame with no `kind` all stay [`StoreError::RpcError`] - whose
+/// `Display` names the provider's own `code` and `message` - instead of being
+/// reported to an operator as a credential failure.
+fn provider_error(method: &str, error: RpcErrorBody) -> StoreError {
+    let refused_authentication = method == "signin" && error.refused_authentication();
+    let rejection = StoreError::RpcError {
+        code: error.code,
+        message: error.message,
+        // `StoreError::RpcError::data` is not a member of the provider's error
+        // object, so there is nothing to put here: the provider emits no
+        // `data`, and no code in this workspace reads the member. It is filled
+        // with `None` deliberately rather than with the vendor `details` blob,
+        // which is free-form provider prose that must not be retained in a
+        // public error member. Removing the member is a coordinated edit to
+        // `crates/eliot-store/src/error.rs` and its readers, not a local one.
+        data: None,
+    };
+
+    if refused_authentication {
+        // Byte-identical to the string this path produced before the provider's
+        // kind was modelled, so a genuine credential refusal still reads
+        // "SurrealDB authentication failed: SurrealDB RPC error -32002: <the
+        // provider's own message>" (upstream's `INVALID_AUTH`).
+        StoreError::ServerAuthFailed(rejection.to_string())
+    } else {
+        rejection
     }
 }
 

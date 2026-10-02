@@ -26,11 +26,8 @@ use crate::error::AdapterError;
 ///
 /// Named boundary: this closure is the envelope only. `result` is a vendor
 /// document and `deny_unknown_fields` does not reach inside a `Value` field.
-/// `RpcErrorBody` is deliberately NOT closed: the real error object carries
-/// `kind` at the same level as `code`/`message` (and optionally `details` and
-/// `cause`) — `surrealdb/types/src/error.rs` — so closing it would refuse every
-/// genuine provider error frame. Its `data` member is never emitted by this
-/// provider; that under-specified shape is a separate, unowned schema question.
+/// `RpcErrorBody` is deliberately NOT closed, for the reason given on that type
+/// itself: the real error object carries members this client must admit.
 ///
 /// Closure admits *which members are named*; it does not assert that one of
 /// them is present. `result` therefore records member presence explicitly
@@ -100,11 +97,41 @@ impl<'de> Deserialize<'de> for RpcResultMember {
     }
 }
 
+/// The provider's real error object, verified against the pinned `v3.1.4` tag's
+/// `surrealdb/types/src/error.rs` rather than inferred.
+///
+/// That file declares `pub struct Error { code: i64, message: String,
+/// #[surreal(flatten)] details: ErrorDetails, cause: Option<Box<Error>> }` and
+/// states, verbatim: "The `details` field is flattened into the serialized
+/// object, so the wire format contains `kind` (string) and optionally `details`
+/// (object) at the same level as `code` and `message`." `ErrorDetails` derives
+/// `#[surreal(tag = "kind", content = "details", skip_content_if =
+/// "Value::is_empty")]`, so `kind` is emitted on every error frame - only an
+/// empty `details` is skipped - and names the failure family
+/// (`ErrorDetails::kind_str`): "Validation", "Configuration", "Query",
+/// "Serialization", "NotAllowed", "NotFound", "AlreadyExists", "Connection",
+/// "Thrown", "Internal", "Context".
+///
+/// Deliberately NOT closed (`deny_unknown_fields`): `kind` is always present
+/// and `details` is present whenever non-empty, so closing this would refuse
+/// every genuine provider error frame and turn each auth, query and credential
+/// failure into a decode failure that names no cause.
+///
+/// `cause` is an optional nested error object there; it is admitted and ignored
+/// rather than decoded, because it is a recursive vendor chain of unbounded
+/// prose that no path in this crate consumes. The previously declared `data`
+/// member is gone: the provider emits no `data`, so it could never be set.
 #[derive(Debug, Deserialize)]
 struct RpcErrorBody {
     code: i64,
     message: String,
-    data: Option<Value>,
+    // `kind` is unconditional upstream, but an unrecognised frame must still
+    // be refused as the provider's own refusal rather than as a decode
+    // failure, so absence is admitted and read as "no family stated".
+    kind: Option<String>,
+    // The flattened `details` object. A vendor document: read only to prove it
+    // was received, never inspected and never echoed into a message.
+    details: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,7 +268,12 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
 /// exactly one result:
 ///
 /// * `error` present — refused as [`AdapterError::ProviderUnavailable`],
-///   unchanged; the code/message/data stay unread and never reach a message.
+///   unchanged. The provider's `code`, `message`, `kind` and `details` are the
+///   provider's own words and stay unread: nothing in this crate turns any of
+///   them into a message, and [`AdapterError::ProviderUnavailable`] carries no
+///   payload to carry them in. Surfacing the provider's `kind` at this
+///   boundary therefore needs a payload-bearing variant in `crate::error` and a
+///   mapping in `AdapterError::into_store_error`, which this cell does not own.
 /// * `result` member present — that member's value, including a real JSON
 ///   `null`, which is how a SurrealQL `NONE` value arrives on the wire. A
 ///   genuine null payload is therefore an admitted `Ok(Value::Null)` here and
@@ -262,7 +294,7 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
 ///   outcome the frame itself never earned. The response body is never echoed.
 pub(super) fn rpc_result(response: RpcResponse) -> Result<Value, AdapterError> {
     if let Some(error) = response.error {
-        let _ = (error.code, error.message, error.data);
+        let _ = (error.code, error.message, error.kind, error.details);
         return Err(AdapterError::ProviderUnavailable);
     }
     response.result.into_present().ok_or_else(|| {
