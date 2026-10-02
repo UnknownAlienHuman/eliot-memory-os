@@ -1456,7 +1456,7 @@ fn run_controlboard_status_windows() -> Result<i32> {
         Err(KernelClientError::MissingRequestIdentity) => {
             write_json_error(
                 "CONTROLBOARD_STATUS_NOT_ADMITTED",
-                "no admitted EBP request identity is bound for an operator-initiated controlboard read; the identity must arrive through the admitted host request path and Ramanujan must serve controlboard.status; tracker #1213",
+                "the live authenticated Kernel session did not admit the broker-owned controlboard.read capability this board read requires, so no operation-bound request identity could be issued for it; Ramanujan must also serve controlboard.status; tracker #1213",
             );
             return Ok(INVALID_REQUEST_EXIT);
         }
@@ -4635,7 +4635,7 @@ fn run_ui() -> Result<i32> {
         Err(eliot_cli::kernel_client::KernelClientError::MissingRequestIdentity) => {
             write_json_error(
                 "KERNEL_OPERATOR_LAUNCH_NOT_ADMITTED",
-                "no admitted EBP request identity is bound for a broker-admitted operator launch; the identity must arrive through the admitted host request path",
+                "the live authenticated Kernel session did not admit the broker-owned controlboard.read capability this operator launch requires, so no operation-bound request identity could be issued for it",
             );
             Ok(INVALID_REQUEST_EXIT)
         }
@@ -5083,17 +5083,21 @@ impl AuthenticatedKernelPort {
     /// Sends the exact `controlboard.status` operation through the
     /// authenticated EBP Execute seam and returns the served result payload.
     ///
-    /// The EBP request identity must already be bound on the client by an
-    /// admitted flow; this front door never mints principal, session, fence,
-    /// or idempotency identity. Without one the call fails closed with
-    /// `MissingRequestIdentity` before any byte is sent.
+    /// The request identity is obtained here from the live authenticated
+    /// handshake by `eliot_cli::kernel_client::KernelClient::read_controlboard_status`,
+    /// so this entry no longer depends on a caller having bound one. This front
+    /// door still mints no principal, session, fence, or authority: the
+    /// identity is built from the `ServerHello` the serving Kernel returned and
+    /// that the client re-proved against the protected installation
+    /// declaration. The `controlboard.status` selector and the request payload
+    /// stay owned by `controlboard_status`; only the identity join moved.
     fn transact_controlboard_status(
         &mut self,
     ) -> std::result::Result<serde_json::Value, eliot_cli::kernel_client::KernelClientError> {
-        self.client.transact_json(
-            controlboard_status::STATUS_OPERATION,
-            controlboard_status::status_request_payload(),
-        )
+        let (served, _identity) =
+            self.client
+                .read_controlboard_status(controlboard_status::status_request_payload())?;
+        Ok(served)
     }
 }
 

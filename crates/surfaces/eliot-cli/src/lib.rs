@@ -492,9 +492,13 @@ pub enum CommandPortError {
 /// well as the exact EBP `ClientHello` binding.
 pub mod kernel_client {
     use std::collections::BTreeMap;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use eliot_contracts::{EpochId, RequestId};
+    use eliot_contracts::{
+        ClockReading, EpochId, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
+        StateFence,
+    };
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
         decode_server_hello_frame,
@@ -506,6 +510,7 @@ pub mod kernel_client {
         ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
         ProtocolVersion, RequestIdentity, ServerHello,
     };
+    use eliot_receipts::RequestBinding;
     pub use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -518,6 +523,14 @@ pub mod kernel_client {
     const OPERATION_LIMIT: usize = 160;
     const KERNEL_SERVICE_NAME: &str = "eliot-kernel";
     const KERNEL_PROTOCOL_VERSION: &str = "eliot.kernel.v1";
+    /// Bounded deadline *preference* this surface proposes for one admitted
+    /// operation. It is never an extension of an existing grant and never a
+    /// standing lease: the serving Kernel owns the deadline absolutely and
+    /// fences any request whose `deadline_unix_ms` is not strictly ahead of its
+    /// own clock (`bins/eliot-kernel/src/user_broker_registration_route.rs:159`).
+    /// Mirrors the admitted bridge preference
+    /// `bins/eliot-agent-bridge/src/lib.rs::BRIDGE_EVENT_DEADLINE_PREFERENCE_MS`.
+    const ADMITTED_DEADLINE_PREFERENCE_MS: u64 = 60_000;
 
     /// Protected installation-provided connection declaration.
     #[derive(Clone, Debug, Deserialize)]
@@ -580,14 +593,49 @@ pub mod kernel_client {
     ///
     /// Broker-owned contract (`eliot.surfaces.user-broker-core/v1`) with the
     /// exact capability pair in
-    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29`
+    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43`
     /// (`OPERATOR_CAPABILITIES = ["controlboard.read", "operator.command"]`).
     /// The Kernel/User Broker lane serves and admits this operation; a typed
     /// provider rejection is the admission signal, never a local stub. This
-    /// selector names no authority: the admitted `RequestIdentity` bound via
-    /// [`KernelClient::set_request_identity`] carries the session, fence, and
-    /// operation binding.
+    /// selector names no authority: the fresh, exact, operation-bound
+    /// `RequestIdentity` minted by [`KernelClient::transact_admitted`] from the
+    /// live authenticated handshake carries the session, fence, and operation
+    /// binding.
     pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
+
+    /// Capability the live session must have admitted before
+    /// [`OPERATOR_LAUNCH_OPERATION`] is dispatched at all.
+    ///
+    /// This is the broker-owned read capability from the same
+    /// `OPERATOR_CAPABILITIES` pair named above. Requiring it against the
+    /// capability set the serving Kernel actually admitted turns "this session
+    /// may not launch" into a typed local refusal before a byte is sent,
+    /// instead of an opaque route rejection after one.
+    pub const OPERATOR_LAUNCH_CAPABILITY: &str = "controlboard.read";
+
+    /// Operation selector for one reconciled `controlboard.status` board read.
+    ///
+    /// Declared by its owner at
+    /// `crates/meta/eliot-runtime-status/src/controlboard_transport.rs:62`
+    /// (`CONTROLBOARD_STATUS_OPERATION`) and re-declared here as a plain wire
+    /// constant only: this surface does not take a dependency on
+    /// `eliot-runtime-status`, and the value is the selector the serving
+    /// process routes on, not authority. The producer/surface handshake that
+    /// contract documents (same EBP/1 frame profile, same
+    /// `Response`/`Result` reply correlated by connection and request id) is
+    /// what this dispatch relies on.
+    pub const CONTROLBOARD_STATUS_OPERATION: &str = "controlboard.status";
+
+    /// Capability the live session must have admitted before a
+    /// `controlboard.status` read is dispatched.
+    ///
+    /// The same broker-owned read capability the Operator endpoint carries
+    /// (`OPERATOR_CAPABILITIES`,
+    /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43`); it is the
+    /// read half of that pair, and requiring it against the capability set the
+    /// serving Kernel actually admitted keeps role filtering on this path
+    /// rather than leaving it to an opaque route rejection.
+    pub const CONTROLBOARD_READ_CAPABILITY: &str = "controlboard.read";
 
     /// Closed launch disposition carried by the serving owner receipt.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -635,8 +683,184 @@ pub mod kernel_client {
     pub struct KernelClient {
         config: KernelClientConfig,
         request_identity: Option<RequestIdentity>,
+        /// Monotonic per-client operation counter.
+        ///
+        /// Every admitted operation draws the next value, so two operations
+        /// dispatched by one client never share a request id, idempotency key,
+        /// or cancellation id. This is what keeps a launch, a status read, and
+        /// a later exact retry three DISTINCT identities on one connection
+        /// owner instead of one replayable identity reused across operations.
+        operation_sequence: AtomicU64,
         #[cfg(windows)]
         config_lease: ProtectedPathLease,
+    }
+
+    /// Live owner-issued admission facts observed on one authenticated
+    /// handshake, snapshotted for exactly one operation.
+    ///
+    /// Every field is read from the validated `ServerHello` the serving Kernel
+    /// just returned; none of it is supplied, defaulted, or widened by this
+    /// surface. It is the sole input to [`admitted_operation_identity`], which
+    /// is why a caller cannot present a stale generation, a foreign authority
+    /// epoch, or an unadmitted capability on this path.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AdmittedOperation {
+        /// Live authority epoch the serving Kernel reported in its
+        /// `ServerHello`, already matched against the protected declaration.
+        pub authority_epoch: EpochId,
+        /// Live module generation the serving Kernel reported in its
+        /// `ServerHello.config_snapshot`, already matched against the
+        /// protected declaration.
+        pub generation: u64,
+        /// Principal/session binding the serving Kernel assigned to this
+        /// session.
+        pub session_principal_binding: String,
+        /// Exact capability set the serving Kernel admitted for this session.
+        pub allowed_capabilities: Vec<String>,
+    }
+
+    /// Returns the live owner-issued admission facts from one validated
+    /// `ServerHello`.
+    ///
+    /// This is the single join point between the authenticated front door and
+    /// the request identity every public entry dispatches under. It reads only
+    /// what the Kernel itself returned, and it is deliberately unforgeable from
+    /// outside this module: a caller that wants an identity must first have
+    /// passed [`validate_server_hello`], which re-proves the principal
+    /// binding, authority epoch, generation, artifact digest, and
+    /// configuration-snapshot digest against the protected installation
+    /// declaration.
+    fn admitted_operation(hello: &ServerHello) -> Result<AdmittedOperation, KernelClientError> {
+        let snapshot: KernelConfigSnapshot = serde_json::from_value(hello.config_snapshot.clone())
+            .map_err(|error| {
+                KernelClientError::Rejected(format!(
+                    "Kernel ServerHello configuration snapshot shape is invalid: {error}"
+                ))
+            })?;
+        if hello.rejection_reason.is_some() || snapshot.generation == 0 {
+            return Err(KernelClientError::Rejected(
+                "Kernel ServerHello admitted no session for this operation".to_owned(),
+            ));
+        }
+        Ok(AdmittedOperation {
+            authority_epoch: hello.authority_epoch.clone(),
+            generation: snapshot.generation,
+            session_principal_binding: hello.session_principal_binding.clone(),
+            allowed_capabilities: hello.allowed_capabilities.clone(),
+        })
+    }
+
+    /// Mints the one fresh, exact, operation-bound `RequestIdentity` for one
+    /// admitted operation.
+    ///
+    /// Every authority-bearing field is copied from the live
+    /// [`AdmittedOperation`] the serving Kernel reported: the State Fence is
+    /// rebuilt from that epoch and generation, the principal/session binding is
+    /// the one the Kernel assigned, and the product/source identities are this
+    /// surface's own declared ones. The surface mints no authority here — it
+    /// mints only the three transport correlations (request id, idempotency
+    /// key, cancellation id) and a bounded deadline preference, all three
+    /// keyed by the operation selector and the client's monotonic sequence so
+    /// two operations can never collide.
+    ///
+    /// The `required_capability` is checked against the capability set the
+    /// Kernel actually admitted for this session, so an operation whose
+    /// capability was not admitted fails closed here rather than being
+    /// discovered as an opaque route rejection on the wire.
+    fn admitted_operation_identity(
+        admitted: &AdmittedOperation,
+        operation: &str,
+        required_capability: &str,
+        sequence: u64,
+        module_bridge_identity: &str,
+    ) -> Result<RequestIdentity, KernelClientError> {
+        validate_operation(operation)?;
+        if required_capability.trim().is_empty() {
+            return Err(KernelClientError::Configuration(
+                "Kernel operation capability selector is empty".to_owned(),
+            ));
+        }
+        if !admitted
+            .allowed_capabilities
+            .iter()
+            .any(|capability| capability == required_capability)
+        {
+            return Err(KernelClientError::MissingRequestIdentity);
+        }
+        let generation = ResourceGeneration::new(admitted.generation).map_err(|error| {
+            KernelClientError::Rejected(format!(
+                "Kernel admitted module generation is unusable: {error}"
+            ))
+        })?;
+        // The neutral frame fence carries only the authority epoch and the
+        // resource generation the Kernel reported for this session; it never
+        // carries a task, policy, or integration revision, because this front
+        // door asserts none. `StateFence::new` is the only constructor used so
+        // no such slot can be widened here.
+        let state_fence = StateFence::new(admitted.authority_epoch.clone(), generation);
+        state_fence
+            .validate()
+            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+        let now_ms = observed_unix_ms()?;
+        let now_i64 = i64::try_from(now_ms)
+            .map_err(|_| KernelClientError::Rejected("system clock is out of range".to_owned()))?;
+        let deadline = now_ms.saturating_add(ADMITTED_DEADLINE_PREFERENCE_MS);
+        if deadline <= now_ms {
+            return Err(KernelClientError::Rejected(
+                "admitted operation deadline preference did not advance past the current clock"
+                    .to_owned(),
+            ));
+        }
+        let correlation = format!("{module_bridge_identity}:{operation}:{sequence}");
+        let request_id = RequestId::new(correlation.clone())
+            .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+        let identity = RequestIdentity {
+            request: RequestBinding {
+                metadata: RequestMetadata {
+                    request_id,
+                    // This front door attaches no semantic Session and selects
+                    // no task: the serving Kernel builds the sender binding from
+                    // the session it already authenticated for this transport.
+                    session_id: None,
+                    task_id: None,
+                    product_id: ProductId::new(module_bridge_identity)
+                        .map_err(|error| KernelClientError::Configuration(error.to_string()))?,
+                    source_id: SourceId::new(module_bridge_identity)
+                        .map_err(|error| KernelClientError::Configuration(error.to_string()))?,
+                    state_fence: state_fence.clone(),
+                    clock: ClockReading {
+                        valid_time_ms: Some(now_i64),
+                        known_time_ms: Some(now_i64),
+                        transaction_sequence: None,
+                        monotonic_ns: None,
+                    },
+                },
+                state_fence,
+            },
+            idempotency_key: format!("{correlation}:idempotent"),
+            deadline_unix_ms: deadline,
+            cancellation_id: format!("{correlation}:cancel"),
+        };
+        identity
+            .validate()
+            .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+        Ok(identity)
+    }
+
+    /// Live host clock reading used only to place one bounded deadline
+    /// preference and the transport clock observation.
+    ///
+    /// This is an observation, never an authority: the serving Kernel owns the
+    /// deadline absolutely and fences an expired request on its own clock.
+    fn observed_unix_ms() -> Result<u64, KernelClientError> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .map_err(|_| {
+                KernelClientError::Rejected(
+                    "system clock is before the Unix epoch".to_owned(),
+                )
+            })
     }
 
     impl KernelClient {
@@ -667,6 +891,7 @@ pub mod kernel_client {
                 Ok(Self {
                     config,
                     request_identity: None,
+                    operation_sequence: AtomicU64::new(0),
                     config_lease: lease,
                 })
             }
@@ -677,16 +902,36 @@ pub mod kernel_client {
             self.request_identity = Some(identity);
         }
 
+        /// Draws the next per-client operation correlation value.
+        ///
+        /// Every admitted operation takes a distinct value, so one client can
+        /// never present the same request id, idempotency key, or cancellation
+        /// id for two different operations.
+        fn next_operation_sequence(&self) -> u64 {
+            self.operation_sequence.fetch_add(1, Ordering::Relaxed)
+        }
+
         /// Requests the broker-owned Operator launch through the authenticated
         /// Kernel/User Broker EBP Execute seam.
         ///
-        /// The admitted [`RequestIdentity`] bound via
-        /// [`KernelClient::set_request_identity`] carries the exact session,
-        /// fence, deadline, and operation binding from the admitted
-        /// host-request path; this front door never mints principal, session,
-        /// fence, clock, or idempotency identity. Without one the call fails
-        /// closed with [`KernelClientError::MissingRequestIdentity`] before
-        /// any byte is sent.
+        /// This public entry obtains its OWN fresh, exact, operation-bound
+        /// [`RequestIdentity`] from the live authenticated handshake before it
+        /// sends anything, through [`Self::transact_admitted`]. It does not
+        /// depend on a caller having pre-bound one: an operator typing
+        /// `eliot ui` has no host-request envelope to supply, so requiring one
+        /// made this entry refuse unconditionally. The surface still mints no
+        /// principal, session, fence, or authority — every authority-bearing
+        /// field comes from the `ServerHello` the serving Kernel returned and
+        /// that `validate_server_hello` re-proved against the protected
+        /// installation declaration.
+        ///
+        /// The identity is one-use for this operation: it is consumed by the
+        /// single frame below and never retained, so a later launch, a status
+        /// read, or an exact retry each draw a different correlation triple
+        /// from the same client. An unknown outcome therefore cannot be
+        /// reconciled by resending this frame under a new identity — it is
+        /// reconciled by the operation identity the serving owner already
+        /// recorded, which is the only stable handle for it.
         ///
         /// The request transacts [`OPERATOR_LAUNCH_OPERATION`] with only the
         /// broker-owned role/capability pair. The CLI supplies no path, image,
@@ -702,10 +947,12 @@ pub mod kernel_client {
         ///
         /// The `"controlboard.read"` capability string is retained because the
         /// broker contract requires it: `OPERATOR_CAPABILITIES` in
-        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:29` is exactly
+        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43` is exactly
         /// `["controlboard.read", "operator.command"]` (verified by grep for
         /// `controlboard.read`; #1213). It is a broker-owned capability name,
-        /// not an `eliot-controlboard` crate binding.
+        /// not an `eliot-controlboard` crate binding, and it is also the
+        /// capability this call requires the live session to have admitted
+        /// before it will dispatch.
         pub fn ensure_operator_launch(&mut self) -> Result<Value, KernelClientError> {
             #[cfg(not(windows))]
             {
@@ -715,10 +962,6 @@ pub mod kernel_client {
             }
             #[cfg(windows)]
             {
-                let identity = self
-                    .request_identity
-                    .clone()
-                    .ok_or(KernelClientError::MissingRequestIdentity)?;
                 let request = OperatorLaunchRequest {
                     role: "human_operator".to_owned(),
                     capabilities: vec![
@@ -731,16 +974,16 @@ pub mod kernel_client {
                         "encode broker-owned operator launch request: {error}"
                     ))
                 })?;
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
-                let expected_operation_id = identity.idempotency_key.clone();
-                let served = runtime.block_on(self.transact_async(
+                let (served, identity) = self.transact_admitted(
                     OPERATOR_LAUNCH_OPERATION,
+                    OPERATOR_LAUNCH_CAPABILITY,
                     payload,
-                    identity,
-                ))?;
+                )?;
+                // The operation identity the owner must echo is the exact
+                // idempotency key this dispatch was admitted under, so the
+                // receipt can only be graded against the request that produced
+                // it.
+                let expected_operation_id = identity.idempotency_key.clone();
                 let (status, receipt) =
                     decode_operator_launch_receipt(&served, &expected_operation_id)?;
                 match status {
@@ -755,6 +998,131 @@ pub mod kernel_client {
                         )))
                     }
                 }
+            }
+        }
+
+        /// Dispatches one operation under a fresh, exact, operation-bound
+        /// identity obtained from the live authenticated handshake, and returns
+        /// both the served payload and the exact identity it was sent under.
+        ///
+        /// This is the join every public operator entry uses. It performs the
+        /// authenticated handshake, validates the `ServerHello` against the
+        /// protected installation declaration, reads the live admission facts
+        /// from that validated reply, and mints one `RequestIdentity` from them
+        /// for this operation only. The returned identity is the caller's
+        /// reconciliation handle: it is the operation identity the serving
+        /// owner must echo, so an unknown outcome is resolved against exactly
+        /// the request that produced it.
+        ///
+        /// Returning the identity is what keeps launch, status, and an exact
+        /// retry three DISTINCT identities: each call draws a fresh
+        /// correlation value from the client's monotonic sequence, so no two
+        /// operations on one client can share a request id, idempotency key, or
+        /// cancellation id. Nothing is cached between calls — a second call
+        /// re-handshakes and re-reads the live fence rather than replaying the
+        /// first call's binding, so a generation that moved in between is
+        /// refused instead of silently presented.
+        ///
+        /// `required_capability` is checked against the capability set the
+        /// serving Kernel admitted for this session; an operation whose
+        /// capability was not admitted fails closed with
+        /// [`KernelClientError::MissingRequestIdentity`] before any byte is
+        /// sent.
+        pub fn transact_admitted(
+            &mut self,
+            operation: &str,
+            required_capability: &str,
+            payload: Value,
+        ) -> Result<(Value, RequestIdentity), KernelClientError> {
+            #[cfg(not(windows))]
+            {
+                let _ = (operation, required_capability, payload);
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                let sequence = self.next_operation_sequence();
+                let module_bridge_identity =
+                    self.config.client_hello.module_bridge_identity.clone();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
+                runtime.block_on(self.transact_admitted_async(
+                    operation,
+                    required_capability,
+                    payload,
+                    sequence,
+                    &module_bridge_identity,
+                ))
+            }
+        }
+
+        #[cfg(windows)]
+        async fn transact_admitted_async(
+            &self,
+            operation: &str,
+            required_capability: &str,
+            payload: Value,
+            sequence: u64,
+            module_bridge_identity: &str,
+        ) -> Result<(Value, RequestIdentity), KernelClientError> {
+            let (mut transport, limits, admitted) = self.connect().await?;
+            let identity = admitted_operation_identity(
+                &admitted,
+                operation,
+                required_capability,
+                sequence,
+                module_bridge_identity,
+            )?;
+            let served = self
+                .exchange(transport, limits, operation, payload, identity.clone())
+                .await?;
+            Ok((served, identity))
+        }
+
+        /// Reads one reconciled `controlboard.status` board under a fresh,
+        /// exact, operation-bound identity from the live authenticated
+        /// handshake.
+        ///
+        /// This is the same transport and the same owner decode the JSON
+        /// `eliot controlboard status` command and the interactive dashboard
+        /// both use, so all three observe one admission path. Like
+        /// [`Self::ensure_operator_launch`] it obtains its own identity rather
+        /// than requiring a caller to pre-bind one, and it returns the exact
+        /// identity it dispatched under so a caller can reconcile an unknown
+        /// outcome against the request that produced it.
+        ///
+        /// `payload` stays owned by the caller: the request body for this
+        /// operation belongs to the runtime-status contract, not to this
+        /// client, and this surface does not restate it.
+        ///
+        /// The capability required here is the same broker-owned
+        /// `controlboard.read` the Operator endpoint is admitted with
+        /// (`OPERATOR_CAPABILITIES`,
+        /// `crates/surfaces/eliot-user-broker-core/src/lib.rs:43`), so a
+        /// session the Kernel did not admit that capability for is refused here
+        /// rather than as an opaque route rejection.
+        pub fn read_controlboard_status(
+            &mut self,
+            payload: Value,
+        ) -> Result<(Value, RequestIdentity), KernelClientError> {
+            #[cfg(not(windows))]
+            {
+                let _ = payload;
+                Err(KernelClientError::FrontDoorClosed(
+                    "Windows authenticated Kernel front door",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                self.transact_admitted(
+                    CONTROLBOARD_STATUS_OPERATION,
+                    CONTROLBOARD_READ_CAPABILITY,
+                    payload,
+                )
             }
         }
 
@@ -806,10 +1174,19 @@ pub mod kernel_client {
             }
         }
 
+        /// Opens one authenticated connection and returns the live
+        /// owner-issued admission facts observed on it.
+        ///
+        /// The `ServerHello` is returned rather than discarded because it is
+        /// the only authority-bearing input a request identity on this front
+        /// door may be built from. It has already been re-proved against the
+        /// protected installation declaration by `validate_server_hello` before
+        /// it is handed back, so a caller cannot reach
+        /// `admitted_operation_identity` without a fresh validated handshake.
         #[cfg(windows)]
         async fn connect(
             &self,
-        ) -> Result<(NamedPipeTransport, TransportLimits), KernelClientError> {
+        ) -> Result<(NamedPipeTransport, TransportLimits, AdmittedOperation), KernelClientError> {
             self.config_lease
                 .verify_stable_identity()
                 .and_then(|()| self.config_lease.verify_path_identity())
@@ -840,12 +1217,13 @@ pub mod kernel_client {
             let hello = decode_server_hello_frame(&server, &self.config.connection_id)
                 .map_err(|error| KernelClientError::Rejected(error.to_string()))?;
             validate_server_hello(&self.config, &hello)?;
-            Ok((transport, limits))
+            let admitted = admitted_operation(&hello)?;
+            Ok((transport, limits, admitted))
         }
 
         #[cfg(windows)]
         async fn probe_async(&self) -> Result<Value, KernelClientError> {
-            let (mut transport, limits) = self.connect().await?;
+            let (mut transport, limits, _admitted) = self.connect().await?;
             let frame = Frame {
                 protocol_version: ProtocolVersion::CURRENT,
                 encoding_profile: EncodingProfile::JsonV1,
@@ -875,7 +1253,29 @@ pub mod kernel_client {
             payload: Value,
             identity: RequestIdentity,
         ) -> Result<Value, KernelClientError> {
-            let (mut transport, limits) = self.connect().await?;
+            let (transport, limits, _admitted) = self.connect().await?;
+            self.exchange(transport, limits, operation, payload, identity)
+                .await
+        }
+
+        /// Sends one already-bound Execute frame and grades the reply against
+        /// the exact request identity it carried.
+        ///
+        /// Shared by the caller-supplied-identity path
+        /// ([`Self::transact_json`], used by the `CommandPort::dispatch` seam
+        /// that receives a correlated `CommandRequest`) and the
+        /// owner-admitted path ([`Self::transact_admitted`]). Both therefore
+        /// put byte-identical frames on the wire for the same identity, so the
+        /// two entries cannot drift into different framing or reply grading.
+        #[cfg(windows)]
+        async fn exchange(
+            &self,
+            mut transport: NamedPipeTransport,
+            limits: TransportLimits,
+            operation: &str,
+            payload: Value,
+            identity: RequestIdentity,
+        ) -> Result<Value, KernelClientError> {
             let request_id = identity.request.metadata.request_id.clone();
             let frame = Frame {
                 protocol_version: ProtocolVersion::CURRENT,
@@ -1256,6 +1656,24 @@ pub mod kernel_client {
             }
         }
 
+        /// A `ServerHello` whose session the Kernel admitted the broker-owned
+        /// Operator read capability for, on the live generation these admission
+        /// tests operate against.
+        fn operator_server_hello() -> ServerHello {
+            ServerHello {
+                allowed_capabilities: vec![CONTROLBOARD_READ_CAPABILITY.to_owned()],
+                ..server_hello(serde_json::json!({
+                    "service": KERNEL_SERVICE_NAME,
+                    "protocol": KERNEL_PROTOCOL_VERSION,
+                    "generation": 11,
+                    "authority_epoch": epoch_json(7),
+                    "artifact_digest": "a".repeat(64),
+                }))
+            }
+        }
+
+        const TEST_MODULE_ID: &str = "eliot-cli";
+
         #[test]
         fn server_hello_fixture_binds_numeric_generation_authority_and_artifact() {
             let artifact_digest = "a".repeat(64);
@@ -1443,6 +1861,221 @@ pub mod kernel_client {
                 "user_broker_epoch": 1,
                 "fence_id": "operator-fence"
             })
+        }
+
+        /// The live admission facts a validated `ServerHello` yields.
+        fn operator_admission() -> AdmittedOperation {
+            admitted_operation(&operator_server_hello()).expect("admitted operator session")
+        }
+
+        // ---- #4600: public UI and ControlBoard entries reach the wire under a
+        // fresh, exact, operation-bound owner-admitted identity. These drive
+        // `admitted_operation` + `admitted_operation_identity`, the exact pair
+        // `transact_admitted` runs between its validated handshake and its
+        // Execute frame, so they need no live Windows installation.
+
+        /// Positive case for `eliot ui`: the launch operation mints a valid
+        /// identity from the live handshake and the frame that carries it passes
+        /// the protocol's own request/correlation validation, which is the
+        /// wire-path admission the entry previously never reached.
+        #[test]
+        fn operator_launch_admits_a_fresh_identity_that_reaches_the_wire_path() {
+            let admitted = operator_admission();
+            let identity = admitted_operation_identity(
+                &admitted,
+                OPERATOR_LAUNCH_OPERATION,
+                OPERATOR_LAUNCH_CAPABILITY,
+                0,
+                TEST_MODULE_ID,
+            )
+            .expect("operator launch identity");
+            identity.validate().expect("valid RequestIdentity");
+            // The State Fence is the Kernel's live authority tuple, not a local
+            // guess: same lineage, same sequence, same generation.
+            assert_eq!(
+                identity.request.state_fence.authority_epoch,
+                test_epoch(7)
+            );
+            assert_eq!(identity.request.state_fence.resource_generation.value(), 11);
+            assert_eq!(identity.request.state_fence, identity.request.metadata.state_fence);
+            // This front door attaches no semantic session and selects no task.
+            assert!(identity.request.metadata.session_id.is_none());
+            assert!(identity.request.metadata.task_id.is_none());
+            // The correlation names this operation, and the deadline is a
+            // bounded preference strictly ahead of the clock it was read at.
+            assert!(
+                identity
+                    .request
+                    .metadata
+                    .request_id
+                    .as_str()
+                    .contains(OPERATOR_LAUNCH_OPERATION)
+            );
+            assert!(identity.idempotency_key.contains(OPERATOR_LAUNCH_OPERATION));
+            assert!(identity.cancellation_id.contains(OPERATOR_LAUNCH_OPERATION));
+            assert!(identity.deadline_unix_ms > 0);
+            // The exact frame `exchange` puts on the wire accepts this identity:
+            // `Frame::validate` requires the request id to equal the identity's.
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: "connection-1".to_owned(),
+                request_id: Some(identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: Some(identity),
+                payload: ProtocolPayload::Json(json!({"operation": OPERATOR_LAUNCH_OPERATION})),
+                trace_context: BTreeMap::new(),
+            };
+            frame.validate().expect("frame carries the admitted identity");
+        }
+
+        /// Positive case for `eliot controlboard status` (and the dashboard
+        /// that shares it): the read mints its own valid identity from the same
+        /// live handshake, under the broker-owned read capability.
+        #[test]
+        fn controlboard_status_admits_a_fresh_identity_that_reaches_the_wire_path() {
+            let admitted = operator_admission();
+            let identity = admitted_operation_identity(
+                &admitted,
+                CONTROLBOARD_STATUS_OPERATION,
+                CONTROLBOARD_READ_CAPABILITY,
+                0,
+                TEST_MODULE_ID,
+            )
+            .expect("controlboard status identity");
+            identity.validate().expect("valid RequestIdentity");
+            assert_eq!(identity.request.state_fence.resource_generation.value(), 11);
+            assert!(
+                identity
+                    .request
+                    .metadata
+                    .request_id
+                    .as_str()
+                    .contains(CONTROLBOARD_STATUS_OPERATION)
+            );
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: "connection-1".to_owned(),
+                request_id: Some(identity.request.metadata.request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: Some(identity),
+                payload: ProtocolPayload::Json(json!({
+                    "operation": CONTROLBOARD_STATUS_OPERATION,
+                })),
+                trace_context: BTreeMap::new(),
+            };
+            frame.validate().expect("frame carries the admitted identity");
+        }
+
+        /// No-admission refusal: a session the Kernel admitted WITHOUT the
+        /// required capability gets no identity at all, so the entry refuses
+        /// before a byte is sent rather than discovering it as an opaque route
+        /// rejection.
+        #[test]
+        fn admission_refuses_when_the_live_session_lacks_the_required_capability() {
+            let mut hello = operator_server_hello();
+            hello.allowed_capabilities = vec!["worker.execute".to_owned()];
+            let admitted =
+                admitted_operation(&hello).expect("session is still a valid handshake");
+            for (operation, capability) in [
+                (OPERATOR_LAUNCH_OPERATION, OPERATOR_LAUNCH_CAPABILITY),
+                (CONTROLBOARD_STATUS_OPERATION, CONTROLBOARD_READ_CAPABILITY),
+            ] {
+                assert!(matches!(
+                    admitted_operation_identity(
+                        &admitted,
+                        operation,
+                        capability,
+                        0,
+                        TEST_MODULE_ID,
+                    ),
+                    Err(KernelClientError::MissingRequestIdentity)
+                ));
+            }
+        }
+
+        /// Wrong-session / wrong-generation refusal: a `ServerHello` the Kernel
+        /// rejected, or one whose snapshot names no live generation, yields no
+        /// admission facts — so there is nothing to mint an identity from.
+        /// The generation itself is also re-proved against the protected
+        /// declaration before admission is read, so a snapshot that disagrees
+        /// with the approved generation never reaches identity construction.
+        #[test]
+        fn admission_refuses_a_rejected_or_generationless_server_hello() {
+            let mut rejected = operator_server_hello();
+            rejected.rejection_reason = Some("no session admitted".to_owned());
+            assert!(matches!(
+                admitted_operation(&rejected),
+                Err(KernelClientError::Rejected(_))
+            ));
+
+            let mut generationless = operator_server_hello();
+            generationless.config_snapshot = serde_json::json!({
+                "service": KERNEL_SERVICE_NAME,
+                "protocol": KERNEL_PROTOCOL_VERSION,
+                "generation": 0,
+                "authority_epoch": epoch_json(7),
+                "artifact_digest": "a".repeat(64),
+            });
+            assert!(matches!(
+                admitted_operation(&generationless),
+                Err(KernelClientError::Rejected(_))
+            ));
+
+            // A live generation the protected declaration does not approve is
+            // refused by the existing snapshot validation, before admission.
+            let moved = operator_server_hello();
+            assert!(
+                validate_server_snapshot(&moved, &test_epoch(7), 12, &"a".repeat(64)).is_err()
+            );
+        }
+
+        /// Reuse refusal: launch, status, and a later exact retry must be three
+        /// DISTINCT identities on one client. Two operations, and two attempts
+        /// at the same operation, can never share a request id, idempotency
+        /// key, or cancellation id — so one identity is never spent on two
+        /// operations, and an exact retry is not a replay of a spent identity.
+        #[test]
+        fn distinct_operations_and_repeated_attempts_never_share_one_identity() {
+            let admitted = operator_admission();
+            let mint = |operation: &str, sequence: u64| {
+                admitted_operation_identity(
+                    &admitted,
+                    operation,
+                    CONTROLBOARD_READ_CAPABILITY,
+                    sequence,
+                    TEST_MODULE_ID,
+                )
+                .expect("admitted identity")
+            };
+
+            let launch = mint(OPERATOR_LAUNCH_OPERATION, 0);
+            let status = mint(CONTROLBOARD_STATUS_OPERATION, 1);
+            // An exact retry of the launch draws the NEXT correlation value, so
+            // it is a distinct identity rather than a replay of a spent one.
+            let launch_retry = mint(OPERATOR_LAUNCH_OPERATION, 2);
+
+            let distinct = [&launch, &status, &launch_retry];
+            for (index, left) in distinct.iter().enumerate() {
+                for right in distinct.iter().skip(index + 1) {
+                    assert_ne!(
+                        left.request.metadata.request_id,
+                        right.request.metadata.request_id,
+                        "two operations shared a request id"
+                    );
+                    assert_ne!(
+                        left.idempotency_key, right.idempotency_key,
+                        "two operations shared an idempotency key"
+                    );
+                    assert_ne!(
+                        left.cancellation_id, right.cancellation_id,
+                        "two operations shared a cancellation id"
+                    );
+                }
+            }
         }
     }
 
