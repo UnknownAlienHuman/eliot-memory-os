@@ -507,7 +507,7 @@ pub fn admit_canonical_revocation_resumes(
             ClockReading {
                 valid_time_ms: None,
                 known_time_ms: None,
-                transaction_sequence: Some(transaction_sequence.clone()),
+                transaction_sequence: Some(transaction_sequence),
                 monotonic_ns: None,
             },
         )
