@@ -1,3 +1,4 @@
+use eliot_context_measurement::MAX_MEASUREMENT_BYTES;
 use eliot_engine::{
     DoctorService, SkillCurationGate, SkillCuratorMemoryWriter, SkillCuratorRunInput,
     SkillCuratorService, SkillPatchService, WriteAdmissionService, WriterActor, WriterConfig,
@@ -77,20 +78,67 @@ fn skill_curator_proposes_patch_for_missing_where_not_apply() {
 
 #[test]
 fn skill_curator_proposes_archive_for_low_utility_high_cost() {
-    let mut skill = active_skill("archive");
-    skill.success_count = 0;
-    skill.failure_count = 5;
-    skill.ordered_steps.extend((0..20).map(|index| SkillStep {
-        step_id: format!("expensive-{index}"),
-        order: index + 10,
-        instruction: "large context cost step with repeated low utility".repeat(4),
-        expected_observation: None,
-        required_tool_or_capability: None,
-        stop_if_fails: false,
-    }));
+    let mut skill = low_utility_skill("archive");
+    skill.ordered_steps.extend(inflated_cost_steps(20));
 
     let proposals = SkillCuratorService::proposals_for_skill(ProjectId::new_v7(), &skill);
     assert!(has_action(&proposals, SkillCurationAction::Archive));
+}
+
+#[test]
+fn unvalidated_context_cost_cannot_gate_the_archive_proposal() {
+    // Paired fixtures differing ONLY in measured envelope size: both are low
+    // utility, so both propose archive. The inflated card measures an order of
+    // magnitude above the removed cost threshold and that magnitude changes
+    // nothing, so an unvalidated STU is not a lifecycle trigger.
+    let baseline = low_utility_skill("archive baseline");
+    let inflated = low_utility_skill("archive inflated");
+    inflated.ordered_steps.extend(inflated_cost_steps(20));
+
+    for skill in [&baseline, &inflated] {
+        let proposals = SkillCuratorService::proposals_for_skill(ProjectId::new_v7(), skill);
+        assert!(has_reason(
+            &proposals,
+            SkillCurationReason::LowUtilityHighCost
+        ));
+        assert!(has_action(&proposals, SkillCurationAction::Archive));
+    }
+
+    // The canonical owner cannot measure a Skill larger than the #704
+    // envelope ceiling: `measure_skill_context_envelope` returns a typed
+    // error, so the curator's cost is `None`. An ABSENT measurement must
+    // neither open nor suppress the archive proposal - observed utility
+    // alone decides. Under the removed cost limb this Skill received no
+    // archive proposal at all.
+    let unmeasurable = low_utility_skill("archive unmeasurable");
+    unmeasurable.ordered_steps.extend(oversized_cost_steps());
+    assert!(
+        u64::try_from(serde_json::to_vec(&unmeasurable).unwrap().len()).unwrap()
+            > MAX_MEASUREMENT_BYTES,
+        "fixture must exceed the measurement ceiling so its cost is unknown"
+    );
+
+    let proposals = SkillCuratorService::proposals_for_skill(ProjectId::new_v7(), &unmeasurable);
+    assert!(has_action(&proposals, SkillCurationAction::Archive));
+    assert!(has_reason(
+        &proposals,
+        SkillCurationReason::LowUtilityHighCost
+    ));
+
+    // The observed-utility limb is unchanged and still owns the decision: a
+    // Skill that is NOT low utility proposes no archive however expensive its
+    // measured envelope is.
+    let mut useful = low_utility_skill("useful but expensive");
+    useful.success_count = 4;
+    useful.failure_count = 1;
+    useful.ordered_steps.extend(inflated_cost_steps(20));
+
+    let proposals = SkillCuratorService::proposals_for_skill(ProjectId::new_v7(), &useful);
+    assert!(!has_action(&proposals, SkillCurationAction::Archive));
+    assert!(!has_reason(
+        &proposals,
+        SkillCurationReason::LowUtilityHighCost
+    ));
 }
 
 #[test]
@@ -539,6 +587,43 @@ fn skill_with_state(name: &str, state: SkillLifecycleState) -> SkillCardV2 {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Low observed utility: failures outnumber successes, on the cheapest
+/// measured envelope this fixture family produces.
+fn low_utility_skill(name: &str) -> SkillCardV2 {
+    let mut skill = active_skill(name);
+    skill.success_count = 0;
+    skill.failure_count = 5;
+    skill
+}
+
+fn inflated_cost_steps(count: usize) -> Vec<SkillStep> {
+    (0..count).map(|index| SkillStep {
+        step_id: format!("expensive-{index}"),
+        order: index as u32 + 10,
+        instruction: "large context cost step with repeated low utility".repeat(4),
+        expected_observation: None,
+        required_tool_or_capability: None,
+        stop_if_fails: false,
+    })
+    .collect()
+}
+
+/// Push the serialized `SkillCardV2` past `MAX_MEASUREMENT_BYTES`, so the
+/// canonical owner cannot measure this envelope at all and its cost is unknown.
+fn oversized_cost_steps() -> Vec<SkillStep> {
+    let filler = "unvalidated envelope filler step; ".repeat(40);
+    (0..110_000)
+        .map(|index| SkillStep {
+            step_id: format!("oversized-{index}"),
+            order: index as u32 + 10,
+            instruction: filler.clone(),
+            expected_observation: None,
+            required_tool_or_capability: None,
+            stop_if_fails: false,
+        })
+        .collect()
 }
 
 fn scope_rule(description: &str) -> SkillScopeRule {

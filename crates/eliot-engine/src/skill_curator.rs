@@ -660,11 +660,30 @@ fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {
         .map(|measurement| measurement.estimated_context_cost())
 }
 
+/// Observed utility is the only limb that may open an archive proposal.
+///
+/// The cost limb is REMOVED, not retuned. The only canonical Skill measurement
+/// is the conservative Source Token Unit in `skill.rs::measure_skill_context_envelope`,
+/// which records `MeasurementStatus::ConservativeStu`, `StuEstimate { empirical:
+/// false }` and `actual_tokens: None`; `SkillContextEnvelopeMeasurement` carries
+/// no route/model/tokenizer identity to carry, so #704's own contract refuses
+/// such a record as a fit proof (`SerializedContextMeasurement::proves_fit`
+/// returns `UnknownMeasurement` for `ConservativeStu`). An unvalidated planning
+/// estimate therefore cannot open a lifecycle action, and the previous
+/// `cost >= 180` comparison over that number is deleted. No replacement
+/// threshold, constant or field is introduced, because the code has no evidence
+/// of a proven Skill measurement to gate on: the owner cannot produce one.
+///
+/// The measurement is still taken and still reported as the proposal's cost
+/// evidence by `expected_context_delta`; it stopped being a lifecycle trigger.
+///
+/// Disposition change, recorded explicitly rather than absorbed: a Skill with
+/// observed low utility now proposes archive regardless of its estimated
+/// envelope size, where the removed cost limb used to suppress proposals for
+/// cheap Skills. The archive proposal remains a reversible candidate gated by
+/// `SkillCurationGate`, which requires evidence refs before it may be allowed.
 fn low_utility_high_cost(skill: &SkillCardV2) -> bool {
-    // Unchanged threshold. Unknown canonical evidence does not prove a high
-    // cost, so it does not open an archive proposal on cost grounds.
     skill.failure_count > skill.success_count
-        && measured_skill_context_cost(skill).is_some_and(|cost| cost >= 180)
 }
 
 fn negative_transfer(skill: &SkillCardV2) -> bool {
