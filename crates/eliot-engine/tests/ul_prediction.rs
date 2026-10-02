@@ -130,16 +130,27 @@ fn t07_skill_and_description_budget() -> Result<(), Box<dyn std::error::Error>> 
     assert!(required.iter().all(|line| body.contains(line)));
     // #783: the budget is now counted in canonical source token units, so the
     // old `/4` number no longer describes the same envelope. The contract this
-    // assertion is protecting is a BYTE envelope, not a unit count, and the
-    // retired `ceil(bytes / 4) <= 500` admitted exactly `4 * 500 - 3 == 1997`
-    // bytes. Restating that same envelope in canonical units gives
-    // `ceil(1997 / 3) == 666`, and 666 admits `3 * 666 == 1998` bytes, so the
-    // one-byte slack the old form also had is preserved rather than tightened
-    // or invented. The shared body is 1901 bytes, i.e. 634 canonical units, so
-    // it sits inside the envelope exactly as it did before the ratio change;
-    // the literal was re-derived, not relaxed.
-    const SKILL_BODY_MAX_UNITS: u32 = 666;
+    // assertion is protecting is a BYTE envelope, not a unit count. The retired
+    // gate `ceil(bytes / 4) <= 500` admitted `b` exactly when
+    // `b <= 4 * 500 == 2_000` bytes, NOT `b <= 1_997`: a 1_999-byte body gives
+    // `ceil(1_999 / 4) == 500 <= 500` and was admitted, as was 2_000. Restating
+    // `b <= 2_000` under the canonical `ceil(b / 3)` needs
+    // `ceil(2_000 / 3) == 667`, and 667 admits `3 * 667 == 2_001` bytes, so the
+    // retired 2_000-byte range is restored in full and the envelope is one
+    // byte wider only because the `/4` ratio could not express it. The literal
+    // is the minimal `ceil(4B / 3)`, so it is re-derived, not relaxed. The
+    // shared body is 1901 bytes, i.e. 634 canonical units, so it sits inside
+    // the envelope exactly as it did before the ratio change.
+    const SKILL_BODY_MAX_UNITS: u32 = 667;
     assert!(ul_token_estimate(body)? <= SKILL_BODY_MAX_UNITS);
+    // The same boundary the production capsule gate carries, measured here so
+    // this fixture constant cannot silently drift back to the `4B - 3`
+    // derivation: `4 * 500 - 1` bytes was admitted by the retired gate and
+    // estimates to exactly 667, so it could not pass the pre-fix 666.
+    assert_eq!(
+        ul_token_estimate(&"x".repeat(4 * 500 - 1))?,
+        SKILL_BODY_MAX_UNITS
+    );
 
     let catalog = fs::read_to_string(root.join("crates/eliot-app/src/mcp_stdio/catalog.rs"))?;
     let descriptions = [

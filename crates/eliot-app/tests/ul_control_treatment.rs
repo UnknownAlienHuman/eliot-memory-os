@@ -940,11 +940,12 @@ fn seed_invariant_capsule(prepared: &mut PreparedHarness, project_id: ProjectId)
         // #783: `budget_limit` is compared against a canonical source-token-unit
         // estimate by `validate_ul_artifact`, and `1_200` here was a loose
         // fixture bound rather than a re-derived envelope. The re-derived
-        // capsule limit is `666` (it admits `3 * 666 == 1998` bytes, the
-        // envelope the retired `ceil(bytes / 4) <= 500` described), so the
-        // fixture uses that value and still admits this seeded body with room
-        // to spare.
-        budget_limit: 666,
+        // capsule limit is the minimal `ceil(4 * 500 / 3) == 667` (the retired
+        // gate `ceil(bytes / 4) <= 500` admitted every `b <= 4 * 500 == 2_000`
+        // bytes, and 667 admits `3 * 667 == 2_001` bytes, so the retired byte
+        // range is restored), so the fixture uses that value and still admits
+        // this seeded body with room to spare.
+        budget_limit: 667,
         token_estimate: ul_token_estimate(&capsule.body_md)?,
         status: PyramidBuildStatus::Promoted,
         previous_build_id: None,

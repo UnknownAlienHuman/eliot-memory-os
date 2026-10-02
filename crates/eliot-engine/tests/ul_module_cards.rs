@@ -68,22 +68,34 @@ fn t05_module_card_is_deterministic_and_bounded() -> TestResult {
     assert_eq!(first_card.body_md, second[0].body_md);
     // #783: the limit is now counted in canonical source token units, so the
     // old `/4` number no longer describes the same envelope. The contract this
-    // assertion protects is a BYTE envelope, not a unit count, and the retired
-    // `ceil(bytes / 4) <= 200` admitted exactly `4 * 200 - 3 == 797` bytes.
-    // Restating that same envelope in canonical units gives
-    // `ceil(797 / 3) == 266`, and 266 admits `3 * 266 == 798` bytes, so the
-    // one-byte slack the old form also had is preserved rather than tightened
-    // or invented. The literal was re-derived, not relaxed.
-    const CARD_BODY_MAX_UNITS: u32 = 266;
-    // Measured, not assumed: 797 bytes is the retired maximum and must still
-    // fit, 799 must not, and the 798 the canonical form also admits is the
-    // one-byte slack the old form carried.
-    let retired_max = ul_token_estimate(&"x".repeat(4 * 200 - 3))?;
-    let retired_max_plus_two = ul_token_estimate(&"x".repeat(4 * 200 - 1))?;
+    // assertion protects is a BYTE envelope, not a unit count. The retired gate
+    // `ceil(bytes / 4) <= 200` admitted `b` exactly when `b <= 4 * 200 == 800`
+    // bytes, NOT `b <= 797`: a 799-byte card gives `ceil(799 / 4) == 200 <= 200`
+    // and was admitted, as was 800. Restating `b <= 800` under the canonical
+    // `ceil(b / 3)` needs `ceil(800 / 3) == 267`, and 267 admits
+    // `3 * 267 == 801` bytes, so the retired 800-byte range is restored in full
+    // and the envelope is one byte wider only because the `/4` ratio could not
+    // express it. The literal is the minimal `ceil(4B / 3)`, so it is re-derived,
+    // not relaxed.
+    const CARD_BODY_MAX_UNITS: u32 = 267;
+    // Measured, not assumed. The discriminator is `4 * 200 - 1 == 799`
+    // bytes: the retired gate admitted it, and it estimates to exactly
+    // `ceil(799 / 3) == 267`, so it could not have passed the pre-fix 266. The
+    // retired maximum 800 and the first length the new constant rejects, 802,
+    // bound the envelope from both sides.
+    let retired_below_max = ul_token_estimate(&"x".repeat(4 * 200 - 1))?;
+    let retired_max = ul_token_estimate(&"x".repeat(4 * 200))?;
     let card_units = ul_token_estimate(&first_card.body_md)?;
     assert!(card_units <= CARD_BODY_MAX_UNITS);
+    assert_eq!(
+        retired_below_max, CARD_BODY_MAX_UNITS,
+        "4 * 200 - 1 bytes was admitted by the retired gate and must still fit"
+    );
     assert!(retired_max <= CARD_BODY_MAX_UNITS);
-    assert!(retired_max_plus_two > CARD_BODY_MAX_UNITS);
+    assert!(
+        ul_token_estimate(&"x".repeat(4 * 200 + 2))? > CARD_BODY_MAX_UNITS,
+        "the envelope must not be widened past the retired 800-byte maximum"
+    );
     assert_eq!(first_card.verifier, "cargo test -p demo");
     let sections = [
         "PURPOSE:",

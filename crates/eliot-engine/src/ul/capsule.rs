@@ -20,14 +20,29 @@ use super::measurement::ul_token_estimate;
 // a unit count, and each was calibrated while the local estimator was
 // `ceil(bytes / 4)`, so each is re-derived here the way
 // `crates/eliot-engine/tests/ul_prediction.rs` re-derives
-// `SKILL_BODY_MAX_UNITS`. For a retired limit `u` the old form admitted exactly
-// `4u - 3` bytes; restating that same envelope in canonical units gives
-// `ceil((4u - 3) / 3)`, and the largest length that still fits is `3u'`. The
-// one-byte slack the old form also had is preserved rather than tightened or
-// invented, and no envelope is widened beyond what `/4` already admitted.
-const CAPSULE_LIMIT: u32 = 666; // 500 units: 1_997 -> 1_998 bytes.
-const MAP_LIMIT: u32 = 799; // 600 units: 2_397 -> 2_397 bytes.
-const CHARTER_LIMIT: u32 = 266; // 200 units: 797 -> 798 bytes.
+// `SKILL_BODY_MAX_UNITS`.
+//
+// The re-derivation starts from the retired gate, which is an integer budget
+// `B` and the estimator `ceil(b / 4)`, so the equivalence to restore is
+//
+//     ceil(b / 4) <= B   <=>   b <= 4B
+//
+// and NOT `b <= 4B - 3`. `4B - 3` is the largest length the retired gate
+// REJECTS, not one it admits: with `B = 500`, a 2_000-byte body gives
+// `ceil(2_000 / 4) == 500 <= 500`, so it was admitted. The retired byte range
+// is therefore `0..=4B`.
+//
+// Restating `b <= 4B` under the canonical estimator `ceil(b / 3)` needs
+// `ceil(4B / 3) <= B'`, so the minimal literal is `ceil(4B / 3)` and its byte
+// range is `0..=3 * B'`. Because `ceil(4B / 3)` is either `4B / 3` (when `B` is
+// a multiple of 3, exact) or one unit above it, the restored range is exactly
+// the retired one, or exactly one byte wider for a rounding remainder. Every
+// constant below is the minimal `ceil(4B / 3)`, and each comment states the
+// arithmetic, so no envelope is tightened and none is widened past the one
+// byte the retired `/4` ratio left unused.
+const CAPSULE_LIMIT: u32 = 667; // B=500: 4B=2_000 bytes; ceil(2_000/3)=667; 3*667=2_001 bytes.
+const MAP_LIMIT: u32 = 800; // B=600: 4B=2_400 bytes; ceil(2_400/3)=800; 3*800=2_400 bytes.
+const CHARTER_LIMIT: u32 = 267; // B=200: 4B=800 bytes; ceil(800/3)=267; 3*267=801 bytes.
 const STALE_PREFIX: &str = "[STALE: changed dependencies: ";
 
 const CAPSULE_HEADERS: &[&str] = &[

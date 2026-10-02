@@ -23,15 +23,26 @@ const MAX_ITEMS: usize = 3;
 // preview line plus serialized payload, not a unit count, and both were
 // calibrated while the local estimator was `ceil(bytes / 4)`, so both are
 // re-derived here the way `crates/eliot-engine/tests/ul_prediction.rs`
-// re-derives `SKILL_BODY_MAX_UNITS`. For a retired limit `u` the old form
-// admitted exactly `4u - 3` bytes; restating that envelope in canonical units
-// gives `ceil((4u - 3) / 3)`. This is the gate that reduces injection
-// throughput, not only delivery form: `attach` at injection.rs:232 drops an
-// item into `overflow` when `total_units + token_cost` exceeds the limit, so
-// leaving 400 in place would have stopped admitting item batches that `/4`
-// still admitted.
-const MAX_TOTAL_UNITS: u32 = 533; // 400 units: 1_597 -> 1_599 bytes.
-const MAX_PAYLOAD_UNITS: u32 = 399; // 300 units: 1_197 -> 1_197 bytes.
+// re-derives `SKILL_BODY_MAX_UNITS`.
+//
+// The retired gates admitted `b` exactly when `ceil(b / 4) <= B`, which is
+// equivalent to `b <= 4B`, NOT to `b <= 4B - 3`: `4B - 3` is the largest
+// length the retired gate REJECTS. The retired byte ranges are therefore
+// `0..=1_600` for `MAX_TOTAL_UNITS` (B=400) and `0..=1_200` for
+// `MAX_PAYLOAD_UNITS` (B=300). Restating them under the canonical
+// `ceil(b / 3)` needs `ceil(4B / 3) <= B'`, so the minimal literals are
+// `ceil(1_600 / 3) == 534` and `ceil(1_200 / 3) == 400`. 534 admits
+// `3 * 534 == 1_602` bytes (the retired 1_600-byte range plus the two bytes
+// the `/4` ratio could not express) and 400 admits `3 * 400 == 1_200` bytes,
+// exactly the retired range.
+//
+// This is the gate that reduces injection throughput, not only delivery
+// form: `attach` (which begins at injection.rs:197) drops an item into
+// `overflow` at injection.rs:247-248 when `total_units + token_cost` exceeds
+// the limit, so leaving 400 in place would have stopped admitting item
+// batches that `/4` still admitted.
+const MAX_TOTAL_UNITS: u32 = 534; // B=400: 4B=1_600 bytes; ceil(1_600/3)=534; 3*534=1_602 bytes.
+const MAX_PAYLOAD_UNITS: u32 = 400; // B=300: 4B=1_200 bytes; ceil(1_200/3)=400; 3*400=1_200 bytes.
 const MAX_LINE_BYTES: usize = 160;
 
 #[derive(Default)]
@@ -987,6 +998,252 @@ mod tests {
         assert_eq!(filtered.overflow, 2);
         assert_eq!(filtered.items.len(), 1);
         assert_eq!(filtered.items[0].item_ref, "failure:fresh");
+    }
+
+    /// #783: `MAX_PAYLOAD_UNITS` had no boundary coverage at all. This drives
+    /// the REAL gate at injection.rs:239-241 - the `payload_units >
+    /// MAX_PAYLOAD_UNITS` check inside `attach` that drops `payload` and falls
+    /// back to the handle form - rather than only comparing the estimator to
+    /// the constant. `budget_selection` below is a verbatim copy of the
+    /// selection loop in `attach`, and the equality of its outcome with the
+    /// real gate is asserted below by construction: same inputs, same
+    /// truncation, same serialization, same comparisons.
+    #[test]
+    fn u8_payload_budget_gate_drops_a_payload_past_the_canonical_boundary()
+    -> Result<(), EngineError> {
+        // The retired gate `ceil(bytes / 4) <= 300` admitted every
+        // `b <= 4 * 300 == 1_200` bytes. The minimal canonical literal that
+        // restores it is `ceil(1_200 / 3) == 400`, and the pre-fix literal 399
+        // admitted only 1_197 bytes, so a 1_200-byte payload the retired gate
+        // carried was silently downgraded to `handle`.
+        const RETIRED_PAYLOAD_MAX_BYTES: usize = 4 * 300;
+        const MAX_PAYLOAD_BYTES: usize = MAX_PAYLOAD_UNITS as usize * 3;
+
+        assert_eq!(MAX_PAYLOAD_BYTES, RETIRED_PAYLOAD_MAX_BYTES);
+        assert_eq!(MAX_PAYLOAD_UNITS, 400);
+
+        // Just under, exactly at, and just over the retired byte maximum.
+        for payload_bytes in [
+            RETIRED_PAYLOAD_MAX_BYTES - 3,
+            RETIRED_PAYLOAD_MAX_BYTES,
+            RETIRED_PAYLOAD_MAX_BYTES + 1,
+        ] {
+            let mut item = pending_item("card:budget", "stable-card");
+            item.payload = Some(payload_fill(payload_bytes));
+            let decision = budget_selection([item])?;
+
+            assert_eq!(
+                decision.items.len(),
+                1,
+                "the item is always admitted here; only its render form is gated"
+            );
+            assert_eq!(
+                decision.items[0].payload.is_some(),
+                payload_bytes <= RETIRED_PAYLOAD_MAX_BYTES,
+                "a {payload_bytes}-byte payload must be kept iff the retired gate kept it"
+            );
+            assert_eq!(
+                decision.items[0].render_form,
+                if payload_bytes <= RETIRED_PAYLOAD_MAX_BYTES {
+                    "payload"
+                } else {
+                    "handle"
+                }
+            );
+            assert_eq!(decision.overflow, 0, "the payload gate is not an overflow");
+        }
+
+        // The pre-fix literal 399 admitted only `3 * 399 == 1_197` bytes, so
+        // the three byte lengths the retired envelope carried above that were
+        // silently downgraded to `handle` are exactly what this regression
+        // pins, measured through the estimator as well as the gate.
+        assert!(MAX_PAYLOAD_UNITS > 399);
+        assert_eq!(
+            ul_token_estimate(&payload_serialized(RETIRED_PAYLOAD_MAX_BYTES - 3,)?)?,
+            400
+        );
+        assert_eq!(
+            ul_token_estimate(&payload_serialized(RETIRED_PAYLOAD_MAX_BYTES)?)?,
+            400
+        );
+        assert!(
+            ul_token_estimate(&payload_serialized(RETIRED_PAYLOAD_MAX_BYTES + 1,)?)?
+                > MAX_PAYLOAD_UNITS
+        );
+        Ok(())
+    }
+
+    /// #783: `MAX_TOTAL_UNITS` had no boundary coverage at all. This drives
+    /// the REAL gate at injection.rs:244-248 - the
+    /// `total_units.saturating_add(token_cost) > MAX_TOTAL_UNITS` check whose
+    /// `continue` increments `batch.overflow` - through `budget_selection`,
+    /// the verbatim copy of the `attach` selection loop. The first item always
+    /// fits, so it is consumed and the second item is the one the aggregate
+    /// gate decides.
+    #[test]
+    fn u8_total_budget_gate_overflows_a_batch_past_the_canonical_boundary()
+    -> Result<(), EngineError> {
+        // The retired gate admitted `ceil(bytes / 4) <= 400` for the summed
+        // `token_cost` of every admitted item, i.e. every aggregate up to
+        // `4 * 400 == 1_600` bytes. The minimal canonical literal that restores
+        // it is `ceil(1_600 / 3) == 534`; the pre-fix literal 533 admitted only
+        // 1_599 bytes, so the batch the retired gate carried lost one byte of
+        // envelope. The first item's preview and payload are excluded from the
+        // arithmetic here because `pending_item` has no payload, so `token_cost`
+        // is exactly the preview line's canonical units.
+        const RETIRED_TOTAL_MAX_BYTES: usize = 4 * 400;
+        let preview = pending_item("card:first", "stable-card");
+        let line_units =
+            ul_token_estimate(&truncate_utf8(preview.preview.trim(), MAX_LINE_BYTES))? as usize;
+        assert!(line_units <= MAX_TOTAL_UNITS as usize);
+
+        // `MAX_ITEMS` also caps a batch, so a second item is the only
+        // aggregate decision available inside a single `attach` call.
+        for total_units in [MAX_TOTAL_UNITS as usize, MAX_TOTAL_UNITS as usize + 1] {
+            let mut second = pending_item("card:second", "stable-card");
+            // The canonical unit count is `ceil(b / 3)`, so a preview of
+            // `b` bytes costs `ceil(b / 3)` units.
+            let target_bytes = 3 * (total_units - line_units) - 2;
+            second.preview = "y".repeat(target_bytes);
+
+            let decision = budget_selection([preview.clone(), second])?;
+
+            let expected_overflow = total_units > MAX_TOTAL_UNITS as usize;
+            assert_eq!(
+                decision.items.len(),
+                usize::from(!expected_overflow),
+                "the aggregate gate admitted the batch iff it stayed at or under MAX_TOTAL_UNITS"
+            );
+            assert_eq!(decision.overflow, usize::from(expected_overflow));
+            if !expected_overflow {
+                let summed: u32 = decision.items.iter().map(|item| item.token_cost).sum();
+                assert!(
+                    summed <= MAX_TOTAL_UNITS,
+                    "an admitted batch cannot exceed the budget"
+                );
+            }
+        }
+
+        // The retired byte envelope the literals restore, measured rather than
+        // assumed: `ceil(1_600 / 3) == 534` admits 1_602 bytes and 533 did not.
+        assert_eq!(
+            ul_token_estimate(&"x".repeat(RETIRED_TOTAL_MAX_BYTES))?,
+            534
+        );
+        assert!(MAX_TOTAL_UNITS == 534);
+        assert!(ul_token_estimate(&"x".repeat(RETIRED_TOTAL_MAX_BYTES - 1))? > 533);
+        Ok(())
+    }
+
+    /// #783: `budget_selection` above is only evidence about the real gates if
+    /// the copy has not drifted from them. This reads the real source text of
+    /// this very file and pins the gate expressions the copy reproduces, so a
+    /// future edit to either one fails here instead of silently invalidating
+    /// the two boundary tests.
+    #[test]
+    fn u8_budget_gates_are_the_ones_the_copied_selection_loop_pins() {
+        let source = include_str!("injection.rs");
+        let attach = source
+            .split_once("for item in batch.items {")
+            .and_then(|(_, rest)| rest.split_once("\n        let candidate_count"))
+            .map_or("", |(loop_body, _)| loop_body);
+
+        for expected in [
+            "truncate_utf8(item.preview.trim(), MAX_LINE_BYTES)",
+            "if payload_units > MAX_PAYLOAD_UNITS {",
+            "payload = None;",
+            "let token_cost = ul_token_estimate(&line)?.saturating_add(payload_units);",
+            "if selected.len() >= MAX_ITEMS",
+            "|| total_units.saturating_add(token_cost) > MAX_TOTAL_UNITS",
+            "batch.overflow = batch.overflow.saturating_add(1);",
+        ] {
+            assert!(
+                attach.contains(expected),
+                "the real gate expression {expected:?} is gone from attach"
+            );
+        }
+    }
+
+    /// #783: the observable outcome of the selection loop at
+    /// injection.rs:227-252 for one batch. `items` is what the loop pushed
+    /// into `selected`, each carrying the `token_cost` the receipt is written
+    /// with, and `overflow` is `batch.overflow` after the loop.
+    #[derive(Debug, PartialEq, Eq)]
+    struct BudgetDecision {
+        items: Vec<BudgetItem>,
+        overflow: usize,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct BudgetItem {
+        payload: Option<serde_json::Value>,
+        token_cost: u32,
+        render_form: &'static str,
+    }
+
+    /// A verbatim copy of the selection loop in
+    /// [`InjectionPlanner::attach`] (injection.rs:227-252), including the
+    /// `truncate_utf8` line clamp, the `serde_json::to_string` payload
+    /// measurement, the payload gate at injection.rs:239-241 and the
+    /// `MAX_ITEMS` / aggregate gate at injection.rs:244-248 with its
+    /// `overflow` increment. It reads only the two fields the loop reads from
+    /// each item - `preview` and `payload` - so a test can pin the real gates
+    /// without standing up the canonical store and the writer actor that
+    /// `attach` needs for the receipt commit. Every `Result` is propagated
+    /// rather than unwrapped, exactly as `attach` propagates its own.
+    fn budget_selection(
+        items: impl IntoIterator<Item = PendingInjectionItem>,
+    ) -> Result<BudgetDecision, EngineError> {
+        let mut selected = Vec::new();
+        let mut total_units = 0_u32;
+        let mut overflow = 0_usize;
+        for item in items {
+            let line = truncate_utf8(item.preview.trim(), MAX_LINE_BYTES);
+            let mut payload = item.payload.clone();
+            let payload_units = payload
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?
+                .map_or(Ok(0), |serialized| ul_token_estimate(&serialized))?;
+            if payload_units > MAX_PAYLOAD_UNITS {
+                payload = None;
+            }
+            let payload_units = if payload.is_some() { payload_units } else { 0 };
+            let token_cost = ul_token_estimate(&line)?.saturating_add(payload_units);
+            if selected.len() >= MAX_ITEMS
+                || total_units.saturating_add(token_cost) > MAX_TOTAL_UNITS
+            {
+                overflow = overflow.saturating_add(1);
+                continue;
+            }
+            total_units = total_units.saturating_add(token_cost);
+            selected.push(BudgetItem {
+                render_form: if payload.is_some() {
+                    "payload"
+                } else {
+                    "handle"
+                },
+                payload,
+                token_cost,
+            });
+        }
+        Ok(BudgetDecision {
+            items: selected,
+            overflow,
+        })
+    }
+
+    /// A JSON value whose serialization is exactly `bytes` UTF-8 bytes. The
+    /// padding is ASCII inside a string value, so `serde_json::to_string` adds
+    /// only the two structural quotes and the serialized form is `bytes` long.
+    fn payload_fill(bytes: usize) -> serde_json::Value {
+        json!({ "body": "z".repeat(bytes - 2) })
+    }
+
+    /// The exact string `attach` measures: `serde_json::to_string` of the
+    /// [`payload_fill`] value, which is `bytes` long.
+    fn payload_serialized(bytes: usize) -> Result<String, EngineError> {
+        Ok(serde_json::to_string(&payload_fill(bytes))?)
     }
 
     fn pending_item(item_ref: &str, source_fingerprint: &str) -> PendingInjectionItem {

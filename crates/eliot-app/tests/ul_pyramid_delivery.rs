@@ -515,13 +515,15 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
             // #783: `budget_limit` is now compared against a canonical
             // source-token-unit estimate, so this fixture carries the
             // re-derived capsule limit rather than the retired `/4` literal.
-            // The production value is private to the engine crate; `666`
-            // admits `3 * 666 == 1998` bytes, which is the envelope the
-            // retired `ceil(bytes / 4) <= 500` described. The seed is
-            // deliberately loose: the fixture only has to admit the seeded
-            // body, and the delivery gate these fixtures exercise is the
-            // packet pyramid budget, not this build row.
-            666,
+            // The production value is private to the engine crate; it is the
+            // minimal `ceil(4 * 500 / 3) == 667`, and the retired gate
+            // `ceil(bytes / 4) <= 500` admitted every `b <= 4 * 500 == 2_000`
+            // bytes while 667 admits `3 * 667 == 2_001` bytes, so the retired
+            // byte range is restored. The seed is deliberately loose: the
+            // fixture only has to admit the seeded body, and the delivery gate
+            // these fixtures exercise is the packet pyramid budget, not this
+            // build row.
+            667,
             ul_token_estimate(&capsule.body_md)?,
         );
         prepared.seed(&ul_command(
@@ -556,10 +558,11 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
         PyramidTargetKind::SystemMap,
         map.map_id.clone(),
         // #783: the map limit is re-derived for canonical units exactly as
-        // the capsule fixture above; `799` admits `3 * 799 == 2397` bytes,
-        // which is the envelope the retired `ceil(bytes / 4) <= 600`
-        // described.
-        799,
+        // the capsule fixture above; it is the minimal `ceil(4 * 600 / 3) ==
+        // 800`, the retired gate `ceil(bytes / 4) <= 600` admitted every
+        // `b <= 4 * 600 == 2_400` bytes, and 800 admits `3 * 800 == 2_400`
+        // bytes, so the retired byte range is restored exactly.
+        800,
         ul_token_estimate(&map.body_md)?,
     );
     prepared.seed(&ul_command(
@@ -588,9 +591,11 @@ fn seed_pyramid(prepared: &mut PreparedHarness, project_id: ProjectId) -> TestRe
         PyramidTargetKind::ProjectCharter,
         charter.charter_id.clone(),
         // #783: the charter limit is re-derived for canonical units exactly as
-        // the other two above; `266` admits `3 * 266 == 798` bytes, which is
-        // the envelope the retired `ceil(bytes / 4) <= 200` described.
-        266,
+        // the other two above; it is the minimal `ceil(4 * 200 / 3) == 267`,
+        // the retired gate `ceil(bytes / 4) <= 200` admitted every
+        // `b <= 4 * 200 == 800` bytes, and 267 admits `3 * 267 == 801` bytes,
+        // so the retired byte range is restored in full.
+        267,
         ul_token_estimate(&charter.body_md)?,
     );
     prepared.seed(&ul_command(

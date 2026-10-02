@@ -19,15 +19,19 @@ use std::sync::Arc;
 // #783: the budget is now counted in canonical source token units, so the
 // old `/4` number no longer describes the same envelope. The contract this
 // gate protects is a BYTE envelope on the rendered capsule, not a unit
-// count: the retired `ceil(bytes / 4) <= 1_500` admitted exactly
-// `4 * 1_500 - 3 == 5_997` bytes, and the canonical form left in place
-// admitted only `3 * 1_500 == 4_500` bytes, so every capsule of 4_501-5_997
-// bytes was silently degraded to `handle_only` at ul.rs:333 with no
-// threshold change and no test noticing. Restating that same envelope in
-// canonical units gives `ceil(5_997 / 3) == 1_999`, and 1_999 admits
-// `3 * 1_999 == 5_997` bytes exactly, so the byte range is restored and not
-// widened. The literal was re-derived, not relaxed.
-const PACKET_PYRAMID_BUDGET: u32 = 1_999;
+// count, and it was calibrated while the estimator was `ceil(bytes / 4)`.
+// That gate admitted `b` exactly when `ceil(b / 4) <= 1_500`, which is
+// equivalent to `b <= 6_000` and NOT to `b <= 6_000 - 3`: a 6_000-byte
+// capsule gives `ceil(6_000 / 4) == 1_500 <= 1_500` and was admitted. The
+// canonical form left in place at the time admitted only
+// `3 * 1_500 == 4_500` bytes, so every capsule of 4_501..=6_000 bytes was
+// silently degraded to `handle_only` at ul.rs:345 with no threshold change
+// and no test noticing. Restating the retired range in canonical units
+// needs `ceil(6_000 / 3) == 2_000`, and 2_000 admits
+// `3 * 2_000 == 6_000` bytes exactly, so the retired byte range is restored
+// and not widened. The literal is the minimal `ceil(4B / 3)`, re-derived
+// rather than relaxed.
+const PACKET_PYRAMID_BUDGET: u32 = 2_000;
 const UL_FALLBACK_MATCH_TOKEN_LIMIT: usize = 12;
 
 pub(super) struct PyramidPacketEnrichment {
@@ -594,8 +598,8 @@ mod tests {
     /// byte envelope the retired `/4` form admitted, so this pins both ends of
     /// that envelope rather than trusting the arithmetic in the comment. The
     /// canonical estimator is exercised directly on byte lengths, so the
-    /// `4_501..=5_997` range that used to be degraded to `handle_only` at
-    /// `ul.rs:333` is proven to fit again, and `5_998` is proven not to.
+    /// `4_501..=6_000` range that used to be degraded to `handle_only` at
+    /// `ul.rs:345` is proven to fit again, and `6_001` is proven not to.
     #[test]
     fn packet_pyramid_budget_admits_the_retired_byte_envelope() {
         assert!(
@@ -603,11 +607,11 @@ mod tests {
             "the envelope the retired form already admitted must still fit"
         );
         assert!(
-            ul_token_estimate(&"x".repeat(5_997)).expect("measurable") <= PACKET_PYRAMID_BUDGET,
-            "5_997 bytes is the exact old maximum and must fit again"
+            ul_token_estimate(&"x".repeat(6_000)).expect("measurable") <= PACKET_PYRAMID_BUDGET,
+            "6_000 bytes is the retired maximum, since ceil(6_000 / 4) == 1_500"
         );
         assert!(
-            ul_token_estimate(&"x".repeat(5_998)).expect("measurable") > PACKET_PYRAMID_BUDGET,
+            ul_token_estimate(&"x".repeat(6_001)).expect("measurable") > PACKET_PYRAMID_BUDGET,
             "the envelope must not be widened past the retired maximum"
         );
     }
