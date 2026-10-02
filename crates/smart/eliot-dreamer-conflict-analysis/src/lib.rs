@@ -68,18 +68,25 @@
 //! owners either name a decision owner or they do not, and where they do not,
 //! the recommendation stays unnamed instead of adopting a kind-derived default.
 //!
-//! A fourth rule bounds the position denominator itself. Fewer than
-//! [`MINIMUM_CONFLICT_POSITIONS`] positions is not a conflict, and a position
-//! the set declares as an unresolved owner but does not supply has left the
-//! denominator rather than been decided in it, so it is refused instead of
-//! counted away. Both legs are read from the set's own declaration: a bare count
-//! of the supplied `positions` would let a caller drop a declared member and
-//! receive a clean analysis of a narrower conflict than the one that exists.
-//! There is no typed missing-rival exception here yet, and the reason is
-//! structural rather than an oversight: a `ConflictPosition` carries no
-//! availability axis, and the crate's one omission type,
-//! [`RivalDenominator`], is scoped to a causal claim's rival/confounder models
-//! and says nothing about how many conflict positions exist.
+//! A fourth rule bounds the position denominator itself. The denominator is
+//! read from the set's own declaration, not counted off the supplied
+//! `positions` vector: a bare count would let a caller drop a declared member
+//! and receive a clean analysis of a narrower conflict than the one that exists.
+//! Fewer than [`MINIMUM_CONFLICT_POSITIONS`] members is not a conflict, and a
+//! member the set declares as an unresolved owner but supplies no position for
+//! has left the denominator rather than been decided in it, so it is refused
+//! unless the set also records it as a
+//! [`MissingConflictPosition`](eliot_epistemic_contracts::MissingConflictPosition):
+//! the owning contract's typed declaration of a declared-but-absent member,
+//! carrying the [`MemberDisposition`](eliot_epistemic_contracts::MemberDisposition)
+//! its owner issued for it. Qualification is that disposition and nothing else,
+//! so the exception is not a flag a caller flips: an open outcome keeps the
+//! absent member in the denominator as a named gap and admits a one-position
+//! set whose second member is genuinely still open, while a closed outcome —
+//! observed presence or authoritative absence — is refused by the contract and
+//! refused again here. Every admitted absent member is counted by
+//! [`ConflictSet::position_denominator`], the same width this cell bounds and
+//! then names in its coverage note, so the member can never be counted away.
 //!
 //! Absence note: this file contains no persistence, identifier allocation,
 //! graph traversal beyond the bounded member lists, source acquisition, probe
@@ -221,7 +228,8 @@
 //!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
-//! empty and single position are not conflicts, 673/5 duplicate and changed
+//! empty and single position are not conflicts while a single position whose
+//! second member is declared but still open is, 673/5 duplicate and changed
 //! identities fail closed, 673/6 complete/partial/stale/blocked/withheld
 //! denominators stay explicit, 673/7 exact replay preserves digest while
 //! changed content moves it, 673/8 no model, tool, store, peer, Concilium,
@@ -314,11 +322,14 @@ pub const MAX_POSITIONS: usize = 32;
 /// Minimum positions admitted in one analysis.
 ///
 /// I13.1 and I13.2 type a conflict as a disagreement between distinct claims,
-/// so a set of zero or one position holds no disagreement to analyze. This is
-/// the same minimum the canonical `ConflictSet` contract enforces when the set
-/// is constructed; it is named here because the denominator this cell actually
+/// so a set of zero or one MEMBER holds no disagreement to analyze. This is the
+/// same minimum the canonical `ConflictSet` contract enforces when the set is
+/// constructed; it is named here because the denominator this cell actually
 /// reads is the one it restates, and because a rule that can only be found by
-/// re-reading a bare literal is a rule nobody can check.
+/// re-reading a bare literal is a rule nobody can check. It counts DECLARED
+/// members, so a carried position and a still-open declared-but-absent member
+/// each count once; for a set that declares no absent member this is exactly the
+/// carried-position count and the meaning of the constant is unchanged.
 pub const MINIMUM_CONFLICT_POSITIONS: usize = 2;
 /// Maximum sources admitted in one analysis.
 pub const MAX_SOURCES: usize = 64;
@@ -3187,31 +3198,42 @@ fn validate_supplement_shapes(
 /// unresolved owner, and the analysis would then report a clean two-sided
 /// conflict over a denominator that is really three members wide. The set's own
 /// `unresolved_owners` declaration is what makes that suppression visible, so
-/// every declared member must be present as a position and the refused member is
-/// named rather than counted away.
+/// every declared member is either carried as a position or recorded as a
+/// [`MissingConflictPosition`](eliot_epistemic_contracts::MissingConflictPosition),
+/// and the refused member is named rather than counted away.
 ///
-/// A declared member with no position is refused here rather than preserved as
-/// a withheld or unavailable disposition. [`PositionDispositionKind::Withheld`]
-/// and [`PositionDispositionKind::Unavailable`] name that outcome, but this cell
-/// has no typed INPUT that can carry one: a `ConflictPosition` is stance text
-/// plus its assumptions, counters, and minority flag, with no availability axis,
-/// and the closest existing omission type, [`RivalDenominator`], is scoped to a
-/// causal claim's rival/confounder models and says nothing about how many
-/// conflict positions exist. Admitting the exception on a caller-set flag would
-/// hand back exactly the power this check removes, so the refusal stands until
-/// a typed missing-position declaration exists to carry it.
+/// A declared member with no position and no such record is refused here rather
+/// than preserved as a withheld or unavailable disposition.
+/// [`PositionDispositionKind::Withheld`] and
+/// [`PositionDispositionKind::Unavailable`] name that outcome, and the typed
+/// INPUT that carries one now exists: the owning contract's `MissingConflictPosition`,
+/// which names the absent owner and the
+/// [`MemberDisposition`](eliot_epistemic_contracts::MemberDisposition) its owner
+/// issued for it. Qualification is that disposition and nothing else —
+/// `is_terminal()` closes a member on observed presence or authoritative
+/// absence — so admitting the exception here hands back no power the check
+/// removes: a closed outcome is refused, the contract independently refuses it
+/// and refuses an absent member the set's own residue does not name, and every
+/// admitted member is counted in [`ConflictSet::position_denominator`], which is
+/// the same width this function bounds. The declared-but-absent leg is therefore
+/// reconciled rather than dropped: the same owner that was refused outright is
+/// now admitted only when the set itself recorded why it is still open, and it
+/// stays in the reported denominator the whole time.
 fn validate_conflict_denominators(
     conflict_set: &ConflictSet,
     policy: &ConflictAnalysisPolicy,
 ) -> Result<(), ConflictAnalysisError> {
     check_bounded_text(&conflict_set.conflict_id, "conflict.id", MAX_SCOPE_BYTES)?;
     check_bounded_text(&conflict_set.scope, "conflict.scope", MAX_SCOPE_BYTES)?;
+    // The bound reads the DECLARED denominator rather than the carried
+    // positions, so a member moved out of `positions` and into a
+    // missing-position record cannot buy extra width past the policy ceiling.
     bound_list_length(
         "positions",
-        conflict_set.positions.len(),
+        conflict_set.position_denominator(),
         policy.max_positions.min(MAX_POSITIONS),
     )?;
-    if conflict_set.positions.len() < MINIMUM_CONFLICT_POSITIONS {
+    if conflict_set.position_denominator() < MINIMUM_CONFLICT_POSITIONS {
         return Err(ConflictAnalysisError::Denominator {
             detail: format!("conflict requires at least {MINIMUM_CONFLICT_POSITIONS} positions"),
         });
@@ -3239,20 +3261,77 @@ fn validate_conflict_denominators(
             detail: "duplicate position source identity".to_owned(),
         });
     }
+    let missing_sources = validate_declared_absent_members(conflict_set, &seen_sources)?;
     for owner in &conflict_set.unresolved_owners {
-        if !seen_sources
+        if seen_sources
             .iter()
             .any(|source| source.as_str() == owner.as_str())
         {
+            continue;
+        }
+        if missing_sources
+            .iter()
+            .any(|source| source.as_str() == owner.as_str())
+        {
+            continue;
+        }
+        return Err(ConflictAnalysisError::Denominator {
+            detail: format!(
+                "a declared unresolved owner has no position and would leave the denominator: {}",
+                redact(owner.as_str())
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validates each declared-but-absent member and returns the handles it names.
+///
+/// This is the leg that decides admission, so it re-reads the owner's own
+/// recorded outcome rather than trusting the contract that stored it: a closed
+/// outcome means the member is not a live rival of this conflict. It also
+/// refuses a member the set already carries and a member named twice, because
+/// either would let one member occupy two slots of the denominator.
+fn validate_declared_absent_members(
+    conflict_set: &ConflictSet,
+    carried: &[String],
+) -> Result<Vec<String>, ConflictAnalysisError> {
+    let mut absent: Vec<String> = Vec::with_capacity(conflict_set.missing_positions().len());
+    for missing in conflict_set.missing_positions() {
+        let source_text = missing.owner.as_str();
+        check_handle(source_text, "conflict.missing_position.owner")?;
+        check_bounded_text(
+            &missing.reason,
+            "conflict.missing_position.reason",
+            MAX_NOTE_BYTES,
+        )?;
+        if !missing.is_in_denominator() {
             return Err(ConflictAnalysisError::Denominator {
                 detail: format!(
-                    "a declared unresolved owner has no position and would leave the denominator: {}",
-                    redact(owner.as_str())
+                    "a declared missing position is closed by its own disposition and is not in the denominator: {}",
+                    redact(source_text)
                 ),
             });
         }
+        if carried.iter().any(|source| source.as_str() == source_text) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "a declared missing position is already carried as a position: {}",
+                    redact(source_text)
+                ),
+            });
+        }
+        if absent.iter().any(|source| source.as_str() == source_text) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "a declared missing position is named more than once: {}",
+                    redact(source_text)
+                ),
+            });
+        }
+        absent.push(source_text.to_owned());
     }
-    Ok(())
+    Ok(absent)
 }
 
 /// Returns the sorted source handles of every position in the set.
@@ -5294,13 +5373,24 @@ fn check_preservation(
     let coverage_passed = positions.len() == conflict_set.positions.len()
         && supplements.objections.len() <= MAX_OBJECTIONS
         && supplements.supplied_probes.len() <= MAX_PROBES;
-    let coverage_note = if coverage_passed {
+    let coverage_note = if !coverage_passed {
+        "coverage shortfall: expected members missing".to_owned()
+    } else if conflict_set.missing_positions().is_empty() {
         format!(
             "every expected position, objection, and source retained or explicitly unavailable ({} positions)",
             positions.len()
         )
     } else {
-        "coverage shortfall: expected members missing".to_owned()
+        // A declared-but-absent member is explicitly unavailable rather than
+        // missing, so coverage still passes — but the note names the declared
+        // width, because reporting only the carried count here would claim a
+        // completeness this analysis does not have.
+        format!(
+            "every expected position, objection, and source retained or explicitly unavailable ({} of {} declared positions; {} declared but absent)",
+            positions.len(),
+            conflict_set.position_denominator(),
+            conflict_set.missing_positions().len(),
+        )
     };
     let faithfulness_passed = !positions.is_empty()
         && !claims_count_is_truth(
@@ -6017,12 +6107,31 @@ pub fn analyze_conflict(
     let unrecommendable_probes = recommended.is_empty() && !supplements.supplied_probes.is_empty();
     let undecided_without_unknown = conflict_set.acceptability == ArgumentAcceptability::Undecided
         && supplements.unknowns.is_empty();
-    let incompleteness = if has_unknown_lineage || unrecommendable_probes {
-        Some("incomplete coverage: named open lineage or probe gaps remain")
-    } else if undecided_without_unknown {
-        Some("incomplete coverage: undecided acceptability and no load-bearing unknown is supplied")
+    // A declared member of the denominator that carries no position is the most
+    // specific gap there is, so it is named first and it is named with the exact
+    // declared width. Reporting this set `Complete` would be Algorithm 2's "a
+    // missing member disappearing from a complete claim": the set is a real
+    // conflict over two declared members and only one of them was read here.
+    let incompleteness: Option<String> = if conflict_set.missing_positions().is_empty() {
+        if has_unknown_lineage || unrecommendable_probes {
+            Some(String::from(
+                "incomplete coverage: named open lineage or probe gaps remain",
+            ))
+        } else if undecided_without_unknown {
+            Some(String::from(
+                "incomplete coverage: undecided acceptability and no load-bearing unknown is supplied",
+            ))
+        } else {
+            None
+        }
     } else {
-        None
+        Some(format!(
+            "incomplete coverage: {} of {} declared positions are declared but absent, so the analyzed denominator is {} of {}",
+            conflict_set.missing_positions().len(),
+            conflict_set.positions.len() + conflict_set.missing_positions().len(),
+            conflict_set.positions.len(),
+            conflict_set.position_denominator(),
+        ))
     };
     if let Some(note) = incompleteness {
         // With no partial path admitted, an incomplete analysis is withheld
@@ -6045,7 +6154,7 @@ pub fn analyze_conflict(
             &risks,
             &recommended,
             &owner,
-            note,
+            &note,
         );
     }
     emit_candidate(
@@ -6101,8 +6210,8 @@ mod tests {
         curation::{ProcedurePayload, TargetEvidence},
     };
     use eliot_epistemic_contracts::{
-        ConflictPosition, ConflictSetParams, ContractError, LineageRootId, Precision,
-        ValidityBounds,
+        ConflictPosition, ConflictSetParams, ContractError, LineageRootId, MemberDisposition,
+        MissingConflictPosition, Precision, ValidityBounds,
     };
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
@@ -6703,6 +6812,164 @@ mod tests {
                 if field == "conflict.positions"
             ),
             "one position without a qualified missing-rival denominator is not a conflict"
+        );
+
+        // Leg "with": the SAME one position plus a declared-but-absent rival
+        // whose owner-issued outcome is still open. The set's own declaration is
+        // now two members wide, so it constructs, the absent member is counted
+        // by the same denominator this cell bounds, and the analyzer produces a
+        // real candidate over the one carried position with the gap named.
+        let qualified = ConflictSet::new_with_missing_positions(
+            ConflictSetParams {
+                conflict_id: "conflict-missing-rival".to_owned(),
+                kind: ConflictKind::Epistemic,
+                scope: "scope-1".to_owned(),
+                task_id: None,
+                positions: vec![test_position("source-a", "cache helps tail latency", false)],
+                evidence_refs: BTreeSet::new(),
+                owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                common_lineage: BTreeSet::new(),
+                resolved_parts: BTreeSet::new(),
+                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+                unresolved_owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                acceptability: ArgumentAcceptability::Contested,
+                defeated_refs: BTreeSet::new(),
+                probe: None,
+                decision_owner: SourceId::new("source-a").expect("valid source"),
+                affected_actions: vec!["decide-cache".to_owned()],
+                lifecycle: ConflictLifecycle::Open,
+                receipt_digest: receipt.bundle_digest.clone(),
+            },
+            vec![
+                MissingConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    MemberDisposition::Unavailable,
+                    "the rival's owner has not released its stance yet",
+                )
+                .expect("valid missing position"),
+            ],
+        )
+        .expect("a declared-but-absent open rival is a two-member denominator");
+        assert_eq!(
+            qualified.position_denominator(),
+            2,
+            "the absent member is counted, never counted away"
+        );
+        qualified
+            .validate()
+            .expect("the qualified set carries a matching frozen digest");
+        let mut supplements = test_supplements();
+        // The absent member carries no position, so supplements naming it would
+        // describe a member this denominator does not carry.
+        supplements
+            .lineage
+            .retain(|entry| entry.source_handle == "source-a");
+        supplements
+            .objections
+            .retain(|objection| objection.target_source == "source-a");
+        let mut policy = test_policy();
+        policy.allow_partial = true;
+        let candidate = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &qualified,
+            &supplements,
+            &policy,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("qualified missing-rival analysis: {err:?}"),
+        };
+        assert_eq!(
+            candidate.outcome,
+            ConflictOutcome::Partial,
+            "an admitted absent member keeps the analysis incomplete, never complete"
+        );
+        assert_eq!(candidate.positions.len(), 1);
+        assert_eq!(candidate.positions[0].source_handle, "source-a");
+        assert!(
+            candidate.note.contains("1 of 2 declared positions"),
+            "the note reports the exact declared denominator: {}",
+            candidate.note
+        );
+        assert!(
+            candidate.resolution_status.is_none(),
+            "an analyzed conflict set is still unresolved"
+        );
+        candidate
+            .preservation
+            .overall()
+            .expect("every preservation dimension still holds with the gap named");
+        // The same set under a stricter emission policy is withheld, never
+        // promoted: the outcome is read from the gap, not from the permission.
+        let mut strict = test_policy();
+        strict.allow_partial = false;
+        let withheld = match analyze_conflict(
+            &test_item(),
+            &test_draft(),
+            &test_grounded(),
+            &qualified,
+            &supplements,
+            &strict,
+        ) {
+            Ok(candidate) => candidate,
+            Err(err) => panic!("qualified missing-rival analysis: {err:?}"),
+        };
+        assert_eq!(withheld.outcome, ConflictOutcome::Abstention);
+
+        // Refusal on the new declaration path: the absent member's own
+        // owner-issued outcome CLOSED the question, so it is not a rival of this
+        // conflict and cannot widen the denominator. This is what makes the
+        // qualifier a disposition and not a flag.
+        let closed = ConflictSet::new_with_missing_positions(
+            ConflictSetParams {
+                conflict_id: "conflict-missing-rival-closed".to_owned(),
+                kind: ConflictKind::Epistemic,
+                scope: "scope-1".to_owned(),
+                task_id: None,
+                positions: vec![test_position("source-a", "cache helps tail latency", false)],
+                evidence_refs: BTreeSet::new(),
+                owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                common_lineage: BTreeSet::new(),
+                resolved_parts: BTreeSet::new(),
+                unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+                unresolved_owners: BTreeSet::from([
+                    SourceId::new("source-a").expect("valid source"),
+                    SourceId::new("source-b").expect("valid source"),
+                ]),
+                acceptability: ArgumentAcceptability::Contested,
+                defeated_refs: BTreeSet::new(),
+                probe: None,
+                decision_owner: SourceId::new("source-a").expect("valid source"),
+                affected_actions: vec!["decide-cache".to_owned()],
+                lifecycle: ConflictLifecycle::Open,
+                receipt_digest: receipt.bundle_digest.clone(),
+            },
+            vec![
+                MissingConflictPosition::new(
+                    SourceId::new("source-b").expect("valid source"),
+                    MemberDisposition::AuthoritativeAbsence,
+                    "the rival's owner states no such position exists",
+                )
+                .expect("valid missing position"),
+            ],
+        );
+        assert!(
+            matches!(
+                closed,
+                Err(ContractError::ImpossibleCombination { field })
+                if field == "conflict.missing_positions"
+            ),
+            "a closed outcome is not a live rival and cannot admit a one-position set"
         );
     }
 

@@ -71,7 +71,7 @@ pub use claim_map::{
 };
 pub use conflict::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictPosition, ConflictSet,
-    ConflictSetParams,
+    ConflictSetParams, MissingConflictPosition,
 };
 pub use contribution::ProviderContribution;
 pub use coverage::{

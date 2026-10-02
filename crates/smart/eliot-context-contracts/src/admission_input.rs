@@ -975,6 +975,37 @@ impl AdmissionResult {
             return Err(ContextError::MissingFloor);
         }
         admitted.validate()?;
+        // #1724 A2 — the receipt's own recipe identity, bound to THIS admission.
+        //
+        // `ContextEconomyReceipt::validate` proves only that `recipe_digest` and
+        // `policy_sha256` are well-formed digests and that the receipt hashes to
+        // its own `receipt_digest`, and `AdmittedContextSet::validate` proves only
+        // that the receipt accounts for the admitted membership. Neither compares
+        // the receipt to the recipe instance this admission ran under, so a receipt
+        // naming a different — but independently valid, correctly re-sealed —
+        // recipe instance or approved policy revision was accepted here. The
+        // envelope's own `recipe_digest` was compared with
+        // `input.recipe.recipe_sha256` above, which binds the envelope and left
+        // the receipt it carries unbound.
+        //
+        // Both sides are ORIGINAL RECORDED values, so no digest is recomputed to
+        // stand in for either record: `input.recipe.recipe_sha256` and
+        // `input.recipe.decision.policy_sha256` are what the recipe instance
+        // recorded, and that instance's own `ContextRecipe::validate` is what
+        // re-derives them (run by the input owner). The `policy_sha256` half is
+        // the same value `ContextRecipePolicy::binds_recipe` compares against an
+        // approved revision's own `policy_sha256`; resolution of that digest to
+        // immutable approved content is that owner record's own `validate`, not a
+        // second recomputation here.
+        //
+        // The refusal is `ContextError::IdentityConflict`, the same typed failure
+        // the neighbouring identity comparisons above raise, because a receipt
+        // issued under another recipe identity is exactly that.
+        if admitted.economy.recipe_digest != input.recipe.recipe_sha256
+            || admitted.economy.policy_sha256 != input.recipe.decision.policy_sha256
+        {
+            return Err(ContextError::IdentityConflict);
+        }
         if admitted.binding != self.binding
             || admitted.floor != input.floor.floor
             || self.evidence.economy.as_ref() != Some(&admitted.economy)
