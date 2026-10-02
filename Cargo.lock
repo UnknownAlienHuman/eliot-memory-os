@@ -3290,6 +3290,7 @@ dependencies = [
  "eliot-protocol",
  "eliot-receipts",
  "eliot-store-api",
+ "eliot-types",
  "futures-util",
  "schemars",
  "secrecy",
