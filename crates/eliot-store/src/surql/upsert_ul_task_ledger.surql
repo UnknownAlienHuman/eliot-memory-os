@@ -43,7 +43,16 @@ LET $ledger = UPSERT ONLY $record_id CONTENT {
   injected_tokens: $injected_tokens,
   read_tool_input_bytes: $read_tool_input_bytes,
   read_tool_output_bytes: $read_tool_output_bytes,
-  exploration_tokens: ($read_tool_input_bytes + $read_tool_output_bytes + 3) / 4,
+  -- Canonical #704 `STU(bytes) = ceil(bytes / 3)`, measured by the engine from
+  -- the observed read-tool bytes and carried in on `$delta`. The STU ratio
+  -- lives only in #704's owner `stu_for_bytes`, reached through
+  -- `eliot_engine::ul::ul_token_estimate_for_bytes`; this clause accumulates
+  -- that already-computed value and never divides bytes. It used to recompute
+  -- it here as `(bytes + 3) / 4`, a second byte-to-token ratio whose smaller
+  -- value understated exploration cost and overwrote the canonical value on the
+  -- way in (#783).
+  exploration_tokens: (IF $existing = NONE { 0 } ELSE { $existing.exploration_tokens ?? 0 })
+    + $delta.exploration_tokens,
   matched_baseline_tokens: $matched_baseline_tokens,
   net_token_delta: <int> $injected_tokens - <int> $matched_baseline_tokens,
   expanded_injected_handles: (
