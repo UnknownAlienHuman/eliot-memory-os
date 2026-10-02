@@ -34,6 +34,25 @@
 //! declarations, and severity is the existing
 //! [`AuditEventKind::assurance_class`] I16.9 assurance class. This module
 //! therefore adds no second lineage, fence, severity, or lifecycle owner.
+//!
+//! The brief is also the reader of the replayable trace context. I16.7 joins
+//! "exact LogWindowRef/evidence handles" and "unknowns and observation gaps",
+//! and I16.12 requires a replayable trace to carry the action contract, State
+//! Fence, principal/Session, lease, requested and actual route, call
+//! input/output handles, receipts, finish decision, and "missing parts
+//! explicitly listed". Those classes already have one durable owner: the sealed
+//! [`TraceManifest`] on the same audit chain. [`compile_diagnostic_brief`]
+//! replays that body with
+//! [`TraceManifest::find_sealed`](crate::trace_manifest::TraceManifest::find_sealed)
+//! and serves it whole, so a brief names the exact contract, fence,
+//! caller/session, lease, routes, handles, receipt, and finish decision of the
+//! operation the condition belongs to. The manifest's own completion gate
+//! decides servability; a body that withholds a required part is served as the
+//! degraded record it is, and a self-contradicting one is served as nothing, so
+//! the brief reports a gap rather than an unqualified trace (I16.12: "Missing
+//! trace does not invent failure or success; it limits replay and may force
+//! `DEGRADED_NO_PROOF`"). No digest, schema, or completion rule is
+//! re-created here: the reader reads, and reports what the record says.
 
 #![forbid(unsafe_code)]
 
@@ -43,6 +62,7 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
 use super::kernel_audit::{AuditAssuranceClass, AuditEventKind, AuditRecord};
+use crate::trace_manifest::TraceManifest;
 
 /// I16.9 redaction status of one bounded operational log window.
 ///
@@ -455,6 +475,11 @@ pub enum ObservationGapCode {
     /// No prior repair or renewal record is present in the window.
     #[serde(rename = "PRIOR_REPAIR_NOT_IN_WINDOW")]
     PriorRepairNotInWindow,
+    /// The operation the condition belongs to has no sealed trace manifest the
+    /// replay read may serve, so the I16.12 classes cannot be identified
+    /// (issue #1838).
+    #[serde(rename = "REPLAYABLE_TRACE_UNSERVABLE")]
+    ReplayableTraceUnservable,
 }
 
 impl ObservationGapCode {
@@ -472,6 +497,7 @@ impl ObservationGapCode {
         Self::AffectedScopeUnattributed,
         Self::GenerationChangeNotCorrelated,
         Self::PriorRepairNotInWindow,
+        Self::ReplayableTraceUnservable,
     ];
 
     /// Returns the stable wire code.
@@ -486,6 +512,7 @@ impl ObservationGapCode {
             Self::AffectedScopeUnattributed => "AFFECTED_SCOPE_UNATTRIBUTED",
             Self::GenerationChangeNotCorrelated => "GENERATION_CHANGE_NOT_CORRELATED",
             Self::PriorRepairNotInWindow => "PRIOR_REPAIR_NOT_IN_WINDOW",
+            Self::ReplayableTraceUnservable => "REPLAYABLE_TRACE_UNSERVABLE",
         }
     }
 
@@ -516,6 +543,10 @@ impl ObservationGapCode {
             }
             Self::PriorRepairNotInWindow => {
                 "prior repair or renewal record inside the bounded window"
+            }
+            Self::ReplayableTraceUnservable => {
+                "trace.manifest_sealed record for the condition's operation_id, carrying the \
+                 required I16.12 evidence classes"
             }
         }
     }
@@ -692,6 +723,10 @@ impl BriefStateFence {
 /// unknowns, the observation gaps, and exactly one next step — all under one
 /// State Fence and one invalidation condition. It never carries a cause, and
 /// it never carries rolling log content.
+///
+/// The I16.12 replayable trace context is joined whole: [`Self::trace_replay`]
+/// is the sealed [`TraceManifest`] of the condition's operation exactly as the
+/// canonical chain recorded it, never a projection of counts over it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticBrief {
@@ -713,6 +748,11 @@ pub struct DiagnosticBrief {
     pub attempted_repairs: Vec<CausalEventRef>,
     /// I16.3 lineage slots with no observed value for the trigger record.
     pub unknowns: Vec<String>,
+    /// The replayed I16.12 trace context of the condition's operation, read
+    /// back from the canonical audit chain; `None` when no sealed body is
+    /// servable, which is itself reported as
+    /// [`ObservationGapCode::ReplayableTraceUnservable`].
+    pub trace_replay: Option<TraceManifest>,
     /// Required observations the brief could not satisfy.
     pub observation_gaps: Vec<ObservationGap>,
     /// The single cheapest useful next step.
@@ -730,6 +770,45 @@ impl DiagnosticBrief {
     #[must_use]
     pub fn reports_gap_not_cause(&self) -> bool {
         !self.observation_gaps.is_empty()
+    }
+
+    /// Returns the replayed I16.12 trace context of the condition's operation.
+    ///
+    /// The body is served exactly as the canonical chain sealed it, so the
+    /// action contract, State Fence, caller/session, lease, requested and
+    /// actual route, call input/output handles, result receipt, finish
+    /// decision, and explicit missing parts are the recorded ones. `None` means
+    /// no sealed body was servable, never an invented one (issue #1838).
+    #[must_use]
+    pub fn trace_replay(&self) -> Option<&TraceManifest> {
+        self.trace_replay.as_ref()
+    }
+
+    /// Returns whether the replayed trace is a proof-bearing complete one.
+    ///
+    /// The gate is the manifest's own recorded finish decision
+    /// ([`crate::trace_manifest::TraceFinish::is_complete`]), not a
+    /// re-derivation: the replay read already refused every body whose recorded
+    /// completion claim the recorded required slots do not carry, so a manifest
+    /// this brief holds is complete exactly when the record says so. A manifest
+    /// that withheld a required part is reported with its missing parts and
+    /// never as complete (I16.12).
+    #[must_use]
+    pub fn replay_is_complete(&self) -> bool {
+        self.trace_replay
+            .as_ref()
+            .is_some_and(|replay| replay.finish.is_complete())
+    }
+
+    /// Returns the required I16.12 classes the replayed trace reports missing.
+    ///
+    /// The list is the manifest's own explicit missing-parts list, carried
+    /// through unchanged: the reader never recomputes it from a partial view.
+    #[must_use]
+    pub fn replay_missing_parts(&self) -> &[String] {
+        self.trace_replay
+            .as_ref()
+            .map_or(&[], |replay| replay.missing_parts.as_slice())
     }
 }
 
@@ -839,6 +918,13 @@ const GENERATION_CHANGE_KINDS: &[&str] = &[
 /// when the window is not a bounded range of the supplied chain, or when the
 /// trigger record carries no State Fence. A refused compilation yields no
 /// brief, never a partially attributed cause.
+///
+/// The brief also replays the I16.12 trace context of the condition's
+/// operation from the same supplied chain (issue #1838). The read is the
+/// manifest owner's own
+/// [`TraceManifest::find_sealed`](crate::trace_manifest::TraceManifest::find_sealed),
+/// so the recorded completion gate decides servability and this module
+/// re-implements no completion rule.
 pub fn compile_diagnostic_brief(
     records: &[AuditRecord],
     problem: &DiagnosticProblem,
@@ -857,6 +943,7 @@ pub fn compile_diagnostic_brief(
     let change_hypotheses = correlated_change_hypotheses(selected);
     let affected_scope = project_affected_scope(trigger);
     let unknowns = affected_scope.unknown_fields.clone();
+    let trace_replay = read_sealed_trace_replay(records, affected_scope.operation_id.as_deref());
     let observation_gaps = observation_gaps(
         selected,
         &log_window_refs,
@@ -864,6 +951,7 @@ pub fn compile_diagnostic_brief(
         &affected_scope,
         &change_hypotheses,
         &attempted_repairs,
+        trace_replay.as_ref(),
     );
     Ok(DiagnosticBrief {
         symptom: project_symptom(trigger, problem.trigger),
@@ -875,6 +963,7 @@ pub fn compile_diagnostic_brief(
         prior_failures,
         attempted_repairs,
         unknowns,
+        trace_replay,
         next_action: select_next_action(&observation_gaps, trigger.seq),
         observation_gaps,
         fence: BriefStateFence {
@@ -883,6 +972,28 @@ pub fn compile_diagnostic_brief(
             invalidation_conditions: BriefInvalidation::ALL.to_vec(),
         },
     })
+}
+
+/// Replays the sealed trace manifest of one operation (issue #1838).
+///
+/// The operation identity comes from the trigger record's own
+/// `AuditLineage` owner — the same slot [`AffectedScope::operation_id`]
+/// reports — so the brief replays the operation the observed condition
+/// belongs to and never an operation it selected for itself.
+///
+/// The read itself is
+/// [`TraceManifest::find_sealed`](crate::trace_manifest::TraceManifest::find_sealed):
+/// the manifest's own recorded gate refuses a body whose completion claim its
+/// own recorded required slots do not carry, so this reader cannot serve a
+/// self-contradicting success and does not re-implement that rule. A body that
+/// genuinely withheld a required part is served as the degraded record it is,
+/// with its explicit missing parts intact (I16.12).
+fn read_sealed_trace_replay(
+    records: &[AuditRecord],
+    operation_id: Option<&str>,
+) -> Option<TraceManifest> {
+    let operation_id = operation_id?;
+    TraceManifest::find_sealed(records, operation_id)
 }
 
 /// Selects the exact bounded window out of the retained canonical chain.
@@ -1125,6 +1236,7 @@ fn observation_gaps(
     affected_scope: &AffectedScope,
     change_hypotheses: &[ChangeHypothesis],
     attempted_repairs: &[CausalEventRef],
+    trace_replay: Option<&TraceManifest>,
 ) -> Vec<ObservationGap> {
     let mut gaps = Vec::new();
     if log_window_refs.is_empty() {
@@ -1177,6 +1289,15 @@ fn observation_gaps(
     if attempted_repairs.is_empty() {
         gaps.push(ObservationGap::new(
             ObservationGapCode::PriorRepairNotInWindow,
+        ));
+    }
+    // Issue #1838 (I16.12): a condition whose operation has no servable sealed
+    // trace manifest cannot name the replay context at all, so the gap is
+    // reported with the exact record that would supply it rather than being
+    // read as a complete trace.
+    if trace_replay.is_none() {
+        gaps.push(ObservationGap::new(
+            ObservationGapCode::ReplayableTraceUnservable,
         ));
     }
     gaps

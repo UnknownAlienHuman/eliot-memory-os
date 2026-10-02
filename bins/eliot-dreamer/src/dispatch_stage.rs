@@ -42,11 +42,17 @@
 //! with `UnsupportedJobClass` (they never reach here via `submit`; direct
 //! calls refuse).
 //!
-//! Fail-closed: every refusal is [`DreamerError::InvalidAdmission`] (the
-//! request-rejected code) or [`DreamerError::UnsupportedJobClass`], never the
-//! Kernel-admission code: the admission itself was valid, the owner inputs
-//! were not. Dynamic payloads (handles, digests, reasons) are dropped in favor
-//! of bounded static field names; nothing secret flows. The Curation leaf
+//! Fail-closed: every owner-refusal mapping here is
+//! [`DreamerError::InvalidAdmission`] (the request-rejected code) or
+//! [`DreamerError::UnsupportedJobClass`] — the admission itself was valid, the
+//! owner inputs were not. The one path that may still return the
+//! Kernel-admission code is the admission binding check
+//! ([`verify_admitted_binding`], reached directly by
+//! [`dispatch_admitted`] and again inside [`require_validated_binding`]),
+//! because a caller-switched job identity or fence means the admission never
+//! applied to this pair at all rather than that an owner input was missing.
+//! Dynamic payloads (handles, digests, reasons) are dropped in favor of
+//! bounded static field names; nothing secret flows. The Curation leaf
 //! handler runs only behind a Governor-injected carrier: production carries
 //! none (the ten live ports are Governor-injected and absent in-binary), so
 //! production Curation refuses at the carrier check before any generic stage
@@ -76,8 +82,8 @@ use eliot_dreamer_orientation::{
 };
 
 use crate::admitted_material::{
-    admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
-    v1_model_of, validation_policy_of,
+    admission_of, bundle_of, manifest_of, observed_attempt_wall_ms, orientation_frame_of,
+    preservation_of, usage_of, v1_grounded_of, v1_model_of, validation_policy_of,
 };
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
@@ -283,6 +289,14 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// exactly the same reason the validated candidate is — see the parameter
 /// documentation below). Returns the owner-typed [`DreamResult`].
 ///
+/// `attempt_started` is the admitted chain's own clock origin, taken at the head
+/// of that chain by the caller that owns the attempt and threaded in unchanged.
+/// Only the Orientation arm reads it, and only for the v1 A-05 deadline
+/// observation and the CC-002 usage receipt: the origin belongs to the caller
+/// that owns the attempt (see
+/// [`observed_attempt_wall_ms`](crate::admitted_material::observed_attempt_wall_ms)),
+/// so no arm here may restart the clock behind its own back.
+///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
 /// match runs with no wildcard. Orientation proves the structured receipt
@@ -323,6 +337,7 @@ pub(crate) fn dispatch_admitted(
     // never branches on `Some`/`None`, so `None` is not a new refusal there.
     // Only the Orientation arm consumes it.
     pipeline: Option<PipelineOrientationRecords<'_>>,
+    attempt_started: Instant,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -364,7 +379,14 @@ pub(crate) fn dispatch_admitted(
             let Some(records) = pipeline else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, carriers.orientation, records)
+            dispatch_orientation(
+                admission,
+                job,
+                candidate,
+                carriers.orientation,
+                records,
+                attempt_started,
+            )
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -470,25 +492,44 @@ pub(crate) fn require_validated_binding(
 /// `pipeline` carries the two records the admitted pipeline itself produced,
 /// so the carrier joins that pipeline's own committed receipt instead of asking
 /// the Governor channel for values the channel could never hold.
+///
+/// `attempt_started` is the admitted chain's own clock origin, taken at the head
+/// of that chain by the caller that owns the attempt and threaded in unchanged.
+/// This arm never restarts that clock: an origin taken here would measure only
+/// what is left after the screen, admission, bundle and frame-source work above,
+/// and in production after the whole model, grounding and validation chain,
+/// which is the most permissive reading the job's `deadline_ms` budget could
+/// ever be given.
 fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
     orientation_supply: Option<&OrientationSupply<'_>>,
     pipeline: PipelineOrientationRecords<'_>,
+    attempt_started: Instant,
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
     let admitted = admission_of(admission, job)?;
     let bundle = bundle_of(admission, job)?;
     let frame_source = orientation_frame_source(&bundle)?;
-    let route_started = Instant::now();
     let model = v1_model_of(admission, job)?;
-    let route_wall_ms = u64::try_from(route_started.elapsed().as_millis())
+    // The CC-002 usage receipt reports this attempt's elapsed wall time as at
+    // the moment the v1 draft was derived. It is read from the chain origin, on
+    // the same monotonic clock and in the same unit as the admitted wall budget
+    // it is later proved against, so it is the interval that budget pays for
+    // rather than a per-arm restart of the clock.
+    let attempt_wall_ms = u64::try_from(attempt_started.elapsed().as_millis())
         .map_err(|_| DreamerError::InvalidAdmission("model route wall observation"))?;
     let grounded = v1_grounded_of(&model)?;
     let usage = usage_of(&admitted.budget);
     let validation_policy = validation_policy_of(admitted.policy_ref.as_str())?;
-    let preservation = preservation_of()?;
+    let manifest = manifest_of(&bundle)?;
+    let preservation = preservation_of(&admitted, &bundle, &manifest, job)?;
+    // The v1 track's own A-05 observation, read from that same chain origin
+    // rather than supplied as a literal: the owner compares it against the
+    // admitted job's `deadline_ms` in the same unit, so a literal here would
+    // make that gate unreachable exactly as it would on the structured track.
+    let observed = observed_attempt_wall_ms(attempt_started)?;
     let candidate = match validate_grounded_dream_draft_at(
         &admitted,
         &bundle,
@@ -497,7 +538,7 @@ fn dispatch_orientation(
         &validation_policy,
         &usage,
         &preservation,
-        Some(0),
+        Some(observed),
         false,
     ) {
         Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
@@ -517,7 +558,7 @@ fn dispatch_orientation(
     // an invented call.
     let model_request = crate::model_stage::model_route_request(admission, job, &bundle)?;
     let route_usage =
-        crate::model_stage::ModelRouteUsage::measured(&bundle, &model, 0, route_wall_ms)?;
+        crate::model_stage::ModelRouteUsage::measured(&bundle, &model, 0, attempt_wall_ms)?;
     let model_outcome =
         crate::model_stage::model_route_outcome(&model_request, &model, route_usage)?;
     let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
@@ -1862,7 +1903,13 @@ mod slice_7_native_owner_tests {
             allowed_tools: Vec::new(),
             allowed_model_routes: vec!["route-test".to_owned()],
             budget_units: 1,
-            deadline_ms: 1,
+            // A realistic wall budget, not a nominal one: the A-05 owners
+            // compare the supplied observation against this value in the same
+            // unit and refuse only when the observation is at or beyond it, so
+            // a one-millisecond budget would refuse any elapsed reading of 1 ms
+            // or more, and the fixture below could not carry the measured
+            // observation production threads.
+            deadline_ms: 60_000,
             output_schema: "eliot.dreamer.v1".to_owned(),
             forbidden_effects: Vec::new(),
         }
@@ -1917,13 +1964,22 @@ mod slice_7_native_owner_tests {
     /// retains a clone exactly as production does.
     ///
     /// Every stage genuinely invokes its owner; any refusal fails the proof.
+    ///
+    /// The attempt origin this chain started at is returned with them, because
+    /// `dispatch_admitted` takes that origin as its own parameter and only the
+    /// caller that owns the attempt may supply it. Handing dispatch a fresh
+    /// `Instant::now()` here would restart the clock behind the owner's back
+    /// and reproduce the very permissiveness production avoids by hoisting the
+    /// origin to the head of the chain.
     fn validated_for(
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
     ) -> (
         GroundingRequest,
         eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
+        Instant,
     ) {
+        let attempt_started = Instant::now();
         let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
@@ -1937,18 +1993,31 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
-            Ok(grounded) => grounded,
-            Err(error) => panic!("fixture grounding must prove, got {error:?}"),
+        // Same wiring production runs: the root supplies the A-05 attachment
+        // and the owning crate grounds and constructs the carrier. The
+        // observation time is measured, not a literal, exactly as the admitted
+        // chain measures it.
+        let observed = match observed_attempt_wall_ms(attempt_started) {
+            Ok(observed) => observed,
+            Err(error) => panic!("fixture observation time must measure, got {error:?}"),
         };
-        let carrier =
-            match crate::admitted_material::validation_input_for(admission, job, grounded, Some(0))
-            {
-                Ok(carrier) => carrier,
-                Err(error) => panic!("fixture carrier must build, got {error:?}"),
-            };
+        let attachment = match crate::admitted_material::validation_attachment_for(
+            admission,
+            job,
+            Some(observed),
+        ) {
+            Ok(attachment) => attachment,
+            Err(error) => panic!("fixture A-05 attachment must derive, got {error:?}"),
+        };
+        let carrier = match crate::validation_stage::ground_and_bind_validation_carrier(
+            request.clone(),
+            attachment,
+        ) {
+            Ok(carrier) => carrier,
+            Err(error) => panic!("fixture carrier must build, got {error:?}"),
+        };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
-            Ok(validated) => (request, validated),
+            Ok(validated) => (request, validated, attempt_started),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),
         }
     }
@@ -1974,16 +2043,34 @@ mod slice_7_native_owner_tests {
         }
     }
 
-    /// Orientation genuinely projects from the admitted pair: the structured
-    /// A-05 receipt is proved at the dispatch gate, then the v1 hypothesis
-    /// pair validates through the real v1 A-05 entry, the owner
-    /// `build_projection` succeeds, packet identity bindings travel verbatim,
-    /// and the G4 residues are preserved in `rival_models_and_dissent`.
+    /// Orientation runs the whole admitted chain and publishes the typed
+    /// blocked disposition, carrying no packet.
+    ///
+    /// What this genuinely proves: the structured A-05 receipt is proved at the
+    /// dispatch gate, the v1 hypothesis pair derives and validates through the
+    /// real v1 A-05 entry, and the CC-002 model-route request/outcome pair is
+    /// composed and bound — so the only absent prerequisite is the Governor
+    /// owner supply channel, and that absence is published honestly rather than
+    /// refused or silently defaulted.
+    ///
+    /// What it deliberately does NOT claim, and why no assertion here can: a
+    /// packet. [`DreamResult::Packet`] and [`DreamResult::Orientation`] are
+    /// distinct variants and this arm constructs only the latter — the
+    /// packet-only compatibility seam was deleted, so there is no second route.
+    /// Reaching a packet through this arm needs an [`OrientationSupply`], and
+    /// nothing in this binary constructs one: the only
+    /// [`OrientationSupplySource`](crate::OrientationSupplySource)
+    /// implementor returns `Ok(None)`, so `resolve_production_inputs` always
+    /// takes its blocked arm here. (The packet-to-result mapping
+    /// [`map_orientation_packet`] is a separate function covered by its own
+    /// module below. It takes no carrier, and on this path it is reached only
+    /// through the production composer, which this arm calls, downstream of
+    /// the owner-supply gate that blocks before it on today's tree.)
     #[test]
-    fn orientation_projects_packet_with_g4_preserved() {
+    fn orientation_without_owner_supply_publishes_blocked_pulse() {
         let admission = admission();
         let job = semantic_job(JobClass::Orientation);
-        let (grounding, validated) = validated_for(&admission, &job);
+        let (grounding, validated, attempt_started) = validated_for(&admission, &job);
         let result = dispatch_admitted(
             &admission,
             &job,
@@ -1991,57 +2078,76 @@ mod slice_7_native_owner_tests {
             JobClass::Orientation,
             Some(&validated),
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            attempt_started,
         );
-        let Ok(DreamResult::Packet(packet)) = result else {
-            panic!("orientation must project, got {result:?}");
+        let Ok(DreamResult::Orientation(pulse)) = result else {
+            panic!("orientation must publish the typed pulse, got {result:?}");
         };
-        assert_eq!(packet.packet_id.len(), 64);
-        assert_eq!(packet.question, QUESTION);
-        assert_eq!(packet.scope_id, SCOPE);
-        assert_eq!(packet.state_fence, job.state_fence);
-        assert_eq!(packet.source_coverage.evidence, job.evidence_handles);
-        assert_eq!(packet.source_coverage.memory, job.memory_handles);
         assert_eq!(
-            packet.source_coverage.architecture,
-            job.architecture_handles
+            pulse.disposition,
+            eliot_dreamer_orientation::OrientationDisposition::Blocked,
+            "an absent owner supply channel is an honest blocked disposition"
         );
         assert_eq!(
-            packet.source_coverage.implementation,
-            job.implementation_handles
+            pulse.schema_version,
+            crate::ORIENTATION_PULSE_RESULT_SCHEMA_VERSION
         );
-        assert_eq!(packet.source_coverage.conformance, job.conformance_handles);
-        assert_eq!(packet.synthesized_interpretations.len(), 1);
-        let interpretation = &packet.synthesized_interpretations[0];
-        assert_eq!(interpretation.statement, QUESTION);
-        assert_eq!(interpretation.support_handles, job.evidence_handles);
-        assert_eq!(interpretation.epistemic_status, "candidate_only");
-        // ABSOLUTE G4 RULE: the admitted model carries no counterevidence
-        // text, so the rival list is exactly the two owner residue texts —
-        // neither marker dropped nor thinned.
-        assert_eq!(
-            packet.rival_models_and_dissent.len(),
-            2,
-            "rival list must carry exactly both residue markers, got {:?}",
-            packet.rival_models_and_dissent
-        );
-        // The four screening-side families are accounted as omissions and
-        // surface as unknowns, never silently dropped.
-        assert_eq!(
-            packet.unknowns_and_gaps.len(),
-            4,
-            "unknowns must account the four omitted families, got {:?}",
-            packet.unknowns_and_gaps
-        );
-        assert_eq!(
-            packet.recommended_probes_or_next_actions,
-            Vec::<String>::new()
-        );
-        assert_eq!(packet.invalidation_conditions, vec![CONFLICT.to_owned()]);
         assert!(
-            packet.provenance.contains(&OPERATION.to_owned()),
-            "provenance must carry the projection-input proof, got {:?}",
-            packet.provenance
+            pulse.packet.is_none(),
+            "a blocked disposition carries no packet, got {:?}",
+            pulse.packet
         );
+        assert_eq!(
+            pulse.proof_ceiling,
+            crate::pulse::CEILING_BLOCKED,
+            "nothing was executed, so nothing is proved"
+        );
+        // The CC-002 boundary this arm really composed IS present; the CC-004
+        // boundary and every stage-owner record are the absent ones. Asserting
+        // the boundary that exists is what distinguishes this blocked pulse
+        // from one raised before any derivation ran.
+        assert!(
+            pulse.model_outcome.present,
+            "the v1 track composed the CC-002 pair before the carrier refused"
+        );
+        assert!(
+            !pulse.projections.present,
+            "the CC-004 projection set is Governor-published and absent"
+        );
+        assert_eq!(
+            pulse.projections.reason.as_deref(),
+            Some(crate::production_orientation::CC004_MISSING),
+            "the CC-004 absence must name its exact governed input"
+        );
+        assert_eq!(
+            pulse.omissions,
+            vec![
+                crate::production_orientation::CC004_MISSING.to_owned(),
+                crate::production_orientation::ORIENTATION_SUPPLY_MISSING.to_owned(),
+            ],
+            "both omitted carriers must be named, got {:?}",
+            pulse.omissions
+        );
+        // Every mandatory member is accounted as blocked rather than dropped:
+        // the projection owner plus the nine stage owners, and the same ten
+        // ledger records in denominator order.
+        assert_eq!(pulse.stages.len(), 10);
+        assert_eq!(pulse.missing_owners.len(), 10);
+        assert!(
+            pulse
+                .stages
+                .iter()
+                .all(|stage| stage.disposition == crate::OrientationStageDisposition::Blocked),
+            "no member may report executed under a blocked disposition"
+        );
+        assert!(
+            pulse.stages.iter().any(|stage| stage.stage == "packet"),
+            "the packet member must be accounted, not omitted from the ledger"
+        );
+        // The published identity is the admitted pair's, not a synthesized one.
+        assert_eq!(pulse.job_id, admission.job_id);
+        assert_eq!(pulse.scope_id, SCOPE);
+        assert_eq!(pulse.state_fence, job.state_fence);
     }
 
     /// Orientation without evidence handles refuses at the frame source: the
@@ -2053,7 +2159,7 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.evidence_handles.clear();
-        let (grounding, validated) = validated_for(&admission, &job);
+        let (grounding, validated, attempt_started) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
             &admission,
             &job,
@@ -2061,6 +2167,7 @@ mod slice_7_native_owner_tests {
             JobClass::Orientation,
             Some(&validated),
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            attempt_started,
         );
         assert!(
             matches!(
@@ -2088,7 +2195,7 @@ mod slice_7_native_owner_tests {
         // the gate ORDER: an available pipeline record does not substitute for
         // the structured A-05 receipt, so the refusal is the receipt gate and
         // not the arm quietly proceeding on the record alone.
-        let (grounding, validated) = validated_for(&admission, &job);
+        let (grounding, validated, attempt_started) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
             &admission,
             &job,
@@ -2096,6 +2203,7 @@ mod slice_7_native_owner_tests {
             JobClass::Orientation,
             None,
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            attempt_started,
         );
         assert!(
             matches!(
@@ -2130,6 +2238,11 @@ mod slice_7_native_owner_tests {
             // refusal IS this case's subject, so building a record here would
             // mean asserting a pipeline that never executed.
             None,
+            // The chain this refusal names never began, so there is no attempt
+            // to measure. The origin is still supplied rather than defaulted:
+            // it is the identity `run_admitted_pipeline` would pass, and no arm
+            // reads it on a path that refuses at the binding check.
+            Instant::now(),
         );
         assert_eq!(
             refused.map_err(|error| error.code()),
@@ -2147,7 +2260,7 @@ mod slice_7_native_owner_tests {
         // the record is genuine. The `job_class` argument is what disagrees; the
         // refusal must come from the binding check before that argument routes
         // anything, which is only observable when a valid record is present.
-        let (grounding, validated) = validated_for(&admission, &job);
+        let (grounding, validated, attempt_started) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
             &admission,
             &job,
@@ -2155,6 +2268,7 @@ mod slice_7_native_owner_tests {
             JobClass::Curation,
             None,
             Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            attempt_started,
         );
         assert!(
             matches!(
@@ -2184,6 +2298,10 @@ mod slice_7_native_owner_tests {
             // built. Supplying one would mean fabricating a receipt the owner
             // refuses to issue.
             None,
+            // The Curation arm refuses before any observation, so this origin
+            // is never read here; it is supplied rather than defaulted so the
+            // call shape stays identical to the one production runs.
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -2226,6 +2344,10 @@ mod slice_7_native_owner_tests {
             // built. Supplying one would mean fabricating a receipt the owner
             // refuses to issue.
             None,
+            // The Curation arm refuses before any observation, so this origin
+            // is never read here; it is supplied rather than defaulted so the
+            // call shape stays identical to the one production runs.
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -2259,6 +2381,10 @@ mod slice_7_native_owner_tests {
             // built. Supplying one would mean fabricating a receipt the owner
             // refuses to issue.
             None,
+            // The Curation arm refuses before any observation, so this origin
+            // is never read here; it is supplied rather than defaulted so the
+            // call shape stays identical to the one production runs.
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -2299,6 +2425,10 @@ mod slice_7_native_owner_tests {
             // built. Supplying one would mean fabricating a receipt the owner
             // refuses to issue.
             None,
+            // The Curation arm refuses before any observation, so this origin
+            // is never read here; it is supplied rather than defaulted so the
+            // call shape stays identical to the one production runs.
+            Instant::now(),
         );
         assert!(
             matches!(
@@ -2343,6 +2473,11 @@ mod slice_7_native_owner_tests {
             // built. Supplying one would mean fabricating a receipt the owner
             // refuses to issue.
             None,
+            // This arm never reads that clock origin — it does no observation
+            // and takes no measurement — which is why a value is supplied
+            // rather than defaulted: the call shape stays identical to the one
+            // production runs.
+            Instant::now(),
         );
         let Ok(DreamResult::Curation {
             job_id,
@@ -2436,7 +2571,7 @@ mod slice_7_native_owner_tests {
         ] {
             let admission = admission();
             let job = semantic_job(class);
-            let (grounding, validated) = validated_for(&admission, &job);
+            let (grounding, validated, attempt_started) = validated_for(&admission, &job);
             let refused = dispatch_admitted(
                 &admission,
                 &job,
@@ -2444,6 +2579,7 @@ mod slice_7_native_owner_tests {
                 class,
                 Some(&validated),
                 Some(PipelineOrientationRecords::new(&grounding, &validated)),
+                attempt_started,
             );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
@@ -2479,7 +2615,7 @@ mod slice_7_native_owner_tests {
             // rather than passed as `None`. Supplying it is what makes the case
             // prove the ORDER: an available, valid pipeline record still cannot
             // route a class that `submit` never admits.
-            let (grounding, validated) = validated_for(&admission, &job);
+            let (grounding, validated, attempt_started) = validated_for(&admission, &job);
             let refused = dispatch_admitted(
                 &admission,
                 &job,
@@ -2487,6 +2623,7 @@ mod slice_7_native_owner_tests {
                 class,
                 None,
                 Some(PipelineOrientationRecords::new(&grounding, &validated)),
+                attempt_started,
             );
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
@@ -2666,8 +2803,8 @@ mod slice_7_native_owner_tests {
 mod orientation_packet_mapping_tests {
     use super::*;
     use crate::admitted_material::{
-        admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
-        v1_model_of, validation_policy_of,
+        admission_of, bundle_of, manifest_of, observed_attempt_wall_ms, orientation_frame_of,
+        preservation_of, usage_of, v1_grounded_of, v1_model_of, validation_policy_of,
     };
     use eliot_dreamer_orientation::projection::build_projection;
     use std::num::NonZeroU64;
@@ -2726,7 +2863,11 @@ mod orientation_packet_mapping_tests {
             allowed_tools: Vec::new(),
             allowed_model_routes: vec!["route-test".to_owned()],
             budget_units: 1,
-            deadline_ms: 1,
+            // A realistic wall budget, for the same reason as the slice-7
+            // fixture: the v1 owner compares the supplied observation against
+            // this value and refuses only at or beyond it, so a one-millisecond
+            // budget would refuse any elapsed reading of 1 ms or more.
+            deadline_ms: 60_000,
             output_schema: "eliot.dreamer.v1".to_owned(),
             forbidden_effects: Vec::new(),
         }
@@ -2743,6 +2884,7 @@ mod orientation_packet_mapping_tests {
     );
 
     fn admitted_packet_material() -> PacketMaterial {
+        let attempt_started = Instant::now();
         let admission = admission();
         let job = job();
         let admitted = admission_of(&admission, &job).expect("admitted job must derive");
@@ -2753,7 +2895,20 @@ mod orientation_packet_mapping_tests {
         let usage = usage_of(&admitted.budget);
         let validation_policy =
             validation_policy_of(admitted.policy_ref.as_str()).expect("validation policy seals");
-        let preservation = preservation_of().expect("preservation report must build");
+        let manifest = match manifest_of(&bundle) {
+            Ok(manifest) => manifest,
+            Err(error) => panic!("frozen manifest must rebuild, got {error:?}"),
+        };
+        let preservation = match preservation_of(&admitted, &bundle, &manifest, &job) {
+            Ok(preservation) => preservation,
+            Err(error) => panic!("preservation report must build, got {error:?}"),
+        };
+        // Measured, exactly as the production v1 site measures it, rather than
+        // a literal that could never trip the deadline gate.
+        let observed = match observed_attempt_wall_ms(attempt_started) {
+            Ok(observed) => observed,
+            Err(error) => panic!("fixture observation time must measure, got {error:?}"),
+        };
         let candidate = match validate_grounded_dream_draft_at(
             &admitted,
             &bundle,
@@ -2762,7 +2917,7 @@ mod orientation_packet_mapping_tests {
             &validation_policy,
             &usage,
             &preservation,
-            Some(0),
+            Some(observed),
             false,
         ) {
             Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,

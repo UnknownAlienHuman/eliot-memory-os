@@ -54,7 +54,7 @@
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::AuditEventDraft;
-use super::trace_manifest::TraceManifest;
+use super::trace_manifest::{SealEvidence, TraceEvidence, TraceManifest};
 use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
@@ -4827,8 +4827,11 @@ impl KernelComposition {
             &persisted,
             queued_envelope.as_ref(),
             lane,
-            caller_principal.as_deref(),
-            active_view_packet_manifest.as_deref(),
+            &SealEvidence {
+                principal: caller_principal.as_deref(),
+                active_view_packet_manifest: active_view_packet_manifest.as_deref(),
+                evidence: &observed_trace_evidence(session, queued_envelope.as_ref(), &persisted),
+            },
         );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
@@ -6328,8 +6331,11 @@ impl KernelComposition {
             &persisted,
             queued_envelope.as_ref(),
             lane,
-            caller_principal.as_deref(),
-            None,
+            &SealEvidence {
+                principal: caller_principal.as_deref(),
+                active_view_packet_manifest: None,
+                evidence: &observed_trace_evidence(session, queued_envelope.as_ref(), &persisted),
+            },
         );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
@@ -6562,6 +6568,33 @@ fn validate_campaign_view_result(
         return Err(TransportError::SessionFenced);
     }
     Ok(Some(publication.view_id.as_str().to_owned()))
+}
+
+/// Projects the I16.12 evidence classes the seal site does not receive from its
+/// caller, off the durable row that owns them.
+///
+/// The fence handed to the projection is the one the seal will record: the
+/// admitted envelope's own fence, or the presenting session's fence once queue
+/// memory has retired the envelope. When that session fence cannot be proved
+/// against the row's recorded `fence_digest` the seal withholds the fence
+/// entirely, and a projected policy snapshot then has no fence to bind to and
+/// leaves its required slot absent — which is the honest classification, not a
+/// lost observation.
+///
+/// Read from the row, never from the submitted body: the durable record stays
+/// the single owner of what was observed, so recovery can read back exactly
+/// what this seal bound.
+fn observed_trace_evidence(
+    session: &Session,
+    envelope: Option<&HostRequestEnvelope>,
+    persisted: &HostRequestRecord,
+) -> TraceEvidence {
+    TraceEvidence::observed(
+        persisted,
+        envelope
+            .map(|envelope| &envelope.state_fence)
+            .or(Some(&session.module_generation.state_fence)),
+    )
 }
 
 /// Builds the Kernel-observed bridge process binding from retained state.
@@ -10307,7 +10340,20 @@ fn recorded_trace_manifest_matches_result(
         .as_ref()
         .and_then(|lineage| lineage.policy_fence.as_ref())
         .filter(|policy_fence| policy_fence.state_fence == envelope.state_fence)
-        .map(|policy_fence| policy_fence.policy_snapshot_id.as_str());
+        .map(|policy_fence| policy_fence.policy_snapshot_id.clone())
+        // A retained claim bound to another fence is a substituted snapshot, so
+        // the policy identity the authority decision itself carries is the
+        // applicable one and is what the seal records instead.
+        .or_else(|| {
+            envelope
+                .state_fence
+                .policy_revision
+                .map(|revision| revision.value().to_string())
+        });
+    let expected_retained_principal = record
+        .result_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.producer_ref.as_deref());
     let fence_digest =
         sha256_json(&envelope.state_fence).map_err(|_| TransportError::SessionFenced)?;
     let expected_authority_epoch =
@@ -10345,12 +10391,16 @@ fn recorded_trace_manifest_matches_result(
             && fence_digest == record.fence_digest
             && manifest.session_id.as_deref() == expected_session
             && manifest.task_id.as_deref() == expected_task
-            && manifest
-                .principal
-                .as_deref()
-                .is_none_or(|recorded| Some(recorded) == current_caller_principal)
+            // The recorded principal is the authenticated identity one of its two owners
+            // observed: the caller's retained Resolved activation, or the
+            // producer reference the read owner retained on this very row. Any
+            // other value is refused rather than reconciled.
+            && manifest.principal.as_deref().is_none_or(|recorded| {
+                Some(recorded) == current_caller_principal
+                    || Some(recorded) == expected_retained_principal
+            })
             && manifest.work_scope_id.as_deref() == expected_scope
-            && manifest.policy_snapshot.as_deref() == expected_policy_snapshot
+            && manifest.policy_snapshot.as_deref() == expected_policy_snapshot.as_deref()
             && manifest.authority_epoch.as_deref() == Some(expected_authority_epoch.as_str())
             && manifest.module_generation.as_deref() == Some(expected_module_generation.as_str())
             && manifest.requested_route.as_deref() == Some(record.capability_ref.as_str())

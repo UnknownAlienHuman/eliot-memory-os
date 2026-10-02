@@ -5,7 +5,8 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_dreamer_claim_grounding::{
-    Cancellation, GroundingControls, GroundingRequest, ground_draft, ground_draft_with_controls,
+    Cancellation, GroundingControls, GroundingRequest, GroundingValidationRequest,
+    ValidationAttachment, ground_draft, ground_draft_with_controls, ground_for_validation,
 };
 use eliot_dreamer_contracts::grounding::canonical::{GradeAssignment, SupportResult};
 use eliot_dreamer_contracts::grounding::{ClaimKind, PrecisionPayload};
@@ -1271,7 +1272,103 @@ fn partial_subclaim_closure_is_explicit() {
     );
 }
 
+/// A parent claim carrying its OWN accepted support while every one of its
+/// subclaims is supportless, taken through the PUBLIC entry.
+///
+/// This is the regression case for the measured major defect: the grade axis.
+/// `evidence::evaluate_claim` gives a supportless child `grade = None` and
+/// `grade_ceiling = Orienting`, so a parent that lowers its own `grade_ceiling`
+/// to its weakest child ends up claiming less rigour than the grade its own
+/// accepted support certified. `grounding::aggregate_parent_record` re-pins that
+/// ceiling to the parent's own grade once the grade is known, and this case is
+/// what observes that through the only path a consumer can reach.
+///
+/// Fixture shape, built from the same `support` helpers as the 602/12 subclaim
+/// case above:
+///
+/// - manifest: one usable reference whose exact typed assertion supports
+///   `proposition-1` at grade `Grounded`;
+/// - `child-2`: `proposition-2`, no proposed handle at all, so it grounds to
+///   `Unknown` with `grade = None` and `grade_ceiling = Orienting`;
+/// - `claim-1` (the parent): `proposition-1` WITH its own `evidence-1` handle and
+///   its own `component_digests`, and `subclaim_ids = {child-2}`.
+///
+/// The parent's own component outcomes are deliberately kept: that is what
+/// distinguishes this record class from 602/12, whose parent has no support of
+/// its own and therefore cannot expose the defect. Because the parent has its
+/// own support, its `grade` is `Some(Grounded)` while `child_assignments` is
+/// empty — the exact state the removed `!child_assignments.is_empty()` gate
+/// skipped. On the old path `ground_for_validation` refused this legitimate
+/// grounding with `InvalidContract { field: "grounding.grade" }`.
 // WORK_UNIT_CASE: 602/13
+#[test]
+fn parent_with_own_support_and_a_supportless_subclaim_binds_through_the_public_entry() {
+    let manifest = manifest_for("proposition-1", Some(supported_record()));
+    let supportless_child = claim("child-2", "proposition-2", None);
+    let mut parent = claim("claim-1", "proposition-1", Some("evidence-1"));
+    parent.subclaim_ids = BTreeSet::from(["child-2".to_owned()]);
+    refresh_claim(&mut parent);
+    let model_draft = draft(
+        &manifest,
+        vec![supportless_child, parent],
+        eliot_dreamer_contracts::JobClass::Orientation,
+    );
+    let request = GroundingRequest::new(
+        model_draft.job.clone(),
+        model_draft.bundle.clone(),
+        manifest,
+        model_draft,
+        policy(),
+    );
+
+    let carrier = ground_for_validation(GroundingValidationRequest::new(
+        request,
+        validation_attachment("grounding-policy"),
+    ))
+    .expect("a parent with its own support and a supportless subclaim grounds and binds");
+
+    carrier
+        .validate()
+        .expect("the frozen contract accepts the bound carrier");
+
+    let child = &carrier.grounded.ledger.records["child-2"];
+    assert_eq!(
+        child.disposition,
+        SupportResult::Unknown,
+        "measured: the subclaim has no proposed handle, so nothing supports it"
+    );
+    assert_eq!(
+        child.grade, None,
+        "measured: a supportless subclaim certifies no rigour at all"
+    );
+    assert_eq!(
+        child.grade_ceiling,
+        eliot_dreamer_contracts::grounding::canonical::EvidenceGrade::Orienting,
+        "measured: the subclaim therefore leaves the weakest grade ceiling"
+    );
+
+    let parent = &carrier.grounded.ledger.records["claim-1"];
+    assert_eq!(
+        parent.disposition,
+        SupportResult::Partial,
+        "measured: the parent's own support aggregates with the supportless subclaim"
+    );
+    assert_eq!(
+        parent.grade,
+        Some(GradeAssignment::known(
+            eliot_dreamer_contracts::grounding::canonical::EvidenceGrade::Grounded
+        )),
+        "measured: the parent's own accepted support certifies Grounded"
+    );
+    assert_eq!(
+        parent.grade_ceiling,
+        eliot_dreamer_contracts::grounding::canonical::EvidenceGrade::Grounded,
+        "measured: the producer re-pins grade_ceiling to the parent's own grade, so a supportless \
+         subclaim cannot leave the grade axis claiming rigour below the grade it certifies"
+    );
+}
+
+// WORK_UNIT_CASE: 602/14
 #[test]
 fn contradictory_support_and_counterevidence_are_both_preserved() {
     let mut manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1316,7 +1413,7 @@ fn contradictory_support_and_counterevidence_are_both_preserved() {
     assert_eq!(record.witnesses.len(), 2);
 }
 
-// WORK_UNIT_CASE: 602/14
+// WORK_UNIT_CASE: 602/15
 #[test]
 fn related_but_not_entailing_evidence_stays_unsupported() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1378,7 +1475,7 @@ fn related_but_not_entailing_evidence_stays_unsupported() {
     );
 }
 
-// WORK_UNIT_CASE: 602/15
+// WORK_UNIT_CASE: 602/16
 #[test]
 fn authority_outside_claim_domain_never_promotes() {
     let trusted = manifest_for("proposition-1", Some(supported_record()));
@@ -1435,7 +1532,7 @@ fn authority_outside_claim_domain_never_promotes() {
     let _ = trusted;
 }
 
-// WORK_UNIT_CASE: 602/16
+// WORK_UNIT_CASE: 602/17
 #[test]
 fn weakest_grade_wins_and_dependent_sources_do_not_inflate() {
     let mut manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1510,7 +1607,7 @@ fn weakest_grade_wins_and_dependent_sources_do_not_inflate() {
     );
 }
 
-// WORK_UNIT_CASE: 602/17
+// WORK_UNIT_CASE: 602/18
 #[test]
 fn stale_transformed_and_partial_evidence_lower_or_block_ceiling() {
     let mut stale_manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1572,7 +1669,7 @@ fn stale_transformed_and_partial_evidence_lower_or_block_ceiling() {
     );
 }
 
-// WORK_UNIT_CASE: 602/18
+// WORK_UNIT_CASE: 602/19
 #[test]
 fn confidence_repetition_and_citation_count_cannot_raise_support() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1632,7 +1729,7 @@ fn confidence_repetition_and_citation_count_cannot_raise_support() {
     );
 }
 
-// WORK_UNIT_CASE: 602/19
+// WORK_UNIT_CASE: 602/20
 #[test]
 fn numeric_value_unit_denominator_and_rounding_are_exact() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -1717,7 +1814,7 @@ fn numeric_value_unit_denominator_and_rounding_are_exact() {
     );
 }
 
-// WORK_UNIT_CASE: 602/20
+// WORK_UNIT_CASE: 602/21
 #[test]
 fn current_versus_historical_version_and_time_mismatch_stays_unknown() {
     let temporal_manifest = manifest_for_typed(
@@ -1817,7 +1914,7 @@ fn current_versus_historical_version_and_time_mismatch_stays_unknown() {
     );
 }
 
-// WORK_UNIT_CASE: 602/21
+// WORK_UNIT_CASE: 602/22
 #[test]
 fn chronology_correlation_and_dependency_cannot_support_causal() {
     let mechanism = causal_payload();
@@ -1901,7 +1998,7 @@ fn chronology_correlation_and_dependency_cannot_support_causal() {
     );
 }
 
-// WORK_UNIT_CASE: 602/22
+// WORK_UNIT_CASE: 602/23
 #[test]
 fn causal_rival_and_confounder_changes_invalidate_support() {
     let mechanism = causal_payload();
@@ -2014,7 +2111,7 @@ fn causal_rival_and_confounder_changes_invalidate_support() {
     );
 }
 
-// WORK_UNIT_CASE: 602/23
+// WORK_UNIT_CASE: 602/24
 #[test]
 fn absence_complete_supports_while_partial_or_unavailable_stays_unknown() {
     let (complete_payload, denominator, receipt) = complete_absence_payload();
@@ -2121,7 +2218,7 @@ fn absence_complete_supports_while_partial_or_unavailable_stays_unknown() {
     );
 }
 
-// WORK_UNIT_CASE: 602/24
+// WORK_UNIT_CASE: 602/25
 #[test]
 fn comparative_requires_exact_population_and_compatible_measure() {
     let payload = comparative_payload();
@@ -2226,7 +2323,7 @@ fn comparative_requires_exact_population_and_compatible_measure() {
     );
 }
 
-// WORK_UNIT_CASE: 602/25
+// WORK_UNIT_CASE: 602/26
 #[test]
 fn exact_quote_beats_paraphrase_and_attribution_mismatch() {
     let payload = quote_payload();
@@ -2331,7 +2428,7 @@ fn exact_quote_beats_paraphrase_and_attribution_mismatch() {
     );
 }
 
-// WORK_UNIT_CASE: 602/26
+// WORK_UNIT_CASE: 602/27
 #[test]
 fn recommendation_keeps_facts_assumptions_and_inference_separate() {
     let payload = recommendation_payload();
@@ -2442,7 +2539,7 @@ fn recommendation_keeps_facts_assumptions_and_inference_separate() {
     );
 }
 
-// WORK_UNIT_CASE: 602/27
+// WORK_UNIT_CASE: 602/28
 #[test]
 fn identity_requires_exact_entity_version_and_scope() {
     let payload = identity_payload();
@@ -2579,7 +2676,7 @@ fn identity_requires_exact_entity_version_and_scope() {
     );
 }
 
-// WORK_UNIT_CASE: 602/28
+// WORK_UNIT_CASE: 602/29
 #[test]
 fn dropped_counterevidence_cannot_yield_a_complete_witness() {
     let mut manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -2653,7 +2750,7 @@ fn dropped_counterevidence_cannot_yield_a_complete_witness() {
     );
 }
 
-// WORK_UNIT_CASE: 602/29
+// WORK_UNIT_CASE: 602/30
 #[test]
 fn every_material_claim_has_terminal_disposition_and_residue_is_exact() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -2739,7 +2836,7 @@ fn every_material_claim_has_terminal_disposition_and_residue_is_exact() {
     assert!(bounded.ledger.unprocessed_reason.is_some());
 }
 
-// WORK_UNIT_CASE: 602/30
+// WORK_UNIT_CASE: 602/31
 #[test]
 fn claim_order_permutation_preserves_output_while_mutation_invalidates() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -2818,7 +2915,7 @@ fn claim_order_permutation_preserves_output_while_mutation_invalidates() {
     );
 }
 
-// WORK_UNIT_CASE: 602/31
+// WORK_UNIT_CASE: 602/32
 #[test]
 fn exact_bounds_and_one_over_preserve_omission_without_false_completeness() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -2889,7 +2986,7 @@ fn exact_bounds_and_one_over_preserve_omission_without_false_completeness() {
     );
 }
 
-// WORK_UNIT_CASE: 602/32
+// WORK_UNIT_CASE: 602/33
 #[test]
 fn cancellation_deadline_and_incomplete_coverage_cannot_all_ground() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -2977,7 +3074,7 @@ fn cancellation_deadline_and_incomplete_coverage_cannot_all_ground() {
     );
 }
 
-// WORK_UNIT_CASE: 602/33
+// WORK_UNIT_CASE: 602/34
 #[test]
 fn unknown_versions_kinds_and_permissive_defaults_are_rejected() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -3035,7 +3132,7 @@ fn unknown_versions_kinds_and_permissive_defaults_are_rejected() {
     );
 }
 
-// WORK_UNIT_CASE: 602/34
+// WORK_UNIT_CASE: 602/35
 #[test]
 fn malformed_bounded_inputs_fail_closed_without_panic_or_leak() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -3105,7 +3202,7 @@ fn malformed_bounded_inputs_fail_closed_without_panic_or_leak() {
     );
 }
 
-// WORK_UNIT_CASE: 602/35
+// WORK_UNIT_CASE: 602/36
 #[test]
 fn api_guard_excludes_extraction_entailment_retrieval_and_effects() {
     let manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -3186,17 +3283,7 @@ fn api_guard_excludes_extraction_entailment_retrieval_and_effects() {
     );
 }
 
-// WORK_UNIT_CASE: 602/35 (compile-time surface and zero runtime I/O guarantee)
-#[test]
-fn api_surface_is_pure_and_restricted() {
-    fn assert_pure_fn<Req, Out>(
-        _f: fn(Req) -> Result<Out, eliot_dreamer_contracts::ContractViolation>,
-    ) {
-    }
-    assert_pure_fn(eliot_dreamer_claim_grounding::ground_draft_with_controls);
-}
-
-// WORK_UNIT_CASE: 602/36
+// WORK_UNIT_CASE: 602/37
 #[test]
 fn supported_claims_have_complete_exact_coverage_without_promotion() {
     let numeric_manifest = manifest_for("proposition-1", Some(supported_record()));
@@ -3310,4 +3397,206 @@ fn supported_claims_have_complete_exact_coverage_without_promotion() {
         SupportResult::Supported,
         "references alone cannot prove truth or causality"
     );
+}
+
+// WORK_UNIT_CASE: 602/38 (compile-time surface and zero runtime I/O guarantee)
+// A distinct case number, not a second 602/36: 602/36 is the forbidden-capability
+// surface guard on
+// `api_guard_excludes_extraction_entailment_retrieval_and_effects`, and a label
+// cited by two tests cannot identify which one broke. It sits after the coverage
+// case above so the numbered run ascends through this file; the manifest numbers
+// this file 602/1..41.
+#[test]
+fn api_surface_is_pure_and_restricted() {
+    fn assert_pure_fn<Req, Out>(
+        _f: fn(Req) -> Result<Out, eliot_dreamer_contracts::ContractViolation>,
+    ) {
+    }
+    assert_pure_fn(eliot_dreamer_claim_grounding::ground_draft_with_controls);
+}
+
+// ---------------------------------------------------------------------------
+// A-14b -> A-05 carrier producer (issue #262, R-UNRESOLVED-ROWS "A-14b -> A-05
+// producer link" and the A2 static-vs-runtime acceptance gap behind it).
+//
+// `cognitive-wave-10.toml` records `rust_owner =
+// "eliot-dreamer-claim-grounding"` for the `GroundingValidationInput` carrier,
+// so this crate owns the one production construction site
+// (`validation_bridge.rs::bind_validation_input`, crate-internal so no external
+// consumer can hand it a grounded value that skipped grounding) and its
+// production caller (`validation_bridge.rs::ground_for_validation`, which
+// grounds through `grounding.rs::ground_draft_with_controls`). The carrier type
+// itself is frozen in `eliot-dreamer-contracts`, and its `validate()` remains
+// the single binding validator.
+// ---------------------------------------------------------------------------
+
+/// Maximum receipt-excluded canonical preimage byte ceiling, from the frozen
+/// validation-bounds owner.
+fn max_canonical_bytes() -> u64 {
+    u64::try_from(eliot_dreamer_contracts::validation::MAX_CANONICAL_BYTES)
+        .expect("canonical ceiling fits u64")
+}
+
+/// Builds the independently supplied A-05 leg of the handoff.
+///
+/// The policy identity is the only variable input: it is what the carrier
+/// contract binds against the grounded job's `policy_ref`.
+fn validation_attachment(policy_ref: &str) -> ValidationAttachment {
+    let mut policy =
+        eliot_dreamer_contracts::ValidationPolicy::new(policy_ref, 1, max_canonical_bytes());
+    policy.seal().expect("validation policy seals");
+    let verdicts = eliot_dreamer_contracts::PRESERVATION_DIMENSIONS
+        .iter()
+        .map(
+            |spelling| eliot_dreamer_contracts::candidate::DimensionVerdict {
+                dimension: eliot_dreamer_contracts::PreservationDimension::parse(spelling)
+                    .expect("known preservation dimension"),
+                passed: true,
+                known: true,
+                note: "candidate-only grounding handoff; verbatim retention, no fact promoted"
+                    .to_owned(),
+            },
+        )
+        .collect();
+    ValidationAttachment {
+        policy,
+        usage: eliot_dreamer_contracts::BudgetUsage::default(),
+        preservation: eliot_dreamer_contracts::PreservationReport { verdicts },
+        observation_time_ms: None,
+        cancellation_requested: false,
+        rival_declarations: None,
+    }
+}
+
+/// One real, fully grounded A03 v2 context bound to a supported claim.
+fn grounding_request_for_producer() -> GroundingRequest {
+    let manifest = manifest_for("proposition-1", Some(supported_record()));
+    let model_draft = draft(
+        &manifest,
+        vec![claim("claim-1", "proposition-1", Some("evidence-1"))],
+        eliot_dreamer_contracts::JobClass::Orientation,
+    );
+    GroundingRequest::new(
+        model_draft.job.clone(),
+        model_draft.bundle.clone(),
+        manifest,
+        model_draft,
+        policy(),
+    )
+}
+
+/// The owner producer builds the carrier from real grounding inputs and the
+/// frozen carrier contract accepts it.
+// WORK_UNIT_CASE: 602/39
+#[test]
+fn owner_producer_binds_the_carrier_from_real_grounding() {
+    let carrier = ground_for_validation(GroundingValidationRequest::new(
+        grounding_request_for_producer(),
+        validation_attachment("grounding-policy"),
+    ))
+    .expect("owner binds the A-05 carrier");
+    carrier
+        .validate()
+        .expect("carrier contract accepts the bound value");
+    assert_eq!(
+        carrier.grounded.ledger.job_id, carrier.grounded.job_id,
+        "the ledger records the grounded job identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.task_id, carrier.grounded.task_id,
+        "the ledger records the grounded task identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.scope_id, carrier.grounded.scope_id,
+        "the ledger records the grounded scope identity"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.state_fence, carrier.grounded.state_fence,
+        "the ledger records the grounded state fence"
+    );
+    assert_eq!(
+        carrier.policy.policy_id, carrier.grounded.input.job.policy_ref,
+        "the A-05 policy is bound to the grounded job"
+    );
+    assert_eq!(
+        carrier.grounded.ledger.records["claim-1"].disposition,
+        SupportResult::Supported,
+        "the carrier carries real owner-computed grounding, not an empty ledger"
+    );
+    carrier
+        .input_digest_and_size()
+        .expect("the bound carrier has a receipt-excluded input digest");
+}
+
+/// Refusal: an A-05 leg recorded against a different job cannot be sealed into
+/// this carrier. The frozen `validate()` owns this join; the producer routes
+/// every outcome through it instead of restating it.
+// WORK_UNIT_CASE: 602/40
+#[test]
+fn owner_producer_refuses_a_carrier_whose_binding_does_not_match_its_input() {
+    let error = ground_for_validation(GroundingValidationRequest::new(
+        grounding_request_for_producer(),
+        validation_attachment("other-policy"),
+    ))
+    .expect_err("a policy recorded for another job cannot seal this carrier");
+    assert!(
+        matches!(
+            error,
+            eliot_dreamer_contracts::DreamDraftValidationError::InvalidContract {
+                field: "structured.policy.policy_ref",
+                ..
+            }
+        ),
+        "unexpected refusal: {error}"
+    );
+}
+
+/// Positive control for the grade axis: this crate's own grounded record
+/// carries `grade == grade_ceiling`, so the grade axis asserts nothing above
+/// the candidate-only position, and the public entry therefore binds a carrier
+/// the frozen contract accepts.
+///
+/// The forged-value refusals for BOTH epistemic axes live in the crate's own
+/// `src/validation_bridge.rs` test module instead of here. `bind_validation_input`
+/// is `pub(crate)` on purpose: it is the production construction site and the
+/// only caller is `ground_for_validation`, which grounds first. An integration
+/// target is a separate crate and cannot reach it, which is precisely the
+/// property Defect B required. Reaching a refusal from here therefore means
+/// going through `ground_for_validation`, and the public entry grounds through
+/// `ground_draft_with_controls`, whose producer caps cannot emit a
+/// self-certified record in the first place — on EITHER axis, not just the
+/// assertability one. The assertability axis is capped unconditionally by
+/// `evidence::evaluate_claim`; the grade axis is re-pinned by
+/// `grounding::aggregate_parent_record`, which sets a parent's `grade_ceiling`
+/// to the parent's own `grade` once that grade is known, so a parent carrying
+/// its own accepted support cannot end up certifying rigour above a ceiling its
+/// own subclaims lowered. That is the point of the case: the public surface can
+/// no longer be handed a grounded value that skipped grounding, on either axis.
+/// `parent_with_own_support_and_a_supportless_subclaim_binds_through_the_public_entry`
+/// earlier in this file is the multi-claim form of the same guarantee; this case
+/// is the single-claim form.
+// WORK_UNIT_CASE: 602/41
+#[test]
+fn owner_producer_binds_when_the_grade_axis_is_at_its_ceiling() {
+    let carrier = ground_for_validation(GroundingValidationRequest::new(
+        grounding_request_for_producer(),
+        validation_attachment("grounding-policy"),
+    ))
+    .expect("the legitimate grade axis binds");
+    let record = &carrier.grounded.ledger.records["claim-1"];
+    assert_eq!(
+        record.grade_ceiling,
+        eliot_dreamer_contracts::grounding::canonical::EvidenceGrade::Grounded,
+        "measured: the producer leaves grade_ceiling at the weakest retained grade"
+    );
+    assert_eq!(
+        record.grade,
+        Some(GradeAssignment::known(
+            eliot_dreamer_contracts::grounding::canonical::EvidenceGrade::Grounded
+        )),
+        "measured: grade equals its own ceiling, so the grade axis certifies nothing above it"
+    );
+    carrier
+        .validate()
+        .expect("the frozen contract accepts the bound carrier");
 }

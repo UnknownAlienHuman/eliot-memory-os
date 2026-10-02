@@ -352,6 +352,15 @@
 //!   `ImprovementCandidate::transition_lifecycle` refuses `Supported`/`Narrowed`
 //!   outright (`lib.rs:948`) and only `promote_lifecycle` admits them, and only
 //!   with a budget proof.
+//! - The edge INTO `AcceptedForExperiment` is additionally gated on the
+//!   Governor's governed improvement-experiment owner
+//!   (`eliot_governor::run_improvement_experiment_loop`, reached from
+//!   `governed_experiment_refusal`): the outer experiment loop's candidate must
+//!   exist before the lifecycle may claim an experiment is starting. The
+//!   improvement-intake seam publishes no experiment owner record, so the gate
+//!   answers with a typed `OwnerAbsent` rather than a pass, and the live daemon
+//!   leg — which only ever passes `ImprovementLifecycle::Triaged` here — is
+//!   unchanged.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
 //!
@@ -621,6 +630,49 @@ fn lifecycle_edge_allowed(from: ImprovementLifecycle, to: ImprovementLifecycle) 
             )
             | (ImprovementLifecycle::Stale, ImprovementLifecycle::Archived)
     )
+}
+
+/// Ask the Governor's governed improvement-experiment owner for the experiment
+/// the `accepted_for_experiment` edge would start, and report the typed refusal
+/// that blocks the edge.
+///
+/// This is the production caller of
+/// [`eliot_governor::run_improvement_experiment_loop`], reached from the live
+/// daemon leg: `daemon_runtime::run_improvement_intake` →
+/// `improvement_intake_dispatch::assemble_improvement_artifact` →
+/// `ImprovementCandidate::transition_lifecycle`. Before #45 the outer experiment
+/// loop had no producer at all, so `AcceptedForExperiment` was reachable only in
+/// this crate's own fixtures.
+///
+/// The three hops are named, not line-pinned: `daemon_runtime.rs` grows, and the
+/// durable evidence for this caller is the hop chain rather than any one
+/// line number.
+///
+/// The improvement-intake seam publishes no experiment owner records at all — no
+/// attribution, bounded plan, mechanism declaration, assignment seed, rollback
+/// contract, contamination account, evidence freeze or dimensioned outcome
+/// reaches it — so the presentation is
+/// [`eliot_governor::ExperimentOwnerInput::no_owner_records`] and the Governor
+/// owner answers with its own typed `OwnerAbsent` naming the first missing seam.
+/// Nothing is invented to reach `accepted_for_experiment`, and the verdict is
+/// returned to the caller rather than dropped.
+///
+/// The `Experimental` arm cannot be reached through this presentation. It is
+/// kept explicit rather than folded into the other arm so that a future owner
+/// publishing every record at this seam gets a refusal naming the ledger this
+/// seam does not own, instead of a candidate that is silently dropped on the
+/// floor.
+fn governed_experiment_refusal() -> eliot_governor::ExperimentRefusal {
+    match eliot_governor::run_improvement_experiment_loop(
+        &eliot_governor::ExperimentOwnerInput::no_owner_records(),
+    ) {
+        eliot_governor::ExperimentLoopOutcome::NotExperimental { reason } => reason,
+        eliot_governor::ExperimentLoopOutcome::Experimental(_) => {
+            eliot_governor::ExperimentRefusal::OwnerAbsent {
+                field: "experiment.intake_ledger",
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -941,6 +993,22 @@ impl ImprovementCandidate {
     /// [`ImprovementCandidate::promote_lifecycle`], which is the only seam that
     /// admits a budget record. The gate therefore lives on the transition to
     /// promotion itself, not only on the intake path.
+    ///
+    /// # The edge INTO an experiment is the outer loop's experiment step
+    ///
+    /// I12.24:36-37 makes `accepted_for_experiment` a lifecycle edge, and
+    /// I12.24:65 places "decision owner selects reject / investigate / work item
+    /// / experiment" immediately before "isolated worktree or candidate Module
+    /// generation". So the edge into `AcceptedForExperiment` is where the outer
+    /// loop actually starts, and it is fail-closed through
+    /// [`governed_experiment_refusal`]: the Governor experiment owner is asked
+    /// to produce the governed
+    /// [`eliot_learning_contracts::ImprovementExperimentCandidate`] from the
+    /// owner records published at this seam, and the candidate's absence or
+    /// refusal is this edge's typed gate. The daemon's live leg passes
+    /// [`ImprovementLifecycle::Triaged`] here, so no behaviour changes on it; an
+    /// owner that does select an experiment is refused with the exact named seam
+    /// rather than being handed a lifecycle state with no experiment behind it.
     pub fn transition_lifecycle(
         &mut self,
         next: ImprovementLifecycle,
@@ -950,6 +1018,11 @@ impl ImprovementCandidate {
                 "promote or narrow requires a matched budget-equivalence ledger and \
                  conclusive complexity-economics delta; use promote_lifecycle",
             ));
+        }
+        if next == ImprovementLifecycle::AcceptedForExperiment {
+            return Err(ImprovementError::Experiment {
+                reason: governed_experiment_refusal(),
+            });
         }
         self.apply_lifecycle_edge(next)
     }
@@ -1373,6 +1446,19 @@ pub enum ImprovementError {
     ApplicationClassViolation,
     #[error("promotion requires a bound budget-equivalence and economics record")]
     MissingBudgetProof,
+    /// The Governor's governed improvement-experiment owner refused the
+    /// candidate.
+    ///
+    /// CC-007's improvement-experiment contract needs named owners, and the
+    /// Governor experiment owner returns a typed reason for every refusal: an
+    /// absent owner seam stays distinct from a content failure and from a failed
+    /// owner record, so this refusal is carried whole and is never collapsed
+    /// into a boolean or a reason string.
+    #[error("governed improvement experiment refused: {reason}")]
+    Experiment {
+        /// The Governor experiment owner's typed refusal.
+        reason: eliot_governor::ExperimentRefusal,
+    },
     #[error("budget gate refused promotion: {0}")]
     BudgetGateViolation(&'static str),
     #[error("backlog refused intake: {0}")]

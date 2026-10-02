@@ -4,10 +4,29 @@
 //! [`DreamJobAdmission`](eliot_dreamer_contracts::DreamJobAdmission),
 //! [`DreamInputBundle`](eliot_dreamer_contracts::DreamInputBundle),
 //! [`AllowedReferenceManifest`](eliot_dreamer_contracts::grounding::AllowedReferenceManifest),
-//! the v2 validation carrier, and the v1 hypothesis pair — from the admitted
-//! pair only. No retrieval, ranking, model work, or truth promotion happens
-//! here: every digest below is owner-computed and every value passes the real
-//! owner validation before it leaves.
+//! the A-05 validation attachment, and the v1 hypothesis pair — from the
+//! admitted pair only. No retrieval, ranking, model work, or truth promotion
+//! happens here: every digest below is owner-computed and every value passes
+//! the real owner validation before it leaves.
+//!
+//! The A-14b -> A-05 handoff has exactly one production construction site, and
+//! it is not here. `eliot-dreamer-claim-grounding` owns it
+//! (`validation_bridge::ground_for_validation` -> `bind_validation_input`,
+//! which calls the frozen `GroundingValidationInput::new`): `ARCH-MOD-03`
+//! ("one causal responsibility, one owner") and the crate's own
+//! `module.toml` put the carrier construction in the cell that owns the
+//! `GroundedDreamDraft` it carries. This module therefore supplies only the
+//! A-05 half that the owner cannot know: the policy, the usage, the seven
+//! preservation verdicts each computed from the admitted fact it corresponds
+//! to (admitted job, derived bundle, rebuilt frozen manifest), plus the
+//! observation time the caller measures for this attempt
+//! ([`observed_attempt_wall_ms`]). One preservation verdict is not derived
+//! from admitted material at all: [`identity_and_closure_findings`] names the
+//! one conjunct that reads the standing policy this root issues instead. A
+//! member this root does not hold is either reported as the absence it is, or
+//! — where the frozen contract admits no absent state at all, as with
+//! `cancellation_requested` — named in the comment that carries it, never
+//! turned into a fabricated default.
 //!
 //! Binary-derived bindings, documented once here:
 //!
@@ -54,8 +73,10 @@
 //!   truth. The binary packet mapping keeps the `candidate_only` ceiling.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use eliot_contracts::{StateFence, TaskId, sha256_hex};
+use eliot_dreamer_claim_grounding::ValidationAttachment;
 use eliot_dreamer_contracts::budget::{
     ATTEMPTS_CEILING, CANDIDATES_CEILING, INPUT_BYTES_CEILING, MODEL_CALLS_CEILING,
     OUTPUT_BYTES_CEILING, REFERENCE_WIDTH_CEILING, REPORT_BYTES_CEILING, SOURCE_WIDTH_CEILING,
@@ -65,13 +86,11 @@ use eliot_dreamer_contracts::candidate::{
     DimensionVerdict, PRESERVATION_DIMENSIONS, PreservationDimension,
 };
 use eliot_dreamer_contracts::grounding::{
-    AllowedReferenceManifest, ClaimKind, GROUNDING_SCHEMA_VERSION, GroundedDreamDraft,
-    GroundingPolicy,
+    AllowedReferenceManifest, ClaimKind, GROUNDING_SCHEMA_VERSION, GroundingPolicy,
 };
 use eliot_dreamer_contracts::job::DREAM_JOB_SCHEMA_VERSION;
 use eliot_dreamer_contracts::validation::MAX_CANONICAL_BYTES;
 use eliot_dreamer_contracts::validation::model_digest;
-use eliot_dreamer_contracts::validation::structured::GroundingValidationInput;
 use eliot_dreamer_contracts::{
     BudgetLimits, BudgetUsage, BundleCompleteness, BundleMaterial, ClaimResidue, DreamInputBundle,
     DreamJobAdmission, GroundedDreamDraft as TextGroundedDraft, JobClass,
@@ -329,10 +348,22 @@ pub(crate) fn manifest_of(
 /// Fixed composition constants, not per-job derivation: the policy admits the
 /// full closed claim vocabulary with bounded ceilings under every owner
 /// class ceiling, and no non-material residue class (retained residue refuses
-/// fail-closed at the owner). The digest is owner-computed; on the impossible
-/// encoding failure a well-formed hex fallback is carried instead, which the
-/// owner digest check then refuses fail-closed rather than grounding under a
-/// forged binding.
+/// fail-closed at the owner). The digest is owner-computed.
+///
+/// This is the single place in this module where a typed owner failure becomes
+/// a value rather than a refusal. Everywhere else an owner `Err` becomes the
+/// matching `DreamerError::InvalidAdmission` static; here
+/// [`GroundingPolicy::computed_digest`](eliot_dreamer_contracts::grounding::GroundingPolicy::computed_digest)
+/// returning `ContractViolation` substitutes a freshly hashed well-formed hex
+/// digest instead of propagating an `Err`, so the caller receives a policy
+/// rather than a refusal. The substitution is deliberate and fail-closed one
+/// stage later rather than at this site: the substituted digest is a valid hex
+/// encoding but not the policy's real preimage digest, so the owner's own
+/// digest check — `GroundingPolicy::validate`'s
+/// `computed_digest()? != self.digest`
+/// (`eliot-dreamer-contracts/src/grounding/policy.rs:88-93`), which the
+/// grounding owner calls on this policy — is where the refusal actually
+/// happens. Nothing grounds under a forged binding.
 pub(crate) fn grounding_policy() -> GroundingPolicy {
     let mut policy = GroundingPolicy {
         schema_version: GROUNDING_SCHEMA_VERSION,
@@ -402,22 +433,329 @@ pub(crate) fn validation_policy_of(policy_ref: &str) -> Result<ValidationPolicy,
     Ok(policy)
 }
 
-/// Builds the seven-dimension preservation report for a candidate-only bundle.
+/// Observes the A-05 observation time for one admitted attempt.
 ///
-/// Every dimension passes known with an honest candidate-only note: the
-/// bundle carries handles, never promoted facts, so there is nothing to
-/// preserve beyond verbatim retention. Proved with the real owner shape
-/// check; `overall` is left to the validating owner.
-pub(crate) fn preservation_of() -> Result<PreservationReport, DreamerError> {
+/// The A-05 owner compares this value against the admitted job's own
+/// `deadline_ms` in the same unit — its `validate_budget_deadline` refuses only
+/// when `observed >= deadline`, and it refuses a *missing* observation as a
+/// deadline failure of its own — so the value this seam supplies must be that
+/// job's elapsed wall time, measured from the moment the admitted chain for
+/// this attempt began. It is a measurement, never a literal: the origin
+/// belongs to the caller that owns the attempt, this function only reads the
+/// clock. A monotonic reading that does not fit the wire range is fail-closed
+/// rather than clamped to a value the deadline gate would read as unexpired.
+pub(crate) fn observed_attempt_wall_ms(started: Instant) -> Result<u64, DreamerError> {
+    u64::try_from(started.elapsed().as_millis())
+        .map_err(|_| DreamerError::InvalidAdmission("admitted attempt wall clock is out of range"))
+}
+
+/// Every handle family the admitted job carries, in bundle-accounting order.
+fn admitted_handle_families(job: &DreamJobInput) -> [(&'static str, &[String]); 5] {
+    [
+        ("evidence", job.evidence_handles.as_slice()),
+        ("memory", job.memory_handles.as_slice()),
+        ("architecture", job.architecture_handles.as_slice()),
+        ("implementation", job.implementation_handles.as_slice()),
+        ("conformance", job.conformance_handles.as_slice()),
+    ]
+}
+
+/// Builds one preservation verdict from an already-computed finding.
+///
+/// Its two refusals are distinct owner failures and keep distinct statics: an
+/// unrecognised dimension spelling is not the same fault as the report shape
+/// the caller later proves with
+/// [`PreservationReport::validate`](eliot_dreamer_contracts::PreservationReport::validate).
+fn preservation_verdict(
+    spelling: &str,
+    passed: bool,
+    note: String,
+) -> Result<DimensionVerdict, DreamerError> {
+    Ok(DimensionVerdict {
+        dimension: PreservationDimension::parse(spelling).map_err(|_| {
+            DreamerError::InvalidAdmission("preservation dimension spelling is not a dimension")
+        })?,
+        passed,
+        known: true,
+        note,
+    })
+}
+
+/// The two accountings the derived bundle makes of the admitted handles: the
+/// handles it carries as material, and the handles it accounts as omissions.
+fn bundle_handle_sets(bundle: &DreamInputBundle) -> (BTreeSet<&str>, BTreeSet<&str>) {
+    let carried: BTreeSet<&str> = bundle.materials.iter().map(|m| m.handle.as_str()).collect();
+    let omitted: BTreeSet<&str> = bundle.omissions.iter().map(|o| o.handle.as_str()).collect();
+    (carried, omitted)
+}
+
+/// Computes the preservation verdicts that read the bundle's own accounting.
+///
+/// `coverage`, `faithfulness`, `reversibility`, and `provenance_retention` are
+/// all properties of what the derived bundle does and does not carry, so each
+/// is decided here by comparing the bundle's entries with the admitted job's
+/// handle families. Keys are the owner's canonical dimension spellings.
+fn bundle_accounting_findings(
+    bundle: &DreamInputBundle,
+    job: &DreamJobInput,
+) -> BTreeMap<&'static str, (bool, String)> {
+    let (carried, omitted) = bundle_handle_sets(bundle);
+    let admitted_evidence: BTreeSet<&str> =
+        job.evidence_handles.iter().map(String::as_str).collect();
+    let is_retained_digest = |value: &str| {
+        value.len() == 64
+            && value
+                .chars()
+                .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
+    };
+    let denominator_declared_honestly = bundle.materials.len() == carried.len()
+        && bundle.omissions.len() == omitted.len()
+        && bundle.completeness == BundleCompleteness::PartialForScope
+        && bundle.authoritative_denominator.is_none();
+    let handles_kept_verbatim = bundle
+        .materials
+        .iter()
+        .all(|m| admitted_evidence.contains(m.handle.as_str()))
+        && bundle
+            .materials
+            .iter()
+            .all(|m| m.disposition == SourceDisposition::Required)
+        && bundle.completeness != BundleCompleteness::CompleteForScope;
+    let omissions_recoverable = bundle
+        .omissions
+        .iter()
+        .all(|o| o.reversible && o.nonrecoverable_reason.is_none());
+    let digests_retained = bundle
+        .materials
+        .iter()
+        .all(|m| is_retained_digest(m.digest.as_str()))
+        && bundle
+            .omissions
+            .iter()
+            .all(|o| is_retained_digest(o.digest.as_str()) && !o.reason.trim().is_empty());
+    BTreeMap::from([
+        (
+            "coverage",
+            (
+                denominator_declared_honestly,
+                format!(
+                    "{} carried and {} omitted handles declared {:?} with no authoritative \
+                     denominator",
+                    carried.len(),
+                    omitted.len(),
+                    bundle.completeness
+                ),
+            ),
+        ),
+        (
+            "faithfulness",
+            (
+                handles_kept_verbatim,
+                format!(
+                    "every one of the {} carried handles keeps its admitted handle verbatim at \
+                     the Required disposition; completeness never claims a whole scope",
+                    carried.len()
+                ),
+            ),
+        ),
+        (
+            "reversibility",
+            (
+                omissions_recoverable,
+                format!(
+                    "all {} omitted handles are reversible with no nonrecoverable reason, and \
+                     this composition performs no external effect before the handoff",
+                    omitted.len()
+                ),
+            ),
+        ),
+        (
+            "provenance_retention",
+            (
+                digests_retained,
+                format!(
+                    "every one of the {} carried entries retains a 64-hex owner-computed content \
+                     digest, and all {} omitted entries retain their reason and record digest",
+                    carried.len(),
+                    omitted.len()
+                ),
+            ),
+        ),
+    ])
+}
+
+/// Computes the preservation verdicts that read identity and closure.
+///
+/// `lineage`, `authority_ceiling`, and `dependency_closure` are decided against
+/// the admitted job: `lineage` and `dependency_closure` compare the derived
+/// bundle and the rebuilt frozen manifest with the admitted job, so each of
+/// those comparisons is over admitted material only. `authority_ceiling` is
+/// the one exception — its third conjunct reads [`grounding_policy`], the
+/// standing composition constant this root issues, not admitted material,
+/// because the ceiling this root admits is a property of the root's own
+/// policy. Keys are the owner's canonical dimension spellings.
+fn identity_and_closure_findings(
+    admitted: &DreamJobAdmission,
+    bundle: &DreamInputBundle,
+    manifest: &AllowedReferenceManifest,
+    job: &DreamJobInput,
+) -> BTreeMap<&'static str, (bool, String)> {
+    let (carried, omitted) = bundle_handle_sets(bundle);
+    // Bound once: the standing policy is the same value in the
+    // `authority_ceiling` conjunct and in its note, and each call recomputes
+    // the owner SHA-256 digest.
+    let policy = grounding_policy();
+
+    // Every admitted handle must be named exactly once across the bundle's two
+    // accountings, and no handle may be both carried and omitted.
+    let admitted_count: usize = admitted_handle_families(job)
+        .iter()
+        .map(|(_, handles)| handles.len())
+        .sum();
+    let mut handles_accounted = true;
+    for (_, handles) in admitted_handle_families(job) {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for handle in handles {
+            if !seen.insert(handle.as_str()) {
+                handles_accounted = false;
+            }
+            if !carried.contains(handle.as_str()) && !omitted.contains(handle.as_str()) {
+                handles_accounted = false;
+            }
+        }
+    }
+    let every_handle_named_once = handles_accounted
+        && carried.is_disjoint(&omitted)
+        && bundle.materials.iter().all(|m| !m.handle.trim().is_empty())
+        && bundle.omissions.iter().all(|o| !o.handle.trim().is_empty());
+
+    let identity_chain_intact = bundle.job_id == admitted.canonical_id()
+        && bundle.scope_id == admitted.scope_id
+        && bundle.task_id == admitted.task_id
+        && bundle.state_fence == job.state_fence
+        && bundle.manifest_digest == admitted.frozen_manifest_digest
+        && manifest.digest == admitted.frozen_manifest_digest
+        && bundle
+            .omissions
+            .iter()
+            .all(|o| o.scope_id == admitted.scope_id && o.task_id == admitted.task_id);
+
+    // The third conjunct is the one comparison here that does not read the
+    // admitted job: the standing policy is this root's own composition
+    // constant (see this function's doc and [`grounding_policy`]).
+    let ceiling_respected = manifest.references.is_empty()
+        && bundle.authoritative_denominator.is_none()
+        && policy.permitted_nonmaterial_classes.is_empty();
+
+    BTreeMap::from([
+        (
+            "lineage",
+            (
+                identity_chain_intact,
+                format!(
+                    "bundle job, scope, task, fence, and frozen manifest digest agree with the \
+                     admitted job and the rebuilt manifest; all {} omissions carry the same \
+                     scope and task",
+                    omitted.len()
+                ),
+            ),
+        ),
+        (
+            "authority_ceiling",
+            (
+                ceiling_respected,
+                format!(
+                    "the rebuilt frozen manifest admits {} references, the bundle claims no \
+                     authoritative denominator, and the standing grounding policy this root \
+                     issues admits {} non-material residue classes; the owner caps every \
+                     retained record itself",
+                    manifest.references.len(),
+                    policy.permitted_nonmaterial_classes.len()
+                ),
+            ),
+        ),
+        (
+            "dependency_closure",
+            (
+                every_handle_named_once,
+                format!(
+                    "all {admitted_count} admitted handles are named exactly once across {} \
+                     carried and {} omitted entries; none is dropped, duplicated, or both",
+                    carried.len(),
+                    omitted.len()
+                ),
+            ),
+        ),
+    ])
+}
+
+/// Builds the seven-dimension preservation report from the admitted material.
+///
+/// Each verdict is a comparison over admitted material this root actually
+/// holds — the derived bundle, the rebuilt frozen manifest, and the admitted
+/// job — with the single exception named in
+/// [`identity_and_closure_findings`]. Each note states the counts that
+/// comparison read, and those counts are the whole of the report's
+/// discriminating content: what separates one admitted job's report from
+/// another's is the admitted handle counts the comparisons read (`carried`,
+/// `omitted`, the admitted handle total, the rebuilt manifest's reference
+/// count, the standing policy's non-material class count), plus the
+/// construction-fixed completeness the `coverage` note renders. No note
+/// carries `job_id`, `scope_id`, `task_id`, `exact_question`, `budget_units`,
+/// `deadline_ms`, `privacy_profile`, or `allowed_model_routes`, so two distinct
+/// admitted jobs whose handle families have equal counts produce
+/// byte-identical reports. A report for an admitted job with different handle
+/// counts is therefore distinguishable from this one, and that weaker statement
+/// is the one the composition-root proof asserts.
+///
+/// The comparisons are real derivations, not literals, and they stay: they are
+/// what would decide the verdict if their inputs disagreed, and removing them
+/// would delete the derivation rather than strengthen the claim. What the
+/// measured truth is that on today's tree no admitted job can make any of them
+/// fail. Duplicate handles are already refused by the real `bundle.validate()`
+/// (bundle.rs:217-228) before [`bundle_of`] returns, so the `dependency_closure`
+/// arm cannot fail;
+/// `manifest.references` is empty by construction; the standing grounding
+/// policy's permitted non-material classes are an empty set; `reversible: true`
+/// and `nonrecoverable_reason: None` are fixed at construction; the disposition,
+/// completeness, and denominator values are fixed at construction; and the
+/// lineage comparisons compare fields [`bundle_of`] itself copied from the
+/// admitted job. So on the current tree all seven verdicts pass by
+/// construction. A structural re-derivation that could actually fail belongs
+/// to the A-05 owner
+/// (`candidate-validation/src/structured/validate.rs`), which re-checks these
+/// properties against the grounded value it holds.
+///
+/// Every dimension is derived here, so none of them is reported as unmeasured:
+/// a dimension this root could not derive is refused, not passed on a guess.
+/// That refusal is the `Err` at the bottom of this function —
+/// `DreamerError::InvalidAdmission("preservation dimension is not derived")` —
+/// so no dimension is ever emitted with `known: false`;
+/// [`preservation_verdict`] sets that field to `true` on every verdict it
+/// builds, and a dimension that never reaches it never reaches a report.
+///
+/// The A-05 owner re-derives the same properties structurally against the
+/// grounded value it holds
+/// (`eliot_dreamer_candidate_validation::validate_preservation_evidence`),
+/// so this report is the caller's half of that check — the admitted-input half
+/// — and not a replacement for it. Proved with the real owner shape check;
+/// `overall` is left to the validating owner.
+pub(crate) fn preservation_of(
+    admitted: &DreamJobAdmission,
+    bundle: &DreamInputBundle,
+    manifest: &AllowedReferenceManifest,
+    job: &DreamJobInput,
+) -> Result<PreservationReport, DreamerError> {
+    let mut computed = identity_and_closure_findings(admitted, bundle, manifest, job);
+    computed.extend(bundle_accounting_findings(bundle, job));
     let mut verdicts = Vec::with_capacity(PRESERVATION_DIMENSIONS.len());
     for spelling in PRESERVATION_DIMENSIONS {
-        verdicts.push(DimensionVerdict {
-            dimension: PreservationDimension::parse(spelling)
-                .map_err(|_| DreamerError::InvalidAdmission("preservation binding invalid"))?,
-            passed: true,
-            known: true,
-            note: "candidate-only bounded bundle; verbatim retention, no fact promoted".to_owned(),
-        });
+        let Some((passed, note)) = computed.remove(*spelling) else {
+            return Err(DreamerError::InvalidAdmission(
+                "preservation dimension is not derived",
+            ));
+        };
+        verdicts.push(preservation_verdict(spelling, passed, note)?);
     }
     let report = PreservationReport { verdicts };
     report
@@ -426,33 +764,68 @@ pub(crate) fn preservation_of() -> Result<PreservationReport, DreamerError> {
     Ok(report)
 }
 
-/// Builds the v2 A-05 input carrier for one grounded draft.
+/// Supplies the A-05 half of the A-14b -> A-05 handoff for one admission.
 ///
-/// Derives usage, policy (bound to the admitted `policy_ref`), and
-/// preservation from admitted material only, with no rival declarations and
-/// no cancellation. The caller supplies the explicit observation time:
-/// pass `Some(0)` (start of attempt) for jobs with a positive deadline.
-/// Proved with the real [`GroundingValidationInput::new`](eliot_dreamer_contracts::validation::structured::GroundingValidationInput::new).
-pub(crate) fn validation_input_for(
+/// This is **not** a carrier: it is the explicitly supplied
+/// [`ValidationAttachment`] the owning crate binds to the grounded draft. Every
+/// member is derived from admitted material or measured by the caller — usage
+/// from the admitted budget, policy sealed against the admitted `policy_ref`,
+/// the seven preservation verdicts each computed from the derived bundle and
+/// the rebuilt frozen manifest - with the single `authority_ceiling` exception
+/// named in [`identity_and_closure_findings`] - and `observation_time_ms` as
+/// the caller
+/// measured it for this attempt ([`observed_attempt_wall_ms`]). The observation
+/// is the admitted job's own elapsed wall time because that is the unit the
+/// owner compares it against; it is never a literal, and the owner refuses a
+/// deadline without an explicit observation, so an honest absence would be a
+/// refusal rather than a pass.
+///
+/// Two members this root does not hold are reported differently, because the
+/// frozen contract treats them differently.
+///
+/// `rival_declarations` is `None`: rival declarations are not admitted
+/// material on this path, absence is recorded as absence, and it is never
+/// filled from the grounded value, the ledger, or model text.
+///
+/// `cancellation_requested` is a frozen `bool`, not an `Option<bool>`
+/// (`eliot_dreamer_contracts::validation::structured::GroundingValidationInput`),
+/// so the field has no absent state: a `false` supplied here is read
+/// downstream as an authoritative "not cancelled" and is consumed as such
+/// (A-05's `validate_budget_deadline` rejects on `true` alone). The value
+/// below is therefore not a recorded absence of observation — it is the
+/// negative this path asserts, and it is asserted without consulting the
+/// cancellation identity the root does hold:
+/// [`KernelJobAdmission::cancellation_id`]. That identity is a Kernel-owned
+/// handle with no local cancellation signal behind it on this path, so
+/// nothing here checks, and the honest reading of this member is "this
+/// composition did not observe a cancellation", not "cancellation was
+/// checked and is absent". The missing tri-state belongs to the frozen
+/// contract, which this root does not restate; it is recorded as a Contract
+/// Challenge rather than papered over here.
+///
+/// The carrier itself is constructed in exactly one production place, inside
+/// the crate whose `module.toml` claims that ownership
+/// (`eliot_dreamer_claim_grounding::validation_bridge`).
+pub(crate) fn validation_attachment_for(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-    grounded: GroundedDreamDraft,
     observation_time_ms: Option<u64>,
-) -> Result<GroundingValidationInput, DreamerError> {
+) -> Result<ValidationAttachment, DreamerError> {
     let admitted = admission_of(admission, job)?;
-    let usage = usage_of(&admitted.budget);
-    let policy = validation_policy_of(admitted.policy_ref.as_str())?;
-    let preservation = preservation_of()?;
-    GroundingValidationInput::new(
-        grounded,
-        policy,
-        usage,
-        preservation,
+    let bundle = bundle_of(admission, job)?;
+    let manifest = manifest_of(&bundle)?;
+    Ok(ValidationAttachment {
+        policy: validation_policy_of(admitted.policy_ref.as_str())?,
+        usage: usage_of(&admitted.budget),
+        preservation: preservation_of(&admitted, &bundle, &manifest, job)?,
         observation_time_ms,
-        false,
-        None,
-    )
-    .map_err(|_| DreamerError::InvalidAdmission("validation input binding invalid"))
+        // See the module-level note above: the frozen field admits no
+        // unobserved state, so this `false` is an asserted negative and the
+        // `cancellation_id` this root holds is not consulted to reach it.
+        cancellation_requested: false,
+        // No rival declarations are admitted material on this path.
+        rival_declarations: None,
+    })
 }
 
 /// Derives the v1 hypothesis text from the admitted pair.

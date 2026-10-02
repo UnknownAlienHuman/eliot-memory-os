@@ -17,11 +17,11 @@ primary_responsibility = "Bind every decision-bearing claim in a bounded model d
 owned_mutable_state = []
 allowed_effects = []
 inputs = ["DreamInputBundle", "ReferenceManifest", "ModelDraft"]
-outputs = ["GroundedDreamDraft", "ClaimGroundingLedger", "unsupported/conflicted claim dispositions"]
+outputs = ["GroundedDreamDraft", "ClaimGroundingLedger", "GroundingValidationInput", "unsupported/conflicted claim dispositions"]
 depends_on = ["eliot-dreamer-contracts"]
 consumers = ["eliot-dreamer-candidate-validation"]
 non_goals = ["retrieve or grade sources", "resolve truth", "rewrite claims to sound supported", "call a model"]
-invariants = ["aggregate packet lineage never substitutes for claim lineage", "only handles authorized by the bundle may bind", "unsupported and conflicted claims remain visible", "grounding does not promote epistemic status"]
+invariants = ["aggregate packet lineage never substitutes for claim lineage", "only handles authorized by the bundle may bind", "unsupported and conflicted claims remain visible", "grounding does not promote epistemic status", "this crate's public surface constructs the A-05 carrier only from this cell's owner-computed grounding output plus independently supplied A-05 data, while the frozen contracts-crate carrier type keeps its own pub constructor that this cell neither owns nor closes, and no retained record may claim an epistemic position above the candidate-only ceiling declared once as evidence::CANDIDATE_ONLY_CEILING", "a retained record's grade never sits above its own grade_ceiling, a relational invariant with no shared constant to drift from, established by the producer that re-pins the ceiling to the grade and re-checked by the construction-site refusal"]
 failure_behavior = "Reject unauthorized references; retain unsupported/conflicted claims as explicit non-assertable entries rather than silently dropping or polishing them."
 proof_surface = ["per-claim coverage", "unauthorized and stale handle fixtures", "conflicting evidence", "claim-order permutation invariance"]
 replacement_boundary = "pure claim-to-reference binding algorithm behind GroundedDreamDraft"
@@ -58,8 +58,27 @@ workspace_admission = "admitted via #836 (T8-A4) root workspace membership"
 [acceptance]
 require_deny_unknown_fields = true
 forbid_unsafe = true
-required_exports = ["ground_draft", "ground_draft_with_controls", "GroundingRequest", "GroundingControls", "Cancellation"]
-required_tests = ["tests/grounding.rs hosts all 36 WORK_UNIT_CASE 602/1..36 cases"]
+required_exports = ["ground_draft", "ground_draft_with_controls", "GroundingRequest", "GroundingControls", "Cancellation", "ground_for_validation", "GroundingValidationRequest", "ValidationAttachment"]
+# `tests/grounding.rs` hosts the numbered WORK_UNIT_CASE matrix 602/1..41: 41
+# cases whose labels are contiguous and ascending in file order and are never
+# reused by two tests.
+#
+# SIX tests sit ABOVE the first label (tests at lines 46, 70, 119, 157, 240
+# and 321: exact_typed_assertion_is_the_only_support_witness,
+# contradiction_wins_and_counterevidence_is_retained,
+# quota_preserves_the_exact_unprocessed_suffix,
+# curation_without_exact_screen_binding_cannot_be_supported,
+# causal_precision_requires_a_closed_mechanism_relation,
+# absence_requires_complete_closed_coverage) and carry NO label by decision,
+# not by omission: they are inherited pre-602 coverage that predates this work
+# unit on main (e15ca6890 and 6b2c2aab9, before the first 602 label), and a
+# WORK_UNIT_CASE label records WHICH WORK UNIT delivered a case, so numbering
+# them into the 602 sequence would assert a delivery provenance this work unit
+# does not have. They therefore remain deliberately OUTSIDE the numbered
+# matrix. They are still required coverage and they still run, so "602/1..41"
+# is a statement about the numbered matrix and NOT about the file's total test
+# count, which is 47.
+required_tests = ["tests/grounding.rs hosts the 41 WORK_UNIT_CASE 602/1..41 cases, contiguous and ascending in file order, with no label reused by two tests"]
 forbidden_patterns = ['serde_json::Value', 'unimplemented!', 'todo!']
 
 # I2.10 classification of this functional capability cell. Every value below is
