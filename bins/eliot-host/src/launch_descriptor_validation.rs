@@ -56,10 +56,13 @@ use super::launch_artifact::{
 // limits size, not sensitivity (I15.4). Sink outcome never alters
 // result/order/count/handle/cleanup/timeout. There is no mutable global dedup
 // cache and no terminal emission here: one terminal per failed operation is
-// owned by the single outermost contour (`HostJobBranches::start_approved`
-// guard owns `host-launch-failed`), while these descriptor phases correlate
-// by stage order only. Retained identity on substitution failure is preserved
-// (case 978/3); descriptor rejections stay typed (case 978/2).
+// owned by the enclosing operation guard (`host-start-failed`,
+// `host-open-failed` or `host-resume-pending-failed`); the `start_approved`
+// launch leaf emits no terminal of its own, and that guard is wrapped directly
+// (`observe_launch_terminal`) only on the cutover contour. These descriptor
+// phases correlate by stage order only. Retained identity on substitution
+// failure is preserved (case 978/3); descriptor rejections stay typed (case
+// 978/2).
 #[cfg(windows)]
 fn launch_descriptor_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
