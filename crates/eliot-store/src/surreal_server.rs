@@ -69,7 +69,10 @@ impl std::fmt::Debug for ReadySurrealServer {
             .debug_struct("ReadySurrealServer")
             .field("started_pid", &self.started_pid)
             .field("lease_path", &self.lease_path)
-            .field("holds_kill_on_close_job", &self._kill_on_close_job.is_some())
+            .field(
+                "holds_kill_on_close_job",
+                &self._kill_on_close_job.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -159,11 +162,7 @@ impl<'a> SpawnedServerFinalizer<'a> {
     /// Non-Windows has no Job Object, so the guard owns only the child. The
     /// signature matches the Windows constructor so both callers are identical.
     #[cfg(not(windows))]
-    fn new(
-        supervisor: &'a SurrealServerSupervisor,
-        child: Child,
-        pid: Option<u32>,
-    ) -> Self {
+    fn new(supervisor: &'a SurrealServerSupervisor, child: Child, pid: Option<u32>) -> Self {
         Self {
             supervisor,
             child: Some(child),
@@ -259,7 +258,7 @@ impl<'a> SpawnedServerFinalizer<'a> {
                     Err(_elapsed) => cleanup_failures.push(format!(
                         "exact child wait exceeded {}ms",
                         wait_bound.as_millis()
-)),
+                    )),
                 }
             }
         }

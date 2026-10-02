@@ -103,9 +103,7 @@ impl ProviderKillDomain {
     /// `assign_process`, or `None` before admission.
     #[must_use]
     pub fn admitted_identity(&self) -> Option<&ProcessIdentity> {
-        self.admitted
-            .as_ref()
-            .map(|(_, identity)| identity)
+        self.admitted.as_ref().map(|(_, identity)| identity)
     }
 }
 
@@ -150,7 +148,12 @@ where
     let mut child = spawn()
         .map_err(|_| AdapterError::Config("canonical provider process launch failed".to_owned()))?;
     match ProviderKillDomain::admit_spawned(child_process_id(&child)) {
-        Ok(admitted) => Ok((child, ProviderKillOnCloseLease { _kill_domain: admitted })),
+        Ok(admitted) => Ok((
+            child,
+            ProviderKillOnCloseLease {
+                _kill_domain: admitted,
+            },
+        )),
         Err(cause) => {
             // The launch is refused, so the already-created child must not
             // outlive this call. Terminate and reap it before surfacing the
@@ -211,10 +214,8 @@ pub fn fixture_provider_environment(
     bootstrap_username: &str,
     bootstrap_password: &str,
 ) -> Vec<(OsString, OsString)> {
-    let system_root = std::env::var_os("SystemRoot").map_or_else(
-        || OsString::from("C:\\Windows"),
-        |value| value.into(),
-    );
+    let system_root = std::env::var_os("SystemRoot")
+        .map_or_else(|| OsString::from("C:\\Windows"), |value| value.into());
     vec![
         ("SystemRoot".into(), system_root.clone()),
         ("WINDIR".into(), system_root),
