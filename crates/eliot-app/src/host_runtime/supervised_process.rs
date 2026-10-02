@@ -3,6 +3,7 @@ use eliot_engine::{
     BoxProviderProcessFuture, ProviderProcessOutcome, ProviderProcessRunner, ProviderProcessSpec,
     runtime_supervision::{AdapterExecutionContext, CancellationToken},
 };
+use eliot_types::runtime_supervision::ReapCompleteness;
 use eliot_types::{
     DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION, DescendantFileIdentity, DescendantProcessSnapshot,
     DescendantsAtRootExit, DescendantsAtRootExitFailed, DescendantsCaptureErrorKind,
@@ -1388,10 +1389,23 @@ fn run_worker(
         terminal_error_codes,
         descendants_at_root_exit,
     };
-    if receipt.proves_complete_reap() {
-        cancellation.mark_reaped();
-    } else if worker_error.is_none() {
-        worker_error = Some("process reap receipt is incomplete".to_owned());
+    // The typed disposition keeps an unusable descendant capture distinguishable
+    // from a receipt that observed the process tree still running, so the
+    // recorded reason stays truthful about which of the two happened.
+    match receipt.reap_completeness() {
+        ReapCompleteness::Proven => cancellation.mark_reaped(),
+        ReapCompleteness::Incomplete => {
+            if worker_error.is_none() {
+                worker_error = Some("process reap receipt is incomplete".to_owned());
+            }
+        }
+        ReapCompleteness::DescendantEvidenceUntrusted => {
+            if worker_error.is_none() {
+                worker_error = Some(
+                    "process reap receipt carries no validated descendant evidence".to_owned(),
+                );
+            }
+        }
     }
     let (first_output_at, last_output_at) =
         output_activity.lock().map_or((None, None), |activity| {

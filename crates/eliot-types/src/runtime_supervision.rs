@@ -136,20 +136,139 @@ where
     deserialize_protected_string(deserializer, "key")
 }
 
-fn deserialize_descendants_at_root_exit_schema_version<'de, D>(
+/// Bounded refusal for an optional protected identifier that decoded as the
+/// spelled-out-empty spelling of an absent value.
+///
+/// The required-field path already refuses an absent lease, hash, job or
+/// process identity, but `Some("")` is the same absence written down, and a
+/// durable checkpoint, restart window, operation detail or supervision report is
+/// trusted by those identities. The message is fixed and never echoes the
+/// received value onto an operator surface.
+fn deserialize_optional_protected_string<'de, D>(
     deserializer: D,
-) -> Result<String, D::Error>
+    field: &'static str,
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
-    if value == DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION {
-        Ok(value)
-    } else {
-        Err(unsupported_schema_version(
-            DESCENDANTS_AT_ROOT_EXIT_SCHEMA_VERSION,
-        ))
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(text) = &value
+        && text.is_empty()
+    {
+        return Err(empty_protected_identifier(field));
     }
+    Ok(value)
+}
+
+fn deserialize_invocation_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "invocation_id")
+}
+
+fn deserialize_optional_adapter_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "adapter_id")
+}
+
+fn deserialize_optional_service_generation<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "service_generation")
+}
+
+fn deserialize_executable_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "executable_sha256")
+}
+
+fn deserialize_expected_governor_sha256<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "expected_governor_sha256")
+}
+
+fn deserialize_observed_governor_sha256<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "observed_governor_sha256")
+}
+
+fn deserialize_optional_job_object_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "job_object_name")
+}
+
+fn deserialize_role_lease_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "role_lease_id")
+}
+
+fn deserialize_runtime_contract_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "runtime_contract_sha256")
+}
+
+fn deserialize_root_executable_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_protected_string(deserializer, "root_executable_sha256")
+}
+
+/// Bounded refusal for an optional process identity written as the zero PID.
+///
+/// A zero PID is not a weaker process identity, it is an absent one, and the
+/// descendant capture evidence at the reap boundary already refuses a zero
+/// `root_pid` for the same reason. This closes the spelled-out-zero spelling of
+/// that absence on the durable checkpoint and operation-detail records. The
+/// message is fixed and never echoes a received value.
+fn zero_protected_pid<E>(field: &'static str) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("zero protected process identity: {field}"))
+}
+
+fn deserialize_optional_pid<'de, D>(
+    deserializer: D,
+    field: &'static str,
+) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u32>::deserialize(deserializer)?;
+    if value == Some(0) {
+        return Err(zero_protected_pid(field));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_root_pid<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_optional_pid(deserializer, "root_pid")
 }
 
 fn deserialize_runtime_integrity_report_schema_version<'de, D>(
@@ -261,16 +380,21 @@ pub struct OperationRuntimeCheckpoint {
     pub schema_version: String,
     #[serde(deserialize_with = "deserialize_operation_id")]
     pub operation_id: String,
+    #[serde(deserialize_with = "deserialize_invocation_id")]
     pub invocation_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_adapter_id")]
     pub adapter_id: Option<String>,
     pub generation: u64,
     pub phase: OperationPhase,
     pub dispatch_state: ProviderDispatchState,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
+    #[serde(deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub root_process_start_ticks: Option<u64>,
+    #[serde(deserialize_with = "deserialize_root_executable_sha256")]
     pub root_executable_sha256: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_job_object_name")]
     pub job_object_name: Option<String>,
     pub active_process_count: u32,
     pub stdin_bytes: u64,
@@ -290,8 +414,10 @@ pub struct OperationRuntimeCheckpoint {
     pub absolute_deadline_at: OffsetDateTime,
     pub restart_count: u32,
     pub restart_window_started_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
+    #[serde(deserialize_with = "deserialize_runtime_contract_sha256")]
     pub runtime_contract_sha256: Option<String>,
     pub last_error_class: Option<String>,
     pub last_evidence_refs: Vec<String>,
@@ -396,15 +522,18 @@ pub enum DescendantsCaptureErrorKind {
     InvalidPid,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+// `Deserialize` is deliberately absent on both variant structs. The durable
+// descendant evidence is trusted as the authoritative answer to "what was left
+// of the process tree at root exit", and every load-bearing invariant of a
+// captured record — a non-zero `root_pid`, a bounded, pid-sorted, duplicate-free
+// descendant list, and per-entry PID/path/hash bounds — lives in
+// `DescendantsAtRootExit::validate`. A derived per-field decoder would rebuild
+// the "decoded but invalid" state that `validate` exists to exclude, so the
+// bytes are read through the private wire mirror below and the public value is
+// only ever produced after a full `validate()`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitCaptured {
-    // `DescendantsAtRootExit::validate` re-checks this field, but that method is
-    // not run by `Deserialize`. A snapshot written by a capture build whose
-    // layout this build does not own would otherwise decode and then be read as
-    // an authoritative empty-or-populated descendant list, so the version is
-    // bound at the decoder and the refusal is typed.
-    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: u32,
     pub root_exit_code: Option<i32>,
@@ -412,13 +541,9 @@ pub struct DescendantsAtRootExitCaptured {
     pub descendants: Vec<DescendantProcessSnapshot>,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DescendantsAtRootExitFailed {
-    // Bound at the decoder for the same reason as the captured variant: a
-    // failure record is the one that decides whether a capture attempt carried
-    // any descendant evidence at all, so an unowned version must not decode.
-    #[serde(deserialize_with = "deserialize_descendants_at_root_exit_schema_version")]
     pub schema_version: String,
     pub root_pid: Option<u32>,
     pub root_exit_code: Option<i32>,
@@ -427,11 +552,89 @@ pub struct DescendantsAtRootExitFailed {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DescendantsAtRootExit {
     Captured(DescendantsAtRootExitCaptured),
     Failed(DescendantsAtRootExitFailed),
+}
+
+/// Private wire mirror of `DescendantsAtRootExit`.
+///
+/// It exists only to own the derived byte read. It is never public, never
+/// returned, and never validated by a second rule set: `Deserialize` converts
+/// it into the public value and then runs the one existing validator,
+/// `DescendantsAtRootExit::validate`. The wire shape is identical to the
+/// derived one it replaces, so current valid bytes and canonical digests are
+/// unchanged.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DescendantsAtRootExitWire {
+    Captured(DescendantsAtRootExitCapturedWire),
+    Failed(DescendantsAtRootExitFailedWire),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendantsAtRootExitCapturedWire {
+    schema_version: String,
+    root_pid: u32,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    descendants: Vec<DescendantProcessSnapshot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendantsAtRootExitFailedWire {
+    schema_version: String,
+    root_pid: Option<u32>,
+    root_exit_code: Option<i32>,
+    capture_elapsed_ms: u64,
+    error_kind: DescendantsCaptureErrorKind,
+    detail: String,
+}
+
+/// Bounded refusal for descendant evidence that decoded but is not a capture any
+/// build could have taken.
+///
+/// The message carries only the fixed invariant name returned by `validate`; no
+/// received identifier, path or hash is echoed onto an operator surface.
+fn invalid_descendant_evidence<E>(invariant: String) -> E
+where
+    E: de::Error,
+{
+    E::custom(format!("invalid descendant capture evidence: {invariant}"))
+}
+
+impl<'de> Deserialize<'de> for DescendantsAtRootExit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DescendantsAtRootExitWire::deserialize(deserializer)?;
+        let value = match wire {
+            DescendantsAtRootExitWire::Captured(captured) => {
+                Self::Captured(DescendantsAtRootExitCaptured {
+                    schema_version: captured.schema_version,
+                    root_pid: captured.root_pid,
+                    root_exit_code: captured.root_exit_code,
+                    capture_elapsed_ms: captured.capture_elapsed_ms,
+                    descendants: captured.descendants,
+                })
+            }
+            DescendantsAtRootExitWire::Failed(failed) => Self::Failed(DescendantsAtRootExitFailed {
+                schema_version: failed.schema_version,
+                root_pid: failed.root_pid,
+                root_exit_code: failed.root_exit_code,
+                capture_elapsed_ms: failed.capture_elapsed_ms,
+                error_kind: failed.error_kind,
+                detail: failed.detail,
+            }),
+        };
+        value.validate().map_err(invalid_descendant_evidence::<D::Error>)?;
+        Ok(value)
+    }
 }
 
 impl DescendantsAtRootExit {
@@ -597,6 +800,7 @@ pub struct ProcessReapReceipt {
     pub generation: u64,
     #[serde(deserialize_with = "deserialize_job_object_name")]
     pub job_object_name: String,
+    #[serde(deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub process_count_before: u32,
     pub process_count_after: u32,
@@ -611,14 +815,55 @@ pub struct ProcessReapReceipt {
 }
 
 impl ProcessReapReceipt {
+    /// Typed disposition of this receipt's cleanup proof.
+    ///
+    /// The bool projection cannot be trusted to keep the two failure classes
+    /// apart, and they are not the same claim: `Incomplete` means the receipt
+    /// itself observed process members, open pipes or unjoined tasks, while
+    /// `DescendantEvidenceUntrusted` means the process-level conditions hold but
+    /// the descendant capture is failed, absent, or not a capture this build can
+    /// validate. Only `Proven` is an authoritative cleanup predicate.
     #[must_use]
-    pub fn proves_complete_reap(&self) -> bool {
-        self.process_count_after == 0
+    pub fn reap_completeness(&self) -> ReapCompleteness {
+        let process_level_complete = self.process_count_after == 0
             && self.stdout_closed
             && self.stderr_closed
             && self.all_tasks_joined
-            && (self.forced_termination || self.terminal_error_codes.is_empty())
+            && (self.forced_termination || self.terminal_error_codes.is_empty());
+        if !process_level_complete {
+            return ReapCompleteness::Incomplete;
+        }
+        // Process observation is not a substitute for the descendant capture:
+        // a zero member count with a failed or unusable capture has not proven
+        // that the process tree is gone, so it fails closed here as well as at
+        // the decoder.
+        if self.descendants_at_root_exit.is_captured()
+            && self.descendants_at_root_exit.validate().is_ok()
+        {
+            ReapCompleteness::Proven
+        } else {
+            ReapCompleteness::DescendantEvidenceUntrusted
+        }
     }
+
+    #[must_use]
+    pub fn proves_complete_reap(&self) -> bool {
+        matches!(self.reap_completeness(), ReapCompleteness::Proven)
+    }
+}
+
+/// Disposition of a `ProcessReapReceipt` as cleanup evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReapCompleteness {
+    /// Every process-level condition holds and the descendant capture is a
+    /// validated capture of this receipt.
+    Proven,
+    /// The receipt itself observed remaining process members, open pipes,
+    /// unjoined tasks, or unfreed terminal error codes.
+    Incomplete,
+    /// The process-level conditions hold, but the descendant capture is failed,
+    /// absent, or not valid capture evidence, so the tree is not proven gone.
+    DescendantEvidenceUntrusted,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -633,7 +878,9 @@ pub struct RuntimeCoreHealth {
     pub db_ready: bool,
     pub writer_ready: bool,
     pub read_service_ready: bool,
+    #[serde(deserialize_with = "deserialize_optional_service_generation")]
     pub service_generation: Option<String>,
+    #[serde(deserialize_with = "deserialize_executable_sha256")]
     pub executable_sha256: Option<String>,
 }
 
@@ -672,6 +919,7 @@ pub struct RuntimeOperationDetail {
     pub phase: OperationPhase,
     pub last_progress_at: String,
     pub phase_deadline_at: String,
+    #[serde(deserialize_with = "deserialize_optional_root_pid")]
     pub root_pid: Option<u32>,
     pub active_process_count: u32,
     pub stdin_state: String,
@@ -679,6 +927,7 @@ pub struct RuntimeOperationDetail {
     pub stderr_state: String,
     pub cancellation_state: OperationCancellationState,
     pub reconciliation_state: OperationReconciliationState,
+    #[serde(deserialize_with = "deserialize_role_lease_id")]
     pub role_lease_id: Option<String>,
     pub role_lease_epoch: Option<u64>,
 }
@@ -714,7 +963,9 @@ pub struct RuntimeAuthorityIntegrity {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIntegrityHealth {
     pub clean: bool,
+    #[serde(deserialize_with = "deserialize_expected_governor_sha256")]
     pub expected_governor_sha256: Option<String>,
+    #[serde(deserialize_with = "deserialize_observed_governor_sha256")]
     pub observed_governor_sha256: Option<String>,
     pub locked_active_binary: Option<String>,
     pub process_orphans: u32,
@@ -789,8 +1040,71 @@ mod tests {
     use super::{
         DescendantFileIdentity, DescendantProcessSnapshot, DescendantsAtRootExit,
         DescendantsCaptureErrorKind, MAX_DESCENDANT_DETAIL_CHARS, MAX_DESCENDANT_IMAGE_PATH_CHARS,
-        MAX_DESCENDANTS_AT_ROOT_EXIT, ProcessReapReceipt,
+        MAX_DESCENDANTS_AT_ROOT_EXIT, OperationRuntimeCheckpoint, ProcessReapReceipt,
+        ReapCompleteness,
     };
+
+    // Raw durable bytes, never a pre-normalized `Value`: the counterexample
+    // below is exactly the artifact a reap-journal restart would hand to
+    // `serde_json`, and its nested capture claims a root PID that no process can
+    // own. Every process-level field is the shape a complete reap needs, so the
+    // only discriminator available to a decoder that never consulted the nested
+    // capture was `proves_complete_reap() == true`.
+    const ZERO_CAPTURE_ROOT_PID_RECEIPT_BYTES: &str = r#"{"operation_id":"op-1","generation":1,"job_object_name":"job-1","root_pid":null,"process_count_before":1,"process_count_after":0,"graceful_attempted":true,"forced_termination":true,"stdout_closed":true,"stderr_closed":true,"all_tasks_joined":true,"elapsed_ms":1,"terminal_error_codes":[],"descendants_at_root_exit":{"kind":"captured","schema_version":"eliot-descendants-at-root-exit-v1","root_pid":0,"root_exit_code":0,"capture_elapsed_ms":1,"descendants":[]}}"#;
+
+    // The same bytes with a real root PID: current valid durable spellings stay
+    // decodable and keep proving a complete reap.
+    const VALID_CAPTURE_RECEIPT_BYTES: &str = r#"{"operation_id":"op-1","generation":1,"job_object_name":"job-1","root_pid":null,"process_count_before":1,"process_count_after":0,"graceful_attempted":true,"forced_termination":true,"stdout_closed":true,"stderr_closed":true,"all_tasks_joined":true,"elapsed_ms":1,"terminal_error_codes":[],"descendants_at_root_exit":{"kind":"captured","schema_version":"eliot-descendants-at-root-exit-v1","root_pid":42424,"root_exit_code":0,"capture_elapsed_ms":1,"descendants":[]}}"#;
+
+    #[test]
+    fn reap_receipt_bytes_with_zero_capture_root_pid_are_refused_by_the_decoder() {
+        let decoded: Result<ProcessReapReceipt, _> =
+            serde_json::from_str(ZERO_CAPTURE_ROOT_PID_RECEIPT_BYTES);
+        assert!(
+            decoded.is_err(),
+            "a capture claiming root_pid 0 must not decode into a typed receipt"
+        );
+    }
+
+    #[test]
+    fn valid_capture_receipt_bytes_still_decode_and_prove_a_complete_reap() {
+        let decoded: ProcessReapReceipt =
+            serde_json::from_str(VALID_CAPTURE_RECEIPT_BYTES).unwrap();
+        assert_eq!(decoded.reap_completeness(), ReapCompleteness::Proven);
+        assert!(decoded.proves_complete_reap());
+    }
+
+    #[test]
+    fn optional_protected_checkpoint_identities_refuse_spelled_out_absences() {
+        const CHECKPOINT_PREFIX: &str = concat!(
+            r#"{"schema_version":"eliot-operation-runtime-v1","operation_id":"op-1","generation":1,"phase":"running","dispatch_state":"not_started","cancellation_state":"not_requested","reconciliation_state":"not_required","active_process_count":0,"stdin_bytes":0,"stdout_bytes":0,"stderr_bytes":0,"phase_started_at":"2026-10-01T00:00:00Z","last_progress_at":"2026-10-01T00:00:00Z","phase_deadline_at":"2026-10-01T00:00:00Z","absolute_deadline_at":"2026-10-01T00:00:00Z","restart_count":0,"last_evidence_refs":[],"#,
+            );
+        let checkpoint = |identity: &str| {
+            let mut bytes = String::from(CHECKPOINT_PREFIX);
+            bytes.push_str(identity);
+            bytes.push('}');
+            bytes
+        };
+        for identity in [
+            r#""invocation_id":"""#,
+            r#""adapter_id":"""#,
+            r#""root_executable_sha256":"""#,
+            r#""job_object_name":"""#,
+            r#""role_lease_id":"""#,
+            r#""runtime_contract_sha256":"""#,
+            r#""root_pid":0"#,
+        ] {
+            let bytes = checkpoint(identity);
+            let decoded: Result<OperationRuntimeCheckpoint, _> = serde_json::from_str(&bytes);
+            assert!(
+                decoded.is_err(),
+                "{identity} is a spelled-out absence and must not decode"
+            );
+        }
+        let absent: Result<OperationRuntimeCheckpoint, _> =
+            serde_json::from_str(&checkpoint(r#""adapter_id":null"#));
+        assert!(absent.is_ok(), "a genuine absence must stay decodable");
+    }
 
     fn empty_captured(root_pid: u32) -> DescendantsAtRootExit {
         DescendantsAtRootExit::captured(root_pid, Some(0), 10, Vec::new()).unwrap()

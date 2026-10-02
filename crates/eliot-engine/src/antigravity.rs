@@ -4,6 +4,7 @@ use crate::{
     EngineError, ExternalReviewNormalizer, ProviderCallReservationOwner, ProviderInvocationJournal,
     ProviderOutputSpool, ValidatedExternalReviewDocument, work_lease_is_active,
 };
+use eliot_types::runtime_supervision::ReapCompleteness;
 use eliot_types::{
     AntigravityArgvPolicy, AntigravityAuthCheck, AntigravityAuthCheckMethod, AntigravityAuthStatus,
     AntigravityBinaryCandidate, AntigravityBinaryCandidateSource, AntigravityBinaryResolution,
@@ -2290,10 +2291,22 @@ impl AntigravityRunner {
                 return Err(error);
             }
         };
-        if !output.reap_receipt.proves_complete_reap() {
-            return Err(rejected(
-                "supervised Antigravity process returned an incomplete reap receipt",
-            ));
+        // A process-observation-only receipt is not a cleanup proof. The disposition
+        // is matched so a receipt whose descendant capture never validated is
+        // reported as untrusted evidence rather than as an observed-incomplete
+        // reap.
+        match output.reap_receipt.reap_completeness() {
+            ReapCompleteness::Proven => {}
+            ReapCompleteness::Incomplete => {
+                return Err(rejected(
+                    "supervised Antigravity process returned an incomplete reap receipt",
+                ));
+            }
+            ReapCompleteness::DescendantEvidenceUntrusted => {
+                return Err(rejected(
+                    "supervised Antigravity process returned a reap receipt without validated descendant evidence",
+                ));
+            }
         }
         if let Some(violation) = inspect_secret_bytes(&output.stdout)
             .err()
