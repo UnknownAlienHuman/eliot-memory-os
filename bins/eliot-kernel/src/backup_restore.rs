@@ -84,6 +84,14 @@
 //! layer, which must upgrade reconciliation there, never downgrade readback to
 //! a blind re-apply here.
 //!
+//! Import closure is decided by NAME against the archive's own member
+//! identities, never by comparing a directory's file COUNT with the archive's
+//! member count: a length cannot tell a subset from a superset, so a member
+//! that never arrived would be satisfied by any stray standing in its place.
+//! Closure is a property of the destination against the admitted archive, not
+//! of this execution's own bookkeeping compared with itself
+//! (`check_import_closure`).
+//!
 //! Every staged byte is made durable BEFORE the phase receipt that names it is
 //! written, in the order the same module's ORS journal already applies to its
 //! own sealed bodies: reserve bounded output capacity, write the
@@ -3273,25 +3281,108 @@ impl<'a> KernelRestoreTarget<'a> {
             .map_err(|error| BackupError::Target(error.to_string()))
     }
 
-    fn count_dir(&self, relative: &str) -> Result<usize, BackupError> {
+    /// Checks one imported member class for closure against an INDEPENDENT
+    /// expected set, by NAME.
+    ///
+    /// ## Why this replaced a length comparison
+    ///
+    /// This used to be `count_dir(<dir>)? == bundle.<class>.len()`. That number
+    /// cannot tell a SUBSET from a SUPERSET, and both are closure failures: a
+    /// restore that published three of four expected members while one expected
+    /// member is missing and one unexpected file is present has the same count,
+    /// so the length comparison passed it. It also counted ANY file in the
+    /// directory, so a leftover [`TEMP_RESTORE_EXTENSION`] temporary or a
+    /// foreign member could stand in for a member the archive requires, and a
+    /// member published under a name the archive never named passed too.
+    ///
+    /// What is compared here instead is the exact SET of member names, relative to
+    /// the class directory, derived from the ARCHIVE's own identities through
+    /// the same `format!` spellings [`KernelRestoreTarget::apply_blob`],
+    /// [`Self::import_canonical_event`], [`Self::import_receipt`] and
+    /// [`Self::import_projection`] write, against the exact set of names
+    /// actually present in that directory. Two set differences are both
+    /// refusals, and they are distinct facts:
+    ///
+    /// - an expected name that is absent is a MISSING member: the archive's
+    ///   material did not all arrive;
+    /// - a present name that was not expected is an UNEXPECTED member: something
+    ///   is in the destination that no admitted archive member accounts for.
+    ///
+    /// The expected set is the archive's, not a copy of what this execution
+    /// happened to write, so a member this run never wrote cannot satisfy the
+    /// check and a member this run wrote twice cannot inflate it. Closure is a
+    /// property of the destination against the archive, not of this
+    /// execution's own bookkeeping against itself.
+    ///
+    /// Each read is fallible and neither kind of failure is an absence: an
+    /// unreadable directory or entry refuses as [`BackupError::Target`] rather
+    /// than being read as an empty directory, and a non-file standing where a
+    /// member belongs refuses as [`BackupError::RestoreEvidenceIncomplete`]
+    /// rather than being skipped. Neither is ever satisfied by the members that
+    /// did resolve, so a permission denial cannot masquerade as a class the
+    /// archive declared empty.
+    fn check_import_closure(
+        &self,
+        relative: &str,
+        expected: &BTreeSet<String>,
+    ) -> Result<(), BackupError> {
         let path = self.root.join(relative);
-        if !path.exists() {
-            return Ok(0);
-        }
-        let mut count = 0;
-        let entries =
-            std::fs::read_dir(&path).map_err(|error| BackupError::Target(error.to_string()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| BackupError::Target(error.to_string()))?;
-            if entry
-                .file_type()
-                .map_err(|error| BackupError::Target(error.to_string()))?
-                .is_file()
-            {
-                count += 1;
+        let mut observed: BTreeSet<String> = BTreeSet::new();
+        match std::fs::read_dir(&path) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|error| BackupError::Target(error.to_string()))?;
+                    Self::require_member_file(&entry)?;
+                    observed.insert(entry.file_name().to_string_lossy().into_owned());
+                }
             }
+            // A class the archive declares EMPTY has no directory to read, and
+            // an absent directory is exactly the empty observed set. This arm is
+            // reachable only then: a non-empty expected set with no directory is
+            // a missing member set, which is what the difference below refuses.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BackupError::Target(error.to_string())),
         }
-        Ok(count)
+        // Missing is checked first: it is the closure failure this phase exists
+        // to catch (an archive member that never arrived), and it is strictly
+        // stronger evidence than a stray, since a stray can accompany a
+        // complete import while a missing member cannot.
+        if expected.difference(&observed).next().is_some() {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        // Then the superset: a name present that no admitted archive member
+        // accounts for is not closure either, and it is the half the length
+        // comparison this replaced could never see.
+        if observed.difference(expected).next().is_some() {
+            return Err(BackupError::RestoreEvidenceIncomplete);
+        }
+        Ok(())
+    }
+
+    /// The exact member names one archive class must have published, spelled
+    /// through the same `format!` the corresponding import arm writes.
+    fn expected_members(relative: &str, names: impl Iterator<Item = String>) -> BTreeSet<String> {
+        names.map(|name| format!("{relative}/{name}")).collect()
+    }
+
+    /// Rejects a directory entry that is not an ordinary member file.
+    ///
+    /// `file_type` is used rather than `metadata` because it does not follow
+    /// symlinks: a link standing where an archive member belongs is reported as
+    /// the non-file it is, instead of being followed to whatever it names and
+    /// then counted as the member. On Windows this is also what a reparse point
+    /// is, so the same rule covers the junction case
+    /// [`Self::refuse_member_directory_outside_root`] exists for.
+    fn require_member_file(entry: &std::fs::DirEntry) -> Result<(), BackupError> {
+        if entry
+            .file_type()
+            .map_err(|error| BackupError::Target(error.to_string()))?
+            .is_file()
+        {
+            Ok(())
+        } else {
+            Err(BackupError::RestoreEvidenceIncomplete)
+        }
     }
 
     fn apply_prepare(
@@ -3463,13 +3554,50 @@ impl<'a> KernelRestoreTarget<'a> {
         intent: &RestoreIntent,
     ) -> Result<RestoreAppliedEffect, BackupError> {
         self.gate(bundle)?;
-        if self.count_dir("blobs")? != bundle.blobs.len()
-            || self.count_dir("events")? != bundle.canonical_events.len()
-            || self.count_dir("receipts")? != bundle.receipts.len()
-            || self.count_dir("projections")? != bundle.projections.len()
-        {
-            return Err(BackupError::RestoreEvidenceIncomplete);
-        }
+        // Import closure, by NAME, against the archive's own member identities.
+        // The previous length comparison (`count_dir(...) == bundle.<class>.len()`)
+        // could not tell a subset from a superset: an expected member that never
+        // arrived was satisfied by any stray file standing in its place, and a
+        // leftover staging temporary counted as an imported member. See
+        // `check_import_closure` for the full argument.
+        //
+        // The expected names are spelled through the SAME `format!` the import
+        // arms write, and they come from the ARCHIVE rather than from anything
+        // this execution recorded, so closure is a property of the destination
+        // against the admitted archive — not of this run's own bookkeeping
+        // compared against itself.
+        let blobs = Self::expected_members(
+            "blobs",
+            bundle
+                .blobs
+                .iter()
+                .map(|blob| blob.locator.hash.to_string()),
+        );
+        let events = Self::expected_members(
+            "events",
+            bundle
+                .canonical_events
+                .iter()
+                .map(|record| format!("{}.json", record.record_id)),
+        );
+        let receipts = Self::expected_members(
+            "receipts",
+            bundle
+                .receipts
+                .iter()
+                .map(|receipt| format!("{}.json", receipt.operation_id)),
+        );
+        let projections = Self::expected_members(
+            "projections",
+            bundle
+                .projections
+                .iter()
+                .map(|record| format!("{}.json", record.record_id)),
+        );
+        self.check_import_closure("blobs", &blobs)?;
+        self.check_import_closure("events", &events)?;
+        self.check_import_closure("receipts", &receipts)?;
+        self.check_import_closure("projections", &projections)?;
         let marker = serde_json::json!({
             "blobs": bundle.blobs.len(),
             "events": bundle.canonical_events.len(),

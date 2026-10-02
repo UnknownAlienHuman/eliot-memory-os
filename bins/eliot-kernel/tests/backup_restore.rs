@@ -79,6 +79,65 @@ fn test_bundle(target: &str) -> BackupBundle {
     .expect("test bundle builds")
 }
 
+/// The same archive as [`test_bundle`], but carrying real canonical members.
+///
+/// [`test_bundle`] is empty of members, which is right for most cases and
+/// exactly wrong for the import-closure cases below: with no expected member,
+/// every name-based closure check is satisfied by an empty directory and cannot
+/// distinguish "nothing was required" from "something was required and did not
+/// arrive". These cases need a non-empty expected set for the check to have
+/// anything to pin, so the bundle is rebuilt here through the SAME
+/// [`BackupBundle::build`] the other fixtures use — the members are produced by
+/// [`CanonicalRecord::new`], which computes and validates each record's own
+/// digest, rather than by hand-editing a record's fields.
+fn test_bundle_with_events(target: &str, event_ids: &[&str]) -> BackupBundle {
+    let events = event_ids
+        .iter()
+        .map(|id| {
+            eliot_backup::CanonicalRecord::new(
+                "test-event-960",
+                *id,
+                serde_json::json!({ "id": id }),
+            )
+            .expect("canonical event validates")
+        })
+        .collect();
+    let source_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
+    BackupBundle::build(BackupInput {
+        backup_id: format!("backup-960-{target}"),
+        class: BackupClass::CanonicalOnlyDegraded,
+        source_adapter: "test-adapter-960".to_owned(),
+        schema_generation: "1".to_owned(),
+        export_fence: ExportFence {
+            export_id: format!("export-960-{target}"),
+            store_generation: "store-960".to_owned(),
+            state_fence: source_fence,
+            scope_id: None,
+            revision_heads: Vec::new(),
+            ordering_heads: Vec::new(),
+            event_range: EventRange {
+                first_sequence: None,
+                last_sequence: None,
+                count: 0,
+            },
+            blob_reachability_manifest: Vec::new(),
+            consistent: true,
+        },
+        canonical_events: events,
+        projections: Vec::new(),
+        receipts: Vec::new(),
+        blobs: Vec::new(),
+        purge_ledger: Vec::new(),
+        ors_snapshot: None,
+        artifacts: Vec::new(),
+        watchdog_spool: None,
+        host_audit: None,
+        missing_features: Vec::new(),
+        purge_ledger_revision: 1,
+    })
+    .expect("member-carrying test bundle builds")
+}
+
 fn test_context(target: &str) -> RestoreContext {
     RestoreContext {
         target_id: target.to_owned(),
@@ -1654,6 +1713,180 @@ fn a_substituted_member_under_a_retained_receipt_is_refused_as_substitution() {
         std::fs::read(&member).expect("member still readable"),
         substituted,
         "the refusal did not overwrite the substitution with a re-applied member"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/26
+#[test]
+fn import_closure_accepts_the_archive_member_set_exactly() {
+    let target = "t960-26";
+    // The positive half of the closure pair. The archive declares exactly one
+    // canonical member, so the rebuild phase's expected set is exactly one name
+    // and the destination must hold exactly that name.
+    let bundle = test_bundle_with_events(target, &["event-960-26"]);
+    assert_eq!(
+        bundle.canonical_events.len(),
+        1,
+        "this case's premise: the archive declares exactly one member"
+    );
+    let context = test_context(target);
+    let root = work_root("26");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    // Interrupt at the IMPORT phase's receipt, so the member is published and
+    // the journal is still parked at that phase's intent. Rebuild has not run
+    // yet, which is what makes the resume below the first moment the closure
+    // check is evaluated against a destination this case controls.
+    let mut journal = FixtureJournal {
+        fail_cas_persisting_receipt_for: Some(RestorePhase::ImportCanonicalEvent {
+            record_id: "event-960-26".to_owned(),
+        }),
+        ..FixtureJournal::default()
+    };
+    coordinator
+        .restore(&bundle, context.clone(), &ports, &mut journal)
+        .expect_err("the interrupted run fails typed");
+    let member = destination_root.join("events").join("event-960-26.json");
+    assert!(
+        member.is_file(),
+        "the import phase published exactly the member the archive declares"
+    );
+    // Nothing is added or removed: the destination holds precisely the expected
+    // name, so closure holds and the restore runs to completion. This is the
+    // refusal case's own premise stated in the affirmative — without a case
+    // where the exact set is ACCEPTED, the refusal below would be satisfied by
+    // a check that refuses unconditionally.
+    //
+    // The SAME journal is resumed rather than a fresh one: the interruption
+    // above left it holding `IntentPersisted` for the import phase, which is
+    // what makes this a resumption of one transaction rather than a second
+    // execution (the convention cases 960/24 and 960/25 use).
+    let resumed = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect("an import set matching the archive exactly satisfies closure");
+    resumed.receipt.validate().expect("receipt validates");
+    assert!(
+        resumed.phase_log.contains(&"rebuild".to_owned()),
+        "the rebuild phase ran and did not refuse: {:?}",
+        resumed.phase_log
+    );
+    assert!(
+        resumed.destination_root == destination_root,
+        "the resume continued the same destination"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// WORK_UNIT_CASE: 960/27
+#[test]
+fn import_closure_refuses_a_member_set_that_only_matches_in_length() {
+    let target = "t960-27";
+    // The refusal half, and the whole point of the pair above. TWO declared
+    // members, and the destination is put into the shape a LENGTH comparison
+    // cannot distinguish from closure: one declared member is GONE and a file
+    // the archive never named stands in its place. Two files either way, so
+    // `count_dir("events") == bundle.canonical_events.len()` holds exactly — the
+    // check this case exists to defeat.
+    //
+    // TWO members rather than one, and this is load-bearing rather than
+    // incidental. The journal is parked at the SECOND import phase's intent, so
+    // the first phase is already journalled `ReceiptPersisted` and the engine
+    // ADVANCES past it on resume without re-reading its material. That is what
+    // makes the rebuild phase's closure check the first thing in the resumed run
+    // to observe the missing member: if the corrupted member belonged to the
+    // parked phase, `check_attested_material` would refuse with
+    // `RestoreJournalCorrupt` first and this case would be re-proving case
+    // 960/24 instead of pinning the closure check.
+    let bundle = test_bundle_with_events(target, &["event-960-27-a", "event-960-27-b"]);
+    assert_eq!(
+        bundle.canonical_events.len(),
+        2,
+        "this case's premise: two declared members, so a stray can stand in for one"
+    );
+    let context = test_context(target);
+    let root = work_root("27");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    let ports = production_ports(&admission, &fence, &root);
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let destination_root = root.join(".eliot").join(RESTORE_ISOLATED_AREA).join(target);
+    let mut journal = FixtureJournal {
+        fail_cas_persisting_receipt_for: Some(RestorePhase::ImportCanonicalEvent {
+            record_id: "event-960-27-b".to_owned(),
+        }),
+        ..FixtureJournal::default()
+    };
+    coordinator
+        .restore(&bundle, context.clone(), &ports, &mut journal)
+        .expect_err("the interrupted run fails typed");
+    let record = journal.record.as_ref().expect("the journal holds a record");
+    assert!(
+        matches!(record.state, RestoreJournalState::IntentPersisted)
+            && record.phase
+                == RestorePhase::ImportCanonicalEvent {
+                    record_id: "event-960-27-b".to_owned()
+                },
+        "the journal is parked at the second import phase's intent, got {:?}/{:?}",
+        record.state,
+        record.phase
+    );
+    let events = destination_root.join("events");
+    let removed = events.join("event-960-27-a.json");
+    assert!(
+        removed.is_file(),
+        "the FIRST import phase published its member and the journal advanced past it"
+    );
+    // Swap it for a name no admitted archive member accounts for. The COUNT is
+    // preserved deliberately: this is the case where completeness is checked
+    // against an independent expected SET rather than against a length.
+    std::fs::remove_file(&removed).expect("remove the declared member");
+    std::fs::write(events.join("stray-never-declared.json"), b"{}")
+        .expect("plant a stray standing in for the declared member");
+    assert_eq!(
+        std::fs::read_dir(&events)
+            .expect("events readable")
+            .filter_map(Result::ok)
+            .count(),
+        2,
+        "this case's premise: the stray keeps the length comparison satisfied"
+    );
+    assert!(
+        !removed.exists(),
+        "the member the archive declares is genuinely absent"
+    );
+    let error = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect_err("a member set that only matches in length is not closure");
+    // The rebuild phase is what refuses, and it refuses with the same typed
+    // incompleteness this file already used for this condition — no new error
+    // kind, no wrapper, no downgrade into a success.
+    assert!(
+        matches!(
+            error,
+            KernelRestoreError::RetainedForResume {
+                primary: BackupError::RestoreEvidenceIncomplete,
+                ..
+            } | KernelRestoreError::TargetFailed(BackupError::RestoreEvidenceIncomplete)
+        ),
+        "import closure refuses with the existing typed incompleteness, got {error}"
+    );
+    // The refusal happened AT the closure check rather than after it: the phase
+    // that checks closure is the same phase that writes `rebuild.json`, so its
+    // absence is the on-disk proof that the check refused before publishing.
+    assert!(
+        !destination_root.join("rebuild.json").exists(),
+        "the rebuild phase refused at its closure check and published no evidence"
+    );
+    // The stray was not adopted as the archive's member, and the refusal did not
+    // delete it either: a file this operation did not create is not its to remove,
+    // which is the same ownership rule the staged-temporary cleanup follows.
+    assert!(
+        events.join("stray-never-declared.json").is_file(),
+        "the refusal did not delete the stray either: it is not this run's to remove"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
