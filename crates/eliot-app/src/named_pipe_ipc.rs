@@ -1526,7 +1526,9 @@ mod tests {
             .cloned()
             .context("tools/call arguments must survive the gate")?;
         let typed: eliot_types::CompilePacketToolInput = serde_json::from_value(arguments)
-            .context("the existing CompilePacketToolInput visitor must accept the gated document")?;
+            .context(
+                "the existing CompilePacketToolInput visitor must accept the gated document",
+            )?;
         assert_eq!(typed.request.goal, "first");
         assert_eq!(typed.request.max_tokens, 1800);
         Ok(())

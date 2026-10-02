@@ -1939,11 +1939,11 @@ mod slice_7_native_owner_tests {
             Ok(draft) => draft,
             Err(error) => panic!("fixture model must prove, got {error:?}"),
         };
-        let request = match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft, &[])
-        {
-            Ok(request) => request,
-            Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
-        };
+        let request =
+            match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft, &[]) {
+                Ok(request) => request,
+                Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
+            };
         let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
             Ok(grounded) => grounded,
             Err(error) => panic!("fixture grounding must prove, got {error:?}"),
