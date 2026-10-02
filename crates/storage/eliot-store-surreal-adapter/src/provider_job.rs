@@ -179,20 +179,29 @@ where
 ///
 /// The test starters routed through this one function so far are the kernel
 /// S-CONC harness, the S-CONC-TX bootstrap, the adapter transaction-allocation
-/// suite, and every `prepare_initial_root_user` fixture. They use it rather than
-/// their own `Command::spawn()`, so the assigned-set teardown is defined once.
+/// suite, every `prepare_initial_root_user` fixture, and every `surreal.exe`
+/// server starter inside this adapter crate. They use it rather than their own
+/// `Command::spawn()`, so the assigned-set teardown is defined once.
 ///
-/// # This is NOT yet every `surreal.exe` starter in the repository
+/// # The in-crate sites are routed; the other-crate groups are still open
 ///
-/// A verification pass on this delivery found TWENTY-TWO further launch paths
-/// still spawning a `surreal.exe` SERVER with no Job Object, which the leak
-/// report marks "Survives external kill: YES". All twenty-two are test-gated
-/// (`#[cfg(test)]` or `#[cfg(all(test, ...))]`); none is a bare server launch
-/// reachable from a production path, because production launch is exactly the
-/// two routed sites - `src/client/provider_owner.rs` and
-/// `crates/eliot-store/src/surreal_server.rs`, both assigned through
-/// `assign_owned_server_to_kill_on_close_job`.
+/// The TWENTY-TWO launch paths that a verification pass found still spawning a
+/// `surreal.exe` SERVER with no Job Object - which the leak report marks
+/// "Survives external kill: YES" - are all test-gated (`#[cfg(test)]` or
+/// `#[cfg(all(test, ...))]`); none is a bare server launch reachable from a
+/// production path, because production launch is exactly the two routed sites -
+/// `src/client/provider_owner.rs` and `crates/eliot-store/src/surreal_server.rs`,
+/// both assigned through `assign_owned_server_to_kill_on_close_job`.
 ///
+/// In this adapter crate, all six in-crate starters now call this function:
+/// `concurrent_allocation_tests::Harness::start` in `src/apply.rs`,
+/// `real_scope_tests::Harness::start` in `src/apply/read_boundary.rs`,
+/// `payload_tests.rs::Harness::start`, `ownership_tests::Harness::provision` in
+/// `src/client/session.rs`, `pool_behavior_tests::PoolHarness::provision` in
+/// `src/client/session_pool.rs`, and `tests/epistemic_revision.rs::bootstrap`.
+///
+/// The remaining groups live in other crates and are still un-routed, each
+/// owned by a separate writer for this issue:
 /// In `crates/eliot-store/tests/`: `start_surreal` in
 /// `ul_dependency_activation.rs`, `ul_token_policy.rs`, `ul_observability_store.rs`.
 /// In `crates/eliot-engine/tests/`: `start_surreal` in `ul_observability_writer.rs`,

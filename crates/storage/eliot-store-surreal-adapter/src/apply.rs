@@ -3089,7 +3089,7 @@ mod concurrent_allocation_tests {
         use std::process::Stdio;
         use std::time::Duration;
         use tokio::net::TcpStream;
-        use tokio::process::Command;
+        use tokio::process::{Child, Command};
         use tokio::time::{Instant, sleep, timeout};
 
         const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -3242,7 +3242,8 @@ mod concurrent_allocation_tests {
                     harness.root.display()
                 );
                 let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
-                let mut child = Command::new(&exe)
+                let mut command = Command::new(&exe);
+                command
                     .args(&harness.config.provider_arguments)
                     .current_dir(&work)
                     .env_clear()
@@ -3256,9 +3257,21 @@ mod concurrent_allocation_tests {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .creation_flags(0x0800_0000)
-                    .kill_on_drop(true)
-                    .spawn()
-                    .expect("bootstrap provider");
+                    .kill_on_drop(true);
+                // One launch path (issue #1888, K-STORE): the bootstrap provider
+                // is admitted into the kill-on-close Job Object immediately and
+                // the lease is held for this child's whole life, so an external
+                // kill of the test process ends this provider too. A refused
+                // assignment terminates and reaps the child; there is no
+                // unassigned fallback.
+                let (mut child, _kill_on_close) = crate::provider_job::launch_fixture_provider(
+                    || command.spawn(),
+                    |child: &Child| child.id(),
+                    |child: &mut Child| {
+                        let _kill_result = child.start_kill();
+                    },
+                )
+                .expect("bootstrap provider is admitted into its kill-on-close job");
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {
                     assert!(

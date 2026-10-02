@@ -126,23 +126,32 @@ fn configuration(sandbox: &Sandbox) -> ProofResult<SurrealAdapterConfig> {
 fn bootstrap(config: &SurrealAdapterConfig) -> ProofResult {
     use std::os::windows::process::CommandExt;
     let system_root = std::env::var_os("SystemRoot").ok_or("SystemRoot absent")?;
-    let mut process = Bootstrap(
-        Command::new(&config.provider_executable_path)
-            .args(&config.provider_arguments)
-            .current_dir(&config.store_work_root)
-            .env_clear()
-            .env("SystemRoot", &system_root)
-            .env("WINDIR", &system_root)
-            .env("TEMP", &config.store_temp_root)
-            .env("TMP", &config.store_temp_root)
-            .env("SURREAL_USER", &config.username)
-            .env("SURREAL_PASS", config.password.expose_secret())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()?,
-    );
+    let mut command = Command::new(&config.provider_executable_path);
+    command
+        .args(&config.provider_arguments)
+        .current_dir(&config.store_work_root)
+        .env_clear()
+        .env("SystemRoot", &system_root)
+        .env("WINDIR", &system_root)
+        .env("TEMP", &config.store_temp_root)
+        .env("TMP", &config.store_temp_root)
+        .env("SURREAL_USER", &config.username)
+        .env("SURREAL_PASS", config.password.expose_secret())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000);
+    // One launch path (issue #1888, K-STORE): the bootstrap provider is
+    // admitted into the kill-on-close Job Object immediately and the lease is
+    // held for this child's whole life, so an external kill of the test process
+    // ends this provider too. A refused assignment terminates and reaps the
+    // child; there is no unassigned fallback.
+    let (child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+        || command.spawn(),
+        |child: &Child| child.id(),
+        eliot_store_surreal_adapter::reap_refused_std_child,
+    )?;
+    let mut process = Bootstrap(child);
     let deadline = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(&config.provider_bind_address).is_err() {
         if process.0.try_wait()?.is_some() || Instant::now() >= deadline {
@@ -153,6 +162,9 @@ fn bootstrap(config: &SurrealAdapterConfig) -> ProofResult {
     // The upstream setup path commits its root user before normal operation.
     // Provisioning is outside the mutation proof; reopen validates durability.
     std::thread::sleep(Duration::from_secs(2));
+    // The Job Object lease stays held until this function returns, so the
+    // explicit `Bootstrap` stop below runs while the child is still admitted
+    // and the assigned-set teardown stays defined by the job-owned path.
     drop(process);
     while TcpStream::connect(&config.provider_bind_address).is_ok() {
         if Instant::now() >= deadline {
