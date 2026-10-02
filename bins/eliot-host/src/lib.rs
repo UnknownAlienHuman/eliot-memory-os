@@ -3647,7 +3647,7 @@ mod host_lifecycle_boundary_table_tests {
         let pending = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_UNKNOWN_PENDING);
         let replay = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY);
         let requested = row(super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
-        assert_eq!(pending.name, "kernel-restart-reconcile unknown pending");
+        assert_eq!(pending.name, "kernel-restart-reconcile.unknown-pending");
         assert_ne!(pending.event, replay.event);
         assert_ne!(pending.event, requested.event);
         assert_eq!(
