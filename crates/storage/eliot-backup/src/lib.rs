@@ -1500,7 +1500,8 @@ impl RestorePlan {
                         .as_ref()
                         .ok_or(BackupError::RestoreJournalCorrupt)?;
                     refuse_erasure_rehydration(bundle, intent)?;
-                    match target.reconcile_restore_effect(intent)? {
+                    let reconciliation = target.reconcile_restore_effect(intent)?;
+                    match reconciliation {
                         RestoreReconciliation::Applied(applied) => {
                             let final_receipt = validate_applied_effect(
                                 self,
@@ -1508,6 +1509,7 @@ impl RestorePlan {
                                 &transaction,
                                 intent,
                                 &applied,
+                                target,
                             )?;
                             let mut observed = record.clone();
                             observed.revision = next_revision(record.revision)?;
@@ -1529,6 +1531,7 @@ impl RestorePlan {
                                 &transaction,
                                 intent,
                                 &applied,
+                                target,
                             )?;
                             let mut observed = record.clone();
                             observed.revision = next_revision(record.revision)?;
@@ -1614,7 +1617,7 @@ impl RestorePlan {
 
                     let applied = apply_restore_phase(self, bundle, target, &intent)?;
                     let final_receipt =
-                        validate_applied_effect(self, bundle, &transaction, &intent, &applied)?;
+                        validate_applied_effect(self, bundle, &transaction, &intent, &applied, target)?;
                     let mut observed = record.clone();
                     observed.revision = next_revision(record.revision)?;
                     observed.state = RestoreJournalState::ReceiptPersisted;
@@ -2046,12 +2049,20 @@ fn refuse_purged_blob_rehydration(bundle: &BackupBundle) -> Result<(), BackupErr
     Ok(())
 }
 
-fn validate_applied_effect(
+/// Validates one target-observed effect and, for the final phase, mints the
+/// receipt the owner then persists into its isolated destination.
+///
+/// The owner is threaded in purely so this function can hand the minted
+/// receipt back to the only party that can name the destination (see
+/// [`RestoreTarget::persist_owner_receipt`]). Nothing here reads or derives a
+/// path: the coordinator mints the identity, the owner places it.
+fn validate_applied_effect<T: RestoreTarget>(
     plan: &RestorePlan,
     bundle: &BackupBundle,
     transaction: &RestoreTransaction,
     intent: &RestoreIntent,
     applied: &RestoreAppliedEffect,
+    target: &mut T,
 ) -> Result<Option<RestoreReceipt>, BackupError> {
     validate_effect_receipt(intent, &applied.receipt)?;
     let is_final = matches!(intent.phase, RestorePhase::FinalizeIsolatedRoot);
@@ -2074,7 +2085,7 @@ fn validate_applied_effect(
         return Err(BackupError::FinalizeEvidenceMismatch);
     }
     evidence.validate_against_plan(plan, bundle)?;
-    Ok(Some(RestoreReceipt {
+    let receipt = RestoreReceipt {
         receipt_id: restore_receipt_id(plan),
         plan_id: plan.plan_id.clone(),
         bundle_sha256: transaction.bundle_sha256.clone(),
@@ -2085,7 +2096,14 @@ fn validate_applied_effect(
         canonical_only: executor_canonical_only(bundle.manifest.class),
         operational_recovery_ready: false,
         cutover_performed: false,
-    }))
+    };
+    // #938: never hand the owner a receipt its own validator refuses, and
+    // never let the journal record this phase as receipted unless the owner
+    // has actually placed that receipt in its destination. An unwritable
+    // receipt path is therefore a typed failure, not a quiet success.
+    receipt.validate()?;
+    target.persist_owner_receipt(&receipt)?;
+    Ok(Some(receipt))
 }
 
 /// Distinct restore proof ceilings. Archive class validity, isolated import,
@@ -2872,6 +2890,32 @@ pub trait RestoreTarget {
         &mut self,
         restored_fence: &RestoredFence,
     ) -> Result<RestoreEvidence, BackupError>;
+
+    /// Persists the owner-minted final [`RestoreReceipt`] into the isolated
+    /// destination this receipt was issued for (issue #938).
+    ///
+    /// The coordinator mints the receipt only after the final evidence has
+    /// validated, but a [`RestoreContext`](crate::RestoreContext) names a
+    /// destination by `target_id` and never by path, and this library has no
+    /// filesystem of its own. The owner is therefore the only party that can
+    /// name its own destination, so it is the only party allowed to place the
+    /// artifact that a later consumer binds by digest: a consumer that decodes
+    /// the bytes and calls [`RestoreReceipt::validate`] proves issuance, and
+    /// it can only find them where the owner actually wrote them.
+    ///
+    /// The owner persists exactly the receipt it was handed. A target must
+    /// never synthesise, re-mint or rewrite this identity, and the coordinator
+    /// never writes it on the owner's behalf.
+    ///
+    /// The default is fail-closed, like
+    /// [`apply_restore_effect`](RestoreTarget::apply_restore_effect): a target
+    /// that cannot place the receipt it was issued must not let the restore
+    /// journal record the phase as durably receipted, because a retained
+    /// report whose identity was never persisted cannot authorize anything
+    /// later.
+    fn persist_owner_receipt(&mut self, _receipt: &RestoreReceipt) -> Result<(), BackupError> {
+        Err(BackupError::RestoreTargetReceiptRequired)
+    }
 }
 
 /// One immutable verified archive bound to its single publication operation:

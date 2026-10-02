@@ -33,6 +33,23 @@ use super::{
     verify_portable_key_material,
 };
 
+/// Stable, documented member path of the owner-issued restore receipt inside
+/// the isolated root: `<isolated-root>/restore-evidence/owner-restore-receipt.json`.
+///
+/// This is the one location where this crate writes a `super::RestoreReceipt`,
+/// and it is written only by [`FileRestoreTarget::persist_owner_receipt`]. A
+/// consumer proves issuance by reading exactly this path, binding the bytes by
+/// digest, decoding them as a `super::RestoreReceipt` and calling its own
+/// `validate()`.
+///
+/// The runner's other retained evidence (`evidence.json`, `prepared.json`,
+/// `purge_ledger.json`, ...) is flat at the root, so the `restore-evidence`
+/// segment is a deliberate grouping directory for the owner-issued receipt
+/// rather than yet another flat root-level file. It matches the directory name
+/// already used for retained restore evidence in the tree, while holding a
+/// different document type than that writer's own report.
+const OWNER_RESTORE_RECEIPT_MEMBER: &str = "restore-evidence/owner-restore-receipt.json";
+
 /// Temp-file-backed restore journal (rehearsal grade).
 ///
 /// Persists `journal_key -> record` as JSON under an isolated root, giving
@@ -593,6 +610,31 @@ impl RestoreTarget for FileRestoreTarget {
             return Err(BackupError::RestoreJournalCorrupt);
         }
         self.apply_phase(plan, bundle, intent)
+    }
+
+    /// Places the coordinator-minted final receipt at this runner's stable
+    /// evidence path, `restore-evidence/owner-restore-receipt.json` under the
+    /// isolated root.
+    ///
+    /// This runner owns its root, so it is the only party that can name the
+    /// destination; the coordinator deliberately holds no path and writes
+    /// nothing here on the owner's behalf. The bytes are the owner receipt
+    /// verbatim, serialized canonically so a later consumer can bind them by
+    /// digest, decode them as a `super::RestoreReceipt` and call its own
+    /// `validate()` to prove issuance. The receipt is re-validated here before
+    /// any byte is written, so an unwritable path and a receipt this owner
+    /// could not honor both surface as typed failures instead of a quiet
+    /// success.
+    fn persist_owner_receipt(
+        &mut self,
+        receipt: &super::RestoreReceipt,
+    ) -> Result<(), BackupError> {
+        receipt.validate()?;
+        let bytes = canonical_json_bytes(receipt)
+            .map_err(|error| BackupError::Serialization(error.to_string()))?;
+        self.write_file(OWNER_RESTORE_RECEIPT_MEMBER, &bytes)?;
+        self.calls.push("persist-owner-receipt".to_owned());
+        Ok(())
     }
 
     fn reconcile_restore_effect(
