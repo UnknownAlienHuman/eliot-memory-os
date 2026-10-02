@@ -2039,4 +2039,19 @@ mod default_members_guard_tests {
             )
         );
     }
+
+    /// Negative control for the arm above: a well-formed list of the same shape
+    /// that omits the facade passes, so that refusal is caused by the listed
+    /// member and not by the fixture.
+    #[test]
+    fn accepts_well_formed_default_members_list_without_the_facade() {
+        let manifest = concat!(
+            "[workspace]\n",
+            "default-members = [\n",
+            "  \"bins/eliot\",\n",
+            "  \"bins/eliotd\",\n",
+            "]\n",
+        );
+        assert_eq!(default_members_section_refuses_facade(manifest), Ok(()));
+    }
 }
