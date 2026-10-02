@@ -1259,8 +1259,8 @@ mod tests {
     impl ScratchRoot {
         /// `tag` identifies the owning test; the v4 run id identifies this run.
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("eliot-i876-{tag}-{}", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("eliot-i876-{tag}-{}", uuid::Uuid::new_v4()));
             let _ = std::fs::remove_dir_all(&path);
             Self(path)
         }
@@ -1368,7 +1368,10 @@ mod tests {
         assert_eq!(error.cause.namespace(), native_namespace());
         assert_eq!(error.cleanup.namespace(), native_namespace());
         assert!(std::error::Error::source(&error.cleanup).is_none());
-        assert!(error.destination_available, "verified content availability is still recorded");
+        assert!(
+            error.destination_available,
+            "verified content availability is still recorded"
+        );
         // Diagnostics reveal no configured root and no native message.
         let debug = format!("{error:?}");
         assert!(!debug.contains(&temp_dir.display().to_string()));

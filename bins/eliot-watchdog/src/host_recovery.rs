@@ -1418,8 +1418,7 @@ pub fn commit_recovery_step(
         // approved registration, the runtime identity, and the expected
         // generation. Only the currently approved unchanged registration is
         // ever started, and only after the required old-target disposition.
-        revalidate_boundary(stored.target(), evidence)
-            .map_err(RecoveryError::Boundary)?;
+        revalidate_boundary(stored.target(), evidence).map_err(RecoveryError::Boundary)?;
     }
     stored.apply(step)?;
     let bytes = encode(&stored)?;
@@ -1586,7 +1585,10 @@ mod recovery_boundary_tests {
     fn temp_journal(label: &str) -> PathBuf {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let index = NEXT.fetch_add(1, Ordering::Relaxed);
-        let name = format!("eliot-watchdog-recovery-{label}-{}-{index}", std::process::id());
+        let name = format!(
+            "eliot-watchdog-recovery-{label}-{}-{index}",
+            std::process::id()
+        );
         std::env::temp_dir().join(name)
     }
 
@@ -1735,8 +1737,12 @@ mod recovery_boundary_tests {
             observed_registration: Some(coordination('7')?),
             ..reproduces_target(&target)
         };
-        let refused =
-            commit_recovery_step(&database, &stopped, &RecoveryStep::StartRequested, &substituted);
+        let refused = commit_recovery_step(
+            &database,
+            &stopped,
+            &RecoveryStep::StartRequested,
+            &substituted,
+        );
         assert_eq!(
             refused.err(),
             Some(RecoveryError::Boundary(

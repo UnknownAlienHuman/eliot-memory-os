@@ -9757,8 +9757,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 // Kernel-issued receipt this closure recorded; the presentation
                 // keeps reporting the grant revoked instead of leaving a stale
                 // pending record behind a completed second phase.
-                let completed =
-                    PresentedAuthorityRequest::GrantRevocation(request.clone());
+                let completed = PresentedAuthorityRequest::GrantRevocation(request.clone());
                 if let Ok(retained) = self.retain_presentation(completed)
                     && retained
                         .note_revoked(&reconciliation.authority_receipt)
@@ -9828,7 +9827,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || committed_closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
         {
             return Err(CompositionError::Recovery(
-                "committed closure does not bind the presented target grant and snapshot".to_owned(),
+                "committed closure does not bind the presented target grant and snapshot"
+                    .to_owned(),
             ));
         }
         // The first phase's acknowledgement was lost to this composition: it
@@ -9837,7 +9837,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // `note_unknown_outcome` compares the presented snapshot with the
         // retained request, so a superseded snapshot can never reconcile it.
         let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
-        if let Some(retained) = self.authority_presentations.get(presented.ledger_key().as_str())
+        if let Some(retained) = self
+            .authority_presentations
+            .get(presented.ledger_key().as_str())
             && retained.request() != &presented
         {
             return Err(CompositionError::Authority(P07PortError::IdentityConflict));
@@ -10171,14 +10173,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 phase: CanonicalRevocationPhase::ClosureReadback,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        self.finish_canonical_revocation(
-            request,
-            authority_receipt,
-            &closure,
-            commit,
-            durable_link,
-        )
-        .await
+        self.finish_canonical_revocation(request, authority_receipt, &closure, commit, durable_link)
+            .await
     }
 
     /// Runs the canonical second phase over an ALREADY admitted closure and the

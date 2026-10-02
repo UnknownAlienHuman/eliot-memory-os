@@ -40,10 +40,10 @@ use eliot_agent_api::{
     CandidateSelectionDisposition, ClockReading, ContractError, DecisionId, EventCursor, EventId,
     ExecutionOutcome, ExecutionUnit, LowercaseSha256, NativeSession, NativeSessionLocator,
     NormalizedHostEventPayload, PhysicalRouteObservationReceipt, PolicyRevision, ProofCeiling,
-    ProviderExecutionBinding, QuotaKnowledge, RequestId, RestrictedRawSourceHandle,
-    ResourceGeneration, RouteFingerprint, RouteObservationState, RouteSelectionCandidate, StateFence,
-    UsageReceipt, WorkLeaseId, candidate_digest_for, host_event::CommittedRouteBindingDisposition,
-    route_fingerprint_digest_for,
+    ProviderExecutionBinding, QuotaKnowledge, RequestId, ResourceGeneration,
+    RestrictedRawSourceHandle, RouteFingerprint, RouteObservationState, RouteSelectionCandidate,
+    StateFence, UsageReceipt, WorkLeaseId, candidate_digest_for,
+    host_event::CommittedRouteBindingDisposition, route_fingerprint_digest_for,
 };
 use eliot_contracts::EpochLineageId;
 use eliot_evaluation_contracts::{
@@ -287,12 +287,13 @@ impl CoveragePlanFixture {
         CoverageManifestPlan {
             fingerprint,
             allowed_manifest_digest,
-            expected_event_sources_and_event_classes: &self.expected_event_sources_and_event_classes,
+            expected_event_sources_and_event_classes: &self
+                .expected_event_sources_and_event_classes,
             observable_actions: &self.observable_actions,
             unobservable_actions: &self.unobservable_actions,
             missing_source_reasons: &self.missing_source_reasons,
-            coverage_by_material_action_and_effect_route:
-                &self.coverage_by_material_action_and_effect_route,
+            coverage_by_material_action_and_effect_route: &self
+                .coverage_by_material_action_and_effect_route,
             denominator_origin_and_sampling_policy: &self.denominator_origin_and_sampling_policy,
             completeness: CoverageCompleteness::Partial,
             invalidation_dependencies: &self.invalidation_dependencies,
@@ -375,7 +376,10 @@ fn run_produces_and_delivers_execution_unit_events_with_owner_route_evidence() -
     assert_eq!(
         produced.route_evidence.actual_route_digest,
         Some(route_fingerprint_digest_for(
-            observation.observed_route.as_ref().ok_or("matched observation carries a route")?
+            observation
+                .observed_route
+                .as_ref()
+                .ok_or("matched observation carries a route")?
         )?)
     );
     assert_eq!(

@@ -31,7 +31,7 @@ use crate::current_unix_ms;
 use crate::health_projection::{HealthProjectionCell, evaluate_interval_health};
 use crate::heartbeat_transport::{HeartbeatTransport, HeartbeatTransportError};
 use crate::host_identity_observation::{
-    ApprovedRegistrationReadback, ApprovedRecoveryPolicy, BoundedChallengeWait,
+    ApprovedRecoveryPolicy, ApprovedRegistrationReadback, BoundedChallengeWait,
     ChallengeAttemptOutcome, ChallengeUncertainty, HostObservation, HostResponsiveness,
     MAX_CHALLENGE_WAIT_SECS,
 };

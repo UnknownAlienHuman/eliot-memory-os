@@ -903,10 +903,9 @@ mod tests {
     use eliot_platform::PlatformHandle;
     use eliot_protocol::backup::{
         BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
-        BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
-        BackupAdmissionRef, BackupAuthenticatedPrincipal, BackupClassWire,
-        BackupIsolatedRestorePrepare, BackupMutationBinding, BackupReplayLedger,
-        BackupRequestIdentity,
+        BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION, BackupAdmissionRef,
+        BackupAuthenticatedPrincipal, BackupClassWire, BackupIsolatedRestorePrepare,
+        BackupMutationBinding, BackupReplayLedger, BackupRequestIdentity,
     };
     use eliot_receipts::{
         AuthorityBinding, EffectClass, ProofCeiling, RequestBinding, WorkScopeBinding, WorkScopeId,
@@ -1001,8 +1000,7 @@ mod tests {
             cancellation_id: "cancel-001".to_owned(),
             admission: BackupAdmissionRef {
                 authority: AuthorityBinding {
-                    authority_id: ContractId::new("admission-authority-001")
-                        .expect("authority id"),
+                    authority_id: ContractId::new("admission-authority-001").expect("authority id"),
                     authority_owner: "backup-admission-authority".to_owned(),
                     authority_epoch: replay_epoch(),
                     state_fence: replay_fence(),
@@ -1095,7 +1093,11 @@ mod tests {
     #[test]
     fn byte_identical_prepare_replay_is_refused_before_the_owner_seam() {
         let endpoint = replay_endpoint();
-        assert!(endpoint.observe_backup_replay(&replay_request("snapshot-001")).is_ok());
+        assert!(
+            endpoint
+                .observe_backup_replay(&replay_request("snapshot-001"))
+                .is_ok()
+        );
         let replayed = replay_request("snapshot-001");
         assert!(replayed.validate().is_ok());
         let refusal = endpoint
@@ -1123,7 +1125,11 @@ mod tests {
     #[test]
     fn changed_content_prepare_replay_under_one_identity_is_refused() {
         let endpoint = replay_endpoint();
-        assert!(endpoint.observe_backup_replay(&replay_request("snapshot-001")).is_ok());
+        assert!(
+            endpoint
+                .observe_backup_replay(&replay_request("snapshot-001"))
+                .is_ok()
+        );
         let changed = replay_request("snapshot-changed");
         assert!(changed.validate().is_ok());
         let refusal = endpoint
