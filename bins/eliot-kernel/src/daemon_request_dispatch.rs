@@ -10479,6 +10479,16 @@ impl KernelComposition {
             // was never proven keeps its reconciliation obligation, because
             // this leg only refuses and writes nothing.
             self.reevaluate_retained_disclosure_permission(&record, session, &envelope)?;
+            let trace_manifest = self
+                .local_read_replay_manifest(&receipt, &record, &envelope)?
+                .map_or(Ok(serde_json::Value::Null), |manifest| {
+                    serde_json::to_value(manifest).map_err(|_| TransportError::SessionFenced)
+                })?;
+            let mut replayed = replayed;
+            replayed
+                .as_object_mut()
+                .ok_or(TransportError::SessionFenced)?
+                .insert("trace_manifest".to_owned(), trace_manifest);
             return Ok(replayed);
         }
         // No bypass: the presented attempt must be the live claim-record

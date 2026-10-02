@@ -10,12 +10,10 @@
 //! attempt; the policy snapshot when the fence is policy-bound; the requested
 //! and actual route; the local-port call with immutable input/output handles;
 //! observed side effects; canonical receipts; the finish decision; and an
-//! explicit missing-parts list. I16.12 slots this path cannot produce (the
-//! semantic principal, a policy snapshot without a policy-bound fence, the
-//! Active View/packet manifest, the independent verifier result, and the
-//! executor identity when the owner does not name one) are enumerated in
-//! `unavailable`: missing evidence limits replay and is never silently
-//! treated as success.
+//! explicit missing-parts list. The original principal comes from the retained
+//! resolved activation; policy, packet and verifier handles come from their
+//! retained owners. Absent required evidence is listed in `missing_parts` and
+//! forces `DEGRADED_NO_PROOF` at this Material/Critical boundary.
 //!
 //! The executor observation is not a second copy: it is projected from the
 //! durable ORS row that retained it with the completion (issue #1853 W2), so
@@ -51,9 +49,14 @@ use eliot_protocol::{HostRequestEnvelope, HostRequestResultBody};
 use serde::{Deserialize, Serialize};
 
 use crate::kernel_audit::{AuditEventKind, AuditRecord, authority_epoch_text};
+use crate::sha256_json;
 
 /// Canonical trace-manifest format version.
-pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 1;
+///
+/// Version 2 enforces the full I16.12 evidence set. Original version-1 bodies
+/// remain in the audit chain but are unsupported for replay; their earlier
+/// completion claims are never rewritten to manufacture current proof.
+pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 2;
 
 /// Required manifest slots, in stable enumeration order.
 ///
@@ -61,7 +64,7 @@ pub const TRACE_MANIFEST_FORMAT_VERSION: u16 = 1;
 /// the presenting session, or the submitted execution evidence. An absent
 /// required slot lands in [`TraceManifest::missing_parts`] and forces
 /// [`TraceFinish::DegradedNoProof`].
-pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 12] = [
+pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 17] = [
     "action_contract",
     "state_fence",
     "caller_session",
@@ -73,7 +76,12 @@ pub const TRACE_MANIFEST_REQUIRED_SLOTS: [&str; 12] = [
     "output_handle",
     "side_effects",
     "adapter_identity",
+    "executor_identity",
     "result_receipt",
+    "principal",
+    "policy_snapshot",
+    "active_view_packet_manifest",
+    "verifier_result",
 ];
 
 /// Honest finish vocabulary for one sealed manifest (A10.8).
@@ -129,8 +137,8 @@ impl TraceFinish {
 /// Canonical replayable trace manifest for one bound result (I16.12).
 ///
 /// Keyed by `trace_id`/`operation_id`. `None` slots carry no value; required
-/// slots without a value are named in `missing_parts`, and I16.12 evidence
-/// slots this path cannot produce are named in `unavailable`.
+/// slots without a value are named in `missing_parts`. Explicitly unavailable
+/// evidence cannot bypass required completeness.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TraceManifest {
@@ -180,9 +188,9 @@ pub struct TraceManifest {
     pub executor_identity: Option<String>,
     /// Observed side-effect declaration (`none` or an effect reference).
     pub side_effects: Option<String>,
-    /// Semantic principal (resolved by eliotd, never by Kernel).
+    /// Original semantic principal from the retained resolved activation.
     pub principal: Option<String>,
-    /// Policy revision snapshot, when the fence is policy-bound.
+    /// Original policy snapshot handle bound to the same State Fence.
     pub policy_snapshot: Option<String>,
     /// Active View/packet manifest reference.
     pub active_view_packet_manifest: Option<String>,
@@ -225,6 +233,8 @@ impl TraceManifest {
         persisted: &HostRequestRecord,
         envelope: Option<&HostRequestEnvelope>,
         lane: &'static str,
+        principal: Option<&str>,
+        active_view_packet_manifest: Option<&str>,
     ) -> Self {
         let capability = envelope
             .map(|envelope| envelope.identity.capability.clone())
@@ -232,9 +242,7 @@ impl TraceManifest {
         let payload_digest = envelope
             .map(|envelope| envelope.identity.payload_sha256.clone())
             .or_else(|| Some(persisted.payload_digest.clone()));
-        let state_fence = envelope
-            .map(|envelope| envelope.state_fence.clone())
-            .or_else(|| Some(session.module_generation.state_fence.clone()));
+        let state_fence = Self::sealed_state_fence(session, persisted, envelope);
         let session_id = envelope
             .and_then(|envelope| envelope.identity.session_id.clone())
             .or_else(|| {
@@ -244,11 +252,8 @@ impl TraceManifest {
                     .map(|session| session.as_str().to_owned())
             });
         let evidence = persisted.result_evidence.as_ref();
-        let policy_snapshot = state_fence.as_ref().and_then(|fence| {
-            fence
-                .policy_revision
-                .map(|revision| revision.value().to_string())
-        });
+        let policy_snapshot = Self::retained_policy_snapshot(persisted, state_fence.as_ref());
+        let verifier_result = Self::retained_verifier_result(persisted);
         let authority_epoch = state_fence
             .as_ref()
             .map(|fence| authority_epoch_text(&fence.authority_epoch));
@@ -267,7 +272,7 @@ impl TraceManifest {
             capability: capability.clone(),
             payload_digest,
             state_fence,
-            connection_id: Some(session.connection_id.clone()),
+            connection_id: Some(persisted.connection_ref.as_str().to_owned()),
             session_id,
             task_id: envelope
                 .and_then(|envelope| envelope.identity.task_id.clone())
@@ -303,10 +308,14 @@ impl TraceManifest {
             adapter_identity: evidence.and_then(|evidence| evidence.adapter_identity.clone()),
             executor_identity: evidence.and_then(|evidence| evidence.executor_identity.clone()),
             side_effects: evidence.and_then(|evidence| evidence.side_effects.clone()),
-            principal: None,
+            principal: principal.map(str::to_owned),
             policy_snapshot,
-            active_view_packet_manifest: None,
-            verifier_result: None,
+            active_view_packet_manifest: if lane == "campaign-packet" {
+                active_view_packet_manifest.map(str::to_owned)
+            } else {
+                None
+            },
+            verifier_result,
             result_digest: Some(body.result_digest.clone()),
             durable_state: Some(format!("{:?}", persisted.state)),
             finish: TraceFinish::VerifiedComplete,
@@ -324,6 +333,42 @@ impl TraceManifest {
         manifest
     }
 
+    fn sealed_state_fence(
+        session: &Session,
+        persisted: &HostRequestRecord,
+        envelope: Option<&HostRequestEnvelope>,
+    ) -> Option<StateFence> {
+        if let Some(envelope) = envelope {
+            Some(envelope.state_fence.clone())
+        } else {
+            let fallback = &session.module_generation.state_fence;
+            (fallback.validate().is_ok()
+                && sha256_json(fallback).ok().as_deref() == Some(persisted.fence_digest.as_str()))
+            .then(|| fallback.clone())
+        }
+    }
+
+    fn retained_policy_snapshot(
+        persisted: &HostRequestRecord,
+        state_fence: Option<&StateFence>,
+    ) -> Option<String> {
+        persisted
+            .result_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.policy_fence.as_ref())
+            .filter(|policy_fence| state_fence == Some(&policy_fence.state_fence))
+            .map(|policy_fence| policy_fence.policy_snapshot_id.clone())
+    }
+
+    fn retained_verifier_result(persisted: &HostRequestRecord) -> Option<String> {
+        let lineage = persisted.result_lineage.as_ref()?;
+        (matches!(
+            &lineage.result_class,
+            eliot_ors::HostRequestRetainedResultClass::VerifierObservation
+        ) && persisted.result_digest.as_deref() == Some(lineage.output_digest.as_str()))
+        .then(|| lineage.output_digest.clone())
+    }
+
     /// Reads back the latest sealed manifest for one operation.
     ///
     /// Scans retained chain records for the newest
@@ -339,29 +384,38 @@ impl TraceManifest {
     /// reproduces the sealed record or reports no manifest.
     #[must_use]
     pub fn find_sealed(records: &[AuditRecord], operation_id: &str) -> Option<Self> {
-        records
-            .iter()
-            .rev()
-            .find(|record| {
-                record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
-                    && record.lineage.operation_id.as_deref() == Some(operation_id)
-            })
-            .and_then(|record| serde_json::from_value(record.event_body.clone()).ok())
-            .filter(Self::records_supported_completion)
+        let record = records.iter().rev().find(|record| {
+            record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
+                && record.lineage.operation_id.as_deref() == Some(operation_id)
+        })?;
+        let manifest: Self = serde_json::from_value(record.event_body.clone()).ok()?;
+        let trace_id = record.lineage.trace_id.as_deref()?;
+        (has_text(trace_id)
+            && has_text(operation_id)
+            && manifest.trace_id == trace_id
+            && manifest.operation_id == operation_id
+            && Self::records_supported_completion(&manifest))
+        .then_some(manifest)
     }
 
     /// Returns true when the recorded completion claim is carried by the
     /// recorded required slots.
     ///
-    /// The guarantee is one-directional on purpose: a recorded
-    /// [`TraceFinish::VerifiedComplete`] whose own slots leave a required
-    /// absence is a self-contradicting body and is refused, so replay never
-    /// serves an unqualified success. A recorded degraded or partial
-    /// classification over complete slots is conservative, never an
-    /// over-claim, so it is served as recorded.
+    /// The original recorded lists and classification must agree with the
+    /// required evidence carried by this body. A contradictory body is refused
+    /// instead of receiving a newly computed completion claim.
     fn records_supported_completion(&self) -> bool {
         self.format_version == TRACE_MANIFEST_FORMAT_VERSION
-            && (!self.finish.is_complete() || self.missing_parts().is_empty())
+            && has_text(&self.trace_id)
+            && has_text(&self.operation_id)
+            && self.missing_parts == self.missing_parts()
+            && self.unavailable == self.unavailable_parts()
+            && self.finish
+                == if self.missing_parts.is_empty() {
+                    TraceFinish::VerifiedComplete
+                } else {
+                    TraceFinish::DegradedNoProof
+                }
     }
 
     /// Returns the required slots with no value, in stable order.
@@ -382,21 +436,40 @@ impl TraceManifest {
     /// Returns true when one required slot carries a value.
     fn required_slot_present(&self, slot: &str) -> bool {
         match slot {
-            "action_contract" => self.capability.is_some() && self.payload_digest.is_some(),
+            "action_contract" => {
+                has_text_option(self.capability.as_deref())
+                    && has_text_option(self.payload_digest.as_deref())
+            }
             "state_fence" => self.state_fence.is_some(),
             // A1 names caller AND session: the presenting transport
             // connection alone does not identify the semantic caller, so
             // withholding the session leaves the slot absent.
-            "caller_session" => self.connection_id.is_some() && self.session_id.is_some(),
-            "lease" => self.lease_attempt_id.is_some(),
-            "requested_route" => self.requested_route.is_some(),
-            "actual_route" => self.actual_route.is_some(),
-            "invoked_operation" => self.invoked_operation.is_some(),
-            "input_handle" => self.input_handle.is_some(),
-            "output_handle" => self.output_handle.is_some(),
-            "side_effects" => self.side_effects.is_some(),
-            "adapter_identity" => self.adapter_identity.is_some(),
-            "result_receipt" => self.result_digest.is_some() && self.durable_state.is_some(),
+            "caller_session" => {
+                has_text_option(self.connection_id.as_deref())
+                    && has_text_option(self.session_id.as_deref())
+            }
+            "lease" => {
+                has_text_option(self.lease_attempt_id.as_deref())
+                    && self.fencing_generation.is_some()
+            }
+            "requested_route" => has_text_option(self.requested_route.as_deref()),
+            "actual_route" => has_text_option(self.actual_route.as_deref()),
+            "invoked_operation" => has_text_option(self.invoked_operation.as_deref()),
+            "input_handle" => has_text_option(self.input_handle.as_deref()),
+            "output_handle" => has_text_option(self.output_handle.as_deref()),
+            "side_effects" => has_text_option(self.side_effects.as_deref()),
+            "adapter_identity" => has_text_option(self.adapter_identity.as_deref()),
+            "executor_identity" => has_text_option(self.executor_identity.as_deref()),
+            "result_receipt" => {
+                has_text_option(self.result_digest.as_deref())
+                    && has_text_option(self.durable_state.as_deref())
+            }
+            "principal" => has_text_option(self.principal.as_deref()),
+            "policy_snapshot" => has_text_option(self.policy_snapshot.as_deref()),
+            "active_view_packet_manifest" => {
+                has_text_option(self.active_view_packet_manifest.as_deref())
+            }
+            "verifier_result" => has_text_option(self.verifier_result.as_deref()),
             _ => false,
         }
     }
@@ -405,14 +478,23 @@ impl TraceManifest {
     fn unavailable_parts(&self) -> Vec<String> {
         let mut unavailable = Vec::new();
         for (slot, name) in [
-            (self.principal.is_some(), "principal"),
-            (self.policy_snapshot.is_some(), "policy_snapshot"),
+            (has_text_option(self.principal.as_deref()), "principal"),
             (
-                self.active_view_packet_manifest.is_some(),
+                has_text_option(self.policy_snapshot.as_deref()),
+                "policy_snapshot",
+            ),
+            (
+                has_text_option(self.active_view_packet_manifest.as_deref()),
                 "active_view_packet_manifest",
             ),
-            (self.verifier_result.is_some(), "verifier_result"),
-            (self.executor_identity.is_some(), "executor_identity"),
+            (
+                has_text_option(self.verifier_result.as_deref()),
+                "verifier_result",
+            ),
+            (
+                has_text_option(self.executor_identity.as_deref()),
+                "executor_identity",
+            ),
         ] {
             if !slot {
                 unavailable.push(name.to_owned());
@@ -420,4 +502,12 @@ impl TraceManifest {
         }
         unavailable
     }
+}
+
+fn has_text(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+fn has_text_option(value: Option<&str>) -> bool {
+    value.is_some_and(has_text)
 }

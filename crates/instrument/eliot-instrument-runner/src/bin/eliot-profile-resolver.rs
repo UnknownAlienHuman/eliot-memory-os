@@ -1958,3 +1958,7 @@ impl ProcessEvidenceSink for RetainedEvidenceSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "eliot-profile-resolver/provider_registry_physical.rs"]
+mod provider_registry_physical;

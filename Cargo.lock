@@ -2229,6 +2229,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-bootstrap",
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
@@ -3360,6 +3361,7 @@ dependencies = [
  "eliot-cli",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-runner",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
@@ -3381,6 +3383,7 @@ dependencies = [
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-nextest",
  "eliot-process",
  "eliot-protocol",
  "redb",
