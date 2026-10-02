@@ -167,12 +167,18 @@ fn unvalidated_measurement_never_changes_skill_need_inclusion() {
         serde_json::to_vec(&large).map(|bytes| bytes.len())
     );
     assert_eq!(large_estimate.verdict, small_estimate.verdict);
-    assert_eq!(large_estimate.distractor_risk, small_estimate.distractor_risk);
+    assert_eq!(
+        large_estimate.distractor_risk,
+        small_estimate.distractor_risk
+    );
 
     // The shared verdict is the real Include/Exclude decision this audit is
     // about, and it is reached by both the estimator and the filter that
     // populates `skills_included`.
-    assert_eq!(small_estimate.verdict, eliot_types::SkillNeedVerdict::Include);
+    assert_eq!(
+        small_estimate.verdict,
+        eliot_types::SkillNeedVerdict::Include
+    );
     let filter = SkillDistractorFilterService::filter(
         project_id,
         task_id,
@@ -189,11 +195,18 @@ fn unvalidated_measurement_never_changes_skill_need_inclusion() {
     // `distractor_risk` asserted above is what proves they do not.
     let small_stu = SkillLifecycleService::record_for(&small, None).context_cost;
     let large_stu = SkillLifecycleService::record_for(&large, None).context_cost;
-    let small_bytes = serde_json::to_vec(&small).expect("skill card serializes").len();
-    let large_bytes = serde_json::to_vec(&large).expect("skill card serializes").len();
+    let small_bytes = serde_json::to_vec(&small)
+        .expect("skill card serializes")
+        .len();
+    let large_bytes = serde_json::to_vec(&large)
+        .expect("skill card serializes")
+        .len();
     assert_eq!(small_stu, Some(u64::try_from(small_bytes + 2).unwrap() / 3));
     assert_eq!(large_stu, Some(u64::try_from(large_bytes + 2).unwrap() / 3));
-    assert_ne!(large_stu, small_stu, "the pair differs only in envelope size");
+    assert_ne!(
+        large_stu, small_stu,
+        "the pair differs only in envelope size"
+    );
 }
 
 #[test]

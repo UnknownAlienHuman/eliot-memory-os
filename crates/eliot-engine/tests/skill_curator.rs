@@ -599,15 +599,16 @@ fn low_utility_skill(name: &str) -> SkillCardV2 {
 }
 
 fn inflated_cost_steps(count: usize) -> Vec<SkillStep> {
-    (0..count).map(|index| SkillStep {
-        step_id: format!("expensive-{index}"),
-        order: index as u32 + 10,
-        instruction: "large context cost step with repeated low utility".repeat(4),
-        expected_observation: None,
-        required_tool_or_capability: None,
-        stop_if_fails: false,
-    })
-    .collect()
+    (0..count)
+        .map(|index| SkillStep {
+            step_id: format!("expensive-{index}"),
+            order: index as u32 + 10,
+            instruction: "large context cost step with repeated low utility".repeat(4),
+            expected_observation: None,
+            required_tool_or_capability: None,
+            stop_if_fails: false,
+        })
+        .collect()
 }
 
 /// Push the serialized `SkillCardV2` past `MAX_MEASUREMENT_BYTES`, so the

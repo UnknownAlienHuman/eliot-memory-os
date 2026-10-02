@@ -25,9 +25,7 @@ use time::OffsetDateTime;
 #[path = "context_cost_measurement.rs"]
 mod context_cost_measurement;
 
-use context_cost_measurement::{
-    canonical_context_cost_observation, checked_context_cost_add,
-};
+use context_cost_measurement::{canonical_context_cost_observation, checked_context_cost_add};
 
 pub const MEMORY_DISTILLATION_RULESET_VERSION: &str = "eliot-c4-distillation-v1";
 const MEMORY_DISTILLATION_NORMALIZATION_TOKEN_LIMIT: usize = 12;
