@@ -54,7 +54,7 @@
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::AuditEventDraft;
-use super::trace_manifest::TraceManifest;
+use super::trace_manifest::{TraceEvidence, TraceManifest};
 use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
@@ -4679,8 +4679,24 @@ impl KernelComposition {
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
-        let manifest =
-            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // `TraceEvidence::observed` reads the I16.12 principal, policy
+        // snapshot, Active View/packet manifest, and verifier/artifact result
+        // classes from the durable row this same call persisted; a class the
+        // row does not carry stays absent and is sealed as a missing part.
+        let observed_evidence = TraceEvidence::observed(
+            &persisted,
+            queued_envelope
+                .as_ref()
+                .map(|envelope| &envelope.state_fence),
+        );
+        let manifest = TraceManifest::seal(
+            session,
+            body,
+            &persisted,
+            queued_envelope.as_ref(),
+            lane,
+            &observed_evidence,
+        );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
         observe_trace_seal(&manifest);
@@ -6167,9 +6183,24 @@ impl KernelComposition {
             ));
         }
         // Issue #1838: seal the canonical replayable trace manifest for the
-        // bound result through the single audit chain.
-        let manifest =
-            TraceManifest::seal(session, body, &persisted, queued_envelope.as_ref(), lane);
+        // bound result through the single audit chain. The four I16.12
+        // evidence classes are projected from the durable row just persisted
+        // here, so a class that owner does not carry stays absent and is
+        // sealed as a missing part rather than as a completion claim.
+        let observed_evidence = TraceEvidence::observed(
+            &persisted,
+            queued_envelope
+                .as_ref()
+                .map(|envelope| &envelope.state_fence),
+        );
+        let manifest = TraceManifest::seal(
+            session,
+            body,
+            &persisted,
+            queued_envelope.as_ref(),
+            lane,
+            &observed_evidence,
+        );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
         observe_trace_seal(&manifest);
