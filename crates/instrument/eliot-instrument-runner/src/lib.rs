@@ -33,9 +33,12 @@ pub mod registry;
 pub mod rust_analyzer_profile;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
+pub mod toolchain_resolution;
 pub mod verification_profile;
 
-pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
+pub use admission_submission::{
+    AdmissionSubmission, AdmissionSubmissionReadback, prepare_admission_submission,
+};
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
@@ -91,15 +94,16 @@ pub use profile::{
     REGISTRY_SNAPSHOT_SCHEMA_VERSION, ResolvedProfile, ResolvedStage, ResourceLimits, StageDag,
     StageDecl, StageEnvironment, TEST_PROFILE, TOOLCHAIN_PATH_ENV, TargetLayout, WorkScope,
     RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT, RUST_ANALYZER_PROFILE,
-    RUST_ANALYZER_VERSION_INSTRUMENT,
+    RUST_ANALYZER_SCIP_INSTRUMENT, RUST_ANALYZER_VERSION_INSTRUMENT,
     admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
     package_verification_profile, test_profile,
 };
 pub use profile_run::{
-    AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
-    ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,
-    StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
-    TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
+    AdmissionSubmissionProofPort, AggregateStatus, InstrumentRun, MappedStageLauncher,
+    PlannedStage, ProfileAggregate, ProfileRunError, ProviderDispatch, RetainedExitOutcome,
+    RetainedToolIdentity, StageEvidence, StageIdentity, StageLauncher, StageOrchestrator,
+    StagePlan, StageTargetLayout, TestExecutionPlaneRoute, TestdPlaneAdmission,
+    compose_provider_dispatch,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
@@ -122,6 +126,10 @@ pub use testd_port::{
 pub use testd_profile_dispatch::{
     TESTD_DISPATCH_BINDINGS, TestdDispatchBinding, TestdDispatchError, dispatched_testd_profiles,
     instrument_contract_for_testd_profile, verify_testd_dispatch,
+};
+pub use toolchain_resolution::{
+    ToolchainResolutionError, isolated_projection as selected_toolchain_environment,
+    resolve_tool as resolve_selected_toolchain_member,
 };
 pub use verification_profile::{
     AggregateOutcome, DeclaredEnvironmentDependency, ExternalToolProvenance, PROFILE_PROOF_CEILING,

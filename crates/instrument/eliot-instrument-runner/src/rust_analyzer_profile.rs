@@ -1,4 +1,4 @@
-//! Admitted one-shot Rust Analyzer diagnostics and version profile.
+//! Admitted one-shot Rust Analyzer diagnostics, version, and SCIP profile.
 //!
 //! These helpers return only the original values held by the typed
 //! InstrumentSpec and provider registries. Executable discovery, source
@@ -12,7 +12,8 @@ use crate::profile::{
     BUILTIN_PROFILE_REVISION, InstrumentClass, InstrumentProfile, InstrumentRegistry,
     InstrumentSpec, LSP_BRIDGE_NORMALIZER_CONTRACT, ProfileError,
     RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT, RUST_ANALYZER_PROFILE,
-    RUST_ANALYZER_VERSION_INSTRUMENT, DIAGNOSTIC_PARSER_CONTRACT,
+    RUST_ANALYZER_SCIP_INSTRUMENT, RUST_ANALYZER_VERSION_INSTRUMENT,
+    DIAGNOSTIC_PARSER_CONTRACT,
 };
 use crate::registry::{
     ProviderRegistry, RegistryEntry, RegistryError, RegistryFreshness, ResolvedExecutableIdentity,
@@ -53,7 +54,7 @@ pub enum RustAnalyzerProfileError {
         /// Generation pinned by the original profile registry.
         found: u64,
     },
-    /// The invocation did not name one of the two admitted Rust Analyzer kinds.
+    /// The invocation did not name an admitted Rust Analyzer operation.
     #[error("instrument '{instrument}' is not an admitted Rust Analyzer operation")]
     UnsupportedInstrument {
         /// Original instrument identity.
@@ -110,6 +111,7 @@ pub fn resolve_current<'a>(
     let expected_parser = match instrument_name {
         RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT => DIAGNOSTIC_PARSER_CONTRACT,
         RUST_ANALYZER_VERSION_INSTRUMENT => LSP_BRIDGE_NORMALIZER_CONTRACT,
+        RUST_ANALYZER_SCIP_INSTRUMENT => LSP_BRIDGE_NORMALIZER_CONTRACT,
         _ => {
             return Err(RustAnalyzerProfileError::UnsupportedInstrument {
                 instrument: instrument_name.to_owned(),

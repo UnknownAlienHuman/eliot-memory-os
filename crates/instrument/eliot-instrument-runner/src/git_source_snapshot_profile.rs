@@ -267,7 +267,11 @@ pub fn prepare_current_git_source_snapshot_profile<'a>(
         || intent.executable_sha256() != resolved_executable.content_digest.as_str()
         || intent.working_directory() != canonical_working_directory
         || intent.environment() != environment
-        || environment_index != index_file
+        || environment
+            .non_secret()
+            .get("GIT_INDEX_FILE")
+            .map(String::as_str)
+            != Some(index_file)
     {
         return Err(GitSourceSnapshotProfileError::IntentMismatch);
     }

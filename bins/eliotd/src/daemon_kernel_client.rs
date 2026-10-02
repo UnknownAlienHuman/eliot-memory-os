@@ -686,10 +686,14 @@ pub fn parse_selected_source_capture_staged_admission(
         .map_err(|error| format!("typed ORS claims cannot be encoded: {error}"))?;
     let authority_epoch = serde_json::to_value(&staged.authority_epoch)
         .map_err(|error| format!("staged ORS epoch cannot be encoded: {error}"))?;
-    let expected_operation = match invocation.operation {
-        eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
-        eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
-    };
+    let expected_operation = invocation
+        .operation
+        .canonical_serialization()
+        .map_err(|error| format!("original selected-source operation cannot be serialized: {error}"))?;
+    let intent_operation = intent
+        .operation
+        .canonical_serialization()
+        .map_err(|error| format!("stage operation cannot be serialized: {error}"))?;
     if record.work_item_id != selected.evidence_ref()
         || record.proposed_attempt_id == record.work_item_id
         || record.reservation_id == record.work_item_id
@@ -702,7 +706,7 @@ pub fn parse_selected_source_capture_staged_admission(
         || record.work_lease_id != selected.selection_source_ref()
         || record.principal_id != selected.principal_ref()
         || record.operation != expected_operation
-        || record.operation != intent.operation
+        || record.operation != intent_operation
         || record.selected_relative_path != invocation.selected_relative_path
         || record.selected_relative_path != intent.selected_relative_path
         || record.selector != invocation.selector
@@ -2647,6 +2651,423 @@ impl DaemonKernelClient {
         serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
+    /// Sends one original Git source-snapshot child request through the
+    /// parent-bound current-source P-03 route. The selected-source identity is
+    /// retained separately from the per-command child identity; neither is
+    /// reconstructed from the command selector or process request.
+    #[cfg(windows)]
+    pub(super) async fn execute_current_source_git_process(
+        &self,
+        parent_identity: RequestIdentity,
+        child_identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
+        request: eliot_kernel_service::ProcessExecutionRequest,
+    ) -> Result<eliot_kernel_service::ProcessExecutionResponse, KernelClientError> {
+        request
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        parent_identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        child_identity
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+
+        let operation_id = request.operation_id().ok_or_else(|| {
+            KernelClientError::Contract(
+                "current-source Git request omitted its process operation identity".to_owned(),
+            )
+        })?;
+        let parent_binding = &parent_identity.request;
+        let child_binding = &child_identity.request;
+        let parent_metadata = &parent_binding.metadata;
+        let child_metadata = &child_binding.metadata;
+        let current_fence = self.snapshot.state_fence();
+        if parent_metadata.request_id == child_metadata.request_id
+            || parent_identity.deadline_unix_ms != child_identity.deadline_unix_ms
+            || parent_metadata.product_id != child_metadata.product_id
+            || parent_metadata.source_id != child_metadata.source_id
+            || parent_metadata.session_id != child_metadata.session_id
+            || parent_metadata.task_id.as_ref() != Some(&admitted_task_id)
+            || child_metadata.task_id.as_ref() != Some(&admitted_task_id)
+            || parent_binding.state_fence != current_fence
+            || parent_metadata.state_fence != parent_binding.state_fence
+            || child_binding.state_fence != parent_binding.state_fence
+            || child_metadata.state_fence != child_binding.state_fence
+            || child_metadata.request_id.as_str() != operation_id.as_str()
+        {
+            return Err(KernelClientError::Contract(
+                "current-source Git child does not retain the selected-source task, source, product, deadline, operation, and current Kernel fence".to_owned(),
+            ));
+        }
+        if let eliot_kernel_service::ProcessExecutionRequest::Start(admission) = &request
+            && (admission.recipient_module_id() != self.snapshot.service.as_str()
+                || admission.deadline_unix_ms() != child_identity.deadline_unix_ms
+                || admission.intent().operation_id().as_str() != operation_id.as_str()
+                || !admission
+                    .state_fence()
+                    .authority_epoch()
+                    .is_same_authority(&child_binding.state_fence.authority_epoch)
+                || admission.state_fence().generation().get()
+                    != child_binding.state_fence.resource_generation.value())
+        {
+            return Err(KernelClientError::Contract(
+                "current-source Git Start admission differs from its owner-created child identity".to_owned(),
+            ));
+        }
+
+        let value = self
+            .transact_async_with_identity(
+                "execute_current_source_git_process",
+                serde_json::json!({
+                    "parent_identity": parent_identity,
+                    "request": request,
+                    "admitted_task_id": admitted_task_id,
+                }),
+                child_identity,
+            )
+            .await?;
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("known")
+            || value
+                .get("recovery")
+                .is_none_or(|recovery| !recovery.is_null())
+        {
+            return Err(KernelClientError::Unknown(
+                "current-source Git owner did not return a known, non-recovery response"
+                    .to_owned(),
+            ));
+        }
+        let response = value.get("value").cloned().ok_or_else(|| {
+            KernelClientError::Unknown(
+                "current-source Git owner response omits its typed P-03 value".to_owned(),
+            )
+        })?;
+        serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))
+    }
+
+    /// Reads one complete original P-03 stream through bounded Kernel
+    /// readback. A preview or partial capture is never promoted to a process
+    /// outcome; every chunk must retain the original start receipt and typed
+    /// stream evidence identities through EOF.
+    #[cfg(windows)]
+    pub(super) async fn read_current_source_git_process_stream(
+        &self,
+        parent_identity: RequestIdentity,
+        child_identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
+        intent: &eliot_process::ProcessIntent,
+        start_receipt: &eliot_process::ProcessStartReceipt,
+        evidence: &eliot_process::ProcessStreamEvidence,
+    ) -> Result<Vec<u8>, KernelClientError> {
+        const CHUNK_BYTES: u64 = eliot_kernel_service::PROCESS_STREAM_READ_CHUNK_MAX_BYTES;
+
+        intent
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        start_receipt
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        evidence
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let stream_ceiling = match evidence.stream() {
+            eliot_process::ProcessStreamKind::Stdout => {
+                intent.resource_limits().stdout_bytes()
+            }
+            eliot_process::ProcessStreamKind::Stderr => {
+                intent.resource_limits().stderr_bytes()
+            }
+        };
+        if evidence.binding() != start_receipt.binding()
+            || start_receipt.operation_id() != intent.operation_id()
+            || evidence.transport() != eliot_process::StreamTransportStatus::Complete
+            || evidence.observed_bytes() > stream_ceiling
+        {
+            return Err(KernelClientError::Contract(
+                "original process stream evidence is not complete, within its admitted stream resource limit, and bound to the original intent and start receipt".to_owned(),
+            ));
+        }
+
+        let start_receipt_sha256 = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(start_receipt)
+                .map_err(|error| KernelClientError::Contract(error.to_string()))?,
+        );
+        let stream_evidence_sha256 = evidence
+            .identity_sha256()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let total_bytes = evidence.observed_bytes();
+        let capacity = usize::try_from(total_bytes).map_err(|error| {
+            KernelClientError::Contract(format!(
+                "original process stream length is not representable: {error}"
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|error| {
+            KernelClientError::Unknown(format!(
+                "cannot allocate the admitted original process stream length: {error}"
+            ))
+        })?;
+        let mut offset = 0_u64;
+        loop {
+            let remaining = total_bytes.saturating_sub(offset);
+            let max_bytes = if remaining == 0 {
+                1
+            } else {
+                remaining.min(CHUNK_BYTES)
+            };
+            let request = eliot_kernel_service::ProcessStreamReadRequest::new(
+                start_receipt.clone(),
+                intent.clone(),
+                evidence.stream(),
+                offset,
+                max_bytes,
+            )
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+            let response = self
+                .execute_current_source_git_process(
+                    parent_identity.clone(),
+                    child_identity.clone(),
+                    admitted_task_id.clone(),
+                    eliot_kernel_service::ProcessExecutionRequest::ReadStream { request },
+                )
+                .await?;
+            let chunk = match response {
+                eliot_kernel_service::ProcessExecutionResponse::StreamChunk(chunk) => chunk,
+                eliot_kernel_service::ProcessExecutionResponse::Rejected(rejection) => {
+                    return Err(KernelClientError::Unknown(format!(
+                        "Kernel refused original process stream readback ({}): {}",
+                        rejection.code, rejection.detail
+                    )));
+                }
+                _ => {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel returned a non-stream response to original process readback"
+                            .to_owned(),
+                    ));
+                }
+            };
+            chunk
+                .validate()
+                .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+            if chunk.operation_id() != start_receipt.operation_id()
+                || chunk.binding() != start_receipt.binding()
+                || chunk.process_intent_effect_digest() != intent.effect_digest()
+                || chunk.stream_limit_bytes() != stream_ceiling
+                || chunk.stream() != evidence.stream()
+                || chunk.start_receipt_sha256() != start_receipt_sha256
+                || chunk.stream_evidence_sha256() != stream_evidence_sha256
+                || chunk.observed_sha256() != evidence.observed_sha256()
+                || chunk.observed_bytes() != total_bytes
+                || chunk.offset() != offset
+                || (remaining > 0 && chunk.bytes().is_empty())
+            {
+                return Err(KernelClientError::Unknown(
+                    "Kernel process stream chunk changed its original receipt, evidence, digest, length, or offset".to_owned(),
+                ));
+            }
+            let next_offset = offset
+                .checked_add(u64::try_from(chunk.bytes().len()).map_err(|error| {
+                    KernelClientError::Unknown(format!(
+                        "Kernel process stream chunk length is not representable: {error}"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    KernelClientError::Unknown("Kernel process stream offset overflowed".to_owned())
+                })?;
+            if next_offset > total_bytes {
+                return Err(KernelClientError::Unknown(
+                    "Kernel process stream chunk exceeded the original observed length".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(chunk.bytes());
+            offset = next_offset;
+            if chunk.chunk_eof() {
+                if offset != total_bytes {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel process stream reached EOF before the original observed length"
+                            .to_owned(),
+                    ));
+                }
+                break;
+            }
+            if offset >= total_bytes {
+                return Err(KernelClientError::Unknown(
+                    "Kernel process stream omitted its original EOF marker".to_owned(),
+                ));
+            }
+        }
+        if u64::try_from(bytes.len()).ok() != Some(total_bytes)
+            || eliot_contracts::sha256_hex(&bytes) != evidence.observed_sha256()
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel process stream bytes do not match the original complete evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Reads one complete analyzer stream through the original selected-source
+    /// process route. The full bytes remain tied to the admitted ProcessIntent
+    /// and the exact Start/Reconcile evidence; a bounded preview is never
+    /// promoted to full output.
+    #[cfg(windows)]
+    pub(super) async fn read_current_source_process_stream(
+        &self,
+        identity: RequestIdentity,
+        admitted_task_id: eliot_contracts::TaskId,
+        intent: &eliot_process::ProcessIntent,
+        start_receipt: &eliot_process::ProcessStartReceipt,
+        evidence: &eliot_process::ProcessStreamEvidence,
+    ) -> Result<Vec<u8>, KernelClientError> {
+        const CHUNK_BYTES: u64 = eliot_kernel_service::PROCESS_STREAM_READ_CHUNK_MAX_BYTES;
+
+        intent
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        start_receipt
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        evidence
+            .validate()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let stream_ceiling = match evidence.stream() {
+            eliot_process::ProcessStreamKind::Stdout => {
+                intent.resource_limits().stdout_bytes()
+            }
+            eliot_process::ProcessStreamKind::Stderr => {
+                intent.resource_limits().stderr_bytes()
+            }
+        };
+        if evidence.binding() != start_receipt.binding()
+            || start_receipt.operation_id() != intent.operation_id()
+            || identity.request.metadata.request_id.as_str()
+                != intent.operation_id().as_str()
+            || evidence.transport() != eliot_process::StreamTransportStatus::Complete
+            || evidence.observed_bytes() > stream_ceiling
+        {
+            return Err(KernelClientError::Contract(
+                "analyzer stream evidence is not complete, within its admitted stream limit, and bound to the original intent, identity, and start receipt".to_owned(),
+            ));
+        }
+
+        let start_receipt_sha256 = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(start_receipt)
+                .map_err(|error| KernelClientError::Contract(error.to_string()))?,
+        );
+        let stream_evidence_sha256 = evidence
+            .identity_sha256()
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let total_bytes = evidence.observed_bytes();
+        let capacity = usize::try_from(total_bytes).map_err(|error| {
+            KernelClientError::Contract(format!(
+                "analyzer stream length is not representable: {error}"
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|error| {
+            KernelClientError::Unknown(format!(
+                "cannot allocate the admitted analyzer stream length: {error}"
+            ))
+        })?;
+        let mut offset = 0_u64;
+        loop {
+            let remaining = total_bytes.saturating_sub(offset);
+            let max_bytes = if remaining == 0 {
+                1
+            } else {
+                remaining.min(CHUNK_BYTES)
+            };
+            let request = eliot_kernel_service::ProcessStreamReadRequest::new(
+                start_receipt.clone(),
+                intent.clone(),
+                evidence.stream(),
+                offset,
+                max_bytes,
+            )
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+            let response = self
+                .execute_current_source_process(
+                    eliot_kernel_service::ProcessExecutionRequest::ReadStream { request },
+                    identity.clone(),
+                    admitted_task_id.clone(),
+                )
+                .await?;
+            let chunk = match response {
+                eliot_kernel_service::ProcessExecutionResponse::StreamChunk(chunk) => chunk,
+                eliot_kernel_service::ProcessExecutionResponse::Rejected(rejection) => {
+                    return Err(KernelClientError::Unknown(format!(
+                        "Kernel refused complete analyzer stream readback ({}): {}",
+                        rejection.code, rejection.detail
+                    )));
+                }
+                _ => {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel returned a non-stream response to analyzer readback".to_owned(),
+                    ));
+                }
+            };
+            chunk
+                .validate()
+                .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+            if chunk.operation_id() != start_receipt.operation_id()
+                || chunk.binding() != start_receipt.binding()
+                || chunk.process_intent_effect_digest() != intent.effect_digest()
+                || chunk.stream_limit_bytes() != stream_ceiling
+                || chunk.stream() != evidence.stream()
+                || chunk.start_receipt_sha256() != start_receipt_sha256
+                || chunk.stream_evidence_sha256() != stream_evidence_sha256
+                || chunk.observed_sha256() != evidence.observed_sha256()
+                || chunk.observed_bytes() != total_bytes
+                || chunk.offset() != offset
+                || (remaining > 0 && chunk.bytes().is_empty())
+            {
+                return Err(KernelClientError::Unknown(
+                    "Kernel analyzer chunk changed the original receipt, evidence, digest, length, or offset".to_owned(),
+                ));
+            }
+            let next_offset = offset
+                .checked_add(u64::try_from(chunk.bytes().len()).map_err(|error| {
+                    KernelClientError::Unknown(format!(
+                        "Kernel analyzer chunk length is not representable: {error}"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    KernelClientError::Unknown("Kernel analyzer stream offset overflowed".to_owned())
+                })?;
+            if next_offset > total_bytes {
+                return Err(KernelClientError::Unknown(
+                    "Kernel analyzer chunk exceeded the original observed stream length".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(chunk.bytes());
+            offset = next_offset;
+            if chunk.chunk_eof() {
+                if offset != total_bytes {
+                    return Err(KernelClientError::Unknown(
+                        "Kernel analyzer stream reached EOF before its original length".to_owned(),
+                    ));
+                }
+                break;
+            }
+            if offset >= total_bytes {
+                return Err(KernelClientError::Unknown(
+                    "Kernel analyzer stream omitted its original EOF marker".to_owned(),
+                ));
+            }
+        }
+        if u64::try_from(bytes.len()).ok() != Some(total_bytes)
+            || eliot_contracts::sha256_hex(&bytes) != evidence.observed_sha256()
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel analyzer bytes differ from the original complete stream evidence"
+                    .to_owned(),
+            ));
+        }
+        Ok(bytes)
+    }
+
     #[cfg(windows)]
     pub(super) async fn transact_async_with_identity(
         &self,
@@ -3146,11 +3567,7 @@ impl DaemonKernelClient {
         selected: &eliot_governor::TaskSelectionAdmissionBinding,
         intent: eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent,
     ) -> Result<SelectedSourceCaptureStagedAdmission, super::DaemonError> {
-        let expected_operation = match claimed.invocation.operation {
-            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
-            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
-        };
-        if intent.operation != expected_operation
+        if intent.operation != claimed.invocation.operation
             || intent.selected_relative_path != claimed.invocation.selected_relative_path
             || intent.selector != claimed.invocation.selector
             || intent.work_item_id.as_str() != selected.evidence_ref()

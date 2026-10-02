@@ -62,7 +62,9 @@ pub const RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT: &str =
     "eliot.instrument.rust-analyzer.diagnostics";
 /// Rust Analyzer version-probe instrument identity.
 pub const RUST_ANALYZER_VERSION_INSTRUMENT: &str = "eliot.instrument.rust-analyzer.version";
-/// One-shot profile containing only the admitted Rust Analyzer operations.
+/// Rust Analyzer one-shot SCIP sidecar emission instrument identity.
+pub const RUST_ANALYZER_SCIP_INSTRUMENT: &str = "eliot.instrument.rust-analyzer.scip";
+/// One-shot profile containing the admitted Rust Analyzer operations.
 pub const RUST_ANALYZER_PROFILE: &str = "rust-analyzer-one-shot";
 /// Parser generation shipped for every builtin [`InstrumentSpec`].
 ///
@@ -1086,6 +1088,13 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             ContractId::new(LSP_BRIDGE_NORMALIZER_CONTRACT)?,
             vec!["--version".to_owned()],
         )?,
+        builtin_rust_analyzer_spec(
+            &credential,
+            &network,
+            RUST_ANALYZER_SCIP_INSTRUMENT,
+            ContractId::new(LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+            vec!["scip".to_owned()],
+        )?,
     ])
 }
 
@@ -1115,10 +1124,11 @@ fn builtin_rust_analyzer_spec(
     })
 }
 
-/// Builds the one-shot Rust Analyzer diagnostics/version profile.
+/// Builds the one-shot Rust Analyzer diagnostics/version/SCIP profile.
 ///
-/// The two stages use separate admitted instrument identities because the
-/// bridge binds diagnostics and version observations to different parsers.
+/// The stages use separate admitted instrument identities because the bridge
+/// binds diagnostics, version, and SCIP observations to different process
+/// shapes and parsers.
 pub fn rust_analyzer_profile() -> Result<InstrumentProfile, ProfileError> {
     let dag = StageDag::build(
         RUST_ANALYZER_PROFILE,
@@ -1134,6 +1144,14 @@ pub fn rust_analyzer_profile() -> Result<InstrumentProfile, ProfileError> {
             StageDecl::new(
                 "rust-analyzer-version".to_owned(),
                 ContractId::new(RUST_ANALYZER_VERSION_INSTRUMENT)?,
+                InstrumentKind::Inspect,
+                Vec::new(),
+                false,
+                true,
+            )?,
+            StageDecl::new(
+                "rust-analyzer-scip".to_owned(),
+                ContractId::new(RUST_ANALYZER_SCIP_INSTRUMENT)?,
                 InstrumentKind::Inspect,
                 Vec::new(),
                 false,

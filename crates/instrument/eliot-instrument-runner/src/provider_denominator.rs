@@ -100,7 +100,10 @@ impl AdvertisedInstrument {
 }
 
 use ProviderSupport::{DecoderOnly, Executable, InProcess, Unmapped};
-use crate::profile::{RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT, RUST_ANALYZER_VERSION_INSTRUMENT};
+use crate::profile::{
+    RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT, RUST_ANALYZER_SCIP_INSTRUMENT,
+    RUST_ANALYZER_VERSION_INSTRUMENT,
+};
 
 /// Every Instrument contract identity advertised by the instrument
 /// subtree, in sorted contract order.
@@ -145,6 +148,11 @@ pub const ADVERTISED_INSTRUMENTS: &[AdvertisedInstrument] = &[
     ),
     AdvertisedInstrument::new(
         RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT,
+        "eliot-lsp-bridge",
+        Executable,
+    ),
+    AdvertisedInstrument::new(
+        RUST_ANALYZER_SCIP_INSTRUMENT,
         "eliot-lsp-bridge",
         Executable,
     ),

@@ -1107,6 +1107,7 @@ impl ProviderRegistry {
             scip_entry(fingerprints, generation)?,
             rust_analyzer_diagnostics_entry(fingerprints, generation)?,
             rust_analyzer_version_entry(fingerprints, generation)?,
+            rust_analyzer_scip_entry(fingerprints, generation)?,
             git_source_snapshot_entry(
                 fingerprints,
                 generation,
@@ -1776,6 +1777,25 @@ fn rust_analyzer_version_entry(
         crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT,
         "one-shot --version probe through the shared ProcessExecutor",
         "P-03 OperationId for one-shot Rust Analyzer version probe under the admitted State Fence",
+    )
+}
+
+/// Rust Analyzer SCIP entry: one-shot sidecar emission through P-03.
+///
+/// The emitted index is a process artifact retained by the LSP bridge. The
+/// decoder-only `scip_entry` remains a separate instrument and never launches
+/// a process.
+fn rust_analyzer_scip_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+) -> Result<RegistryEntry, ContractError> {
+    rust_analyzer_entry(
+        fingerprints,
+        generation,
+        crate::profile::RUST_ANALYZER_SCIP_INSTRUMENT,
+        crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT,
+        "one-shot rust-analyzer scip emission through the shared ProcessExecutor into an invocation-owned sidecar",
+        "P-03 OperationId for one-shot Rust Analyzer SCIP emission under the admitted State Fence",
     )
 }
 

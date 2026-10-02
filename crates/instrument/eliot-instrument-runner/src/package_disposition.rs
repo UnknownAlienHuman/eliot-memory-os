@@ -97,7 +97,7 @@ pub const TESTD_DISPATCH_UNIVERSE: [&str; 4] = [
 ///
 /// A package that is not dispatchable (bounded fixture or deleted) must not
 /// name any member of this universe.
-pub const TESTD_PROFILE_UNIVERSE: [&str; 14] = [
+pub const TESTD_PROFILE_UNIVERSE: [&str; 15] = [
     "eliot.instrument.build-test-graph",
     "eliot.instrument.cargo",
     "eliot.instrument.diagnostic",
@@ -108,6 +108,7 @@ pub const TESTD_PROFILE_UNIVERSE: [&str; 14] = [
     "eliot.instrument.rustc",
     "eliot.instrument.rustfmt",
     "eliot.instrument.rust-analyzer.diagnostics",
+    "eliot.instrument.rust-analyzer.scip",
     "eliot.instrument.rust-analyzer.version",
     "eliot.instrument.scip",
     "eliot.instrument.test-selection",

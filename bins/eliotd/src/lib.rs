@@ -245,6 +245,7 @@ struct DaemonCurrentSourceLspProcessOwner<'a> {
     kernel: &'a DaemonKernelClient,
     identity: RequestIdentity,
     task_id: eliot_contracts::TaskId,
+    intent: eliot_process::ProcessIntent,
 }
 
 #[cfg(windows)]
@@ -309,6 +310,82 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
                 }
                 other => Err(current_source_process_rejection(other, "Reconciled")),
             }
+        })
+    }
+
+    fn read_streams<'a>(
+        &'a self,
+        process_start: &'a eliot_process::ProcessStartReceipt,
+        evidence: &'a eliot_process::ProcessEvidence,
+    ) -> eliot_lsp_bridge::LspProcessOwnerFuture<'a, eliot_lsp_bridge::LspProcessStreamReadback> {
+        Box::pin(async move {
+            process_start
+                .validate()
+                .map_err(|error| {
+                    eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
+                })?;
+            evidence.validate().map_err(|error| {
+                eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
+            })?;
+            if process_start.binding() != evidence.binding()
+                || process_start.operation_id() != self.intent.operation_id()
+                || evidence.operation_id() != self.intent.operation_id()
+            {
+                return Err(eliot_lsp_bridge::LspProcessOwnerError::Rejected {
+                    code: "LSP_STREAM_BINDING_MISMATCH".to_owned(),
+                    detail: "full stream readback does not retain the original admitted intent and process start".to_owned(),
+                });
+            }
+
+            let stdout = match evidence.stdout() {
+                Some(stream)
+                    if stream.transport() == eliot_process::StreamTransportStatus::Complete
+                        && stream.persistence()
+                            == eliot_process::StreamPersistenceStatus::CompleteSource =>
+                {
+                    Some(
+                        self.kernel
+                            .read_current_source_process_stream(
+                                self.identity.clone(),
+                                self.task_id.clone(),
+                                &self.intent,
+                                process_start,
+                                stream,
+                            )
+                            .await
+                            .map_err(|error| {
+                                eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
+                            })?,
+                    )
+                }
+                _ => None,
+            };
+            let stderr = match evidence.stderr() {
+                Some(stream)
+                    if stream.transport() == eliot_process::StreamTransportStatus::Complete
+                        && stream.persistence()
+                            == eliot_process::StreamPersistenceStatus::CompleteSource =>
+                {
+                    Some(
+                        self.kernel
+                            .read_current_source_process_stream(
+                                self.identity.clone(),
+                                self.task_id.clone(),
+                                &self.intent,
+                                process_start,
+                                stream,
+                            )
+                            .await
+                            .map_err(|error| {
+                                eliot_lsp_bridge::LspProcessOwnerError::Owner(Box::new(error))
+                            })?,
+                    )
+                }
+                _ => None,
+            };
+            Ok(eliot_lsp_bridge::LspProcessStreamReadback::new(
+                stdout, stderr,
+            ))
         })
     }
 }
@@ -439,6 +516,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+mod lsp_source_owner_inputs;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
 // Public because `daemon_runtime` lives in the `eliotd` binary crate and
@@ -468,6 +546,8 @@ pub mod skill_dispatch;
 mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
+#[cfg(test)]
+mod selected_source_lsp_acceptance;
 pub mod solo_agent_driver;
 /// I5.2 D1 same-stack source-artifact Blob owner. It consumes the live
 /// Governor source-effect admission and retains S-04 receipt lineage here.
@@ -2483,12 +2563,18 @@ impl DaemonComposition {
                     "current Instrument Registry owner snapshot failed its existing recovery validator",
                 )
             })?;
-        let instrument_name = match claimed.invocation.operation {
+        let instrument_name = match &claimed.invocation.operation {
             eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => {
                 eliot_instrument_runner::RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT
             }
             eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => {
                 eliot_instrument_runner::RUST_ANALYZER_VERSION_INSTRUMENT
+            }
+            eliot_protocol::SelectedSourceCaptureOperation::Definitions { .. }
+            | eliot_protocol::SelectedSourceCaptureOperation::References { .. }
+            | eliot_protocol::SelectedSourceCaptureOperation::Symbols
+            | eliot_protocol::SelectedSourceCaptureOperation::RenameCandidate { .. } => {
+                eliot_instrument_runner::RUST_ANALYZER_SCIP_INSTRUMENT
             }
         };
         if instrument_registry
@@ -2511,10 +2597,15 @@ impl DaemonComposition {
             state_fence: registry_response.state_fence,
             registry: instrument_registry,
         };
-        let expected_operation = match claimed.invocation.operation {
-            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
-            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
-        };
+        let expected_operation = claimed
+            .invocation
+            .operation
+            .canonical_serialization()
+            .map_err(|_| {
+                CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                    "selected-source operation has no canonical serialization",
+                )
+            })?;
         let identity_value = serde_json::to_value(&claimed.request_identity)?;
         let stage_operation_id = staged.staged_record.stage_operation_id.as_str();
         if record.request_identity != identity_value
@@ -2697,7 +2788,7 @@ impl DaemonComposition {
         invocation: LiveLspCaptureInvocation<'_, G, C>,
     ) -> Result<CapturedLspW1Outcome, CapturedLspAdoptionError>
     where
-        G: eliot_lsp_bridge::GitProcessRunner + 'static,
+        G: eliot_lsp_bridge::GitProcessRunner,
         C: FnOnce(eliot_process::OperationId) -> F,
         F: Future<Output = Result<eliot_process::ProcessEvidence, String>>,
     {
@@ -2756,10 +2847,12 @@ impl DaemonComposition {
             )
             .await;
         let operation_id = process_admission.intent().operation_id().clone();
+        let process_intent = process_admission.intent().clone();
         let process_owner = DaemonCurrentSourceLspProcessOwner {
             kernel,
             identity: identity.clone(),
             task_id: task_id.clone(),
+            intent: process_intent,
         };
         let bridge = eliot_lsp_bridge::LspCurrentBridge::new(Arc::new(process_owner), git_owner);
         let profile = self
