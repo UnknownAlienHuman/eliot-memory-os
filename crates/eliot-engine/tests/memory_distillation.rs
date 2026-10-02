@@ -381,8 +381,7 @@ fn exact_distillation_reduces_estimated_covering_active_bytes_without_losing_cur
     )?;
 
     let before = plan.corpus_profile_before.estimated_covering_active_bytes;
-    let after =
-        i64::try_from(before)? + plan.expected_estimated_covering_active_bytes_delta;
+    let after = i64::try_from(before)? + plan.expected_estimated_covering_active_bytes_delta;
     assert!(before > 0);
     assert!(after >= 0);
     assert!(after * 100 <= i64::try_from(before)? * 60);
