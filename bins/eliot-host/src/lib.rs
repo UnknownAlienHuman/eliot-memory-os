@@ -7688,6 +7688,32 @@ impl HostComposition {
             loaded
         };
         let pending_for_reopen = registry.pending_activation().cloned();
+        // F-LOG-HOST-2 / #893: the pending activation IS this open operation's
+        // subject, and it is in scope at exactly this line — the registry the
+        // owner just loaded produced it, so the owner genuinely holds its
+        // owner-issued `tx`/`effect`/`req` handles here. Bind them to the open
+        // terminal HERE, ahead of the first `?` that can fail on this pending
+        // (launch validation, stale-epoch recovery, profile/artifact checks,
+        // epoch reopen), so a terminal emitted from any of those returns is
+        // joinable to its own `host.epoch pending recovery requested` and
+        // activation reconcile records instead of a byte-identical uncorrelated
+        // code shared with another installation's open.
+        //
+        // Both paths are explicit. Pending PRESENT: bind the pending's own
+        // handles; a pending that never reached Phase-B has no effect/request
+        // pair and the helper keeps the correlation explicitly unavailable
+        // rather than borrowing one from a later phase. Pending ABSENT: this
+        // open has no activation subject at all, so the guard renders the
+        // explicitly unavailable disposition it was armed with — a missing
+        // identity is never inferred (I13.11).
+        #[cfg(windows)]
+        {
+            let correlation = pending_for_reopen.as_ref().map_or_else(
+                host_diagnostics::HostTerminalCorrelation::unavailable,
+                pending_activation_terminal_correlation,
+            );
+            host_terminal.bind_operation(correlation);
+        }
         Self::validate_launch_options_for_registry(
             &launch_options,
             &registry,
@@ -7887,14 +7913,16 @@ impl HostComposition {
         }
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
-            // The pending activation IS this open operation's subject, and it
-            // carries the owner-issued transaction/effect/request handles the
-            // activation reconcile records below already render as `tx`. Bind
-            // them to the open terminal now, so an open that fails here is
-            // joinable to its own subordinate records instead of emitting a
-            // byte-identical uncorrelated code beside another open's. Absent or
-            // half-populated handles stay explicitly unavailable (I13.11).
-            host_terminal.bind_operation(pending_activation_terminal_correlation(&pending));
+            // No bind here (#893): the open terminal was already bound to this
+            // pending activation's owner-issued transaction/effect/request
+            // handles at the point the pending first entered scope, ahead of
+            // `validate_launch_options_for_registry`. This block re-reads the
+            // same pending from the same in-memory registry value, so it carries
+            // the identical correlation; binding again would project one
+            // identity twice and could only ever overwrite it with itself. The
+            // pending here is still the open operation's subject, and every
+            // `?` below now emits a terminal joinable to its own subordinate
+            // reconcile records.
             if pending.phase_b_agent_bridge_stage_prepared.is_some()
                 && pending.phase_b_prepared.is_none()
             {
