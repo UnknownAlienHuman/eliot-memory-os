@@ -1544,6 +1544,12 @@ fn baked_surface(path: &str) -> Option<&'static ConsumerSurface> {
         .find(|surface| surface.path == path)
 }
 
+/// The inventory-revision constant is not a `YYYY-MM-DD` token, so no inventory
+/// can be compared against it. Typed separately from an undated ROW condition,
+/// which is refused per row against a named proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InventoryRevisionUndated;
+
 /// The way one temporary fixture's recorded removal condition fails the
 /// expiry rule, as a typed cause instead of only failure text.
 ///
@@ -1553,6 +1559,9 @@ fn baked_surface(path: &str) -> Option<&'static ConsumerSurface> {
 /// error string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpiryRefusal {
+    /// [`INVENTORY_REVISION`] itself carries no `YYYY-MM-DD` token, so the
+    /// threshold does not exist and no row can be judged against it.
+    InventoryRevisionUndated(InventoryRevisionUndated),
     /// The recorded condition never says the path is removed at all.
     NoRemovalCondition {
         /// Inventory proof of the offending row.
@@ -1573,17 +1582,6 @@ pub enum ExpiryRefusal {
     },
 }
 
-impl ExpiryRefusal {
-    /// Inventory proof of the row this refusal was built for.
-    const fn proof(self) -> &'static str {
-        match self {
-            Self::NoRemovalCondition { proof }
-            | Self::UndatedRemovalCondition { proof }
-            | Self::ExpiredFixture { proof, .. } => proof,
-        }
-    }
-}
-
 /// Fail when a [`Disposition::TemporaryFixture`] in `entries` has no dated
 /// removal condition, or when that condition is not strictly later than
 /// [`INVENTORY_REVISION`], which means the fixture outlived its own deadline.
@@ -1593,9 +1591,9 @@ impl ExpiryRefusal {
 /// shipped entry gate and this function are one rule with one threshold.
 pub fn expiry_condition_guard_over<'a>(entries: &'a [ConsumerEntry]) -> Result<(), ExpiryRefusal> {
     let Some(revision) = first_iso_date_digits(INVENTORY_REVISION) else {
-        return Err(ExpiryRefusal::UndatedRemovalCondition {
-            proof: INVENTORY_REVISION,
-        });
+        return Err(ExpiryRefusal::InventoryRevisionUndated(
+            InventoryRevisionUndated,
+        ));
     };
     for entry in entries {
         if entry.disposition != Disposition::TemporaryFixture {
@@ -1622,17 +1620,26 @@ pub fn expiry_condition_guard_over<'a>(entries: &'a [ConsumerEntry]) -> Result<(
 /// [`INVENTORY_REVISION`], which means the fixture outlived its own deadline.
 pub fn expiry_condition_guard() -> Result<(), String> {
     expiry_condition_guard_over(current_consumer_inventory()).map_err(|refusal| {
-        let proof = refusal.proof();
         match refusal {
-            ExpiryRefusal::NoRemovalCondition { .. } => {
-                format!("temporary fixture {proof} records no removal condition")
+            ExpiryRefusal::InventoryRevisionUndated(_) => {
+                "inventory revision constant is not an ISO date".to_owned()
             }
-            ExpiryRefusal::UndatedRemovalCondition { .. } => format!(
-                "temporary fixture {proof} records no YYYY-MM-DD removal date in {:?}",
+            ExpiryRefusal::NoRemovalCondition { proof } => format!(
+                "temporary fixture {} records no removal condition in {:?}",
+                proof,
                 entries_expiry_for(proof)
             ),
-            ExpiryRefusal::ExpiredFixture { expired_on, .. } => format!(
-                "temporary fixture {proof} expired on {}; record the removal or give it a condition later than {}",
+            ExpiryRefusal::UndatedRemovalCondition { proof } => format!(
+                "temporary fixture {} records no YYYY-MM-DD removal date in {:?}",
+                proof,
+                entries_expiry_for(proof)
+            ),
+            ExpiryRefusal::ExpiredFixture {
+                proof,
+                expired_on,
+            } => format!(
+                "temporary fixture {} expired on {}; record the removal or give it a condition later than {}",
+                proof,
                 iso_date_text(expired_on),
                 INVENTORY_REVISION
             ),
@@ -2465,6 +2472,46 @@ mod tests {
             Ok(()),
             "an extract row whose removal date is already past is still skipped: the \
              exemption is keyed on disposition alone, so no date is ever compared for it"
+        );
+    }
+
+    #[test]
+    fn the_inventory_revision_parse_arm_of_the_expiry_guard_is_unreachable() {
+        // FINDING, recorded rather than worked around: the guard's threshold arm
+        // cannot be exercised. Its `let Some(revision) = ... else` branch, written
+        // at `expiry_condition_guard_over` in
+        // crates/eliot-app/src/disposition.rs:1595, fails closed when
+        // `INVENTORY_REVISION` carries no `YYYY-MM-DD` token, but
+        // `INVENTORY_REVISION` is a compile-time `&'static str` literal at
+        // crates/eliot-app/src/disposition.rs:1129 and
+        // `first_iso_date_digits` takes `&str`, not `&'static str`. No inventory
+        // value, no test fixture and no `expiry_condition_guard_over` argument can
+        // change the threshold text, so the arm has no reachable input and its
+        // `ExpiryRefusal::InventoryRevisionUndated` cause cannot be produced.
+        //
+        // This is why that cause is typed but never asserted below: asserting it
+        // would require either weakening `first_iso_date_digits` until it rejects
+        // a well-formed date, or parameterising the guard with a threshold this
+        // issue's owner has not specified. Neither is done here.
+        assert_eq!(
+            first_iso_date_digits(INVENTORY_REVISION),
+            Some([2, 0, 2, 6, 0, 9, 2, 5]),
+            "INVENTORY_REVISION must stay a parseable YYYY-MM-DD token; if this ever \
+             fails, the guard's threshold arm becomes live and needs its own test"
+        );
+
+        // The literal is fixed at compile time, which is what makes the arm
+        // unreachable rather than merely unexercised: it is not a parameter.
+        let _: &'static str = INVENTORY_REVISION;
+
+        // The threshold the guard actually compares against is the parsed
+        // revision, so every refusal above is measured against this exact value
+        // and no other threshold can silently take its place.
+        assert_eq!(
+            iso_date_text(first_iso_date_digits(INVENTORY_REVISION).unwrap()),
+            INVENTORY_REVISION,
+            "the comparison threshold is exactly INVENTORY_REVISION, with no other \
+             date, offset or grace period applied"
         );
     }
 
