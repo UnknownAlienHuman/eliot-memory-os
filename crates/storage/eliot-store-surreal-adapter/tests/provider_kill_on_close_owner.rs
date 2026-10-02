@@ -226,7 +226,8 @@ fn provider_owner_entrypoint() -> OwnerResult {
         if Instant::now() >= deadline {
             return Err(std::io::Error::other(
                 "owner provider never accepted a connection",
-            ));
+            )
+            .into());
         }
         std::thread::sleep(PARENT_POLL_INTERVAL);
     }

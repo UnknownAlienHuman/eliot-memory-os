@@ -136,9 +136,19 @@ fn poll_until_absent(process_id: u32) -> bool {
 /// refusal, and admission never yields a usable kill domain.
 #[test]
 fn assign_process_refuses_pid_zero_with_typed_launch_refusal() -> RefusalResult {
-    let refusal = ProviderKillDomain::create()
-        .and_then(|domain| domain.admit(0))
-        .expect_err("assign_process must refuse process id 0");
+    // `expect_err` would require `ProviderKillDomain: Debug`, and it
+    // deliberately implements none - a live Job handle must not be printable.
+    // The success value is therefore discarded explicitly and the refusal is
+    // unwrapped on its own, which needs no `Debug` bound at all.
+    let admitted = ProviderKillDomain::create().and_then(|domain| domain.admit(0));
+    assert!(
+        admitted.is_err(),
+        "assign_process must refuse process id 0 rather than admit it"
+    );
+    let refusal = match admitted {
+        Ok(_) => panic!("pid 0 was admitted, which the platform must never do"),
+        Err(error) => error,
+    };
 
     assert_eq!(
         refusal_cause(&refusal),
@@ -199,7 +209,13 @@ fn refused_launch_reaps_provider_and_returns_typed_refusal() -> RefusalResult {
         |child: &mut Child| reap_refused_std_child(child),
     );
 
-    let refusal = spawn_result.expect_err("an unadmittable provider must refuse the launch");
+    // The Ok variant carries the lease, which deliberately has no `Debug` (a live
+    // Job handle must not be printable), so `expect_err` cannot be used. Match
+    // instead, which places no bound on either side.
+    let refusal = match spawn_result {
+        Ok(_) => panic!("an unadmittable provider must refuse the launch, not return it"),
+        Err(error) => error,
+    };
     assert!(
         matches!(
             refusal,
