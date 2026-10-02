@@ -1589,7 +1589,7 @@ pub enum ExpiryRefusal {
 /// `entries` is the inventory this rule is applied to;
 /// [`expiry_condition_guard`] passes [`current_consumer_inventory`], so the
 /// shipped entry gate and this function are one rule with one threshold.
-pub fn expiry_condition_guard_over<'a>(entries: &'a [ConsumerEntry]) -> Result<(), ExpiryRefusal> {
+pub fn expiry_condition_guard_over(entries: &[ConsumerEntry]) -> Result<(), ExpiryRefusal> {
     let Some(revision) = first_iso_date_digits(INVENTORY_REVISION) else {
         return Err(ExpiryRefusal::InventoryRevisionUndated(
             InventoryRevisionUndated,
@@ -2067,6 +2067,17 @@ mod tests {
         }
     }
 
+    /// Recorded disposition word. `Disposition::label` is private to the parent
+    /// module, so the test reads the word through a trait-free local match
+    /// instead of widening the production type's API for a test.
+    fn disposition_label(disposition: Disposition) -> &'static str {
+        match disposition {
+            Disposition::ExtractToCurrentOwner => "extract_to_current_owner",
+            Disposition::TemporaryFixture => "temporary_fixture",
+            Disposition::Remove => "remove",
+        }
+    }
+
     #[test]
     fn expiry_condition_guard_accepts_the_shipped_inventory_and_never_invents_a_deadline() {
         // Production entry point under test.
@@ -2185,7 +2196,7 @@ mod tests {
     fn expiry_condition_guard_over_refuses_a_temporary_fixture_whose_condition_never_says_remove() {
         // Refusal arm one: the `!expiry.contains("remove")` branch, written at
         // `expiry_condition_guard_over` in
-        // crates/eliot-app/src/disposition.rs:1606. The fixture is built here
+        // crates/eliot-app/src/disposition.rs:1602. The fixture is built here
         // because no production row should ever fail this arm.
         let fixture = refused_fixture(
             Disposition::TemporaryFixture,
@@ -2228,7 +2239,7 @@ mod tests {
     {
         // Refusal arm two: the `let Some(expiry_date) = ... else` branch, written
         // at `expiry_condition_guard_over` in
-        // crates/eliot-app/src/disposition.rs:1611. This is the arm that SHOULD
+        // crates/eliot-app/src/disposition.rs:1605. This is the arm that SHOULD
         // catch the six undated `ExtractToCurrentOwner` rows, and does not
         // reach them; the test proves the arm itself is live by handing it the
         // same kind of value as a fixture row.
@@ -2285,7 +2296,7 @@ mod tests {
      {
         // Refusal arm three: the `expiry_date <= revision` branch, written at
         // `expiry_condition_guard_over` in
-        // crates/eliot-app/src/disposition.rs:1619. This is the arm that
+        // crates/eliot-app/src/disposition.rs:1608. This is the arm that
         // refuses a dated row that outlived its own recorded deadline.
         //
         // The dates below are taken from `INVENTORY_REVISION` itself (parsed,
@@ -2407,7 +2418,7 @@ mod tests {
     #[test]
     fn expiry_condition_guard_over_skips_every_row_whose_disposition_is_not_a_temporary_fixture() {
         // The skip arm, written at `expiry_condition_guard_over` in
-        // crates/eliot-app/src/disposition.rs:1603-1605. It is the guard's only
+        // crates/eliot-app/src/disposition.rs:1599-1601. It is the guard's only
         // exemption, it is keyed on the disposition word alone, and it runs
         // before any refusal can be built. This test proves all three with
         // values the guard is MEANT to refuse on every other count.
@@ -2453,7 +2464,7 @@ mod tests {
                     "{} carrying {condition} must be skipped by the disposition \
                      exemption, not inspected: the exemption runs before any refusal \
                      can be built",
-                    disposition.label()
+                    disposition_label(disposition)
                 );
             }
         }
@@ -2480,7 +2491,7 @@ mod tests {
         // FINDING, recorded rather than worked around: the guard's threshold arm
         // cannot be exercised. Its `let Some(revision) = ... else` branch, written
         // at `expiry_condition_guard_over` in
-        // crates/eliot-app/src/disposition.rs:1595, fails closed when
+        // crates/eliot-app/src/disposition.rs:1593, fails closed when
         // `INVENTORY_REVISION` carries no `YYYY-MM-DD` token, but
         // `INVENTORY_REVISION` is a compile-time `&'static str` literal at
         // crates/eliot-app/src/disposition.rs:1129 and
@@ -2507,8 +2518,10 @@ mod tests {
         // The threshold the guard actually compares against is the parsed
         // revision, so every refusal above is measured against this exact value
         // and no other threshold can silently take its place.
+        let revision_digits = first_iso_date_digits(INVENTORY_REVISION)
+            .unwrap_or_else(|| panic!("INVENTORY_REVISION carries no YYYY-MM-DD token"));
         assert_eq!(
-            iso_date_text(first_iso_date_digits(INVENTORY_REVISION).unwrap()),
+            iso_date_text(revision_digits),
             INVENTORY_REVISION,
             "the comparison threshold is exactly INVENTORY_REVISION, with no other \
              date, offset or grace period applied"
