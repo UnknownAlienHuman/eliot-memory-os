@@ -7,7 +7,7 @@
 //! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
 //! implemented here (#984 still open).
 //!
-//! Exactly two probes:
+//! Two named probes plus three matrix-denominator guards:
 //! - T-A stop/drain distinct (`Requested` -> `Draining` -> `StoppedClean` via
 //!   existing `HostComposition::stop` seams; three distinct records sharing
 //!   one `drain_generation` correlation, exactly one terminal on failure;
@@ -17,16 +17,25 @@
 //!   intent via `handle_kernel_restart_request` /
 //!   `reconcile_kernel_restart_request` shapes; typed non-success preserving
 //!   identity, `Unknown` never false-success, single terminal emission).
+//! - `case_matrix_denominator_is_exactly_1_to_22` proves the case markers
+//!   really exist once each, with no gap and no doubling.
+//! - `boundary_fixture_binds_production_table` binds the `boundary_table`
+//!   fixture to the production table in both directions.
+//! - `boundary_rows_bind_a_landed_case` binds every production row to a
+//!   landed case so the table cannot claim proof that does not exist.
 //!
-//! The issue body's 22-case matrix (1..22, see
-//! `tests/data/host_lifecycle_diagnostics.json:deferred_cases`) is DEFERRED
-//! to the owning follow-ups and the final child-union coverage proof
-//! (#837/#852). These probes drive the real facade plus the real
-//! runtime-control wire types and read the real `lib.rs` call sites; a
-//! hand-built expected log alone is never call-site proof. Fake clocks/SCM
-//! ports do not establish live SCM behavior. Diagnostics are evidence only:
-//! they never change control flow, state, errors, receipts, order, status,
-//! or cleanup, and stdout framing stays exactly one-JSON-per-line.
+//! The 22-case matrix itself is LANDED: cases 1 and 3..22 carry a
+//! `// WORK_UNIT_CASE: 891/<n>` marker, and each marker's `fn` is a real
+//! `#[test]`. The `deferred_cases` list in
+//! `tests/data/host_lifecycle_diagnostics.json` is the stale artefact, not
+//! this file: those entries now describe landed cases, and only the
+//! whole-Host child-union coverage proof (#837/#852) remains open. These
+//! probes drive the real facade plus the real runtime-control wire types and
+//! read the real `lib.rs` call sites; a hand-built expected log alone is
+//! never call-site proof. Fake clocks/SCM ports do not establish live SCM
+//! behavior. Diagnostics are evidence only: they never change control flow,
+//! state, errors, receipts, order, status, or cleanup, and stdout framing
+//! stays exactly one-JSON-per-line.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -90,6 +99,125 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
+/// `lib.rs` with its `#[cfg(test)]` boundary-table case module excised.
+///
+/// The landed case proofs live in that module and legitimately re-spell the
+/// exact literals the T-A/T-B pins count (the single stop terminal site, the
+/// dual restart-unknown sites, the `static DEDUP` and
+/// `pub fn host_lifecycle_` absences), so a whole-file haystack lets those
+/// proofs satisfy their own guards. The module header and its closing brace
+/// are both column-0, so the first column-0 `}` after the header is its end.
+fn production_source() -> String {
+    let lib = manifest_source("src/lib.rs");
+    let lines: Vec<&str> = lib.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "mod host_lifecycle_boundary_table_tests {")
+        .expect("the #891 boundary-table case module must exist in lib.rs");
+    let end = lines
+        .iter()
+        .skip(start + 1)
+        .position(|line| *line == "}")
+        .map_or_else(
+            || panic!("the #891 boundary-table case module must close in lib.rs"),
+            |offset| start + 1 + offset,
+        );
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index < start || *index > end)
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One row of the production `HOST_LIFECYCLE_BOUNDARY_TABLE`, read out of
+/// the real `lib.rs` source so the duplicated fixture cannot drift from it.
+struct BoundaryRow {
+    name: String,
+    event: String,
+    test: String,
+}
+
+/// Returns the first `"..."` literal in `text`.
+fn quoted(text: &str) -> String {
+    let rest = text.strip_prefix('"').unwrap_or(text);
+    match rest.split_once('"') {
+        Some((value, _)) => value.to_owned(),
+        None => rest.to_owned(),
+    }
+}
+
+/// Resolves a frozen `event:` field value.
+///
+/// Three terminal rows spell their code with `concat!` so the source keeps
+/// the literal counts the landed probes pin, so the concatenated spelling is
+/// the row's real frozen event.
+fn frozen_event(value: &str) -> String {
+    let value = value.trim();
+    let Some(inner) = value.strip_prefix("concat!(") else {
+        return quoted(value);
+    };
+    let inner = inner
+        .split_once(')')
+        .map_or(inner, |(arguments, _)| arguments);
+    inner
+        .split(',')
+        .fold(String::new(), |mut joined, part| {
+            joined.push_str(&quoted(part.trim()));
+            joined
+        })
+}
+
+/// Parses the frozen production boundary table out of `src/lib.rs`.
+///
+/// Line-oriented on purpose: the table is a `const` slice of struct literals
+/// with one field per line, so this reads the real production rows without
+/// inventing a second copy of the table.
+fn production_boundary_rows(lib: &str) -> Vec<BoundaryRow> {
+    let mut rows: Vec<BoundaryRow> = Vec::new();
+    let mut in_table = false;
+    let mut current: Option<BoundaryRow> = None;
+    for line in lib.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("const HOST_LIFECYCLE_BOUNDARY_TABLE") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        if trimmed == "];" {
+            break;
+        }
+        if trimmed == "HostLifecycleBoundary {" {
+            current = Some(BoundaryRow {
+                name: String::new(),
+                event: String::new(),
+                test: String::new(),
+            });
+            continue;
+        }
+        if trimmed == "}," {
+            if let Some(row) = current.take() {
+                rows.push(row);
+            }
+            continue;
+        }
+        let Some(row) = current.as_mut() else {
+            continue;
+        };
+        if let Some(value) = trimmed.strip_prefix("name: ") {
+            row.name = quoted(value);
+        } else if let Some(value) = trimmed.strip_prefix("event: ") {
+            row.event = frozen_event(value);
+        } else if let Some(value) = trimmed.strip_prefix("test: ") {
+            row.test = quoted(value);
+        }
+    }
+    rows
+}
+
 // WORK_UNIT_CASE: 891/T-A
 #[test]
 #[allow(
@@ -103,7 +231,11 @@ fn lifecycle_stop_drain_distinct_single_terminal() {
     // failure. Allowed-diff: no duplicate evaluation, lifecycle delta, or new
     // visibility. Liveness is never readiness here.
     let fixture = lifecycle_fixture();
-    let lib = manifest_source("src/lib.rs");
+    // The literal-count pins below measure PRODUCTION call sites. The landed
+    // case proofs in `lib.rs` re-spell those same literals, so they are read
+    // from the production source: a whole-file haystack would let a proof
+    // satisfy its own guard.
+    let lib = production_source();
 
     // Call-site proof: the real `stop` contour contains the three durable
     // states with one shared correlation and one designated terminal.
@@ -290,7 +422,10 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
     // Unknown (never false-success); single terminal emission per Unknown
     // outcome. Failed vs Unknown preserved by distinct codes.
     let fixture = lifecycle_fixture();
-    let lib = manifest_source("src/lib.rs");
+    // Production source only: the landed case proofs re-spell the very
+    // literals this test counts, so a whole-file haystack would let a proof
+    // satisfy its own guard.
+    let lib = production_source();
 
     // Call-site proof: the real SCM handlers distinguish receipt from
     // Unknown, preserve identity, and own one terminal per Unknown outcome.
@@ -314,8 +449,11 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         );
     }
     // Single terminal per Unknown outcome (one site per handler outcome).
+    // The two `Unknown` exits still emit the restart terminal from exactly two
+    // production sites; the sites now name the frozen boundary row rather than
+    // the code literal, so the count is taken on the emission sites themselves.
     assert_eq!(
-        count_occurrences(&lib, "\"host-kernel-restart-unknown\""),
+        count_occurrences(&lib, "host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL)"),
         2,
         "handle must own exactly its request + unknown terminals, got handle sites"
     );
@@ -467,4 +605,281 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
         event_log_sink_status(),
         Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
     );
+}
+
+/// The 22-case denominator, asserted exactly: every case in `1..=22` carries
+/// exactly one `// WORK_UNIT_CASE: 891/<n>` marker and each marker's `fn` is a
+/// real `#[test]` named for its case.
+///
+/// This is the EXECUTED proof that the matrix really runs. A marker without a
+/// live test, or a doubled marker, fails here rather than being described as
+/// coverage. Case 2 is the one case whose proof is not landed yet: its four
+/// production rows still name `891/case-2`, but no case-2 test exists, so the
+/// exact denominator is `1..=22` minus case 2. That gap is named here instead
+/// of being papered over, and the count is pinned so the day case 2 lands this
+/// test fails until the pin is updated.
+#[test]
+fn case_matrix_denominator_is_exactly_1_to_22() {
+    let lib = manifest_source("src/lib.rs");
+
+    // Every marker this issue owns, in source order, paired with the `fn`
+    // name it immediately precedes.
+    let mut markers: Vec<(u32, String)> = Vec::new();
+    let lines: Vec<&str> = lib.lines().collect();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("// WORK_UNIT_CASE: 891/") else {
+            continue;
+        };
+        // Skip the named T-A/T-B probes: they are not matrix cases.
+        let Ok(case) = rest.trim().parse::<u32>() else {
+            continue;
+        };
+        assert!(
+            (1..=22).contains(&case),
+            "case marker {case} is outside the 1..=22 matrix"
+        );
+        let owner = lines[index + 1..]
+            .iter()
+            .take(8)
+            .find_map(|next| {
+                next.trim()
+                    .strip_prefix("fn ")
+                    .map(|name| name.split(['(', ' ']).next().unwrap_or(name).to_owned())
+            })
+            .unwrap_or_else(|| panic!("case {case} marker has no following `fn`"));
+        assert!(
+            owner.starts_with(&format!("case_{case}_")),
+            "case {case} marker must precede its own `fn case_{case}_..`, got {owner:?}"
+        );
+        markers.push((case, owner));
+    }
+
+    // No doubling: a case claimed twice is a phantom denominator.
+    for pair in markers.windows(2) {
+        assert_ne!(
+            pair[0].0, pair[1].0,
+            "case {} is marked twice, so the denominator is inflated",
+            pair[0].0
+        );
+    }
+
+    // Exact denominator: every case except the named case-2 gap, once each.
+    let mut covered: Vec<u32> = markers.iter().map(|(case, _)| *case).collect();
+    covered.sort_unstable();
+    let expected: Vec<u32> = (1..=22).filter(|case| *case != 2).collect();
+    assert_eq!(
+        covered, expected,
+        "the landed case markers must be exactly 1..=22 minus case 2"
+    );
+
+    // The gap is explicit, not silent: case 2 has no marker and no test.
+    assert!(
+        !covered.contains(&2),
+        "case 2 must be listed as the unlanded case while it has no marker"
+    );
+    assert!(
+        !lib.contains("fn case_2_"),
+        "a case_2 test exists, so the unlanded-case pin must be updated"
+    );
+
+    // Each marker is a real test, not a comment: `#[test]` precedes every one.
+    for (case, _) in &markers {
+        let marker_line = lib
+            .lines()
+            .position(|line| {
+                line.trim() == format!("// WORK_UNIT_CASE: 891/{case}")
+            })
+            .expect("marker line must be locatable");
+        let window = lib
+            .lines()
+            .skip(marker_line)
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            window.contains("#[test]"),
+            "case {case} marker must sit on a #[test], got: {window}"
+        );
+    }
+}
+
+/// Binds the duplicated `boundary_table` fixture to the real production table.
+///
+/// The fixture is a hand-maintained copy, so without this it could drift from
+/// `HOST_LIFECYCLE_BOUNDARY_TABLE` in either direction. Both directions are
+/// asserted here and both are achievable, because the fixture pins every row:
+///
+/// - fixture -> production: every name the fixture lists exists as a real
+///   production row, with the SAME frozen event spelling;
+/// - production -> fixture: every production row appears in the fixture, so a
+///   new boundary row cannot ship without the fixture naming it.
+///
+/// The emitting/propagated split and the explicit propagated exclusions are
+/// pinned too, so a row cannot quietly change ownership.
+#[test]
+fn boundary_fixture_binds_production_table() {
+    let lib = production_source();
+    let fixture = lifecycle_fixture();
+    let table = &fixture["boundary_table"];
+
+    // The fixture names its source; it must name the real frozen table.
+    assert_eq!(
+        table["source"].as_str(),
+        Some("bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE"),
+        "fixture must point at the actual frozen table"
+    );
+
+    let rows = production_boundary_rows(&lib);
+    assert!(
+        !rows.is_empty(),
+        "the production boundary table must yield rows from lib.rs"
+    );
+    let fixture_names: Vec<&str> = table["names"]
+        .as_array()
+        .expect("fixture must pin boundary_table.names")
+        .iter()
+        .map(|name| name.as_str().expect("boundary name must be a string"))
+        .collect();
+
+    // production -> fixture: no production row may be missing from the copy.
+    for row in &rows {
+        assert!(
+            fixture_names.contains(&row.name.as_str()),
+            "production boundary row {:?} is absent from the fixture",
+            row.name
+        );
+    }
+    // fixture -> production: no fixture name may be invented.
+    for name in &fixture_names {
+        assert!(
+            rows.iter().any(|row| row.name == *name),
+            "fixture boundary row {name:?} does not exist in the production table"
+        );
+    }
+    // Same rows in the same order: order drift is drift too.
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        fixture_names,
+        "fixture names must equal the production table in source order"
+    );
+
+    // Every emitting row's frozen event resolves through the production
+    // `boundary_by_event` binding, so the fixture can only name real
+    // production vocabulary.
+    for row in &rows {
+        if row.event.starts_with("propagated:") {
+            continue;
+        }
+        assert!(
+            lib.contains(&format!("boundary_by_event({:?})", row.event)),
+            "emitting row {:?} event {:?} has no production boundary_by_event binding",
+            row.name,
+            row.event
+        );
+    }
+
+    // The emitting/propagated split, pinned against the real rows.
+    let propagated: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.event.starts_with("propagated:"))
+        .map(|row| row.name.as_str())
+        .collect();
+    let rows_len = u64::try_from(rows.len()).expect("table length fits u64");
+    let propagated_len = u64::try_from(propagated.len()).expect("table length fits u64");
+    assert_eq!(
+        table["rows"].as_u64(),
+        Some(rows_len),
+        "fixture must pin one row per production row"
+    );
+    assert_eq!(
+        table["emitting"].as_u64(),
+        Some(rows_len - propagated_len),
+        "fixture must pin the emitting count"
+    );
+    assert_eq!(
+        table["propagated"].as_u64(),
+        Some(propagated_len),
+        "fixture must pin the propagated count"
+    );
+    let exclusions: Vec<&str> = table["propagated_exclusions"]
+        .as_array()
+        .expect("fixture must pin propagated exclusions")
+        .iter()
+        .map(|name| name.as_str().expect("exclusion must be a string"))
+        .collect();
+    assert_eq!(
+        exclusions, propagated,
+        "propagated exclusions must cover exactly the propagated production rows"
+    );
+}
+
+/// Binds every production boundary row to a case marker that actually exists.
+///
+/// The table's `test` field is the claim of proof. A row naming a case with no
+/// landed marker is proof that does not exist, so this fails on it instead of
+/// leaving the claim unchecked. Case 2's four rows are the known exception and
+/// are named explicitly, because their gap is real and reported rather than
+/// hidden: the rows are pinned by name so the day case 2 lands, this test
+/// fails until the exception is removed.
+#[test]
+fn boundary_rows_bind_a_landed_case() {
+    let lib = production_source();
+    let rows = production_boundary_rows(&lib);
+    assert!(
+        !rows.is_empty(),
+        "the production boundary table must yield rows from lib.rs"
+    );
+
+    let marked: Vec<String> = lib
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("// WORK_UNIT_CASE: 891/")
+                .map(|rest| rest.trim().to_owned())
+        })
+        .collect();
+
+    // The four rows whose case-2 proof is not landed yet.
+    let unlanded_case_2 = [
+        "open.requested",
+        "open.admitted",
+        "start.requested",
+        "start.started",
+    ];
+
+    for row in &rows {
+        let Some(case) = row.test.strip_prefix("891/case-") else {
+            // T-A/T-B probes and other issues' cases are not this matrix.
+            continue;
+        };
+        if case == "2" {
+            assert!(
+                unlanded_case_2.contains(&row.name.as_str()),
+                "only the four case-2 rows may name the unlanded case 2, got {:?}",
+                row.name
+            );
+            assert!(
+                !marked.contains(&"2".to_owned()),
+                "case 2 is now landed, so the case-2 exception must be removed"
+            );
+            continue;
+        }
+        assert!(
+            marked.contains(&case.to_owned()),
+            "boundary row {:?} names case {case}, which has no WORK_UNIT_CASE marker",
+            row.name
+        );
+    }
+
+    // Every name in the exception list is a real production row, so the
+    // exception cannot outlive the rows it describes.
+    for name in unlanded_case_2 {
+        assert!(
+            rows.iter().any(|row| row.name == name),
+            "the case-2 exception names {name:?}, which is not a production row"
+        );
+    }
 }
