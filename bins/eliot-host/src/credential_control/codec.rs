@@ -64,9 +64,8 @@ fn credential_codec_note_event_log_unavailable() {
 ///
 /// Owner mapping (the reason codes `credential_control.rs` mints through
 /// `unknown(request, <label>)`, each registered in `eliot_installation`'s
-/// `is_credential_unknown_reason`). The codec never mints or claims one of
-/// these; the parent's single terminal still carries the exact code, and the
-/// contour below only states which check inside this codec rejected the record:
+/// `is_credential_unknown_reason`). The codec never mints one of these; the
+/// parent's single terminal still carries the code that call site chose:
 ///
 /// - `credential-marker-mac` / `credential-marker-created-mac` /
 ///   `credential-delete-marker-mac` — every marker variant, whichever
@@ -76,11 +75,27 @@ fn credential_codec_note_event_log_unavailable() {
 ///   `credential-delete-readback` — every envelope variant, whichever
 ///   `decode_envelope` call site rejected.
 ///
-/// The call site, not this codec, selects between those owner codes; the
-/// contour is the codec's contribution and cannot disagree with any of them.
+/// The two sides name different scopes, and neither side is invented here.
+/// The contour is the precise one: the exact internal check that rejected
+/// this record. The owner code is the coarser one: a call site has one fixed
+/// code for its whole `decode_*` result and cannot see which check fired, so
+/// it may name a broader contour than the one observed — a wire-version
+/// rejection still mints `credential-marker-mac`, and an envelope
+/// wire-version rejection still mints `credential-target-binding`. The
+/// contour therefore refines the owner code and never contradicts it, but
+/// the owner code need not name the contour.
+///
+/// `marker-expected-mac` / `envelope-expected-mac` name the expected-record
+/// ENCODING step (`marker_bytes` / `envelope_bytes` failing to produce
+/// comparable bytes), not a MAC comparison; the strings are frozen
+/// vocabulary, so the variant docs below carry the accurate wording.
 #[derive(Clone, Copy)]
 enum CodecRejectReason {
     /// Marker bytes were not a decodable `MarkerRecord` (shape or JSON).
+    /// The same contour also covers re-decoding the bytes this codec just
+    /// encoded itself, a same-type serde round-trip that cannot fail in
+    /// practice, so the label stays broad rather than naming a cause it
+    /// cannot reach.
     MarkerRecordShape,
     /// The expected marker record could not be re-encoded for comparison.
     MarkerExpectedMac,
@@ -91,6 +106,8 @@ enum CodecRejectReason {
     /// Marker wire version is not the version this codec owns.
     MarkerWireVersionMismatch,
     /// Envelope bytes were not a decodable `CredentialEnvelope` (shape/JSON).
+    /// As with `MarkerRecordShape`, this also covers the unreachable
+    /// same-type round-trip re-decode of the envelope bytes just encoded.
     EnvelopeRecordShape,
     /// The expected envelope record could not be re-encoded for comparison.
     EnvelopeExpectedMac,
