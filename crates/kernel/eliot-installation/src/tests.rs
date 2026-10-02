@@ -158,7 +158,11 @@ impl InstallationTransactionStore for SharedStore {
         let state = self.state.lock().unwrap_or_else(|_| unreachable!());
         let transactions: Vec<_> = state.iter().cloned().collect();
         managed_change_execution::derive_managed_root_effect_proof(
-            &transactions, anchor_transaction_id, installation_root, profile, root,
+            &transactions,
+            anchor_transaction_id,
+            installation_root,
+            profile,
+            root,
         )
     }
 
@@ -1640,6 +1644,9 @@ fn installer_plan_parts(
                 InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
                     panic!("fixture must not plan a UserMode supervision authority effect")
                 }
+                InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                    panic!("core installer fixture must not plan a managed-tool change")
+                }
             },
             precondition_refs: vec![test_handle("evidence:installer-precondition")],
             postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
@@ -2071,7 +2078,8 @@ fn system_registration_transaction() -> InstallationTransaction {
             }
             InstallerEffectPlan::CreateRoot { .. }
             | InstallerEffectPlan::ApplyAcl { .. }
-            | InstallerEffectPlan::StagePackage { .. } => {}
+            | InstallerEffectPlan::StagePackage { .. }
+            | InstallerEffectPlan::ManagedEnvironmentChange { .. } => {}
             // This loop rebinds the manifest-derived Host image onto the
             // effects that carry one, and the current-user authority plan
             // carries none. `installer_plan_parts` never plans that effect, so
@@ -2429,6 +2437,9 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
             // un-applied if the fixture ever starts planning one.
             InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } => {
                 panic!("fully-applied fixture must not meet a UserMode authority effect")
+            }
+            InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                panic!("fully-applied core fixture must not meet a managed-tool effect")
             }
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 let change = transaction
@@ -4459,18 +4470,33 @@ fn cleanup_production_transaction(transaction: &InstallationTransaction) {
 #[test]
 fn survey_working_area_reads_original_root_marker_and_rejects_substitution() {
     let _serial = PRODUCTION_INSTALLER_TEST_LOCK
-        .lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let transaction = planned_transaction();
     let transaction_id = transaction.transaction_id.clone();
-    let expected_root = transaction.candidate_manifest.runtime_launch.runtime_state_roots
-        .kernel_work_root.clone();
-    let index = transaction.installer_effects.iter().position(|effect| matches!(
-        effect, InstallerEffectPlan::CreateRoot { root, .. } if *root == expected_root
-    )).unwrap_or_else(|| unreachable!());
+    let expected_root = transaction
+        .candidate_manifest
+        .runtime_launch
+        .runtime_state_roots
+        .kernel_work_root
+        .clone();
+    let index = transaction
+        .installer_effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect, InstallerEffectPlan::CreateRoot { root, .. } if *root == expected_root
+            )
+        })
+        .unwrap_or_else(|| unreachable!());
     let mut store = SharedStore::default();
     must(store.create_planned(&transaction));
     let mut coordinator = WindowsInstallationCoordinator::new(store.clone());
-    assert!(coordinator.retain_survey_probe_working_area(&transaction_id).is_err());
+    assert!(
+        coordinator
+            .retain_survey_probe_working_area(&transaction_id)
+            .is_err()
+    );
     for _ in 0..=index {
         let outcome = must(coordinator.drive_effect(&transaction_id));
         assert!(matches!(outcome, InstallationStepOutcome::Applied { .. }));
@@ -4479,7 +4505,13 @@ fn survey_working_area_reads_original_root_marker_and_rejects_substitution() {
     let area = must(coordinator.retain_survey_probe_working_area(&transaction_id));
     assert_eq!(area.path(), Path::new(expected_root.as_str()));
     must(area.verify());
-    let request = must(effect_request(&created, index, 1, InstallationEffectAction::Apply, None));
+    let request = must(effect_request(
+        &created,
+        index,
+        1,
+        InstallationEffectAction::Apply,
+        None,
+    ));
     let marker = ownership_receipt_path(&request);
     let original = must(std::fs::read(&marker));
     must(std::fs::write(&marker, b"{}"));
@@ -10102,8 +10134,7 @@ fn trusted_source_observe_is_bound_to_retained_handle_and_fails_on_mutation() {
 #[cfg(windows)]
 #[test]
 fn signed_managed_registration_runs_through_original_coordinator_to_completed() {
-    use integration_discovery::accepted_managed_change_tests::
-        managed_registration_transaction_for_terminal_test;
+    use integration_discovery::accepted_managed_change_tests::managed_registration_transaction_for_terminal_test;
 
     let mut fixture = managed_registration_transaction_for_terminal_test();
     let (outcome, transaction, projection) = fixture.admit_and_drive();
@@ -10144,13 +10175,13 @@ fn signed_managed_registration_runs_through_original_coordinator_to_completed() 
     assert_eq!(evidence[0], source_snapshot.digest);
     assert!(transaction.observed_postconditions.contains(&evidence[0]));
     assert!(transaction.completed_stage_refs.contains(&evidence[0]));
-    assert!(transaction
-        .completed_stage_refs
-        .contains(postcondition_digest));
+    assert!(
+        transaction
+            .completed_stage_refs
+            .contains(postcondition_digest)
+    );
     let persisted_native_target = transaction
-        .completed_managed_target_executable_observation(
-            &transaction.effect_progress[0].effect_id,
-        )
+        .completed_managed_target_executable_observation(&transaction.effect_progress[0].effect_id)
         .expect("the original Completed transaction validates its receipt chain")
         .expect("the signed original survey retained one exact native target observation");
     let admitted_native_target = fixture
@@ -10263,9 +10294,9 @@ impl ManagedRepairLostAckPort {
         test_secret_store: InstallationTestSecretStore,
     ) -> Self {
         Self {
-            inner: WindowsInstallationEffectPort::new_with_test_secret_store(
-                Arc::clone(&test_secret_store),
-            ),
+            inner: WindowsInstallationEffectPort::new_with_test_secret_store(Arc::clone(
+                &test_secret_store,
+            )),
             transaction_id,
             effect_id,
             lose_next_ack,
@@ -10357,10 +10388,7 @@ impl InstallationEffectPort for ManagedRepairLostAckPort {
         self.inner.reconcile(request)
     }
 
-    fn delete_ownership_secret(
-        &mut self,
-        request: &InstallationEffectRequest,
-    ) -> PortOutcome<()> {
+    fn delete_ownership_secret(&mut self, request: &InstallationEffectRequest) -> PortOutcome<()> {
         if self.is_target(request) {
             self.trace
                 .lock()
@@ -10398,16 +10426,12 @@ fn drive_signed_managed_test_child<P: InstallationEffectPort>(
             .unwrap_or_else(|error| panic!("reload the original managed test child: {error}"))
             .expect("the original managed test child remains durable");
         must(current.validate());
-        if current
-            .effect_progress()
-            .iter()
-            .all(|progress| {
-                matches!(
-                    &progress.state,
-                    InstallationEffectProgressState::Applied { .. }
-                )
-            })
-        {
+        if current.effect_progress().iter().all(|progress| {
+            matches!(
+                &progress.state,
+                InstallationEffectProgressState::Applied { .. }
+            )
+        }) {
             must(current.require_all_effects_applied());
             return must(coordinator.drive_effect(transaction_id));
         }
@@ -10468,8 +10492,7 @@ fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() 
 
     let mut fixture = managed_repair_crash_fixture();
     let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut store =
-        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let mut store = install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
     let repair = must(fixture.repair_transaction(&store));
     fixture
         .revalidate(&store, &fixture.accepted_repair)
@@ -10519,13 +10542,17 @@ fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() 
         } => (*attempt, intent_digest.clone()),
         state => panic!("lost stage response retains its exact committed intent: {state:?}"),
     };
-    assert!(interrupted.effect_progress()[effect_index]
-        .staging_receipt
-        .is_none());
-    assert!(interrupted
-        .pending_external_changes
-        .iter()
-        .any(|reference| reference.as_str() == "unknown:Indeterminate"));
+    assert!(
+        interrupted.effect_progress()[effect_index]
+            .staging_receipt
+            .is_none()
+    );
+    assert!(
+        interrupted
+            .pending_external_changes
+            .iter()
+            .any(|reference| reference.as_str() == "unknown:Indeterminate")
+    );
     assert_eq!(
         trace
             .lock()
@@ -10564,10 +10591,12 @@ fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() 
         .expect("the original Repair transaction reaches its durable terminal");
     must(completed.validate());
     assert_eq!(completed.stage(), InstallationStage::Completed);
-    assert!(completed
-        .completed_stage_refs
-        .iter()
-        .any(|reference| reference.as_str() == "unknown:Indeterminate"));
+    assert!(
+        completed
+            .completed_stage_refs
+            .iter()
+            .any(|reference| reference.as_str() == "unknown:Indeterminate")
+    );
     assert!(matches!(
         &completed.effect_progress()[effect_index].state,
         InstallationEffectProgressState::Applied {
@@ -10583,7 +10612,10 @@ fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() 
     assert_eq!(trace.target_execute_count, 1);
     assert_eq!(trace.target_rollback_execute_count, 0);
     assert_eq!(trace.target_secret_delete_count, 0);
-    assert_eq!(trace.target_reconcile_intents, vec![original_intent.1.clone()]);
+    assert_eq!(
+        trace.target_reconcile_intents,
+        vec![original_intent.1.clone()]
+    );
     assert_eq!(trace.lost_intent_digest, Some(original_intent.1));
     assert!(!trace.target_execute_error);
     let projection = restarted
@@ -10605,8 +10637,7 @@ fn signed_repair_lost_package_ack_reopens_and_reconciles_the_original_attempt() 
 #[cfg(windows)]
 #[test]
 fn signed_completed_repair_requalifies_its_current_stage_receipt_without_admitting_a_probe() {
-    use integration_discovery::accepted_managed_change_tests::
-        managed_repair_crash_fixture_with_prior_image;
+    use integration_discovery::accepted_managed_change_tests::managed_repair_crash_fixture_with_prior_image;
 
     let system_root = std::env::var_os("SystemRoot")
         .expect("Windows exposes its system root to the signed-image fixture");
@@ -10617,8 +10648,7 @@ fn signed_completed_repair_requalifies_its_current_stage_receipt_without_admitti
         .expect("read the existing System32 image without executing it");
     let mut fixture = managed_repair_crash_fixture_with_prior_image(Some(&prior_image));
     let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut store =
-        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let mut store = install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
     let repair = must(fixture.repair_transaction(&store));
     fixture
         .revalidate(&store, &fixture.accepted_repair)
@@ -10694,7 +10724,10 @@ fn signed_completed_repair_requalifies_its_current_stage_receipt_without_admitti
         staged_native.file_identity.as_ref(),
         Some(&staged_file.destination_identity)
     );
-    assert_eq!(staged_native.sha256.as_deref(), Some(staged_file.sha256.as_str()));
+    assert_eq!(
+        staged_native.sha256.as_deref(),
+        Some(staged_file.sha256.as_str())
+    );
 
     let (original_identity, _, original_sha256) = fixture
         .accepted_repair
@@ -10732,12 +10765,18 @@ fn signed_completed_repair_requalifies_its_current_stage_receipt_without_admitti
         &transaction_id,
     )
     .expect("the exact completed owner can requalify its current stage receipt");
-    assert_eq!(requalified.result().runtime_hash.as_deref(), Some(staged_sha256.as_str()));
+    assert_eq!(
+        requalified.result().runtime_hash.as_deref(),
+        Some(staged_sha256.as_str())
+    );
     assert_eq!(
         requalified.result().previous_runtime_hash.as_deref(),
         Some(original_sha256.as_str())
     );
-    assert_ne!(requalified.result().runtime_hash, requalified.result().previous_runtime_hash);
+    assert_ne!(
+        requalified.result().runtime_hash,
+        requalified.result().previous_runtime_hash
+    );
     assert_eq!(requalified.result().advertisement.target_identity, None);
     assert!(matches!(
         &requalified.result().advertisement.state.status,
@@ -10797,8 +10836,7 @@ fn signed_repair_refuses_a_changed_prior_generation_and_keeps_its_typed_cause() 
 
     let mut fixture = managed_repair_crash_fixture();
     let test_secret_store: InstallationTestSecretStore = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut store =
-        install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
+    let mut store = install_managed_repair_fixture(&mut fixture, Arc::clone(&test_secret_store));
     let repair = must(fixture.refusal_transaction(&store));
     fixture
         .revalidate(&store, &fixture.accepted_refusal)
@@ -10855,13 +10893,17 @@ fn signed_repair_refuses_a_changed_prior_generation_and_keeps_its_typed_cause() 
         } => (*attempt, intent_digest.clone()),
         state => panic!("a prior-resource mismatch preserves its original intent: {state:?}"),
     };
-    assert!(interrupted
-        .pending_external_changes
-        .iter()
-        .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch"));
-    assert!(interrupted.effect_progress()[effect_index]
-        .staging_receipt
-        .is_none());
+    assert!(
+        interrupted
+            .pending_external_changes
+            .iter()
+            .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch")
+    );
+    assert!(
+        interrupted.effect_progress()[effect_index]
+            .staging_receipt
+            .is_none()
+    );
     assert_eq!(
         std::fs::read(&changed_file).expect("refused repair leaves the substituted file intact"),
         changed_bytes
@@ -10902,13 +10944,17 @@ fn signed_repair_refuses_a_changed_prior_generation_and_keeps_its_typed_cause() 
     };
     assert_eq!(retained.0, original_intent.0);
     assert_eq!(retained.1, &original_intent.1);
-    assert!(refused
-        .pending_external_changes
-        .iter()
-        .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch"));
-    assert!(refused.effect_progress()[effect_index]
-        .staging_receipt
-        .is_none());
+    assert!(
+        refused
+            .pending_external_changes
+            .iter()
+            .any(|reference| reference.as_str() == "stage-package-error-v1:hash-mismatch")
+    );
+    assert!(
+        refused.effect_progress()[effect_index]
+            .staging_receipt
+            .is_none()
+    );
     let trace = trace.lock().unwrap_or_else(|_| unreachable!());
     assert_eq!(trace.target_execute_count, 1);
     assert_eq!(trace.target_rollback_execute_count, 0);

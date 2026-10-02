@@ -493,6 +493,7 @@ impl KernelComposition {
             executable,
             working_directory,
             lease: Arc::new(lease),
+            survey_probe: None,
         })
     }
 }

@@ -99,7 +99,6 @@ fn observation(
 fn observe_windows_file_version(path: &Path) -> FileVersionObservation {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    use sha2::{Digest as _, Sha256};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
@@ -131,17 +130,15 @@ fn observe_windows_file_version(path: &Path) -> FileVersionObservation {
         return observation(None, None, FileVersionOutcome::Invalid);
     }
 
-    let identity = match crate::file_identity_for_open_handle(&file) {
-        Ok(identity) => identity,
-        Err(_) => return observation(None, None, FileVersionOutcome::Unreadable),
+    let Ok(identity) = crate::file_identity_for_open_handle(&file) else {
+        return observation(None, None, FileVersionOutcome::Unreadable);
     };
     let digest_before = match hash_retained_file(&mut file) {
         Ok(digest) => digest,
         Err(outcome) => return observation(Some(identity), None, outcome),
     };
-    let path_from_handle = match crate::final_windows_path_from_handle(&file) {
-        Ok(path) => path,
-        Err(_) => return observation(None, None, FileVersionOutcome::Unreadable),
+    let Ok(path_from_handle) = crate::final_windows_path_from_handle(&file) else {
+        return observation(None, None, FileVersionOutcome::Unreadable);
     };
 
     let outcome = query_fixed_file_version(&path_from_handle);
@@ -152,9 +149,8 @@ fn observe_windows_file_version(path: &Path) -> FileVersionObservation {
     let identity_after = crate::file_identity_for_open_handle(&file);
     let digest_after = hash_retained_file(&mut file);
     let final_length = file.metadata().map(|metadata| metadata.len());
-    let identity_after = match identity_after {
-        Ok(identity_after) => identity_after,
-        Err(_) => return observation(None, None, FileVersionOutcome::Unreadable),
+    let Ok(identity_after) = identity_after else {
+        return observation(None, None, FileVersionOutcome::Unreadable);
     };
     let digest_after = match digest_after {
         Ok(digest_after) => digest_after,
@@ -164,7 +160,8 @@ fn observe_windows_file_version(path: &Path) -> FileVersionObservation {
         Ok(length) => length,
         Err(error) => return observation(None, None, classify_io_error(&error)),
     };
-    if identity_after != identity || digest_after != digest_before || final_length != metadata.len() {
+    if identity_after != identity || digest_after != digest_before || final_length != metadata.len()
+    {
         return observation(None, None, FileVersionOutcome::Invalid);
     }
 
@@ -181,7 +178,7 @@ fn hash_retained_file(file: &mut std::fs::File) -> Result<String, FileVersionOut
         .map_err(|error| classify_io_error(&error))?;
     let mut digest = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file
             .read(&mut buffer)
@@ -203,13 +200,12 @@ fn hash_retained_file(file: &mut std::fs::File) -> Result<String, FileVersionOut
 #[cfg(windows)]
 fn classify_io_error(error: &std::io::Error) -> FileVersionOutcome {
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
-        ERROR_SHARING_VIOLATION,
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
     };
 
-    match error.raw_os_error().map(|code| code as u32) {
-        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND) => FileVersionOutcome::NotFound,
-        Some(ERROR_ACCESS_DENIED) | Some(ERROR_SHARING_VIOLATION) => FileVersionOutcome::Denied,
+    match error.raw_os_error().map(i32::cast_unsigned) {
+        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => FileVersionOutcome::NotFound,
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) => FileVersionOutcome::Denied,
         _ if error.kind() == std::io::ErrorKind::NotFound => FileVersionOutcome::NotFound,
         _ if error.kind() == std::io::ErrorKind::PermissionDenied => FileVersionOutcome::Denied,
         _ => FileVersionOutcome::Unreadable,
@@ -231,8 +227,8 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         GetLastError,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_VER_GET_NEUTRAL, GetFileVersionInfoExW, GetFileVersionInfoSizeExW,
-        VS_FFI_SIGNATURE, VS_FFI_STRUCVERSION, VS_FIXEDFILEINFO, VerQueryValueW,
+        FILE_VER_GET_NEUTRAL, GetFileVersionInfoExW, GetFileVersionInfoSizeExW, VS_FFI_SIGNATURE,
+        VS_FFI_STRUCVERSION, VS_FIXEDFILEINFO, VerQueryValueW,
     };
 
     let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -248,7 +244,7 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         GetFileVersionInfoSizeExW(
             FILE_VER_GET_NEUTRAL,
             wide_path.as_ptr(),
-            &mut ignored_translation,
+            &raw mut ignored_translation,
         )
     };
     if size == 0 {
@@ -279,9 +275,8 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         return FileVersionOutcome::Unreadable;
     }
     resource.resize(size, 0);
-    let size_u32 = match u32::try_from(size) {
-        Ok(size) => size,
-        Err(_) => return FileVersionOutcome::Invalid,
+    let Ok(size_u32) = u32::try_from(size) else {
+        return FileVersionOutcome::Invalid;
     };
 
     // SAFETY: the buffer is writable for its checked size and the path remains
@@ -301,8 +296,11 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         return match error {
             ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION => FileVersionOutcome::Denied,
             ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => FileVersionOutcome::NotFound,
-            ERROR_INVALID_DATA | ERROR_BAD_EXE_FORMAT | ERROR_RESOURCE_DATA_NOT_FOUND
-            | ERROR_RESOURCE_LANG_NOT_FOUND | ERROR_RESOURCE_NAME_NOT_FOUND
+            ERROR_INVALID_DATA
+            | ERROR_BAD_EXE_FORMAT
+            | ERROR_RESOURCE_DATA_NOT_FOUND
+            | ERROR_RESOURCE_LANG_NOT_FOUND
+            | ERROR_RESOURCE_NAME_NOT_FOUND
             | ERROR_RESOURCE_TYPE_NOT_FOUND => FileVersionOutcome::Invalid,
             _ => FileVersionOutcome::Unreadable,
         };
@@ -317,8 +315,8 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         VerQueryValueW(
             resource.as_ptr().cast(),
             root.as_ptr(),
-            &mut value,
-            &mut value_length,
+            &raw mut value,
+            &raw mut value_length,
         )
     };
     if found == 0 || value.is_null() {
@@ -335,9 +333,8 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
     if value_start < resource_start || value_end > resource_end {
         return FileVersionOutcome::Invalid;
     }
-    let required = match u32::try_from(std::mem::size_of::<VS_FIXEDFILEINFO>()) {
-        Ok(required) => required,
-        Err(_) => return FileVersionOutcome::Invalid,
+    let Ok(required) = u32::try_from(std::mem::size_of::<VS_FIXEDFILEINFO>()) else {
+        return FileVersionOutcome::Invalid;
     };
     if value_length < required {
         return FileVersionOutcome::Invalid;
@@ -352,22 +349,28 @@ fn query_fixed_file_version(path: &Path) -> FileVersionOutcome {
         fixed.dwFileVersionLS,
         value_length,
         required,
-        VS_FFI_SIGNATURE as u32,
+        VS_FFI_SIGNATURE.cast_unsigned(),
         VS_FFI_STRUCVERSION as u32,
     ) {
-        Some((file_version_ms, file_version_ls)) => FileVersionOutcome::Present {
-            file_version_ms,
-            file_version_ls,
-        },
+        Some((version_most_significant, version_least_significant)) => {
+            FileVersionOutcome::Present {
+                file_version_ms: version_most_significant,
+                file_version_ls: version_least_significant,
+            }
+        }
         None => FileVersionOutcome::Invalid,
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the native VS_FIXEDFILEINFO projection validates all observed and expected fields together"
+)]
 fn fixed_version_parts(
     signature: u32,
     structure_version: u32,
-    file_version_ms: u32,
-    file_version_ls: u32,
+    version_most_significant: u32,
+    version_least_significant: u32,
     observed_length: u32,
     required_length: u32,
     expected_signature: u32,
@@ -376,10 +379,14 @@ fn fixed_version_parts(
     (signature == expected_signature
         && structure_version == expected_structure_version
         && observed_length >= required_length)
-        .then_some((file_version_ms, file_version_ls))
+        .then_some((version_most_significant, version_least_significant))
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "the single Windows fixture lookup is an explicit fail-fast test precondition"
+)]
 mod tests {
     use super::*;
 

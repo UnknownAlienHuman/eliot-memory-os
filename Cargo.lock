@@ -1153,6 +1153,7 @@ dependencies = [
  "eliot-learning-contracts",
  "eliot-reactive-context-plan",
  "eliot-receipts",
+ "eliot-runtime-contracts",
  "eliot-security-contracts",
  "serde",
 ]
@@ -2228,6 +2229,7 @@ dependencies = [
 name = "eliot-instrument-runner"
 version = "0.1.0"
 dependencies = [
+ "eliot-bootstrap",
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
@@ -2314,6 +2316,7 @@ dependencies = [
  "eliot-backup",
  "eliot-contracts",
  "eliot-installation",
+ "eliot-instrument-api",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
@@ -2849,6 +2852,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror",
  "windows",
  "windows-sys",
 ]
@@ -3358,6 +3362,7 @@ dependencies = [
  "eliot-cli",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-runner",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
@@ -3379,6 +3384,7 @@ dependencies = [
  "eliot-build-test-graph",
  "eliot-contracts",
  "eliot-instrument-api",
+ "eliot-instrument-nextest",
  "eliot-process",
  "eliot-protocol",
  "redb",
@@ -3603,6 +3609,7 @@ dependencies = [
  "eliot-governor",
  "eliot-host-state",
  "eliot-improvement",
+ "eliot-installation",
  "eliot-instrument-api",
  "eliot-integration-coverage",
  "eliot-ipc",

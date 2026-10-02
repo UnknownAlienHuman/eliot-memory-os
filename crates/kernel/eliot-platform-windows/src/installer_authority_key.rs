@@ -480,10 +480,7 @@ impl WindowsInstallationAuthorityKeyStore {
     /// preparing a new setup-purpose key. This is only a collision check; it
     /// never adopts an existing key without its original public and native
     /// identity receipt.
-    pub fn require_absent_slot(
-        &self,
-        key_id: &str,
-    ) -> Result<(), InstallationAuthorityKeyError> {
+    pub fn require_absent_slot(&self, key_id: &str) -> Result<(), InstallationAuthorityKeyError> {
         validate_key_id(key_id)?;
         self.validate_root()?;
         let path = self.slot_path(key_id);
@@ -604,6 +601,10 @@ impl WindowsInstallationAuthorityKeyStore {
     /// Writes the already-receipted seed through its retained exact slot
     /// handle, then independently reopens the same native file identity and
     /// returns the original protected signer.
+    // Consuming this value closes the one-use CREATE_NEW reservation even when
+    // validation or the write fails; borrowing would leave that reservation
+    // reusable by the caller.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn write_reserved(
         &self,
         reserved: ReservedInstallationAuthorityKey,

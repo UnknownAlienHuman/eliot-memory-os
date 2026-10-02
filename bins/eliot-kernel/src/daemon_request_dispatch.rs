@@ -3353,7 +3353,8 @@ impl KernelComposition {
             #[cfg(windows)]
             eliot_installation::INSTALLATION_SURVEY_PROBE_OPERATION => {
                 let identity = request_identity.ok_or(TransportError::SessionFenced)?;
-                self.installation_survey_probe_operation(session, identity, payload).await
+                self.installation_survey_probe_operation(session, identity, payload)
+                    .await
             }
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {

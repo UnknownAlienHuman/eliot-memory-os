@@ -95,8 +95,8 @@ pub use eliot_watchdog_core::{WatchdogSpoolAcknowledgement, WatchdogSpoolExportB
 use host_identity_observation::classify_host_error;
 use host_identity_observation::read_host_registration_runtime;
 pub use host_identity_observation::{
-    HostIdentityMonitor, HostObservation, HostObservationSource, HostObservationState,
-    LiveHostObservationSource,
+    ApprovedRegistrationReadback, HostIdentityMonitor, HostObservation, HostObservationSource,
+    HostObservationState, LiveHostObservationSource,
 };
 pub use independent_sensor::{
     ApprovedSensorBinding, ArtifactDigestObservation, MAX_APPROVED_ARTIFACT_DIGEST_BYTES,
@@ -1907,7 +1907,7 @@ fn validate_authenticated_spool_ack(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::registry_fixture::RegistryFixture;
     use super::*;
     use eliot_contracts::{EpochId, EpochLineageId};
@@ -2224,7 +2224,11 @@ mod tests {
         args
     }
 
-    fn installer_approval_fixture(
+    /// One installer-approved SCM registration approval, built through the
+    /// installer's own wire contract so the retained request is a real
+    /// reconstruction. Shared with the observation module's approved-registration
+    /// readback proof.
+    pub(crate) fn installer_approval_fixture(
         role: InstallerServiceRole,
         registration_nonce: &str,
     ) -> (

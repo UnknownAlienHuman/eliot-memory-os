@@ -143,18 +143,17 @@ use eliot_config::legacy_capability_import::{
 };
 use eliot_governor::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
-    GovernorComposition, KernelGenerationPort, KernelTransitionPort, MAX_CAPABILITY_EVIDENCE_RECORDS,
-    OwnerEvidenceRevision, RouteScopeFingerprint, ScopeDependencySelector, SkillStanding,
-    capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
-    commit_capability_evidence_record,
+    GovernorComposition, KernelGenerationPort, KernelTransitionPort,
+    MAX_CAPABILITY_EVIDENCE_RECORDS, OwnerEvidenceRevision, RouteScopeFingerprint,
+    ScopeDependencySelector, SkillStanding, capability_evidence_idempotency_key,
+    capability_evidence_mutation_request_for_record, commit_capability_evidence_record,
 };
 use eliot_store_api::{
-    EVIDENCE_PACK_MAX_RECORDS, EventProjectionRelationIntents, EffectClass,
-    MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS,
-    MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES, NamedReadOperation, NamedReadRequest,
-    NamedReadResponse, ReadConsistency, ScopeId, SecurityContext, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
-    operation_manifest_set_digest, validate_store_receipt_envelope,
+    EVIDENCE_PACK_MAX_RECORDS, EffectClass, EventProjectionRelationIntents,
+    MAX_CAPABILITY_EVIDENCE_PAGE_RECORDS, MAX_CAPABILITY_EVIDENCE_SKILL_ID_BYTES,
+    NamedReadOperation, NamedReadRequest, NamedReadResponse, ReadConsistency, ScopeId,
+    SecurityContext, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, operation_manifest_set_digest, validate_store_receipt_envelope,
 };
 use thiserror::Error;
 
@@ -1264,8 +1263,7 @@ fn prepare_exact_prior_runtime_scope_change(
     let mut targeted = CapabilityRegistry::new();
     let mut pending = Vec::new();
     for retained in admission.registry().retained().iter().filter(|retained| {
-        retained.record.scope_fingerprint.runtime_hash.as_deref()
-            == Some(previous_runtime_hash)
+        retained.record.scope_fingerprint.runtime_hash.as_deref() == Some(previous_runtime_hash)
     }) {
         if retained.record.is_limited() {
             if retained.record.blocking_limitation() == Some(blocking_evidence_ref)
@@ -1543,10 +1541,7 @@ where
             &manifest_digest,
             fence,
         )?;
-        let revision = restriction_revision_after_commit(
-            &request,
-            expected_canonical_revision,
-        )?;
+        let revision = restriction_revision_after_commit(&request, expected_canonical_revision)?;
         if !admission.insert(restricted.clone(), revision) {
             return Err(EvidenceBridgeError::CapacityExceeded);
         }
@@ -1612,13 +1607,18 @@ fn prepare_restriction_receipt_expectation(
     operation_id: &eliot_contracts::OperationId,
     idempotency_key: &str,
     expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
-) -> Result<(eliot_store_api::OperationManifestDigest, eliot_canonical::PreparedTransition), EvidenceBridgeError> {
-    let manifest_digest = operation_manifest_set_digest(
-        &generated_operation_manifests().map_err(|error| {
+) -> Result<
+    (
+        eliot_store_api::OperationManifestDigest,
+        eliot_store_api::PreparedTransition,
+    ),
+    EvidenceBridgeError,
+> {
+    let manifest_digest =
+        operation_manifest_set_digest(&generated_operation_manifests().map_err(|error| {
             EvidenceBridgeError::RestrictionCommit(format!("operation catalogue: {error}"))
-        })?,
-    )
-    .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
+        })?)
+        .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?;
     let envelope = eliot_canonical::CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -1628,7 +1628,9 @@ fn prepare_restriction_receipt_expectation(
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
-            .map_err(|error| EvidenceBridgeError::RestrictionCommit(error.to_string()))?,
+            .map_err(|error| {
+            EvidenceBridgeError::RestrictionCommit(error.to_string())
+        })?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![request.clone()],
         event_projection_relation_intents: EventProjectionRelationIntents {
@@ -1653,7 +1655,7 @@ fn prepare_restriction_receipt_expectation(
 fn validate_restriction_receipt(
     receipt: &WriteReceipt,
     identity: &eliot_protocol::RequestIdentity,
-    prepared: &eliot_canonical::PreparedTransition,
+    prepared: &eliot_store_api::PreparedTransition,
     operation_id: &eliot_contracts::OperationId,
     idempotency_key: &str,
     manifest_digest: &eliot_store_api::OperationManifestDigest,
@@ -2229,10 +2231,7 @@ mod tests {
 
         // Model the owner commit leg advancing only the selected canonical
         // row. Rows outside that original key remain admitted in the held view.
-        assert!(admission.insert(
-            staled.records[0].record.clone(),
-            test_owner_revision(2)
-        ));
+        assert!(admission.insert(staled.records[0].record.clone(), test_owner_revision(2)));
         assert!(!admission.admit_production_route("skill-target", &prior_scope, 10));
         assert!(admission.admit_production_route("skill-sibling", &prior_scope, 10));
         assert!(admission.admit_production_route("skill-target", &unrelated_scope, 10));
@@ -2330,17 +2329,19 @@ mod tests {
             ("skill-second", prior_b.clone()),
             ("skill-first", unrelated.clone()),
         ] {
-            assert!(admission.insert(
-                CapabilityEvidenceRecord::verified(
-                    skill,
-                    CapabilityStatus::ProbePassed,
-                    CapabilitySource::ActiveProbe,
-                    route,
-                    1,
+            assert!(
+                admission.insert(
+                    CapabilityEvidenceRecord::verified(
+                        skill,
+                        CapabilityStatus::ProbePassed,
+                        CapabilitySource::ActiveProbe,
+                        route,
+                        1,
+                    )
+                    .expect("valid fixture evidence"),
+                    test_owner_revision(1),
                 )
-                .expect("valid fixture evidence"),
-                test_owner_revision(1),
-            ));
+            );
         }
 
         let staled = prepare_exact_prior_runtime_scope_change(
@@ -2377,17 +2378,19 @@ mod tests {
         };
         let blocking_ref = observed.reference_digest();
         let mut admission = GovernorCapabilityAdmission::new();
-        assert!(admission.insert(
-            CapabilityEvidenceRecord::verified(
-                "skill-unchanged",
-                CapabilityStatus::ProbePassed,
-                CapabilitySource::ActiveProbe,
-                route.clone(),
-                1,
+        assert!(
+            admission.insert(
+                CapabilityEvidenceRecord::verified(
+                    "skill-unchanged",
+                    CapabilityStatus::ProbePassed,
+                    CapabilitySource::ActiveProbe,
+                    route.clone(),
+                    1,
+                )
+                .expect("valid fixture evidence"),
+                test_owner_revision(1),
             )
-            .expect("valid fixture evidence"),
-            test_owner_revision(1),
-        ));
+        );
 
         let staled = prepare_exact_prior_runtime_scope_change(
             &admission,
@@ -2444,8 +2447,10 @@ mod tests {
         assert_eq!(retry.records.len(), 1);
         assert_eq!(retry.records[0].record, first.records[0].record);
         assert_eq!(retry.records[0].revision, first.records[0].revision);
-        assert!(!retained_record_is_durable(&retry.records[0])
-            .expect("the pre-change owner digest is not the limited record digest"));
+        assert!(
+            !retained_record_is_durable(&retry.records[0])
+                .expect("the pre-change owner digest is not the limited record digest")
+        );
 
         let limited = retry.records[0].record.clone();
         let limited_digest = eliot_contracts::sha256_hex(

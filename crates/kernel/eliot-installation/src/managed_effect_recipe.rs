@@ -64,23 +64,44 @@ impl ManagedEffectOperation {
     const fn allowed_changes(self) -> &'static [ManagedResourceChange] {
         use ManagedResourceChange as Change;
         match self {
-            Self::InstallPortableGeneration => &[Change::CreatePackageGeneration, Change::CreateRegistration],
-            Self::UpdatePortableGeneration => &[Change::CreatePackageGeneration, Change::ReplaceRegistration],
+            Self::InstallPortableGeneration => {
+                &[Change::CreatePackageGeneration, Change::CreateRegistration]
+            }
+            Self::UpdatePortableGeneration => {
+                &[Change::CreatePackageGeneration, Change::ReplaceRegistration]
+            }
             Self::RepairPortableGeneration => &[Change::RepairPackageGeneration],
-            Self::RemoveOwnedPortableGeneration => &[Change::RemoveRegistration, Change::RemoveOwnedGeneration],
+            Self::RemoveOwnedPortableGeneration => {
+                &[Change::RemoveRegistration, Change::RemoveOwnedGeneration]
+            }
             Self::RegisterObservedPortableGeneration => &[Change::CreateRegistration],
-            Self::ReconfigurePortableGeneration => &[Change::CreateConfigurationGeneration, Change::ReplaceRegistrationConfiguration],
+            Self::ReconfigurePortableGeneration => &[
+                Change::CreateConfigurationGeneration,
+                Change::ReplaceRegistrationConfiguration,
+            ],
         }
     }
 
     const fn postcondition(self) -> ManagedEffectPostcondition {
         match self {
-            Self::InstallPortableGeneration => ManagedEffectPostcondition::GenerationAndRegistrationReadBack,
-            Self::UpdatePortableGeneration => ManagedEffectPostcondition::GenerationAndRegistrationSwitchedReadBack,
-            Self::RepairPortableGeneration => ManagedEffectPostcondition::GenerationRepairedReadBack,
-            Self::RemoveOwnedPortableGeneration => ManagedEffectPostcondition::OwnedGenerationAndRegistrationAbsent,
-            Self::RegisterObservedPortableGeneration => ManagedEffectPostcondition::RegistrationReadBack,
-            Self::ReconfigurePortableGeneration => ManagedEffectPostcondition::ConfigurationAndRegistrationReadBack,
+            Self::InstallPortableGeneration => {
+                ManagedEffectPostcondition::GenerationAndRegistrationReadBack
+            }
+            Self::UpdatePortableGeneration => {
+                ManagedEffectPostcondition::GenerationAndRegistrationSwitchedReadBack
+            }
+            Self::RepairPortableGeneration => {
+                ManagedEffectPostcondition::GenerationRepairedReadBack
+            }
+            Self::RemoveOwnedPortableGeneration => {
+                ManagedEffectPostcondition::OwnedGenerationAndRegistrationAbsent
+            }
+            Self::RegisterObservedPortableGeneration => {
+                ManagedEffectPostcondition::RegistrationReadBack
+            }
+            Self::ReconfigurePortableGeneration => {
+                ManagedEffectPostcondition::ConfigurationAndRegistrationReadBack
+            }
         }
     }
 }
@@ -114,7 +135,9 @@ pub enum ManagedResourceChange {
 /// Competencies this portable adapter explicitly refuses to perform. A signed
 /// recipe may declare one so admission can report why it is unsupported; the
 /// transaction writer never interprets the requirement as permission.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedEffectRequirement {
     /// Downloading or network access is required.
@@ -199,43 +222,75 @@ pub struct ManagedEffectRecipe {
 impl ManagedEffectRecipe {
     /// Checks the full signed wire recipe without consulting caller labels or
     /// performing an effect.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the signed recipe's complete effect and resource-change contract is validated at one admission boundary"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.recipe_id, "managed_effect_recipe.recipe_id")?;
         if self.recipe_id.as_str() != PORTABLE_PACKAGE_RECIPE_ID {
-            return Err(invalid_recipe("recipe_id", "unsupported recipe discriminator"));
+            return Err(invalid_recipe(
+                "recipe_id",
+                "unsupported recipe discriminator",
+            ));
         }
         if self.action != self.operation.action() {
-            return Err(invalid_recipe("operation", "must implement the exact action"));
+            return Err(invalid_recipe(
+                "operation",
+                "must implement the exact action",
+            ));
         }
-        WindowsPathIdentity::parse_root(self.source_bundle.as_str(), "managed_effect_recipe.source_bundle")?;
+        WindowsPathIdentity::parse_root(
+            self.source_bundle.as_str(),
+            "managed_effect_recipe.source_bundle",
+        )?;
         if self.source_bundle_identity.volume_serial_number == 0
             || self.source_bundle_identity.file_index == 0
         {
-            return Err(invalid_recipe("source_bundle_identity", "must be a non-zero file identity"));
+            return Err(invalid_recipe(
+                "source_bundle_identity",
+                "must be a non-zero file identity",
+            ));
         }
         handle(&self.target_family, "managed_effect_recipe.target_family")?;
-        handle(&self.package_version, "managed_effect_recipe.package_version")?;
-        if validate_package_relative_path(Path::new(self.target_family.as_str()))
-            .is_err()
+        handle(
+            &self.package_version,
+            "managed_effect_recipe.package_version",
+        )?;
+        if validate_package_relative_path(Path::new(self.target_family.as_str())).is_err()
             || self.target_family.as_str().contains('/')
             || self.target_family.as_str().contains('\\')
             || validate_package_relative_path(Path::new(self.package_version.as_str())).is_err()
             || self.package_version.as_str().contains('/')
             || self.package_version.as_str().contains('\\')
         {
-            return Err(invalid_recipe("package_version", "family and version must each be one safe path component"));
+            return Err(invalid_recipe(
+                "package_version",
+                "family and version must each be one safe path component",
+            ));
         }
         let expected_generation = format!("{}/{}", self.target_family, self.package_version);
         if expected_generation != self.package_manifest.generation {
-            return Err(invalid_recipe("package_manifest.generation", "must bind the exact family and version"));
+            return Err(invalid_recipe(
+                "package_manifest.generation",
+                "must bind the exact family and version",
+            ));
         }
-        let manifest_generation = validate_package_relative_path(Path::new(&self.package_manifest.generation))
-            .map_err(|error| invalid_recipe("package_manifest.generation", &error.to_string()))?;
+        let manifest_generation = validate_package_relative_path(Path::new(
+            &self.package_manifest.generation,
+        ))
+        .map_err(|error| invalid_recipe("package_manifest.generation", &error.to_string()))?;
         if manifest_generation.as_str() != self.package_manifest.generation {
-            return Err(invalid_recipe("package_manifest.generation", "must be canonical"));
+            return Err(invalid_recipe(
+                "package_manifest.generation",
+                "must be canonical",
+            ));
         }
         if self.package_manifest.files.is_empty() {
-            return Err(invalid_recipe("package_manifest.files", "must be non-empty and bounded"));
+            return Err(invalid_recipe(
+                "package_manifest.files",
+                "must be non-empty and bounded",
+            ));
         }
         let normalized_manifest = PackageManifest::new(
             &self.package_manifest.generation,
@@ -243,83 +298,131 @@ impl ManagedEffectRecipe {
         )
         .map_err(|error| invalid_recipe("package_manifest", &error.to_string()))?;
         if normalized_manifest != self.package_manifest {
-            return Err(invalid_recipe("package_manifest", "must use its canonical sorted shape"));
+            return Err(invalid_recipe(
+                "package_manifest",
+                "must use its canonical sorted shape",
+            ));
         }
         if self.expected_files.len() != self.package_manifest.files.len() {
-            return Err(invalid_recipe("expected_files", "must exactly cover the manifest inventory"));
+            return Err(invalid_recipe(
+                "expected_files",
+                "must exactly cover the manifest inventory",
+            ));
         }
         for (index, file) in self.package_manifest.files.iter().enumerate() {
-            if self.package_manifest.files[index + 1..].iter().any(|other| {
-                ordinal_path_equal(&file.relative_path, &other.relative_path)
-            }) {
-                return Err(invalid_recipe("package_manifest.files", "contains a duplicate path"));
+            if self.package_manifest.files[index + 1..]
+                .iter()
+                .any(|other| ordinal_path_equal(&file.relative_path, &other.relative_path))
+            {
+                return Err(invalid_recipe(
+                    "package_manifest.files",
+                    "contains a duplicate path",
+                ));
             }
         }
-        for (file, digest) in self
-            .package_manifest
-            .files
-            .iter()
-            .zip(&self.expected_files)
-        {
+        for (file, digest) in self.package_manifest.files.iter().zip(&self.expected_files) {
             let path = validate_package_relative_path(Path::new(&file.relative_path))
                 .map_err(|error| invalid_recipe("package_manifest.files", &error.to_string()))?;
             if path.as_str() != file.relative_path || file.expected_size == 0 {
-                return Err(invalid_recipe("package_manifest.files", "path or size is not canonical"));
+                return Err(invalid_recipe(
+                    "package_manifest.files",
+                    "path or size is not canonical",
+                ));
             }
             if digest.relative_path != file.relative_path
                 || digest.expected_size != file.expected_size
                 || !is_lower_sha256(digest.sha256.as_str())
             {
-                return Err(invalid_recipe("expected_files", "ordered digest/size inventory differs from the manifest"));
+                return Err(invalid_recipe(
+                    "expected_files",
+                    "ordered digest/size inventory differs from the manifest",
+                ));
             }
         }
         for (index, digest) in self.expected_files.iter().enumerate() {
-            if self.expected_files[index + 1..].iter().any(|other| {
-                ordinal_path_equal(&digest.relative_path, &other.relative_path)
-            }) {
-                return Err(invalid_recipe("expected_files", "contains a duplicate path"));
+            if self.expected_files[index + 1..]
+                .iter()
+                .any(|other| ordinal_path_equal(&digest.relative_path, &other.relative_path))
+            {
+                return Err(invalid_recipe(
+                    "expected_files",
+                    "contains a duplicate path",
+                ));
             }
         }
         if self.target_relative_path.as_str() != MANAGED_TOOLS_RELATIVE_ROOT {
-            return Err(invalid_recipe("target_relative_path", "must be the fixed managed-tools child"));
+            return Err(invalid_recipe(
+                "target_relative_path",
+                "must be the fixed managed-tools child",
+            ));
         }
-        handle(&self.registration_identity, "managed_effect_recipe.registration_identity")?;
+        handle(
+            &self.registration_identity,
+            "managed_effect_recipe.registration_identity",
+        )?;
         if self.executable_relative_paths.is_empty()
             || self.executable_relative_paths.len() > self.package_manifest.files.len()
         {
-            return Err(invalid_recipe("executable_relative_paths", "must be non-empty and bounded"));
+            return Err(invalid_recipe(
+                "executable_relative_paths",
+                "must be non-empty and bounded",
+            ));
         }
         for (index, executable) in self.executable_relative_paths.iter().enumerate() {
-            handle(executable, "managed_effect_recipe.executable_relative_paths")?;
+            handle(
+                executable,
+                "managed_effect_recipe.executable_relative_paths",
+            )?;
             let path = validate_package_relative_path(Path::new(executable.as_str()))
                 .map_err(|error| invalid_recipe("executable_relative_paths", &error.to_string()))?;
             if path.as_str() != executable.as_str() {
-                return Err(invalid_recipe("executable_relative_paths", "path must be canonical"));
+                return Err(invalid_recipe(
+                    "executable_relative_paths",
+                    "path must be canonical",
+                ));
             }
             if self.executable_relative_paths[index + 1..]
                 .iter()
                 .any(|other| ordinal_path_equal(executable.as_str(), other.as_str()))
             {
-                return Err(invalid_recipe("executable_relative_paths", "contains a duplicate path"));
+                return Err(invalid_recipe(
+                    "executable_relative_paths",
+                    "contains a duplicate path",
+                ));
             }
             if !self.package_manifest.files.iter().any(|file| {
                 file.executable && ordinal_path_equal(executable.as_str(), &file.relative_path)
             }) {
-                return Err(invalid_recipe("executable_relative_paths", "must name executable manifest entries"));
+                return Err(invalid_recipe(
+                    "executable_relative_paths",
+                    "must name executable manifest entries",
+                ));
             }
         }
         if !self.fixed_arguments.is_empty() {
-            return Err(invalid_recipe("fixed_arguments", "portable file effects accept no process arguments"));
+            return Err(invalid_recipe(
+                "fixed_arguments",
+                "portable file effects accept no process arguments",
+            ));
         }
         if self.allowed_resource_changes.as_slice() != self.operation.allowed_changes() {
-            return Err(invalid_recipe("allowed_resource_changes", "must exactly match the closed action mapping"));
+            return Err(invalid_recipe(
+                "allowed_resource_changes",
+                "must exactly match the closed action mapping",
+            ));
         }
         if self.postcondition != self.operation.postcondition() {
-            return Err(invalid_recipe("postcondition", "must exactly match the operation's typed readback"));
+            return Err(invalid_recipe(
+                "postcondition",
+                "must exactly match the operation's typed readback",
+            ));
         }
         for pair in self.unsupported_requirements.windows(2) {
             if pair[0] >= pair[1] {
-                return Err(invalid_recipe("unsupported_requirements", "must be sorted and distinct"));
+                return Err(invalid_recipe(
+                    "unsupported_requirements",
+                    "must be sorted and distinct",
+                ));
             }
         }
         Ok(())
@@ -364,13 +467,19 @@ mod direct_tests {
             (
                 ManagedEffectOperation::InstallPortableGeneration,
                 ManagedEnvironmentAction::Install,
-                &[ManagedResourceChange::CreatePackageGeneration, ManagedResourceChange::CreateRegistration][..],
+                &[
+                    ManagedResourceChange::CreatePackageGeneration,
+                    ManagedResourceChange::CreateRegistration,
+                ][..],
                 ManagedEffectPostcondition::GenerationAndRegistrationReadBack,
             ),
             (
                 ManagedEffectOperation::UpdatePortableGeneration,
                 ManagedEnvironmentAction::Update,
-                &[ManagedResourceChange::CreatePackageGeneration, ManagedResourceChange::ReplaceRegistration][..],
+                &[
+                    ManagedResourceChange::CreatePackageGeneration,
+                    ManagedResourceChange::ReplaceRegistration,
+                ][..],
                 ManagedEffectPostcondition::GenerationAndRegistrationSwitchedReadBack,
             ),
             (
@@ -382,7 +491,10 @@ mod direct_tests {
             (
                 ManagedEffectOperation::RemoveOwnedPortableGeneration,
                 ManagedEnvironmentAction::Remove,
-                &[ManagedResourceChange::RemoveRegistration, ManagedResourceChange::RemoveOwnedGeneration][..],
+                &[
+                    ManagedResourceChange::RemoveRegistration,
+                    ManagedResourceChange::RemoveOwnedGeneration,
+                ][..],
                 ManagedEffectPostcondition::OwnedGenerationAndRegistrationAbsent,
             ),
             (
@@ -394,7 +506,10 @@ mod direct_tests {
             (
                 ManagedEffectOperation::ReconfigurePortableGeneration,
                 ManagedEnvironmentAction::Reconfigure,
-                &[ManagedResourceChange::CreateConfigurationGeneration, ManagedResourceChange::ReplaceRegistrationConfiguration][..],
+                &[
+                    ManagedResourceChange::CreateConfigurationGeneration,
+                    ManagedResourceChange::ReplaceRegistrationConfiguration,
+                ][..],
                 ManagedEffectPostcondition::ConfigurationAndRegistrationReadBack,
             ),
         ];

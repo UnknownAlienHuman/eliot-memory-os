@@ -37,9 +37,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AcceptedIntegrationCatalogue, InstallationError, InstallationProfile, InstallationSurvey,
-    ManagedChangeApproval, ManagedEnvironmentAction, ManagedEnvironmentChangeRequest,
-    ManagedEffectRecipe, PlatformHandle, SurveyFamilyReport, SurveyStage, SurveyStageOutcome,
-    VerifiedSetupBinding, handle, is_lower_sha256, resolve_bounded_probe, sha256_handle,
+    ManagedChangeApproval, ManagedEffectRecipe, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PlatformHandle, SurveyFamilyReport, SurveyStage,
+    SurveyStageOutcome, VerifiedSetupBinding, handle, is_lower_sha256, resolve_bounded_probe,
+    sha256_handle,
 };
 
 /// The unique native file observation that belongs to one surveyed target.
@@ -198,8 +199,8 @@ impl ManagedEnvironmentChangePlan {
     /// retained bytes. Every field is validated; callers must independently
     /// reopen signed catalogue/approval and current owner bindings before use.
     pub(crate) fn from_retained_json(encoded: &str) -> Result<Self, InstallationError> {
-        let wire: RetainedManagedChangePlan = serde_json::from_str(encoded)
-            .map_err(|_| InstallationError::IdentityConflict)?;
+        let wire: RetainedManagedChangePlan =
+            serde_json::from_str(encoded).map_err(|_| InstallationError::IdentityConflict)?;
         let plan = Self {
             request: wire.request,
             approval: wire.approval,
@@ -270,11 +271,9 @@ impl ManagedEnvironmentChangePlan {
         &self,
     ) -> Option<(&PlatformHandle, &PlatformHandle, &PlatformHandle)> {
         match (&self.target_identity, &self.target_executable_observation) {
-            (Some(target_identity), Some(observation)) => Some((
-                target_identity,
-                &observation.path,
-                &observation.sha256,
-            )),
+            (Some(target_identity), Some(observation)) => {
+                Some((target_identity, &observation.path, &observation.sha256))
+            }
             _ => None,
         }
     }
@@ -335,7 +334,6 @@ impl ManagedEnvironmentChangePlan {
     /// The request is checked through its own existing `validate()` rather than
     /// a second copy of those rules.
     pub fn validate(&self) -> Result<(), InstallationError> {
-        let _compilation_seal = self.compilation_seal;
         self.request.validate()?;
         self.approval.validate()?;
         self.effect_recipe.validate()?;
@@ -406,7 +404,7 @@ impl ManagedEnvironmentChangePlan {
             }
         }?;
         match (&self.target_identity, &self.target_executable_observation) {
-            (None, None) | (Some(_), None) => {}
+            (None | Some(_), None) => {}
             (Some(identity), Some(observation)) => observation.validate_for_target(identity)?,
             (None, Some(_)) => return Err(InstallationError::IdentityConflict),
         }
@@ -799,12 +797,11 @@ fn target_native_file_observation(
     let Some(sha256) = file_version.sha256.as_ref() else {
         return Ok(None);
     };
-    let sha256 = PlatformHandle::new(sha256.clone()).map_err(|error| {
-        InstallationError::InvalidField {
+    let sha256 =
+        PlatformHandle::new(sha256.clone()).map_err(|error| InstallationError::InvalidField {
             field: "managed_change_plan.target_executable_observation.sha256".to_owned(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     sha256_handle(
         &sha256,
         "managed_change_plan.target_executable_observation.sha256",

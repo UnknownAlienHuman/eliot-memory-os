@@ -2539,6 +2539,13 @@ impl GenerationPackagePlanner {
                     InstallerEffectPlan::MaterializePhaseB {
                         static_template, ..
                     } => static_template.authority_id.clone(),
+                    InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                        return Err(InstallationError::InvalidField {
+                            field: "generation.installer_effect".to_owned(),
+                            reason: "managed environment changes must use the accepted managed-change admission path"
+                                .to_owned(),
+                        });
+                    }
                 };
                 let change_id = effect.effect_id().clone();
                 Ok(PlannedChange {

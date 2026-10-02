@@ -20,23 +20,23 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use eliot_config::Setting;
 use eliot_config::first_run::FirstRunDecision;
 use eliot_config::initial_snapshot::{
     InitialConfigSnapshotTrustAnchor, InitialSnapshotError, InitialSnapshotIdentity,
     InitialSnapshotSigner, InitialSnapshotVerificationContext, PrivacyChoice,
     SignedInitialConfigSnapshot, prepare_initial_snapshot_payload_with_settings,
 };
-use eliot_config::Setting;
 use eliot_contracts::StateFence;
 use eliot_platform::PlatformHandle;
 use thiserror::Error;
 
 use crate::{
-    DISCOVERY_CATALOGUE_SETTING_KEY, DISCOVERY_CATALOGUE_SCHEMA, InstallationError,
+    DISCOVERY_CATALOGUE_SCHEMA, DISCOVERY_CATALOGUE_SETTING_KEY, InstallationError,
     InstallationProfile, InstallationTransactionStore, IntegrationDiscoveryCatalogue,
     MANAGED_CHANGE_APPROVALS_SCHEMA, MANAGED_CHANGE_APPROVALS_SETTING_KEY,
-    ManagedChangeApprovalSet, RedbInstallationTransactionStore, SetupAdmissionError,
-    SetupBinding, SetupKeyReference, SetupMilestone, VerifiedSetupBinding, verify_setup_binding,
+    ManagedChangeApprovalSet, RedbInstallationTransactionStore, SetupAdmissionError, SetupBinding,
+    SetupKeyReference, SetupMilestone, VerifiedSetupBinding, verify_setup_binding,
 };
 use std::path::{Path, PathBuf};
 
@@ -85,9 +85,7 @@ pub enum InitialSnapshotPublicationError {
     Snapshot(#[from] InitialSnapshotError),
     /// Protected owner-key identity, SID, or readback refused.
     #[error(transparent)]
-    ProtectedKey(
-        #[from] eliot_platform_windows::SetupOwnerInitialSnapshotKeyError,
-    ),
+    ProtectedKey(#[from] eliot_platform_windows::SetupOwnerInitialSnapshotKeyError),
     /// The transaction or setup record does not prove the required original
     /// owner state for first-snapshot publication.
     #[error("initial snapshot publication refused: {0}")]
@@ -119,6 +117,10 @@ pub enum InitialSnapshotPublicationError {
 /// Returns [`InitialSnapshotPublicationError`] when the original transaction,
 /// setup facts, protected key, catalogue, approval set, signature, or durable
 /// readback cannot be admitted exactly.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one owner transition binds the original setup facts, persisted intent, protected signature and mandatory readback"
+)]
 pub fn publish_system_owner_initial_snapshot(
     store: &mut RedbInstallationTransactionStore,
     transaction_id: &PlatformHandle,
@@ -127,16 +129,17 @@ pub fn publish_system_owner_initial_snapshot(
     catalogue: &IntegrationDiscoveryCatalogue,
     approvals: &ManagedChangeApprovalSet,
 ) -> Result<InitialSnapshotPublicationReceipt, InitialSnapshotPublicationError> {
-    let transaction = store
-        .load(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
-            "the current installation transaction is absent from the selected store",
-        ))?;
-    let binding = store
-        .load_setup_binding(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
+    let transaction =
+        store
+            .load(transaction_id)?
+            .ok_or(InitialSnapshotPublicationError::Refused(
+                "the current installation transaction is absent from the selected store",
+            ))?;
+    let binding = store.load_setup_binding(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused(
             "the original deterministic-setup binding is absent",
-        ))?;
+        ),
+    )?;
     validate_transaction_binding(&transaction, &binding, transaction_id)?;
     crate::setup_production::validate_original_setup_key_readback(store, &binding).map_err(
         |_| {
@@ -183,8 +186,7 @@ pub fn publish_system_owner_initial_snapshot(
             "the setup signing reference belongs to a different installation profile",
         ));
     }
-    let provider =
-        eliot_platform_windows::WindowsSetupOwnerInitialSnapshotKeyProvider::new();
+    let provider = eliot_platform_windows::WindowsSetupOwnerInitialSnapshotKeyProvider::new();
     let signer = provider.open(
         &setup_key_reference.target_ref,
         &setup_key_reference.key_id,
@@ -224,23 +226,19 @@ pub fn publish_system_owner_initial_snapshot(
         setup_revision: expected_snapshot_revision,
         state_fence: configuration.state_fence.clone(),
     };
-    let privacy = binding.privacy_choice().ok_or(
-        InitialSnapshotPublicationError::Refused(
+    let privacy = binding
+        .privacy_choice()
+        .ok_or(InitialSnapshotPublicationError::Refused(
             "the original PrivacyModeSelected result is absent",
-        ),
-    )?;
+        ))?;
     if privacy != configuration.privacy_choice {
         return Err(InitialSnapshotPublicationError::Refused(
             "requested privacy differs from the original PrivacyModeSelected milestone",
         ));
     }
     let settings = owner_settings(catalogue, approvals, binding.confirmed_owner.as_str())?;
-    let payload = prepare_initial_snapshot_payload_with_settings(
-        &identity,
-        privacy,
-        first_run,
-        &settings,
-    )?;
+    let payload =
+        prepare_initial_snapshot_payload_with_settings(&identity, privacy, first_run, &settings)?;
 
     // Persist the exact content intent before invoking the protected signer or
     // writing the immutable signed envelope. This digest is the original
@@ -258,37 +256,34 @@ pub fn publish_system_owner_initial_snapshot(
     )?;
 
     let existing_snapshot = store.load_initial_snapshot(transaction_id)?;
-    let expected_snapshot = match existing_snapshot {
-        Some(snapshot) => {
-            if snapshot.payload != payload {
-                return Err(InitialSnapshotPublicationError::Refused(
-                    "the original snapshot intent already has different retained payload bytes",
-                ));
-            }
-            require_snapshot_matches_protected_key(&snapshot, &anchor, &identity)?;
-            snapshot
+    let expected_snapshot = if let Some(snapshot) = existing_snapshot {
+        if snapshot.payload != payload {
+            return Err(InitialSnapshotPublicationError::Refused(
+                "the original snapshot intent already has different retained payload bytes",
+            ));
         }
-        None => {
-            if binding.state() == SetupMilestone::InitialSnapshotCreated {
-                return Err(InitialSnapshotPublicationError::Refused(
-                    "the completed setup binding has no retained initial snapshot",
-                ));
-            }
-            let snapshot = SignedInitialConfigSnapshot::sign(
-                &payload,
-                &ProtectedSnapshotSigner { signer: &signer },
-            )?;
-            require_snapshot_matches_protected_key(&snapshot, &anchor, &identity)?;
-            store.create_initial_snapshot(transaction_id, &snapshot)?;
-            snapshot
+        require_snapshot_matches_protected_key(&snapshot, &anchor, &identity)?;
+        snapshot
+    } else {
+        if binding.state() == SetupMilestone::InitialSnapshotCreated {
+            return Err(InitialSnapshotPublicationError::Refused(
+                "the completed setup binding has no retained initial snapshot",
+            ));
         }
+        let snapshot = SignedInitialConfigSnapshot::sign(
+            &payload,
+            &ProtectedSnapshotSigner { signer: &signer },
+        )?;
+        require_snapshot_matches_protected_key(&snapshot, &anchor, &identity)?;
+        store.create_initial_snapshot(transaction_id, &snapshot)?;
+        snapshot
     };
 
-    let retained_snapshot = store
-        .load_initial_snapshot(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
+    let retained_snapshot = store.load_initial_snapshot(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused(
             "the original signed snapshot was not present on mandatory readback",
-        ))?;
+        ),
+    )?;
     if retained_snapshot != expected_snapshot {
         return Err(InitialSnapshotPublicationError::Refused(
             "the retained signed snapshot differs from the original effect result",
@@ -319,10 +314,12 @@ pub fn publish_system_owner_initial_snapshot(
     retained_anchor.verify(&retained_snapshot, &verification_context)?;
 
     if binding.state() == SetupMilestone::StorageVerified {
-        let envelope_digest = PlatformHandle::new(retained_snapshot.envelope_digest()?)
-            .map_err(|error| InstallationError::InvalidField {
-                field: "initial_snapshot.envelope_digest".to_owned(),
-                reason: error.to_string(),
+        let envelope_digest =
+            PlatformHandle::new(retained_snapshot.envelope_digest()?).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "initial_snapshot.envelope_digest".to_owned(),
+                    reason: error.to_string(),
+                }
             })?;
         let expected_revision = binding.revision();
         let mut completed = binding;
@@ -354,21 +351,23 @@ pub fn publish_system_owner_initial_snapshot(
         store.compare_and_save_setup_binding(expected_revision, &completed)?;
     }
 
-    let retained_binding = store
-        .load_setup_binding(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
+    let retained_binding = store.load_setup_binding(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused(
             "the final setup binding was not present on mandatory readback",
-        ))?;
-    let final_snapshot = store
-        .load_initial_snapshot(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
+        ),
+    )?;
+    let final_snapshot = store.load_initial_snapshot(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused(
             "the final signed snapshot was not present on mandatory readback",
-        ))?;
+        ),
+    )?;
     let authority = verify_setup_binding(&retained_binding, &final_snapshot, &retained_anchor)?;
-    let envelope_digest = PlatformHandle::new(final_snapshot.envelope_digest()?)
-        .map_err(|error| InstallationError::InvalidField {
-            field: "initial_snapshot.envelope_digest".to_owned(),
-            reason: error.to_string(),
+    let envelope_digest =
+        PlatformHandle::new(final_snapshot.envelope_digest()?).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "initial_snapshot.envelope_digest".to_owned(),
+                reason: error.to_string(),
+            }
         })?;
     let signer_key_id = PlatformHandle::new(retained_signer.key_id()).map_err(|error| {
         InstallationError::InvalidField {
@@ -398,16 +397,17 @@ pub fn load_system_owner_initial_snapshot_authority(
     transaction_id: &PlatformHandle,
 ) -> Result<(InitialConfigSnapshotTrustAnchor, VerifiedSetupBinding), InitialSnapshotPublicationError>
 {
-    let transaction = store
-        .load(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
-            "the selected installation transaction is absent",
-        ))?;
-    let binding = store
-        .load_setup_binding(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
+    let transaction =
+        store
+            .load(transaction_id)?
+            .ok_or(InitialSnapshotPublicationError::Refused(
+                "the selected installation transaction is absent",
+            ))?;
+    let binding = store.load_setup_binding(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused(
             "the original deterministic-setup binding is absent",
-        ))?;
+        ),
+    )?;
     validate_transaction_binding(&transaction, &binding, transaction_id)?;
     binding.require_complete()?;
     crate::setup_production::validate_original_setup_key_readback(store, &binding).map_err(
@@ -418,11 +418,9 @@ pub fn load_system_owner_initial_snapshot_authority(
         },
     )?;
     validate_prior_setup_facts(store, &binding)?;
-    let snapshot = store
-        .load_initial_snapshot(transaction_id)?
-        .ok_or(InitialSnapshotPublicationError::Refused(
-            "the original signed initial snapshot is absent",
-        ))?;
+    let snapshot = store.load_initial_snapshot(transaction_id)?.ok_or(
+        InitialSnapshotPublicationError::Refused("the original signed initial snapshot is absent"),
+    )?;
     let setup_key_reference = select_setup_owner_key_reference(&binding)?;
     let profile = installer_root_profile(transaction.profile);
     let selected_key_root = setup_key_root(&transaction)?;
@@ -465,7 +463,9 @@ pub fn load_system_owner_initial_snapshot_authority(
     Ok((anchor, authority))
 }
 
-fn installer_root_profile(profile: InstallationProfile) -> eliot_platform_windows::InstallerRootProfile {
+fn installer_root_profile(
+    profile: InstallationProfile,
+) -> eliot_platform_windows::InstallerRootProfile {
     match profile {
         InstallationProfile::SystemService => {
             eliot_platform_windows::InstallerRootProfile::SystemService
@@ -486,9 +486,11 @@ fn setup_key_root(
         ),
     )?;
     let root = match transaction.profile {
-        InstallationProfile::SystemService => Path::new(roots.runtime_state_roots.profile_anchor_root.as_str())
-            .join("Eliot")
-            .join(eliot_platform_windows::INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE),
+        InstallationProfile::SystemService => {
+            Path::new(roots.runtime_state_roots.profile_anchor_root.as_str())
+                .join("Eliot")
+                .join(eliot_platform_windows::INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE)
+        }
         InstallationProfile::UserMode => return Ok(None),
         InstallationProfile::PortableDev => {
             PathBuf::from(roots.runtime_state_roots.profile_anchor_root.as_str())
@@ -574,7 +576,9 @@ fn validate_catalogue_and_approvals(
             .supported_platforms
             .iter()
             .any(|supported| supported == platform)
-        || catalogue.expires_at_ms.is_some_and(|expiry| now_ms >= expiry)
+        || catalogue
+            .expires_at_ms
+            .is_some_and(|expiry| now_ms >= expiry)
     {
         return Err(InitialSnapshotPublicationError::Refused(
             "catalogue schema, owner acceptance, platform, or expiry is not current",
@@ -681,8 +685,12 @@ fn verification_context(
 }
 
 fn current_platform_handle() -> Result<PlatformHandle, InitialSnapshotPublicationError> {
-    PlatformHandle::new(format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
-        .map_err(|_| InitialSnapshotPublicationError::Refused("current platform identity is invalid"))
+    PlatformHandle::new(format!(
+        "{}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ))
+    .map_err(|_| InitialSnapshotPublicationError::Refused("current platform identity is invalid"))
 }
 
 fn current_unix_time_ms() -> Result<u64, InitialSnapshotPublicationError> {
@@ -711,13 +719,11 @@ impl InitialSnapshotSigner for ProtectedSnapshotSigner<'_> {
     }
 
     fn sign(&self, canonical_bytes: &[u8]) -> Result<Vec<u8>, InitialSnapshotError> {
-        self.signer.sign(canonical_bytes).map_err(|error| {
-            InitialSnapshotError::InvalidField {
+        self.signer
+            .sign(canonical_bytes)
+            .map_err(|error| InitialSnapshotError::InvalidField {
                 field: "protected_setup_signer".to_owned(),
                 reason: error.to_string(),
-            }
-        })
+            })
     }
 }
-
-#[allow(dead_code, reason = "the exact payload digest is retained by the setup effect intent")]

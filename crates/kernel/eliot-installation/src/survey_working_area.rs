@@ -11,15 +11,14 @@ use std::sync::Arc;
 use eliot_platform_windows::{FileIdentity, UserOwnedRootReadLease};
 
 use super::{
-    InstallationCreateDisposition, InstallationEffectDisposition,
-    InstallationEffectProgressState, InstallationError, InstallationProfile,
-    InstallationSecretLifecycle, InstallationSecretProvisionDisposition,
+    InstallationCreateDisposition, InstallationEffectDisposition, InstallationEffectObservation,
+    InstallationEffectProgressState, InstallationError, InstallationManagedRootEffectProof,
+    InstallationProfile, InstallationSecretLifecycle, InstallationSecretProvisionDisposition,
     InstallationSecretScope, InstallationTransaction, InstallationTransactionStore,
-    InstallationManagedRootEffectProof, InstallationEffectObservation,
     InstallerEffectPlan, InstallerRootObjectSnapshot, InstallerRootPrimitiveObservation,
     InstallerRootPrimitiveSpec, InstallerRootProfile, PlatformHandle,
-    WindowsInstallationCoordinator, WindowsInstallationEffectPort,
-    WindowsRootOwnershipReceipt, constant_time_equal, hmac_sha256_hex, sha256_hex,
+    WindowsInstallationCoordinator, WindowsInstallationEffectPort, WindowsRootOwnershipReceipt,
+    constant_time_equal, hmac_sha256_hex, sha256_hex,
 };
 
 /// A retained, installer-authenticated working area for a read-only probe.
@@ -41,7 +40,7 @@ pub enum SurveyProbeWorkingAreaPathError {
     /// Root verification failed before any executor-owned path effect.
     Root(InstallationError),
     /// Original native path admission failed, possibly retaining cleanup.
-    Native(eliot_platform_windows::SurveyProbePathAdmissionError),
+    Native(Box<eliot_platform_windows::SurveyProbePathAdmissionError>),
 }
 
 impl SurveyProbeWorkingArea {
@@ -85,11 +84,18 @@ impl SurveyProbeWorkingArea {
         operation_id: &str,
         invocation_digest: &str,
         working_directory: &Path,
-    ) -> Result<eliot_platform_windows::RetainedSurveyProbePathLease, SurveyProbeWorkingAreaPathError> {
-        self.verify().map_err(SurveyProbeWorkingAreaPathError::Root)?;
+    ) -> Result<eliot_platform_windows::RetainedSurveyProbePathLease, SurveyProbeWorkingAreaPathError>
+    {
+        self.verify()
+            .map_err(SurveyProbeWorkingAreaPathError::Root)?;
         eliot_platform_windows::retain_survey_probe_path_lease(
-            &self.lease, process_path, operation_id, invocation_digest, working_directory,
-        ).map_err(SurveyProbeWorkingAreaPathError::Native)
+            &self.lease,
+            process_path,
+            operation_id,
+            invocation_digest,
+            working_directory,
+        )
+        .map_err(|error| SurveyProbeWorkingAreaPathError::Native(Box::new(error)))
     }
     /// Returns the exact durable installation's Kernel working root.
     #[must_use]
@@ -110,7 +116,9 @@ impl SurveyProbeWorkingArea {
     /// Refuses a replaced root or marker, a changed DACL, a foreign credential
     /// principal, a missing key, or a mismatch with the original durable receipt.
     pub fn verify(&self) -> Result<(), InstallationError> {
-        self.lease.verify_stable_identity().map_err(platform_error)?;
+        self.lease
+            .verify_stable_identity()
+            .map_err(platform_error)?;
         if self.lease.canonical_path().map_err(platform_error)? != self.path {
             return Err(InstallationError::IdentityConflict);
         }
@@ -136,7 +144,7 @@ impl<S: InstallationTransactionStore> WindowsInstallationCoordinator<S> {
     /// Retains the exact original installer's admitted Kernel working area.
     ///
     /// This read-only producer accepts no caller-selected root or owner bits.
-    /// PortableDev is the current managed-tool profile; other profiles require
+    /// `PortableDev` is the current managed-tool profile; other profiles require
     /// their own retained protected-root contour and are refused here.
     ///
     /// # Errors
@@ -158,13 +166,20 @@ impl<S: InstallationTransactionStore> WindowsInstallationCoordinator<S> {
             return Err(InstallationError::IdentityConflict);
         }
         let path = PathBuf::from(
-            transaction.candidate_manifest.runtime_launch.runtime_state_roots
-                .kernel_work_root.as_str(),
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .kernel_work_root
+                .as_str(),
         );
         let mut roots = transaction.installer_effects.iter().enumerate().filter_map(
             |(index, plan)| match plan {
                 InstallerEffectPlan::CreateRoot { root, .. }
-                    if Path::new(root.as_str()) == path => Some(index),
+                    if Path::new(root.as_str()) == path =>
+                {
+                    Some(index)
+                }
                 _ => None,
             },
         );
@@ -179,7 +194,12 @@ impl<S: InstallationTransactionStore> WindowsInstallationCoordinator<S> {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        let area = SurveyProbeWorkingArea { lease, transaction, root_index, path };
+        let area = SurveyProbeWorkingArea {
+            lease,
+            transaction,
+            root_index,
+            path,
+        };
         area.verify()?;
         Ok(area)
     }
@@ -190,17 +210,30 @@ fn read_owned_root(
     transaction: &InstallationTransaction,
     index: usize,
 ) -> Result<InstallerRootObjectSnapshot, InstallationError> {
-    let plan = transaction.installer_effects.get(index)
+    let plan = transaction
+        .installer_effects
+        .get(index)
         .ok_or(InstallationError::IdentityConflict)?;
-    let progress = transaction.effect_progress.get(index)
+    let progress = transaction
+        .effect_progress
+        .get(index)
         .ok_or(InstallationError::IdentityConflict)?;
-    read_owned_root_record(port, &InstallationManagedRootEffectProof {
-        owner_transaction_id: transaction.transaction_id.clone(),
-        installer_plan_digest: transaction.installer_plan_digest.clone(),
-        original_plan: plan.clone(),
-        original_progress: progress.clone(),
-    }, &transaction.candidate_manifest.runtime_launch.runtime_state_roots.installation_root,
-        transaction.profile, true)
+    read_owned_root_record(
+        port,
+        &InstallationManagedRootEffectProof {
+            owner_transaction_id: transaction.transaction_id.clone(),
+            installer_plan_digest: transaction.installer_plan_digest.clone(),
+            original_plan: plan.clone(),
+            original_progress: progress.clone(),
+        },
+        &transaction
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .installation_root,
+        transaction.profile,
+        true,
+    )
 }
 
 pub(super) fn read_owned_root_proof(
@@ -212,6 +245,10 @@ pub(super) fn read_owned_root_proof(
     read_owned_root_record(port, proof, installation_root, profile, false)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact root proof, filesystem observation and owner revision form one read-only evidence join"
+)]
 fn read_owned_root_record(
     port: &WindowsInstallationEffectPort,
     proof: &InstallationManagedRootEffectProof,
@@ -232,10 +269,13 @@ fn read_owned_root_record(
         evidence,
         postcondition_digest,
         ..
-    } = &progress.state else {
+    } = &progress.state
+    else {
         return Err(InstallationError::IdentityConflict);
     };
-    let ownership = progress.ownership_secret.as_ref()
+    let ownership = progress
+        .ownership_secret
+        .as_ref()
         .ok_or(InstallationError::IdentityConflict)?;
     ownership.validate()?;
     if progress.effect_id != *proof.original_plan.effect_id()
@@ -253,8 +293,10 @@ fn read_owned_root_record(
     let installation_root = PathBuf::from(installation_root.as_str());
     let spec = InstallerRootPrimitiveSpec {
         root: PathBuf::from(root.as_str()),
-        profile_anchor: installation_root.parent()
-            .ok_or(InstallationError::IdentityConflict)?.to_path_buf(),
+        profile_anchor: installation_root
+            .parent()
+            .ok_or(InstallationError::IdentityConflict)?
+            .to_path_buf(),
         installation_root,
         profile: match profile {
             InstallationProfile::PortableDev => InstallerRootProfile::PortableDev,
@@ -263,24 +305,38 @@ fn read_owned_root_record(
         },
     };
     let InstallerRootPrimitiveObservation::Matching(observed) =
-        port.primitive.inspect(&spec).map_err(platform_error)? else {
-            return Err(InstallationError::IdentityConflict);
-        };
-    let marker_name = sha256_hex(format!("{}\0{}\0{}",
-        proof.owner_transaction_id.as_str(), proof.original_plan.effect_id().as_str(),
-        proof.installer_plan_digest.as_str()).as_bytes());
-    let marker = port.primitive.read_protected_file(
-        &spec, &spec.root.join(format!(".eliot-install-{marker_name}.receipt")),
-        super::RECEIPT_LIMIT,
-    ).map_err(platform_error)?;
-    let receipt: WindowsRootOwnershipReceipt = serde_json::from_slice(&marker.bytes)
-        .map_err(|_| InstallationError::IdentityConflict)?;
+        port.primitive.inspect(&spec).map_err(platform_error)?
+    else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    let marker_name = sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            proof.owner_transaction_id.as_str(),
+            proof.original_plan.effect_id().as_str(),
+            proof.installer_plan_digest.as_str()
+        )
+        .as_bytes(),
+    );
+    let marker = port
+        .primitive
+        .read_protected_file(
+            &spec,
+            &spec
+                .root
+                .join(format!(".eliot-install-{marker_name}.receipt")),
+            super::RECEIPT_LIMIT,
+        )
+        .map_err(platform_error)?;
+    let receipt: WindowsRootOwnershipReceipt =
+        serde_json::from_slice(&marker.bytes).map_err(|_| InstallationError::IdentityConflict)?;
     if receipt.version != super::OWNERSHIP_RECEIPT_VERSION
         || receipt.transaction_id != proof.owner_transaction_id.as_str()
         || receipt.effect_id != proof.original_plan.effect_id().as_str()
         || receipt.plan_digest != proof.installer_plan_digest.as_str()
         || receipt.secret_reference != ownership.reference.target.as_str()
-        || receipt.root != observed || receipt.marker != marker.object
+        || receipt.root != observed
+        || receipt.marker != marker.object
         || receipt.external_identity().map_err(platform_error)? != *external_identity
     {
         return Err(InstallationError::IdentityConflict);
@@ -291,19 +347,31 @@ fn read_owned_root_record(
     // The marker, native identities and both ORIGINAL recorded digests must
     // still match. Caller-carried managed proofs cannot take this exception.
     if ownership.lifecycle == InstallationSecretLifecycle::Active {
-        let secret = port.read_ownership_secret(&ownership.reference.target).map_err(platform_error)?;
+        let secret = port
+            .read_ownership_secret(&ownership.reference.target)
+            .map_err(platform_error)?;
         let payload = receipt.mac_payload().map_err(platform_error)?;
-        if !constant_time_equal(receipt.mac.as_bytes(),
-            hmac_sha256_hex(secret.expose(), &payload).as_bytes()) {
+        if !constant_time_equal(
+            receipt.mac.as_bytes(),
+            hmac_sha256_hex(secret.expose(), &payload).as_bytes(),
+        ) {
             return Err(InstallationError::IdentityConflict);
         }
     }
     let InstallationEffectObservation::Matching {
-        evidence: observed_evidence, postcondition_digest: observed_postcondition, ..
+        evidence: observed_evidence,
+        postcondition_digest: observed_postcondition,
+        ..
     } = super::matching_created_for_binding(
-        proof.original_plan.effect_id(), &proof.installer_plan_digest,
-        &observed, &marker.object, &receipt, external_identity.clone(),
-    ).map_err(platform_error)? else {
+        proof.original_plan.effect_id(),
+        &proof.installer_plan_digest,
+        &observed,
+        &marker.object,
+        &receipt,
+        external_identity.clone(),
+    )
+    .map_err(platform_error)?
+    else {
         return Err(InstallationError::IdentityConflict);
     };
     if observed_evidence != *evidence || observed_postcondition != *postcondition_digest {
@@ -313,8 +381,10 @@ fn read_owned_root_record(
 }
 
 fn snapshot_identity(snapshot: &InstallerRootObjectSnapshot) -> FileIdentity {
-    FileIdentity { volume_serial_number: snapshot.volume_serial_number,
-        file_index: snapshot.file_index }
+    FileIdentity {
+        volume_serial_number: snapshot.volume_serial_number,
+        file_index: snapshot.file_index,
+    }
 }
 
 pub(super) fn managed_root_effects(
@@ -322,39 +392,72 @@ pub(super) fn managed_root_effects(
     plan: &InstallerEffectPlan,
 ) -> Result<Vec<InstallationManagedRootEffectProof>, InstallationError> {
     let InstallerEffectPlan::ManagedEnvironmentChange {
-        managed_tools_root, request, recipe, prior_root_effects, ..
-    } = plan else { return Ok(Vec::new()); };
+        managed_tools_root,
+        request,
+        recipe,
+        prior_root_effects,
+        ..
+    } = plan
+    else {
+        return Ok(Vec::new());
+    };
     if !super::managed_change_execution::managed_operation_requires_destination_parent(
         recipe.operation,
-    ) { return Ok(Vec::new()); }
+    ) {
+        return Ok(Vec::new());
+    }
     let family = Path::new(managed_tools_root.as_str()).join(request.target_family.as_str());
     let mut result = Vec::new();
     for path in [PathBuf::from(managed_tools_root.as_str()), family] {
-        let root = PlatformHandle::new(path.to_string_lossy().into_owned())?;
-        let current = transaction.installer_effects.iter().zip(&transaction.effect_progress)
-            .find(|(effect, _)| matches!(effect,
+        let root =
+            PlatformHandle::new(path.to_string_lossy().into_owned()).map_err(platform_error)?;
+        let current = transaction
+            .installer_effects
+            .iter()
+            .zip(&transaction.effect_progress)
+            .find(|(effect, _)| {
+                matches!(effect,
                 InstallerEffectPlan::CreateRoot { root: candidate, .. }
-                    if candidate == &root));
+                    if candidate == &root)
+            });
         let proof = match current {
-            Some((original_plan, original_progress)) if matches!(
-                original_progress.state, InstallationEffectProgressState::Applied {
-                    disposition: InstallationEffectDisposition::CreatedByTransaction, ..
-                }) => InstallationManagedRootEffectProof {
+            Some((original_plan, original_progress))
+                if matches!(
+                    original_progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                ) =>
+            {
+                InstallationManagedRootEffectProof {
                     owner_transaction_id: transaction.transaction_id.clone(),
                     installer_plan_digest: transaction.installer_plan_digest.clone(),
                     original_plan: original_plan.clone(),
                     original_progress: original_progress.clone(),
-                },
-            Some((_, progress)) if !matches!(progress.state,
-                InstallationEffectProgressState::Applied {
-                    disposition: InstallationEffectDisposition::PreexistingMatching, ..
-                }) => return Err(InstallationError::IdentityConflict),
+                }
+            }
+            Some((_, progress))
+                if !matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::PreexistingMatching,
+                        ..
+                    }
+                ) =>
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
             _ => {
-                let mut owners = prior_root_effects.iter().filter(|proof| matches!(
+                let mut owners = prior_root_effects.iter().filter(|proof| {
+                    matches!(
                     &proof.original_plan, InstallerEffectPlan::CreateRoot { root: candidate, .. }
-                        if candidate == &root));
+                        if candidate == &root)
+                });
                 let owner = owners.next().ok_or(InstallationError::IdentityConflict)?;
-                if owners.next().is_some() { return Err(InstallationError::IdentityConflict); }
+                if owners.next().is_some() {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 owner.clone()
             }
         };
@@ -368,25 +471,39 @@ pub(super) fn validate_managed_root_effects(
     request: &super::InstallationEffectRequest,
 ) -> Result<(), InstallationError> {
     let InstallerEffectPlan::ManagedEnvironmentChange {
-        managed_tools_root, request: change, recipe, ..
-    } = &request.plan else {
-        return if request.managed_root_effects.is_empty() { Ok(()) }
-            else { Err(InstallationError::IdentityConflict) };
+        managed_tools_root,
+        request: change,
+        recipe,
+        ..
+    } = &request.plan
+    else {
+        return if request.managed_root_effects.is_empty() {
+            Ok(())
+        } else {
+            Err(InstallationError::IdentityConflict)
+        };
     };
     if !super::managed_change_execution::managed_operation_requires_destination_parent(
         recipe.operation,
     ) {
-        return if request.managed_root_effects.is_empty() { Ok(()) }
-            else { Err(InstallationError::IdentityConflict) };
+        return if request.managed_root_effects.is_empty() {
+            Ok(())
+        } else {
+            Err(InstallationError::IdentityConflict)
+        };
     }
     if request.managed_root_effects.len() != 2 {
         return Err(InstallationError::IdentityConflict);
     }
     let family = Path::new(managed_tools_root.as_str()).join(change.target_family.as_str());
-    for (proof, root) in request.managed_root_effects.iter().zip([
-        PathBuf::from(managed_tools_root.as_str()), family,
-    ]) {
-        proof.validate(&PlatformHandle::new(root.to_string_lossy().into_owned())?)?;
+    for (proof, root) in request
+        .managed_root_effects
+        .iter()
+        .zip([PathBuf::from(managed_tools_root.as_str()), family])
+    {
+        let root =
+            PlatformHandle::new(root.to_string_lossy().into_owned()).map_err(platform_error)?;
+        proof.validate(&root)?;
     }
     Ok(())
 }
@@ -399,9 +516,9 @@ pub(super) fn managed_destination_parent_identity(
         .map_err(|_| eliot_platform::PortError::InvalidRequestMetadata)?;
     let mut parent = None;
     for proof in &request.managed_root_effects {
-        let observed = read_owned_root_proof(
-            port, proof, &request.installation_root, request.profile,
-        ).map_err(|_| eliot_platform::PortError::InvalidRequestMetadata)?;
+        let observed =
+            read_owned_root_proof(port, proof, &request.installation_root, request.profile)
+                .map_err(|_| eliot_platform::PortError::InvalidRequestMetadata)?;
         parent = Some(snapshot_identity(&observed));
     }
     Ok(parent)

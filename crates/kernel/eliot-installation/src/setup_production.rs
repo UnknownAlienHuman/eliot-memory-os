@@ -4,8 +4,8 @@
 //! setup-effect intent table. It never chooses a replacement transaction,
 //! infers owner identity from a path, or substitutes a caller Boolean for an
 //! effect readback. Every profile's key material is prepared once and its
-//! exact public receipt is committed to the ServiceKeysGenerated intent before
-//! provider effects. SystemService also commits the native slot identity after
+//! exact public receipt is committed to the `ServiceKeysGenerated` intent before
+//! provider effects. `SystemService` also commits the native slot identity after
 //! create-only reservation and before writing private key bytes. A restart
 //! reopens only the exact retained receipt and never regenerates a missing key.
 
@@ -39,7 +39,7 @@ pub enum SetupProductionError {
 }
 
 /// Verifies that the key reference retained in the setup binding is exactly
-/// the profile-specific receipt stored in the original ServiceKeysGenerated
+/// the profile-specific receipt stored in the original `ServiceKeysGenerated`
 /// intent. Callers still reopen the key through the provider, which performs
 /// current-principal, path, ACL and key-material readback.
 pub(crate) fn validate_original_setup_key_readback(
@@ -84,7 +84,8 @@ pub(crate) fn validate_original_setup_key_readback(
             }
             let typed = eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_setup_target_ref(
                 &retained.target_ref,
-            )?
+            )
+            .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?
             .ok_or(SetupProductionError::Refused(
                 "the original SystemService key does not carry the initial-snapshot purpose",
             ))?;
@@ -130,13 +131,7 @@ pub fn prepare_deterministic_setup_for_initial_snapshot(
         .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     let mut binding = match store.load_setup_binding(transaction_id)? {
         Some(binding) => {
-            validate_existing_binding(
-                store,
-                &transaction,
-                transaction_id,
-                &binding,
-                &current_sid,
-            )?;
+            validate_existing_binding(store, &transaction, transaction_id, &binding, &current_sid)?;
             binding
         }
         None => create_identity_binding(store, &transaction, transaction_id, &current_sid)?,
@@ -151,7 +146,13 @@ pub fn prepare_deterministic_setup_for_initial_snapshot(
     )?;
     ensure_service_key(store, &transaction, &mut binding, &current_sid)?;
     ensure_acl_readback(store, &transaction, &mut binding, &current_sid)?;
-    ensure_privacy_choice(store, &transaction, &mut binding, &current_sid, privacy_choice)?;
+    ensure_privacy_choice(
+        store,
+        &transaction,
+        &mut binding,
+        &current_sid,
+        privacy_choice,
+    )?;
     ensure_storage_verified(store, &transaction, &mut binding)?;
     Ok(binding)
 }
@@ -163,9 +164,18 @@ fn validate_confirmation(
 ) -> Result<(), SetupProductionError> {
     if transaction.transaction_id != *transaction_id
         || transaction.installation_epoch.installation.as_str() != confirmed_installation_id
-        || transaction.candidate_manifest.runtime_launch.installation_epoch.installation
+        || transaction
+            .candidate_manifest
+            .runtime_launch
+            .installation_epoch
+            .installation
             != transaction.installation_epoch.installation
-        || transaction.request.required_owner.as_str().trim().is_empty()
+        || transaction
+            .request
+            .required_owner
+            .as_str()
+            .trim()
+            .is_empty()
     {
         return Err(SetupProductionError::Refused(
             "the explicit installation confirmation does not match the original transaction",
@@ -183,9 +193,13 @@ fn validate_existing_binding(
     current_sid: &PlatformHandle,
 ) -> Result<(), SetupProductionError> {
     binding.validate()?;
-    let roots = transaction.profile_governed_roots.as_ref().ok_or(
-        SetupProductionError::Refused("the transaction has no retained profile-root binding"),
-    )?;
+    let roots =
+        transaction
+            .profile_governed_roots
+            .as_ref()
+            .ok_or(SetupProductionError::Refused(
+                "the transaction has no retained profile-root binding",
+            ))?;
     if binding.transaction_id != *transaction_id
         || binding.installation_id != transaction.installation_epoch.installation
         || binding.profile != transaction.profile
@@ -242,12 +256,20 @@ fn create_identity_binding(
     transaction_id: &PlatformHandle,
     current_sid: &PlatformHandle,
 ) -> Result<SetupBinding, SetupProductionError> {
-    let roots = transaction.profile_governed_roots.as_ref().ok_or(
-        SetupProductionError::Refused("the transaction has no retained profile-root binding"),
-    )?;
+    let roots =
+        transaction
+            .profile_governed_roots
+            .as_ref()
+            .ok_or(SetupProductionError::Refused(
+                "the transaction has no retained profile-root binding",
+            ))?;
     let installation_id = transaction.installation_epoch.installation.clone();
     let confirmed_owner = transaction.request.required_owner.clone();
-    let evidence_refs = vec![transaction_id.clone(), installation_id.clone(), current_sid.clone()];
+    let evidence_refs = vec![
+        transaction_id.clone(),
+        installation_id.clone(),
+        current_sid.clone(),
+    ];
     let facts = (
         transaction_id.as_str(),
         installation_id.as_str(),
@@ -272,11 +294,12 @@ fn create_identity_binding(
         evidence_refs,
     )?;
     store.create_setup_binding(&binding)?;
-    let retained = store
-        .load_setup_binding(transaction_id)?
-        .ok_or(SetupProductionError::Refused(
-            "the original identity-confirmation binding was not read back",
-        ))?;
+    let retained =
+        store
+            .load_setup_binding(transaction_id)?
+            .ok_or(SetupProductionError::Refused(
+                "the original identity-confirmation binding was not read back",
+            ))?;
     if retained != binding {
         return Err(SetupProductionError::Refused(
             "the original identity-confirmation binding differs on readback",
@@ -385,24 +408,15 @@ fn ensure_service_key(
     }
 
     let setup_key = match transaction.profile {
-        InstallationProfile::PortableDev => prepare_or_reconcile_portable_dev_key(
-            store,
-            transaction,
-            binding,
-            current_sid,
-        )?,
-        InstallationProfile::UserMode => prepare_or_reconcile_user_mode_key(
-            store,
-            transaction,
-            binding,
-            current_sid,
-        )?,
-        InstallationProfile::SystemService => prepare_or_reconcile_system_service_key(
-            store,
-            transaction,
-            binding,
-            current_sid,
-        )?,
+        InstallationProfile::PortableDev => {
+            prepare_or_reconcile_portable_dev_key(store, transaction, binding, current_sid)?
+        }
+        InstallationProfile::UserMode => {
+            prepare_or_reconcile_user_mode_key(store, transaction, binding, current_sid)?
+        }
+        InstallationProfile::SystemService => {
+            prepare_or_reconcile_system_service_key(store, transaction, binding, current_sid)?
+        }
     };
     let evidence_refs = vec![
         setup_key.key_id.clone(),
@@ -411,9 +425,9 @@ fn ensure_service_key(
     ];
     let facts = (
         transaction.transaction_id.as_str(),
-        setup_key.key_id.as_str(),
-        setup_key.target_ref.as_str(),
-        setup_key.principal_sid.as_str(),
+        setup_key.key_id.clone(),
+        setup_key.target_ref.clone(),
+        setup_key.principal_sid.clone(),
     );
     advance_after_recorded_intent(
         store,
@@ -426,6 +440,10 @@ fn ensure_service_key(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "original PortableDev key preparation and restart reconciliation share one durable intent boundary"
+)]
 fn prepare_or_reconcile_portable_dev_key(
     store: &mut RedbInstallationTransactionStore,
     transaction: &InstallationTransaction,
@@ -440,7 +458,10 @@ fn prepare_or_reconcile_portable_dev_key(
     };
 
     let provider = WindowsPortableDevSupervisionAuthorityKeyProvider::new();
-    let roots = &transaction.candidate_manifest.runtime_launch.runtime_state_roots;
+    let roots = &transaction
+        .candidate_manifest
+        .runtime_launch
+        .runtime_state_roots;
     if roots.profile != InstallationProfile::PortableDev {
         return Err(SetupProductionError::Refused(
             "PortableDev key provisioning requires the exact PortableDev runtime roots",
@@ -463,8 +484,16 @@ fn prepare_or_reconcile_portable_dev_key(
     let request = Request {
         transaction_id: transaction.transaction_id.as_str().to_owned(),
         effect_id: milestone_effect_id().to_owned(),
-        installation_id: transaction.installation_epoch.installation.as_str().to_owned(),
-        candidate_generation: transaction.candidate_manifest.generation.as_str().to_owned(),
+        installation_id: transaction
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned(),
+        candidate_generation: transaction
+            .candidate_manifest
+            .generation
+            .as_str()
+            .to_owned(),
         authority_generation: runtime.authority_generation,
         supervision_lease_scope_id: runtime.supervision_lease_scope_id().to_owned(),
         signer_id: binding.confirmed_owner.as_str().to_owned(),
@@ -484,6 +513,9 @@ fn prepare_or_reconcile_portable_dev_key(
             Ok(Observation::Matching { receipt: observed }) if observed == receipt => {
                 setup_key_reference_from_portable(receipt, binding, current_sid)
             }
+            Ok(Observation::Matching { .. }) => Err(SetupProductionError::Refused(
+                "the original PortableDev key receipt readback differs from the retained receipt",
+            )),
             Ok(Observation::Absent { .. } | Observation::Mismatch { .. }) | Err(_) => {
                 Err(SetupProductionError::Refused(
                     "the original PortableDev key receipt has no matching key; recovery must inspect that exact intent and may not rotate it",
@@ -492,7 +524,10 @@ fn prepare_or_reconcile_portable_dev_key(
         };
     }
     if store
-        .load_setup_effect_intent(&transaction.transaction_id, SetupMilestone::ServiceKeysGenerated)?
+        .load_setup_effect_intent(
+            &transaction.transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+        )?
         .is_some()
     {
         return Err(SetupProductionError::Refused(
@@ -520,6 +555,9 @@ fn prepare_or_reconcile_portable_dev_key(
         Ok(Observation::Matching { receipt: observed }) if observed == receipt => {
             setup_key_reference_from_portable(receipt, binding, current_sid)
         }
+        Ok(Observation::Matching { .. }) => Err(SetupProductionError::Refused(
+            "PortableDev setup-key readback differs from its original durable intent",
+        )),
         Ok(Observation::Absent { .. } | Observation::Mismatch { .. }) | Err(_) => {
             Err(SetupProductionError::Refused(
                 "PortableDev setup-key write is unresolved under its original receipt; do not generate a replacement",
@@ -546,15 +584,25 @@ fn prepare_or_reconcile_user_mode_key(
     let request = Request {
         transaction_id: transaction.transaction_id.as_str().to_owned(),
         effect_id: milestone_effect_id().to_owned(),
-        installation_id: transaction.installation_epoch.installation.as_str().to_owned(),
-        candidate_generation: transaction.candidate_manifest.generation.as_str().to_owned(),
+        installation_id: transaction
+            .installation_epoch
+            .installation
+            .as_str()
+            .to_owned(),
+        candidate_generation: transaction
+            .candidate_manifest
+            .generation
+            .as_str()
+            .to_owned(),
         authority_generation: runtime.authority_generation,
         supervision_lease_scope_id: runtime.supervision_lease_scope_id().to_owned(),
         signer_id: binding.confirmed_owner.as_str().to_owned(),
         key_id: transaction.transaction_id.as_str().to_owned(),
         owner_sid: current_sid.as_str().to_owned(),
     };
-    if let Some(receipt) = store.load_setup_user_mode_signing_key_intent(&transaction.transaction_id)? {
+    if let Some(receipt) =
+        store.load_setup_user_mode_signing_key_intent(&transaction.transaction_id)?
+    {
         if receipt.request != request {
             return Err(SetupProductionError::Refused(
                 "the original UserMode key receipt differs from the current transaction or principal",
@@ -564,6 +612,9 @@ fn prepare_or_reconcile_user_mode_key(
             Ok(Observation::Matching { receipt: observed }) if *observed == receipt => {
                 setup_key_reference_from_user_mode(receipt, binding, current_sid)
             }
+            Ok(Observation::Matching { .. }) => Err(SetupProductionError::Refused(
+                "the original UserMode key receipt readback differs from the retained receipt",
+            )),
             Ok(Observation::Absent { .. } | Observation::Mismatch { .. }) | Err(_) => {
                 Err(SetupProductionError::Refused(
                     "the original UserMode key receipt has no matching credential; recovery may not rotate it",
@@ -572,7 +623,10 @@ fn prepare_or_reconcile_user_mode_key(
         };
     }
     if store
-        .load_setup_effect_intent(&transaction.transaction_id, SetupMilestone::ServiceKeysGenerated)?
+        .load_setup_effect_intent(
+            &transaction.transaction_id,
+            SetupMilestone::ServiceKeysGenerated,
+        )?
         .is_some()
     {
         return Err(SetupProductionError::Refused(
@@ -600,6 +654,9 @@ fn prepare_or_reconcile_user_mode_key(
         Ok(Observation::Matching { receipt: observed }) if *observed == receipt => {
             setup_key_reference_from_user_mode(receipt, binding, current_sid)
         }
+        Ok(Observation::Matching { .. }) => Err(SetupProductionError::Refused(
+            "UserMode setup-key readback differs from its original durable intent",
+        )),
         Ok(Observation::Absent { .. } | Observation::Mismatch { .. }) | Err(_) => {
             Err(SetupProductionError::Refused(
                 "UserMode setup-key write is unresolved under its original receipt; do not generate a replacement",
@@ -608,6 +665,10 @@ fn prepare_or_reconcile_user_mode_key(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "SystemService reservation, intent, write and exact readback must remain one ordered owner transition"
+)]
 fn prepare_or_reconcile_system_service_key(
     store: &mut RedbInstallationTransactionStore,
     transaction: &InstallationTransaction,
@@ -616,11 +677,9 @@ fn prepare_or_reconcile_system_service_key(
 ) -> Result<SetupKeyReference, SetupProductionError> {
     use eliot_platform_windows::WindowsInstallationAuthorityKeyStore;
 
-    let key_root = selected_profile_key_root(transaction)?.ok_or(
-        SetupProductionError::Refused(
-            "the SystemService setup key has no transaction-selected protected root",
-        ),
-    )?;
+    let key_root = selected_profile_key_root(transaction)?.ok_or(SetupProductionError::Refused(
+        "the SystemService setup key has no transaction-selected protected root",
+    ))?;
     let key_store = WindowsInstallationAuthorityKeyStore::new(&key_root)
         .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     let key_root_identity = key_store
@@ -628,9 +687,9 @@ fn prepare_or_reconcile_system_service_key(
         .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     let transaction_key_id = transaction.transaction_id.as_str();
 
-    if let Some(intent) = store.load_setup_system_service_signing_key_intent(
-        &transaction.transaction_id,
-    )? {
+    if let Some(intent) =
+        store.load_setup_system_service_signing_key_intent(&transaction.transaction_id)?
+    {
         if intent.installation_id != transaction.installation_epoch.installation
             || intent.confirmed_owner != binding.confirmed_owner
             || intent.authorized_principal_sid != *current_sid
@@ -649,26 +708,22 @@ fn prepare_or_reconcile_system_service_key(
         let signer = key_store
             .open_prepared_receipt(&intent.receipt)
             .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
-        let slot_identity = intent.receipt.slot_file_identity.ok_or(
-            SetupProductionError::Refused(
-                "the original SystemService key intent lost its native slot identity",
-            ),
-        )?;
+        let slot_identity =
+            intent
+                .receipt
+                .slot_file_identity
+                .ok_or(SetupProductionError::Refused(
+                    "the original SystemService key intent lost its native slot identity",
+                ))?;
         if signer.metadata().key_id != intent.receipt.key_id
-            || signer.metadata().public_key_fingerprint
-                != intent.receipt.public_key_fingerprint
+            || signer.metadata().public_key_fingerprint != intent.receipt.public_key_fingerprint
             || signer.metadata().file_identity != slot_identity
         {
             return Err(SetupProductionError::Refused(
                 "the original SystemService keyslot metadata does not match its durable preparation receipt",
             ));
         }
-        return setup_key_reference_from_system_service(
-            &signer,
-            transaction,
-            binding,
-            current_sid,
-        );
+        return setup_key_reference_from_system_service(&signer, transaction, binding, current_sid);
     }
 
     if store
@@ -747,7 +802,12 @@ fn setup_key_reference_from_system_service(
         )
         .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     Ok(SetupKeyReference {
-        key_id: PlatformHandle::new(reference.key_id())?,
+        key_id: PlatformHandle::new(reference.key_id()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "setup_key.key_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?,
         target_ref: reference
             .target_ref()
             .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?,
@@ -762,16 +822,18 @@ fn setup_key_reference_from_portable(
     binding: &SetupBinding,
     current_sid: &PlatformHandle,
 ) -> Result<SetupKeyReference, SetupProductionError> {
-    let reference = eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_portable_dev_receipt(
-        receipt,
-        binding.transaction_id.as_str().to_owned(),
-        binding.installation_id.as_str().to_owned(),
-        binding.confirmed_owner.as_str().to_owned(),
-        current_sid.as_str().to_owned(),
-    )
-    .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
+    let reference =
+        eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_portable_dev_receipt(
+            receipt,
+            binding.transaction_id.as_str().to_owned(),
+            binding.installation_id.as_str().to_owned(),
+            binding.confirmed_owner.as_str().to_owned(),
+            current_sid.as_str().to_owned(),
+        )
+        .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     Ok(SetupKeyReference {
-        key_id: PlatformHandle::new(reference.key_id())?,
+        key_id: PlatformHandle::new(reference.key_id())
+            .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?,
         target_ref: reference
             .target_ref()
             .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?,
@@ -784,16 +846,18 @@ fn setup_key_reference_from_user_mode(
     binding: &SetupBinding,
     current_sid: &PlatformHandle,
 ) -> Result<SetupKeyReference, SetupProductionError> {
-    let reference = eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_user_mode_receipt(
-        receipt,
-        binding.transaction_id.as_str().to_owned(),
-        binding.installation_id.as_str().to_owned(),
-        binding.confirmed_owner.as_str().to_owned(),
-        current_sid.as_str().to_owned(),
-    )
-    .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
+    let reference =
+        eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_user_mode_receipt(
+            receipt,
+            binding.transaction_id.as_str().to_owned(),
+            binding.installation_id.as_str().to_owned(),
+            binding.confirmed_owner.as_str().to_owned(),
+            current_sid.as_str().to_owned(),
+        )
+        .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
     Ok(SetupKeyReference {
-        key_id: PlatformHandle::new(reference.key_id())?,
+        key_id: PlatformHandle::new(reference.key_id())
+            .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?,
         target_ref: reference
             .target_ref()
             .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?,
@@ -808,9 +872,12 @@ fn setup_key_reference(binding: &SetupBinding) -> Result<SetupKeyReference, Setu
         )
         .is_ok_and(|reference| reference.is_some())
     });
-    let reference = matches.next().cloned().ok_or(SetupProductionError::Refused(
-        "the exact purpose-bound setup signing-key reference is absent",
-    ))?;
+    let reference = matches
+        .next()
+        .cloned()
+        .ok_or(SetupProductionError::Refused(
+            "the exact purpose-bound setup signing-key reference is absent",
+        ))?;
     if matches.next().is_some() {
         return Err(SetupProductionError::Refused(
             "more than one purpose-bound setup signing-key reference is retained",
@@ -825,12 +892,14 @@ fn reopen_setup_key(
     reference: &SetupKeyReference,
 ) -> Result<(), SetupProductionError> {
     let profile = installer_root_profile(transaction.profile);
-    let typed = eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_setup_target_ref(
-        &reference.target_ref,
-    )?
-    .ok_or(SetupProductionError::Refused(
-        "the retained setup key target has no initial-snapshot purpose reference",
-    ))?;
+    let typed =
+        eliot_platform_windows::SetupOwnerInitialSnapshotKeyReference::from_setup_target_ref(
+            &reference.target_ref,
+        )
+        .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?
+        .ok_or(SetupProductionError::Refused(
+            "the retained setup key target has no initial-snapshot purpose reference",
+        ))?;
     if !typed.belongs_to_profile(profile) {
         return Err(SetupProductionError::Refused(
             "the retained setup key target belongs to a different selected profile",
@@ -923,17 +992,27 @@ fn observe_profile_roots(
         WindowsInstallerRootPrimitive,
     };
 
-    let selected = transaction.profile_governed_roots.as_ref().ok_or(
-        SetupProductionError::Refused("the transaction has no retained profile-root binding"),
-    )?;
-    let runtime = &transaction.candidate_manifest.runtime_launch.runtime_state_roots;
+    let selected =
+        transaction
+            .profile_governed_roots
+            .as_ref()
+            .ok_or(SetupProductionError::Refused(
+                "the transaction has no retained profile-root binding",
+            ))?;
+    let runtime = &transaction
+        .candidate_manifest
+        .runtime_launch
+        .runtime_state_roots;
     let profile = installer_root_profile(transaction.profile);
     let mut declarations = vec![
         (
             "immutable_binaries",
             PathBuf::from(selected.immutable_binaries.as_str()),
         ),
-        ("durable_data", PathBuf::from(selected.durable_data.as_str())),
+        (
+            "durable_data",
+            PathBuf::from(selected.durable_data.as_str()),
+        ),
         ("user_config", PathBuf::from(selected.user_config.as_str())),
         ("user_cache", PathBuf::from(selected.user_cache.as_str())),
     ];
@@ -1123,11 +1202,14 @@ fn ensure_storage_verified(
 
 fn read_committed_activation_receipt(
     transaction: &InstallationTransaction,
-) -> Result<(crate::ActivationCommitReceipt, eliot_platform_windows::FileIdentity), SetupProductionError>
-{
-    use crate::{
-        InstallationProfile, ProtectedRootLease, RedbInstallationRegistry,
-    };
+) -> Result<
+    (
+        crate::ActivationCommitReceipt,
+        eliot_platform_windows::FileIdentity,
+    ),
+    SetupProductionError,
+> {
+    use crate::{InstallationProfile, ProtectedRootLease, RedbInstallationRegistry};
 
     let host_state_root = Path::new(
         transaction
@@ -1143,9 +1225,7 @@ fn read_committed_activation_receipt(
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
             let identity = root.identity();
             let registry = RedbInstallationRegistry::open_existing_at(root)?.ok_or(
-                SetupProductionError::Refused(
-                    "the original SystemService Host registry is absent",
-                ),
+                SetupProductionError::Refused("the original SystemService Host registry is absent"),
             )?;
             let receipt = registry.read_committed_activation_receipt(
                 &transaction.transaction_id,
@@ -1165,22 +1245,21 @@ fn read_committed_activation_receipt(
         InstallationProfile::UserMode | InstallationProfile::PortableDev => {
             let root = UserOwnedRootLease::open_existing(host_state_root)
                 .map_err(|error| InstallationError::Platform(error.to_string()))?;
-            let live_sid = eliot_platform_windows::WindowsSetupOwnerInitialSnapshotKeyProvider::new()
-                .current_principal_sid()
-                .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
+            let live_sid =
+                eliot_platform_windows::WindowsSetupOwnerInitialSnapshotKeyProvider::new()
+                    .current_principal_sid()
+                    .map_err(|error| SetupProductionError::SigningKey(error.to_string()))?;
             if root.current_user_sid() != live_sid.as_str() {
                 return Err(SetupProductionError::Refused(
                     "the current-user Host root does not belong to the authenticated setup principal",
                 ));
             }
             let identity = root.identity();
-            let registry = RedbInstallationRegistry::open_existing_user_owned_at(
-                root,
-                transaction.profile,
-            )?
-            .ok_or(SetupProductionError::Refused(
-                "the original current-user Host registry is absent",
-            ))?;
+            let registry =
+                RedbInstallationRegistry::open_existing_user_owned_at(root, transaction.profile)?
+                    .ok_or(SetupProductionError::Refused(
+                    "the original current-user Host registry is absent",
+                ))?;
             let receipt = registry.read_committed_activation_receipt(
                 &transaction.transaction_id,
                 &transaction.installer_plan_digest,
@@ -1198,11 +1277,13 @@ fn read_committed_activation_receipt(
         }
     };
     receipt.validate_against_transaction(transaction)?;
-    let retained = transaction.active_verified_receipt.as_ref().ok_or(
-        SetupProductionError::Refused(
-            "the original transaction has no retained ActiveVerified receipt binding",
-        ),
-    )?;
+    let retained =
+        transaction
+            .active_verified_receipt
+            .as_ref()
+            .ok_or(SetupProductionError::Refused(
+                "the original transaction has no retained ActiveVerified receipt binding",
+            ))?;
     retained.validate_against_transaction(transaction)?;
     if !retained.matches_receipt(&receipt) {
         return Err(SetupProductionError::Refused(
@@ -1222,7 +1303,15 @@ fn advance_with_intent<T: Serialize>(
 ) -> Result<(), SetupProductionError> {
     let intent_digest = digest_handle(&format!("{domain}.intent"), facts)?;
     store.record_setup_effect_intent(&binding.transaction_id, milestone, &intent_digest)?;
-    advance_after_intent(store, binding, milestone, evidence_refs, domain, facts, Vec::new())
+    advance_after_intent(
+        store,
+        binding,
+        milestone,
+        evidence_refs,
+        domain,
+        facts,
+        Vec::new(),
+    )
 }
 
 fn advance_after_recorded_intent<T: Serialize>(
@@ -1234,7 +1323,15 @@ fn advance_after_recorded_intent<T: Serialize>(
     facts: &T,
     key_references: Vec<SetupKeyReference>,
 ) -> Result<(), SetupProductionError> {
-    advance_after_intent(store, binding, milestone, evidence_refs, domain, facts, key_references)
+    advance_after_intent(
+        store,
+        binding,
+        milestone,
+        evidence_refs,
+        domain,
+        facts,
+        key_references,
+    )
 }
 
 fn advance_after_intent<T: Serialize>(
@@ -1265,11 +1362,12 @@ fn save_and_readback(
     binding: &mut SetupBinding,
 ) -> Result<(), SetupProductionError> {
     store.compare_and_save_setup_binding(expected_revision, next)?;
-    let retained = store
-        .load_setup_binding(&next.transaction_id)?
-        .ok_or(SetupProductionError::Refused(
-            "the setup milestone result was not present on mandatory readback",
-        ))?;
+    let retained =
+        store
+            .load_setup_binding(&next.transaction_id)?
+            .ok_or(SetupProductionError::Refused(
+                "the setup milestone result was not present on mandatory readback",
+            ))?;
     if retained != *next {
         return Err(SetupProductionError::Refused(
             "the setup milestone result differs from its exact original result on readback",
@@ -1287,12 +1385,9 @@ fn ensure_existing_observation<T: Serialize>(
     facts: &T,
 ) -> Result<(), SetupProductionError> {
     let expected = make_observation(milestone, evidence_refs.to_vec(), domain, facts)?;
-    let observed = binding
-        .observed_effects()
-        .get(milestone.position())
-        .ok_or(SetupProductionError::Refused(
-            "the original setup observation is absent",
-        ))?;
+    let observed = binding.observed_effects().get(milestone.position()).ok_or(
+        SetupProductionError::Refused("the original setup observation is absent"),
+    )?;
     if observed != &expected {
         return Err(SetupProductionError::Refused(
             "the current setup readback differs from the exact original milestone evidence",
@@ -1330,18 +1425,19 @@ fn make_observation<T: Serialize>(
     })
 }
 
-fn digest_handle<T: Serialize>(domain: &str, facts: &T) -> Result<PlatformHandle, SetupProductionError> {
-    let encoded = serde_json::to_vec(facts).map_err(|error| {
-        InstallationError::InvalidField {
-            field: "setup.effect_digest".to_owned(),
-            reason: error.to_string(),
-        }
+fn digest_handle<T: Serialize>(
+    domain: &str,
+    facts: &T,
+) -> Result<PlatformHandle, SetupProductionError> {
+    let encoded = serde_json::to_vec(facts).map_err(|error| InstallationError::InvalidField {
+        field: "setup.effect_digest".to_owned(),
+        reason: error.to_string(),
     })?;
     let mut bytes = Vec::with_capacity(domain.len() + 1 + encoded.len());
     bytes.extend_from_slice(domain.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(&encoded);
-    handle(&sha256_hex(&bytes))
+    Ok(handle(&sha256_hex(&bytes))?)
 }
 
 fn handle(value: &str) -> Result<PlatformHandle, InstallationError> {
@@ -1359,7 +1455,9 @@ fn milestone_effect_id() -> &'static str {
     SetupMilestone::ServiceKeysGenerated.effect_identity()
 }
 
-fn installer_root_profile(profile: InstallationProfile) -> eliot_platform_windows::InstallerRootProfile {
+fn installer_root_profile(
+    profile: InstallationProfile,
+) -> eliot_platform_windows::InstallerRootProfile {
     match profile {
         InstallationProfile::SystemService => {
             eliot_platform_windows::InstallerRootProfile::SystemService
@@ -1374,9 +1472,13 @@ fn installer_root_profile(profile: InstallationProfile) -> eliot_platform_window
 fn selected_profile_key_root(
     transaction: &InstallationTransaction,
 ) -> Result<Option<PathBuf>, SetupProductionError> {
-    let roots = transaction.profile_governed_roots.as_ref().ok_or(
-        SetupProductionError::Refused("the transaction has no retained profile-root binding"),
-    )?;
+    let roots =
+        transaction
+            .profile_governed_roots
+            .as_ref()
+            .ok_or(SetupProductionError::Refused(
+                "the transaction has no retained profile-root binding",
+            ))?;
     match transaction.profile {
         InstallationProfile::SystemService => Ok(Some(
             Path::new(roots.runtime_state_roots.profile_anchor_root.as_str())

@@ -18,21 +18,22 @@ use std::time::{Duration, Instant};
 use eliot_contracts::sha256_hex;
 use eliot_installation::SurveyProbeWorkingArea;
 use eliot_platform_windows::{
-    FileIdentity, SurveyStreamArtifact, SurveyStreamArtifactError,
-    SurveyStreamArtifactReadback, SurveyStreamArtifactRoot,
+    FileIdentity, SurveyStreamArtifact, SurveyStreamArtifactError, SurveyStreamArtifactReadback,
+    SurveyStreamArtifactRoot,
 };
 use eliot_process::{
-    DurableProcessStreamSource, DurableStreamLocatorKind, ProcessExecutionBinding,
-    ProcessRequest, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
-    ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
-    ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
-    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
-    ProcessStreamSinkFuture, ProcessStreamSinkLimits, ProcessStreamSinkOpenRequest,
+    DurableProcessStreamSource, DurableStreamLocatorKind, ProcessExecutionBinding, ProcessRequest,
+    ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
+    ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest,
     ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionId,
     ProcessStreamSinkSessionView, ProcessStreamSinkState, ProcessStreamSinkTerminal,
-    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkUnknownOutcome,
-    StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
+    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkUnknownOutcome, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamTransportStatus,
 };
+#[cfg(test)]
+use eliot_process::{ProcessStreamPrefixPreview, ProcessStreamSinkLimits};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -184,9 +185,7 @@ impl StreamSinkCore {
     ) -> Result<BlockingCall<T>, ProcessStreamSinkError>
     where
         T: Send + 'static,
-        F: FnOnce(Arc<Self>, Arc<AtomicBool>) -> Result<T, ProcessStreamSinkError>
-            + Send
-            + 'static,
+        F: FnOnce(Arc<Self>, Arc<AtomicBool>) -> Result<T, ProcessStreamSinkError> + Send + 'static,
     {
         let reservation = self.reserve_blocking_call()?;
         Ok(self.schedule_reserved(reservation, operation))
@@ -213,9 +212,7 @@ impl StreamSinkCore {
     ) -> BlockingCall<T>
     where
         T: Send + 'static,
-        F: FnOnce(Arc<Self>, Arc<AtomicBool>) -> Result<T, ProcessStreamSinkError>
-            + Send
-            + 'static,
+        F: FnOnce(Arc<Self>, Arc<AtomicBool>) -> Result<T, ProcessStreamSinkError> + Send + 'static,
     {
         let timed_out = Arc::new(AtomicBool::new(false));
         let worker_timed_out = Arc::clone(&timed_out);
@@ -235,8 +232,13 @@ impl StreamSinkCore {
         call: BlockingCall<T>,
         wait_budget_ms: u64,
     ) -> Result<T, ProcessStreamSinkError> {
-        let started = Instant::now();
-        let wait_budget = Duration::from_millis(wait_budget_ms);
+        Self::wait_bounded_until(call, Instant::now() + Duration::from_millis(wait_budget_ms)).await
+    }
+
+    async fn wait_bounded_until<T>(
+        call: BlockingCall<T>,
+        deadline: Instant,
+    ) -> Result<T, ProcessStreamSinkError> {
         let mut worker = call.worker;
         let timed_out = call.timed_out;
         let mut completion = WaitCompletionGuard {
@@ -245,10 +247,22 @@ impl StreamSinkCore {
         };
         let runtime = call.runtime;
         let _entered = runtime.enter();
-        let mut deadline = Box::pin(tokio::time::sleep(wait_budget));
+        let mut deadline_sleep = Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::from_std(deadline),
+        ));
         drop(_entered);
-        poll_fn(move |context| {
+        poll_fn(|context| {
+            if Instant::now() >= deadline {
+                timed_out.store(true, Ordering::Release);
+                completion.finished = true;
+                return Poll::Ready(Err(ProcessStreamSinkError::ProviderUnavailable));
+            }
             if let Poll::Ready(result) = Pin::new(&mut worker).poll(context) {
+                if Instant::now() >= deadline {
+                    timed_out.store(true, Ordering::Release);
+                    completion.finished = true;
+                    return Poll::Ready(Err(ProcessStreamSinkError::ProviderUnavailable));
+                }
                 let output = match result {
                     Ok(result) => result,
                     Err(_) => {
@@ -259,7 +273,7 @@ impl StreamSinkCore {
                 completion.finished = true;
                 return Poll::Ready(output);
             }
-            if started.elapsed() >= wait_budget || deadline.as_mut().poll(context).is_ready() {
+            if Instant::now() >= deadline || deadline_sleep.as_mut().poll(context).is_ready() {
                 timed_out.store(true, Ordering::Release);
                 completion.finished = true;
                 return Poll::Ready(Err(ProcessStreamSinkError::ProviderUnavailable));
@@ -343,9 +357,11 @@ impl StreamSinkCore {
                 Some(PendingTerminal::Finalize(request)) => terminal
                     .validate_against_finalize(request)
                     .map_err(|error| owner_release_error(record, &error.to_string()))?,
-                Some(PendingTerminal::Abort(request)) => terminal
-                    .validate_against_abort(request)
-                    .map_err(|error| owner_release_error(record, &error.to_string()))?,
+                Some(PendingTerminal::Abort(request)) => {
+                    terminal
+                        .validate_against_abort(request)
+                        .map_err(|error| owner_release_error(record, &error.to_string()))?
+                }
                 None => {
                     return Err(owner_release_error(
                         record,
@@ -355,12 +371,14 @@ impl StreamSinkCore {
             }
             if record.late_append.is_some()
                 && (!terminal_has_persistence_gap(&terminal)
-                    || terminal.state() != ProcessStreamSinkState::SourceUnavailable
+                    || terminal.evidence().persistence()
+                        != StreamPersistenceStatus::SourceUnavailable
+                    || terminal.state() == ProcessStreamSinkState::CompleteSource
                     || terminal.evidence().source().is_some())
             {
                 return Err(owner_release_error(
                     record,
-                    "late unacknowledged bytes lack the original source-unavailable gap terminal",
+                    "late unacknowledged bytes lack source-unavailable persistence gap evidence",
                 ));
             }
 
@@ -373,7 +391,7 @@ impl StreamSinkCore {
             let proof = record.closed_proof.as_ref().ok_or_else(|| {
                 owner_release_error(record, "terminal lacks its original close/readback proof")
             })?;
-            verify_stable_object(record, proof)
+            verify_existing_stable_object(record, proof)
                 .map_err(|error| owner_release_error(record, &error.to_string()))?;
             if record.late_append.is_some() {
                 if !matches_late_tail(record, proof) {
@@ -392,11 +410,13 @@ impl StreamSinkCore {
             }
             if record.late_append.is_some()
                 && (terminal.evidence().source().is_some()
-                    || terminal.state() != ProcessStreamSinkState::SourceUnavailable)
+                    || terminal.evidence().persistence()
+                        != StreamPersistenceStatus::SourceUnavailable
+                    || terminal.state() == ProcessStreamSinkState::CompleteSource)
             {
                 return Err(owner_release_error(
                     record,
-                    "unadmitted tail cannot produce a source-ready terminal",
+                    "unadmitted tail cannot produce a source-ready terminal state",
                 ));
             }
             match terminal.evidence().source() {
@@ -421,14 +441,8 @@ impl StreamSinkCore {
     fn prepare_open(
         &self,
         request: ProcessStreamSinkOpenRequest,
-    ) -> Result<
-        (
-            ProcessStreamSinkSession,
-            OpenAction,
-            Option<InFlightGuard>,
-        ),
-        ProcessStreamSinkError,
-    > {
+    ) -> Result<(ProcessStreamSinkSession, OpenAction, Option<InFlightGuard>), ProcessStreamSinkError>
+    {
         request.validate()?;
         self.validate_open_request(&request)?;
         let session = ProcessStreamSinkSession::from_open_request(request.clone())?;
@@ -441,10 +455,10 @@ impl StreamSinkCore {
                 return Err(ProcessStreamSinkError::SessionMismatch);
             }
             if record.phase == SessionPhase::Refused {
-                return Err(record
-                    .primary_failure
-                    .as_ref()
-                    .map_or(ProcessStreamSinkError::SourceMismatch, Failure::as_sink_error));
+                return Err(record.primary_failure.as_ref().map_or(
+                    ProcessStreamSinkError::SourceMismatch,
+                    Failure::as_sink_error,
+                ));
             }
             let action = match record.phase {
                 SessionPhase::Unknown => OpenAction::Reconcile,
@@ -475,7 +489,10 @@ impl StreamSinkCore {
                 reason: "survey stream session count exceeds stdout/stderr",
             });
         }
-        if sessions.values().any(|record| record.session.stream() == session.stream()) {
+        if sessions
+            .values()
+            .any(|record| record.session.stream() == session.stream())
+        {
             return Err(ProcessStreamSinkError::StreamMismatch);
         }
 
@@ -508,59 +525,61 @@ impl StreamSinkCore {
                 Ok(session)
             }
             OpenAction::Create => match self.root.create_stream_file(&record.file_name) {
-            Ok(artifact) => {
-                record.artifact = Some(artifact);
-                if timed_out.load(Ordering::Acquire) {
-                    record.primary_failure.get_or_insert(Failure::Invariant(
-                        "open native create completed after its wait budget",
-                    ));
-                    mark_unknown(record, "open-create-deadline")?;
-                } else {
-                    record.phase = SessionPhase::Open;
+                Ok(artifact) => {
+                    record.artifact = Some(artifact);
+                    if timed_out.load(Ordering::Acquire) {
+                        record.primary_failure.get_or_insert(Failure::Invariant(
+                            "open native create completed after its wait budget",
+                        ));
+                        mark_unknown(record, "open-create-deadline")?;
+                    } else {
+                        record.phase = SessionPhase::Open;
+                    }
+                    Ok(session)
                 }
-                Ok(session)
-            }
-            Err(error @ SurveyStreamArtifactError::ExistingArtifact)
-            | Err(error @ SurveyStreamArtifactError::UnsupportedPlatform) => {
-                record.phase = SessionPhase::Refused;
-                record.primary_failure = Some(Failure::Native(error));
-                Err(Failure::Native(error).as_sink_error())
-            }
-            Err(error) => {
-                record.primary_failure.get_or_insert(Failure::Native(error));
-                if timed_out.load(Ordering::Acquire) {
-                    mark_unknown(record, "open-create-deadline-unknown")?;
-                    return Ok(session);
+                Err(
+                    error @ (SurveyStreamArtifactError::ExistingArtifact
+                    | SurveyStreamArtifactError::UnsupportedPlatform),
+                ) => {
+                    record.phase = SessionPhase::Refused;
+                    record.primary_failure = Some(Failure::Native(error));
+                    Err(Failure::Native(error).as_sink_error())
                 }
-                let file_name = record.file_name.clone();
-                match self.root.reconcile_created_stream_file(&file_name) {
-                    Ok(artifact) => {
-                        record.artifact = Some(artifact);
-                        if timed_out.load(Ordering::Acquire) {
-                            mark_unknown(record, "open-create-reconcile-deadline")?;
-                            return Ok(session);
-                        }
-                        match self.read_artifact(record, false) {
-                            Ok(proof)
-                                if proof.byte_length == 0
-                                    && proof.sha256 == sha256_hex(&[]) =>
-                            {
-                                if timed_out.load(Ordering::Acquire) {
-                                    mark_unknown(record, "open-readback-deadline")?;
-                                } else {
-                                    record.phase = SessionPhase::Open;
-                                    record.unknown_outcome = None;
+                Err(error) => {
+                    record.primary_failure.get_or_insert(Failure::Native(error));
+                    if timed_out.load(Ordering::Acquire) {
+                        mark_unknown(record, "open-create-deadline-unknown")?;
+                        return Ok(session);
+                    }
+                    let file_name = record.file_name.clone();
+                    match self.root.reconcile_created_stream_file(&file_name) {
+                        Ok(artifact) => {
+                            record.artifact = Some(artifact);
+                            if timed_out.load(Ordering::Acquire) {
+                                mark_unknown(record, "open-create-reconcile-deadline")?;
+                                return Ok(session);
+                            }
+                            match self.read_artifact(record, false) {
+                                Ok(proof)
+                                    if proof.byte_length == 0
+                                        && proof.sha256 == sha256_hex(&[]) =>
+                                {
+                                    if timed_out.load(Ordering::Acquire) {
+                                        mark_unknown(record, "open-readback-deadline")?;
+                                    } else {
+                                        record.phase = SessionPhase::Open;
+                                        record.unknown_outcome = None;
+                                    }
+                                }
+                                Ok(_) | Err(_) => {
+                                    mark_unknown(record, "open-create-readback-mismatch")?;
                                 }
                             }
-                            Ok(_) | Err(_) => {
-                                mark_unknown(record, "open-create-readback-mismatch")?;
-                            }
                         }
+                        Err(_) => mark_unknown(record, "open-create-reconcile-pending")?,
                     }
-                    Err(_) => mark_unknown(record, "open-create-reconcile-pending")?,
+                    Ok(session)
                 }
-                Ok(session)
-            }
             },
         }
     }
@@ -611,8 +630,9 @@ impl StreamSinkCore {
         &self,
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAppend,
-        timed_out: &AtomicBool,
-    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        deadline: Instant,
+        timed_out: Arc<AtomicBool>,
+    ) -> Result<AppendWorkerResult, ProcessStreamSinkError> {
         let mut sessions = lock_sessions(&self.sessions);
         let record = sessions
             .get_mut(session.session_id())
@@ -621,23 +641,25 @@ impl StreamSinkCore {
         session.validate_append(&request)?;
 
         if let Some(terminal) = &record.terminal {
-            return Ok(ProcessStreamSinkAppendDisposition::Terminal {
-                state: terminal.state(),
-                terminal_sha256: terminal.terminal_sha256().to_owned(),
-            });
+            return Ok(AppendWorkerResult::Disposition(
+                ProcessStreamSinkAppendDisposition::Terminal {
+                    state: terminal.state(),
+                    terminal_sha256: terminal.terminal_sha256().to_owned(),
+                },
+            ));
         }
         if record.phase == SessionPhase::Unknown {
-            return Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                retry_after_ms: 1,
-            });
+            return Ok(AppendWorkerResult::Disposition(
+                ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+            ));
         }
         if record.phase != SessionPhase::Open {
             return Err(ProcessStreamSinkError::AppendAfterFinalizing);
         }
         if record.late_append.is_some() {
-            return Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                retry_after_ms: 1,
-            });
+            return Ok(AppendWorkerResult::Disposition(
+                ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+            ));
         }
         if request.bytes().is_empty() {
             return Err(ProcessStreamSinkError::InvalidRequest {
@@ -652,10 +674,12 @@ impl StreamSinkCore {
                         && receipt.byte_length == request.byte_length()
                         && receipt.sha256 == request.sha256() =>
                 {
-                    Ok(ProcessStreamSinkAppendDisposition::Replayed {
-                        next_sequence: record.next_sequence,
-                        next_offset: record.next_offset,
-                    })
+                    Ok(AppendWorkerResult::Disposition(
+                        ProcessStreamSinkAppendDisposition::Replayed {
+                            next_sequence: record.next_sequence,
+                            next_offset: record.next_offset,
+                        },
+                    ))
                 }
                 Some(_) => Err(ProcessStreamSinkError::MismatchedReplay),
                 None => Err(ProcessStreamSinkError::MismatchedReplay),
@@ -706,7 +730,16 @@ impl StreamSinkCore {
             candidate_sha256,
             candidate_hasher,
             candidate_preview,
+            acknowledgement_deadline: deadline,
+            acknowledgement_expired: Arc::clone(&timed_out),
         };
+
+        if timed_out.load(Ordering::Acquire) || Instant::now() >= deadline {
+            timed_out.store(true, Ordering::Release);
+            return Ok(AppendWorkerResult::Disposition(
+                ProcessStreamSinkAppendDisposition::DeadlineExceeded,
+            ));
+        }
 
         let append_result = match record.artifact.as_mut() {
             Some(artifact) => artifact.append(
@@ -719,26 +752,29 @@ impl StreamSinkCore {
                     "open session lost its retained native artifact",
                 ));
                 mark_unknown(record, "append-without-native-artifact")?;
-                return Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                    retry_after_ms: 1,
-                });
+                return Ok(AppendWorkerResult::Disposition(
+                    ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+                ));
             }
         };
-        if timed_out.load(Ordering::Acquire) {
-            record.pending_append = Some(candidate);
-            record.primary_failure.get_or_insert(Failure::Invariant(
-                "native append completed after its original wait budget",
-            ));
-            mark_unknown(record, "append-native-deadline")?;
-            return Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded);
+        let deadline_expired = timed_out.load(Ordering::Acquire) || Instant::now() >= deadline;
+        if deadline_expired {
+            timed_out.store(true, Ordering::Release);
         }
+        let pending_ack = PendingAppendTicket::from_candidate(&candidate);
         match append_result {
             Ok(next_offset) if next_offset == candidate_offset => {
-                admit_append(record, candidate);
-                Ok(ProcessStreamSinkAppendDisposition::Accepted {
-                    next_sequence: record.next_sequence,
-                    next_offset: record.next_offset,
-                })
+                record.pending_append = Some(candidate);
+                if deadline_expired {
+                    record.primary_failure.get_or_insert(Failure::Invariant(
+                        "native append completed after its original wait budget",
+                    ));
+                    mark_unknown(record, "append-native-deadline")?;
+                    return Ok(AppendWorkerResult::Disposition(
+                        ProcessStreamSinkAppendDisposition::DeadlineExceeded,
+                    ));
+                }
+                Ok(AppendWorkerResult::NeedsAcknowledgement(pending_ack))
             }
             Ok(_) => {
                 record.primary_failure.get_or_insert(Failure::Invariant(
@@ -746,9 +782,9 @@ impl StreamSinkCore {
                 ));
                 record.pending_append = Some(candidate);
                 mark_unknown(record, "append-offset-readback-required")?;
-                Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                    retry_after_ms: 1,
-                })
+                Ok(AppendWorkerResult::Disposition(
+                    ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+                ))
             }
             Err(error) => {
                 record.primary_failure.get_or_insert(Failure::Native(error));
@@ -757,47 +793,108 @@ impl StreamSinkCore {
                         if proof.byte_length == record.next_offset
                             && proof.sha256 == record.admitted_sha256() =>
                     {
-                        if timed_out.load(Ordering::Acquire) {
-                            record.pending_append = Some(candidate);
+                        if deadline_expired {
                             mark_unknown(record, "append-error-readback-deadline")?;
-                            return Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded);
+                            Ok(AppendWorkerResult::Disposition(
+                                ProcessStreamSinkAppendDisposition::DeadlineExceeded,
+                            ))
+                        } else {
+                            Ok(AppendWorkerResult::Disposition(
+                                ProcessStreamSinkAppendDisposition::Backpressured {
+                                    retry_after_ms: 1,
+                                },
+                            ))
                         }
-                        Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                            retry_after_ms: 1,
-                        })
                     }
                     Ok(proof)
                         if proof.byte_length == candidate_offset
                             && proof.sha256 == candidate.candidate_sha256 =>
                     {
-                        if timed_out.load(Ordering::Acquire) {
-                            record.pending_append = Some(candidate);
+                        record.pending_append = Some(candidate);
+                        if timed_out.load(Ordering::Acquire) || Instant::now() >= deadline {
+                            timed_out.store(true, Ordering::Release);
+                            record.primary_failure.get_or_insert(Failure::Invariant(
+                                "native append readback completed after its original wait budget",
+                            ));
                             mark_unknown(record, "append-candidate-readback-deadline")?;
-                            return Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded);
+                            Ok(AppendWorkerResult::Disposition(
+                                ProcessStreamSinkAppendDisposition::DeadlineExceeded,
+                            ))
+                        } else {
+                            Ok(AppendWorkerResult::NeedsAcknowledgement(pending_ack))
                         }
-                        admit_append(record, candidate);
-                        Ok(ProcessStreamSinkAppendDisposition::Accepted {
-                            next_sequence: record.next_sequence,
-                            next_offset: record.next_offset,
-                        })
                     }
                     Ok(_) => {
                         record.pending_append = Some(candidate);
                         mark_unknown(record, "append-native-bytes-not-admitted-prefix")?;
-                        Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                            retry_after_ms: 1,
-                        })
+                        Ok(AppendWorkerResult::Disposition(
+                            ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+                        ))
                     }
                     Err(_) => {
                         record.pending_append = Some(candidate);
                         mark_unknown(record, "append-readback-unknown")?;
-                        Ok(ProcessStreamSinkAppendDisposition::Backpressured {
-                            retry_after_ms: 1,
-                        })
+                        Ok(AppendWorkerResult::Disposition(
+                            ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 1 },
+                        ))
                     }
                 }
             }
         }
+    }
+
+    fn acknowledge_pending_append(
+        &self,
+        session: &ProcessStreamSinkSession,
+        ticket: &PendingAppendTicket,
+        deadline: Instant,
+        timed_out: &Arc<AtomicBool>,
+    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        let mut sessions = match try_lock_sessions(&self.sessions) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                timed_out.store(true, Ordering::Release);
+                return if matches!(&error, ProcessStreamSinkError::ProviderUnavailable) {
+                    Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded)
+                } else {
+                    Err(error)
+                };
+            }
+        };
+        let record = sessions
+            .get_mut(session.session_id())
+            .ok_or(ProcessStreamSinkError::SessionMismatch)?;
+        require_exact_session(record, session)?;
+        if !matches!(record.phase, SessionPhase::Open | SessionPhase::Unknown) {
+            return Err(ProcessStreamSinkError::AppendAfterFinalizing);
+        }
+        let pending = record
+            .pending_append
+            .as_ref()
+            .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+        if !ticket.matches(pending)
+            || !Arc::ptr_eq(&pending.acknowledgement_expired, timed_out)
+            || pending.acknowledgement_deadline != deadline
+        {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if Instant::now() >= deadline || timed_out.load(Ordering::Acquire) {
+            timed_out.store(true, Ordering::Release);
+            record.primary_failure.get_or_insert(Failure::Invariant(
+                "append acknowledgement missed its original wait budget",
+            ));
+            mark_unknown(record, "append-acknowledgement-deadline")?;
+            return Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded);
+        }
+        let pending = record
+            .pending_append
+            .take()
+            .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+        admit_append(record, pending);
+        Ok(ProcessStreamSinkAppendDisposition::Accepted {
+            next_sequence: record.next_sequence,
+            next_offset: record.next_offset,
+        })
     }
 
     fn finalize_checked(
@@ -918,12 +1015,15 @@ impl StreamSinkCore {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         }
         if let Err(error) = verify_stable_object(record, &proof) {
-            record.primary_failure.get_or_insert(Failure::Sink(error.clone()));
+            record
+                .primary_failure
+                .get_or_insert(Failure::Sink(error.clone()));
             mark_unknown(record, "terminal-native-identity-mismatch")?;
             return Err(error);
         }
         let admitted_sha256 = record.admitted_sha256();
-        let admitted_exact = proof.byte_length == record.next_offset && proof.sha256 == admitted_sha256;
+        let admitted_exact =
+            proof.byte_length == record.next_offset && proof.sha256 == admitted_sha256;
         let late_tail_exact = matches_late_tail(record, &proof);
         if (record.late_append.is_some() && !late_tail_exact)
             || (!admitted_exact && !late_tail_exact)
@@ -944,7 +1044,9 @@ impl StreamSinkCore {
                 Ok(terminal)
             }
             Err(error) => {
-                record.primary_failure.get_or_insert(Failure::Sink(error.clone()));
+                record
+                    .primary_failure
+                    .get_or_insert(Failure::Sink(error.clone()));
                 mark_unknown(record, "terminal-evidence-construction-failed")?;
                 Err(error)
             }
@@ -1079,7 +1181,8 @@ impl StreamSinkCore {
             .as_mut()
             .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
         let proof = artifact.readback(max_total_bytes, close_writer)?;
-        verify_stable_object(record, &proof).map_err(|_| SurveyStreamArtifactError::IdentityMismatch)?;
+        verify_stable_object(record, &proof)
+            .map_err(|_| SurveyStreamArtifactError::IdentityMismatch)?;
         if close_writer {
             record.closed_proof = Some(proof.clone());
         }
@@ -1162,6 +1265,22 @@ impl StreamSinkCore {
         }
 
         if record.pending_append.is_some() {
+            let acknowledgement_expired = record.pending_append.as_ref().is_some_and(|pending| {
+                pending.acknowledgement_expired.load(Ordering::Acquire)
+                    || Instant::now() >= pending.acknowledgement_deadline
+            });
+            if !acknowledgement_expired {
+                mark_unknown(record, "original-append-acknowledgement-pending")?;
+                return Ok(unknown_readback(record)?);
+            }
+            if let Some(pending) = record.pending_append.as_ref() {
+                pending
+                    .acknowledgement_expired
+                    .store(true, Ordering::Release);
+            }
+            record.primary_failure.get_or_insert(Failure::Invariant(
+                "original append acknowledgement expired before admission",
+            ));
             if timed_out.load(Ordering::Acquire) {
                 mark_unknown(record, "pending-append-reconcile-deadline")?;
                 return Ok(unknown_readback(record)?);
@@ -1182,13 +1301,10 @@ impl StreamSinkCore {
                 .pending_append
                 .take()
                 .ok_or(ProcessStreamSinkError::SessionMismatch)?;
-            if proof.byte_length == record.next_offset
-                && proof.sha256 == record.admitted_sha256()
-            {
+            if proof.byte_length == record.next_offset && proof.sha256 == record.admitted_sha256() {
                 record.phase = SessionPhase::Open;
                 record.unknown_outcome = None;
-            } else if proof.byte_length
-                == pending.offset.saturating_add(pending.byte_length)
+            } else if proof.byte_length == pending.offset.saturating_add(pending.byte_length)
                 && proof.sha256 == pending.candidate_sha256
             {
                 record.late_proof = Some(proof);
@@ -1196,10 +1312,9 @@ impl StreamSinkCore {
                 record.phase = SessionPhase::Open;
                 record.unknown_outcome = None;
             } else {
-                // The original append returned Backpressured so P-04 did not
-                // advance its admitted prefix. Even if later readback finds
-                // the candidate bytes, they cannot be promoted into the
-                // executor's original contiguous sequence.
+                // The original append did not return a timely acknowledgement,
+                // so P-04 did not advance its admitted prefix. Later readback
+                // cannot promote these bytes into that original sequence.
                 record.pending_append = Some(pending);
                 record.primary_failure.get_or_insert(Failure::Invariant(
                     "native file contains bytes not admitted by the original executor call",
@@ -1224,8 +1339,8 @@ impl StreamSinkCore {
                 mark_unknown(record, "pending-terminal-readback-deadline")?;
                 return Ok(unknown_readback(record)?);
             }
-            let admitted_exact = proof.byte_length == record.next_offset
-                && proof.sha256 == record.admitted_sha256();
+            let admitted_exact =
+                proof.byte_length == record.next_offset && proof.sha256 == record.admitted_sha256();
             if (record.late_append.is_some() && !matches_late_tail(record, &proof))
                 || (record.late_append.is_none() && !admitted_exact)
             {
@@ -1347,9 +1462,10 @@ impl ProcessStreamSinkClient for InstallationSurveyStreamSink {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             let wait_budget_ms = request.wait_budget_ms();
+            let deadline = Instant::now() + Duration::from_millis(wait_budget_ms);
             let worker_session = session.clone();
             let call = match core.schedule_blocking(move |core, timed_out| {
-                core.append_checked(worker_session, request, &timed_out)
+                core.append_checked(worker_session, request, deadline, timed_out)
             }) {
                 Ok(call) => call,
                 Err(ProcessStreamSinkError::ProviderUnavailable) => {
@@ -1360,11 +1476,15 @@ impl ProcessStreamSinkClient for InstallationSurveyStreamSink {
                 Err(error) => return Err(error),
             };
             let timed_out = Arc::clone(&call.timed_out);
-            match StreamSinkCore::wait_bounded(call, wait_budget_ms).await {
+            match StreamSinkCore::wait_bounded_until(call, deadline).await {
                 Err(_) if timed_out.load(Ordering::Acquire) => {
                     Ok(ProcessStreamSinkAppendDisposition::DeadlineExceeded)
                 }
-                result => result,
+                Err(error) => Err(error),
+                Ok(AppendWorkerResult::Disposition(disposition)) => Ok(disposition),
+                Ok(AppendWorkerResult::NeedsAcknowledgement(ticket)) => {
+                    core.acknowledge_pending_append(&session, &ticket, deadline, &timed_out)
+                }
             }
         })
     }
@@ -1459,9 +1579,7 @@ impl ArtifactRoot {
         file_name: &str,
     ) -> Result<ArtifactFile, SurveyStreamArtifactError> {
         match self {
-            Self::Native(root) => root
-                .create_stream_file(file_name)
-                .map(ArtifactFile::Native),
+            Self::Native(root) => root.create_stream_file(file_name).map(ArtifactFile::Native),
             #[cfg(test)]
             Self::Test(root) => root.create_stream_file(file_name).map(ArtifactFile::Test),
         }
@@ -1637,7 +1755,6 @@ impl SessionRecord {
     fn policy_retains_raw_source(&self) -> bool {
         self.session.policy().retention_ref() != P04_BOUNDED_PREFIX_RETENTION
     }
-
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1655,6 +1772,41 @@ struct PendingAppend {
     candidate_sha256: String,
     candidate_hasher: Sha256,
     candidate_preview: Vec<u8>,
+    acknowledgement_deadline: Instant,
+    acknowledgement_expired: Arc<AtomicBool>,
+}
+
+struct PendingAppendTicket {
+    sequence: u64,
+    offset: u64,
+    byte_length: u64,
+    sha256: String,
+    candidate_sha256: String,
+}
+
+impl PendingAppendTicket {
+    fn from_candidate(candidate: &PendingAppend) -> Self {
+        Self {
+            sequence: candidate.sequence,
+            offset: candidate.offset,
+            byte_length: candidate.byte_length,
+            sha256: candidate.sha256.clone(),
+            candidate_sha256: candidate.candidate_sha256.clone(),
+        }
+    }
+
+    fn matches(&self, candidate: &PendingAppend) -> bool {
+        self.sequence == candidate.sequence
+            && self.offset == candidate.offset
+            && self.byte_length == candidate.byte_length
+            && self.sha256 == candidate.sha256
+            && self.candidate_sha256 == candidate.candidate_sha256
+    }
+}
+
+enum AppendWorkerResult {
+    NeedsAcknowledgement(PendingAppendTicket),
+    Disposition(ProcessStreamSinkAppendDisposition),
 }
 
 #[derive(Clone)]
@@ -1695,12 +1847,12 @@ impl Failure {
                     reason: "native stream artifact input is invalid",
                 }
             }
-            Self::Native(SurveyStreamArtifactError::UnsupportedPlatform)
-            | Self::Native(SurveyStreamArtifactError::IdentityMismatch)
-            | Self::Native(SurveyStreamArtifactError::SecurityMismatch)
-            | Self::Native(SurveyStreamArtifactError::NativeIo) => {
-                ProcessStreamSinkError::ProviderUnavailable
-            }
+            Self::Native(
+                SurveyStreamArtifactError::UnsupportedPlatform
+                | SurveyStreamArtifactError::IdentityMismatch
+                | SurveyStreamArtifactError::SecurityMismatch
+                | SurveyStreamArtifactError::NativeIo,
+            ) => ProcessStreamSinkError::ProviderUnavailable,
             Self::Sink(error) => error.clone(),
             Self::Invariant(_) => ProcessStreamSinkError::ProviderUnavailable,
         }
@@ -1717,8 +1869,10 @@ fn lock_sessions(
 
 fn try_lock_sessions(
     sessions: &Mutex<HashMap<ProcessStreamSinkSessionId, SessionRecord>>,
-) -> Result<MutexGuard<'_, HashMap<ProcessStreamSinkSessionId, SessionRecord>>, ProcessStreamSinkError>
-{
+) -> Result<
+    MutexGuard<'_, HashMap<ProcessStreamSinkSessionId, SessionRecord>>,
+    ProcessStreamSinkError,
+> {
     match sessions.try_lock() {
         Ok(guard) => Ok(guard),
         Err(std::sync::TryLockError::Poisoned(error)) => Ok(error.into_inner()),
@@ -1729,7 +1883,8 @@ fn try_lock_sessions(
 }
 
 fn lock_owner_gate(gate: &Mutex<bool>) -> MutexGuard<'_, bool> {
-    gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    gate.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn try_lock_owner_gate(gate: &Mutex<bool>) -> Result<MutexGuard<'_, bool>, ProcessStreamSinkError> {
@@ -1891,6 +2046,16 @@ fn verify_stable_object(
     record: &mut SessionRecord,
     proof: &ArtifactProof,
 ) -> Result<(), ProcessStreamSinkError> {
+    if record.object_identity.is_none() {
+        record.object_identity = Some((proof.locator.clone(), proof.file_identity));
+    }
+    verify_existing_stable_object(record, proof)
+}
+
+fn verify_existing_stable_object(
+    record: &SessionRecord,
+    proof: &ArtifactProof,
+) -> Result<(), ProcessStreamSinkError> {
     match &record.object_identity {
         Some((locator, identity))
             if locator != &proof.locator || identity != &proof.file_identity =>
@@ -1898,10 +2063,7 @@ fn verify_stable_object(
             Err(ProcessStreamSinkError::SourceMismatch)
         }
         Some(_) => Ok(()),
-        None => {
-            record.object_identity = Some((proof.locator.clone(), proof.file_identity));
-            Ok(())
-        }
+        None => Err(ProcessStreamSinkError::SourceMismatch),
     }
 }
 
@@ -1918,20 +2080,21 @@ fn matches_late_tail(record: &SessionRecord, proof: &ArtifactProof) -> bool {
         && proof.sha256 == late.candidate_sha256
 }
 
-fn mark_unknown(
-    record: &mut SessionRecord,
-    evidence: &str,
-) -> Result<(), ProcessStreamSinkError> {
+fn mark_unknown(record: &mut SessionRecord, evidence: &str) -> Result<(), ProcessStreamSinkError> {
     if record.unknown_outcome.is_some() {
         record.phase = SessionPhase::Unknown;
         return Ok(());
     }
-    let primary = record
-        .primary_failure
-        .as_ref()
-        .map_or_else(|| "unclassified".to_owned(), |failure| format!("{failure:?}"));
+    let primary = record.primary_failure.as_ref().map_or_else(
+        || "unclassified".to_owned(),
+        |failure| format!("{failure:?}"),
+    );
     let uncertainty = sha256_hex(
-        format!("{}:{primary}:{evidence}", record.session.open_request_sha256()).as_bytes(),
+        format!(
+            "{}:{primary}:{evidence}",
+            record.session.open_request_sha256()
+        )
+        .as_bytes(),
     );
     let outcome = ProcessStreamSinkUnknownOutcome::new(
         record.session.session_id().clone(),
@@ -1944,7 +2107,9 @@ fn mark_unknown(
     Ok(())
 }
 
-fn unknown_readback(record: &SessionRecord) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+fn unknown_readback(
+    record: &SessionRecord,
+) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
     let outcome = record
         .unknown_outcome
         .clone()
@@ -1952,7 +2117,9 @@ fn unknown_readback(record: &SessionRecord) -> Result<ProcessStreamSinkReadback,
     Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
 }
 
-fn session_view(record: &SessionRecord) -> Result<ProcessStreamSinkSessionView, ProcessStreamSinkError> {
+fn session_view(
+    record: &SessionRecord,
+) -> Result<ProcessStreamSinkSessionView, ProcessStreamSinkError> {
     ProcessStreamSinkSessionView::new(
         record.session.session_id().clone(),
         record.session.source_id().clone(),
@@ -1969,10 +2136,10 @@ fn session_view(record: &SessionRecord) -> Result<ProcessStreamSinkSessionView, 
 }
 
 fn owner_release_error(record: &SessionRecord, detail: &str) -> InstallationSurveyStreamSinkError {
-    let cause = record
-        .primary_failure
-        .as_ref()
-        .map_or_else(|| "none retained".to_owned(), |failure| format!("{failure:?}"));
+    let cause = record.primary_failure.as_ref().map_or_else(
+        || "none retained".to_owned(),
+        |failure| format!("{failure:?}"),
+    );
     InstallationSurveyStreamSinkError::new(format!(
         "survey stream {} cannot release its original owner: {detail}; primary cause: {cause}",
         record.session.session_id().as_str()
@@ -2162,19 +2329,19 @@ mod tests {
     use eliot_contracts::{EpochId, EpochLineageId};
     use eliot_platform::ClockObservation;
     use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority,
-        DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection,
-        FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId,
-        PermitIssuance, PhysicalProcessBinding, ProcessId, ProcessIntent, ProcessRequest,
-        ProcessStreamDigestAlgorithm, ProcessTreeId, ResourceLimits, SessionId,
-        StreamEvidenceGap, SuspendedProcessIdentity,
+        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
+        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
+        KernelDispatchKey, OperationId, PermitIssuance, PhysicalProcessBinding, ProcessId,
+        ProcessIntent, ProcessRequest, ProcessStreamDigestAlgorithm, ProcessTreeId, ResourceLimits,
+        SessionId, StreamEvidenceGap, SuspendedProcessIdentity,
     };
 
     use super::*;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
     const TEST_EXECUTABLE: &str = r"C:\tools\survey-probe.exe";
-    const TEST_EXECUTABLE_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const TEST_EXECUTABLE_SHA256: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     fn drive<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
@@ -2214,11 +2381,7 @@ mod tests {
             TEST_EXECUTABLE_SHA256,
             vec!["--version".to_owned()],
             r"C:\eliot\survey-probe-working",
-            EnvironmentProjection::new(
-                BTreeMap::new(),
-                Vec::new(),
-                EnvironmentInheritance::None,
-            )?,
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)?,
             ResourceLimits::new(
                 10_000,
                 Some(5_000),
@@ -2284,11 +2447,8 @@ mod tests {
             revision_heads,
             41,
         )?;
-        let validated = validating_authority.validate_and_consume(
-            validating_request,
-            suspended,
-            &context,
-        )?;
+        let validated =
+            validating_authority.validate_and_consume(validating_request, suspended, &context)?;
         Ok((sealed_request, validated.binding().clone()))
     }
 
@@ -2357,8 +2517,7 @@ mod tests {
     }
 
     fn test_runtime() -> &'static tokio::runtime::Runtime {
-        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
-            std::sync::OnceLock::new();
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
         RUNTIME.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -2382,10 +2541,7 @@ mod tests {
             StreamTransportStatus::Complete,
             sha256_hex(bytes),
             bytes.len() as u64,
-            ProcessStreamPrefixPreview::from_transport_prefix(
-                bytes.to_vec(),
-                bytes.len() as u64,
-            )?,
+            ProcessStreamPrefixPreview::from_transport_prefix(bytes.to_vec(), bytes.len() as u64)?,
             None,
             gaps,
         )?)
@@ -2394,10 +2550,10 @@ mod tests {
     #[test]
     fn complete_and_zero_byte_streams_use_actual_readback_proofs() -> TestResult {
         let (request, binding) = process_request_and_binding("survey-sink-bytes", 128)?;
-        let policy = policy()?;
+        let stream_policy = policy()?;
         let root = TestArtifactRoot::new();
-        let sink = test_sink(&request, policy.clone(), Arc::clone(&root))?;
-        let session = drive(sink.open(open_request(binding, policy, 128)?))?;
+        let sink = test_sink(&request, stream_policy.clone(), Arc::clone(&root))?;
+        let session = drive(sink.open(open_request(binding, stream_policy, 128)?))?;
         let chunk = ProcessStreamSinkAppend::from_bytes(1, 0, b"version ".to_vec(), 250);
         assert!(matches!(
             drive(sink.append(session.clone(), chunk))?,
@@ -2420,7 +2576,10 @@ mod tests {
         ))?;
         assert_eq!(terminal.state(), ProcessStreamSinkState::CompleteSource);
         assert_eq!(
-            terminal.evidence().source().map(DurableProcessStreamSource::byte_length),
+            terminal
+                .evidence()
+                .source()
+                .map(DurableProcessStreamSource::byte_length),
             Some(10)
         );
         sink.reconcile_for_owner_release()?;
@@ -2428,16 +2587,16 @@ mod tests {
         let (empty_request, empty_binding) = process_request_and_binding("survey-sink-empty", 128)?;
         let empty_policy = policy()?;
         let empty_sink = test_sink(&empty_request, empty_policy.clone(), root)?;
-        let empty_session = drive(empty_sink.open(open_request(
-            empty_binding,
-            empty_policy,
-            128,
-        )?))?;
+        let empty_session =
+            drive(empty_sink.open(open_request(empty_binding, empty_policy, 128)?))?;
         let empty_terminal = drive(empty_sink.finalize(
             empty_session.clone(),
             finalize_request(&empty_session, 0, b"", Vec::new())?,
         ))?;
-        assert_eq!(empty_terminal.state(), ProcessStreamSinkState::CompleteSource);
+        assert_eq!(
+            empty_terminal.state(),
+            ProcessStreamSinkState::CompleteSource
+        );
         assert_eq!(empty_terminal.evidence().observed_bytes(), 0);
         empty_sink.reconcile_for_owner_release()?;
         Ok(())
@@ -2453,12 +2612,18 @@ mod tests {
         let sequence_gap = ProcessStreamSinkAppend::from_bytes(2, 0, b"a".to_vec(), 250);
         assert!(matches!(
             drive(sink.append(session.clone(), sequence_gap)),
-            Err(ProcessStreamSinkError::SequenceGap { expected: 1, observed: 2 })
+            Err(ProcessStreamSinkError::SequenceGap {
+                expected: 1,
+                observed: 2
+            })
         ));
         let offset_gap = ProcessStreamSinkAppend::from_bytes(1, 1, b"a".to_vec(), 250);
         assert!(matches!(
             drive(sink.append(session.clone(), offset_gap)),
-            Err(ProcessStreamSinkError::OffsetMismatch { expected: 0, observed: 1 })
+            Err(ProcessStreamSinkError::OffsetMismatch {
+                expected: 0,
+                observed: 1
+            })
         ));
 
         let foreign = process_request_and_binding("survey-sink-foreign", 128)?.1;
@@ -2477,11 +2642,7 @@ mod tests {
             wire[field] = replacement;
             let substituted: ProcessExecutionBinding = serde_json::from_value(wire)?;
             assert!(matches!(
-                drive(sink.open(open_request(
-                    substituted,
-                    policy.clone(),
-                    128,
-                )?)),
+                drive(sink.open(open_request(substituted, policy.clone(), 128,)?)),
                 Err(ProcessStreamSinkError::BindingMismatch)
             ));
             assert_eq!(mutex_lock_recover(&root.files).len(), 1);
@@ -2587,7 +2748,10 @@ mod tests {
         ));
         barrier.wait();
         let disposition = drive(append_future)?;
-        assert_eq!(disposition, ProcessStreamSinkAppendDisposition::DeadlineExceeded);
+        assert_eq!(
+            disposition,
+            ProcessStreamSinkAppendDisposition::DeadlineExceeded
+        );
         assert!(sink.reconcile_for_owner_release().is_err());
 
         // The caller's wait ended while the blocking worker still owned the
@@ -2616,6 +2780,182 @@ mod tests {
         ))?;
         assert_eq!(terminal.state(), ProcessStreamSinkState::SourceUnavailable);
         assert!(terminal.evidence().source().is_none());
+        sink.reconcile_for_owner_release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_client_poll_cannot_ack_native_append_after_its_deadline() -> TestResult {
+        let (request, binding) = process_request_and_binding("survey-sink-delayed-poll", 128)?;
+        let policy = policy()?;
+        let root = TestArtifactRoot::new();
+        let sink = test_sink(&request, policy.clone(), Arc::clone(&root))?;
+        let session = drive(sink.open(open_request(binding, policy, 128)?))?;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut controls = mutex_lock_recover(&root.controls);
+            controls.delay_next_append_ms = 10;
+            controls.append_barrier = Some(Arc::clone(&barrier));
+        }
+
+        let mut append_future = Box::pin(sink.append(
+            session.clone(),
+            ProcessStreamSinkAppend::from_bytes(1, 0, b"late".to_vec(), 250),
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            append_future.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        // The fixture reaches this barrier after writing the candidate bytes.
+        // The original caller then stays unpolled past its absolute deadline,
+        // while the native worker returns and retains the unacknowledged result.
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let sessions = lock_sessions(&sink.core.sessions);
+            let record = sessions
+                .get(session.session_id())
+                .ok_or_else(|| std::io::Error::other("original stream session was lost"))?;
+            let pending = record
+                .pending_append
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("native append did not finish"))?;
+            assert!(!pending.acknowledgement_expired.load(Ordering::Acquire));
+            assert_eq!(record.next_sequence, 0);
+            assert_eq!(record.next_offset, 0);
+        }
+        assert_eq!(
+            drive(append_future)?,
+            ProcessStreamSinkAppendDisposition::DeadlineExceeded
+        );
+        assert!(sink.reconcile_for_owner_release().is_err());
+
+        assert!(matches!(
+            drive(sink.readback(session.clone()))?,
+            ProcessStreamSinkReadback::Session { ref view }
+                if view.next_sequence() == 0 && view.next_offset() == 0
+        ));
+        {
+            let sessions = lock_sessions(&sink.core.sessions);
+            let record = sessions
+                .get(session.session_id())
+                .ok_or_else(|| std::io::Error::other("original stream session was lost"))?;
+            let late = record
+                .late_append
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("late append outcome was not retained"))?;
+            let proof = record
+                .late_proof
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("late append readback was not retained"))?;
+            assert_eq!(late.sequence, 1);
+            assert_eq!(late.offset, 0);
+            assert_eq!(late.byte_length, 4);
+            assert_eq!(proof.byte_length, 4);
+            assert_eq!(proof.sha256, sha256_hex(b"late"));
+            assert!(matches_late_tail(record, proof));
+            assert!(record.primary_failure.is_some());
+        }
+        let terminal = drive(sink.finalize(
+            session.clone(),
+            finalize_request(
+                &session,
+                0,
+                b"",
+                vec![StreamEvidenceGap::PersistenceBackpressure],
+            )?,
+        ))?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::SourceUnavailable);
+        assert!(terminal.evidence().source().is_none());
+        {
+            let sessions = lock_sessions(&sink.core.sessions);
+            let record = sessions
+                .get(session.session_id())
+                .ok_or_else(|| std::io::Error::other("terminal stream session was lost"))?;
+            let proof = record
+                .closed_proof
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("closed native proof was not retained"))?;
+            assert!(matches_late_tail(record, proof));
+        }
+        sink.reconcile_for_owner_release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_native_append_cancellation_preserves_cancelled_state_and_releases_owner()
+    -> TestResult {
+        let (request, binding) = process_request_and_binding("survey-sink-cancel-deadline", 128)?;
+        let policy = policy()?;
+        let root = TestArtifactRoot::new();
+        let sink = test_sink(&request, policy.clone(), Arc::clone(&root))?;
+        let session = drive(sink.open(open_request(binding, policy, 128)?))?;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        {
+            let mut controls = mutex_lock_recover(&root.controls);
+            controls.delay_next_append_ms = 400;
+            controls.append_barrier = Some(Arc::clone(&barrier));
+        }
+        let mut append_future = Box::pin(sink.append(
+            session.clone(),
+            ProcessStreamSinkAppend::from_bytes(1, 0, b"x".to_vec(), 250),
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            append_future.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        barrier.wait();
+        assert_eq!(
+            drive(append_future)?,
+            ProcessStreamSinkAppendDisposition::DeadlineExceeded
+        );
+        assert!(sink.reconcile_for_owner_release().is_err());
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(
+            drive(sink.readback(session.clone()))?,
+            ProcessStreamSinkReadback::Session { .. }
+        ));
+        let abort = ProcessStreamSinkAbortRequest::new(
+            session.terminal_id().clone(),
+            ProcessStreamSinkAbortReason::Cancellation,
+            0,
+            0,
+            session.limits().max_abort_wait_ms(),
+            StreamTransportStatus::CancelledBeforeEof,
+            sha256_hex(&[]),
+            0,
+            ProcessStreamPrefixPreview::from_transport_prefix(Vec::new(), 0)?,
+            None,
+            vec![
+                StreamEvidenceGap::PersistenceBackpressure,
+                StreamEvidenceGap::CancelledBeforeEof,
+            ],
+        )?;
+        let terminal = drive(sink.abort(session.clone(), abort))?;
+        assert_eq!(terminal.state(), ProcessStreamSinkState::Cancelled);
+        assert_eq!(
+            terminal.evidence().persistence(),
+            StreamPersistenceStatus::SourceUnavailable
+        );
+        assert!(terminal.evidence().source().is_none());
+        assert!(
+            terminal
+                .evidence()
+                .gaps()
+                .contains(&StreamEvidenceGap::PersistenceBackpressure)
+        );
+        {
+            let sessions = lock_sessions(&sink.core.sessions);
+            let record = sessions
+                .get(session.session_id())
+                .ok_or("cancelled session lost its retained record")?;
+            assert!(record.primary_failure.is_some());
+        }
         sink.reconcile_for_owner_release()?;
         Ok(())
     }

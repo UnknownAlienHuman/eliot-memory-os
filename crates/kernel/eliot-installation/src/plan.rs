@@ -9,13 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AgentBridgeSourceMaterializationPlan, CandidateManifest, ELIOT_HOST_SERVICE_NAME,
-    ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError, InstallationProfile,
-    InstallationManagedRootEffectProof, ManagedEnvironmentChangeRequest, ManagedEffectRecipe,
-    ManagedResourceProjection, PlatformHandle, RuntimeStateRoots, StoreCredentialProvisionPlan,
-    WindowsPathIdentity,
-    approved_path, handle, package_plan_error, phase_b_host_state_root_digest,
-    phase_b_static_template_for_candidate, phase_b_watchdog_selector_digest, sha256_handle,
-    validate_package_relative_text,
+    ELIOT_WATCHDOG_SERVICE_NAME, HostPhaseBStaticTemplate, InstallationError,
+    InstallationManagedRootEffectProof, InstallationProfile, ManagedEffectRecipe,
+    ManagedEnvironmentChangeRequest, ManagedResourceProjection, PlatformHandle, RuntimeStateRoots,
+    StoreCredentialProvisionPlan, WindowsPathIdentity, approved_path, handle, package_plan_error,
+    phase_b_host_state_root_digest, phase_b_static_template_for_candidate,
+    phase_b_watchdog_selector_digest, sha256_handle, validate_package_relative_text,
 };
 mod contract_models;
 
@@ -74,8 +73,8 @@ pub enum InstallerEffectPlan {
         /// Canonical digest of the exact package manifest.
         package_manifest_digest: PlatformHandle,
     },
-    /// Execute one System-Owner-signed, non-privileged portable managed-tool
-    /// operation through the existing durable transaction and PackageStager.
+    /// Execute one operation signed by the System Owner through the existing
+    /// durable transaction and `PackageStager`.
     /// The private plan carries the exact catalogue/survey/approval bindings;
     /// the optional projection is an immutable precondition that the redb
     /// owner must compare with its same-store row before committing the effect.
@@ -101,7 +100,7 @@ pub enum InstallerEffectPlan {
         /// against their transaction/effect pointers before the effect runs.
         #[serde(default)]
         prior_receipts: Vec<StagingReceipt>,
-        /// Original same-installation CreateRoot receipts for managed-tools
+        /// Original same-installation `CreateRoot` receipts for managed-tools
         /// or family parents that predate this transaction.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         prior_root_effects: Vec<InstallationManagedRootEffectProof>,
@@ -347,8 +346,7 @@ impl InstallerEffectPlan {
                     (true, Some(prior))
                         if prior.key.family_id == request.target_family
                             && prior.key.exact_candidate == request.exact_candidate
-                            && prior.disposition
-                                != super::ManagedResourceDisposition::Removed =>
+                            && prior.disposition != super::ManagedResourceDisposition::Removed =>
                     {
                         prior.validate()?;
                     }
@@ -370,9 +368,7 @@ impl InstallerEffectPlan {
                 }
                 let matching_prior_generation = prior_receipts
                     .iter()
-                    .filter(|receipt| {
-                        receipt.generation == recipe.package_manifest.generation
-                    })
+                    .filter(|receipt| receipt.generation == recipe.package_manifest.generation)
                     .count();
                 match recipe.operation {
                     super::ManagedEffectOperation::RepairPortableGeneration
@@ -478,11 +474,11 @@ pub(super) fn validate_effect_profile(
         {
             Ok(())
         }
-        InstallerEffectPlan::ManagedEnvironmentChange { .. } => Err(
-            InstallationError::ProfileViolation(
+        InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+            Err(InstallationError::ProfileViolation(
                 "managed portable-tool effects require PortableDev".to_owned(),
-            ),
-        ),
+            ))
+        }
         InstallerEffectPlan::ApplyAcl { principals, .. } => {
             let expected = match profile {
                 InstallationProfile::SystemService => [
@@ -636,6 +632,7 @@ pub(super) fn validate_user_mode_authority_effect_bindings(
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_installer_effects(
     profile: InstallationProfile,
     roots: &RuntimeStateRoots,
@@ -683,13 +680,13 @@ fn validate_installer_effects_impl(
     planned_changes: &[PlannedChange],
     effects: &[InstallerEffectPlan],
 ) -> Result<(), InstallationError> {
-    if effects.iter().any(|effect| {
-        matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
-    }) {
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. }))
+    {
         let immutable_binaries = immutable_binaries.ok_or_else(|| {
             InstallationError::ProfileViolation(
-                "managed portable effects require the retained immutable-binaries root"
-                    .to_owned(),
+                "managed portable effects require the retained immutable-binaries root".to_owned(),
             )
         })?;
         return validate_managed_installer_effects(
@@ -1142,10 +1139,14 @@ fn validate_installer_effects_impl(
 }
 
 /// Closes the existing installation effect owner over the one narrow
-/// PortableDev managed-package recipe. These transactions may only add the
-/// two signed child roots needed by PackageStager; all other effects remain
-/// outside this adapter. The package generation itself is not a CreateRoot:
-/// PackageStager owns that exact final leaf and its durable receipt.
+/// `PortableDev` managed-package recipe. These transactions may only add the
+/// two signed child roots needed by `PackageStager`; all other effects remain
+/// outside this adapter. The package generation itself is not a `CreateRoot`:
+/// `PackageStager` owns that exact final leaf and its durable receipt.
+#[allow(
+    clippy::too_many_lines,
+    reason = "this validation boundary checks the full ordered root and managed-effect owner contract together"
+)]
 fn validate_managed_installer_effects(
     profile: InstallationProfile,
     roots: &RuntimeStateRoots,
@@ -1167,8 +1168,7 @@ fn validate_managed_installer_effects(
         .iter()
         .enumerate()
         .filter_map(|(index, effect)| {
-            matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
-                .then_some(index)
+            matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. }).then_some(index)
         })
         .collect::<Vec<_>>();
     if managed_indexes.len() != 1 {
@@ -1228,7 +1228,8 @@ fn validate_managed_installer_effects(
         }
         match effect {
             InstallerEffectPlan::CreateRoot { root, .. } if index < managed_index => {
-                let actual = WindowsPathIdentity::parse_root(root.as_str(), "installer_effect.root")?;
+                let actual =
+                    WindowsPathIdentity::parse_root(root.as_str(), "installer_effect.root")?;
                 created_roots.push(actual);
             }
             InstallerEffectPlan::ManagedEnvironmentChange { .. } if index == managed_index => {}
@@ -1255,9 +1256,7 @@ fn validate_managed_installer_effects(
     {
         vec![
             recipe.target_root(base),
-            recipe
-                .target_root(base)
-                .join(recipe.target_family.as_str()),
+            recipe.target_root(base).join(recipe.target_family.as_str()),
         ]
     } else {
         Vec::new()
@@ -1270,14 +1269,10 @@ fn validate_managed_installer_effects(
         let root_identity = WindowsPathIdentity::parse_root(root.as_str(), "managed_root.root")?;
         let mut proof_index = None;
         for (index, required) in required_prior_root_paths.iter().enumerate() {
-            let required_identity = WindowsPathIdentity::parse_root(
-                &required.to_string_lossy(),
-                "managed_root.root",
-            )?;
-            if required_identity == root_identity {
-                if proof_index.replace(index).is_some() {
-                    return Err(InstallationError::IdentityConflict);
-                }
+            let required_identity =
+                WindowsPathIdentity::parse_root(&required.to_string_lossy(), "managed_root.root")?;
+            if required_identity == root_identity && proof_index.replace(index).is_some() {
+                return Err(InstallationError::IdentityConflict);
             }
         }
         let Some(proof_index) = proof_index else {

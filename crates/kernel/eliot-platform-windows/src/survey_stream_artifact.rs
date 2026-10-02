@@ -9,16 +9,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(windows)]
+use sha2::{Digest as _, Sha256};
+#[cfg(windows)]
 use std::{
     io::{Read as _, Seek as _, Write as _},
     path::Path,
 };
-#[cfg(windows)]
-use sha2::{Digest as _, Sha256};
 
-use crate::{
-    FileIdentity, ProtectedPathError, UserOwnedRootLease, UserOwnedRootReadLease,
-};
+use crate::{FileIdentity, ProtectedPathError, UserOwnedRootLease, UserOwnedRootReadLease};
 
 const ARTIFACT_DIRECTORY: &str = "installation-survey-streams";
 
@@ -80,9 +78,9 @@ struct SurveyStreamArtifactRootInner {
 
 #[derive(Default)]
 struct PendingArtifactHandles {
-    append_file: Option<std::fs::File>,
-    flush_file: Option<std::fs::File>,
-    read_file: Option<std::fs::File>,
+    append: Option<std::fs::File>,
+    flush: Option<std::fs::File>,
+    read: Option<std::fs::File>,
 }
 
 impl SurveyStreamArtifactRoot {
@@ -93,9 +91,7 @@ impl SurveyStreamArtifactRoot {
     ///
     /// Refuses an unsupported platform, changed root identity, unsafe path,
     /// or a foreign/unprotected pre-existing artifact directory.
-    pub fn open(
-        original_root: &UserOwnedRootReadLease,
-    ) -> Result<Self, SurveyStreamArtifactError> {
+    pub fn open(original_root: &UserOwnedRootReadLease) -> Result<Self, SurveyStreamArtifactError> {
         #[cfg(windows)]
         {
             original_root
@@ -136,9 +132,7 @@ impl SurveyStreamArtifactRoot {
                     artifact_root,
                     installer_root_identity: original_root.identity(),
                     artifact_path,
-                    pending_created_files: std::sync::Mutex::new(
-                        std::collections::HashMap::new(),
-                    ),
+                    pending_created_files: std::sync::Mutex::new(std::collections::HashMap::new()),
                 }),
             })
         }
@@ -177,14 +171,12 @@ impl SurveyStreamArtifactRoot {
             if proposed_locator.len() > 256 {
                 return Err(SurveyStreamArtifactError::InvalidInput);
             }
-            let append_file = create_new_append_artifact(
-                &path,
-                self.inner.artifact_root.current_user_sid(),
-            )?;
+            let append_file =
+                create_new_append_artifact(&path, self.inner.artifact_root.current_user_sid())?;
             pending.insert(
                 file_name.to_owned(),
                 PendingArtifactHandles {
-                    append_file: Some(append_file),
+                    append: Some(append_file),
                     ..PendingArtifactHandles::default()
                 },
             );
@@ -241,7 +233,7 @@ impl SurveyStreamArtifactRoot {
                 .get_mut(file_name)
                 .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
             let append_file = handles
-                .append_file
+                .append
                 .as_ref()
                 .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
             let identity = crate::file_identity_from_handle(append_file)
@@ -258,15 +250,15 @@ impl SurveyStreamArtifactRoot {
             // ReOpenFile binds each auxiliary handle to the original created
             // object. Store a successful open before any fallible proof so a
             // later retry retains it alongside the original append handle.
-            if handles.flush_file.is_none() {
+            if handles.flush.is_none() {
                 let flush_file = reopen_artifact_handle(
                     append_file,
                     windows_sys::Win32::Foundation::GENERIC_WRITE,
                 )?;
-                handles.flush_file = Some(flush_file);
+                handles.flush = Some(flush_file);
             }
             let flush_file = handles
-                .flush_file
+                .flush
                 .as_ref()
                 .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
             if crate::file_identity_from_handle(flush_file)
@@ -278,15 +270,15 @@ impl SurveyStreamArtifactRoot {
             verify_file_kind_and_link_count(flush_file)?;
             verify_file_security(flush_file, self.inner.artifact_root.current_user_sid())?;
 
-            if handles.read_file.is_none() {
+            if handles.read.is_none() {
                 let read_file = reopen_artifact_handle(
                     append_file,
                     windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ,
                 )?;
-                handles.read_file = Some(read_file);
+                handles.read = Some(read_file);
             }
             let read_file = handles
-                .read_file
+                .read
                 .as_ref()
                 .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
             if crate::file_identity_from_handle(read_file)
@@ -303,13 +295,13 @@ impl SurveyStreamArtifactRoot {
         let mut handles = pending
             .remove(file_name)
             .ok_or(SurveyStreamArtifactError::IdentityMismatch)?;
-        let Some(read_file) = handles.read_file.take() else {
+        let Some(read_file) = handles.read.take() else {
             pending.insert(file_name.to_owned(), handles);
             return Err(SurveyStreamArtifactError::IdentityMismatch);
         };
         Ok(SurveyStreamArtifact {
-            append_file: handles.append_file,
-            flush_file: handles.flush_file,
+            append_file: handles.append,
+            flush_file: handles.flush,
             read_file,
             identity,
             locator,
@@ -382,9 +374,10 @@ impl SurveyStreamArtifact {
                 .map_err(|_| SurveyStreamArtifactError::NativeIo)?
                 .len();
             let new_length = expected_offset
-                .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                    SurveyStreamArtifactError::InvalidInput
-                })?)
+                .checked_add(
+                    u64::try_from(bytes.len())
+                        .map_err(|_| SurveyStreamArtifactError::InvalidInput)?,
+                )
                 .ok_or(SurveyStreamArtifactError::InvalidInput)?;
             if current != expected_offset || new_length > max_total_bytes {
                 return Err(SurveyStreamArtifactError::InvalidInput);
@@ -395,7 +388,8 @@ impl SurveyStreamArtifact {
             flush_file
                 .sync_data()
                 .map_err(|_| SurveyStreamArtifactError::NativeIo)?;
-            if self.read_file
+            if self
+                .read_file
                 .metadata()
                 .map_err(|_| SurveyStreamArtifactError::NativeIo)?
                 .len()
@@ -454,16 +448,18 @@ impl SurveyStreamArtifact {
                 if read == 0 {
                     break;
                 }
-                let read = u64::try_from(read).map_err(|_| SurveyStreamArtifactError::InvalidInput)?;
+                let read =
+                    u64::try_from(read).map_err(|_| SurveyStreamArtifactError::InvalidInput)?;
                 byte_length = byte_length
                     .checked_add(read)
                     .ok_or(SurveyStreamArtifactError::InvalidInput)?;
                 if byte_length > max_total_bytes {
                     return Err(SurveyStreamArtifactError::InvalidInput);
                 }
-                hasher.update(&buffer[..usize::try_from(read).map_err(|_| {
-                    SurveyStreamArtifactError::InvalidInput
-                })?]);
+                hasher.update(
+                    &buffer[..usize::try_from(read)
+                        .map_err(|_| SurveyStreamArtifactError::InvalidInput)?],
+                );
             }
             if self
                 .read_file
@@ -480,8 +476,7 @@ impl SurveyStreamArtifact {
             self.verify_retained_handles()?;
             let ready_receipt_ref = format!(
                 "native-readback:{:016x}-{:016x}:{byte_length}:{sha256}",
-                self.identity.volume_serial_number,
-                self.identity.file_index,
+                self.identity.volume_serial_number, self.identity.file_index,
             );
             if finalize_artifact {
                 // Drop both mutable capabilities only after the independent
@@ -508,10 +503,12 @@ impl SurveyStreamArtifact {
 
     #[cfg(windows)]
     fn verify_retained_handles(&self) -> Result<(), SurveyStreamArtifactError> {
-        self.root.installer_root
+        self.root
+            .installer_root
             .verify_stable_identity()
             .map_err(map_protected_path_error)?;
-        self.root.artifact_root
+        self.root
+            .artifact_root
             .verify_stable_identity()
             .map_err(map_protected_path_error)?;
         let file_identity = crate::file_identity_from_handle(&self.read_file)
@@ -519,18 +516,14 @@ impl SurveyStreamArtifact {
         if self.root.installer_root.identity() != self.root.installer_root_identity
             || self.root.artifact_root.identity() != self.root.artifact_root_identity
             || file_identity != self.identity
-            || self
-                .append_file
-                .as_ref()
-                .is_some_and(|file| crate::file_identity_from_handle(file).ok() != Some(self.identity))
-            || self
-                .flush_file
-                .as_ref()
-                .is_some_and(|file| crate::file_identity_from_handle(file).ok() != Some(self.identity))
-            || (self.finalized
-                && (self.append_file.is_some() || self.flush_file.is_some()))
-            || (!self.finalized
-                && (self.append_file.is_none() || self.flush_file.is_none()))
+            || self.append_file.as_ref().is_some_and(|file| {
+                crate::file_identity_from_handle(file).ok() != Some(self.identity)
+            })
+            || self.flush_file.as_ref().is_some_and(|file| {
+                crate::file_identity_from_handle(file).ok() != Some(self.identity)
+            })
+            || (self.finalized && (self.append_file.is_some() || self.flush_file.is_some()))
+            || (!self.finalized && (self.append_file.is_none() || self.flush_file.is_none()))
         {
             return Err(SurveyStreamArtifactError::IdentityMismatch);
         }
@@ -582,13 +575,13 @@ fn create_new_append_artifact(
     path: &Path,
     sid: &str,
 ) -> Result<std::fs::File, SurveyStreamArtifactError> {
-    use std::os::windows::{io::FromRawHandle, os_str::OsStrExt};
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
     use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::{READ_CONTROL, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
     };
 
     let descriptor = crate::OwnedSecurityDescriptor::for_user_owned_storage(sid, false)
@@ -639,10 +632,9 @@ fn reopen_artifact_handle(
 ) -> Result<std::fs::File, SurveyStreamArtifactError> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::Security::READ_CONTROL;
     use windows_sys::Win32::Storage::FileSystem::{
-        ReOpenFile, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        READ_CONTROL, ReOpenFile,
     };
 
     // ReOpenFile creates a new handle to this exact file object. Share modes
@@ -674,17 +666,14 @@ fn verify_file_kind_and_link_count(file: &std::fs::File) -> Result<(), SurveyStr
     let metadata = file
         .metadata()
         .map_err(|_| SurveyStreamArtifactError::NativeIo)?;
-    if !metadata.is_file()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(SurveyStreamArtifactError::IdentityMismatch);
     }
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the retained file handle is live and the output points to valid
     // storage for the documented Windows information structure.
-    let observed = unsafe {
-        GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information)
-    };
+    let observed =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information) };
     if observed == 0 || information.nNumberOfLinks != 1 {
         return Err(SurveyStreamArtifactError::IdentityMismatch);
     }
@@ -692,10 +681,7 @@ fn verify_file_kind_and_link_count(file: &std::fs::File) -> Result<(), SurveyStr
 }
 
 #[cfg(windows)]
-fn verify_file_security(
-    file: &std::fs::File,
-    sid: &str,
-) -> Result<(), SurveyStreamArtifactError> {
+fn verify_file_security(file: &std::fs::File, sid: &str) -> Result<(), SurveyStreamArtifactError> {
     let expected = crate::OwnedSecurityDescriptor::for_user_owned_storage(sid, false)
         .map_err(|_| SurveyStreamArtifactError::SecurityMismatch)?;
     crate::verify_exact_file_security(file, &expected, sid)
@@ -704,6 +690,10 @@ fn verify_file_security(
 
 #[cfg(test)]
 #[cfg(windows)]
+#[allow(
+    clippy::expect_used,
+    reason = "Windows artifact fixtures fail fast with the exact setup or native operation that failed"
+)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -726,10 +716,13 @@ mod tests {
         let path = owned_root();
         let root = UserOwnedRootReadLease::open_existing(&path)
             .expect("test owner root readback succeeds");
-        let artifact_root = SurveyStreamArtifactRoot::open(&root)
-            .expect("dedicated artifact area opens");
+        let artifact_root =
+            SurveyStreamArtifactRoot::open(&root).expect("dedicated artifact area opens");
 
-        let session_name = format!("{}-stdout.raw", eliot_contracts::sha256_hex(b"test-session-stdout"));
+        let session_name = format!(
+            "{}-stdout.raw",
+            eliot_contracts::sha256_hex(b"test-session-stdout")
+        );
         let mut stdout = artifact_root
             .create_stream_file(&session_name)
             .expect("stdout artifact is newly created");
@@ -740,13 +733,19 @@ mod tests {
             .readback(64, true)
             .expect("stdout bytes are read back from the same file");
         assert_eq!(readback.byte_length, 13);
-        assert_eq!(readback.sha256, eliot_contracts::sha256_hex(b"survey output"));
+        assert_eq!(
+            readback.sha256,
+            eliot_contracts::sha256_hex(b"survey output")
+        );
         let repeated_readback = stdout
             .readback(64, true)
             .expect("finalized stdout remains readable through its retained read handle");
         assert_eq!(repeated_readback, readback);
 
-        let empty_session = format!("{}-stderr.raw", eliot_contracts::sha256_hex(b"test-session-empty"));
+        let empty_session = format!(
+            "{}-stderr.raw",
+            eliot_contracts::sha256_hex(b"test-session-empty")
+        );
         let mut empty = artifact_root
             .create_stream_file(&empty_session)
             .expect("empty stderr artifact is newly created");
@@ -768,9 +767,12 @@ mod tests {
         let path = owned_root();
         let root = UserOwnedRootReadLease::open_existing(&path)
             .expect("test owner root readback succeeds");
-        let artifact_root = SurveyStreamArtifactRoot::open(&root)
-            .expect("dedicated artifact area opens");
-        let file_name = format!("{}-stdout.raw", eliot_contracts::sha256_hex(b"pending-recovery"));
+        let artifact_root =
+            SurveyStreamArtifactRoot::open(&root).expect("dedicated artifact area opens");
+        let file_name = format!(
+            "{}-stdout.raw",
+            eliot_contracts::sha256_hex(b"pending-recovery")
+        );
         let file_path = artifact_root.inner.artifact_path.join(&file_name);
         let append_file = create_new_append_artifact(
             &file_path,
@@ -787,7 +789,7 @@ mod tests {
         pending.insert(
             file_name.clone(),
             PendingArtifactHandles {
-                append_file: Some(append_file),
+                append: Some(append_file),
                 ..PendingArtifactHandles::default()
             },
         );
@@ -804,7 +806,10 @@ mod tests {
             .readback(64, true)
             .expect("reconciled file is flushed and read back");
         assert_eq!(readback.byte_length, 16);
-        assert_eq!(readback.sha256, eliot_contracts::sha256_hex(b"reconciled bytes"));
+        assert_eq!(
+            readback.sha256,
+            eliot_contracts::sha256_hex(b"reconciled bytes")
+        );
 
         drop(recovered);
         drop(artifact_root);
@@ -817,12 +822,14 @@ mod tests {
         let path = owned_root();
         let root = UserOwnedRootReadLease::open_existing(&path)
             .expect("test owner root readback succeeds");
-        let artifact_root = SurveyStreamArtifactRoot::open(&root)
-            .expect("dedicated artifact area opens");
-        let file_name = format!("{}-stdout.raw", eliot_contracts::sha256_hex(b"foreign-existing-session"));
+        let artifact_root =
+            SurveyStreamArtifactRoot::open(&root).expect("dedicated artifact area opens");
+        let file_name = format!(
+            "{}-stdout.raw",
+            eliot_contracts::sha256_hex(b"foreign-existing-session")
+        );
         let foreign_path = artifact_root.inner.artifact_path.join(&file_name);
-        std::fs::write(&foreign_path, b"foreign bytes")
-            .expect("foreign file fixture is created");
+        std::fs::write(&foreign_path, b"foreign bytes").expect("foreign file fixture is created");
         assert!(matches!(
             artifact_root.create_stream_file(&file_name),
             Err(SurveyStreamArtifactError::ExistingArtifact),

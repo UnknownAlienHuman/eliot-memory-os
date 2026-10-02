@@ -12,23 +12,22 @@ use std::collections::BTreeMap;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     CanonicalWriteEnvelope, CompositionReadiness, GovernorComposition, KernelGenerationPort,
+    KernelTransitionPort,
 };
 use eliot_installation::{
     INSTALLATION_SURVEY_PROBE_OPERATION, InstallationSurveyProbeRequest,
     InstallationSurveyProbeResult, ManagedEnvironmentAction,
 };
 use eliot_protocol::{
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestKind,
-    HostRequestResultBody, HostRequestResultClass, HostRequestResultLineage, LocalReadAttempt,
-    host_request_operation_id,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestKind, HostRequestResultBody,
+    HostRequestResultClass, HostRequestResultLineage, LocalReadAttempt, host_request_operation_id,
 };
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
-    operation_manifest_set_digest, validate_store_receipt_envelope, CanonicalReadClient,
-    EVIDENCE_PACK_MAX_RECORDS,
+    CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, EffectClass, EventProjectionRelationIntents,
+    NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OrderingHead, OrderingHeadExpectation, OrderingScopeId, ReadConsistency,
+    ScopeId, SecurityContext, TransitionClass, WriteReceipt, WriteReceiptStatus,
+    generated_operation_manifests, operation_manifest_set_digest, validate_store_receipt_envelope,
 };
 
 use crate::capability_evidence_wiring::commit_leg_identity;
@@ -55,7 +54,9 @@ pub(super) fn decode_original_survey_request(
     let tool_bytes = canonical_json_bytes(tool)
         .map_err(|error| format!("installation survey tool cannot be canonicalized: {error}"))?;
     if sha256_hex(&tool_bytes) != envelope.identity.payload_sha256 {
-        return Err("installation survey tool does not match the admitted envelope payload".to_owned());
+        return Err(
+            "installation survey tool does not match the admitted envelope payload".to_owned(),
+        );
     }
     eliot_installation::decode_installation_survey_observation(tool)
         .map_err(|error| format!("decode original installation survey request: {error}"))?
@@ -292,29 +293,37 @@ where
             .as_deref()
             .is_some_and(|session| session != attempt.session_id.as_str())
     {
-        return Err("installation observation is not bound to the original admitted observe attempt".to_owned());
+        return Err(
+            "installation observation is not bound to the original admitted observe attempt"
+                .to_owned(),
+        );
     }
     let governor_fence = governor.kernel_snapshot().state_fence();
     let live_fence = reads.kernel().kernel_fence();
-    if envelope.state_fence != *governor_fence || live_fence != *governor_fence {
-        return Err("installation observation Governor, Kernel and host fences do not match".to_owned());
+    if envelope.state_fence != governor_fence || live_fence != governor_fence {
+        return Err(
+            "installation observation Governor, Kernel and host fences do not match".to_owned(),
+        );
     }
 
-    let selected_scope = envelope
-        .identity
-        .work_scope_id
-        .as_deref()
-        .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
-        })
-        .ok_or_else(|| "installation observation has no admitted work-scope or session".to_owned())?;
+    let selected_scope =
+        envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
+            .or_else(|| {
+                envelope.identity.session_id.as_deref().filter(|scope| {
+                    !scope.trim().is_empty() && !scope.chars().any(char::is_control)
+                })
+            })
+            .ok_or_else(|| {
+                "installation observation has no admitted work-scope or session".to_owned()
+            })?;
     if selected_scope != attempt.scope_id {
-        return Err("installation observation attempt does not bind the admitted host scope".to_owned());
+        return Err(
+            "installation observation attempt does not bind the admitted host scope".to_owned(),
+        );
     }
     ScopeId::new(selected_scope.to_owned())
         .map_err(|error| format!("installation observation scope: {error}"))
@@ -355,14 +364,18 @@ pub(super) async fn read_ordering_head(
     response
         .validate()
         .map_err(|error| format!("installation observation ordering-head shape: {error}"))?;
-    if response.operation != NamedReadOperation::GetOrderingHeads || response.state_fence != *fence {
-        return Err("installation observation ordering-head read changed operation or fence".to_owned());
+    if response.operation != NamedReadOperation::GetOrderingHeads || response.state_fence != *fence
+    {
+        return Err(
+            "installation observation ordering-head read changed operation or fence".to_owned(),
+        );
     }
     let heads: Vec<OrderingHead> = serde_json::from_value(response.payload)
         .map_err(|error| format!("decode installation observation ordering heads: {error}"))?;
     for head in &heads {
-        head.validate()
-            .map_err(|error| format!("installation observation ordering head is invalid: {error}"))?;
+        head.validate().map_err(|error| {
+            format!("installation observation ordering head is invalid: {error}")
+        })?;
     }
     let ordering_scope = OrderingScopeId::new(format!("scope:{}", scope.as_str()))
         .map_err(|error| format!("installation observation ordering scope: {error}"))?;
@@ -390,22 +403,29 @@ pub(super) fn ordering_head_from_receipt(
         .validate()
         .map_err(|error| format!("reconciled installation receipt is malformed: {error}"))?;
     if receipt.status != WriteReceiptStatus::Committed || receipt.state_fence != *fence {
-        return Err("reconciled installation receipt is not committed at the live fence".to_owned());
+        return Err(
+            "reconciled installation receipt is not committed at the live fence".to_owned(),
+        );
     }
     let ordering_scope = OrderingScopeId::new(format!("scope:{}", scope.as_str()))
         .map_err(|error| format!("installation observation ordering scope: {error}"))?;
     if receipt.ordering_sequences.len() != 1 {
-        return Err("reconciled installation receipt does not carry one exact ordering head".to_owned());
+        return Err(
+            "reconciled installation receipt does not carry one exact ordering head".to_owned(),
+        );
     }
     let head = receipt
         .ordering_sequences
         .iter()
         .find(|head| head.scope == ordering_scope)
         .ok_or_else(|| "reconciled installation receipt names another ordering scope".to_owned())?;
-    head.validate()
-        .map_err(|error| format!("reconciled installation receipt ordering head is invalid: {error}"))?;
+    head.validate().map_err(|error| {
+        format!("reconciled installation receipt ordering head is invalid: {error}")
+    })?;
     if head.state_fence != *fence {
-        return Err("reconciled installation receipt ordering head belongs to another fence".to_owned());
+        return Err(
+            "reconciled installation receipt ordering head belongs to another fence".to_owned(),
+        );
     }
     let expected_sequence = original_ordering_predecessor(head.sequence)?;
     Ok(OrderingHeadExpectation {
@@ -461,8 +481,7 @@ fn validate_evidence_pack(
     response
         .validate()
         .map_err(|error| format!("installation observation evidence-pack shape: {error}"))?;
-    if response.operation != NamedReadOperation::GetEvidencePack || response.state_fence != *fence
-    {
+    if response.operation != NamedReadOperation::GetEvidencePack || response.state_fence != *fence {
         return Err("installation observation evidence pack changed operation or fence".to_owned());
     }
     let records = response.payload["records"]
@@ -474,18 +493,19 @@ fn validate_evidence_pack(
         || response.payload["scope_id"] != scope.as_str()
         || response.payload["provenance"]["truncated"] != false
         || records.is_empty()
-        || response.payload["provenance"]["returned"].as_u64()
-            != Some(records.len() as u64)
-        || response.payload["provenance"]["matched_total"].as_u64()
-            != Some(records.len() as u64)
+        || response.payload["provenance"]["returned"].as_u64() != Some(records.len() as u64)
+        || response.payload["provenance"]["matched_total"].as_u64() != Some(records.len() as u64)
         || response.payload["provenance"]["state_fence"] != serde_json::json!(fence)
-        || records.iter().any(|row| {
-            row["operation"] != "CaptureObservation" || row["parameters"] != parameters
-        })
+        || records
+            .iter()
+            .any(|row| row["operation"] != "CaptureObservation" || row["parameters"] != parameters)
         || command.operation != NamedMutationOperation::CaptureObservation
-        || command.parameters != BTreeMap::from([("subject".to_owned(), serde_json::json!(subject))])
+        || command.parameters
+            != BTreeMap::from([("subject".to_owned(), serde_json::json!(subject))])
     {
-        return Err("installation observation evidence pack is incomplete or substituted".to_owned());
+        return Err(
+            "installation observation evidence pack is incomplete or substituted".to_owned(),
+        );
     }
     Ok(())
 }
@@ -493,7 +513,7 @@ fn validate_evidence_pack(
 fn validate_capture_receipt(
     receipt: &WriteReceipt,
     identity: &eliot_protocol::RequestIdentity,
-    prepared: &eliot_canonical::PreparedTransition,
+    prepared: &eliot_store_api::PreparedTransition,
     operation_id: &OperationId,
     idempotency_key: &str,
     manifest_digest: &eliot_store_api::OperationManifestDigest,
@@ -502,8 +522,11 @@ fn validate_capture_receipt(
     receipt
         .validate()
         .map_err(|error| format!("installation observation receipt is malformed: {error}"))?;
-    validate_store_receipt_envelope(&identity.request.metadata, prepared, receipt)
-        .map_err(|error| format!("installation observation receipt does not bind its prepared write: {error}"))?;
+    validate_store_receipt_envelope(&identity.request.metadata, prepared, receipt).map_err(
+        |error| {
+            format!("installation observation receipt does not bind its prepared write: {error}")
+        },
+    )?;
     if receipt.status != WriteReceiptStatus::Committed
         || receipt.operation_id != *operation_id
         || receipt.idempotency_key != idempotency_key
@@ -513,7 +536,9 @@ fn validate_capture_receipt(
         || receipt.state_fence != *fence
         || receipt.envelope.is_none()
     {
-        return Err("installation observation receipt does not match the original capture".to_owned());
+        return Err(
+            "installation observation receipt does not match the original capture".to_owned(),
+        );
     }
     Ok(())
 }
@@ -522,8 +547,8 @@ fn validate_capture_receipt(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        PriorRuntimeScopeChange, capture_operation_identity,
-        decide_prior_runtime_scope_change, validate_result_hashes,
+        PriorRuntimeScopeChange, capture_operation_identity, decide_prior_runtime_scope_change,
+        validate_result_hashes,
     };
     use eliot_installation::{
         InstallationSurveyProbeRequest, InstallationSurveyProbeResult,
@@ -556,11 +581,12 @@ mod tests {
     fn installation_survey_capture_reconciles_the_exact_original_observation() {
         let first = capture_operation_identity("hostreq:first", &result()).expect("identity");
         let replay = capture_operation_identity("hostreq:first", &result()).expect("replay");
-        let other_request = capture_operation_identity("hostreq:second", &result()).expect("other request");
+        let other_request =
+            capture_operation_identity("hostreq:second", &result()).expect("other request");
         let mut changed_result = result();
         changed_result.runtime_hash = Some("c".repeat(64));
-        let other_bytes = capture_operation_identity("hostreq:first", &changed_result)
-            .expect("changed result");
+        let other_bytes =
+            capture_operation_identity("hostreq:first", &changed_result).expect("changed result");
 
         assert_eq!(first, replay);
         assert_ne!(first, other_request);

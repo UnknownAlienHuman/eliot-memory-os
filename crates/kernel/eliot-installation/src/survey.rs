@@ -27,11 +27,11 @@
 //! `I3.15` keeps the `InstallationTransaction` the single installation owner.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use eliot_platform_windows::{FileVersionObservation, FileVersionOutcome};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use eliot_platform_windows::{FileVersionObservation, FileVersionOutcome};
 
 use super::{
     InstallationError, IntegrationCategory, IntegrationDiscoveryCatalogue,
@@ -157,13 +157,13 @@ impl SurveyInputObservation {
                         .to_owned(),
                 });
             }
-            if let Some(digest) = &file_version.sha256 {
-                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    return Err(InstallationError::InvalidField {
-                        field: "survey.observation.file_version.sha256".to_owned(),
-                        reason: "must be a retained SHA-256 digest".to_owned(),
-                    });
-                }
+            if let Some(digest) = &file_version.sha256
+                && (digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "survey.observation.file_version.sha256".to_owned(),
+                    reason: "must be a retained SHA-256 digest".to_owned(),
+                });
             }
             match &file_version.outcome {
                 FileVersionOutcome::Present { .. } | FileVersionOutcome::Absent => {
@@ -174,9 +174,7 @@ impl SurveyInputObservation {
                         ));
                     }
                 }
-                FileVersionOutcome::NotFound
-                    if self.outcome != SurveyStageOutcome::NotFound =>
-                {
+                FileVersionOutcome::NotFound if self.outcome != SurveyStageOutcome::NotFound => {
                     return Err(InstallationError::IncompleteObservation(
                         "a missing image must remain a missing identity-stage input".to_owned(),
                     ));
@@ -304,21 +302,24 @@ pub struct SurveyProbeAnswer {
     pub answer: PlatformHandle,
 }
 
-/// A metadata-only source of installation survey observations.
+/// Sealed owner of read-only, metadata-only observations for an installation survey.
 ///
-/// Implementations read existing platform metadata. They do not execute a
+/// Implementations inspect existing platform metadata. They do not execute a
 /// discovered program, mutate the environment or write to the filesystem:
-/// finding a name in PATH is not permission to run it.
-///
-/// The three methods are the first three stages of [`SurveyStage::ORDER`].
-/// There is deliberately no method for `AdmittedSafeProbe`, because this
-/// coordinator has no execution port to call.
+/// finding a name in PATH is not permission to run it. The three methods are
+/// the first three stages of [`SurveyStage::ORDER`]. There is deliberately no
+/// method for `AdmittedSafeProbe`, because this coordinator has no execution
+/// port to call.
 pub(crate) mod observation_source_sealed {
     /// Private supertrait that prevents arbitrary external observations from
     /// being promoted into an accepted installation survey.
     pub trait Sealed {}
 }
 
+/// A metadata-only source of installation survey observations.
+///
+/// The sealed interface only accepts observations collected without executing
+/// discovered programs or changing the surveyed environment.
 #[allow(private_bounds)]
 pub trait SurveyObservationSource: observation_source_sealed::Sealed {
     /// Inspects known configuration paths and manifests.
@@ -370,7 +371,12 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
             .iter()
             .map(|input| {
                 let Some(path) = absolute_location(input) else {
-                    return Ok(observation(input.clone(), SurveyStageOutcome::Withheld, None, None));
+                    return Ok(observation(
+                        input.clone(),
+                        SurveyStageOutcome::Withheld,
+                        None,
+                        None,
+                    ));
                 };
                 let outcome = match std::fs::symlink_metadata(path) {
                     Ok(metadata) if metadata.file_type().is_symlink() => SurveyStageOutcome::Denied,
@@ -400,7 +406,12 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
             .map(|input| {
                 let names = executable_basenames(input);
                 if names.is_empty() {
-                    return Ok(observation(input.clone(), SurveyStageOutcome::Withheld, None, None));
+                    return Ok(observation(
+                        input.clone(),
+                        SurveyStageOutcome::Withheld,
+                        None,
+                        None,
+                    ));
                 }
                 let mut matches = Vec::new();
                 let mut denied = false;
@@ -415,9 +426,7 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
                                 matches.push(candidate);
                             }
                             Ok(_) => {}
-                            Err(error)
-                                if error.kind() == std::io::ErrorKind::PermissionDenied =>
-                            {
+                            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                                 denied = true;
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -447,26 +456,25 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
         let mut unresolved = Vec::new();
         for location in &entry.known_locations {
             if let Some(path) = absolute_location(location) {
-                if !executable_basenames(location).is_empty() {
-                    candidates.insert(path.to_path_buf());
-                } else {
+                if executable_basenames(location).is_empty() {
                     unresolved.push(location.clone());
+                } else {
+                    candidates.insert(path.to_path_buf());
                 }
                 continue;
             }
             let names = executable_basenames(location);
-            if !names.is_empty() {
-                unresolved.push(location.clone());
-                for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-                    for name in &names {
-                        let candidate = root.join(name);
-                        if std::fs::symlink_metadata(&candidate).is_ok() {
-                            candidates.insert(candidate);
-                        }
+            unresolved.push(location.clone());
+            if names.is_empty() {
+                continue;
+            }
+            for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                for name in &names {
+                    let candidate = root.join(name);
+                    if std::fs::symlink_metadata(&candidate).is_ok() {
+                        candidates.insert(candidate);
                     }
                 }
-            } else {
-                unresolved.push(location.clone());
             }
         }
 
@@ -494,9 +502,11 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
             .collect::<Result<Vec<_>, _>>()?;
         unresolved.sort();
         unresolved.dedup();
-        observations.extend(unresolved.into_iter().map(|input| {
-            observation(input, SurveyStageOutcome::Withheld, None, None)
-        }));
+        observations.extend(
+            unresolved
+                .into_iter()
+                .map(|input| observation(input, SurveyStageOutcome::Withheld, None, None)),
+        );
         Ok(observations)
     }
 }
@@ -510,7 +520,10 @@ fn executable_basenames(input: &PlatformHandle) -> Vec<std::ffi::OsString> {
     let Some(name) = Path::new(input.as_str()).file_name() else {
         return Vec::new();
     };
-    match Path::new(name).extension().map(|value| value.to_string_lossy()) {
+    match Path::new(name)
+        .extension()
+        .map(|value| value.to_string_lossy())
+    {
         Some(extension)
             if extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com") =>
         {
@@ -573,25 +586,25 @@ struct IdentityObservationFailure {
 fn inspect_executable_identity(
     path: &Path,
 ) -> Result<(PlatformHandle, PlatformHandle, FileVersionObservation), IdentityObservationFailure> {
-
     use eliot_platform_windows::{
         AuthenticodeVerifier as _, WindowsAuthenticodeVerifier, observe_file_version,
     };
     use sha2::{Digest as _, Sha256};
 
     let file_version = observe_file_version(path);
-    let file_id = file_version.file_identity.ok_or_else(|| {
-        IdentityObservationFailure {
+    let file_id = file_version
+        .file_identity
+        .ok_or_else(|| IdentityObservationFailure {
             stage_outcome: file_version_stage_outcome(&file_version.outcome),
             file_version: file_version.clone(),
-        }
-    })?;
-    let sha256 = file_version.sha256.as_deref().ok_or_else(|| {
-        IdentityObservationFailure {
+        })?;
+    let sha256 = file_version
+        .sha256
+        .as_deref()
+        .ok_or_else(|| IdentityObservationFailure {
             stage_outcome: file_version_stage_outcome(&file_version.outcome),
             file_version: file_version.clone(),
-        }
-    })?;
+        })?;
     if !matches!(
         &file_version.outcome,
         FileVersionOutcome::Present { .. } | FileVersionOutcome::Absent
@@ -601,11 +614,10 @@ fn inspect_executable_identity(
             file_version,
         });
     }
-    let canonical_path = std::fs::canonicalize(path)
-        .map_err(|_| IdentityObservationFailure {
-            stage_outcome: SurveyStageOutcome::Unreadable,
-            file_version: file_version.clone(),
-        })?;
+    let canonical_path = std::fs::canonicalize(path).map_err(|_| IdentityObservationFailure {
+        stage_outcome: SurveyStageOutcome::Unreadable,
+        file_version: file_version.clone(),
+    })?;
     let signature = WindowsAuthenticodeVerifier
         .verify(&canonical_path, file_id, sha256)
         .map_err(|_| IdentityObservationFailure {
@@ -622,9 +634,7 @@ fn inspect_executable_identity(
         .unwrap_or("unsigned");
     let identity = format!(
         "windows-file:v1:{canonical_path_digest}:{:08x}:{:016x}:{sha256}:{:?}:{signer}",
-        file_id.volume_serial_number,
-        file_id.file_index,
-        signature.verdict,
+        file_id.volume_serial_number, file_id.file_index, signature.verdict,
     );
     let evidence = format!(
         "survey-evidence:v1:{canonical_path_digest}:{sha256}:{:?}:{signer}",
@@ -644,7 +654,9 @@ fn inspect_executable_identity(
 
 fn file_version_stage_outcome(outcome: &FileVersionOutcome) -> SurveyStageOutcome {
     match outcome {
-        FileVersionOutcome::Present { .. } | FileVersionOutcome::Absent => SurveyStageOutcome::Found,
+        FileVersionOutcome::Present { .. } | FileVersionOutcome::Absent => {
+            SurveyStageOutcome::Found
+        }
         FileVersionOutcome::NotFound => SurveyStageOutcome::NotFound,
         FileVersionOutcome::Denied => SurveyStageOutcome::Denied,
         FileVersionOutcome::Unreadable => SurveyStageOutcome::Unreadable,
@@ -690,7 +702,6 @@ impl InstallationSurvey {
     /// Validates stage order, coverage partitioning, alias ordering and the
     /// probe-stage candidate correspondence.
     pub fn validate(&self) -> Result<(), InstallationError> {
-        let _source_seal = self.source_seal;
         handle(&self.catalogue_origin, "survey.catalogue_origin")?;
         if self.catalogue_revision == 0 {
             return Err(InstallationError::InvalidField {
@@ -968,6 +979,10 @@ fn aggregate_outcome(result: &SurveyStageResult) -> SurveyStageOutcome {
 impl SurveyStageResult {
     /// Validates that the buckets partition the stage's inputs and that the
     /// recorded outcome is the one those buckets imply.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all stage input observations and coverage buckets must be checked against one partition invariant"
+    )]
     pub fn validate(&self) -> Result<(), InstallationError> {
         if self.stage == SurveyStage::AdmittedSafeProbe {
             if !self.observations.is_empty() {
@@ -997,8 +1012,7 @@ impl SurveyStageResult {
         observed_evidence.sort_unstable();
         if observed_evidence != self.evidence {
             return Err(InstallationError::IncompleteObservation(
-                "survey evidence handles do not match the retained input observations"
-                    .to_owned(),
+                "survey evidence handles do not match the retained input observations".to_owned(),
             ));
         }
         if self.stage != SurveyStage::AdmittedSafeProbe {
@@ -1014,8 +1028,7 @@ impl SurveyStageResult {
                 };
                 if !bucket.contains(&observation.input) {
                     return Err(InstallationError::IncompleteObservation(
-                        "survey observation outcome does not match its coverage bucket"
-                            .to_owned(),
+                        "survey observation outcome does not match its coverage bucket".to_owned(),
                     ));
                 }
             }
@@ -1114,9 +1127,7 @@ impl SurveyStageResult {
 /// identity only because the source reported that exact pairing, so two
 /// observations sharing a name or a directory but reporting different
 /// identities remain distinct installations.
-fn coalesce_candidates(
-    identity_observations: &[SurveyInputObservation],
-) -> Vec<SurveyCandidate> {
+fn coalesce_candidates(identity_observations: &[SurveyInputObservation]) -> Vec<SurveyCandidate> {
     let mut aliases: BTreeMap<PlatformHandle, BTreeSet<PlatformHandle>> = BTreeMap::new();
     for observation in identity_observations {
         let Some(observed_identity) = &observation.observed_identity else {
@@ -1221,6 +1232,7 @@ mod direct_tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn identity_aliases_coalesce_but_probe_provenance_stays_withheld() {
         let identity = PlatformHandle::new("candidate-identity").expect("valid identity");
         let first = PlatformHandle::new("C:\\tools\\one.exe").expect("valid input");
@@ -1250,6 +1262,7 @@ mod direct_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn absent_version_resource_and_file_proof_survive_stage_reduction() {
         let input = PlatformHandle::new("C:\\tools\\unversioned.exe").expect("valid input");
         let identity = PlatformHandle::new("candidate-identity").expect("valid identity");
@@ -1279,6 +1292,8 @@ mod direct_tests {
         assert_eq!(result.outcome, SurveyStageOutcome::Found);
         assert_eq!(result.found, vec![input]);
         assert_eq!(result.observations[0].file_version, Some(file_version));
-        result.validate().expect("retained observations match buckets");
+        result
+            .validate()
+            .expect("retained observations match buckets");
     }
 }

@@ -318,6 +318,7 @@ fn real_executor_path_proof(
         executable,
         working_directory,
         lease: Arc::new(lease),
+        survey_probe: None,
     }
 }
 

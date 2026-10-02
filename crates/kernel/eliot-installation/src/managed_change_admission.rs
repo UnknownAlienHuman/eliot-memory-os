@@ -5,7 +5,7 @@
 //! accepted-survey seam. Before each effect, its method re-reads the retained
 //! signed configuration bytes, re-matches the exact approval, resolves the
 //! current typed recipe, re-runs the ordered survey through the same sealed
-//! observation source, and confirms the durable PortableDev root binding.
+//! observation source, and confirms the durable `PortableDev` root binding.
 //! Holding the carrier is not permission to skip that check or to report a
 //! successful probe.
 
@@ -18,8 +18,8 @@ use super::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, InstallationError, InstallationProfile,
     InstallationTransactionStore, ManagedChangeAdmissionError, ManagedChangeApproval,
     ManagedEffectRecipe, ManagedEnvironmentChangePlan, PlatformHandle, SurveyObservationSource,
-    VerifiedSetupBinding,
-    WindowsPathIdentity, revalidate_managed_change_plan, survey_accepted_installation,
+    VerifiedSetupBinding, WindowsPathIdentity, revalidate_managed_change_plan,
+    survey_accepted_installation,
 };
 
 /// One accepted request and its exact signed plan, carried to the existing
@@ -88,7 +88,8 @@ impl AcceptedManagedChange {
         source: &dyn SurveyObservationSource,
     ) -> Result<(), ManagedChangeAdmissionError> {
         let _admitted = rederive_accepted_plan(&self.plan, context, source)?;
-        let current_root = managed_tools_root(context.authority, context.store, context.transaction_id)?;
+        let current_root =
+            managed_tools_root(context.authority, context.store, context.transaction_id)?;
         if !same_windows_root(&current_root, &self.managed_tools_root)? {
             return Err(InstallationError::IdentityConflict.into());
         }
@@ -128,7 +129,7 @@ pub struct RequalificationBinding {
 /// current signed catalogue and surveys its current family. The optional probe
 /// is resolved only for a native identity that the current catalogue survey
 /// observed; retaining this carrier does not execute that probe.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CompletedManagedChangeRequalification {
     result: super::InstallationSurveyProbeResult,
     probe: Option<super::BoundedProbeInvocation>,
@@ -158,6 +159,10 @@ impl CompletedManagedChangeRequalification {
 /// Registration and reconfiguration can retain the original fingerprint only
 /// when the current survey proves that exact original identity, path and hash.
 /// The recorded plan is never recompiled or rewritten.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live requalification must keep original transaction, signed approval, survey and readback joins together"
+)]
 pub fn requalify_completed_managed_change(
     context: &AcceptedCatalogueContext<'_>,
     source: &dyn SurveyObservationSource,
@@ -195,7 +200,13 @@ pub fn requalify_completed_managed_change(
                 request: retained_request,
                 recipe,
                 ..
-            } => Some((index, effect_id, accepted_plan_json, retained_request, recipe)),
+            } => Some((
+                index,
+                effect_id,
+                accepted_plan_json,
+                retained_request,
+                recipe,
+            )),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -204,7 +215,8 @@ pub fn requalify_completed_managed_change(
     else {
         return Err(InstallationError::IdentityConflict.into());
     };
-    if *retained_request != request || recipe.action != request.action
+    if *retained_request != request
+        || recipe.action != request.action
         || recipe.target_family != request.target_family
     {
         return Err(InstallationError::IdentityConflict.into());
@@ -229,74 +241,73 @@ pub fn requalify_completed_managed_change(
     {
         return Err(InstallationError::IdentityConflict.into());
     }
-    let previous_observation = transaction
-        .completed_managed_target_executable_observation(effect_id)?;
+    let previous_observation =
+        transaction.completed_managed_target_executable_observation(effect_id)?;
     let previous_runtime_hash = previous_observation
         .as_ref()
         .map(|(_, _, sha256)| sha256.as_str().to_owned());
 
     let live = survey_accepted_installation(context, source)?;
     let accepted = &live.accepted;
-    accepted.require_approval(
-        request,
-        context.authority,
-        super::wall_clock_millis(),
-    )?;
+    accepted.require_approval(request, context.authority, super::wall_clock_millis())?;
     let family = live
         .survey
-        .families()
+        .families
         .iter()
         .find(|family| family.family_id == request.target_family)
-        .ok_or_else(|| InstallationError::IncompleteObservation(
-            "the completed change family was not covered by the live survey".to_owned(),
-        ))?;
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "the completed change family was not covered by the live survey".to_owned(),
+            )
+        })?;
     let current_family_id = &request.target_family;
     let coverage_gaps = survey_coverage_gaps(family);
 
-    let current_runtime_hash = match request.action {
-        super::ManagedEnvironmentAction::Install
-        | super::ManagedEnvironmentAction::Update
-        | super::ManagedEnvironmentAction::Repair => {
-            package_receipt_runtime_hash(progress.staging_receipt.as_ref(), recipe)?
-        }
-        super::ManagedEnvironmentAction::Register
-        | super::ManagedEnvironmentAction::Reconfigure => {
-            previous_observation.as_ref().and_then(|(identity, path, sha256)| {
-                surveyed_native_match(family, identity, path, sha256.as_str(), None)
-                    .then(|| sha256.as_str().to_owned())
-            })
-        }
-        super::ManagedEnvironmentAction::Remove => None,
-    };
+    let current_runtime_hash =
+        match request.action {
+            super::ManagedEnvironmentAction::Install
+            | super::ManagedEnvironmentAction::Update
+            | super::ManagedEnvironmentAction::Repair => {
+                package_receipt_runtime_hash(progress.staging_receipt.as_ref(), recipe)?
+            }
+            super::ManagedEnvironmentAction::Register
+            | super::ManagedEnvironmentAction::Reconfigure => previous_observation
+                .as_ref()
+                .and_then(|(identity, path, sha256)| {
+                    surveyed_native_match(family, identity, path, sha256.as_str(), None)
+                        .then(|| sha256.as_str().to_owned())
+                }),
+            super::ManagedEnvironmentAction::Remove => None,
+        };
 
-    let matched_identity = match request.action {
-        super::ManagedEnvironmentAction::Install
-        | super::ManagedEnvironmentAction::Update
-        | super::ManagedEnvironmentAction::Repair => current_runtime_hash
-            .as_ref()
-            .and_then(|_| progress.staging_receipt.as_ref())
-            .and_then(|receipt| receipt_survey_identity(family, receipt, recipe)),
-        super::ManagedEnvironmentAction::Register
-        | super::ManagedEnvironmentAction::Reconfigure => previous_observation
-            .as_ref()
-            .and_then(|(identity, path, sha256)| {
-                surveyed_native_match(family, identity, path, sha256.as_str(), None)
-                    .then(|| identity.clone())
-            }),
-        super::ManagedEnvironmentAction::Remove => None,
-    };
+    let matched_identity =
+        match request.action {
+            super::ManagedEnvironmentAction::Install
+            | super::ManagedEnvironmentAction::Update
+            | super::ManagedEnvironmentAction::Repair => current_runtime_hash
+                .as_ref()
+                .and(progress.staging_receipt.as_ref())
+                .and_then(|receipt| receipt_survey_identity(family, receipt, recipe)),
+            super::ManagedEnvironmentAction::Register
+            | super::ManagedEnvironmentAction::Reconfigure => previous_observation
+                .as_ref()
+                .and_then(|(identity, path, sha256)| {
+                    surveyed_native_match(family, identity, path, sha256.as_str(), None)
+                        .then(|| identity.clone())
+                }),
+            super::ManagedEnvironmentAction::Remove => None,
+        };
     let probe = if let Some(identity) = matched_identity.as_ref() {
         super::resolve_bounded_probe(accepted.catalogue(), current_family_id, identity)?
     } else {
         None
     };
-    let state = match matched_identity.as_ref() {
-        Some(_) => candidate_state(probe.as_ref(), coverage_gaps),
-        None => {
-            let mut missing = coverage_gaps;
-            missing.push(MissingQualification::TargetNotObservedInTheLiveSurvey);
-            unsupported_state(missing)
-        }
+    let state = if matched_identity.is_some() {
+        candidate_state(probe.as_ref(), coverage_gaps)
+    } else {
+        let mut missing = coverage_gaps;
+        missing.push(MissingQualification::TargetNotObservedInTheLiveSurvey);
+        unsupported_state(missing)
     };
     let category = family.category;
     let advertisement = ManagedCapabilityAdvertisement {
@@ -434,24 +445,22 @@ fn surveyed_native_match(
                 Path::new(observation.input.as_str()),
                 Path::new(expected_path.as_str()),
             )
-            && observation
-                .file_version
-                .as_ref()
-                .is_some_and(|version| {
-                    expected_file_identity.map_or(true, |expected| {
-                        version.file_identity.as_ref() == Some(expected)
-                    })
-                        && version
+            && observation.file_version.as_ref().is_some_and(|version| {
+                expected_file_identity
+                    .is_none_or(|expected| version.file_identity.as_ref() == Some(expected))
+                    && version
                         .sha256
                         .as_deref()
                         .is_some_and(|sha256| sha256.eq_ignore_ascii_case(expected_sha256))
-                })
+            })
     });
     matches.next().is_some() && matches.next().is_none()
 }
 
 /// Qualification gaps a live installation survey may report.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingQualification {
     /// This identity has no exact accepted bounded probe contract.
@@ -539,14 +548,15 @@ pub fn requalify_managed_capability(
     let plan = &accepted_change.plan;
     let accepted = live.accepted();
     let survey = live.survey();
-    let entry = accepted.catalogue().entry(plan.family_id())?;
     let family = survey
-        .families()
+        .families
         .iter()
         .find(|family| family.family_id == *plan.family_id())
-        .ok_or_else(|| InstallationError::IncompleteObservation(
-            "the requested family was not covered by the live survey".to_owned(),
-        ))?;
+        .ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "the requested family was not covered by the live survey".to_owned(),
+            )
+        })?;
     let missing_coverage = survey_coverage_gaps(family);
     let state = match plan.target_identity() {
         None if missing_coverage.is_empty() => ManagedCapabilityState {
@@ -555,19 +565,25 @@ pub fn requalify_managed_capability(
         },
         None => unsupported_state(missing_coverage),
         Some(identity) => {
-            let Some(candidate) = family
+            if !family
                 .candidates
                 .iter()
-                .find(|candidate| &candidate.observed_identity == identity)
-            else {
+                .any(|candidate| &candidate.observed_identity == identity)
+            {
                 return Ok(ManagedCapabilityAdvertisement {
                     family_id: plan.family_id().clone(),
                     category: family.category,
                     target_identity: Some(identity.clone()),
-                    state: unsupported_state(vec![MissingQualification::TargetNotObservedInTheLiveSurvey]),
-                    requalified_against: requalification_binding(accepted, survey, context.authority)?,
+                    state: unsupported_state(vec![
+                        MissingQualification::TargetNotObservedInTheLiveSurvey,
+                    ]),
+                    requalified_against: requalification_binding(
+                        accepted,
+                        survey,
+                        context.authority,
+                    )?,
                 });
-            };
+            }
             candidate_state(plan.target_probe(), missing_coverage)
         }
     };
@@ -584,21 +600,18 @@ fn candidate_state(
     probe: Option<&super::BoundedProbeInvocation>,
     mut missing: Vec<MissingQualification>,
 ) -> ManagedCapabilityState {
-    match probe {
-        Some(probe) => {
-            missing.push(MissingQualification::NotProbedByAnAdmittedExecutor);
-            sort_missing(&mut missing);
-            ManagedCapabilityState {
-                status: ManagedCapabilityStatus::Declared {
-                    probe_id: probe.probe_id.clone(),
-                },
-                missing,
-            }
+    if let Some(probe) = probe {
+        missing.push(MissingQualification::NotProbedByAnAdmittedExecutor);
+        sort_missing(&mut missing);
+        ManagedCapabilityState {
+            status: ManagedCapabilityStatus::Declared {
+                probe_id: probe.probe_id.clone(),
+            },
+            missing,
         }
-        None => {
-            missing.push(MissingQualification::NoBoundedProbeAdmittedForThisIdentity);
-            unsupported_state(missing)
-        }
+    } else {
+        missing.push(MissingQualification::NoBoundedProbeAdmittedForThisIdentity);
+        unsupported_state(missing)
     }
 }
 
@@ -607,7 +620,11 @@ fn survey_coverage_gaps(family: &super::SurveyFamilyReport) -> Vec<MissingQualif
     if family.stages.iter().any(|stage| !stage.invalid.is_empty()) {
         missing.push(MissingQualification::LiveSurveyInvalidInput);
     }
-    if family.stages.iter().any(|stage| !stage.unreadable.is_empty()) {
+    if family
+        .stages
+        .iter()
+        .any(|stage| !stage.unreadable.is_empty())
+    {
         missing.push(MissingQualification::LiveSurveyUnreadableInput);
     }
     if family.stages.iter().any(|stage| !stage.denied.is_empty()) {
@@ -615,12 +632,15 @@ fn survey_coverage_gaps(family: &super::SurveyFamilyReport) -> Vec<MissingQualif
     }
     if family.stages.iter().any(|stage| {
         !stage.not_covered.is_empty()
-            || (stage.stage != super::SurveyStage::AdmittedSafeProbe
-                && !stage.withheld.is_empty())
+            || (stage.stage != super::SurveyStage::AdmittedSafeProbe && !stage.withheld.is_empty())
     }) {
         missing.push(MissingQualification::LiveSurveyInputNotCovered);
     }
-    if family.stages.iter().any(|stage| !stage.ambiguous.is_empty()) {
+    if family
+        .stages
+        .iter()
+        .any(|stage| !stage.ambiguous.is_empty())
+    {
         missing.push(MissingQualification::AmbiguousIdentityInTheLiveSurvey);
     }
     sort_missing(&mut missing);
@@ -694,11 +714,12 @@ pub(crate) fn managed_tools_root(
             "portable managed-tool effects require PortableDev".to_owned(),
         ));
     }
-    let transaction = store
-        .load(transaction_id)?
-        .ok_or_else(|| InstallationError::TransactionNotFound {
-            transaction_id: transaction_id.as_str().to_owned(),
-        })?;
+    let transaction =
+        store
+            .load(transaction_id)?
+            .ok_or_else(|| InstallationError::TransactionNotFound {
+                transaction_id: transaction_id.as_str().to_owned(),
+            })?;
     transaction.validate()?;
     if transaction.transaction_id != *transaction_id
         || transaction.installation_epoch.installation.as_str() != authority.installation_id()
@@ -706,12 +727,11 @@ pub(crate) fn managed_tools_root(
     {
         return Err(InstallationError::IdentityConflict);
     }
-    let roots = transaction
-        .profile_governed_roots
-        .as_ref()
-        .ok_or_else(|| InstallationError::ProfileViolation(
+    let roots = transaction.profile_governed_roots.as_ref().ok_or_else(|| {
+        InstallationError::ProfileViolation(
             "managed tool effect requires the durable I3.1 root binding".to_owned(),
-        ))?;
+        )
+    })?;
     roots.validate(transaction.profile)?;
     if roots.runtime_state_roots.profile != authority.profile()
         || roots.runtime_state_roots.roots_digest != *authority.runtime_state_roots_digest()
@@ -739,9 +759,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn invalid_file_version_resource_remains_an_explicit_qualification_gap() {
-        let invalid_input = PlatformHandle::new("C:\\tools\\malformed.exe")
-            .expect("test input handle is valid");
+        let invalid_input =
+            PlatformHandle::new("C:\\tools\\malformed.exe").expect("test input handle is valid");
         let family = super::super::SurveyFamilyReport {
             family_id: PlatformHandle::new("family:test").expect("test family handle is valid"),
             category: super::super::IntegrationCategory::Toolchain,

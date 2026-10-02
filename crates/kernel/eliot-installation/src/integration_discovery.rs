@@ -28,12 +28,12 @@ use eliot_config::initial_snapshot::{
     InitialConfigSnapshotTrustAnchor, InitialSnapshotError, InitialSnapshotVerificationContext,
 };
 
-use super::setup_binding::profile_ref;
 use super::managed_effect_recipe::ManagedEffectRecipe;
+use super::setup_binding::profile_ref;
 use super::{
-    BoundedProbeInvocation, InstallationError, InstallationSurvey, PlatformHandle,
-    RedbInstallationTransactionStore, SurveyInputObservation, SurveyObservationSource,
-    SurveyStage, SurveyStageOutcome, VerifiedSetupBinding, handle, handles, text,
+    InstallationError, InstallationSurvey, PlatformHandle, RedbInstallationTransactionStore,
+    SurveyInputObservation, SurveyObservationSource, SurveyStage, SurveyStageOutcome,
+    VerifiedSetupBinding, handle, handles, text,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -41,8 +41,6 @@ pub(crate) struct WindowsPathIdentity {
     pub(crate) prefix: String,
     pub(crate) components: Vec<String>,
 }
-
-
 
 impl WindowsPathIdentity {
     pub(crate) fn parse_root(value: &str, field: &str) -> Result<Self, InstallationError> {
@@ -633,7 +631,10 @@ impl ManagedChangeApproval {
         for (value, field) in [
             (&self.catalogue_origin, "catalogue_origin"),
             (&self.approved_by, "approved_by"),
-            (&self.runtime_state_roots_digest, "runtime_state_roots_digest"),
+            (
+                &self.runtime_state_roots_digest,
+                "runtime_state_roots_digest",
+            ),
             (&self.snapshot_id, "snapshot_id"),
         ] {
             handle(value, field)?;
@@ -1094,7 +1095,9 @@ impl AcceptedIntegrationCatalogue {
             .approvals
             .iter()
             .find(|approval| approval.request.request_id == request.request_id)
-            .ok_or_else(|| ManagedChangeApprovalError::Missing(request.request_id.as_str().to_owned()))?;
+            .ok_or_else(|| {
+                ManagedChangeApprovalError::Missing(request.request_id.as_str().to_owned())
+            })?;
         if approval.request != *request
             || approval.catalogue_origin != self.catalogue.origin
             || approval.catalogue_revision != self.catalogue.revision
@@ -1224,13 +1227,16 @@ pub fn admit_installation_survey_and_compile_change(
         context.authority,
         super::wall_clock_millis(),
     )?;
-    let entry = admitted.accepted.catalogue().entry(&request.target_family)?;
-    let effect_recipe = entry
-        .managed_effect_for(request.action)
-        .ok_or_else(|| ManagedChangeAdmissionError::MissingEffectRecipe {
+    let entry = admitted
+        .accepted
+        .catalogue()
+        .entry(&request.target_family)?;
+    let effect_recipe = entry.managed_effect_for(request.action).ok_or_else(|| {
+        ManagedChangeAdmissionError::MissingEffectRecipe {
             family: request.target_family.as_str().to_owned(),
             action: request.action,
-        })?;
+        }
+    })?;
     if let Err(requirement) = effect_recipe.require_supported() {
         return Err(ManagedChangeAdmissionError::UnsupportedEffect(requirement));
     }
@@ -1332,7 +1338,7 @@ impl AcceptedInstallationSurvey {
 
         let mut families = self
             .survey
-            .families()
+            .families
             .iter()
             .filter(|family| family.family_id == invocation.family_id);
         let family = families.next()?;
@@ -1594,12 +1600,11 @@ fn decode_approval_setting(
         }
         .into());
     };
-    let set: ManagedChangeApprovalSet = serde_json::from_str(literal).map_err(|error| {
-        InstallationError::InvalidField {
+    let set: ManagedChangeApprovalSet =
+        serde_json::from_str(literal).map_err(|error| InstallationError::InvalidField {
             field: MANAGED_CHANGE_APPROVALS_SETTING_KEY.to_owned(),
             reason: format!("approval payload is not the current strict shape: {error}"),
-        }
-    })?;
+        })?;
     set.validate()?;
     if set
         .approvals
@@ -1665,15 +1670,17 @@ pub(crate) mod accepted_managed_change_tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::survey::observation_source_sealed;
     use crate::{
         GenerationPackagePlanInput, GenerationPackagePlanner, InstallationEpoch,
         InstallationProfile, InstallationTransaction, InstallationTransactionStore,
-        ManagedEnvironmentAction, ManagedEnvironmentChangeRequest,
-        ManagedEffectOperation, ManagedEffectPostcondition, ManagedResourceChange,
-        PackageArtifactDigest, RedbInstallationTransactionStore, SetupAdvanceInput,
-        SetupBinding, SetupEffectObservation, SetupKeyReference, SetupMilestone,
-        SurveyInputObservation, SurveyProbeAnswer, SurveyStage, SurveyStageOutcome,
-        admit_installation_survey_and_compile_change, verify_setup_binding,
+        ManagedEffectOperation, ManagedEffectPostcondition, ManagedEnvironmentAction,
+        ManagedEnvironmentChangeRequest, ManagedResourceChange, PackageArtifactDigest,
+        RedbInstallationTransactionStore, SetupAdvanceInput, SetupBinding, SetupEffectObservation,
+        SetupKeyReference, SetupMilestone, SurveyInputObservation, SurveyProbeAnswer, SurveyStage,
+        SurveyStageOutcome, WindowsInstallationCoordinator,
+        admit_installation_survey_and_compile_change, survey_installation, verify_setup_binding,
+        wall_clock_millis,
     };
 
     const INSTALLATION_ID: &str = "installation:managed-change-proof";
@@ -1683,6 +1690,7 @@ pub(crate) mod accepted_managed_change_tests {
     const PROFILE_GENERATION: &str = "candidate";
     const OBSERVED_PLATFORM: &str = "windows-x86_64";
 
+    #[allow(clippy::expect_used)]
     fn h(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value.into()).expect("test handle is valid")
     }
@@ -1691,18 +1699,27 @@ pub(crate) mod accepted_managed_change_tests {
         h(crate::sha256_hex(value))
     }
 
+    #[allow(clippy::expect_used)]
     fn minimal_pe() -> Vec<u8> {
         let pe_offset = 0x80_usize;
         let optional_size = 0xf0_usize;
         let section_end = pe_offset + 4 + 20 + optional_size + 40;
         let mut bytes = vec![0_u8; section_end];
         bytes[..2].copy_from_slice(b"MZ");
-        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[0x3c..0x40].copy_from_slice(
+            &u32::try_from(pe_offset)
+                .expect("fixture PE offset fits the image format")
+                .to_le_bytes(),
+        );
         bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
         let coff = pe_offset + 4;
         bytes[coff..coff + 2].copy_from_slice(&0x8664_u16.to_le_bytes());
         bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[coff + 16..coff + 18].copy_from_slice(&(optional_size as u16).to_le_bytes());
+        bytes[coff + 16..coff + 18].copy_from_slice(
+            &u16::try_from(optional_size)
+                .expect("fixture optional header size fits the image format")
+                .to_le_bytes(),
+        );
         bytes[coff + 18..coff + 20].copy_from_slice(&2_u16.to_le_bytes());
         bytes[coff + 20..coff + 22].copy_from_slice(&0x20b_u16.to_le_bytes());
         bytes
@@ -1728,11 +1745,12 @@ pub(crate) mod accepted_managed_change_tests {
 
     impl ManagedBundle {
         fn new() -> Self {
-            Self::with_executable_bytes(minimal_pe())
+            Self::with_executable_bytes(&minimal_pe())
         }
 
         /// Copies an existing Windows-signed image into a disposable bundle.
         /// The test reads and copies the image; the package path never executes it.
+        #[allow(clippy::expect_used)]
         fn new_system_signed_image() -> Self {
             let system_root = std::env::var_os("SystemRoot")
                 .expect("Windows exposes its system root to the signed-image fixture");
@@ -1740,30 +1758,29 @@ pub(crate) mod accepted_managed_change_tests {
             let bytes = std::fs::read(&image)
                 .expect("read the existing Windows-signed System32 image without executing it");
             assert!(!bytes.is_empty(), "the signed Windows image is non-empty");
-            Self::with_executable_bytes(bytes)
+            Self::with_executable_bytes(&bytes)
         }
 
-        fn with_executable_bytes(bytes: Vec<u8>) -> Self {
+        #[allow(clippy::expect_used)]
+        fn with_executable_bytes(bytes: &[u8]) -> Self {
             let directory = TempDir::new().expect("managed bundle directory");
-            std::fs::write(directory.path().join("codex.exe"), &bytes)
+            std::fs::write(directory.path().join("codex.exe"), bytes)
                 .expect("write test package executable");
             let source = TrustedSourceBundle::open(directory.path())
                 .expect("open exact managed source bundle");
             let identity = source.identity();
             let manifest = PackageManifest::new(
                 format!("{TARGET_FAMILY}/{PACKAGE_VERSION}"),
-                vec![PackageFileSpec::new(
-                    "codex.exe",
-                    true,
-                    bytes.len() as u64,
-                )
-                .expect("valid package file spec")],
+                vec![
+                    PackageFileSpec::new("codex.exe", true, bytes.len() as u64)
+                        .expect("valid package file spec"),
+                ],
             )
             .expect("valid one-file managed manifest");
             let expected_files = vec![PackageArtifactDigest {
                 relative_path: "codex.exe".to_owned(),
                 expected_size: bytes.len() as u64,
-                sha256: digest(&bytes),
+                sha256: digest(bytes),
             }];
             Self {
                 source: h(directory.path().to_string_lossy().into_owned()),
@@ -1780,7 +1797,7 @@ pub(crate) mod accepted_managed_change_tests {
                 action: ManagedEnvironmentAction::Install,
                 operation: ManagedEffectOperation::InstallPortableGeneration,
                 source_bundle: self.source.clone(),
-                source_bundle_identity: self.identity.clone(),
+                source_bundle_identity: self.identity,
                 target_family: h(TARGET_FAMILY),
                 package_version: h(PACKAGE_VERSION),
                 package_manifest: self.manifest.clone(),
@@ -1836,8 +1853,10 @@ pub(crate) mod accepted_managed_change_tests {
     /// Builds a non-staging managed child through the existing signed
     /// admission fixture so terminal-state tests reuse the real sealed plan
     /// path instead of manufacturing a serialized approval or recipe.
-    pub(crate) fn managed_registration_transaction_for_terminal_test(
-    ) -> ManagedRegistrationTransactionFixture {
+    // Keep each loud assertion in the fixture that establishes its provenance.
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
+    pub(crate) fn managed_registration_transaction_for_terminal_test()
+    -> ManagedRegistrationTransactionFixture {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
         let mut recipe = bundle.recipe();
@@ -1881,17 +1900,14 @@ pub(crate) mod accepted_managed_change_tests {
             .observations
             .iter()
             .find(|observation| {
-                observation.observed_identity.as_ref()
-                    == Some(&native_candidate.observed_identity)
+                observation.observed_identity.as_ref() == Some(&native_candidate.observed_identity)
             })
             .expect("native survey retains the candidate's exact path and file digest");
-        let native_sha256 = h(
-            native_observation
-                .file_version
-                .as_ref()
-                .and_then(|file_version| file_version.sha256.as_deref())
-                .expect("native survey measured the target file SHA-256"),
-        );
+        let native_sha256 = h(native_observation
+            .file_version
+            .as_ref()
+            .and_then(|file_version| file_version.sha256.as_deref())
+            .expect("native survey measured the target file SHA-256"));
         let target_executable_path = native_observation.input.clone();
         let fixture = signed_admission_fixture_with_recipe(
             &profile_root,
@@ -1917,8 +1933,8 @@ pub(crate) mod accepted_managed_change_tests {
         )
         .expect("construct the exact managed child through the transaction owner");
         let SignedAdmissionFixture {
-            _database_directory,
-            _planner_bundle,
+            database_directory,
+            _planner_bundle: planner_bundle,
             transaction_id,
             store,
             anchor,
@@ -1931,8 +1947,8 @@ pub(crate) mod accepted_managed_change_tests {
             _profile_root: profile_root,
             _bundle: bundle,
             _native_target_directory: native_target_directory,
-            _database_directory,
-            _planner_bundle,
+            _database_directory: database_directory,
+            _planner_bundle: planner_bundle,
             publication_transaction_id: transaction_id,
             store: Some(store),
             anchor,
@@ -1969,6 +1985,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     impl ManagedRegistrationTransactionFixture {
+        #[allow(clippy::expect_used)]
         pub(crate) fn mutate_native_target_and_revalidate(&self) -> bool {
             let Some(store) = self.store.as_ref() else {
                 return false;
@@ -1999,6 +2016,7 @@ pub(crate) mod accepted_managed_change_tests {
                 .is_err()
         }
 
+        #[allow(clippy::expect_used)]
         pub(crate) fn admit_and_drive(
             &mut self,
         ) -> (
@@ -2045,9 +2063,9 @@ pub(crate) mod accepted_managed_change_tests {
     /// test. The target image is copied from Windows without being executed.
     pub(crate) struct ManagedRepairCrashFixture {
         _profile_root: TempDir,
-        bundle: ManagedBundle,
+        _bundle: ManagedBundle,
         _native_target_directory: TempDir,
-        _database_directory: TempDir,
+        database_directory: TempDir,
         _planner_bundle: TempDir,
         publication_transaction_id: PlatformHandle,
         store: Option<RedbInstallationTransactionStore>,
@@ -2056,7 +2074,6 @@ pub(crate) mod accepted_managed_change_tests {
         _signed_snapshot: SignedInitialConfigSnapshot,
         observed_platform: PlatformHandle,
         pub(crate) anchor: InstallationTransaction,
-        pub(crate) install_request: ManagedEnvironmentChangeRequest,
         pub(crate) repair_request: ManagedEnvironmentChangeRequest,
         pub(crate) refusal_request: ManagedEnvironmentChangeRequest,
         pub(crate) accepted_install: crate::AcceptedManagedChange,
@@ -2065,14 +2082,16 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     impl ManagedRepairCrashFixture {
+        #[allow(clippy::expect_used)]
         pub(crate) fn take_store(&mut self) -> RedbInstallationTransactionStore {
             self.store.take().expect("fixture store is available once")
         }
 
         pub(crate) fn redb_path(&self) -> std::path::PathBuf {
-            self._database_directory.path().join("installation.redb")
+            self.database_directory.path().join("installation.redb")
         }
 
+        #[allow(clippy::expect_used)]
         pub(crate) fn reopen_store(&self) -> RedbInstallationTransactionStore {
             RedbInstallationTransactionStore::open_unpublished_stage_fixture_exact_path(
                 self.redb_path(),
@@ -2129,22 +2148,14 @@ pub(crate) mod accepted_managed_change_tests {
             &self,
             store: &RedbInstallationTransactionStore,
         ) -> Result<InstallationTransaction, InstallationError> {
-            self.transaction_for_change(
-                store,
-                &self.accepted_repair,
-                &self.repair_request,
-            )
+            self.transaction_for_change(store, &self.accepted_repair, &self.repair_request)
         }
 
         pub(crate) fn refusal_transaction(
             &self,
             store: &RedbInstallationTransactionStore,
         ) -> Result<InstallationTransaction, InstallationError> {
-            self.transaction_for_change(
-                store,
-                &self.accepted_refusal,
-                &self.refusal_request,
-            )
+            self.transaction_for_change(store, &self.accepted_refusal, &self.refusal_request)
         }
 
         fn transaction_for_change(
@@ -2167,7 +2178,8 @@ pub(crate) mod accepted_managed_change_tests {
                     .ok_or(InstallationError::IdentityConflict)?;
                 original.validate()?;
                 let receipt = crate::managed_change_execution::resolve_applied_managed_effect(
-                    &[original], generation,
+                    &[original],
+                    generation,
                 )?
                 .ok_or(InstallationError::IdentityConflict)?;
                 prior_receipts.push(receipt);
@@ -2183,12 +2195,13 @@ pub(crate) mod accepted_managed_change_tests {
             let family = tools.join(request.target_family.as_str());
             let mut prior_root_effects = Vec::new();
             for path in [tools.to_path_buf(), family] {
-                let root = PlatformHandle::new(path.to_string_lossy().into_owned()).map_err(
-                    |error| InstallationError::InvalidField {
-                        field: "managed_root.root".to_owned(),
-                        reason: error.to_string(),
-                    },
-                )?;
+                let root =
+                    PlatformHandle::new(path.to_string_lossy().into_owned()).map_err(|error| {
+                        InstallationError::InvalidField {
+                            field: "managed_root.root".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?;
                 prior_root_effects.push(
                     store
                         .managed_root_effect_proof(
@@ -2214,10 +2227,6 @@ pub(crate) mod accepted_managed_change_tests {
                 .managed_tools_root()
                 .join(&self.accepted_repair.recipe().package_manifest.generation)
         }
-
-        pub(crate) fn source_executable_path(&self) -> std::path::PathBuf {
-            Path::new(self.bundle.source.as_str()).join("codex.exe")
-        }
     }
 
     impl Drop for ManagedRepairCrashFixture {
@@ -2235,13 +2244,15 @@ pub(crate) mod accepted_managed_change_tests {
     /// The caller may supply another already-present native image for the
     /// pre-change observation before the signed snapshot and plan are made.
     /// Package staging still uses the fixture's signed `where.exe` source.
+    // This single fixture binds the pre-change target, signed publication, and
+    // both distinct owner approvals used by the lost-ack recovery proof.
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
     pub(crate) fn managed_repair_crash_fixture_with_prior_image(
         prior_image: Option<&[u8]>,
     ) -> ManagedRepairCrashFixture {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new_system_signed_image();
-        let native_target_directory =
-            TempDir::new().expect("native pre-change target directory");
+        let native_target_directory = TempDir::new().expect("native pre-change target directory");
         let target_bytes = match prior_image {
             Some(bytes) => bytes.to_vec(),
             None => std::fs::read(Path::new(bundle.source.as_str()).join("codex.exe"))
@@ -2255,7 +2266,8 @@ pub(crate) mod accepted_managed_change_tests {
         let mut repair_recipe = install_recipe.clone();
         repair_recipe.action = ManagedEnvironmentAction::Repair;
         repair_recipe.operation = ManagedEffectOperation::RepairPortableGeneration;
-        repair_recipe.allowed_resource_changes = vec![ManagedResourceChange::RepairPackageGeneration];
+        repair_recipe.allowed_resource_changes =
+            vec![ManagedResourceChange::RepairPackageGeneration];
         repair_recipe.postcondition = ManagedEffectPostcondition::GenerationRepairedReadBack;
 
         let mut install_request = managed_request();
@@ -2267,7 +2279,7 @@ pub(crate) mod accepted_managed_change_tests {
         refusal_request.request_id = h("request:managed-repair-unprovable-prior");
 
         let mut publication = variant(install_request.clone());
-        publication.approval_id = "approval:managed-repair-lost-ack-install".to_owned();
+        "approval:managed-repair-lost-ack-install".clone_into(&mut publication.approval_id);
         publication.native_target_path =
             Some(target_executable_path.to_string_lossy().into_owned());
         let survey = survey_installation(
@@ -2288,7 +2300,11 @@ pub(crate) mod accepted_managed_change_tests {
             .candidates
             .first()
             .expect("native identity stage resolves the copied signed target");
-        assert_eq!(family.candidates.len(), 1, "the native target is unambiguous");
+        assert_eq!(
+            family.candidates.len(),
+            1,
+            "the native target is unambiguous"
+        );
         install_request.exact_candidate = native_candidate.observed_identity.clone();
         repair_request.exact_candidate = native_candidate.observed_identity.clone();
         refusal_request.exact_candidate = native_candidate.observed_identity.clone();
@@ -2297,33 +2313,32 @@ pub(crate) mod accepted_managed_change_tests {
         let signed = signed_admission_fixture_with_recipes_and_approvals(
             &profile_root,
             &[install_recipe, repair_recipe],
-            publication,
+            &publication,
             &[
-                (h("approval:managed-repair-lost-ack-repair"), repair_request.clone()),
-                (h("approval:managed-repair-unprovable-prior"), refusal_request.clone()),
+                (
+                    h("approval:managed-repair-lost-ack-repair"),
+                    repair_request.clone(),
+                ),
+                (
+                    h("approval:managed-repair-unprovable-prior"),
+                    refusal_request.clone(),
+                ),
             ],
             "managed-repair-lost-ack",
         );
         let context = signed.context();
         let source = crate::WindowsSurveyObservationSource;
-        let accepted_install = admit_installation_survey_and_compile_change(
-            &context,
-            &source,
-            &install_request,
-        )
-        .expect("the signed install request produces its sealed accepted carrier");
-        let accepted_repair = admit_installation_survey_and_compile_change(
-            &context,
-            &source,
-            &repair_request,
-        )
-        .expect("the distinct signed Repair request produces its sealed accepted carrier");
-        let accepted_refusal = admit_installation_survey_and_compile_change(
-            &context,
-            &source,
-            &refusal_request,
-        )
-        .expect("the separate signed Repair request produces its sealed refusal-test carrier");
+        let accepted_install =
+            admit_installation_survey_and_compile_change(&context, &source, &install_request)
+                .expect("the signed install request produces its sealed accepted carrier");
+        let accepted_repair =
+            admit_installation_survey_and_compile_change(&context, &source, &repair_request)
+                .expect("the distinct signed Repair request produces its sealed accepted carrier");
+        let accepted_refusal =
+            admit_installation_survey_and_compile_change(&context, &source, &refusal_request)
+                .expect(
+                    "the separate signed Repair request produces its sealed refusal-test carrier",
+                );
         let anchor = signed
             .store
             .load(&signed.transaction_id)
@@ -2331,9 +2346,9 @@ pub(crate) mod accepted_managed_change_tests {
             .expect("the setup transaction is retained in the original Redb store");
         ManagedRepairCrashFixture {
             _profile_root: profile_root,
-            bundle,
+            _bundle: bundle,
             _native_target_directory: native_target_directory,
-            _database_directory: signed._database_directory,
+            database_directory: signed.database_directory,
             _planner_bundle: signed._planner_bundle,
             publication_transaction_id: signed.transaction_id,
             store: Some(signed.store),
@@ -2342,7 +2357,6 @@ pub(crate) mod accepted_managed_change_tests {
             _signed_snapshot: signed.signed_snapshot,
             observed_platform: signed.observed_platform,
             anchor,
-            install_request,
             repair_request,
             refusal_request,
             accepted_install,
@@ -2402,10 +2416,7 @@ pub(crate) mod accepted_managed_change_tests {
         }
     }
 
-    fn observation(
-        milestone: SetupMilestone,
-        observation_name: &str,
-    ) -> SetupEffectObservation {
+    fn observation(milestone: SetupMilestone, observation_name: &str) -> SetupEffectObservation {
         SetupEffectObservation {
             effect_id: h(milestone.effect_identity()),
             evidence_refs: vec![h(format!("test:evidence:{observation_name}"))],
@@ -2413,6 +2424,7 @@ pub(crate) mod accepted_managed_change_tests {
         }
     }
 
+    #[allow(clippy::expect_used)]
     fn populate_planner_bundle(directory: &Path) {
         let kernel = planner_file("eliot-kernel.exe", true);
         let protected_snapshot_digest = crate::sha256_hex(
@@ -2435,7 +2447,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     struct SignedAdmissionFixture {
-        _database_directory: TempDir,
+        database_directory: TempDir,
         _planner_bundle: TempDir,
         transaction_id: PlatformHandle,
         store: RedbInstallationTransactionStore,
@@ -2453,7 +2465,7 @@ pub(crate) mod accepted_managed_change_tests {
                 anchor: &self.anchor,
                 authority: &self.authority,
                 observed_platform: &self.observed_platform,
-                now_ms: super::wall_clock_millis(),
+                now_ms: wall_clock_millis(),
             }
         }
     }
@@ -2477,16 +2489,19 @@ pub(crate) mod accepted_managed_change_tests {
         signed_admission_fixture_with_recipes_and_approvals(
             profile_root,
             std::slice::from_ref(recipe),
-            variant,
+            &variant,
             &[],
             transaction_label,
         )
     }
 
+    // Keep the signed setup transaction in one fixture so assertions cover
+    // its original persisted publication and owner binding end to end.
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
     fn signed_admission_fixture_with_recipes_and_approvals(
         profile_root: &TempDir,
         recipes: &[ManagedEffectRecipe],
-        variant: PublicationVariant,
+        variant: &PublicationVariant,
         additional_approvals: &[(PlatformHandle, ManagedEnvironmentChangeRequest)],
         transaction_label: &str,
     ) -> SignedAdmissionFixture {
@@ -2496,8 +2511,8 @@ pub(crate) mod accepted_managed_change_tests {
         populate_planner_bundle(planner_bundle.path());
         let transaction_id = h(format!("transaction:{transaction_label}"));
         let source_path = h(planner_bundle.path().to_string_lossy().into_owned());
-        let transaction = GenerationPackagePlanner::plan_unbound_for_test(
-            GenerationPackagePlanInput {
+        let transaction =
+            GenerationPackagePlanner::plan_unbound_for_test(GenerationPackagePlanInput {
                 transaction_id: transaction_id.clone(),
                 installation_epoch: InstallationEpoch {
                     installation: h(INSTALLATION_ID),
@@ -2515,9 +2530,8 @@ pub(crate) mod accepted_managed_change_tests {
                     "eliot installation recover --transaction-id {transaction_label}"
                 )),
                 agent_bridge_source: None,
-            },
-        )
-        .expect("existing generation planner constructs the root-bound transaction");
+            })
+            .expect("existing generation planner constructs the root-bound transaction");
         let roots = transaction
             .profile_governed_roots
             .as_ref()
@@ -2526,11 +2540,12 @@ pub(crate) mod accepted_managed_change_tests {
             .roots_digest
             .clone();
         let database_directory = TempDir::new().expect("transaction database directory");
-        let mut store = RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
-            database_directory.path().join("installation.redb"),
-            &transaction,
-        )
-        .expect("persist only the planner-produced transaction fixture");
+        let mut store =
+            RedbInstallationTransactionStore::create_unpublished_stage_fixture_at_exact_path(
+                database_directory.path().join("installation.redb"),
+                &transaction,
+            )
+            .expect("persist only the planner-produced transaction fixture");
 
         let owner = h(OWNER_ID);
         let mut binding = SetupBinding::new(
@@ -2665,12 +2680,14 @@ pub(crate) mod accepted_managed_change_tests {
         payload.snapshot_canonical_sha256 = crate::sha256_hex(
             &crate::canonical_json_bytes(&payload.snapshot).expect("canonical signed settings"),
         );
-        payload.validate().expect("full production payload validation");
+        payload
+            .validate()
+            .expect("full production payload validation");
 
         let signer = Ed25519InitialSnapshotSigner::from_secret_key(
             OWNER_ID,
             "test-only-managed-change-key",
-            [0x42; ed25519_dalek::SECRET_KEY_LENGTH],
+            [0x42; 32],
         )
         .expect("real Ed25519 test signer");
         let anchor = InitialConfigSnapshotTrustAnchor::new(
@@ -2682,11 +2699,9 @@ pub(crate) mod accepted_managed_change_tests {
         .expect("independently constructed public trust anchor");
         let signed_snapshot = SignedInitialConfigSnapshot::sign(&payload, &signer)
             .expect("sign the actual catalogue and approval settings");
-        let snapshot_ref = h(
-            signed_snapshot
-                .envelope_digest()
-                .expect("signed envelope digest"),
-        );
+        let snapshot_ref = h(signed_snapshot
+            .envelope_digest()
+            .expect("signed envelope digest"));
         let final_milestone = SetupMilestone::InitialSnapshotCreated;
         store
             .record_setup_effect_intent(
@@ -2726,7 +2741,7 @@ pub(crate) mod accepted_managed_change_tests {
         let authority = verify_setup_binding(&retained_binding, &retained_snapshot, &anchor)
             .expect("production trust-anchor verification admits setup");
         SignedAdmissionFixture {
-            _database_directory: database_directory,
+            database_directory,
             _planner_bundle: planner_bundle,
             transaction_id,
             store,
@@ -2894,28 +2909,25 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used, clippy::too_many_lines)]
     fn real_signed_owner_admission_freezes_plan_and_rejects_all_stale_bindings() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
         let request = managed_request();
-        let original = signed_admission_fixture(
-            &profile_root,
-            &bundle,
-            variant(request.clone()),
-            "original",
-        );
+        let original =
+            signed_admission_fixture(&profile_root, &bundle, variant(request.clone()), "original");
         let source = FixedObservationSource {
             target_identity: h("file-id:codex-cli:volume-1:index-7"),
         };
         let original_context = original.context();
-        let accepted = admit_installation_survey_and_compile_change(
-            &original_context,
-            &source,
-            &request,
-        )
-        .expect("real signed publication and exact approval create the private carrier");
+        let accepted =
+            admit_installation_survey_and_compile_change(&original_context, &source, &request)
+                .expect("real signed publication and exact approval create the private carrier");
         assert_eq!(accepted.plan().request(), &request);
-        assert_eq!(accepted.approval().snapshot_id.as_str(), original.authority.snapshot_id());
+        assert_eq!(
+            accepted.approval().snapshot_id.as_str(),
+            original.authority.snapshot_id()
+        );
         assert_eq!(
             accepted.plan().catalogue_publication_ref().as_str(),
             original
@@ -2954,9 +2966,11 @@ pub(crate) mod accepted_managed_change_tests {
         let changed_executable = FixedObservationSource {
             target_identity: h("file-id:codex-cli:volume-1:index-8"),
         };
-        assert!(accepted
-            .revalidate_for_effect(&original_context, &changed_executable)
-            .is_err());
+        assert!(
+            accepted
+                .revalidate_for_effect(&original_context, &changed_executable)
+                .is_err()
+        );
 
         let mut changed_approval_variant = variant(request.clone());
         changed_approval_variant.approval_id = "approval:codex-cli-install-reissued".to_owned();
@@ -2992,9 +3006,11 @@ pub(crate) mod accepted_managed_change_tests {
             )
             .expect("the new signed approval is current for its publication");
         assert_ne!(changed_approval, *accepted.approval());
-        assert!(accepted
-            .revalidate_for_effect(&changed_approval_context, &source)
-            .is_err());
+        assert!(
+            accepted
+                .revalidate_for_effect(&changed_approval_context, &source)
+                .is_err()
+        );
 
         let mut changed_catalogue_variant = variant(request.clone());
         changed_catalogue_variant.catalogue_origin = "catalogue:managed-change-proof-v2".to_owned();
@@ -3012,9 +3028,11 @@ pub(crate) mod accepted_managed_change_tests {
                 .revision(),
             2
         );
-        assert!(accepted
-            .revalidate_for_effect(&changed_catalogue_context, &source)
-            .is_err());
+        assert!(
+            accepted
+                .revalidate_for_effect(&changed_catalogue_context, &source)
+                .is_err()
+        );
 
         let mut changed_snapshot_variant = variant(request.clone());
         changed_snapshot_variant.snapshot_id = "snapshot:managed-change-proof-next".to_owned();
@@ -3028,9 +3046,11 @@ pub(crate) mod accepted_managed_change_tests {
             changed_snapshot_fixture.authority.snapshot_id(),
             original.authority.snapshot_id()
         );
-        assert!(accepted
-            .revalidate_for_effect(&changed_snapshot_fixture.context(), &source)
-            .is_err());
+        assert!(
+            accepted
+                .revalidate_for_effect(&changed_snapshot_fixture.context(), &source)
+                .is_err()
+        );
 
         let changed_root = TempDir::new().expect("changed root anchor");
         let changed_root_fixture = signed_admission_fixture(
@@ -3043,9 +3063,11 @@ pub(crate) mod accepted_managed_change_tests {
             changed_root_fixture.authority.runtime_state_roots_digest(),
             original.authority.runtime_state_roots_digest()
         );
-        assert!(accepted
-            .revalidate_for_effect(&changed_root_fixture.context(), &source)
-            .is_err());
+        assert!(
+            accepted
+                .revalidate_for_effect(&changed_root_fixture.context(), &source)
+                .is_err()
+        );
 
         let mut wrong_approved_request = request.clone();
         wrong_approved_request.expected_delta = h("delta:different-approved-effect");
@@ -3065,6 +3087,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_managed_plan_refuses_core_family_substitution_before_effect() {
         const CORE_OWNER_REASON: &str =
             "active core components require their side-by-side generation owner";
@@ -3082,12 +3105,9 @@ pub(crate) mod accepted_managed_change_tests {
             target_identity: h("file-id:codex-cli:volume-1:index-7"),
         };
         let original_context = original.context();
-        let accepted = admit_installation_survey_and_compile_change(
-            &original_context,
-            &source,
-            &request,
-        )
-        .expect("real signed publication and exact approval create the private carrier");
+        let accepted =
+            admit_installation_survey_and_compile_change(&original_context, &source, &request)
+                .expect("real signed publication and exact approval create the private carrier");
 
         let accepted_plan = accepted.plan();
         assert_eq!(accepted_plan.family_id.as_str(), TARGET_FAMILY);
@@ -3108,14 +3128,18 @@ pub(crate) mod accepted_managed_change_tests {
             let mut substituted_plan = accepted_plan.clone();
             substituted_plan.family_id = h(protected_family);
 
-            assert!(matches!(
-                substituted_plan.validate(),
-                Err(InstallationError::ProfileViolation(reason)) if reason == CORE_OWNER_REASON
-            ), "protected family {protected_family:?} must route to its side-by-side owner before effects");
+            assert!(
+                matches!(
+                    substituted_plan.validate(),
+                    Err(InstallationError::ProfileViolation(reason)) if reason == CORE_OWNER_REASON
+                ),
+                "protected family {protected_family:?} must route to its side-by-side owner before effects"
+            );
         }
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_plan_retains_exact_native_target_path_hash_and_rejects_file_drift() {
         let fixture = managed_registration_transaction_for_terminal_test();
         let (target_identity, path, sha256) = fixture
@@ -3136,6 +3160,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_plan_keeps_native_target_unknown_without_file_version_evidence() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
@@ -3162,15 +3187,22 @@ pub(crate) mod accepted_managed_change_tests {
         let accepted = admit_installation_survey_and_compile_change(&context, &source, &request)
             .expect("the signed registration request is admitted against the ordered survey");
 
-        assert_eq!(accepted.plan().target_identity(), Some(&request.exact_candidate));
+        assert_eq!(
+            accepted.plan().target_identity(),
+            Some(&request.exact_candidate)
+        );
         assert_eq!(accepted.plan().target_executable_observation(), None);
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn accepted_catalogue_accounts_for_seed_families_independently() {
         let bundle = ManagedBundle::new();
         let mut catalogue = catalogue(&variant(managed_request()), &bundle.recipe());
-        let missing = catalogue.entries.pop().expect("seed catalogue is populated");
+        let missing = catalogue
+            .entries
+            .pop()
+            .expect("seed catalogue is populated");
         let missing_family = missing.family_id.as_str().to_owned();
 
         assert!(matches!(
@@ -3181,6 +3213,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn accepted_survey_is_ordered_deterministic_and_never_admits_unknown_probe_text() {
         let bundle = ManagedBundle::new();
         let variant = variant(managed_request());
@@ -3201,7 +3234,11 @@ pub(crate) mod accepted_managed_change_tests {
             .find(|family| family.family_id.as_str() == TARGET_FAMILY)
             .expect("seed family is present");
         assert_eq!(
-            family.stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+            family
+                .stages
+                .iter()
+                .map(|stage| stage.stage)
+                .collect::<Vec<_>>(),
             SurveyStage::ORDER
         );
         let candidate = family
@@ -3214,10 +3251,14 @@ pub(crate) mod accepted_managed_change_tests {
             .find(|stage| stage.stage == SurveyStage::AdmittedSafeProbe)
             .expect("mandatory probe stage is retained");
         assert_eq!(probe_stage.outcome, SurveyStageOutcome::Withheld);
-        assert_eq!(probe_stage.withheld, vec![candidate.observed_identity.clone()]);
+        assert_eq!(
+            probe_stage.withheld,
+            vec![candidate.observed_identity.clone()]
+        );
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn survey_preserves_denied_unreadable_invalid_ambiguous_and_not_covered_inputs() {
         let bundle = ManagedBundle::new();
         let variant = variant(managed_request());
@@ -3264,6 +3305,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn caller_answer_handle_is_refused_as_probe_provenance() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
@@ -3294,6 +3336,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn missing_signed_catalogue_and_missing_exact_approval_refuse_without_defaults() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
@@ -3335,6 +3378,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn forged_signature_in_the_retained_physical_publication_is_refused() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
@@ -3346,10 +3390,9 @@ pub(crate) mod accepted_managed_change_tests {
             "forged-retained-signature",
         );
         let replace_physical_snapshot = |snapshot: &SignedInitialConfigSnapshot| {
-            let database = redb::Database::open(
-                fixture._database_directory.path().join("installation.redb"),
-            )
-            .expect("open the fixture's actual physical registry");
+            let database =
+                redb::Database::open(fixture.database_directory.path().join("installation.redb"))
+                    .expect("open the fixture's actual physical registry");
             let write = database
                 .begin_write()
                 .expect("begin one physical publication replacement");
@@ -3419,6 +3462,7 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn expired_catalogue_and_expired_approval_are_refused() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
@@ -3438,12 +3482,8 @@ pub(crate) mod accepted_managed_change_tests {
 
         let mut expired_approval = variant(request.clone());
         expired_approval.approval_expires_at_ms = 1;
-        let expired_approval_fixture = signed_admission_fixture(
-            &profile_root,
-            &bundle,
-            expired_approval,
-            "expired-approval",
-        );
+        let expired_approval_fixture =
+            signed_admission_fixture(&profile_root, &bundle, expired_approval, "expired-approval");
         let source = FixedObservationSource {
             target_identity: h("file-id:codex-cli:volume-1:index-7"),
         };
@@ -3460,13 +3500,17 @@ pub(crate) mod accepted_managed_change_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_recipe_for_another_target_is_refused_before_plan_compilation() {
         let profile_root = TempDir::new().expect("PortableDev root anchor");
         let bundle = ManagedBundle::new();
         let mut forged_recipe = bundle.recipe();
         forged_recipe.target_family = h("different-family");
         forged_recipe.package_manifest = PackageManifest::new(
-            format!("{}/{}", forged_recipe.target_family, forged_recipe.package_version),
+            format!(
+                "{}/{}",
+                forged_recipe.target_family, forged_recipe.package_version
+            ),
             forged_recipe.package_manifest.files.clone(),
         )
         .expect("forged family recipe remains internally well-formed");
@@ -3484,25 +3528,24 @@ pub(crate) mod accepted_managed_change_tests {
             ))
         ));
     }
-
 }
 
 #[cfg(all(test, windows))]
 mod catalogue_validation_tests {
     use std::num::NonZeroU64;
 
+    use crate::{
+        MANAGED_TOOLS_RELATIVE_ROOT, ManagedEffectOperation, ManagedEffectPostcondition,
+        ManagedEnvironmentAction,
+    };
     use eliot_config::initial_snapshot::{
-        Ed25519InitialSnapshotSigner, InitialConfigSnapshotTrustAnchor,
-        InitialSnapshotIdentity, InitialSnapshotVerificationContext,
-        SignedInitialConfigSnapshot, prepare_initial_snapshot_payload_with_settings,
+        Ed25519InitialSnapshotSigner, InitialConfigSnapshotTrustAnchor, InitialSnapshotIdentity,
+        InitialSnapshotVerificationContext, SignedInitialConfigSnapshot,
+        prepare_initial_snapshot_payload_with_settings,
     };
     use eliot_config::{PrivacyChoice, Setting, first_run::FirstRunDecision};
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
     use eliot_platform_windows::{PackageFileSpec, PackageManifest, TrustedSourceBundle};
-    use crate::{
-        ManagedEffectOperation, ManagedEffectPostcondition, ManagedEnvironmentAction,
-        MANAGED_TOOLS_RELATIVE_ROOT,
-    };
     use tempfile::TempDir;
 
     use super::*;
@@ -3550,6 +3593,7 @@ mod catalogue_validation_tests {
     /// signs the ordinary initial-snapshot envelope, verifies that envelope
     /// against an external trust anchor, and decodes the retained signed
     /// setting through the production catalogue decoder.
+    #[allow(clippy::expect_used)]
     fn signed_catalogue_roundtrip(
         catalogue: &IntegrationDiscoveryCatalogue,
     ) -> IntegrationDiscoveryCatalogue {
@@ -3581,12 +3625,9 @@ mod catalogue_validation_tests {
                 ResourceGeneration::new(1).expect("non-zero resource generation"),
             ),
         };
-        let signer = Ed25519InitialSnapshotSigner::from_secret_key(
-            TEST_OWNER_ID,
-            TEST_KEY_ID,
-            [0x42; 32],
-        )
-        .expect("test-only snapshot signer");
+        let signer =
+            Ed25519InitialSnapshotSigner::from_secret_key(TEST_OWNER_ID, TEST_KEY_ID, [0x42; 32])
+                .expect("test-only snapshot signer");
         let payload = prepare_initial_snapshot_payload_with_settings(
             &identity,
             PrivacyChoice::Standard,
@@ -3594,7 +3635,7 @@ mod catalogue_validation_tests {
             &[owner_setting],
         )
         .expect("prepare ordinary initial snapshot");
-        let signed = SignedInitialConfigSnapshot::sign(&payload, &signer)
+        let signed_snapshot = SignedInitialConfigSnapshot::sign(&payload, &signer)
             .expect("sign catalogue setting in initial snapshot");
         let anchor = InitialConfigSnapshotTrustAnchor::new(
             TEST_INSTALLATION_ID,
@@ -3611,14 +3652,11 @@ mod catalogue_validation_tests {
             setup_revision: identity.setup_revision,
         };
         let verified = anchor
-            .verify(&signed, &context)
+            .verify(&signed_snapshot, &context)
             .expect("verify actual signed initial-snapshot envelope");
-        decode_catalogue_setting(
-            &verified.payload().snapshot.settings,
-            &h(TEST_OWNER_ID),
-        )
-        .expect("decode signed catalogue setting")
-        .expect("signed catalogue setting is present")
+        decode_catalogue_setting(&verified.payload().snapshot.settings, &h(TEST_OWNER_ID))
+            .expect("decode signed catalogue setting")
+            .expect("signed catalogue setting is present")
     }
 
     fn assert_signed_catalogue_refused(
@@ -3640,6 +3678,7 @@ mod catalogue_validation_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_detection_seed_passes_bounded_catalogue_validation() {
         let signed_catalogue = signed_catalogue_roundtrip(&detection_seed_catalogue());
         signed_catalogue
@@ -3648,6 +3687,7 @@ mod catalogue_validation_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_conflicting_probe_contracts_for_one_identity_refuse_in_either_order() {
         let version = BoundedSafeProbe {
             probe_id: h("probe:version"),
@@ -3666,7 +3706,8 @@ mod catalogue_validation_tests {
         usage.argument = h("--help");
         let mut catalogue = detection_seed_catalogue();
         catalogue.entries[0].bounded_probes = vec![version.clone()];
-        signed_catalogue_roundtrip(&catalogue).validate()
+        signed_catalogue_roundtrip(&catalogue)
+            .validate()
             .expect("one exact probe contract is valid");
         for probes in [vec![version.clone(), usage.clone()], vec![usage, version]] {
             catalogue.entries[0].bounded_probes = probes;
@@ -3711,8 +3752,7 @@ mod catalogue_validation_tests {
             environment_names: Vec::new(),
         };
         let mut catalogue = detection_seed_catalogue();
-        catalogue.entries[0].bounded_probes =
-            vec![invalid_probe; MAX_ENTRY_PROBES + 1];
+        catalogue.entries[0].bounded_probes = vec![invalid_probe; MAX_ENTRY_PROBES + 1];
 
         assert_signed_catalogue_refused(
             &catalogue,
@@ -3722,6 +3762,7 @@ mod catalogue_validation_tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
     fn signed_managed_effect_count_refuses_before_invalid_recipe_fields() {
         let source_dir = TempDir::new().expect("temporary source bundle directory");
         let source = TrustedSourceBundle::open(source_dir.path())
@@ -3736,8 +3777,7 @@ mod catalogue_validation_tests {
             package_version: h("1.0.0"),
             package_manifest: PackageManifest::new(
                 format!("{}/1.0.0", INTEGRATION_SEED_FAMILIES[0].0),
-                vec![PackageFileSpec::new("codex.exe", true, 1)
-                    .expect("test package file spec")],
+                vec![PackageFileSpec::new("codex.exe", true, 1).expect("test package file spec")],
             )
             .expect("test package manifest"),
             expected_files: Vec::new(),

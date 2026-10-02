@@ -57,9 +57,10 @@ pub(crate) use backup_restore::{
 /// can never become a statement, table, connection, or credential override.
 pub(crate) use backup_snapshot::{
     MEMBER_CLASS_ROW_LIMIT, SNAPSHOT_MEMBERS_OPERATION, fixed_snapshot_statement,
-    snapshot_capability, validate_snapshot_operation,
+    snapshot_capability, snapshot_response_ceiling, validate_snapshot_operation,
 };
 pub(crate) use provider_owner::ProviderOwner;
+pub(crate) use rpc_parse::ResponseCeiling;
 use session::RpcSession;
 use session_pool::{SessionPool, SessionRole};
 
@@ -117,6 +118,29 @@ pub(crate) async fn query(
     bindings: serde_json::Map<String, Value>,
 ) -> Result<RpcResults, AdapterError> {
     transport.query(operation, statement, bindings).await
+}
+
+/// Dispatches one closed named operation whose provider response is admitted
+/// under an ELIOT-owned byte bound.
+///
+/// The bounded-capture entry point of the accepted client-set facade (issue
+/// #951). `config` remains an explicit argument at this seam for the same
+/// reason it is on [`query`]: timeout and credential policy cannot be supplied
+/// by a call-site value. The dispatch is otherwise identical — pooled read lane
+/// for an admitted pure read, facade session otherwise — so a bounded capture
+/// cannot reach a different session, lane or statement than any other named
+/// operation carrying the same label.
+pub(crate) async fn query_bounded(
+    transport: &RpcTransport,
+    _config: &SurrealAdapterConfig,
+    operation: &'static str,
+    statement: &str,
+    bindings: serde_json::Map<String, Value>,
+    ceiling: ResponseCeiling,
+) -> Result<RpcResults, AdapterError> {
+    transport
+        .query_bounded(operation, statement, bindings, ceiling)
+        .await
 }
 
 /// Classifies one provider statement error from a Dreamer ledger transaction.
@@ -298,6 +322,65 @@ impl RpcTransport {
         }
         // Keep every error, including decode failures, while preserving the
         // original operation's statement indexes for its existing consumer.
+        results.values.drain(..prefix_len);
+        Ok(results)
+    }
+
+    /// Executes one closed named operation whose provider response is admitted
+    /// under an ELIOT-owned byte bound.
+    ///
+    /// The bounded-capture entry point (issue #951). Lane selection is the same
+    /// closed allowlist [`RpcTransport::query`] uses: a pooled read for an
+    /// admitted pure read, the facade session otherwise. Bounding the response
+    /// is the only thing this adds, so it cannot widen which statement, table,
+    /// binding or session a name reaches.
+    pub(crate) async fn query_bounded(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+        ceiling: ResponseCeiling,
+    ) -> Result<RpcResults, AdapterError> {
+        if is_pool_read_operation(operation) {
+            return self
+                .pool
+                .query_bounded(SessionRole::Read, operation, statement, bindings, ceiling)
+                .await;
+        }
+        self.query_facade_bounded(operation, statement, bindings, ceiling)
+            .await
+    }
+
+    /// Executes the compatibility (non-pooled) named query under a response
+    /// byte bound.
+    ///
+    /// Bounded snapshot operations are all pooled reads, so this arm exists for
+    /// the same reason [`RpcTransport::query_facade`] does: a name outside the
+    /// read allowlist must still reach a session, and it must reach it under the
+    /// bound its caller admitted rather than under a weaker unbounded read.
+    async fn query_facade_bounded(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: serde_json::Map<String, Value>,
+        ceiling: ResponseCeiling,
+    ) -> Result<RpcResults, AdapterError> {
+        let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
+        let value = self
+            .session
+            .request_bounded(
+                operation,
+                "query",
+                json!([statement, Value::Object(bindings)]),
+                ceiling,
+            )
+            .await?;
+        let mut results = RpcResults::from_value(&value)?;
+        if results.values.len() < prefix_len {
+            return Err(AdapterError::Serialization(
+                "RPC query omitted binding decode results".to_owned(),
+            ));
+        }
         results.values.drain(..prefix_len);
         Ok(results)
     }

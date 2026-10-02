@@ -1127,25 +1127,29 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
                 .context("parse the original setup transaction identity")?;
             let mut store = RedbInstallationTransactionStore::open_existing_exact_path(&store)
                 .context("open the original published installation transaction store")?;
-            first_run_flow::run_setup_initial_config(&first_run_flow::SetupInitialConfigArgs {
-            confirmed_installation_id,
-            machine_id,
-            scope_id,
-            authority_lineage,
-            authority_sequence,
-            resource_generation,
-            privacy,
-            catalogue_json,
-            approvals_json,
-            dreamer_route,
-            watchdog_route,
-            dreamer_displayed,
-            watchdog_displayed,
-            dreamer_explicit,
-            watchdog_explicit,
-            automation,
-            }, &mut store, &transaction_id)
-        },
+            first_run_flow::run_setup_initial_config(
+                &first_run_flow::SetupInitialConfigArgs {
+                    confirmed_installation_id,
+                    machine_id,
+                    scope_id,
+                    authority_lineage,
+                    authority_sequence,
+                    resource_generation,
+                    privacy,
+                    catalogue_json,
+                    approvals_json,
+                    dreamer_route,
+                    watchdog_route,
+                    dreamer_displayed,
+                    watchdog_displayed,
+                    dreamer_explicit,
+                    watchdog_explicit,
+                    automation,
+                },
+                &mut store,
+                &transaction_id,
+            )
+        }
     }
 }
 
@@ -2253,18 +2257,24 @@ fn write_manifest_canary_error(pulse: u8, code: &str, detail: &str) {
 #[allow(clippy::too_many_lines)]
 fn run_installation(command: InstallationCommand) -> Result<i32> {
     match command {
-        InstallationCommand::Survey { store, publication_transaction_id } => {
-            managed_installation::survey(&store, &publication_transaction_id)
-        }
-        InstallationCommand::ManagedChange { store, publication_transaction_id, request } => {
-            managed_installation::change(&store, &publication_transaction_id, &request)
-        }
-        InstallationCommand::ManagedResume { store, publication_transaction_id, transaction_id } => {
-            managed_installation::resume(&store, &publication_transaction_id, &transaction_id)
-        }
-        InstallationCommand::ManagedStatus { store, transaction_id } => {
-            managed_installation::status(&store, &transaction_id)
-        }
+        InstallationCommand::Survey {
+            store,
+            publication_transaction_id,
+        } => managed_installation::survey(&store, &publication_transaction_id),
+        InstallationCommand::ManagedChange {
+            store,
+            publication_transaction_id,
+            request,
+        } => managed_installation::change(&store, &publication_transaction_id, &request),
+        InstallationCommand::ManagedResume {
+            store,
+            publication_transaction_id,
+            transaction_id,
+        } => managed_installation::resume(&store, &publication_transaction_id, &transaction_id),
+        InstallationCommand::ManagedStatus {
+            store,
+            transaction_id,
+        } => managed_installation::status(&store, &transaction_id),
         InstallationCommand::Generate { .. } => {
             write_installation_error(
                 "INSTALLATION_GENERATE_RETIRED",

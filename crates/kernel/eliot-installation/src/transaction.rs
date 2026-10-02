@@ -11,19 +11,18 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ActivationCommitReceipt, ActiveVerifiedReceiptBinding, CandidateManifest, ContractVersion,
-    HostPhaseBMaterializationReceipt, INSTALLATION_SECRET_CREATION_PROOF_VERSION,
-    INSTALLATION_TRANSACTION_WIRE_VERSION, InstallationActivationApproval,
-    InstallationActivationProjectionIntent, InstallationEffectPrecondition, InstallationEpoch,
-    InstallationError, InstallationProfile, InstallationRoots, InstallationServiceBootstrap,
-    InstallationServiceStartProof, InstallationStepOutcome, InstallerEffectPlan,
-    InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
-    InstallationManagedRootEffectProof, InstallerServiceRole, ManagedEnvironmentChangeRequest,
-    ManagedResourceProjection,
-    AcceptedManagedChange, PlannedChange, PlatformHandle,
-    ProfileGovernedRoots, ProfileSelectionResolution, RetainedGuardRevert, RuntimeStateRoots,
-    SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt, StoreCredentialLifecycle,
-    StoreCredentialProgress, candidate_manifest_digest, handle, handles,
+    AcceptedManagedChange, ActivationCommitReceipt, ActiveVerifiedReceiptBinding,
+    CandidateManifest, ContractVersion, HostPhaseBMaterializationReceipt,
+    INSTALLATION_SECRET_CREATION_PROOF_VERSION, INSTALLATION_TRANSACTION_WIRE_VERSION,
+    InstallationActivationApproval, InstallationActivationProjectionIntent,
+    InstallationEffectPrecondition, InstallationEpoch, InstallationError,
+    InstallationManagedRootEffectProof, InstallationProfile, InstallationRoots,
+    InstallationServiceBootstrap, InstallationServiceStartProof, InstallationStepOutcome,
+    InstallerEffectPlan, InstallerServiceControlGrantReceipt, InstallerServiceRegistrationApproval,
+    InstallerServiceRole, ManagedEnvironmentChangeRequest, ManagedResourceProjection,
+    PlannedChange, PlatformHandle, ProfileGovernedRoots, ProfileSelectionResolution,
+    RetainedGuardRevert, RuntimeStateRoots, SERVICE_START_TIMEOUT_PENDING_REF, StagingReceipt,
+    StoreCredentialLifecycle, StoreCredentialProgress, candidate_manifest_digest, handle, handles,
     ownership_secret_absence_evidence, phase_b_scm_digest,
     prove_no_service_profile_authority_dependency, sha256_handle, sha256_hex,
     validate_installer_effects_with_managed_root, validate_package_binding,
@@ -642,11 +641,15 @@ impl InstallationTransaction {
         )
     }
 
-    /// Creates one managed-tool transaction from the exact durable PortableDev
+    /// Creates one managed-tool transaction from the exact durable `PortableDev`
     /// anchor and the private-constructed signed admission carrier. The core
     /// candidate manifest is retained byte-for-byte as the transaction's
     /// lifecycle anchor; only the closed managed effect and its two selected
     /// child-root effects are added to the immutable effect list.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this owner binds the exact accepted plan, prior receipts and root effects into one immutable transaction"
+    )]
     pub(crate) fn new_accepted_managed_change(
         anchor: &Self,
         accepted: &AcceptedManagedChange,
@@ -670,17 +673,15 @@ impl InstallationTransaction {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        let roots = anchor
-            .profile_governed_roots
-            .as_ref()
-            .ok_or_else(|| InstallationError::MigrationRequired {
+        let roots = anchor.profile_governed_roots.as_ref().ok_or_else(|| {
+            InstallationError::MigrationRequired {
                 reason: "managed effect requires the retained PortableDev I3.1 root binding"
                     .to_owned(),
-            })?;
+            }
+        })?;
         roots.validate(InstallationProfile::PortableDev)?;
-        let expected_managed_tools = recipe.target_root(std::path::Path::new(
-            &roots.immutable_binaries,
-        ));
+        let expected_managed_tools =
+            recipe.target_root(std::path::Path::new(&roots.immutable_binaries));
         if !eliot_platform_windows::windows_paths_equal(
             accepted.managed_tools_root(),
             &expected_managed_tools,
@@ -716,12 +717,11 @@ impl InstallationTransaction {
                 )?,
             });
         }
-        let accepted_plan_json = serde_json::to_string(plan).map_err(|error| {
-            InstallationError::InvalidField {
+        let accepted_plan_json =
+            serde_json::to_string(plan).map_err(|error| InstallationError::InvalidField {
                 field: "managed_effect.accepted_plan_json".to_owned(),
                 reason: error.to_string(),
-            }
-        })?;
+            })?;
         effects.push(InstallerEffectPlan::ManagedEnvironmentChange {
             effect_id: managed_effect_id.clone(),
             accepted_plan_json,
@@ -737,7 +737,8 @@ impl InstallationTransaction {
         } else {
             request.source_assurance_refs.clone()
         };
-        let evidence_postconditions = vec![request.expected_delta.clone(), request.verifier.clone()];
+        let evidence_postconditions =
+            vec![request.expected_delta.clone(), request.verifier.clone()];
         let planned_changes = effects
             .iter()
             .map(|effect| {
@@ -883,13 +884,17 @@ impl InstallationTransaction {
                 reason: "must be a non-zero explicit policy value".to_owned(),
             });
         }
-        validate_installer_effects_with_managed_root(
-            profile,
-            &candidate_manifest.runtime_launch.runtime_state_roots,
+        let immutable_binaries = retained_plan_handle(
             &candidate_manifest
                 .runtime_launch
                 .profile_governed_roots
                 .immutable_binaries,
+            "candidate_manifest.runtime_launch.profile_governed_roots.immutable_binaries",
+        )?;
+        validate_installer_effects_with_managed_root(
+            profile,
+            &candidate_manifest.runtime_launch.runtime_state_roots,
+            &immutable_binaries,
             &candidate_manifest.store_credential_target,
             &planned_changes,
             &installer_effects,
@@ -1706,14 +1711,18 @@ impl InstallationTransaction {
         for change in &self.planned_changes {
             change.validate()?;
         }
-        validate_installer_effects_with_managed_root(
-            self.profile,
-            &self.candidate_manifest.runtime_launch.runtime_state_roots,
+        let immutable_binaries = retained_plan_handle(
             &self
                 .candidate_manifest
                 .runtime_launch
                 .profile_governed_roots
                 .immutable_binaries,
+            "candidate_manifest.runtime_launch.profile_governed_roots.immutable_binaries",
+        )?;
+        validate_installer_effects_with_managed_root(
+            self.profile,
+            &self.candidate_manifest.runtime_launch.runtime_state_roots,
+            &immutable_binaries,
             &self.candidate_manifest.store_credential_target,
             &self.planned_changes,
             &self.installer_effects,
@@ -1725,10 +1734,8 @@ impl InstallationTransaction {
                 ..
             } = effect
             {
-                let _ = retained_managed_target_executable_observation(
-                    accepted_plan_json,
-                    request,
-                )?;
+                let _ =
+                    retained_managed_target_executable_observation(accepted_plan_json, request)?;
             }
         }
         validate_phase_b_effect_bindings(&self.candidate_manifest, &self.installer_effects)?;
@@ -1796,10 +1803,10 @@ impl InstallationTransaction {
         match (&self.stage, &self.active_verified_receipt) {
             (
                 InstallationStage::ActiveVerified
-                | InstallationStage::Cleaning,
+                | InstallationStage::Cleaning
+                | InstallationStage::Completed,
                 Some(receipt),
-            ) => receipt.validate_against_transaction(self)?,
-            (InstallationStage::Completed, Some(receipt)) => {
+            ) => {
                 receipt.validate_against_transaction(self)?;
             }
             (InstallationStage::Completed, None) if managed_child => {
@@ -2556,8 +2563,9 @@ impl InstallationTransaction {
                     {
                         return Err(InstallationError::InvalidField {
                             field: "effect_progress.staging_receipt".to_owned(),
-                            reason: "applied managed package effect requires its typed staging receipt"
-                                .to_owned(),
+                            reason:
+                                "applied managed package effect requires its typed staging receipt"
+                                    .to_owned(),
                         });
                     }
                     if matches!(
@@ -2648,20 +2656,16 @@ impl InstallationTransaction {
     }
 
     fn validate_stage_progress(&self) -> Result<(), InstallationError> {
-        let Some(package_index) = self
-            .installer_effects
-            .iter()
-            .position(|effect| {
-                matches!(effect, InstallerEffectPlan::StagePackage { .. })
-                    || matches!(
-                        effect,
-                        InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
-                            if super::managed_change_execution::managed_operation_stages(
-                                recipe.operation,
-                            )
-                    )
-            })
-        else {
+        let Some(package_index) = self.installer_effects.iter().position(|effect| {
+            matches!(effect, InstallerEffectPlan::StagePackage { .. })
+                || matches!(
+                    effect,
+                    InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. }
+                        if super::managed_change_execution::managed_operation_stages(
+                            recipe.operation,
+                        )
+                )
+        }) else {
             return Ok(());
         };
         let package_applied = matches!(
@@ -2717,14 +2721,14 @@ impl InstallationTransaction {
         {
             return None;
         }
-        let mut managed = self
-            .installer_effects
-            .iter()
-            .enumerate()
-            .filter_map(|(index, effect)| {
-                matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
-                    .then_some(index)
-            });
+        let mut managed =
+            self.installer_effects
+                .iter()
+                .enumerate()
+                .filter_map(|(index, effect)| {
+                    matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. })
+                        .then_some(index)
+                });
         let index = managed.next()?;
         if managed.next().is_some() || index + 1 != self.installer_effects.len() {
             return None;
@@ -2734,9 +2738,8 @@ impl InstallationTransaction {
         else {
             return None;
         };
-        let stages_package = super::managed_change_execution::managed_operation_stages(
-            recipe.operation,
-        );
+        let stages_package =
+            super::managed_change_execution::managed_operation_stages(recipe.operation);
         let expected_effects = if stages_package { 3 } else { 1 };
         if self.installer_effects.len() != expected_effects
             || (stages_package
@@ -2775,8 +2778,7 @@ impl InstallationTransaction {
             )
         }) {
             return Err(InstallationError::IncompleteObservation(
-                "managed completion requires every exact planned effect to be applied"
-                    .to_owned(),
+                "managed completion requires every exact planned effect to be applied".to_owned(),
             ));
         }
         let InstallerEffectPlan::ManagedEnvironmentChange { recipe, .. } =
@@ -2807,13 +2809,11 @@ impl InstallationTransaction {
             || !self.completed_stage_refs.contains(postcondition_digest)
         {
             return Err(InstallationError::IncompleteObservation(
-                "managed completion requires its retained exact effect readback receipt"
-                    .to_owned(),
+                "managed completion requires its retained exact effect readback receipt".to_owned(),
             ));
         }
-        let stages_package = super::managed_change_execution::managed_operation_stages(
-            recipe.operation,
-        );
+        let stages_package =
+            super::managed_change_execution::managed_operation_stages(recipe.operation);
         if stages_package {
             let receipt = progress
                 .staging_receipt
@@ -2826,12 +2826,9 @@ impl InstallationTransaction {
                 }
             })?;
             if !self.completed_stage_refs.contains(&receipt_digest)
-                || progress
-                    .ownership_secret
-                    .as_ref()
-                    .is_none_or(|ownership| {
-                        ownership.lifecycle != super::InstallationSecretLifecycle::Active
-                    })
+                || progress.ownership_secret.as_ref().is_none_or(|ownership| {
+                    ownership.lifecycle != super::InstallationSecretLifecycle::Active
+                })
             {
                 return Err(InstallationError::IncompleteObservation(
                     "managed package completion requires its retained receipt and ownership key"
@@ -2848,12 +2845,9 @@ impl InstallationTransaction {
                         ..
                     }
                 )
-                && progress
-                    .ownership_secret
-                    .as_ref()
-                    .is_none_or(|ownership| {
-                        ownership.lifecycle != super::InstallationSecretLifecycle::Active
-                    })
+                && progress.ownership_secret.as_ref().is_none_or(|ownership| {
+                    ownership.lifecycle != super::InstallationSecretLifecycle::Active
+                })
             {
                 return Err(InstallationError::IncompleteObservation(
                     "managed completion requires each created parent root's retained owner key"
@@ -2880,13 +2874,12 @@ impl InstallationTransaction {
         else {
             return Err(InstallationError::IdentityConflict);
         };
-        let required_stage = if super::managed_change_execution::managed_operation_stages(
-            recipe.operation,
-        ) {
-            InstallationStage::Staging
-        } else {
-            InstallationStage::Planned
-        };
+        let required_stage =
+            if super::managed_change_execution::managed_operation_stages(recipe.operation) {
+                InstallationStage::Staging
+            } else {
+                InstallationStage::Planned
+            };
         if self.stage != required_stage {
             return Err(InstallationError::IllegalTransition {
                 from: self.stage,
@@ -2920,12 +2913,13 @@ impl InstallationTransaction {
             }
         }
         self.stage = InstallationStage::Completed;
-        self.revision = self.revision.checked_add(1).ok_or_else(|| {
-            InstallationError::InvalidField {
-                field: "revision".to_owned(),
-                reason: "overflow".to_owned(),
-            }
-        })?;
+        self.revision =
+            self.revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
         self.validate()
     }
 
@@ -3492,9 +3486,10 @@ fn retained_managed_target_executable_observation(
         })?;
     let saved_target_identity = match accepted_plan.get("target_identity") {
         Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(value)) => {
-            Some(retained_plan_handle(value, "managed_change_plan.target_identity")?)
-        }
+        Some(serde_json::Value::String(value)) => Some(retained_plan_handle(
+            value,
+            "managed_change_plan.target_identity",
+        )?),
         _ => return Err(InstallationError::IdentityConflict),
     };
     match request.action {
@@ -3560,12 +3555,11 @@ fn retained_managed_target_executable_observation(
 }
 
 fn retained_plan_handle(value: &str, field: &str) -> Result<PlatformHandle, InstallationError> {
-    let platform_handle = PlatformHandle::new(value.to_owned()).map_err(|error| {
-        InstallationError::InvalidField {
+    let platform_handle =
+        PlatformHandle::new(value.to_owned()).map_err(|error| InstallationError::InvalidField {
             field: field.to_owned(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     handle(&platform_handle, field)?;
     Ok(platform_handle)
 }
@@ -3574,11 +3568,12 @@ fn managed_effect_identity(
     request_id: &PlatformHandle,
     role: &str,
 ) -> Result<PlatformHandle, InstallationError> {
-    let bytes = serde_json::to_vec(&("managed-environment-effect-v1", request_id, role))
-        .map_err(|error| InstallationError::InvalidField {
+    let bytes = serde_json::to_vec(&("managed-environment-effect-v1", request_id, role)).map_err(
+        |error| InstallationError::InvalidField {
             field: "managed_effect.effect_id".to_owned(),
             reason: error.to_string(),
-        })?;
+        },
+    )?;
     PlatformHandle::new(sha256_hex(&bytes)).map_err(|error| InstallationError::InvalidField {
         field: "managed_effect.effect_id".to_owned(),
         reason: error.to_string(),

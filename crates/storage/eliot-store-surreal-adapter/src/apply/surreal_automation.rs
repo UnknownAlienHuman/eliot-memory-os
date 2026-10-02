@@ -708,11 +708,14 @@ pub(crate) struct ContinuationReadRequest<'a> {
 /// eligible page. The quota guard serializes reclamation, capacity accounting,
 /// child creation, and parent-to-child linking in one Surreal transaction.
 /// Replaying a parent with an existing child returns that child's same opaque
-/// identifier after checking it against the just-produced page tail.
+/// identifier after checking it against the just-produced page tail. Replaying
+/// an exact first page returns its original cursor from the retained inventory;
+/// competing first-page publishers retry the guard compare-and-set and observe
+/// that same cursor rather than retaining duplicate roots.
 ///
-/// Issue #2860 A6: exact replay therefore preserves the same page and cursor
-/// identity — the already-linked successor is reused, and a changed tail or
-/// binding fails closed instead of minting a fresh identity.
+/// Issue #2860 A6: exact replay therefore preserves page and cursor identity;
+/// changed tails fail closed, while supplied cursors remain bound to their
+/// original query and snapshot through read-owner validation.
 pub(crate) async fn issue_automation_continuation(
     db: &RpcTransport,
     config: &SurrealAdapterConfig,
@@ -779,7 +782,7 @@ fn continuation_parent_issue(
     now_unix_ms: u64,
 ) -> Result<ContinuationParentIssue, AdapterError> {
     let Some(identifier) = parent_identifier else {
-        return Ok(ContinuationParentIssue::Root);
+        return continuation_unparented_issue(inventory, expected, actual_tail, now_unix_ms);
     };
     let parent = inventory
         .active
@@ -825,6 +828,81 @@ fn continuation_parent_issue(
     Ok(ContinuationParentIssue::Replay(
         child_ref.to_wire().map_err(AdapterError::Store)?,
     ))
+}
+
+/// Resolves an unparented page against the existing retained owner records.
+/// The earliest active continuation with exact read bindings and no active
+/// predecessor is the first-page cursor: later pages share the bindings but
+/// are linked from their parent. Its stored returned tail must still match the
+/// page just sliced, or the repeated first-page read is stale.
+fn continuation_unparented_issue(
+    inventory: &AutomationContinuationInventory,
+    expected: AutomationContinuationReadBinding<'_>,
+    actual_tail: &str,
+    now_unix_ms: u64,
+) -> Result<ContinuationParentIssue, AdapterError> {
+    // A parent link makes a continuation a later-page cursor. Its own
+    // successor does not disqualify a root: replay still needs the first-page
+    // cursor after a later page has been issued.
+    let mut first_page_cursor: Option<&ActiveAutomationContinuation> = None;
+    for candidate in &inventory.active {
+        if candidate.expires_at_unix_ms <= now_unix_ms
+            || inventory
+                .active
+                .iter()
+                .any(|parent| parent.successor_identifier == candidate.identifier)
+            || !continuation_read_binding_matches(candidate, expected)?
+        {
+            continue;
+        }
+        let precedes = first_page_cursor.is_none_or(|current| {
+            candidate.creation_revision < current.creation_revision
+                || (candidate.creation_revision == current.creation_revision
+                    && candidate.identifier < current.identifier)
+        });
+        if precedes {
+            first_page_cursor = Some(candidate);
+        }
+    }
+
+    let Some(record) = first_page_cursor else {
+        return Ok(ContinuationParentIssue::Root);
+    };
+    let reference = AutomationContinuationRef::from_owner_identifier(record.identifier.clone())
+        .map_err(AdapterError::Store)?;
+    let verified = verify_automation_continuation(
+        &reference,
+        continuation_binding(record)?,
+        expected,
+        now_unix_ms,
+    )
+    .map_err(AdapterError::Store)?;
+    if verified.exclusive_returned_tail() != actual_tail {
+        return Err(stale_continuation());
+    }
+    Ok(ContinuationParentIssue::Replay(
+        reference.to_wire().map_err(AdapterError::Store)?,
+    ))
+}
+
+/// Compares every read-side identity field while deliberately leaving the
+/// returned tail to the caller, which checks it independently after selecting
+/// the first cursor for these bindings.
+fn continuation_read_binding_matches(
+    record: &ActiveAutomationContinuation,
+    expected: AutomationContinuationReadBinding<'_>,
+) -> Result<bool, AdapterError> {
+    let retained = continuation_binding(record)?;
+    Ok(retained.read_operation == expected.read_operation
+        && retained.query == expected.query
+        && retained.include_retired == expected.include_retired
+        && retained.automation_id == expected.automation_id
+        && retained.read_revision == expected.read_revision
+        && retained.state_fence == expected.state_fence
+        && retained.order == expected.order
+        && retained.max_records == expected.max_records
+        && retained.issuer_identity == expected.issuer_identity
+        && retained.issuer_generation == expected.issuer_generation)
 }
 
 fn next_continuation_revision(guard: &AutomationContinuationGuard) -> Result<u64, AdapterError> {
@@ -2636,6 +2714,100 @@ mod template_tests {
         )
     }
 
+    // Structural-only validator inputs, not persisted owner or provider proof.
+    // These existing fragment hashes satisfy the shared read-revision shape.
+    const STRUCTURAL_READ_REVISION: &str =
+        "8af33cd54a6fad97ffeb1842e6f12485296869cd20bb3686cc81c10b2305a175";
+    const OTHER_STRUCTURAL_READ_REVISION: &str =
+        "fed71f9abd572187dd0ef58a1d180999e3df4fc7a81f8d15369715a76b31f3ee";
+
+    const ROOT_CONTINUATION_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
+    const CHILD_CONTINUATION_ID: &str = "550e8400-e29b-41d4-a716-446655440002";
+    const UNRELATED_CONTINUATION_ID: &str = "550e8400-e29b-41d4-a716-446655440003";
+
+    fn structural_read_binding<'a>(
+        state_fence: &'a StateFence,
+        read_revision: &'a str,
+    ) -> AutomationContinuationReadBinding<'a> {
+        AutomationContinuationReadBinding {
+            read_operation: NamedReadOperation::GetUserAutomationState,
+            query: AutomationContinuationQuery::History,
+            automation_id: "auto-1",
+            read_revision,
+            state_fence,
+            order: continuation_order(AutomationContinuationQuery::History),
+            max_records: eliot_store_api::MAX_AUTOMATION_PAGE_RECORDS,
+            include_retired: false,
+            issuer_identity: "fixture-owner",
+            issuer_generation: 1,
+        }
+    }
+
+    fn structural_active_continuation(
+        identifier: &str,
+        request: AutomationContinuationReadBinding<'_>,
+        tail: &str,
+        creation_revision: u64,
+        successor_identifier: &str,
+    ) -> ActiveAutomationContinuation {
+        let order_key = match request.order.key {
+            AutomationContinuationOrderKey::Revision => "revision",
+            AutomationContinuationOrderKey::OccurrenceId => "occurrence_id",
+        };
+        let mut record = ActiveAutomationContinuation {
+            record_kind: CONTINUATION_ACTIVE_KIND.to_owned(),
+            identifier: identifier.to_owned(),
+            metadata: AutomationContinuationMetadata {
+                read_operation: "GetUserAutomationState".to_owned(),
+                query: continuation_query_name(request.query).to_owned(),
+                include_retired: request.include_retired,
+                automation_id: request.automation_id.to_owned(),
+                read_revision: request.read_revision.to_owned(),
+                state_fence: request.state_fence.clone(),
+                order_key: order_key.to_owned(),
+                direction: "ascending".to_owned(),
+                exclusive_returned_tail: tail.to_owned(),
+                max_records: request.max_records,
+                issuer_identity: request.issuer_identity.to_owned(),
+                issuer_generation: request.issuer_generation,
+            },
+            creation_revision,
+            created_at_unix_ms: 0,
+            expires_at_unix_ms: eliot_store_api::AUTOMATION_CONTINUATION_TTL_MS,
+            successor_identifier: successor_identifier.to_owned(),
+            metadata_bytes: 0,
+        };
+        record.metadata_bytes = match continuation_metadata_bytes(&record) {
+            Ok(metadata_bytes) => metadata_bytes,
+            Err(error) => panic!("structural continuation metadata serializes: {error:?}"),
+        };
+        record
+    }
+
+    fn structural_inventory(
+        active: Vec<ActiveAutomationContinuation>,
+    ) -> AutomationContinuationInventory {
+        let active_metadata_bytes = active.iter().map(|record| record.metadata_bytes).sum();
+        let sequence = active
+            .iter()
+            .map(|record| record.creation_revision)
+            .max()
+            .unwrap_or(0);
+        AutomationContinuationInventory {
+            guard: AutomationContinuationGuard {
+                record_kind: CONTINUATION_GUARD_KIND.to_owned(),
+                identifier: CONTINUATION_GUARD_ID.to_owned(),
+                sequence,
+                active_records: active.len(),
+                active_metadata_bytes,
+                terminal_records: 0,
+                terminal_metadata_bytes: 0,
+            },
+            active,
+            terminal: Vec::new(),
+        }
+    }
+
     fn writes() -> AutomationWrites {
         AutomationWrites {
             revisions: vec![AutomationRevisionWrite {
@@ -2799,5 +2971,111 @@ mod template_tests {
             "unrelated errors stay partial outcomes"
         );
         assert!(!missing_automation_table(&[]), "empty sets never classify");
+    }
+
+    #[test]
+    fn unparented_replay_after_child_returns_retained_root_wire() {
+        let state_fence = test_fence();
+        let expected = structural_read_binding(&state_fence, STRUCTURAL_READ_REVISION);
+        let root = structural_active_continuation(
+            ROOT_CONTINUATION_ID,
+            expected,
+            "r-1",
+            1,
+            CHILD_CONTINUATION_ID,
+        );
+        let child = structural_active_continuation(CHILD_CONTINUATION_ID, expected, "r-2", 2, "");
+        let inventory = structural_inventory(vec![root, child]);
+
+        let issue = match continuation_unparented_issue(&inventory, expected, "r-1", 0) {
+            Ok(issue) => issue,
+            Err(error) => panic!("retained first-page continuation replays: {error:?}"),
+        };
+        let ContinuationParentIssue::Replay(wire) = issue else {
+            panic!("the original first-page cursor is replayed");
+        };
+        let root_reference =
+            match AutomationContinuationRef::from_owner_identifier(ROOT_CONTINUATION_ID.to_owned())
+            {
+                Ok(reference) => reference,
+                Err(error) => {
+                    panic!("root owner identifier forms a continuation reference: {error:?}")
+                }
+            };
+        let root_wire = match root_reference.to_wire() {
+            Ok(wire) => wire,
+            Err(error) => panic!("root continuation reference serializes: {error:?}"),
+        };
+        let child_reference = match AutomationContinuationRef::from_owner_identifier(
+            CHILD_CONTINUATION_ID.to_owned(),
+        ) {
+            Ok(reference) => reference,
+            Err(error) => {
+                panic!("child owner identifier forms a continuation reference: {error:?}")
+            }
+        };
+        let child_wire = match child_reference.to_wire() {
+            Ok(wire) => wire,
+            Err(error) => panic!("child continuation reference serializes: {error:?}"),
+        };
+        assert_eq!(wire, root_wire);
+        assert_ne!(wire, child_wire);
+    }
+
+    #[test]
+    fn unparented_issue_does_not_adopt_linked_child_as_root() {
+        let state_fence = test_fence();
+        let expected = structural_read_binding(&state_fence, STRUCTURAL_READ_REVISION);
+        let parent_binding = structural_read_binding(&state_fence, OTHER_STRUCTURAL_READ_REVISION);
+        let parent = structural_active_continuation(
+            UNRELATED_CONTINUATION_ID,
+            parent_binding,
+            "parent-tail",
+            1,
+            CHILD_CONTINUATION_ID,
+        );
+        let child = structural_active_continuation(CHILD_CONTINUATION_ID, expected, "r-2", 2, "");
+        let inventory = structural_inventory(vec![parent, child]);
+
+        let issue = match continuation_unparented_issue(&inventory, expected, "r-2", 0) {
+            Ok(issue) => issue,
+            Err(error) => panic!("a linked later-page cursor is not adopted as a root: {error:?}"),
+        };
+        assert!(matches!(issue, ContinuationParentIssue::Root));
+    }
+
+    #[test]
+    fn unparented_replay_with_changed_root_tail_returns_stale_snapshot() {
+        let state_fence = test_fence();
+        let expected = structural_read_binding(&state_fence, STRUCTURAL_READ_REVISION);
+        let root = structural_active_continuation(ROOT_CONTINUATION_ID, expected, "r-1", 1, "");
+        let inventory = structural_inventory(vec![root]);
+
+        let result = continuation_unparented_issue(&inventory, expected, "r-2", 0);
+        assert!(matches!(
+            result,
+            Err(AdapterError::Store(StoreError::AutomationContinuation(
+                AutomationContinuationFailure::StaleSnapshot
+            )))
+        ));
+    }
+
+    #[test]
+    fn unparented_issue_with_original_binding_mismatch_returns_root() {
+        let state_fence = test_fence();
+        let expected = structural_read_binding(&state_fence, STRUCTURAL_READ_REVISION);
+        let mismatched_binding =
+            structural_read_binding(&state_fence, OTHER_STRUCTURAL_READ_REVISION);
+        let retained =
+            structural_active_continuation(ROOT_CONTINUATION_ID, mismatched_binding, "r-1", 1, "");
+        let inventory = structural_inventory(vec![retained]);
+
+        let issue = match continuation_unparented_issue(&inventory, expected, "r-1", 0) {
+            Ok(issue) => issue,
+            Err(error) => panic!(
+                "a different original read binding cannot replay the retained cursor: {error:?}"
+            ),
+        };
+        assert!(matches!(issue, ContinuationParentIssue::Root));
     }
 }

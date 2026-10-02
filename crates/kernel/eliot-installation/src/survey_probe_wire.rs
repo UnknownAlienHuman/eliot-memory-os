@@ -48,7 +48,9 @@ pub fn decode_installation_survey_observation(
     tool: &serde_json::Value,
 ) -> Result<Option<InstallationSurveyProbeRequest>, serde_json::Error> {
     if tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.observe")
-        || tool.pointer("/arguments/kind").and_then(serde_json::Value::as_str)
+        || tool
+            .pointer("/arguments/kind")
+            .and_then(serde_json::Value::as_str)
             != Some("observation")
     {
         return Ok(None);

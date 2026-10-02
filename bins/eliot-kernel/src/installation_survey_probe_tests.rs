@@ -10,27 +10,27 @@ use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use eliot_installation::{BoundedProbeInvocation, ProbeBehaviour};
 use eliot_instrument_api::EvidenceAxes;
 use eliot_platform::ClockObservation;
+use eliot_platform::PlatformHandle;
 use eliot_process::{
     ActionLeaseRef, DescendantEvidence, DispatchAuthorityId, DispatchPermitAuthority,
-    DispatchValidationContext, EnvironmentInheritance, EnvironmentProjection, ExitDisposition,
-    ExitStatus, FencingToken, Generation, ImageId, JobId, KernelDispatchKey, OperationId,
-    PermitIssuance, PhysicalProcessBinding, ProcessCallerSession, ProcessEvidence,
-    ProcessExecutionBinding, ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent,
-    ProcessOwnerBinding, ProcessRequest, ProcessSessionClass, ProcessStartReceipt,
-    ProcessState, ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
-    ProcessStreamPrefixPreview, ProcessStreamTransportPrefixIdentity, ProcessTreeId,
-    ResourceLimits, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamTransportStatus, SuspendedProcessIdentity, DurableProcessStreamSource,
-    DurableStreamLocatorKind,
+    DispatchValidationContext, DurableProcessStreamSource, DurableStreamLocatorKind,
+    EnvironmentInheritance, EnvironmentProjection, ExitDisposition, ExitStatus, FencingToken,
+    Generation, ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance,
+    PhysicalProcessBinding, ProcessCallerSession, ProcessEvidence, ProcessExecutionBinding,
+    ProcessHealth, ProcessHealthStatus, ProcessId, ProcessIntent, ProcessOwnerBinding,
+    ProcessRequest, ProcessSessionClass, ProcessStartReceipt, ProcessState, ProcessStreamEvidence,
+    ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview,
+    ProcessStreamTransportPrefixIdentity, ProcessTreeId, ResourceLimits, SessionId,
+    StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus, SuspendedProcessIdentity,
 };
-use eliot_platform::PlatformHandle;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 const TEST_EXECUTABLE_IDENTITY: &str = "file-identity:conflicting-probe-test";
 const TEST_EXECUTABLE: &str = r"C:\tools\survey-probe.exe";
-const TEST_EXECUTABLE_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const TEST_EXECUTABLE_SHA256: &str =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 #[derive(Clone, Copy)]
 enum StreamFixture {
@@ -56,10 +56,7 @@ struct ProbeFixture {
 fn test_epoch() -> TestResult<EpochId> {
     let sequence = NonZeroU64::new(7)
         .ok_or_else(|| std::io::Error::other("test epoch sequence must be non-zero"))?;
-    Ok(EpochId::new(
-        EpochLineageId::new(TEST_LINEAGE)?,
-        sequence,
-    )?)
+    Ok(EpochId::new(EpochLineageId::new(TEST_LINEAGE)?, sequence)?)
 }
 
 fn revision_heads() -> BTreeMap<String, String> {
@@ -131,11 +128,7 @@ fn process_fixture(
         executable_sha256.clone(),
         vec!["--version".to_owned()],
         r"C:\eliot\survey-probe-working",
-        EnvironmentProjection::new(
-            BTreeMap::new(),
-            Vec::new(),
-            EnvironmentInheritance::None,
-        )?,
+        EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)?,
         ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 0)?,
     )?;
     let mut authority = DispatchPermitAuthority::activate(
@@ -254,10 +247,7 @@ fn stream_evidence(
             StreamPersistenceStatus::CompleteSource,
             observed_sha256,
             observed_length,
-            ProcessStreamPrefixPreview::from_transport_prefix(
-                observed.to_vec(),
-                observed_length,
-            )?,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), observed_length)?,
             Some(exact_source(observed)?),
             Vec::new(),
         )?),
@@ -269,10 +259,7 @@ fn stream_evidence(
             StreamPersistenceStatus::SourceUnavailable,
             observed_sha256,
             observed_length,
-            ProcessStreamPrefixPreview::from_transport_prefix(
-                observed.to_vec(),
-                observed_length,
-            )?,
+            ProcessStreamPrefixPreview::from_transport_prefix(observed.to_vec(), observed_length)?,
             None,
             vec![StreamEvidenceGap::PersistenceUnavailable],
         )?),
@@ -287,25 +274,27 @@ fn stream_evidence(
                 source_sha256.clone(),
                 source_length,
             )?;
-            Ok(ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
-                binding.clone(),
-                kind,
-                policy,
-                StreamTransportStatus::Complete,
-                StreamPersistenceStatus::PartialSource,
-                observed_sha256,
-                observed_length,
-                ProcessStreamPrefixPreview::from_transport_prefix(
-                    truncated_source_bytes.to_vec(),
+            Ok(
+                ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
+                    binding.clone(),
+                    kind,
+                    policy,
+                    StreamTransportStatus::Complete,
+                    StreamPersistenceStatus::PartialSource,
+                    observed_sha256,
                     observed_length,
+                    ProcessStreamPrefixPreview::from_transport_prefix(
+                        truncated_source_bytes.to_vec(),
+                        observed_length,
+                    )?,
+                    Some(source),
+                    Some(ProcessStreamTransportPrefixIdentity::new(
+                        source_sha256,
+                        source_length,
+                    )?),
+                    vec![StreamEvidenceGap::PersistenceFailed],
                 )?,
-                Some(source),
-                Some(ProcessStreamTransportPrefixIdentity::new(
-                    source_sha256,
-                    source_length,
-                )?),
-                vec![StreamEvidenceGap::PersistenceFailed],
-            )?)
+            )
         }
         StreamFixture::GappedSource => Ok(ProcessStreamEvidence::new_raw(
             binding.clone(),
@@ -325,7 +314,7 @@ fn stream_evidence(
             let transformed_sha256 = sha256_hex(transformed_bytes);
             let transformation = eliot_process::ProcessStreamTransformationBinding::new(
                 "receipt:probe-redaction",
-                observed_sha256,
+                observed_sha256.clone(),
                 observed_length,
                 transformed_sha256.clone(),
                 transformed_length,
@@ -464,9 +453,10 @@ fn completed_probe_refuses_root_plus_one_descendant_when_bound_is_zero() -> Test
         .descendants()
         .ok_or_else(|| std::io::Error::other("completed terminal has no tree evidence"))?;
     assert_eq!(tree.process_ids().len(), 2);
-    assert!(tree
-        .process_ids()
-        .contains(&ProcessId::new("survey-probe-descendant")?));
+    assert!(
+        tree.process_ids()
+            .contains(&ProcessId::new("survey-probe-descendant")?)
+    );
     assert!(validate_fixture(&fixture, &terminal).is_err());
     Ok(())
 }
@@ -509,69 +499,79 @@ fn completed_probe_refuses_foreign_session_fence_image_hash_and_operation() -> T
         fixture.owner.clone(),
         SessionId::new("foreign-survey-probe-session")?,
     )?;
-    assert!(validate(
-        &fixture.invocation,
-        &fixture.operation_id,
-        &foreign_caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &fixture.invocation,
+            &fixture.operation_id,
+            &foreign_caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let foreign_fence = FencingToken::new(
         fixture.state_fence.authority_epoch().clone(),
         fixture.state_fence.generation(),
         "foreign-survey-probe-fence",
     )?;
-    assert!(validate(
-        &fixture.invocation,
-        &fixture.operation_id,
-        &fixture.caller,
-        &foreign_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &fixture.invocation,
+            &fixture.operation_id,
+            &fixture.caller,
+            &foreign_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let mut foreign_image = fixture.invocation.clone();
     foreign_image.executable_identity = PlatformHandle::new("file-identity:foreign-image")?;
-    assert!(validate(
-        &foreign_image,
-        &fixture.operation_id,
-        &fixture.caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &foreign_image,
+            &fixture.operation_id,
+            &fixture.caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let foreign_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    assert!(validate(
-        &fixture.invocation,
-        &fixture.operation_id,
-        &fixture.caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        foreign_hash,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &fixture.invocation,
+            &fixture.operation_id,
+            &fixture.caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            foreign_hash,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let foreign_operation = OperationId::new("foreign-survey-probe-operation")?;
-    assert!(validate(
-        &fixture.invocation,
-        &foreign_operation,
-        &fixture.caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &fixture.invocation,
+            &foreign_operation,
+            &fixture.caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &terminal,
+        )
+        .is_err()
+    );
 
     let other_lease_fixture = process_fixture(
         "survey-probe-operation",
@@ -592,16 +592,18 @@ fn completed_probe_refuses_foreign_session_fence_image_hash_and_operation() -> T
             .ok_or_else(|| std::io::Error::other("mismatched terminal has no identity"))?
     );
     assert_ne!(fixture.start.binding(), mismatched_terminal.binding());
-    assert!(validate(
-        &fixture.invocation,
-        &fixture.operation_id,
-        &fixture.caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &mismatched_terminal,
-    )
-    .is_err());
+    assert!(
+        validate(
+            &fixture.invocation,
+            &fixture.operation_id,
+            &fixture.caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &mismatched_terminal,
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -640,12 +642,14 @@ fn survey_probe_stream_answer_ref_requires_exact_complete_durable_source() -> Te
         StreamFixture::CompleteExact,
         false,
     )?;
-    assert!(super::survey_probe_stream_answer_ref(
-        unavailable.stdout(),
-        ProcessStreamKind::Stdout,
-        unavailable.binding(),
-    )
-    .is_err());
+    assert!(
+        super::survey_probe_stream_answer_ref(
+            unavailable.stdout(),
+            ProcessStreamKind::Stdout,
+            unavailable.binding(),
+        )
+        .is_err()
+    );
 
     let truncated = completed_terminal(
         &fixture,
@@ -653,12 +657,14 @@ fn survey_probe_stream_answer_ref_requires_exact_complete_durable_source() -> Te
         StreamFixture::CompleteExact,
         false,
     )?;
-    assert!(super::survey_probe_stream_answer_ref(
-        truncated.stdout(),
-        ProcessStreamKind::Stdout,
-        truncated.binding(),
-    )
-    .is_err());
+    assert!(
+        super::survey_probe_stream_answer_ref(
+            truncated.stdout(),
+            ProcessStreamKind::Stdout,
+            truncated.binding(),
+        )
+        .is_err()
+    );
 
     let gapped = completed_terminal(
         &fixture,
@@ -666,12 +672,14 @@ fn survey_probe_stream_answer_ref_requires_exact_complete_durable_source() -> Te
         StreamFixture::CompleteExact,
         false,
     )?;
-    assert!(super::survey_probe_stream_answer_ref(
-        gapped.stdout(),
-        ProcessStreamKind::Stdout,
-        gapped.binding(),
-    )
-    .is_err());
+    assert!(
+        super::survey_probe_stream_answer_ref(
+            gapped.stdout(),
+            ProcessStreamKind::Stdout,
+            gapped.binding(),
+        )
+        .is_err()
+    );
 
     let transformed = completed_terminal(
         &fixture,
@@ -679,12 +687,14 @@ fn survey_probe_stream_answer_ref_requires_exact_complete_durable_source() -> Te
         StreamFixture::CompleteExact,
         false,
     )?;
-    assert!(super::survey_probe_stream_answer_ref(
-        transformed.stdout(),
-        ProcessStreamKind::Stdout,
-        transformed.binding(),
-    )
-    .is_err());
+    assert!(
+        super::survey_probe_stream_answer_ref(
+            transformed.stdout(),
+            ProcessStreamKind::Stdout,
+            transformed.binding(),
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -704,17 +714,19 @@ fn completed_probe_refuses_combined_stdout_and_stderr_over_output_bound() -> Tes
     let observed_output_bytes = byte_length(stream_payload(ProcessStreamKind::Stdout))?
         + byte_length(stream_payload(ProcessStreamKind::Stderr))?;
     let invocation = probe_invocation(observed_output_bytes - 1)?;
-    assert!(super::validate_survey_probe_terminal(
-        &invocation,
-        &fixture.operation_id,
-        &fixture.owner,
-        &fixture.caller,
-        &fixture.state_fence,
-        &fixture.executable,
-        &fixture.executable_sha256,
-        &fixture.start,
-        &terminal,
-    )
-    .is_err());
+    assert!(
+        super::validate_survey_probe_terminal(
+            &invocation,
+            &fixture.operation_id,
+            &fixture.owner,
+            &fixture.caller,
+            &fixture.state_fence,
+            &fixture.executable,
+            &fixture.executable_sha256,
+            &fixture.start,
+            &terminal,
+        )
+        .is_err()
+    );
     Ok(())
 }

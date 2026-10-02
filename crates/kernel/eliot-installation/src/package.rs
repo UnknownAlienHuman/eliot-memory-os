@@ -157,8 +157,7 @@ pub(super) fn validate_package_binding(
                         .runtime_state_roots
                         .installation_root
                         .as_str(),
-                )?
-                {
+                )? {
                     return Err(InstallationError::IdentityConflict);
                 }
                 let validated_recipe_manifest = PackageManifest::new(
@@ -242,8 +241,8 @@ pub(super) fn validate_staging_receipt_for_plan(
             managed_tools_root,
             ..
         } => {
-            let expected_root = Path::new(managed_tools_root.as_str())
-                .join(&recipe.package_manifest.generation);
+            let expected_root =
+                Path::new(managed_tools_root.as_str()).join(&recipe.package_manifest.generation);
             (
                 &recipe.package_manifest,
                 expected_root,
@@ -552,11 +551,7 @@ pub(super) fn package_stager_for_source(
             Path::new(destination_root.as_str()),
             profile,
         ),
-        None => PackageStager::open_for_profile(
-            source,
-            Path::new(staging_root.as_str()),
-            profile,
-        ),
+        None => PackageStager::open_for_profile(source, Path::new(staging_root.as_str()), profile),
     }
 }
 
@@ -615,31 +610,55 @@ fn stage_package_authorization(
     else {
         return Err(PackageStagingError::Io);
     };
-    stage_package_authorization_for_bound_package(
+    stage_package_authorization_for_bound_package(BoundPackageStagingInputs {
         request,
         source_bundle_identity,
         generation,
         manifest,
         staging_root,
-        destination_root.as_ref(),
+        destination_root: destination_root.as_ref(),
         installation_root_identity,
         destination_parent_identity,
-    )
+    })
 }
 
 /// Creates the same HMAC-bound marker authorization for a signed managed
 /// package recipe. Its source facts are taken only from the durable package
 /// precondition, and all identifiers remain the existing transaction's.
+/// Borrowed exact transaction inputs for constructing package-stage authority.
+#[derive(Clone, Copy)]
+pub(super) struct BoundPackageStagingInputs<'a> {
+    /// Original durable effect request.
+    pub(super) request: &'a InstallationEffectRequest,
+    /// Exact source bundle identity admitted by the effect plan.
+    pub(super) source_bundle_identity: &'a FileIdentity,
+    /// Exact package generation identity.
+    pub(super) generation: &'a PlatformHandle,
+    /// Exact immutable package manifest.
+    pub(super) manifest: &'a PackageManifest,
+    /// Existing staging root bound by the effect plan.
+    pub(super) staging_root: &'a PlatformHandle,
+    /// Exact optional final destination bound by the effect plan.
+    pub(super) destination_root: Option<&'a PlatformHandle>,
+    /// Current installation-root identity, when the effect requires it.
+    pub(super) installation_root_identity: Option<FileIdentity>,
+    /// Current managed destination-parent identity, when required.
+    pub(super) destination_parent_identity: Option<FileIdentity>,
+}
+
 pub(super) fn stage_package_authorization_for_bound_package(
-    request: &InstallationEffectRequest,
-    source_bundle_identity: &FileIdentity,
-    generation: &PlatformHandle,
-    manifest: &PackageManifest,
-    staging_root: &PlatformHandle,
-    destination_root: Option<&PlatformHandle>,
-    installation_root_identity: Option<FileIdentity>,
-    destination_parent_identity: Option<FileIdentity>,
+    inputs: BoundPackageStagingInputs<'_>,
 ) -> Result<StagePackageAuthorization, PackageStagingError> {
+    let BoundPackageStagingInputs {
+        request,
+        source_bundle_identity,
+        generation,
+        manifest,
+        staging_root,
+        destination_root,
+        installation_root_identity,
+        destination_parent_identity,
+    } = inputs;
     match &request.plan {
         InstallerEffectPlan::StagePackage {
             source_bundle_identity: planned_source,
@@ -658,8 +677,8 @@ pub(super) fn stage_package_authorization_for_bound_package(
             managed_tools_root,
             ..
         } => {
-            let expected_destination = Path::new(managed_tools_root.as_str())
-                .join(&recipe.package_manifest.generation);
+            let expected_destination =
+                Path::new(managed_tools_root.as_str()).join(&recipe.package_manifest.generation);
             if recipe.source_bundle_identity != *source_bundle_identity
                 || recipe.package_manifest.generation != generation.as_str()
                 || recipe.package_manifest != *manifest
@@ -915,7 +934,7 @@ pub(super) fn package_staging_unknown_port_error(
     package_port_error(error)
 }
 
-fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
+pub(super) fn package_staging_outcome<T>(error: &PackageStagingError) -> PortOutcome<T> {
     match error {
         error @ (PackageStagingError::Win32 { .. } | PackageStagingError::Win32At { .. }) => {
             PortOutcome::Error(package_port_error(error))

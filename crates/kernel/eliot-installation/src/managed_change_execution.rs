@@ -8,31 +8,31 @@
 
 use std::path::{Path, PathBuf};
 
+use eliot_contracts::sha256_hex;
 use eliot_platform::{PortError, PortOutcome, UnknownReason};
 use eliot_platform_windows::{
-    FileIdentity, InstallerRootProfile, PackageStager, PackageStagingError,
-    PackageStagingObservation, StagePackageAuthorization, StagingReceipt, TrustedSourceBundle,
+    FileIdentity, PackageStager, PackageStagingError, PackageStagingObservation, StagingReceipt,
+    TrustedSourceBundle,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{InstallationError, PlatformHandle, handle, sha256_handle};
 
-use super::{
-    InstallationCreateDisposition, InstallationEffectAction, InstallationEffectDisposition,
-    InstallationEffectExecution, InstallationEffectObservation, InstallationEffectPrecondition,
-    InstallationEffectProgress, InstallationEffectProgressState, InstallationEffectRequest,
-    InstallationError as EffectError, InstallationProfile, InstallationStage,
-    InstallationSecretLifecycle, InstallationSecretProvisionDisposition,
-    InstallationTransaction, ManagedEffectOperation, ManagedEffectRecipe, package_staging_profile,
-    same_windows_root,
-};
 use super::package::{
-    build_package_snapshot, package_absent_with_snapshot, package_matching_observation,
-    package_pending, package_receipt_binding, package_stager_for_source,
+    BoundPackageStagingInputs, build_package_snapshot, package_absent_with_snapshot,
+    package_matching_observation, package_pending, package_stager_for_source,
+    package_staging_outcome, package_staging_profile,
     stage_package_authorization_for_bound_package, validate_observed_against_plan,
     validate_staging_receipt_for_observation, validate_staging_receipt_for_plan,
     verify_managed_destination_parent_identity,
+};
+use super::{
+    InstallationCreateDisposition, InstallationEffectAction, InstallationEffectDisposition,
+    InstallationEffectExecution, InstallationEffectObservation, InstallationEffectProgress,
+    InstallationEffectProgressState, InstallationEffectRequest, InstallationProfile,
+    InstallationSecretLifecycle, InstallationSecretProvisionDisposition, InstallationStage,
+    InstallationTransaction, ManagedEffectOperation, ManagedEffectRecipe, same_windows_root,
 };
 
 /// Current wire version of one same-store managed-resource projection.
@@ -52,12 +52,8 @@ impl ManagedResourceKey {
     /// Validate the exact lookup pair before using it as a store key.
     pub(crate) fn validate(&self) -> Result<(), InstallationError> {
         handle(&self.family_id, "managed_resource.family_id")?;
-        handle(
-            &self.exact_candidate,
-            "managed_resource.exact_candidate",
-        )
+        handle(&self.exact_candidate, "managed_resource.exact_candidate")
     }
-
 }
 
 /// Frozen reference to the original transaction that owns one managed parent
@@ -70,7 +66,7 @@ pub struct InstallationManagedRootEffectProof {
     pub owner_transaction_id: PlatformHandle,
     /// Digest of the original transaction's complete immutable effect plan.
     pub installer_plan_digest: PlatformHandle,
-    /// Exact original CreateRoot effect plan.
+    /// Exact original `CreateRoot` effect plan.
     pub original_plan: super::InstallerEffectPlan,
     /// Exact original durable effect progress, including ownership reference.
     pub original_progress: InstallationEffectProgress,
@@ -78,7 +74,10 @@ pub struct InstallationManagedRootEffectProof {
 
 impl InstallationManagedRootEffectProof {
     pub(super) fn validate(&self, root: &PlatformHandle) -> Result<(), InstallationError> {
-        handle(&self.owner_transaction_id, "managed_root.owner_transaction_id")?;
+        handle(
+            &self.owner_transaction_id,
+            "managed_root.owner_transaction_id",
+        )?;
         sha256_handle(
             &self.installer_plan_digest,
             "managed_root.installer_plan_digest",
@@ -121,7 +120,11 @@ impl InstallationManagedRootEffectProof {
 /// Derives the original managed-root owner from the current transaction
 /// table. The current anchor supplies the exact installation epoch and
 /// principal binding; every matching path must resolve to one completed or
-/// ActiveVerified transaction-created root.
+/// `ActiveVerified` transaction-created root.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete owner-transaction and effect-progress proof must be checked as one read-only join"
+)]
 pub(super) fn derive_managed_root_effect_proof(
     transactions: &[InstallationTransaction],
     anchor_transaction_id: &PlatformHandle,
@@ -269,6 +272,10 @@ pub(super) fn derive_managed_root_effect_proof(
 
 /// Atomically revalidates every frozen managed-root proof against the source
 /// transactions in the same table and refuses any unrecorded original owner.
+#[allow(
+    clippy::too_many_lines,
+    reason = "all prior-root ownership and retained receipt checks form one fail-closed admission boundary"
+)]
 pub(super) fn validate_managed_prior_root_effects(
     transactions: &[InstallationTransaction],
     current: &InstallationTransaction,
@@ -429,7 +436,7 @@ pub(super) fn validate_managed_prior_root_effects(
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedResourceEffectRef {
-    /// Existing InstallationTransaction that owns effect intent and outcome.
+    /// Existing `InstallationTransaction` that owns effect intent and outcome.
     pub transaction_id: PlatformHandle,
     /// Exact immutable effect inside that transaction.
     pub effect_id: PlatformHandle,
@@ -531,8 +538,7 @@ impl ManagedResourceProjection {
                 return Err(InstallationError::IdentityConflict);
             }
         } else if self.disposition != ManagedResourceDisposition::Removed
-            && (self.origin.staging_receipt_digest.is_none()
-                || self.owned_generations.is_empty())
+            && (self.origin.staging_receipt_digest.is_none() || self.owned_generations.is_empty())
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -549,6 +555,10 @@ impl ManagedResourceProjection {
 /// and effect receipts in `installation_transactions_v7`. The projection is
 /// derived data: every resource owner and package receipt is resolved through
 /// its immutable transaction/effect identity.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the current projection is derived from one ordered walk of the original transaction table"
+)]
 pub(super) fn derive_managed_resource_projection(
     transactions: &[InstallationTransaction],
     key: &ManagedResourceKey,
@@ -633,7 +643,6 @@ pub(super) fn derive_managed_resource_projection(
                     candidates.push((prior_resource.as_deref().cloned(), projection));
                 }
             }
-            InstallationStage::RolledBack => {}
             _ => {}
         }
     }
@@ -726,7 +735,10 @@ pub(super) fn resolve_applied_managed_effect(
         .enumerate()
         .find(|(_, effect)| effect.effect_id() == &effect_ref.effect_id)
         .ok_or(InstallationError::IdentityConflict)?;
-    if !matches!(effect, super::InstallerEffectPlan::ManagedEnvironmentChange { .. }) {
+    if !matches!(
+        effect,
+        super::InstallerEffectPlan::ManagedEnvironmentChange { .. }
+    ) {
         return Err(InstallationError::IdentityConflict);
     }
     let progress = transaction
@@ -751,6 +763,10 @@ pub(super) fn resolve_applied_managed_effect(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact managed operation transition and ownership revision must remain one auditable mapping"
+)]
 fn transition_managed_resource(
     key: &ManagedResourceKey,
     recipe: &ManagedEffectRecipe,
@@ -819,13 +835,11 @@ fn transition_managed_resource(
                 .iter()
                 .position(|previous| previous.generation == receipt.generation)
                 .ok_or(InstallationError::IdentityConflict)?;
-            let prior_digest = PlatformHandle::new(
-                prior_receipts[prior_receipt_index].digest(),
-            )
-            .map_err(|error| InstallationError::InvalidField {
-                field: "managed_resource.staging_receipt_digest".to_owned(),
-                reason: error.to_string(),
-            })?;
+            let prior_digest = PlatformHandle::new(prior_receipts[prior_receipt_index].digest())
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "managed_resource.staging_receipt_digest".to_owned(),
+                    reason: error.to_string(),
+                })?;
             let generation_ref_index = prior
                 .owned_generations
                 .iter()
@@ -899,9 +913,7 @@ pub(super) fn managed_repair_restart_readback(
             PackageStagingObservation::Mismatch(error) => {
                 PackageStagingObservation::Mismatch(error)
             }
-            PackageStagingObservation::Unknown(error) => {
-                PackageStagingObservation::Unknown(error)
-            }
+            PackageStagingObservation::Unknown(error) => PackageStagingObservation::Unknown(error),
         },
         candidate => candidate,
     }
@@ -911,7 +923,10 @@ pub(super) const fn managed_operation_requires_destination_parent(
     operation: ManagedEffectOperation,
 ) -> bool {
     managed_operation_stages(operation)
-        || matches!(operation, ManagedEffectOperation::RemoveOwnedPortableGeneration)
+        || matches!(
+            operation,
+            ManagedEffectOperation::RemoveOwnedPortableGeneration
+        )
 }
 
 fn managed_destination(
@@ -920,8 +935,7 @@ fn managed_destination(
 ) -> Result<PlatformHandle, InstallationError> {
     let root = match &request.plan {
         super::InstallerEffectPlan::ManagedEnvironmentChange {
-            managed_tools_root,
-            ..
+            managed_tools_root, ..
         } => PathBuf::from(managed_tools_root.as_str()),
         _ => return Err(InstallationError::IdentityConflict),
     };
@@ -938,10 +952,7 @@ fn prior_generation_receipt<'a>(
     request: &'a InstallationEffectRequest,
     recipe: &ManagedEffectRecipe,
 ) -> Result<&'a StagingReceipt, PackageStagingError> {
-    let super::InstallerEffectPlan::ManagedEnvironmentChange {
-        prior_receipts,
-        ..
-    } = &request.plan
+    let super::InstallerEffectPlan::ManagedEnvironmentChange { prior_receipts, .. } = &request.plan
     else {
         return Err(PackageStagingError::IdentityMismatch);
     };
@@ -981,7 +992,8 @@ fn managed_recipe(
         request: managed_request,
         recipe,
         ..
-    } = &request.plan else {
+    } = &request.plan
+    else {
         return Err(PackageStagingError::Io);
     };
     if recipe.action != managed_request.action
@@ -1002,11 +1014,7 @@ fn signed_source_snapshot(
         return Err(PackageStagingError::IdentityMismatch);
     }
     let observed = source.observe()?;
-    validate_observed_against_plan(
-        &observed,
-        &recipe.package_manifest,
-        &recipe.expected_files,
-    )?;
+    validate_observed_against_plan(&observed, &recipe.package_manifest, &recipe.expected_files)?;
     let generation = PlatformHandle::new(recipe.package_manifest.generation.clone())
         .map_err(|_| PackageStagingError::IdentityMismatch)?;
     let manifest_digest = PlatformHandle::new(recipe.package_manifest.canonical_digest())
@@ -1056,12 +1064,14 @@ pub(super) fn validate_nonstaging_managed_readback(
     postcondition_digest: &PlatformHandle,
 ) -> Result<(), InstallationError> {
     let recipe = managed_recipe(request).map_err(|_| InstallationError::IdentityConflict)?;
-    let snapshot = signed_source_snapshot(recipe).map_err(|_| InstallationError::IdentityConflict)?;
+    let snapshot =
+        signed_source_snapshot(recipe).map_err(|_| InstallationError::IdentityConflict)?;
     if request.precondition.package_snapshot.as_ref() != Some(&snapshot) {
         return Err(InstallationError::IdentityConflict);
     }
     let (expected_external_identity, expected_postcondition_digest) =
-        managed_external_binding(request, &snapshot).map_err(|_| InstallationError::IdentityConflict)?;
+        managed_external_binding(request, &snapshot)
+            .map_err(|_| InstallationError::IdentityConflict)?;
     let expected_evidence = match recipe.operation {
         ManagedEffectOperation::RegisterObservedPortableGeneration => vec![snapshot.digest],
         ManagedEffectOperation::RemoveOwnedPortableGeneration => {
@@ -1111,7 +1121,7 @@ fn managed_matching_source(
 /// Inspects the signed source and the exact managed generation destination.
 ///
 /// This does not create or adopt a destination. Package actions use the
-/// existing PackageStager open contract, which retains the existing signed
+/// existing `PackageStager` open contract, which retains the existing signed
 /// family parent and refuses a destination that already exists without the
 /// original receipt. Registration reads only the signed source inventory.
 pub(super) fn inspect_managed_change(
@@ -1140,10 +1150,7 @@ pub(super) fn inspect_managed_change(
         | ManagedEffectOperation::ReconfigurePortableGeneration => {
             let destination = managed_destination(request, recipe)
                 .map_err(|_| PackageStagingError::InvalidRelativePath)?;
-            verify_managed_destination_parent_identity(
-                &destination,
-                destination_parent_identity,
-            )?;
+            verify_managed_destination_parent_identity(&destination, destination_parent_identity)?;
             if recipe.operation == ManagedEffectOperation::RepairPortableGeneration {
                 let prior = prior_generation_receipt(request, recipe)?;
                 match PackageStager::reconcile_profile_destination_only(
@@ -1166,14 +1173,14 @@ pub(super) fn inspect_managed_change(
                 }
                 _ => return Err(PackageStagingError::Io),
             };
-            let _stager = package_stager_for_source(
+            let stager = package_stager_for_source(
                 &recipe.source_bundle,
                 &recipe.source_bundle_identity,
                 &staging_root,
                 Some(&destination),
                 package_staging_profile(request.profile),
             )?;
-            if _stager.destination_parent_identity() != destination_parent_identity {
+            if stager.destination_parent_identity() != destination_parent_identity {
                 return Err(PackageStagingError::IdentityMismatch);
             }
             package_absent_with_snapshot(request, snapshot)
@@ -1182,10 +1189,7 @@ pub(super) fn inspect_managed_change(
             let receipt = prior_generation_receipt(request, recipe)?;
             let destination = managed_destination(request, recipe)
                 .map_err(|_| PackageStagingError::InvalidRelativePath)?;
-            verify_managed_destination_parent_identity(
-                &destination,
-                destination_parent_identity,
-            )?;
+            verify_managed_destination_parent_identity(&destination, destination_parent_identity)?;
             match PackageStager::reconcile_profile_destination_only(
                 Path::new(destination.as_str()),
                 receipt,
@@ -1194,9 +1198,9 @@ pub(super) fn inspect_managed_change(
                 PackageStagingObservation::Matching(_) => {
                     package_absent_with_snapshot(request, snapshot)
                 }
-                PackageStagingObservation::Absent => Ok(package_pending(
-                    &PackageStagingError::IdentityMismatch,
-                )),
+                PackageStagingObservation::Absent => {
+                    Ok(package_pending(&PackageStagingError::IdentityMismatch))
+                }
                 PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
                 PackageStagingObservation::Unknown(error) => Err(error),
             }
@@ -1207,14 +1211,17 @@ pub(super) fn inspect_managed_change(
 /// Performs only the recipe's bounded file stage or metadata-registration
 /// precondition. The registration itself is committed by the same redb CAS
 /// that records `Applied`; this adapter never launches the observed program.
+#[allow(
+    clippy::too_many_lines,
+    reason = "this effect owner revalidates and records one dependent managed operation in its required transaction order"
+)]
 pub(super) fn execute_managed_change(
     request: &InstallationEffectRequest,
     ownership_key: &[u8],
     destination_parent_identity: Option<FileIdentity>,
 ) -> PortOutcome<InstallationEffectExecution> {
-    let recipe = match managed_recipe(request) {
-        Ok(value) => value,
-        Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+    let Ok(recipe) = managed_recipe(request) else {
+        return PortOutcome::Error(PortError::InvalidRequestMetadata);
     };
     if request.profile != InstallationProfile::PortableDev
         || recipe.require_supported().is_err()
@@ -1258,9 +1265,8 @@ pub(super) fn execute_managed_change(
             let Some(snapshot) = request.precondition.package_snapshot.as_ref() else {
                 return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
-            let destination = match managed_destination(request, recipe) {
-                Ok(destination) => destination,
-                Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+            let Ok(destination) = managed_destination(request, recipe) else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
             if let Err(error) = verify_managed_destination_parent_identity(
                 &destination,
@@ -1301,17 +1307,15 @@ pub(super) fn execute_managed_change(
                 ) {
                     return PortOutcome::Error(super::package_port_error(&error));
                 }
-                let generation = match PlatformHandle::new(
-                    recipe.package_manifest.generation.clone(),
-                ) {
-                    Ok(generation) => generation,
-                    Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+                let Ok(generation) =
+                    PlatformHandle::new(recipe.package_manifest.generation.clone())
+                else {
+                    return PortOutcome::Error(PortError::InvalidRequestMetadata);
                 };
-                let manifest_digest = match PlatformHandle::new(
-                    recipe.package_manifest.canonical_digest(),
-                ) {
-                    Ok(digest) => digest,
-                    Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+                let Ok(manifest_digest) =
+                    PlatformHandle::new(recipe.package_manifest.canonical_digest())
+                else {
+                    return PortOutcome::Error(PortError::InvalidRequestMetadata);
                 };
                 let current_snapshot = match build_package_snapshot(
                     source_stager.source().identity(),
@@ -1328,19 +1332,20 @@ pub(super) fn execute_managed_change(
                     ));
                 }
                 let installation_root_identity = source_stager.installation_root_identity();
-                let authorization = match stage_package_authorization_for_bound_package(
-                    request,
-                    &recipe.source_bundle_identity,
-                    &generation,
-                    &recipe.package_manifest,
-                    &request.installation_root,
-                    Some(&destination),
-                    Some(installation_root_identity),
-                    destination_parent_identity,
-                ) {
-                    Ok(authorization) => authorization,
-                    Err(error) => return PortOutcome::Error(super::package_port_error(&error)),
-                };
+                let authorization =
+                    match stage_package_authorization_for_bound_package(BoundPackageStagingInputs {
+                        request,
+                        source_bundle_identity: &recipe.source_bundle_identity,
+                        generation: &generation,
+                        manifest: &recipe.package_manifest,
+                        staging_root: &request.installation_root,
+                        destination_root: Some(&destination),
+                        installation_root_identity: Some(installation_root_identity),
+                        destination_parent_identity,
+                    }) {
+                        Ok(authorization) => authorization,
+                        Err(error) => return PortOutcome::Error(super::package_port_error(&error)),
+                    };
                 let prior = match prior_generation_receipt(request, recipe) {
                     Ok(receipt) => receipt,
                     Err(error) => return PortOutcome::Error(super::package_port_error(&error)),
@@ -1360,8 +1365,10 @@ pub(super) fn execute_managed_change(
                         }
                     }
                     Ok(PackageStagingObservation::Absent) => {}
-                    Ok(PackageStagingObservation::Mismatch(error))
-                    | Ok(PackageStagingObservation::Unknown(error))
+                    Ok(
+                        PackageStagingObservation::Mismatch(error)
+                        | PackageStagingObservation::Unknown(error),
+                    )
                     | Err(error) => {
                         return PortOutcome::Error(super::package_port_error(&error));
                     }
@@ -1388,9 +1395,9 @@ pub(super) fn execute_managed_change(
                     &PackageStagingError::IdentityMismatch,
                 ));
             }
-            let generation = match PlatformHandle::new(recipe.package_manifest.generation.clone()) {
-                Ok(generation) => generation,
-                Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+            let Ok(generation) = PlatformHandle::new(recipe.package_manifest.generation.clone())
+            else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
             let authorization = match repair_preflight {
                 Some((installation_root_identity, authorization))
@@ -1403,19 +1410,21 @@ pub(super) fn execute_managed_change(
                         &PackageStagingError::IdentityMismatch,
                     ));
                 }
-                None => match stage_package_authorization_for_bound_package(
-                    request,
-                    &recipe.source_bundle_identity,
-                    &generation,
-                    &recipe.package_manifest,
-                    &request.installation_root,
-                    Some(&destination),
-                    Some(stager.installation_root_identity()),
-                    destination_parent_identity,
-                ) {
-                    Ok(authorization) => authorization,
-                    Err(error) => return PortOutcome::Error(super::package_port_error(&error)),
-                },
+                None => {
+                    match stage_package_authorization_for_bound_package(BoundPackageStagingInputs {
+                        request,
+                        source_bundle_identity: &recipe.source_bundle_identity,
+                        generation: &generation,
+                        manifest: &recipe.package_manifest,
+                        staging_root: &request.installation_root,
+                        destination_root: Some(&destination),
+                        installation_root_identity: Some(stager.installation_root_identity()),
+                        destination_parent_identity,
+                    }) {
+                        Ok(authorization) => authorization,
+                        Err(error) => return PortOutcome::Error(super::package_port_error(&error)),
+                    }
+                }
             };
             match stager.stage_authorized(&recipe.package_manifest, &authorization, ownership_key) {
                 Ok(receipt) => {
@@ -1427,8 +1436,10 @@ pub(super) fn execute_managed_change(
                         ));
                     }
                     PortOutcome::Known(InstallationEffectExecution {
-                        evidence: vec![PlatformHandle::new(receipt.digest())
-                            .unwrap_or_else(|_| unreachable!())],
+                        evidence: vec![
+                            PlatformHandle::new(receipt.digest())
+                                .unwrap_or_else(|_| unreachable!()),
+                        ],
                         create_disposition: None,
                         credential_receipt: None,
                         staging_receipt: Some(receipt),
@@ -1441,13 +1452,11 @@ pub(super) fn execute_managed_change(
             }
         }
         ManagedEffectOperation::RemoveOwnedPortableGeneration => {
-            let prior = match prior_generation_receipt(request, recipe) {
-                Ok(receipt) => receipt,
-                Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+            let Ok(prior) = prior_generation_receipt(request, recipe) else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
-            let destination = match managed_destination(request, recipe) {
-                Ok(destination) => destination,
-                Err(_) => return PortOutcome::Error(PortError::InvalidRequestMetadata),
+            let Ok(destination) = managed_destination(request, recipe) else {
+                return PortOutcome::Error(PortError::InvalidRequestMetadata);
             };
             if let Err(error) = verify_managed_destination_parent_identity(
                 &destination,
@@ -1461,8 +1470,9 @@ pub(super) fn execute_managed_change(
                 package_staging_profile(request.profile),
             ) {
                 Ok(()) => PortOutcome::Known(InstallationEffectExecution {
-                    evidence: vec![PlatformHandle::new(prior.digest())
-                        .unwrap_or_else(|_| unreachable!())],
+                    evidence: vec![
+                        PlatformHandle::new(prior.digest()).unwrap_or_else(|_| unreachable!()),
+                    ],
                     create_disposition: None,
                     credential_receipt: None,
                     staging_receipt: None,
@@ -1470,7 +1480,7 @@ pub(super) fn execute_managed_change(
                     service_start_disposition: None,
                     service_runtime_lineage: None,
                 }),
-                Err(error) => super::package_staging_outcome(&error),
+                Err(error) => package_staging_outcome(&error),
             }
         }
     }
@@ -1479,6 +1489,10 @@ pub(super) fn execute_managed_change(
 /// Reconciles a committed managed operation from its original package marker
 /// and exact source readback. A missing marker or conflicting tree stays
 /// indeterminate; it never becomes a second stage attempt.
+#[allow(
+    clippy::too_many_lines,
+    reason = "all provider readback states must reconcile under the original managed effect identity"
+)]
 pub(super) fn reconcile_managed_change(
     request: &InstallationEffectRequest,
     ownership_key: &[u8],
@@ -1510,10 +1524,7 @@ pub(super) fn reconcile_managed_change(
         | ManagedEffectOperation::ReconfigurePortableGeneration => {
             let destination = managed_destination(request, recipe)
                 .map_err(|_| PackageStagingError::InvalidRelativePath)?;
-            verify_managed_destination_parent_identity(
-                &destination,
-                destination_parent_identity,
-            )?;
+            verify_managed_destination_parent_identity(&destination, destination_parent_identity)?;
             let observation = if let Some(receipt) = request.staging_receipt.as_ref() {
                 validate_staging_receipt_for_plan(&request.plan, receipt)
                     .map_err(|_| PackageStagingError::IdentityMismatch)?;
@@ -1537,24 +1548,27 @@ pub(super) fn reconcile_managed_change(
                     observation
                 }
             } else if recipe.operation == ManagedEffectOperation::RepairPortableGeneration {
-                let authorization = stage_package_authorization_for_bound_package(
-                    request,
-                    &recipe.source_bundle_identity,
-                    &PlatformHandle::new(recipe.package_manifest.generation.clone())
-                        .map_err(|_| PackageStagingError::IdentityMismatch)?,
-                    &recipe.package_manifest,
-                    &request.installation_root,
-                    Some(&destination),
-                    None,
-                    destination_parent_identity,
-                )?;
-                let candidate_observation = PackageStager::reconcile_prepared_profile_destination_only(
-                    Path::new(request.installation_root.as_str()),
-                    &recipe.package_manifest,
-                    &authorization,
-                    ownership_key,
-                    package_staging_profile(request.profile),
-                )?;
+                let generation = PlatformHandle::new(recipe.package_manifest.generation.clone())
+                    .map_err(|_| PackageStagingError::IdentityMismatch)?;
+                let authorization =
+                    stage_package_authorization_for_bound_package(BoundPackageStagingInputs {
+                        request,
+                        source_bundle_identity: &recipe.source_bundle_identity,
+                        generation: &generation,
+                        manifest: &recipe.package_manifest,
+                        staging_root: &request.installation_root,
+                        destination_root: Some(&destination),
+                        installation_root_identity: None,
+                        destination_parent_identity,
+                    })?;
+                let candidate_observation =
+                    PackageStager::reconcile_prepared_profile_destination_only(
+                        Path::new(request.installation_root.as_str()),
+                        &recipe.package_manifest,
+                        &authorization,
+                        ownership_key,
+                        package_staging_profile(request.profile),
+                    )?;
                 let candidate_absence = match candidate_observation {
                     PackageStagingObservation::Matching(receipt) => {
                         return package_matching_observation(request, receipt)
@@ -1572,27 +1586,26 @@ pub(super) fn reconcile_managed_change(
                     prior,
                     package_staging_profile(request.profile),
                 )?;
-                managed_repair_restart_readback(
-                    candidate_absence,
-                    prior_observation,
-                )
+                managed_repair_restart_readback(candidate_absence, prior_observation)
             } else if request.ownership_secret.as_ref().is_some_and(|ownership| {
                 ownership.create_disposition == InstallationCreateDisposition::Created
                     && ownership.secret_provision_disposition
                         == super::InstallationSecretProvisionDisposition::Created
                     && ownership.lifecycle != super::InstallationSecretLifecycle::Deleted
             }) {
-                let authorization = stage_package_authorization_for_bound_package(
-                    request,
-                    &recipe.source_bundle_identity,
-                    &PlatformHandle::new(recipe.package_manifest.generation.clone())
-                        .map_err(|_| PackageStagingError::IdentityMismatch)?,
-                    &recipe.package_manifest,
-                    &request.installation_root,
-                    Some(&destination),
-                    None,
-                    destination_parent_identity,
-                )?;
+                let generation = PlatformHandle::new(recipe.package_manifest.generation.clone())
+                    .map_err(|_| PackageStagingError::IdentityMismatch)?;
+                let authorization =
+                    stage_package_authorization_for_bound_package(BoundPackageStagingInputs {
+                        request,
+                        source_bundle_identity: &recipe.source_bundle_identity,
+                        generation: &generation,
+                        manifest: &recipe.package_manifest,
+                        staging_root: &request.installation_root,
+                        destination_root: Some(&destination),
+                        installation_root_identity: None,
+                        destination_parent_identity,
+                    })?;
                 PackageStager::reconcile_prepared_profile_destination_only(
                     Path::new(request.installation_root.as_str()),
                     &recipe.package_manifest,
@@ -1621,10 +1634,7 @@ pub(super) fn reconcile_managed_change(
             let prior = prior_generation_receipt(request, recipe)?;
             let destination = managed_destination(request, recipe)
                 .map_err(|_| PackageStagingError::InvalidRelativePath)?;
-            verify_managed_destination_parent_identity(
-                &destination,
-                destination_parent_identity,
-            )?;
+            verify_managed_destination_parent_identity(&destination, destination_parent_identity)?;
             match PackageStager::reconcile_profile_destination_only(
                 Path::new(destination.as_str()),
                 prior,
@@ -1633,15 +1643,16 @@ pub(super) fn reconcile_managed_change(
                 PackageStagingObservation::Absent => managed_absence(
                     request,
                     &snapshot,
-                    vec![PlatformHandle::new(prior.digest())
-                        .unwrap_or_else(|_| unreachable!())],
+                    vec![PlatformHandle::new(prior.digest()).unwrap_or_else(|_| unreachable!())],
                 )
                 .map_err(|_| PackageStagingError::IdentityMismatch),
-                PackageStagingObservation::Matching(_) => Ok(InstallationEffectObservation::Absent {
-                    observed_precondition: request.precondition.clone(),
-                    evidence: vec![snapshot.digest],
-                    service_runtime_lineage: None,
-                }),
+                PackageStagingObservation::Matching(_) => {
+                    Ok(InstallationEffectObservation::Absent {
+                        observed_precondition: request.precondition.clone(),
+                        evidence: vec![snapshot.digest],
+                        service_runtime_lineage: None,
+                    })
+                }
                 PackageStagingObservation::Mismatch(error) => Ok(package_pending(&error)),
                 PackageStagingObservation::Unknown(error) => Err(error),
             }

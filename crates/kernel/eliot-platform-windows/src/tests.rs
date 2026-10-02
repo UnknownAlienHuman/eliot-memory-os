@@ -3055,10 +3055,10 @@ fn caller_pid_image_mismatch_rejection_kills_and_reaps_job() {
             Ok(())
         }
     });
-    assert_eq!(
-        result.err(),
-        Some(SuspendedValidationError::Rejected("pid-image-mismatch"))
-    );
+    assert!(matches!(
+        result,
+        Err(SuspendedValidationError::Rejected("pid-image-mismatch"))
+    ));
     assert!(wait_for_process_gone(pid), "rejected child must not leak");
     assert!(!marker.exists());
     let _ = std::fs::remove_dir_all(root);
@@ -3091,10 +3091,10 @@ fn stale_validation_cannot_validate_a_new_process_generation() {
             Err("stale-validation")
         }
     });
-    assert_eq!(
-        result.err(),
-        Some(SuspendedValidationError::Rejected("stale-validation"))
-    );
+    assert!(matches!(
+        result,
+        Err(SuspendedValidationError::Rejected("stale-validation"))
+    ));
     assert!(wait_for_process_gone(second_pid));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -3109,7 +3109,7 @@ fn validator_panic_still_kills_and_reaps_suspended_job() {
     let child = spawn_suspended_child(&marker, &root, false);
     let pid = child.id();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = child.validate::<(), (), _>(|_| panic!("test validator panic"));
+        let _ = child.validate::<(), &'static str, _>(|_| panic!("test validator panic"));
     }));
     assert!(panic.is_err());
     assert!(wait_for_process_gone(pid));
@@ -4483,10 +4483,10 @@ fn existing_job_member_rejection_and_validator_panic_preserve_root() {
         assert!(evidence.process().start_time_100ns != 0);
         Err("wrong-image-or-policy")
     });
-    assert_eq!(
-        result.err(),
-        Some(SuspendedValidationError::Rejected("wrong-image-or-policy"))
-    );
+    assert!(matches!(
+        result,
+        Err(SuspendedValidationError::Rejected("wrong-image-or-policy"))
+    ));
     assert!(wait_for_process_gone(rejected_pid));
     assert!(
         running_root
@@ -4501,7 +4501,7 @@ fn existing_job_member_rejection_and_validator_panic_preserve_root() {
         .unwrap_or_else(|_| unreachable!());
     let panic_pid = panicking.id();
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = panicking.validate::<(), (), _>(|_| panic!("member validator panic"));
+        let _ = panicking.validate::<(), &'static str, _>(|_| panic!("member validator panic"));
     }));
     assert!(panic.is_err());
     assert!(wait_for_process_gone(panic_pid));

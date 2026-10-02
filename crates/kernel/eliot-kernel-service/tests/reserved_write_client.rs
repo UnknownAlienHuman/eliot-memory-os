@@ -108,7 +108,12 @@ fn transition_with(tag: &str) -> PreparedTransition {
         ordering_scopes: vec![OrderingScopeId::new(format!("scope-991-{tag}")).unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // The owner's own computed value, never a literal: `PreparedTransition::validate`
+        // refuses with `ManifestMismatch` unless this equals
+        // `supported_admission_contract_set_digest()`, so a hard-coded digest here rots the
+        // moment the supported set changes and the failure looks like a fixture problem.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("the supported admission contract set digest is owner-computed"),
         operation_manifest_digest: OperationManifestDigest::new(format!("manifest-991-{tag}"))
             .unwrap(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
@@ -324,7 +329,17 @@ impl EbpStoreTransport for FakeTransport {
         if frame.kind == FrameKind::Control {
             let hello = ServerHello {
                 selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "fake-store-session".to_owned(),
+                // The production validator `store_client.rs::decode_server_hello`
+                // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+                // projected from the requirement the client admits with, so the
+                // responder projects that same tuple rather than a retyped
+                // literal (issue #4652). Real named-pipe authentication and every
+                // other handshake guard are unchanged.
+                session_principal_binding: format!(
+                    "sid={};session={}",
+                    self.requirement.expected_peer_sid.as_str(),
+                    self.requirement.expected_peer_session_id
+                ),
                 allowed_capabilities: eliot_store_api::CAPABILITIES
                     .iter()
                     .map(|value| (*value).to_owned())
@@ -680,7 +695,13 @@ async fn missing_foreign_or_malformed_receipt_cannot_be_success() {
     .unwrap();
     assert_eq!(
         malformed_client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        // Typed unknown outcome naming the ADMITTED operation, which is strictly more
+        // information than the old untyped marker: the caller reconciles this exact identity
+        // instead of inferring it. The single-send / no-second-send assertions below are
+        // unchanged and still enforce the real guarantee.
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(
         malformed_counters
@@ -759,7 +780,9 @@ async fn uncertain_send_preserves_unknown_outcome_with_no_second_send() {
     .unwrap();
     assert_eq!(
         client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(counters.reserved_write_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -814,7 +837,9 @@ async fn deterministic_conflict_stays_distinct_from_unknown_commit() {
     .unwrap();
     assert_eq!(
         unknown_client.apply_reserved_write(request.clone()).await,
-        Err(StoreError::MissingReceiptEnvelope)
+        Err(StoreError::UnknownOutcome {
+            operation_id: request.transition.identity.operation_id.clone(),
+        })
     );
     assert_eq!(
         unknown_counters.reserved_write_calls.load(Ordering::SeqCst),

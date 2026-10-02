@@ -76,6 +76,10 @@ pub mod diagnostic_brief;
 /// `eliot-observability-runtime`; this module only installs that stack and maps
 /// observations the Kernel's own owners already hold onto its catalogue.
 pub mod execution_metrics;
+#[cfg(windows)]
+mod installation_survey_route;
+#[cfg(windows)]
+mod installation_survey_stream_sink;
 /// Kernel-owned durable audit evidence (issue #1837; I16): the single
 /// BLAKE3-chained audit chain plus the single Watchdog-domain anchor sink.
 /// Every authority/lifecycle boundary appends through the composition's
@@ -89,10 +93,6 @@ mod kernel_config;
 pub mod kernel_diagnostics;
 mod process_execution;
 mod process_execution_client;
-#[cfg(windows)]
-mod installation_survey_route;
-#[cfg(windows)]
-mod installation_survey_stream_sink;
 mod supervision_lease_authority;
 mod testd_terminal_completion_route;
 mod tool_exposure;

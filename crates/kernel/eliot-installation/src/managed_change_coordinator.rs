@@ -7,12 +7,12 @@
 use eliot_config::InitialConfigSnapshotTrustAnchor;
 
 use super::{
-    AcceptedCatalogueContext, InstallationError, InstallationStepOutcome,
-    InstallationTransaction, InstallationTransactionStore, InstallerEffectPlan,
-    ManagedChangeAdmissionError, ManagedEnvironmentChangePlan,
-    ManagedEnvironmentChangeRequest, ManagedResourceKey, PlatformHandle,
-    RedbInstallationTransactionStore, SurveyObservationSource, VerifiedSetupBinding,
-    WindowsInstallationCoordinator, admit_installation_survey_and_compile_change,
+    AcceptedCatalogueContext, InstallationError, InstallationStepOutcome, InstallationTransaction,
+    InstallationTransactionStore, InstallerEffectPlan, ManagedChangeAdmissionError,
+    ManagedEnvironmentChangePlan, ManagedEnvironmentChangeRequest, ManagedResourceKey,
+    PlatformHandle, RedbInstallationTransactionStore, SurveyObservationSource,
+    VerifiedSetupBinding, WindowsInstallationCoordinator,
+    admit_installation_survey_and_compile_change,
 };
 
 /// Original publication and setup inputs used with the coordinator's own store.
@@ -42,9 +42,11 @@ impl<S: InstallationTransactionStore> WindowsInstallationCoordinator<S> {
             }
         })?;
         transaction.validate()?;
-        if transaction.installer_effects.iter().any(|effect| matches!(
-            effect, InstallerEffectPlan::ManagedEnvironmentChange { .. }
-        )) {
+        if transaction
+            .installer_effects
+            .iter()
+            .any(|effect| matches!(effect, InstallerEffectPlan::ManagedEnvironmentChange { .. }))
+        {
             return Err(InstallationError::ProfileViolation(
                 "managed effects require current signed catalogue, approval and survey admission"
                     .to_owned(),
@@ -74,7 +76,10 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             let context = self.managed_admission_context(owner);
             admit_installation_survey_and_compile_change(&context, source, request)?
         };
-        let anchor = self.inner.store().load(owner.publication_transaction_id)?
+        let anchor = self
+            .inner
+            .store()
+            .load(owner.publication_transaction_id)?
             .ok_or(InstallationError::IdentityConflict)?;
         let key = ManagedResourceKey {
             family_id: request.target_family.clone(),
@@ -84,32 +89,47 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         let mut prior_receipts = Vec::new();
         if let Some(projection) = &prior {
             for generation in &projection.owned_generations {
-                let original = self.inner.store().load(&generation.transaction_id)?
+                let original = self
+                    .inner
+                    .store()
+                    .load(&generation.transaction_id)?
                     .ok_or(InstallationError::IdentityConflict)?;
                 original.validate()?;
                 let receipt = super::managed_change_execution::resolve_applied_managed_effect(
-                    &[original], generation,
-                )?.ok_or(InstallationError::IdentityConflict)?;
+                    &[original],
+                    generation,
+                )?
+                .ok_or(InstallationError::IdentityConflict)?;
                 prior_receipts.push(receipt);
             }
         }
         let tools = accepted.managed_tools_root();
         let family = tools.join(request.target_family.as_str());
-        let installation_root = &anchor.candidate_manifest.runtime_launch.runtime_state_roots
+        let installation_root = &anchor
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
             .installation_root;
         let mut prior_roots = Vec::new();
         for path in [tools, family.as_path()] {
             let root = PlatformHandle::new(path.to_string_lossy().into_owned())
                 .map_err(|_| InstallationError::IdentityConflict)?;
             if let Some(proof) = self.inner.store().managed_root_effect_proof(
-                owner.publication_transaction_id, installation_root, anchor.profile, &root,
+                owner.publication_transaction_id,
+                installation_root,
+                anchor.profile,
+                &root,
             )? {
                 prior_roots.push(proof);
             }
         }
         accepted.revalidate_for_effect(&self.managed_admission_context(owner), source)?;
         let transaction = InstallationTransaction::new_accepted_managed_change(
-            &anchor, &accepted, prior, prior_receipts, prior_roots,
+            &anchor,
+            &accepted,
+            prior,
+            prior_receipts,
+            prior_roots,
         )?;
         let transaction_id = transaction.transaction_id.clone();
         self.inner.store_mut().create_planned(&transaction)?;
@@ -132,17 +152,23 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         source: &dyn SurveyObservationSource,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, ManagedChangeAdmissionError> {
-        let transaction = self.inner.store().load(transaction_id)?
+        let transaction = self
+            .inner
+            .store()
+            .load(transaction_id)?
             .ok_or(InstallationError::IdentityConflict)?;
         transaction.validate()?;
-        let mut managed = transaction.installer_effects.iter().filter_map(|effect| {
-            match effect {
+        let mut managed = transaction
+            .installer_effects
+            .iter()
+            .filter_map(|effect| match effect {
                 InstallerEffectPlan::ManagedEnvironmentChange {
-                    accepted_plan_json, request, ..
+                    accepted_plan_json,
+                    request,
+                    ..
                 } => Some((accepted_plan_json, request)),
                 _ => None,
-            }
-        });
+            });
         let (encoded, request) = managed.next().ok_or(InstallationError::IdentityConflict)?;
         if managed.next().is_some() || request.request_id != *transaction_id {
             return Err(InstallationError::IdentityConflict.into());
@@ -171,18 +197,32 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         source: &dyn SurveyObservationSource,
         transaction_id: &PlatformHandle,
     ) -> Result<InstallationStepOutcome, ManagedChangeAdmissionError> {
-        let transaction = self.inner.store().load(transaction_id)?
+        let transaction = self
+            .inner
+            .store()
+            .load(transaction_id)?
             .ok_or(InstallationError::IdentityConflict)?;
         transaction.validate()?;
-        let max_steps = transaction.installer_effects.len().checked_add(3)
+        let max_steps = transaction
+            .installer_effects
+            .len()
+            .checked_add(3)
             .ok_or(InstallationError::IdentityConflict)?;
         for _ in 0..max_steps {
-            let current = self.inner.store().load(transaction_id)?
+            let current = self
+                .inner
+                .store()
+                .load(transaction_id)?
                 .ok_or(InstallationError::IdentityConflict)?;
             current.validate()?;
-            if current.is_managed_child_transaction() && current.effect_progress.iter().all(|progress| matches!(
-                progress.state, super::InstallationEffectProgressState::Applied { .. }
-            )) {
+            if current.is_managed_child_transaction()
+                && current.effect_progress.iter().all(|progress| {
+                    matches!(
+                        progress.state,
+                        super::InstallationEffectProgressState::Applied { .. }
+                    )
+                })
+            {
                 current.require_all_effects_applied()?;
                 // All effects in this exact admitted child have already been
                 // independently read back and persisted. The terminal CAS
@@ -207,9 +247,13 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
                     return Err(InstallationError::IncompleteObservation(
                         "managed child terminal dispatch did not return its completed receipt"
                             .to_owned(),
-                    ).into());
+                    )
+                    .into());
                 }
-                let completed = self.inner.store().load(transaction_id)?
+                let completed = self
+                    .inner
+                    .store()
+                    .load(transaction_id)?
                     .ok_or(InstallationError::IdentityConflict)?;
                 if completed.stage() != super::InstallationStage::Completed
                     || !completed.is_managed_child_transaction()
@@ -234,7 +278,8 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         Err(InstallationError::IncompleteObservation(
             "bounded managed effect drive exhausted before the original effects completed"
                 .to_owned(),
-        ).into())
+        )
+        .into())
     }
 
     fn managed_admission_context<'a>(

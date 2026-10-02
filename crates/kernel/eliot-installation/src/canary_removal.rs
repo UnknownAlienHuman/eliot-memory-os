@@ -1886,6 +1886,12 @@ fn freeze_effect_graph(
                 true,
                 false,
             ),
+            InstallerEffectPlan::ManagedEnvironmentChange { .. } => {
+                return Err(InstallationError::IncompleteObservation(
+                    "the canary removal owner cannot classify a managed external-tool effect as a core generation resource"
+                        .to_owned(),
+                ));
+            }
         };
         let created = matches!(
             progress.state,

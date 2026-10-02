@@ -49,13 +49,11 @@ use crate::job_process_ids;
 use crate::last_windows_adapter_error;
 use crate::nul_terminated_wide;
 use crate::os_has_nul;
+use crate::process_path_lease::{RetainedSurveyProbePathLease, SurveyProbeAppContainerProfile};
 use crate::same_windows_path;
 use crate::validate_complete_environment;
 use crate::wait_for_job_empty;
 use crate::windows_adapter_from_io;
-use crate::process_path_lease::{
-    RetainedSurveyProbePathLease, SurveyProbeAppContainerProfile,
-};
 
 #[path = "process_job_observation_models.rs"]
 mod process_job_observation_models;
@@ -1342,6 +1340,9 @@ pub struct SuspendedProcessEvidence {
 /// This is observational mechanics only and carries no launch authority.
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+// These are independent readback facts from separate documented token fields;
+// collapsing them into an enum would lose combinations Windows can report.
+#[allow(clippy::struct_excessive_bools)]
 pub struct SurveyProbeTokenEvidence {
     app_container_sid: String,
     app_container_membership: bool,
@@ -1462,7 +1463,7 @@ impl SuspendedProcessEvidence {
         self.enforced_limits
     }
 
-    /// Returns the strict AppContainer token readback when this child was
+    /// Returns the strict `AppContainer` token readback when this child was
     /// admitted through the survey-probe launch path.
     #[must_use]
     pub fn survey_probe_token(&self) -> Option<&SurveyProbeTokenEvidence> {
@@ -1473,6 +1474,9 @@ impl SuspendedProcessEvidence {
 /// Failure of the consuming caller-owned validation transition.
 #[cfg(windows)]
 #[derive(Debug)]
+// The retained child owner must stay inline so callers can continue cleanup
+// after an unknown outcome without losing ownership of the suspended process.
+#[allow(clippy::large_enum_variant)]
 pub enum SuspendedValidationError<E> {
     Mechanics(WindowsAdapterError),
     Rejected(E),
@@ -1487,9 +1491,12 @@ pub enum SuspendedValidationError<E> {
 
 /// Result of constructing and mechanically validating a new suspended child.
 /// Unknown post-create cleanup retains the exact still-suspended process and
-/// Job handles for the original ProcessExecutor operation.
+/// Job handles for the original `ProcessExecutor` operation.
 #[cfg(windows)]
 #[derive(Debug)]
+// The retained child owner and both failures must stay inline so callers can
+// continue cleanup and preserve the primary failure after an unknown outcome.
+#[allow(clippy::large_enum_variant)]
 pub enum SuspendedSpawnError {
     Mechanics(WindowsAdapterError),
     UnknownOutcome {
@@ -1504,6 +1511,9 @@ pub enum SuspendedSpawnError {
 /// running child or a successful observation.
 #[cfg(windows)]
 #[derive(Debug)]
+// The retained child owner and both failures must stay inline so callers can
+// continue cleanup and preserve the primary failure after an unknown outcome.
+#[allow(clippy::large_enum_variant)]
 pub enum SurveyProbeResumeError {
     Mechanics(WindowsAdapterError),
     UnknownOutcome {
@@ -1881,9 +1891,7 @@ fn job_process_observer_loop(
 struct ProcThreadAttributeList {
     _storage: Vec<usize>,
     list: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
-    _security_capabilities: Option<
-        Box<windows_sys::Win32::Security::SECURITY_CAPABILITIES>,
-    >,
+    _security_capabilities: Option<Box<windows_sys::Win32::Security::SECURITY_CAPABILITIES>>,
 }
 
 #[cfg(windows)]
@@ -1949,8 +1957,7 @@ impl ProcThreadAttributeList {
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
             UpdateProcThreadAttribute,
         };
-        use windows_sys::Win32::System::WindowsProgramming::
-            PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+        use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
         let mut bytes = 0_usize;
         // SAFETY: the documented sizing call writes only `bytes`.
@@ -1966,20 +1973,19 @@ impl ProcThreadAttributeList {
         if unsafe { InitializeProcThreadAttributeList(list, 3, 0, &raw mut bytes) } == 0 {
             return Err(last_windows_adapter_error());
         }
-        let mut security_capabilities = Box::new(
-            windows_sys::Win32::Security::SECURITY_CAPABILITIES {
-                AppContainerSid: profile.sid(),
-                Capabilities: std::ptr::null_mut(),
-                CapabilityCount: 0,
-                Reserved: 0,
-            },
-        );
+        let security_capabilities = Box::new(windows_sys::Win32::Security::SECURITY_CAPABILITIES {
+            AppContainerSid: profile.sid(),
+            Capabilities: std::ptr::null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        });
         let handle_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST)
             .map_err(|_| WindowsAdapterError::Failed)?;
         let security_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES)
             .map_err(|_| WindowsAdapterError::Failed)?;
         let lpac_attribute = usize::try_from(PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY)
             .map_err(|_| WindowsAdapterError::Failed)?;
+        let opt_out_all_application_packages = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
         // SAFETY: the initialized list and every input remain live through the
         // eventual CreateProcessW call; the boxed SECURITY_CAPABILITIES stays
         // at a stable address and names the retained created profile SID.
@@ -2006,10 +2012,8 @@ impl ProcThreadAttributeList {
                     list,
                     0,
                     lpac_attribute,
-                    (&raw const PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT).cast(),
-                    std::mem::size_of_val(
-                        &PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
-                    ),
+                    (&raw const opt_out_all_application_packages).cast(),
+                    std::mem::size_of_val(&opt_out_all_application_packages),
                     std::ptr::null_mut(),
                     std::ptr::null(),
                 ) != 0
@@ -2317,27 +2321,23 @@ impl JobChildHandles {
 /// carrying `ALL_APPLICATION_PACKAGES_OPT_OUT`; information class 46 is not
 /// queried because its Win32 output layout is undocumented.
 #[cfg(windows)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the suspended process token and its exact readback buffers stay in one observation"
+)]
 fn survey_probe_token_evidence(
     process: windows_sys::Win32::Foundation::HANDLE,
     expected_app_container_sid: &str,
 ) -> Result<SurveyProbeTokenEvidence, WindowsAdapterError> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
     use windows_sys::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+        GetSidSubAuthority, GetSidSubAuthorityCount, SECURITY_MAX_SID_SIZE,
         TOKEN_APPCONTAINER_INFORMATION, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_MANDATORY_LABEL,
         TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenElevation, TokenIntegrityLevel,
-        TokenIsAppContainer, SECURITY_MAX_SID_SIZE,
+        TokenIsAppContainer,
     };
-    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
-    use windows_sys::Win32::System::Threading::OpenProcessToken;
     use windows_sys::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
-
-    let mut token = std::ptr::null_mut();
-    // SAFETY: `process` is the live handle retained by the suspended child;
-    // the result slot is initialized and requests query-only access.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(last_windows_adapter_error());
-    }
-    let token = OwnedKernelHandle::new(token)?;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     fn read_token_value<T: Default>(
         token: windows_sys::Win32::Foundation::HANDLE,
@@ -2347,8 +2347,8 @@ fn survey_probe_token_evidence(
 
         let mut value = T::default();
         let mut returned = 0_u32;
-        let length = u32::try_from(std::mem::size_of::<T>())
-            .map_err(|_| WindowsAdapterError::Failed)?;
+        let length =
+            u32::try_from(std::mem::size_of::<T>()).map_err(|_| WindowsAdapterError::Failed)?;
         // SAFETY: `value` is a writable output buffer of exactly `length`;
         // the token is live and queried for a fixed-size documented class.
         if unsafe {
@@ -2378,7 +2378,15 @@ fn survey_probe_token_evidence(
         let mut required = 0_u32;
         // SAFETY: a null buffer with zero length is the documented sizing
         // query; `required` is a valid result slot and the token is live.
-        if unsafe { GetTokenInformation(token, information_class, std::ptr::null_mut(), 0, &raw mut required) } != 0
+        if unsafe {
+            GetTokenInformation(
+                token,
+                information_class,
+                std::ptr::null_mut(),
+                0,
+                &raw mut required,
+            )
+        } != 0
             || required == 0
             || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER
             || usize::try_from(required).map_err(|_| WindowsAdapterError::Failed)? > maximum_bytes
@@ -2407,6 +2415,14 @@ fn survey_probe_token_evidence(
         }
         Ok(buffer)
     }
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `process` is the live handle retained by the suspended child;
+    // the result slot is initialized and requests query-only access.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(last_windows_adapter_error());
+    }
+    let token = OwnedKernelHandle::new(token)?;
 
     let app_container = read_token_value::<u32>(token.0, TokenIsAppContainer)? != 0;
     let app_container_info_buffer = read_token_buffer(
@@ -2438,8 +2454,7 @@ fn survey_probe_token_evidence(
     let integrity_buffer = read_token_buffer(
         token.0,
         TokenIntegrityLevel,
-        std::mem::size_of::<TOKEN_MANDATORY_LABEL>()
-            .saturating_add(SECURITY_MAX_SID_SIZE as usize),
+        std::mem::size_of::<TOKEN_MANDATORY_LABEL>().saturating_add(SECURITY_MAX_SID_SIZE as usize),
         std::mem::size_of::<TOKEN_MANDATORY_LABEL>(),
     )?;
     let integrity = unsafe { &*integrity_buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
@@ -2777,6 +2792,7 @@ impl<'job> SuspendedExistingJobChild<'job> {
     /// Returns [`SuspendedValidationError::Mechanics`] when exact process or
     /// Job membership cannot be re-observed, or `Rejected` for the caller's
     /// policy error. Both paths kill and reap only this candidate.
+    #[allow(clippy::result_large_err)]
     pub fn validate<V, E, F>(
         mut self,
         validator: F,
@@ -2985,7 +3001,7 @@ enum SuspendedJobChildOwner {
     /// the original executor for cleanup. It is not eligible for validation,
     /// resume, or successful process evidence.
     CleanupOnly(JobChildHandles),
-    /// CreateProcessW reported success but returned an incomplete process
+    /// `CreateProcessW` reported success but returned an incomplete process
     /// information pair. This owner can only terminate/read back the exact
     /// returned process handle and Job; it can never validate or resume.
     Partial(PartialProcessCreationCleanup),
@@ -3023,8 +3039,8 @@ impl PartialProcessCreationCleanup {
         let _ = unsafe { TerminateProcess(process.0, 0xE1_04) };
         let process_reaped = unsafe { WaitForSingleObject(process.0, 5_000) } == WAIT_OBJECT_0;
         let _ = self.job.terminate(0xE1_04);
-        let job_empty = wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5))
-            .is_ok();
+        let job_empty =
+            wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5)).is_ok();
         let history_empty = self
             .observer
             .snapshot(self.job.handle)
@@ -3038,12 +3054,13 @@ impl PartialProcessCreationCleanup {
 impl std::fmt::Debug for SuspendedJobChild {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.owner {
-            SuspendedJobChildOwner::Ready(inner)
-            | SuspendedJobChildOwner::CleanupOnly(inner) => formatter
-                .debug_struct("SuspendedJobChild")
-                .field("process_id", &inner.spawn_identity.process_id)
-                .field("terminal", &inner.terminal)
-                .finish_non_exhaustive(),
+            SuspendedJobChildOwner::Ready(inner) | SuspendedJobChildOwner::CleanupOnly(inner) => {
+                formatter
+                    .debug_struct("SuspendedJobChild")
+                    .field("process_id", &inner.spawn_identity.process_id)
+                    .field("terminal", &inner.terminal)
+                    .finish_non_exhaustive()
+            }
             SuspendedJobChildOwner::Partial(inner) => formatter
                 .debug_struct("SuspendedJobChild")
                 .field("process_handle_retained", &inner.process.is_some())
@@ -3376,13 +3393,14 @@ impl SuspendedJobChild {
     }
 
     /// Creates one suspended survey probe inside the current Host Kernel Job,
-    /// with the exact newly-created operation AppContainer profile and LPAC
+    /// with the exact newly-created operation `AppContainer` profile and LPAC
     /// process attributes. The path scope is revalidated before the child is
     /// created and is retained by the executor through terminal cleanup.
     ///
     /// # Errors
     /// Returns a typed refusal when the profile, retained path scope, outer
     /// Job, or suspended launch cannot be revalidated exactly.
+    #[allow(clippy::result_large_err)]
     pub fn spawn_nested_in_kernel_outer_kill_domain_for_survey_probe(
         spec: SuspendedLaunchSpec,
         job_identity: JobObjectIdentity,
@@ -3432,6 +3450,7 @@ impl SuspendedJobChild {
         clippy::too_many_lines,
         reason = "suspended launch and fail-closed cleanup ordering remain contiguous"
     )]
+    #[allow(clippy::result_large_err)]
     fn spawn_named_job_child(
         spec: SuspendedLaunchSpec,
         job_identity: JobObjectIdentity,
@@ -3568,9 +3587,7 @@ impl SuspendedJobChild {
             match inspect_process_handle(information.dwProcessId, information.hProcess) {
                 Ok(identity) => identity,
                 Err(error) => {
-                    return Err(
-                        cleanup_error(&mut cleanup, windows_adapter_from_io(&error)).into(),
-                    );
+                    return Err(cleanup_error(&mut cleanup, windows_adapter_from_io(&error)).into());
                 }
             };
         let inner = JobChildHandles {
@@ -3630,8 +3647,9 @@ impl SuspendedJobChild {
     #[must_use]
     pub const fn id(&self) -> u32 {
         match &self.owner {
-            SuspendedJobChildOwner::Ready(inner)
-            | SuspendedJobChildOwner::CleanupOnly(inner) => inner.spawn_identity.process_id,
+            SuspendedJobChildOwner::Ready(inner) | SuspendedJobChildOwner::CleanupOnly(inner) => {
+                inner.spawn_identity.process_id
+            }
             // Zero is the Windows invalid-PID sentinel. No PID is inferred
             // from PROCESS_INFORMATION when the original process handle was
             // not returned.
@@ -3647,8 +3665,9 @@ impl SuspendedJobChild {
     /// with the caller's own policy/permit error when cleanup is observed.
     /// `UnknownOutcome` preserves the attempt when termination cannot be
     /// observed for the still-suspended process and its Job.
+    #[allow(clippy::result_large_err)]
     pub fn validate<V, E, F>(
-        mut self,
+        self,
         validator: F,
     ) -> Result<ValidatedSuspendedJobChild<V>, SuspendedValidationError<E>>
     where
@@ -3726,8 +3745,7 @@ impl SuspendedJobChild {
     /// both observed terminal.
     pub fn terminate_for_cleanup(&mut self) -> Result<(), WindowsAdapterError> {
         match &mut self.owner {
-            SuspendedJobChildOwner::Ready(inner)
-            | SuspendedJobChildOwner::CleanupOnly(inner) => {
+            SuspendedJobChildOwner::Ready(inner) | SuspendedJobChildOwner::CleanupOnly(inner) => {
                 if inner.terminal {
                     Ok(())
                 } else {
@@ -3806,9 +3824,8 @@ impl<V> ValidatedSuspendedJobChild<V> {
     /// # Errors
     /// Returns `Mechanics` when the failure was followed by complete cleanup,
     /// or `UnknownOutcome` with the exact owner when cleanup remains unknown.
-    pub fn resume_for_survey_probe(
-        self,
-    ) -> Result<RunningJobChild<V>, SurveyProbeResumeError> {
+    #[allow(clippy::result_large_err)]
+    pub fn resume_for_survey_probe(self) -> Result<RunningJobChild<V>, SurveyProbeResumeError> {
         use windows_sys::Win32::System::Threading::ResumeThread;
 
         let Self {
@@ -4112,8 +4129,8 @@ mod malformed_process_information_cleanup_tests {
 #[cfg(all(test, windows))]
 mod survey_probe_resume_cleanup_tests {
     use super::{
-        FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK, SuspendedJobChild, SuspendedJobChildOwner,
-        SuspendedLaunchSpec, SurveyProbeResumeError, ValidatedSuspendedJobChild,
+        FAIL_NEXT_JOB_CHILD_CLEANUP_READBACK, SurveyProbeResumeError, SuspendedJobChild,
+        SuspendedJobChildOwner, SuspendedLaunchSpec, ValidatedSuspendedJobChild,
         WindowsAdapterError, survey_probe_resume_failure,
     };
 
@@ -4129,9 +4146,7 @@ mod survey_probe_resume_cleanup_tests {
     #[test]
     fn unknown_resume_cleanup_keeps_same_process_and_job_owner() {
         let mut environment = std::env::vars_os().collect::<Vec<_>>();
-        environment.retain(|(name, _)| {
-            !name.to_string_lossy().eq_ignore_ascii_case(CHILD_MARKER)
-        });
+        environment.retain(|(name, _)| !name.to_string_lossy().eq_ignore_ascii_case(CHILD_MARKER));
         environment.push((CHILD_MARKER.into(), "1".into()));
         let spec = SuspendedLaunchSpec::new(
             std::env::current_exe().unwrap_or_else(|_| unreachable!()),

@@ -1299,8 +1299,8 @@ impl RedbInstallationTransactionStore {
         )
     }
 
-    /// Persists the original PortableDev setup-key receipt as part of the
-    /// ServiceKeysGenerated intent, before the provider performs its one
+    /// Persists the original `PortableDev` setup-key receipt as part of the
+    /// `ServiceKeysGenerated` intent, before the provider performs its one
     /// create-only write. The receipt is public metadata and is bound by the
     /// same digest as the original milestone intent; it is never reconstructed
     /// after restart.
@@ -1330,8 +1330,8 @@ impl RedbInstallationTransactionStore {
         Ok(intent_digest)
     }
 
-    /// Persists the exact original UserMode setup signing-key receipt in the
-    /// ServiceKeysGenerated intent before the Credential Manager write. The
+    /// Persists the exact original `UserMode` setup signing-key receipt in the
+    /// `ServiceKeysGenerated` intent before the Credential Manager write. The
     /// receipt is public metadata and is never rebuilt after a restart.
     pub fn record_setup_user_mode_signing_key_intent(
         &mut self,
@@ -1359,8 +1359,8 @@ impl RedbInstallationTransactionStore {
         Ok(intent_digest)
     }
 
-    /// Persists the exact public SystemService setup-key preparation receipt
-    /// in the original ServiceKeysGenerated row. The first call records the
+    /// Persists the exact public `SystemService` setup-key preparation receipt
+    /// in the original `ServiceKeysGenerated` row. The first call records the
     /// key/root/public-key facts before slot creation; a single monotonic
     /// update may then add the exact native slot identity before the secret is
     /// written. The digest excludes only that later physical outcome.
@@ -1392,10 +1392,8 @@ impl RedbInstallationTransactionStore {
             authorized_principal_sid: authorized_principal_sid.clone(),
             receipt: receipt.clone(),
         };
-        let intent_digest = setup_system_service_signing_key_intent_digest(
-            transaction_id,
-            &binding,
-        )?;
+        let intent_digest =
+            setup_system_service_signing_key_intent_digest(transaction_id, &binding)?;
         self.record_setup_effect_intent_record(
             transaction_id,
             SetupMilestone::ServiceKeysGenerated,
@@ -1407,6 +1405,10 @@ impl RedbInstallationTransactionStore {
         Ok(intent_digest)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three mutually exclusive setup-key receipts are atomically bound to the original milestone intent here"
+    )]
     fn record_setup_effect_intent_record(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -1535,7 +1537,7 @@ impl RedbInstallationTransactionStore {
             .map_err(|error| InstallationError::Platform(error.to_string()))
     }
 
-    /// Loads the exact original PortableDev setup-key receipt, or returns
+    /// Loads the exact original `PortableDev` setup-key receipt, or returns
     /// `None` when no such prepared key effect was committed. An absent result
     /// after an existing intent is a typed recovery condition; callers must
     /// never prepare a replacement key for that milestone.
@@ -1571,7 +1573,7 @@ impl RedbInstallationTransactionStore {
         Ok(intent.portable_dev_signing_key_receipt)
     }
 
-    /// Loads the exact original UserMode setup-key receipt, or returns `None`
+    /// Loads the exact original `UserMode` setup-key receipt, or returns `None`
     /// when the original profile-key intent did not contain one.
     pub fn load_setup_user_mode_signing_key_intent(
         &self,
@@ -1605,8 +1607,8 @@ impl RedbInstallationTransactionStore {
         Ok(intent.user_mode_signing_key_receipt)
     }
 
-    /// Loads the exact SystemService public setup-key receipt from the original
-    /// ServiceKeysGenerated row. A receipt without a slot identity is an
+    /// Loads the exact `SystemService` public setup-key receipt from the original
+    /// `ServiceKeysGenerated` row. A receipt without a slot identity is an
     /// incomplete original effect and may never authorize adoption or key
     /// replacement.
     pub(crate) fn load_setup_system_service_signing_key_intent(
@@ -1951,7 +1953,7 @@ struct SetupEffectIntentRecord {
     system_service_signing_key_intent: Option<SetupSystemServiceSigningKeyIntent>,
 }
 
-/// Original SystemService setup-key facts stored beside its stable milestone
+/// Original `SystemService` setup-key facts stored beside its stable milestone
 /// intent. The caller/owner bindings come from the immutable transaction and
 /// the actual user identity observation; the provider receipt is public-only.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1999,6 +2001,10 @@ fn encode_setup_effect_intent(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned setup-effect decoder validates every receipt discriminator and identity before reconstruction"
+)]
 fn decode_setup_effect_intent(bytes: &[u8]) -> Result<SetupEffectIntentRecord, InstallationError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
@@ -2060,12 +2066,8 @@ fn decode_setup_effect_intent(bytes: &[u8]) -> Result<SetupEffectIntentRecord, I
         if envelope.intent.milestone != SetupMilestone::ServiceKeysGenerated
             || receipt.request.transaction_id != envelope.intent.transaction_id.as_str()
             || receipt.request.effect_id != envelope.intent.milestone.effect_identity()
-            || setup_user_mode_signing_key_intent_digest(receipt)?
-                != envelope.intent.intent_digest
-            || envelope
-                .intent
-                .portable_dev_signing_key_receipt
-                .is_some()
+            || setup_user_mode_signing_key_intent_digest(receipt)? != envelope.intent.intent_digest
+            || envelope.intent.portable_dev_signing_key_receipt.is_some()
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -2098,10 +2100,7 @@ fn decode_setup_effect_intent(bytes: &[u8]) -> Result<SetupEffectIntentRecord, I
                 &envelope.intent.transaction_id,
                 binding,
             )? != envelope.intent.intent_digest
-            || envelope
-                .intent
-                .portable_dev_signing_key_receipt
-                .is_some()
+            || envelope.intent.portable_dev_signing_key_receipt.is_some()
             || envelope.intent.user_mode_signing_key_receipt.is_some()
         {
             return Err(InstallationError::IdentityConflict);
@@ -3188,8 +3187,7 @@ fn insert_planned(
                     })
                 {
                     return Err(InstallationError::IncompleteObservation(
-                        "another managed transaction still owns the exact resource key"
-                            .to_owned(),
+                        "another managed transaction still owns the exact resource key".to_owned(),
                     ));
                 }
                 stored_transactions.push(stored);

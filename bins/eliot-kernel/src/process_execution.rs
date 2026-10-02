@@ -38,8 +38,8 @@ use eliot_ors::{
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::{
     ProtectedSecret, RecoverableJobBinding, RecoverableJobObject, RetainedProcessPathLease,
-    SurveyProbeAppContainerIdentity, SurveyProbeAppContainerProfile,
-    RetainedSurveyProbePathLease, WindowsPlatform, windows_paths_equal,
+    SurveyProbeAppContainerIdentity, SurveyProbeAppContainerProfile, WindowsPlatform,
+    windows_paths_equal,
 };
 use eliot_process::{
     ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
@@ -1779,8 +1779,7 @@ pub(crate) struct ProcessExecutionGateway {
 struct RetainedSurveyProbeArea {
     working_area: Arc<eliot_installation::SurveyProbeWorkingArea>,
     #[cfg(windows)]
-    stream_sink:
-        Option<Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>>,
+    stream_sink: Option<Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>>,
 }
 
 #[cfg(windows)]
@@ -2026,7 +2025,10 @@ impl std::fmt::Debug for ProcessPathProof {
             .field("executable", &self.executable)
             .field("working_directory", &self.working_directory)
             .field("lease", &self.lease)
-            .field("survey_probe", &self.survey_probe.as_ref().map(|probe| &probe.operation_id))
+            .field(
+                "survey_probe",
+                &self.survey_probe.as_ref().map(|probe| &probe.operation_id),
+            )
             .finish()
     }
 }
@@ -2148,7 +2150,10 @@ impl ProcessLaunchAdmission for KernelPathAdmission {
             survey_probe_request_matches(probe, &proof.lease, request)
                 && proof
                     .lease
-                    .validate_executable(Path::new(request.executable()), request.executable_sha256())
+                    .validate_executable(
+                        Path::new(request.executable()),
+                        request.executable_sha256(),
+                    )
                     .is_ok()
         } else {
             proof
@@ -2174,9 +2179,9 @@ fn survey_probe_request_matches(
     let invocation = &proof.invocation;
     let environment = request.environment();
     let limits = request.resource_limits();
-    let Ok(app_container) = SurveyProbeAppContainerIdentity::for_operation_id(
-        proof.operation_id.as_str(),
-    ) else {
+    let Ok(app_container) =
+        SurveyProbeAppContainerIdentity::for_operation_id(proof.operation_id.as_str())
+    else {
         return false;
     };
     let expected_cwd = app_container.working_directory(proof.working_area.path());
@@ -2190,7 +2195,9 @@ fn survey_probe_request_matches(
             Path::new(request.executable()),
             executable_lease.executable_path(),
         )
-        && request.executable_sha256().eq_ignore_ascii_case(executable_lease.executable_sha256())
+        && request
+            .executable_sha256()
+            .eq_ignore_ascii_case(executable_lease.executable_sha256())
         && windows_paths_equal(Path::new(request.working_directory()), &expected_cwd)
         && limits.wall_timeout_ms() == invocation.timeout_ms
         && invocation.max_output_bytes >= 2
@@ -2201,11 +2208,16 @@ fn survey_probe_request_matches(
         && limits.memory_bytes().is_none()
         && environment.secret_refs().is_empty()
         && environment.inheritance() == eliot_process::EnvironmentInheritance::None
-        && environment
-            .non_secret()
-            .keys()
-            .all(|name| invocation.environment_names.iter().any(|allowed| allowed.as_str() == name))
-        && windows_paths_equal(Path::new(invocation.working_area.as_str()), proof.working_area.path())
+        && environment.non_secret().keys().all(|name| {
+            invocation
+                .environment_names
+                .iter()
+                .any(|allowed| allowed.as_str() == name)
+        })
+        && windows_paths_equal(
+            Path::new(invocation.working_area.as_str()),
+            proof.working_area.path(),
+        )
 }
 
 impl ProcessExecutionGateway {
@@ -2275,7 +2287,10 @@ impl ProcessExecutionGateway {
         area: &Arc<eliot_installation::SurveyProbeWorkingArea>,
         request: &eliot_process::ProcessRequest,
         policy: &eliot_process::ProcessStreamPolicyBinding,
-    ) -> Result<Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>, ProcessExecutionError> {
+    ) -> Result<
+        Arc<super::installation_survey_stream_sink::InstallationSurveyStreamSink>,
+        ProcessExecutionError,
+    > {
         let mut areas = self
             .survey_probe_areas
             .lock()
@@ -2292,8 +2307,11 @@ impl ProcessExecutionGateway {
             None => {
                 let stream_sink = Arc::new(
                     super::installation_survey_stream_sink::InstallationSurveyStreamSink::new(
-                        Arc::clone(area), request, policy.clone(),
-                    ).map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+                        Arc::clone(area),
+                        request,
+                        policy.clone(),
+                    )
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
                 );
                 retained.stream_sink = Some(Arc::clone(&stream_sink));
                 Ok(stream_sink)
@@ -2366,8 +2384,7 @@ impl ProcessExecutionGateway {
             if requires_survey_area {
                 return Err(ProcessExecutionError::UnknownOutcome);
             }
-            self.executor
-                .finish_pre_resume_cleanup(operation_id);
+            self.executor.finish_pre_resume_cleanup(operation_id);
             return Ok(());
         };
         let area = &retained.working_area;
@@ -2391,14 +2408,12 @@ impl ProcessExecutionGateway {
         {
             areas.remove(operation_id);
             drop(areas);
-            self.executor
-                .finish_pre_resume_cleanup(operation_id);
+            self.executor.finish_pre_resume_cleanup(operation_id);
             Ok(())
         } else {
             Err(ProcessExecutionError::UnknownOutcome)
         }
     }
-
 
     pub(crate) fn readiness_configuration_valid(&self) -> bool {
         let binding = self.snapshot_binding.to_wire();
@@ -4328,7 +4343,11 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                             let area = Arc::clone(&probe.working_area);
                             let mut retained_area_here = false;
                             let started = (|| {
-                                if !survey_probe_request_matches(&probe, &executable_lease, &request) {
+                                if !survey_probe_request_matches(
+                                    &probe,
+                                    &executable_lease,
+                                    &request,
+                                ) {
                                     return Err(ProcessExecutionError::Contract(
                                         eliot_process::ContractError::DispatchBindingMismatch,
                                     ));
@@ -4337,24 +4356,27 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                                     operation_id.clone(),
                                     Arc::clone(&area),
                                 )?;
-                                let stream_sink = self.retained_or_create_survey_probe_stream_sink(
-                                    &operation_id,
-                                    &area,
-                                    &request,
-                                    &probe.stream_policy,
-                                )?;
+                                let stream_sink = self
+                                    .retained_or_create_survey_probe_stream_sink(
+                                        &operation_id,
+                                        &area,
+                                        &request,
+                                        &probe.stream_policy,
+                                    )?;
                                 let stream_sink: Arc<dyn eliot_process::ProcessStreamSinkClient> =
                                     stream_sink;
-                                let profile_identity = SurveyProbeAppContainerIdentity::for_operation_id(
-                                    operation_id.as_str(),
-                                )
-                                .map_err(|error| {
-                                    ProcessExecutionError::Unavailable(error.to_string())
-                                })?;
-                                let profile = SurveyProbeAppContainerProfile::create(&profile_identity)
+                                let profile_identity =
+                                    SurveyProbeAppContainerIdentity::for_operation_id(
+                                        operation_id.as_str(),
+                                    )
                                     .map_err(|error| {
                                         ProcessExecutionError::Unavailable(error.to_string())
                                     })?;
+                                let profile =
+                                    SurveyProbeAppContainerProfile::create(&profile_identity)
+                                        .map_err(|error| {
+                                            ProcessExecutionError::Unavailable(error.to_string())
+                                        })?;
                                 let path_scope = match area.retain_executor_path(
                                     Arc::clone(&executable_lease),
                                     operation_id.as_str(),
@@ -4392,22 +4414,20 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                                         return Err(ProcessExecutionError::UnknownOutcome);
                                     }
                                 };
-                                self.executor.start_survey_probe_with_kernel_outer_job_binding(
-                                    request,
-                                    sink,
-                                    binding,
-                                    stream_sink,
-                                    probe.stream_policy,
-                                    profile,
-                                    path_scope,
-                                )
+                                self.executor
+                                    .start_survey_probe_with_kernel_outer_job_binding(
+                                        request,
+                                        sink,
+                                        binding,
+                                        stream_sink,
+                                        probe.stream_policy,
+                                        profile,
+                                        path_scope,
+                                    )
                             })();
                             match started {
                                 Err(error) if retained_area_here => {
-                                    if matches!(
-                                        &error,
-                                        ProcessExecutionError::UnknownOutcome
-                                    ) {
+                                    if matches!(&error, ProcessExecutionError::UnknownOutcome) {
                                         Err(error)
                                     } else {
                                         match self
@@ -4418,12 +4438,11 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                                                 match self
                                                     .complete_pre_resume_survey_probe_cleanup_area(
                                                         &operation_id,
-                                                    )
-                                                {
+                                                    ) {
                                                     Ok(()) => Err(error),
-                                                    Err(_) => Err(
-                                                        ProcessExecutionError::UnknownOutcome,
-                                                    ),
+                                                    Err(_) => {
+                                                        Err(ProcessExecutionError::UnknownOutcome)
+                                                    }
                                                 }
                                             }
                                             Ok(None) | Err(_) => {
@@ -4622,9 +4641,13 @@ fn validate_survey_probe_terminal(
     let expected_tree = eliot_process::ProcessTreeId::new(operation_id.as_str())?;
     let expected_job = eliot_process::JobId::new(operation_id.as_str())?;
     let expected_image = eliot_process::ImageId::new(invocation.executable_identity.as_str())?;
-    let descendant_count = u32::try_from(tree.process_ids().iter()
-        .filter(|process_id| *process_id != identity.process_id()).count())
-        .map_err(|_| survey_probe_refusal())?;
+    let descendant_count = u32::try_from(
+        tree.process_ids()
+            .iter()
+            .filter(|process_id| *process_id != identity.process_id())
+            .count(),
+    )
+    .map_err(|_| survey_probe_refusal())?;
     if start.operation_id() != operation_id
         || terminal.operation_id() != operation_id
         || start.lifecycle() != ProcessLifecycle::Running
@@ -4635,7 +4658,7 @@ fn validate_survey_probe_terminal(
         || identity.image_id() != &expected_image
         || identity.session_id() != caller.session_id()
         || identity.generation() != owner.generation()
-        || !windows_paths_equal(Path::new(identity.image_path()), executable)
+        || !windows_paths_equal(Path::new(identity.physical().image_path()), executable)
         || !identity
             .executable_sha256()
             .eq_ignore_ascii_case(executable_sha256)
@@ -4643,7 +4666,7 @@ fn validate_survey_probe_terminal(
         || binding.job_id() != &expected_job
         || binding.image_id() != &expected_image
         || binding.session_id() != caller.session_id()
-        || binding.generation() != owner.generation()
+        || binding.state_fence().generation() != owner.state_fence().generation()
         || binding.state_fence() != state_fence
         || !owner
             .authority_epoch()
@@ -4694,7 +4717,8 @@ impl KernelComposition {
         &self,
         session: &Session,
         identity: &eliot_protocol::RequestIdentity,
-    ) -> Result<Option<Arc<eliot_installation::SurveyProbeWorkingArea>>, ProcessExecutionError> {
+    ) -> Result<Option<Arc<eliot_installation::SurveyProbeWorkingArea>>, ProcessExecutionError>
+    {
         identity.validate().map_err(|_| survey_probe_refusal())?;
         if identity.deadline_unix_ms <= super::unix_ms()
             || identity.request.state_fence != session.module_generation.state_fence
@@ -4721,9 +4745,8 @@ impl KernelComposition {
         {
             return Err(survey_probe_refusal());
         }
-        let operation_id = OperationId::new(
-            identity.request.metadata.request_id.as_str().to_owned(),
-        )?;
+        let operation_id =
+            OperationId::new(identity.request.metadata.request_id.as_str().to_owned())?;
         let Some(gateway) = &self.process_gateway else {
             return Ok(None);
         };
@@ -4751,7 +4774,10 @@ impl KernelComposition {
     /// Start and terminal values stay inside this owner boundary; a positive
     /// passive advertisement is formed only from the same live gateway call.
     #[cfg(windows)]
-    #[allow(clippy::too_many_lines, reason = "the one-owner probe sequence keeps fresh qualification, original admission, and terminal readback ordered")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-owner probe sequence keeps fresh qualification, original admission, and terminal readback ordered"
+    )]
     pub(crate) async fn run_installation_survey_probe(
         &self,
         session: &Session,
@@ -4781,7 +4807,10 @@ impl KernelComposition {
                 != session.module_generation.generation.value()
             || !windows_paths_equal(working_area.path(), &self.work_root)
             || !Path::new(invocation.working_area.as_str()).is_absolute()
-            || !windows_paths_equal(Path::new(invocation.working_area.as_str()), working_area.path())
+            || !windows_paths_equal(
+                Path::new(invocation.working_area.as_str()),
+                working_area.path(),
+            )
         {
             return Err(survey_probe_refusal());
         }
@@ -4799,9 +4828,7 @@ impl KernelComposition {
         {
             return Err(survey_probe_refusal());
         }
-        let generation = Generation::new(
-            identity.request.state_fence.resource_generation.value(),
-        )?;
+        let generation = Generation::new(identity.request.state_fence.resource_generation.value())?;
         if generation != owner.generation() {
             return Err(survey_probe_refusal());
         }
@@ -4872,11 +4899,9 @@ impl KernelComposition {
         {
             return Err(survey_probe_refusal());
         }
-        let fresh_survey = eliot_installation::survey_accepted_installation(
-            catalogue_context,
-            source,
-        )
-        .map_err(|_| survey_probe_refusal())?;
+        let fresh_survey =
+            eliot_installation::survey_accepted_installation(catalogue_context, source)
+                .map_err(|_| survey_probe_refusal())?;
         let fresh_survey_digest = fresh_survey
             .survey_content_digest()
             .map_err(|_| survey_probe_refusal())?;
@@ -4886,7 +4911,10 @@ impl KernelComposition {
         let observed = fresh_survey
             .executable_observation_for_probe(invocation)
             .ok_or_else(survey_probe_refusal)?;
-        let version = observed.file_version.as_ref().ok_or_else(survey_probe_refusal)?;
+        let version = observed
+            .file_version
+            .as_ref()
+            .ok_or_else(survey_probe_refusal)?;
         let executable_sha256 = version
             .sha256
             .as_deref()
@@ -4944,10 +4972,9 @@ impl KernelComposition {
             Vec::new(),
             eliot_process::EnvironmentInheritance::None,
         )?;
-        let app_container = SurveyProbeAppContainerIdentity::for_operation_id(
-            operation_id.as_str(),
-        )
-        .map_err(|_| survey_probe_refusal())?;
+        let app_container =
+            SurveyProbeAppContainerIdentity::for_operation_id(operation_id.as_str())
+                .map_err(|_| survey_probe_refusal())?;
         let working_directory = app_container.working_directory(working_area.path());
         let working_directory_text = working_directory
             .to_str()
@@ -4967,12 +4994,7 @@ impl KernelComposition {
             environment,
             resource_limits,
         )?;
-        eliot_process::validate_process_intent_session(
-            &intent,
-            &caller,
-            &owner,
-            &state_fence,
-        )?;
+        eliot_process::validate_process_intent_session(&intent, &caller, &owner, &state_fence)?;
         let admission = ProcessExecutionAdmissionRequest::new(
             super::ACTIVE_DAEMON_CALLER,
             intent,
@@ -4993,13 +5015,19 @@ impl KernelComposition {
         // installer receipt fixes the admitted evidence area. These are exact
         // existing references; a generic preview policy cannot admit storage.
         let stream_policy = eliot_process::ProcessStreamPolicyBinding::new(
-            advertisement.requalified_against.catalogue_publication_ref.as_str(),
+            advertisement
+                .requalified_against
+                .catalogue_publication_ref
+                .as_str(),
             invocation.probe_id.as_str(),
             caller.session_id().as_str(),
-            working_area.evidence_area_receipt_ref()
-                .map_err(|_| survey_probe_refusal())?.as_str(),
+            working_area
+                .evidence_area_receipt_ref()
+                .map_err(|_| survey_probe_refusal())?
+                .as_str(),
             invocation.probe_id.as_str(),
-        ).map_err(|_| survey_probe_refusal())?;
+        )
+        .map_err(|_| survey_probe_refusal())?;
         let proof = ProcessPathProof {
             executable: executable_path,
             working_directory,

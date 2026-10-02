@@ -20,6 +20,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Globalization",

@@ -112,8 +112,8 @@ mod protected_path;
 mod runtime_receipt_publication;
 pub mod scm_entry;
 mod secret_store;
-mod setup_signing_key;
 mod service_registration;
+mod setup_signing_key;
 mod supervision_authority_key;
 mod survey_stream_artifact;
 mod tcp_listener_owner;
@@ -143,7 +143,7 @@ pub use event_log::{
     validate_event_log_insertion,
 };
 pub use file_version::{
-    MAX_SURVEY_EXECUTABLE_BYTES, FileVersionObservation, FileVersionOutcome, observe_file_version,
+    FileVersionObservation, FileVersionOutcome, MAX_SURVEY_EXECUTABLE_BYTES, observe_file_version,
 };
 pub use installer_authority_key::{
     INSTALLATION_AUTHORITY_KEY_FILE_BYTES, INSTALLATION_AUTHORITY_KEY_FILE_VERSION,
@@ -152,12 +152,8 @@ pub use installer_authority_key::{
     InstallationAuthorityKeyError, InstallationAuthorityKeyExpectation,
     InstallationAuthorityKeyMetadata, InstallationAuthorityKeyPreparationReceipt,
     InstallationAuthorityKeySigner, PreparedInstallationAuthorityKey,
-    ReservedInstallationAuthorityKey,
-    WindowsInstallationAuthorityKeyProvider, WindowsInstallationAuthorityKeyStore,
-};
-pub use setup_signing_key::{
-    ProtectedSetupOwnerInitialSnapshotSigner, SetupOwnerInitialSnapshotKeyError,
-    SetupOwnerInitialSnapshotKeyReference, WindowsSetupOwnerInitialSnapshotKeyProvider,
+    ReservedInstallationAuthorityKey, WindowsInstallationAuthorityKeyProvider,
+    WindowsInstallationAuthorityKeyStore,
 };
 pub use installer_root::{
     ISOLATED_RESTORE_ROOT_DIR, InstallerProtectedFileReadback, InstallerRootAbsentSnapshot,
@@ -263,20 +259,14 @@ pub use process_job::{
     ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
     JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
     RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
-    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedSpawnError, SuspendedValidationError,
-    SurveyProbeResumeError,
-    TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
-    ValidatedSuspendedJobChild, cancel_capture_thread_io,
+    SUSPENDED_LAUNCH_STDIN_LIMIT, SurveyProbeResumeError, SuspendedExistingJobChild,
+    SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedSpawnError,
+    SuspendedValidationError, TerminatedExistingJobChild, TerminatedJobChild,
+    ValidatedSuspendedExistingJobChild, ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
 pub use process_path_lease::{
     RetainedProcessPathLease, RetainedSurveyProbePathLease, SurveyProbeAppContainerIdentity,
-    SurveyProbePathAdmissionError,
-    SurveyProbeAppContainerProfile, retain_survey_probe_path_lease,
-};
-pub use survey_stream_artifact::{
-    SurveyStreamArtifact, SurveyStreamArtifactError, SurveyStreamArtifactReadback,
-    SurveyStreamArtifactRoot,
+    SurveyProbeAppContainerProfile, SurveyProbePathAdmissionError, retain_survey_probe_path_lease,
 };
 pub use profile_supervision::{
     ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
@@ -315,6 +305,10 @@ pub use service_registration::{
     ServiceRegistrationRuntimeReadback, ServiceRuntimeObservation, ServiceSidType,
     ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
 };
+pub use setup_signing_key::{
+    ProtectedSetupOwnerInitialSnapshotSigner, SetupOwnerInitialSnapshotKeyError,
+    SetupOwnerInitialSnapshotKeyReference, WindowsSetupOwnerInitialSnapshotKeyProvider,
+};
 pub use supervision_authority_key::{
     PortableDevSupervisionAuthorityKeyObservation, PortableDevSupervisionAuthorityKeyReceipt,
     PortableDevSupervisionAuthorityKeyRequest, PortableDevSupervisionAuthorityKeyTargetObservation,
@@ -327,6 +321,10 @@ pub use supervision_authority_key::{
     UserModeSupervisionAuthorityCredentialWriteOutcome,
     WindowsPortableDevSupervisionAuthorityKeyProvider, WindowsSupervisionAuthorityKeyProvider,
     WindowsSupervisionAuthorityKeyStore, WindowsUserModeSupervisionAuthorityCredentialProvider,
+};
+pub use survey_stream_artifact::{
+    SurveyStreamArtifact, SurveyStreamArtifactError, SurveyStreamArtifactReadback,
+    SurveyStreamArtifactRoot,
 };
 pub use tcp_listener_owner::{
     TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,

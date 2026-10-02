@@ -31,8 +31,8 @@ use crate::{
     INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE, INSTALLATION_AUTHORITY_SIGNER_ID,
     InstallationAuthorityKeyError, InstallationAuthorityKeyExpectation,
     InstallationAuthorityKeyMetadata, InstallationAuthorityKeyPreparationReceipt,
-    InstallationAuthorityKeySigner,
-    InstallerRootProfile, WindowsInstallationAuthorityKeyStore, protected_program_data_path,
+    InstallationAuthorityKeySigner, InstallerRootProfile, WindowsInstallationAuthorityKeyStore,
+    protected_program_data_path,
 };
 
 const SETUP_OWNER_KEY_REFERENCE_WIRE: &str = "eliot.setup-owner-initial-snapshot-key-reference.v3";
@@ -52,7 +52,7 @@ pub struct SetupOwnerInitialSnapshotKeyReference {
     /// Current Windows principal authorized to run this setup operation.
     principal_sid: String,
     /// Physical principal that owns the underlying key material. For the
-    /// SystemService profile this is SYSTEM, distinct from `principal_sid`.
+    /// `SystemService` profile this is SYSTEM, distinct from `principal_sid`.
     key_principal_sid: String,
     key_id: String,
     public_key_fingerprint: String,
@@ -84,7 +84,7 @@ impl SetupOwnerInitialSnapshotKeyReference {
             key_principal_sid: InstallationAuthorityKeyMetadata::OWNER_SID.to_owned(),
             key_id: metadata.key_id.clone(),
             public_key_fingerprint: metadata.public_key_fingerprint.clone(),
-            file_identity: Some(metadata.file_identity.clone()),
+            file_identity: Some(metadata.file_identity),
             user_mode_receipt: None,
             portable_dev_receipt: None,
         };
@@ -93,8 +93,8 @@ impl SetupOwnerInitialSnapshotKeyReference {
     }
 
     /// Builds the initial-snapshot purpose reference from the exact original
-    /// UserMode transaction receipt. The receipt remains embedded verbatim in
-    /// the existing SetupKeyReference target and is reopened on every sign.
+    /// `UserMode` transaction receipt. The receipt remains embedded verbatim in
+    /// the existing `SetupKeyReference` target and is reopened on every sign.
     pub fn from_user_mode_receipt(
         receipt: crate::UserModeSupervisionAuthorityCredentialReceipt,
         transaction_id: impl Into<String>,
@@ -124,9 +124,9 @@ impl SetupOwnerInitialSnapshotKeyReference {
     }
 
     /// Builds the initial-snapshot purpose reference from the exact original
-    /// PortableDev setup-effect receipt. Its retained repository root identity
+    /// `PortableDev` setup-effect receipt. Its retained repository root identity
     /// and relative key path are independently reopened by the profile-owned
-    /// provider; no ProgramData or ambient path fallback is available.
+    /// provider; no `ProgramData` or ambient path fallback is available.
     pub fn from_portable_dev_receipt(
         receipt: crate::PortableDevSupervisionAuthorityKeyReceipt,
         transaction_id: impl Into<String>,
@@ -167,7 +167,7 @@ impl SetupOwnerInitialSnapshotKeyReference {
         &self.principal_sid
     }
 
-    /// Returns whether this target is the exact SystemService setup purpose
+    /// Returns whether this target is the exact `SystemService` setup purpose
     /// reference for the prepared protected-key receipt, including the
     /// original native slot identity and the separate physical key principal.
     #[must_use]
@@ -217,7 +217,8 @@ impl SetupOwnerInitialSnapshotKeyReference {
         self.validate()?;
         let encoded = serde_json::to_string(self)
             .map_err(|_| SetupOwnerInitialSnapshotKeyError::InvalidReference)?;
-        PlatformHandle::new(encoded).map_err(|_| SetupOwnerInitialSnapshotKeyError::InvalidReference)
+        PlatformHandle::new(encoded)
+            .map_err(|_| SetupOwnerInitialSnapshotKeyError::InvalidReference)
     }
 
     fn decode_target_ref(
@@ -269,10 +270,9 @@ impl SetupOwnerInitialSnapshotKeyReference {
                 .public_key_fingerprint
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || self
-                .file_identity
-                .as_ref()
-                .is_some_and(|identity| identity.volume_serial_number == 0 || identity.file_index == 0)
+            || self.file_identity.as_ref().is_some_and(|identity| {
+                identity.volume_serial_number == 0 || identity.file_index == 0
+            })
         {
             return Err(SetupOwnerInitialSnapshotKeyError::InvalidReference);
         }
@@ -369,6 +369,10 @@ impl WindowsSetupOwnerInitialSnapshotKeyProvider {
     /// and `PortableDev` uses its exact repository-local key-file receipt.
     /// The active Windows process SID is independently read before any key is
     /// opened.
+    // This typed setup read must validate the exact independent bindings before
+    // a profile-owned signer is opened; keeping the request fields explicit
+    // avoids replacing their identity with an aggregate shim.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
         target_ref: &PlatformHandle,
@@ -532,11 +536,9 @@ impl ProtectedSetupOwnerInitialSnapshotSigner {
             current.selected_profile_key_root.as_deref(),
         )?;
         match signer {
-            SetupProfileSigner::Installation(signer) => {
-                signer.sign(canonical_bytes).map_err(|_| {
-                    SetupOwnerInitialSnapshotKeyError::ProtectedKeyMismatch
-                })
-            }
+            SetupProfileSigner::Installation(signer) => signer
+                .sign(canonical_bytes)
+                .map_err(|_| SetupOwnerInitialSnapshotKeyError::ProtectedKeyMismatch),
             SetupProfileSigner::Supervision(signer) => signer
                 .sign(canonical_bytes)
                 .map_err(|_| SetupOwnerInitialSnapshotKeyError::ProtectedKeyMismatch),
@@ -556,6 +558,9 @@ fn signer_public_key(signer: &SetupProfileSigner) -> Vec<u8> {
     }
 }
 
+// Keep each profile's exact receipt and identity checks adjacent to the
+// provider open that consumes them.
+#[allow(clippy::too_many_lines)]
 fn open_profile_signer(
     reference: &SetupOwnerInitialSnapshotKeyReference,
     profile: InstallerRootProfile,
@@ -575,11 +580,10 @@ fn open_profile_signer(
             if !crate::windows_paths_equal(selected_root, &expected_root) {
                 return Err(SetupOwnerInitialSnapshotKeyError::InvalidReference);
             }
-            let store = WindowsInstallationAuthorityKeyStore::new(selected_root)
-                .map_err(map_key_error)?;
+            let store =
+                WindowsInstallationAuthorityKeyStore::new(selected_root).map_err(map_key_error)?;
             let identity = reference
                 .file_identity
-                .clone()
                 .ok_or(SetupOwnerInitialSnapshotKeyError::InvalidReference)?;
             let expectation = InstallationAuthorityKeyExpectation::new(
                 reference.key_id.clone(),
@@ -591,14 +595,17 @@ fn open_profile_signer(
             let metadata = signer.metadata();
             if metadata.key_id != reference.key_id
                 || metadata.public_key_fingerprint != reference.public_key_fingerprint
-                || Some(metadata.file_identity.clone()) != reference.file_identity
+                || Some(metadata.file_identity) != reference.file_identity
             {
                 return Err(SetupOwnerInitialSnapshotKeyError::ProtectedKeyMismatch);
             }
             // The original slot remains `installer-authority`; this explicit
             // setup-purpose adapter does not mutate its key id or metadata.
             let original_anchor = signer
-                .trust_anchor(reference.installation_id.clone(), INSTALLATION_AUTHORITY_SIGNER_ID)
+                .trust_anchor(
+                    reference.installation_id.clone(),
+                    INSTALLATION_AUTHORITY_SIGNER_ID,
+                )
                 .map_err(map_key_error)?;
             if original_anchor.public_key != metadata.public_key
                 || original_anchor.key_id != reference.key_id
@@ -644,10 +651,9 @@ fn open_profile_signer(
             {
                 return Err(SetupOwnerInitialSnapshotKeyError::InvalidReference);
             }
-            let key_reference = PortableDevSupervisionKeyReference::new(
-                receipt.request.relative_path.clone(),
-            )
-            .map_err(|_| SetupOwnerInitialSnapshotKeyError::InvalidReference)?;
+            let key_reference =
+                PortableDevSupervisionKeyReference::new(receipt.request.relative_path.clone())
+                    .map_err(|_| SetupOwnerInitialSnapshotKeyError::InvalidReference)?;
             let signer = crate::WindowsPortableDevSupervisionAuthorityKeyProvider::new()
                 .load_signer_for_kernel(
                     &key_reference,
@@ -671,9 +677,7 @@ fn protected_key_root() -> Result<std::path::PathBuf, SetupOwnerInitialSnapshotK
     Ok(key_root)
 }
 
-fn map_key_error(
-    error: InstallationAuthorityKeyError,
-) -> SetupOwnerInitialSnapshotKeyError {
+fn map_key_error(error: InstallationAuthorityKeyError) -> SetupOwnerInitialSnapshotKeyError {
     match error {
         InstallationAuthorityKeyError::IdentityMismatch
         | InstallationAuthorityKeyError::MissingOrMalformed

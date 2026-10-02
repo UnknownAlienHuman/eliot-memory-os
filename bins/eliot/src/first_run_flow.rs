@@ -38,16 +38,13 @@ use eliot_config::first_run::{
     decide_first_run, describe_defaults, parse_kind, parse_role,
     recommend_when_automation_disabled, to_settings,
 };
-use eliot_config::initial_snapshot::{
-    PrivacyChoice,
-};
+use eliot_config::initial_snapshot::PrivacyChoice;
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_installation::{
-    InitialSnapshotOwnerConfiguration, IntegrationDiscoveryCatalogue,
-    ManagedChangeApprovalSet, RedbInstallationTransactionStore,
+    InitialSnapshotOwnerConfiguration, IntegrationDiscoveryCatalogue, ManagedChangeApprovalSet,
+    PlatformHandle, RedbInstallationTransactionStore,
     prepare_deterministic_setup_for_initial_snapshot, publish_system_owner_initial_snapshot,
 };
-use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use eliot_platform::PlatformHandle;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;

@@ -254,16 +254,13 @@ impl WindowsPlatform {
             if !working_metadata.is_dir() || is_reparse_point(&working_metadata) {
                 return Err(PortError::InvalidPath);
             }
-            let working_directory_identity =
-                file_identity_from_handle(&working_directory_handle)
-                    .map_err(|_| PortError::Provider(provider_failed()))?;
+            let working_directory_identity = file_identity_from_handle(&working_directory_handle)
+                .map_err(|_| PortError::Provider(provider_failed()))?;
             let ancestor_pins = pin_process_path_ancestors(root, working_directory)?;
             let mut ancestor_identities = Vec::new();
-            for path in executable
-                .ancestors()
-                .take_while(|path| *path != root)
-            {
-                let handle = pin_process_path_directory(path).map_err(|_| PortError::InvalidPath)?;
+            for path in executable.ancestors().take_while(|path| *path != root) {
+                let handle =
+                    pin_process_path_directory(path).map_err(|_| PortError::InvalidPath)?;
                 let identity = file_identity_from_handle(&handle)
                     .map_err(|_| PortError::Provider(provider_failed()))?;
                 ancestor_identities.push((path.to_path_buf(), identity));
@@ -298,6 +295,7 @@ impl RetainedProcessPathLease {
     }
 
     /// Returns the identity retained for the executable handle.
+    #[must_use]
     pub const fn executable_identity(&self) -> FileIdentity {
         self.executable_identity
     }
@@ -310,7 +308,7 @@ impl RetainedProcessPathLease {
 
     /// Validates the retained executable independently from its original
     /// working directory. Survey probes bind a new, operation-owned working
-    /// directory after the original ProcessRequest is sealed; the executable
+    /// directory after the original `ProcessRequest` is sealed; the executable
     /// proof remains the original one and is never widened to that directory.
     ///
     /// # Errors
@@ -339,7 +337,9 @@ impl RetainedProcessPathLease {
                 .read(true)
                 .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-            let mut current = options.open(executable).map_err(|_| PortError::InvalidPath)?;
+            let mut current = options
+                .open(executable)
+                .map_err(|_| PortError::InvalidPath)?;
             let metadata = current.metadata().map_err(|_| PortError::InvalidPath)?;
             if !metadata.is_file() || is_reparse_point(&metadata) {
                 return Err(PortError::InvalidPath);
@@ -550,7 +550,7 @@ fn pin_process_path_ancestors(root: &Path, path: &Path) -> Result<Vec<std::fs::F
     Ok(handles)
 }
 
-/// Physical AppContainer identity derived only from one original operation
+/// Physical `AppContainer` identity derived only from one original operation
 /// identity. It creates no profile and carries no capability or authority.
 /// The lowercase digest is also the closed child-directory locator beneath an
 /// independently authenticated working-area root.
@@ -578,9 +578,9 @@ impl PartialEq for SurveyProbeAppContainerIdentity {
 impl Eq for SurveyProbeAppContainerIdentity {}
 
 impl SurveyProbeAppContainerIdentity {
-    /// Derives the physical AppContainer moniker from an original operation
+    /// Derives the physical `AppContainer` moniker from an original operation
     /// identity. This is a deterministic locator only; it does not create an
-    /// AppContainer profile or issue process authority.
+    /// `AppContainer` profile or issue process authority.
     ///
     /// # Errors
     /// Returns `InvalidText` when the original operation identity is blank,
@@ -606,16 +606,12 @@ impl SurveyProbeAppContainerIdentity {
         working_area.join(&self.moniker)
     }
 
-    pub(crate) fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
     pub(crate) fn moniker(&self) -> &str {
         &self.moniker
     }
 }
 
-/// Non-serializable AppContainer profile created only for one original probe
+/// Non-serializable `AppContainer` profile created only for one original probe
 /// operation. Existing profiles are refused; this lease retains the exact
 /// newly-created SID until terminal tree readback and explicit deletion.
 pub struct SurveyProbeAppContainerProfile {
@@ -650,12 +646,12 @@ impl SurveyProbeAppContainerProfile {
     /// # Errors
     /// Returns `InvalidPath` for an already-existing profile and a provider
     /// failure when Windows cannot create or read back the exact profile SID.
-    pub fn create(
-        identity: &SurveyProbeAppContainerIdentity,
-    ) -> Result<Self, PortError> {
+    pub fn create(identity: &SurveyProbeAppContainerIdentity) -> Result<Self, PortError> {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Security::Isolation::CreateAppContainerProfile;
+            use windows_sys::Win32::Security::Isolation::{
+                CreateAppContainerProfile, DeleteAppContainerProfile,
+            };
 
             let moniker = crate::nul_terminated_wide(std::ffi::OsStr::new(identity.moniker()))
                 .map_err(|_| PortError::Provider(provider_failed()))?;
@@ -685,21 +681,14 @@ impl SurveyProbeAppContainerProfile {
                     PortError::InvalidPath
                 });
             }
-            let sid_text = match crate::sid_to_string(sid) {
-                Ok(value) => value,
-                Err(_) => {
-                    // Creation succeeded for this operation. Attempt only the
-                    // exact profile cleanup; the unique moniker is never
-                    // queried or adopted after this failed readback.
-                    let _ = unsafe {
-                        windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile(
-                            moniker.as_ptr(),
-                        )
-                    };
-                    // SAFETY: the API allocated this returned SID.
-                    unsafe { windows_sys::Win32::Security::FreeSid(sid) };
-                    return Err(PortError::Provider(provider_failed()));
-                }
+            let Ok(sid_text) = crate::sid_to_string(sid) else {
+                // Creation succeeded for this operation. Attempt only the
+                // exact profile cleanup; the unique moniker is never
+                // queried or adopted after this failed readback.
+                let _ = unsafe { DeleteAppContainerProfile(moniker.as_ptr()) };
+                // SAFETY: the API allocated this returned SID.
+                unsafe { windows_sys::Win32::Security::FreeSid(sid) };
+                return Err(PortError::Provider(provider_failed()));
             };
             let profile = Self {
                 identity: identity.clone(),
@@ -752,10 +741,11 @@ impl SurveyProbeAppContainerProfile {
     pub fn remove(&mut self) -> Result<(), PortError> {
         #[cfg(windows)]
         {
+            use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+
             if !self.active {
                 return Ok(());
             }
-            use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
             let moniker = crate::nul_terminated_wide(std::ffi::OsStr::new(self.identity.moniker()))
                 .map_err(|_| PortError::Provider(provider_failed()))?;
             // SAFETY: moniker is the exact operation-derived name retained by
@@ -800,7 +790,6 @@ pub struct RetainedSurveyProbePathLease {
     invocation_digest: String,
     app_container: SurveyProbeAppContainerIdentity,
     admitted_executable: Arc<RetainedProcessPathLease>,
-    root_path: PathBuf,
     root_identity: FileIdentity,
     working_directory: PathBuf,
     child_identity: Option<FileIdentity>,
@@ -917,7 +906,7 @@ impl RetainedSurveyProbePathLease {
         &self.operation_id
     }
 
-    /// Returns the digest of the exact sealed ProcessRequest bound to this
+    /// Returns the digest of the exact sealed `ProcessRequest` bound to this
     /// scope.
     #[must_use]
     pub fn invocation_digest(&self) -> &str {
@@ -936,7 +925,7 @@ impl RetainedSurveyProbePathLease {
         &self.working_directory
     }
 
-    /// Returns the physical AppContainer identity consumed by suspended
+    /// Returns the physical `AppContainer` identity consumed by suspended
     /// process creation.
     #[must_use]
     pub const fn app_container_identity(&self) -> &SurveyProbeAppContainerIdentity {
@@ -945,8 +934,14 @@ impl RetainedSurveyProbePathLease {
 
     /// Returns the executable identity retained by the original admission.
     #[must_use]
-    pub const fn executable_identity(&self) -> FileIdentity {
+    pub fn executable_identity(&self) -> FileIdentity {
         self.admitted_executable.executable_identity()
+    }
+
+    /// Returns the digest retained for the original executable admission.
+    #[must_use]
+    pub fn executable_sha256(&self) -> &str {
+        self.admitted_executable.executable_sha256()
     }
 
     /// Reports whether scoped ACL state still needs terminal restoration.
@@ -1030,7 +1025,7 @@ impl Drop for RetainedSurveyProbePathLease {
 /// Atomically creates the exact empty child cwd named by the original request
 /// and temporarily grants LPAC only root traversal plus cwd read/execute.
 ///
-/// The caller must already have issued the original sealed ProcessRequest;
+/// The caller must already have issued the original sealed `ProcessRequest`;
 /// `operation_id`, `invocation_digest`, and `working_directory` are copied
 /// directly from that request. Existing paths are never adopted, executable
 /// ACLs are never changed, and no parent outside `owned_area` is modified.
@@ -1039,6 +1034,7 @@ impl Drop for RetainedSurveyProbePathLease {
 /// Returns a typed path/provider error when the root, executable proof, exact
 /// operation locator, atomic creation, ACL readback, or cleanup cannot be
 /// established.
+#[allow(clippy::result_large_err)]
 pub fn retain_survey_probe_path_lease(
     owned_area: &crate::UserOwnedRootReadLease,
     admitted_executable: Arc<RetainedProcessPathLease>,
@@ -1047,9 +1043,11 @@ pub fn retain_survey_probe_path_lease(
     working_directory: &Path,
 ) -> Result<RetainedSurveyProbePathLease, SurveyProbePathAdmissionError> {
     if !valid_sha256_hex(invocation_digest) {
-        return Err(SurveyProbePathAdmissionError::before_owner(PortError::InvalidText {
-            field: "invocation_digest".to_owned(),
-        }));
+        return Err(SurveyProbePathAdmissionError::before_owner(
+            PortError::InvalidText {
+                field: "invocation_digest".to_owned(),
+            },
+        ));
     }
     let app_container = SurveyProbeAppContainerIdentity::for_operation_id(operation_id)
         .map_err(SurveyProbePathAdmissionError::before_owner)?;
@@ -1066,13 +1064,16 @@ pub fn retain_survey_probe_path_lease(
         || admitted_executable.executable_identity().file_index == 0
         || working_directory != app_container.working_directory(&root_path)
     {
-        return Err(SurveyProbePathAdmissionError::before_owner(PortError::InvalidPath));
+        return Err(SurveyProbePathAdmissionError::before_owner(
+            PortError::InvalidPath,
+        ));
     }
-    admitted_executable.validate_executable(
-        admitted_executable.executable_path(),
-        admitted_executable.executable_sha256(),
-    )
-    .map_err(SurveyProbePathAdmissionError::before_owner)?;
+    admitted_executable
+        .validate_executable(
+            admitted_executable.executable_path(),
+            admitted_executable.executable_sha256(),
+        )
+        .map_err(SurveyProbePathAdmissionError::before_owner)?;
 
     #[cfg(windows)]
     {
@@ -1082,7 +1083,7 @@ pub fn retain_survey_probe_path_lease(
             app_container,
             operation_id,
             invocation_digest,
-            root_path,
+            &root_path,
             working_directory,
         )
     }
@@ -1097,9 +1098,9 @@ pub fn retain_survey_probe_path_lease(
             root_path,
             working_directory,
         );
-        Err(SurveyProbePathAdmissionError::before_owner(PortError::Provider(
-            provider_failed(),
-        )))
+        Err(SurveyProbePathAdmissionError::before_owner(
+            PortError::Provider(provider_failed()),
+        ))
     }
 }
 
@@ -1165,9 +1166,8 @@ impl DaclSnapshot {
         use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
         use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-            GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-            SE_DACL_PROTECTED,
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
         };
 
         let security = OWNER_SECURITY_INFORMATION
@@ -1327,13 +1327,18 @@ impl Drop for DerivedSurveyAppContainerSid {
 }
 
 #[cfg(windows)]
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    reason = "native ownership acquisition and its incomplete-cleanup handoff stay contiguous"
+)]
 fn create_survey_probe_scope(
     owned_area: &crate::UserOwnedRootReadLease,
     admitted_executable: Arc<RetainedProcessPathLease>,
     app_container: SurveyProbeAppContainerIdentity,
     operation_id: &str,
     invocation_digest: &str,
-    root_path: PathBuf,
+    root_path: &Path,
     working_directory: &Path,
 ) -> Result<RetainedSurveyProbePathLease, SurveyProbePathAdmissionError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -1349,7 +1354,7 @@ fn create_survey_probe_scope(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     let root_handle = root_options
-        .open(&root_path)
+        .open(root_path)
         .map_err(|_| PortError::InvalidPath)?;
     let root_metadata = root_handle.metadata().map_err(|_| PortError::InvalidPath)?;
     let root_identity = file_identity_from_handle(&root_handle)
@@ -1394,7 +1399,6 @@ fn create_survey_probe_scope(
         invocation_digest: invocation_digest.to_owned(),
         app_container,
         admitted_executable,
-        root_path,
         root_identity,
         working_directory: working_directory.to_path_buf(),
         child_identity: None,
@@ -1409,47 +1413,37 @@ fn create_survey_probe_scope(
         active: true,
     };
 
-    let child_handle = match child_options.open(working_directory) {
-        Ok(handle) => handle,
-        Err(_) => {
-            let primary = PortError::InvalidPath;
-            let cleanup = lease.restore().err();
-            return Err(SurveyProbePathAdmissionError::with_owner(
-                primary, cleanup, lease,
-            ));
-        }
+    let Ok(child_handle) = child_options.open(working_directory) else {
+        let primary = PortError::InvalidPath;
+        let cleanup = lease.restore().err();
+        return Err(SurveyProbePathAdmissionError::with_owner(
+            primary, cleanup, lease,
+        ));
     };
     lease.child_handle = Some(child_handle);
     let child_metadata_result = lease
         .child_handle
         .as_ref()
-        .expect("the just-opened child handle is retained")
-        .metadata();
-    let child_metadata = match child_metadata_result {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let primary = PortError::InvalidPath;
-            let cleanup = lease.restore().err();
-            return Err(SurveyProbePathAdmissionError::with_owner(
-                primary, cleanup, lease,
-            ));
-        }
+        .map(std::fs::File::metadata)
+        .transpose();
+    let Ok(Some(child_metadata)) = child_metadata_result else {
+        let primary = PortError::InvalidPath;
+        let cleanup = lease.restore().err();
+        return Err(SurveyProbePathAdmissionError::with_owner(
+            primary, cleanup, lease,
+        ));
     };
-    let child_identity_result = file_identity_from_handle(
-        lease
-            .child_handle
-            .as_ref()
-            .expect("the just-opened child handle is retained"),
-    );
-    let child_identity = match child_identity_result {
-        Ok(identity) => identity,
-        Err(_) => {
-            let primary = PortError::Provider(provider_failed());
-            let cleanup = lease.restore().err();
-            return Err(SurveyProbePathAdmissionError::with_owner(
-                primary, cleanup, lease,
-            ));
-        }
+    let child_identity_result = lease
+        .child_handle
+        .as_ref()
+        .map(file_identity_from_handle)
+        .transpose();
+    let Ok(Some(child_identity)) = child_identity_result else {
+        let primary = PortError::Provider(provider_failed());
+        let cleanup = lease.restore().err();
+        return Err(SurveyProbePathAdmissionError::with_owner(
+            primary, cleanup, lease,
+        ));
     };
     lease.child_identity = Some(child_identity);
     if !child_metadata.is_dir()
@@ -1463,14 +1457,20 @@ fn create_survey_probe_scope(
             primary, cleanup, lease,
         ));
     }
-    let original_child_dacl_result = DaclSnapshot::read(
-        lease
-            .child_handle
-            .as_ref()
-            .expect("the just-opened child handle is retained"),
-    );
+    let original_child_dacl_result = lease
+        .child_handle
+        .as_ref()
+        .map(DaclSnapshot::read)
+        .transpose();
     let original_child_dacl = match original_child_dacl_result {
-        Ok(snapshot) => snapshot,
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            let primary = PortError::InvalidPath;
+            let cleanup = lease.restore().err();
+            return Err(SurveyProbePathAdmissionError::with_owner(
+                primary, cleanup, lease,
+            ));
+        }
         Err(error) => {
             let cleanup = lease.restore().err();
             return Err(SurveyProbePathAdmissionError::with_owner(
@@ -1501,7 +1501,9 @@ fn create_survey_probe_scope(
         let scoped_child_dacl = DaclSnapshot::read(child_handle)?;
         if scoped_child_dacl.owner_sid != original_child_dacl.owner_sid
             || !scoped_child_dacl.protected
-            || !scoped_child_dacl.dacl.matches_raw(child_acl.0.cast_const())?
+            || !scoped_child_dacl
+                .dacl
+                .matches_raw(child_acl.0.cast_const())?
         {
             return Err(PortError::InvalidPath);
         }
@@ -1526,10 +1528,7 @@ fn create_survey_probe_scope(
             return Err(PortError::InvalidPath);
         }
         lease.scoped_root_dacl = Some(scoped_root_dacl.dacl);
-        if !directory_is_empty_and_same_identity(
-            &lease.working_directory,
-            child_identity,
-        ) {
+        if !directory_is_empty_and_same_identity(&lease.working_directory, child_identity) {
             return Err(PortError::InvalidPath);
         }
         Ok(())
@@ -1603,10 +1602,8 @@ fn directory_is_empty_and_same_identity(path: &Path, expected: FileIdentity) -> 
         .and_then(|handle| {
             let identity = file_identity_from_handle(&handle).ok()?;
             let metadata = handle.metadata().ok()?;
-            (identity == expected
-                && metadata.is_dir()
-                && !is_reparse_point(&metadata))
-            .then_some(())
+            (identity == expected && metadata.is_dir() && !is_reparse_point(&metadata))
+                .then_some(())
         })
         .is_some();
     same && std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
@@ -1745,8 +1742,8 @@ fn restore_survey_probe_scope(lease: &mut RetainedSurveyProbePathLease) -> Resul
                 && current_child.protected == original_child_dacl.protected
                 && current_child.dacl.bytes() == original_child_dacl.dacl.bytes();
             let is_scoped = current_child.owner_sid == original_child_dacl.owner_sid
-            && current_child.protected
-            && current_child.dacl.bytes() == scoped.bytes();
+                && current_child.protected
+                && current_child.dacl.bytes() == scoped.bytes();
             if is_scoped {
                 set_dacl(
                     child_handle,

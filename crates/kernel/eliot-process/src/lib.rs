@@ -1259,13 +1259,13 @@ impl ProcessRequest {
     /// produce this complete projection.
     pub fn expected_execution_binding(&self) -> Result<ProcessExecutionBinding, ContractError> {
         self.validate()?;
-        let validation_revision = self
-            .permit
-            .validation_revision
-            .ok_or(ContractError::InvalidValue {
-                field: "dispatch_permit.validation_revision",
-                reason: "an exact revision must be sealed to project the expected binding",
-            })?;
+        let validation_revision =
+            self.permit
+                .validation_revision
+                .ok_or(ContractError::InvalidValue {
+                    field: "dispatch_permit.validation_revision",
+                    reason: "an exact revision must be sealed to project the expected binding",
+                })?;
         let binding = ProcessExecutionBinding {
             operation_id: self.intent.operation_id.clone(),
             process_tree_id: self.intent.process_tree_id.clone(),
@@ -3239,9 +3239,9 @@ mod tests {
     #[test]
     fn expected_execution_binding_projects_only_exact_original_request_fields() -> TestResult {
         let mut dispatch_authority = authority()?;
-        let intent = intent()?;
+        let request_intent = intent()?;
         let permit = dispatch_authority.issue(
-            &intent,
+            &request_intent,
             PermitIssuance::new_with_validation_revision(
                 ActionLeaseRef::new("lease-1")?,
                 fence()?,
@@ -3252,11 +3252,11 @@ mod tests {
                 41,
             )?,
         )?;
-        let request = ProcessRequest::new(intent.clone(), permit)?;
+        let request = ProcessRequest::new(request_intent.clone(), permit)?;
         let expected = request.expected_execution_binding()?;
         let validated = dispatch_authority.validate_and_consume(
             request,
-            observed(&intent)?,
+            observed(&request_intent)?,
             &context(150)?,
         )?;
 
