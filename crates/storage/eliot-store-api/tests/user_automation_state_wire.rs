@@ -89,7 +89,29 @@ fn wire_identity_is_stable_and_versioned() {
 #[test]
 fn catalogue_activates_both_automation_operations() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    // Denominator bound to the producer declaration tables in
+    // `crates/storage/eliot-store-api/src/operation_catalogue.rs`: 23 activated
+    // reads (`ACTIVATED_READS: [ActivatedReadDescriptor; 23]`) + 24 activated
+    // mutations (`ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24]`) + the
+    // genesis bootstrap entry pushed by `generated_operation_manifests` = 48.
+    // The store owner's own count tests in
+    // `crates/storage/eliot-store-api/tests/operation_manifest_catalogue.rs`
+    // assert the same 48.
+    //
+    // Recorded drift, stated plainly so a silent "fix" cannot hide it: this bare
+    // `33` was ALREADY stale before issue #686 activated anything. On pristine
+    // `main` (base 8b06c460) the two declaration tables already held 23 reads and
+    // 23 mutations, so 47 entries existed and 14 rows of drift were pre-existing
+    // red debt this assertion had been failing on since well before #686; #686
+    // did not cause it. #686 adds exactly ONE row, the activated
+    // `RecordAuthorityRevocation` mutation, taking mutations from 23 to 24 and
+    // the total from 47 to 48. Both drift sources are named rather than
+    // absorbed into a new number.
+    //
+    // Exact equality, deliberately still equality and never a bound: a silent
+    // add or drop must fail here. The membership assertions below pin the rows
+    // this file actually depends on, so the count is not a substitute for them.
+    assert_eq!(entries.len(), 48, "23 reads + 24 mutations + genesis");
     let mutation = entries
         .iter()
         .find(|entry| entry.name == "ApplyUserAutomationState")

@@ -4058,9 +4058,38 @@ pub enum NamedMutationOperation {
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
     AppendAuditEvent,
-    /// Durable authority-revocation record (issue #686). Known-but-
-    /// unsupported until a store-owned slice activates its catalogue row
-    /// with proven handlers; the typed parameters are already closed.
+    /// Owner-issued authority-revocation record (issue #686).
+    ///
+    /// Activated: this variant has a row in
+    /// `operation_catalogue::ACTIVATED_MUTATIONS` and a production-registered
+    /// per-backend write handler
+    /// (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+    /// appended into the canonical atomic transaction by
+    /// `append_authority_revocation_statements`), so an admitted revocation
+    /// resolves to a mutation entry and reaches the canonical write path
+    /// instead of failing closed here with [`StoreError::UnknownOperation`].
+    /// The row records only the closure the authority owner already committed
+    /// and durably fenced, and grants no re-grant, restoration or support: a
+    /// revoked influence is never revived by writing this row.
+    ///
+    /// What is proven here is the CONTRACT leg, not persistence. The handler
+    /// is registered in production and RENDERS the create-only
+    /// `recovery_owner` row into the one canonical transaction, ahead of the
+    /// receipt create, as
+    /// `docs/architecture/I05-04-canonical-transition.md` requires; it
+    /// introduces no new table and adds no DDL, and its rendering is
+    /// unit-proven. The DURABLE COMMIT is not proven: this leg has no
+    /// real-Surreal edge proof, so nothing in this contract may be read as a
+    /// promise that a recorded revocation is on disk. Activation and rendering
+    /// are proved; persistence is not, and no reader should treat this variant
+    /// as a durable write until that edge proof exists.
+    ///
+    /// That WRITE leg is not a read-back claim either. The paired named read
+    /// [`NamedReadOperation::GetAuthorityRevocationHistory`] is still
+    /// known-but-unsupported: it has no read row, no per-backend read handler
+    /// and no consumer triple, because the Kernel serves that read from the
+    /// retained P-07 ORS before the store bridge sees it. Recording a
+    /// revocation is therefore not reading it back from the store.
     RecordAuthorityRevocation,
     /// Named canonical erasure/disposition transaction (issue #1712).
     ///
