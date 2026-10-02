@@ -662,6 +662,33 @@ mod tests {
     }
 
     #[test]
+    fn contract_and_manifest_naming_different_owners_is_owner_mismatch() {
+        // Arm: the real generated contract block projects the real
+        // `governor.daemon.skill-catalogue` cell with a different
+        // mutable-state owner than the real manifest names. Both sides still
+        // project all eight cells, so cell set agreement passes; only the owner
+        // comparison can catch a second owner being claimed for one cell, and
+        // it must report both owners rather than a bare mismatch.
+        let contract = add_contract_cell(
+            "governor.daemon.skill-catalogue",
+            "eliot_skill::RenamedSkillCatalogue",
+        );
+
+        let Err(error) = compiled_table_drift_over(MANIFEST_TEXT, &contract) else {
+            panic!("a contract row naming another owner must not pass");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::ContractOwnerMismatch {
+                cell: "governor.daemon.skill-catalogue".to_owned(),
+                manifest_owner: "eliot_skill::SkillCatalogue".to_owned(),
+                contract_owner: "eliot_skill::RenamedSkillCatalogue".to_owned(),
+            },
+            "the typed refusal must name both disagreeing owners"
+        );
+    }
+
+    #[test]
     fn a_contract_cell_the_manifest_does_not_declare_is_undeclared_contract_cell() {
         // Arm: the real generated contract block projects a ninth cell that the
         // real manifest never declares. Every manifest cell is still projected
