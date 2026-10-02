@@ -41,13 +41,16 @@ use eliot_build_test_graph::{
     CacheCounters, CacheLookup, CacheStoreError, DerivedCacheIdentity, DerivedCacheStore,
     FreshDerivation, RejectedCacheRecord, RootDisposition, TrustPolicy,
 };
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_instrument_scip::{SCIP_INSTRUMENT, ScipIndex};
 use eliot_observability::CacheTelemetry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    BridgeError, Definition, Reference, RenameCandidate, SemanticOperation, SymbolInfo, hex_bytes,
+    AnalyzerConfig, BridgeError, CandidateIdentity, Definition, InstrumentSpec,
+    LspRegistryIdentity, LspStartedInvocation, RenameCandidate, ResolvedExecutableIdentityRecord,
+    SemanticOperation, SourceCandidate, SymbolInfo, hex_bytes,
 };
 
 /// Runtime class bound into every cache identity.
@@ -106,6 +109,42 @@ pub struct ScipProjectionCache {
 struct MemoRecord {
     content_digest: String,
     sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CacheIdentityOverrides {
+    source_digest: String,
+    config_digest: String,
+    toolchain_version: String,
+    compiler_version: String,
+    parser_version: String,
+    producer_id: String,
+    producer_generation: u64,
+}
+
+#[derive(Serialize)]
+struct ScipInvocationCommitmentV1<'a> {
+    schema_version: u16,
+    candidate: &'a SourceCandidate,
+    source_tree_id: &'a str,
+    source_kind: &'a eliot_artifact::ArtifactKind,
+    source_content: &'a eliot_artifact::ContentAddress,
+    source_binding: Option<&'a eliot_artifact::SourceBinding>,
+    source_scope_at_dispatch: &'a Option<eliot_types::memory::GovernedGitScope>,
+    candidate_identity_at_dispatch: &'a Option<CandidateIdentity>,
+    build_fingerprint_at_dispatch: &'a Option<eliot_build_test_graph::BuildFingerprint>,
+    config: &'a AnalyzerConfig,
+    operation: &'a SemanticOperation,
+    instrument: &'a str,
+    instrument_kind: &'a eliot_instrument_api::InstrumentKind,
+    instrument_profile: &'a str,
+    instrument_target: &'a str,
+    instrument_arguments: &'a [String],
+    instrument_input_artifacts: &'a [eliot_contracts::ArtifactId],
+    instrument_declared_scope: &'a str,
+    resolved_executable: &'a ResolvedExecutableIdentityRecord,
+    instrument_spec: &'a InstrumentSpec,
+    registry_identity: &'a LspRegistryIdentity,
 }
 
 impl ScipProjectionCache {
@@ -204,9 +243,65 @@ impl ScipProjectionCache {
     ) -> Result<CachedProjection, BridgeError> {
         let index_digest = digest_bytes(index_bytes);
         let op_digest = operation_digest(config_hash, operation);
-        let memo_key = (index_digest.clone(), op_digest.clone());
+        self.reuse_or_derive_with_identity(
+            index_bytes,
+            target_identity,
+            &index_digest,
+            &op_digest,
+            None,
+            project,
+        )
+    }
+
+    /// Reuses projections only for the exact original retained invocation and
+    /// its owner-minted source artifact. The sidecar bytes remain the generated
+    /// input; source content, candidate selectors, admitted executable,
+    /// instrument spec, and parser/registry identities enter the existing
+    /// cache closure. The live start handle is opaque and cannot be rebuilt
+    /// from a retained JSON projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError`] when the invocation has no live owner source
+    /// proof or any original source/config/tool identity fails validation.
+    pub fn reuse_or_derive_for_invocation(
+        &mut self,
+        index_bytes: &[u8],
+        invocation: &LspStartedInvocation,
+        target_identity: &str,
+        project: impl FnOnce(&ScipIndex) -> Result<CachedScipItems, BridgeError>,
+    ) -> Result<CachedProjection, BridgeError> {
+        let overrides = invocation_cache_identity(invocation)?;
+        let memo_key_digest = overrides.config_digest.clone();
+        self.reuse_or_derive_with_identity(
+            index_bytes,
+            target_identity,
+            &overrides.source_digest,
+            &memo_key_digest,
+            Some(overrides),
+            project,
+        )
+    }
+
+    fn reuse_or_derive_with_identity(
+        &mut self,
+        index_bytes: &[u8],
+        target_identity: &str,
+        source_digest: &str,
+        op_digest: &str,
+        overrides: Option<CacheIdentityOverrides>,
+        project: impl FnOnce(&ScipIndex) -> Result<CachedScipItems, BridgeError>,
+    ) -> Result<CachedProjection, BridgeError> {
+        let index_digest = digest_bytes(index_bytes);
+        let memo_key = (index_digest.clone(), op_digest.to_owned());
         if let Some(memo) = self.memo.get(&memo_key).cloned() {
-            let identity = self.identity(&index_digest, &op_digest, &memo.content_digest);
+            let identity = self.identity(
+                source_digest,
+                &index_digest,
+                op_digest,
+                &memo.content_digest,
+                overrides.as_ref(),
+            );
             match self.store.lookup(&identity, &self.trust) {
                 CacheLookup::Hit(artifact) => {
                     match serde_json::from_slice::<CachedScipItems>(&artifact.bytes) {
@@ -238,9 +333,11 @@ impl ScipProjectionCache {
                         index_bytes,
                         target_identity,
                         &index_digest,
-                        &op_digest,
+                        source_digest,
+                        op_digest,
                         &memo_key,
                         rejected,
+                        overrides.as_ref(),
                         project,
                     );
                 }
@@ -250,9 +347,11 @@ impl ScipProjectionCache {
             index_bytes,
             target_identity,
             &index_digest,
-            &op_digest,
+            source_digest,
+            op_digest,
             &memo_key,
             None,
+            overrides.as_ref(),
             project,
         )
     }
@@ -264,9 +363,11 @@ impl ScipProjectionCache {
         index_bytes: &[u8],
         target_identity: &str,
         index_digest: &str,
+        source_digest: &str,
         op_digest: &str,
         memo_key: &(String, String),
         rejected: Option<RejectedCacheRecord>,
+        overrides: Option<&CacheIdentityOverrides>,
         project: impl FnOnce(&ScipIndex) -> Result<CachedScipItems, BridgeError>,
     ) -> Result<CachedProjection, BridgeError> {
         let index = self.decode(index_bytes)?;
@@ -275,7 +376,13 @@ impl ScipProjectionCache {
             BridgeError::ScipDecode(format!("cached projection failed to serialize: {error}"))
         })?;
         let content_digest = digest_bytes(&bytes);
-        let identity = self.identity(index_digest, op_digest, &content_digest);
+        let identity = self.identity(
+            source_digest,
+            index_digest,
+            op_digest,
+            &content_digest,
+            overrides,
+        );
         match self.store.publish(
             &identity,
             &self.trust,
@@ -327,20 +434,40 @@ impl ScipProjectionCache {
     /// identity and invalidates reuse.
     fn identity(
         &self,
+        source_digest: &str,
         index_digest: &str,
         op_digest: &str,
         content_digest: &str,
+        overrides: Option<&CacheIdentityOverrides>,
     ) -> DerivedCacheIdentity {
         DerivedCacheIdentity {
-            source_digest: index_digest.to_owned(),
+            source_digest: source_digest.to_owned(),
             generated_input_digest: index_digest.to_owned(),
-            toolchain_version: self.provenance.indexer_name.clone(),
-            compiler_version: self.provenance.indexer_version.clone(),
-            parser_version: format!("{}/{}", SCIP_INSTRUMENT, env!("CARGO_PKG_VERSION")),
+            toolchain_version: overrides.map_or_else(
+                || self.provenance.indexer_name.clone(),
+                |identity| identity.toolchain_version.clone(),
+            ),
+            compiler_version: overrides.map_or_else(
+                || self.provenance.indexer_version.clone(),
+                |identity| identity.compiler_version.clone(),
+            ),
+            parser_version: overrides.map_or_else(
+                || format!("{}/{}", SCIP_INSTRUMENT, env!("CARGO_PKG_VERSION")),
+                |identity| identity.parser_version.clone(),
+            ),
             runtime_version: RUNTIME_CLASS.to_owned(),
-            config_digest: op_digest.to_owned(),
-            producer_id: self.provenance.producer_id.clone(),
-            producer_generation: self.provenance.producer_generation,
+            config_digest: overrides.map_or_else(
+                || op_digest.to_owned(),
+                |identity| identity.config_digest.clone(),
+            ),
+            producer_id: overrides.map_or_else(
+                || self.provenance.producer_id.clone(),
+                |identity| identity.producer_id.clone(),
+            ),
+            producer_generation: overrides
+                .map_or(self.provenance.producer_generation, |identity| {
+                    identity.producer_generation
+                }),
             root_identity: self.provenance.root_identity.clone(),
             root_acl_digest: self.provenance.root_acl_digest.clone(),
             root_disposition: self.provenance.root_disposition,
@@ -458,6 +585,120 @@ fn operation_digest(config_hash: &str, operation: &SemanticOperation) -> String 
         SemanticOperation::ProbeVersion => "probe-version".to_owned(),
     };
     digest_bytes(format!("{config_hash}\0{material}").as_bytes())
+}
+
+fn invocation_cache_identity(
+    invocation: &LspStartedInvocation,
+) -> Result<CacheIdentityOverrides, BridgeError> {
+    invocation.config.validate()?;
+    invocation.source_candidate.validate()?;
+    if !matches!(
+        &invocation.operation,
+        SemanticOperation::Definitions { .. }
+            | SemanticOperation::References { .. }
+            | SemanticOperation::Symbols { .. }
+            | SemanticOperation::Rename { .. }
+    ) || !super::operation_matches_config(&invocation.operation, &invocation.config)
+        || !super::candidate_selectors_match_operation(
+            &invocation.source_candidate,
+            &invocation.operation,
+        )
+    {
+        return Err(BridgeError::UnsupportedOperation);
+    }
+
+    let proof = invocation.source_artifact_proof.as_ref().ok_or_else(|| {
+        BridgeError::InconsistentBinding(
+            "bound SCIP cache requires the original live source-artifact proof".to_owned(),
+        )
+    })?;
+    if !proof
+        .snapshot
+        .validates_workspace_root(std::path::Path::new(
+            &invocation.source_candidate.workspace_root,
+        ))
+        .map_err(BridgeError::SourceSnapshot)?
+        || !super::source_artifact_binds_invocation(proof, &invocation.instrument_invocation)
+    {
+        return Err(BridgeError::InconsistentBinding(
+            "owner source proof does not bind the admitted SCIP candidate and invocation"
+                .to_owned(),
+        ));
+    }
+
+    super::validate_candidate_identity(
+        invocation.candidate_identity.as_ref(),
+        invocation.build_fingerprint.as_ref(),
+    )?;
+    if let Some(scope) = invocation.source_scope_at_dispatch.as_ref() {
+        super::validate_git_scope(scope)?;
+    }
+    super::validate_instrument_spec(&invocation.instrument_spec)?;
+    let resolved = invocation
+        .resolved_executable
+        .resolve(invocation.registry_identity.instrument.as_str())?;
+    let (expected_parser, _) = super::expected_parser_and_normalizer(&invocation.operation);
+    if !resolved.is_complete()
+        || invocation.registry_identity.instrument != invocation.instrument_invocation.instrument
+        || invocation.registry_identity.parser != invocation.instrument_spec.parser
+        || invocation.registry_identity.parser.as_str() != expected_parser
+        || !super::registry_projection_is_internally_consistent(&invocation.registry_identity)
+    {
+        return Err(BridgeError::InconsistentBinding(
+            "original executable, SCIP instrument, parser, or registry identities disagree"
+                .to_owned(),
+        ));
+    }
+
+    let source = proof.projection();
+    super::validate_source_artifact_identity(&proof.snapshot, &source.artifact_reference)?;
+    let identity = &source.artifact_reference.identity;
+    let commitment = ScipInvocationCommitmentV1 {
+        schema_version: 1,
+        candidate: &invocation.source_candidate,
+        source_tree_id: &source.git_tree_id,
+        source_kind: &identity.kind,
+        source_content: &identity.content,
+        source_binding: identity.source.as_ref(),
+        source_scope_at_dispatch: &invocation.source_scope_at_dispatch,
+        candidate_identity_at_dispatch: &invocation.candidate_identity,
+        build_fingerprint_at_dispatch: &invocation.build_fingerprint,
+        config: &invocation.config,
+        operation: &invocation.operation,
+        instrument: invocation.instrument_invocation.instrument.as_str(),
+        instrument_kind: &invocation.instrument_invocation.kind,
+        instrument_profile: &invocation.instrument_invocation.profile,
+        instrument_target: &invocation.instrument_invocation.target,
+        instrument_arguments: &invocation.instrument_invocation.arguments,
+        instrument_input_artifacts: &invocation.instrument_invocation.input_artifacts,
+        instrument_declared_scope: &invocation.instrument_invocation.declared_scope,
+        resolved_executable: &invocation.resolved_executable,
+        instrument_spec: &invocation.instrument_spec,
+        registry_identity: &invocation.registry_identity,
+    };
+    let commitment_bytes = canonical_json_bytes(&commitment)
+        .map_err(|error| BridgeError::InconsistentBinding(error.to_string()))?;
+    let parser_version = format!(
+        "{}@{};normalizer={};invalidation={}",
+        invocation.registry_identity.parser,
+        invocation.instrument_spec.parser_generation,
+        invocation.registry_identity.normalizer,
+        invocation.registry_identity.invalidation.parser,
+    );
+
+    Ok(CacheIdentityOverrides {
+        source_digest: identity.content.digest_hex.clone(),
+        config_digest: sha256_hex(&commitment_bytes),
+        toolchain_version: invocation.registry_identity.toolchain.clone(),
+        compiler_version: invocation
+            .resolved_executable
+            .tool_version
+            .clone()
+            .unwrap_or_else(|| invocation.resolved_executable.content_digest.clone()),
+        parser_version,
+        producer_id: invocation.registry_identity.instrument.as_str().to_owned(),
+        producer_generation: invocation.registry_identity.generation,
+    })
 }
 
 fn validate_provenance(provenance: &ScipIndexerProvenance) -> Result<(), BridgeError> {

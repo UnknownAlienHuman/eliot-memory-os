@@ -2159,6 +2159,56 @@ pub fn finalize_scip(
     invoked_at_unix_ms: u64,
     cache: Option<&mut ScipProjectionCache>,
 ) -> NormalizedResult {
+    finalize_scip_with_cache_mode(
+        config,
+        candidate,
+        operation,
+        index_bytes,
+        sidecar_path,
+        invoked_at_unix_ms,
+        cache.map(ScipCacheUse::Unbound),
+    )
+}
+
+enum ScipCacheUse<'a> {
+    Unbound(&'a mut ScipProjectionCache),
+    Invocation(&'a mut ScipProjectionCache, &'a LspStartedInvocation),
+}
+
+fn finalize_scip_for_invocation(
+    config: &AnalyzerConfig,
+    candidate: &SourceCandidate,
+    operation: &SemanticOperation,
+    index_bytes: &[u8],
+    sidecar_path: &str,
+    invoked_at_unix_ms: u64,
+    cache: &mut ScipProjectionCache,
+    invocation: &LspStartedInvocation,
+) -> NormalizedResult {
+    finalize_scip_with_cache_mode(
+        config,
+        candidate,
+        operation,
+        index_bytes,
+        sidecar_path,
+        invoked_at_unix_ms,
+        Some(ScipCacheUse::Invocation(cache, invocation)),
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "operation dispatch is exhaustive and each arm pairs one projection with its receipt; splitting would separate results from their evidence"
+)]
+fn finalize_scip_with_cache_mode(
+    config: &AnalyzerConfig,
+    candidate: &SourceCandidate,
+    operation: &SemanticOperation,
+    index_bytes: &[u8],
+    sidecar_path: &str,
+    invoked_at_unix_ms: u64,
+    cache: Option<ScipCacheUse<'_>>,
+) -> NormalizedResult {
     let coverage = match operation {
         SemanticOperation::Definitions { symbol }
         | SemanticOperation::References { symbol }
@@ -2212,9 +2262,19 @@ pub fn finalize_scip(
     if let Some(cache) = cache {
         let target = candidate.reference();
         let config_hash = config.config_hash();
-        match cache.reuse_or_derive(index_bytes, &config_hash, operation, &target, |index| {
-            project_cached_items(index, operation)
-        }) {
+        let consulted = match cache {
+            ScipCacheUse::Unbound(cache) => {
+                cache.reuse_or_derive(index_bytes, &config_hash, operation, &target, |index| {
+                    project_cached_items(index, operation)
+                })
+            }
+            ScipCacheUse::Invocation(cache, invocation) => {
+                cache.reuse_or_derive_for_invocation(index_bytes, invocation, &target, |index| {
+                    project_cached_items(index, operation)
+                })
+            }
+        };
+        match consulted {
             Ok(cached) => return wrap_cached_items(operation, cached.items, ok_receipt()),
             Err(error) => {
                 let receipt = parse_failed(&error);
@@ -2749,6 +2809,7 @@ pub trait LspProcessOwnerPort: Send + Sync {
 pub struct LspCurrentBridge<P, G> {
     process_owner: Arc<P>,
     git_owner: Arc<G>,
+    scip_cache: Option<Mutex<ScipProjectionCache>>,
 }
 
 impl<P, G> LspCurrentBridge<P, G> {
@@ -2757,6 +2818,24 @@ impl<P, G> LspCurrentBridge<P, G> {
         Self {
             process_owner,
             git_owner,
+            scip_cache: None,
+        }
+    }
+
+    /// Creates a Current path that retains the supplied bounded SCIP cache for
+    /// live retained normalization. The cache keeps its original store and
+    /// trust owner; each cache key still comes from the original admitted
+    /// invocation and live source proof.
+    #[must_use]
+    pub fn new_with_scip_cache(
+        process_owner: Arc<P>,
+        git_owner: Arc<G>,
+        scip_cache: ScipProjectionCache,
+    ) -> Self {
+        Self {
+            process_owner,
+            git_owner,
+            scip_cache: Some(Mutex::new(scip_cache)),
         }
     }
 }
@@ -3393,14 +3472,18 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             .map_err(BridgeError::ProcessOwner)?;
         validate_process_owner_readback(&started, &process_evidence)?;
         let raw_outputs = capture_live_raw_outputs(&started, &process_evidence)?;
-        let mut retained = Self::retain_result(
-            &started,
-            process_evidence,
-            raw_outputs,
-            source_scope_after_run,
-            candidate_identity_after_run,
-            build_fingerprint_after_run,
-        )?;
+        let mut retained = {
+            let mut cache = self.scip_cache.as_ref().and_then(|cache| cache.lock().ok());
+            Self::retain_result(
+                &started,
+                process_evidence,
+                raw_outputs,
+                source_scope_after_run,
+                candidate_identity_after_run,
+                build_fingerprint_after_run,
+                cache.as_deref_mut(),
+            )?
+        };
         if let Some(dispatch_proof) = started.source_artifact_proof.as_ref()
             && dispatch_proof
                 .revalidate_current(
@@ -3612,6 +3695,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         source_scope_after_run: Option<&GovernedGitScope>,
         candidate_identity_after_run: Option<&CandidateIdentity>,
         build_fingerprint_after_run: Option<&BuildFingerprint>,
+        cache: Option<&mut ScipProjectionCache>,
     ) -> Result<RetainedLspObservationV1, BridgeError> {
         process_evidence
             .validate()
@@ -3648,6 +3732,8 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             &raw_outputs,
             &process_evidence,
             invoked_at_unix_ms,
+            cache,
+            Some(started),
         )?;
         apply_process_completion(&mut result, process_completed, process_truncated, exit_code);
         let source_binding = LspSourceBindingV1 {
@@ -3908,6 +3994,8 @@ fn validate_retained_observation(record: &RetainedLspObservationV1) -> Result<()
         &record.raw_outputs,
         &record.process_evidence,
         receipt.invoked_at_unix_ms,
+        None,
+        None,
     )?;
     if let NormalizedResult::Version { version, .. } = &normalized
         && !version.is_empty()
@@ -5114,6 +5202,8 @@ fn normalize_retained_operation(
     raw_outputs: &[LspRawOutput],
     process_evidence: &ProcessEvidence,
     invoked_at_unix_ms: u64,
+    cache: Option<&mut ScipProjectionCache>,
+    invocation: Option<&LspStartedInvocation>,
 ) -> Result<NormalizedResult, BridgeError> {
     let (resolved_identity, instrument_spec, registry_identity) = identities;
     let resolved = resolved_identity.resolve("lsp-retained-observation")?;
@@ -5152,15 +5242,31 @@ fn normalize_retained_operation(
                 .ok_or(BridgeError::MissingScipOutput)?;
             let sidecar = output_for(raw_outputs, LspRawOutputKind::ScipSidecar)
                 .map_or(&[][..], |output| output.evidence.bytes.as_slice());
-            finalize_scip(
-                config,
-                candidate,
-                operation,
-                sidecar,
-                sidecar_path,
-                invoked_at_unix_ms,
-                None,
-            )
+            match (cache, invocation) {
+                (Some(cache), Some(invocation))
+                    if process_succeeded(process_completed, exit_code) && !process_truncated =>
+                {
+                    finalize_scip_for_invocation(
+                        config,
+                        candidate,
+                        operation,
+                        sidecar,
+                        sidecar_path,
+                        invoked_at_unix_ms,
+                        cache,
+                        invocation,
+                    )
+                }
+                _ => finalize_scip(
+                    config,
+                    candidate,
+                    operation,
+                    sidecar,
+                    sidecar_path,
+                    invoked_at_unix_ms,
+                    None,
+                ),
+            }
         }
     };
     let mut handles = Vec::new();
