@@ -35,11 +35,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffArtifactLease, HandoffCapture,
+    AgentAttemptId, ContractError, HandoffArtifactLease, HandoffAttemptIdentity, HandoffCapture,
     HandoffCaptureBoundary, HandoffCaptureError, HandoffCaptureLedger, HandoffCaptureReadback,
-    HandoffCaptureSource, HandoffCausalLink, HandoffCheckpointId, HandoffContinuity,
-    HandoffId, HandoffLeaseRelease, PublicReference, RevisionId, TargetId,
-    WorkItemId, validate_collection, validate_text,
+    HandoffCaptureSource, HandoffCausalLink, HandoffCheckpointId, HandoffContinuity, HandoffId,
+    HandoffLeaseRelease, PublicReference, RevisionId, TargetId, WorkItemId, validate_collection,
+    validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
@@ -1042,10 +1042,7 @@ impl HandoffCaptureBinding {
     /// its own recorded values through
     /// [`HandoffCapture::record_readback`](crate::HandoffCapture::record_readback);
     /// nothing here is recomputed over the bytes the capture still holds.
-    pub fn to_readback(
-        &self,
-        read_generation: ResourceGeneration,
-    ) -> HandoffCaptureReadback {
+    pub fn to_readback(&self, read_generation: ResourceGeneration) -> HandoffCaptureReadback {
         HandoffCaptureReadback {
             capture_id: self.checkpoint_id.clone(),
             operation_id: self.operation_id.clone(),

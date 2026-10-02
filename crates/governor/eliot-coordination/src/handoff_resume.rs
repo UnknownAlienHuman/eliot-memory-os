@@ -61,11 +61,11 @@
 #![forbid(unsafe_code)]
 
 use eliot_agent_contracts::{
-    HandoffAttemptIdentity, HandoffAuthorityObservations, HandoffCausalLink, HandoffCaptureRegistry,
-    HandoffCheckpointError, HandoffCheckpointId, HandoffProviderCompactionCapability,
-    HandoffProviderGap, HandoffRecoveryError, HandoffRecoveryInputs, HandoffRecoveryOutput,
-    HandoffResumeEvidence, HandoffResumeIntent, HandoffSourceGenerations, PublicReference,
-    TaskControllerLease, recover_handoff,
+    HandoffAttemptIdentity, HandoffAuthorityObservations, HandoffCaptureRegistry,
+    HandoffCausalLink, HandoffCheckpointError, HandoffCheckpointId,
+    HandoffProviderCompactionCapability, HandoffProviderGap, HandoffRecoveryError,
+    HandoffRecoveryInputs, HandoffRecoveryOutput, HandoffResumeEvidence, HandoffResumeIntent,
+    HandoffSourceGenerations, PublicReference, TaskControllerLease, recover_handoff,
 };
 use eliot_contracts::{EpochId, StateFence};
 use thiserror::Error;

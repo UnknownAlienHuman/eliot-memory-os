@@ -260,10 +260,7 @@ fn readback_committed_capture(
     // retry admits the record the store holds rather than a recomputed one.
     let binding = HandoffCaptureBinding::from_text(&stored.payload_digest)?;
     if binding != expected || binding.checkpoint_id != capture.capture_id {
-        return Err(CoordinationError::IdempotencyConflict(
-            draft.request_id.clone(),
-        )
-        .into());
+        return Err(CoordinationError::IdempotencyConflict(draft.request_id.clone()).into());
     }
     Ok(Some(CheckpointReceipt {
         checkpoint_id: draft.checkpoint_id.clone(),
@@ -329,9 +326,10 @@ pub fn read_back_capture(
         .into());
     }
     let read_generation = event.state_fence.resource_generation;
-    if !capture.readback().is_some_and(|held| {
-        *held == binding.to_readback(read_generation)
-    }) {
+    if !capture
+        .readback()
+        .is_some_and(|held| *held == binding.to_readback(read_generation))
+    {
         capture.record_readback(binding.to_readback(read_generation))?;
     }
     if !capture.admits_destructive_compaction() {

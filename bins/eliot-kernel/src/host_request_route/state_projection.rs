@@ -116,7 +116,7 @@ mod state_read_wire_tests {
     use super::super::*;
     use crate::KernelConfig;
     use eliot_contracts::StateFence;
-    use eliot_ipc::{PeerIdentityUnavailable, SessionState, ServerHandshakePolicy};
+    use eliot_ipc::{PeerIdentityUnavailable, ServerHandshakePolicy, SessionState};
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestResultClass, HostRequestResultLineage,
         HostRequestResultSourceRevision,
@@ -196,8 +196,8 @@ mod state_read_wire_tests {
             .ors
             .stage_host_request(&requested)
             .expect("stage must succeed");
-        let operation_id =
-            OperationIdentity::new(host_request_operation_id(envelope)).expect("operation identity");
+        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .expect("operation identity");
         kernel
             .generation_gateway
             .ors
@@ -211,9 +211,12 @@ mod state_read_wire_tests {
             .expect("admitted record must read back");
     }
 
-    fn stored_record(kernel: &KernelComposition, envelope: &HostRequestEnvelope) -> HostRequestRecord {
-        let operation_id =
-            OperationIdentity::new(host_request_operation_id(envelope)).expect("operation identity");
+    fn stored_record(
+        kernel: &KernelComposition,
+        envelope: &HostRequestEnvelope,
+    ) -> HostRequestRecord {
+        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .expect("operation identity");
         kernel
             .generation_gateway
             .ors
@@ -302,10 +305,8 @@ mod state_read_wire_tests {
         reason = "the roundtrip admits, retains, claims, answers, persists, reads back and replays one state pair in a single focused flow"
     )]
     fn state_pair_reaches_its_owner_and_persists_an_owner_receipted_result() {
-        let root = std::env::temp_dir().join(format!(
-            "eliot-kernel-state-wire-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("eliot-kernel-state-wire-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("test work root");
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
         let policy = kernel
@@ -393,8 +394,7 @@ mod state_read_wire_tests {
 
         // The ordinary readback consumer serves the retained owner-backed
         // result without re-dispatching anything.
-        let receipt =
-            HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
+        let receipt = HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
         let replayed = local_read_replay_response(&receipt, &persisted, &envelope)
             .expect("readback must not fail")
             .expect("a resulted state row must read back");
@@ -436,10 +436,8 @@ mod state_read_wire_tests {
         reason = "the refusals cover the submit entry, the receipt gate, the laundered class and the replay gate on one admitted pair"
     )]
     fn state_result_without_the_owner_receipt_is_refused_and_never_persists() {
-        let root = std::env::temp_dir().join(format!(
-            "eliot-kernel-state-receipt-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("eliot-kernel-state-receipt-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("test work root");
         let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
         let policy = kernel

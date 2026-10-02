@@ -34,7 +34,9 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{ArtifactId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ArtifactId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence,
+};
 use eliot_dreamer_bundle::AssemblyRequest;
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ScreenBinding;
@@ -1283,8 +1285,7 @@ fn submit_orientation_passes_the_controller_gate_on_a_published_snapshot() {
         panic!("an unsealed controller snapshot must still fail closed at the owner transition");
     };
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
-    let still_at_the_gate =
-        matches!(&error, DreamerError::InvalidAdmission(reason) if *reason == CONTROLLER_GATE_REFUSAL);
+    let still_at_the_gate = matches!(&error, DreamerError::InvalidAdmission(reason) if *reason == CONTROLLER_GATE_REFUSAL);
     assert!(
         !still_at_the_gate,
         "a published snapshot must not leave the controller gate refusing, got {error:?}"
@@ -1338,7 +1339,10 @@ fn submit_orientation_refuses_a_foreign_published_controller_snapshot() {
         panic!("a foreign published controller snapshot must refuse at the binding check");
     };
     assert!(
-        matches!(error, DreamerError::InvalidAdmission("controller snapshot binding")),
+        matches!(
+            error,
+            DreamerError::InvalidAdmission("controller snapshot binding")
+        ),
         "refusal must be exactly the controller snapshot binding reason, got {error:?}"
     );
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");

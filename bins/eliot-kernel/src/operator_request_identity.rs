@@ -51,8 +51,8 @@ use eliot_contracts::{
     ClockReading, EpochId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId,
     StateFence,
 };
-use eliot_receipts::RequestBinding;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
+use eliot_receipts::RequestBinding;
 
 use super::{KernelComposition, KernelFrameAction, Session, TransportError, unix_ms};
 

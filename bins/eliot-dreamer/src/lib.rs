@@ -347,10 +347,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     /// source for every admitted non-Curation job. A source that publishes
     /// neither record leaves both gates refused rather than filled.
     #[must_use]
-    pub fn with_admitted_stage_source(
-        self,
-        source: &'a dyn AdmittedStageMaterialSource,
-    ) -> Self {
+    pub fn with_admitted_stage_source(self, source: &'a dyn AdmittedStageMaterialSource) -> Self {
         Self {
             admitted_stage_source: Some(source),
             ..self

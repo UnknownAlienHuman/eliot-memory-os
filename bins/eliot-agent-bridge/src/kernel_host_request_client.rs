@@ -4662,9 +4662,11 @@ mod tests {
             payload
                 .pointer("/envelope/identity/payload_sha256")
                 .and_then(|digest| digest.as_str()),
-            Some(canonical_payload_digest(&request.tool)
-                .expect("payload digest must compute")
-                .as_str())
+            Some(
+                canonical_payload_digest(&request.tool)
+                    .expect("payload digest must compute")
+                    .as_str()
+            )
         );
     }
 

@@ -298,11 +298,9 @@ fn capture_identity_refusal(error: ReceiptContractError) -> HandoffCaptureCaller
         HandoffCaptureCallerError::ReceiptContractRefused { field, reason }
     };
     match error {
-        ReceiptContractError::Blank { field } => {
-            HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
-                eliot_agent_contracts::ContractError::Blank(field),
-            ))
-        }
+        ReceiptContractError::Blank { field } => HandoffCaptureCallerError::Checkpoint(
+            HandoffCheckpointError::Contract(eliot_agent_contracts::ContractError::Blank(field)),
+        ),
         ReceiptContractError::ControlCharacter { field } => {
             HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
                 eliot_agent_contracts::ContractError::ControlCharacter(field),
@@ -312,7 +310,9 @@ fn capture_identity_refusal(error: ReceiptContractError) -> HandoffCaptureCaller
             refusal(field, "exceeds the bounded identity length")
         }
         ReceiptContractError::Zero { field } => refusal(field, "must be greater than zero"),
-        ReceiptContractError::InvalidInterval { field } => refusal(field, "has an invalid interval"),
+        ReceiptContractError::InvalidInterval { field } => {
+            refusal(field, "has an invalid interval")
+        }
         ReceiptContractError::EmptyFence => {
             refusal("state_fence", "must contain at least one dependency")
         }
@@ -344,12 +344,10 @@ fn register_boundary_capture(
         .checkpoint
         .capture_source(operation_id.clone(), request.boundary)?;
     let leases = request.checkpoint.artifact_leases(request.release)?;
-    Ok(
-        match ledger.capture_and_register(source, leases)? {
-            HandoffCaptureRegistration::First(capture)
-            | HandoffCaptureRegistration::Replayed(capture) => capture,
-        },
-    )
+    Ok(match ledger.capture_and_register(source, leases)? {
+        HandoffCaptureRegistration::First(capture)
+        | HandoffCaptureRegistration::Replayed(capture) => capture,
+    })
 }
 
 /// Builds the governed draft the coordination owner commits.
@@ -404,9 +402,9 @@ pub fn controlled_boundary_census(
 mod tests {
     use super::*;
     use eliot_agent_contracts::{
-        ContractError, ContinuityKind, HANDOFF_CHECKPOINT_CONTRACT_VERSION, HandoffAttemptIdentity,
+        ContinuityKind, ContractError, HANDOFF_CHECKPOINT_CONTRACT_VERSION, HandoffAttemptIdentity,
         HandoffCaptureAcceptance, HandoffCausalLink, HandoffCheckpointId, HandoffCompleteness,
-        HandoffContinuity, HandoffCursors, HandoffCursor, HandoffDispatchDecision,
+        HandoffContinuity, HandoffCursor, HandoffCursors, HandoffDispatchDecision,
         HandoffEffectDisposition, HandoffEffectInstruction, HandoffEffectRecord, HandoffFencing,
         HandoffId, HandoffProviderCompactionCapability, HandoffRecoveryError,
         HandoffResumeAdmission, HandoffResumeEvidence, HandoffResumeIntent, HandoffResumeStatus,
@@ -552,9 +550,12 @@ mod tests {
                 deferred: Vec::new(),
                 unavailable: Vec::new(),
             },
-            epistemic_position_handles: vec![
-                reference("evidence", "evidence-1", "1", Some(DIGEST))
-            ],
+            epistemic_position_handles: vec![reference(
+                "evidence",
+                "evidence-1",
+                "1",
+                Some(DIGEST),
+            )],
             load_bearing_atom_handles: vec![reference("atom", "atom-1", "1", Some(DIGEST))],
             diff_ref: reference("frozen-diff", "diff-1", "1", Some(DIGEST)),
             artifact_refs: vec![reference("artifact", "artifact-1", "1", Some(DIGEST))],
@@ -607,7 +608,11 @@ mod tests {
         capture_request_for(boundary, "checkpoint-1")
     }
 
-    fn fresh() -> (CoordinationOwner, HandoffCaptureRegistry, HandoffCaptureLedger) {
+    fn fresh() -> (
+        CoordinationOwner,
+        HandoffCaptureRegistry,
+        HandoffCaptureLedger,
+    ) {
         let (owner, _) = claimed_owner();
         (
             owner,
@@ -748,7 +753,10 @@ mod tests {
         )
         .expect("the same operation reconciles against the owner it can see");
         // The reconciled acceptance is unknown, so nothing compacts under it.
-        assert!(matches!(acceptance, HandoffCaptureAcceptance::Unknown { .. }));
+        assert!(matches!(
+            acceptance,
+            HandoffCaptureAcceptance::Unknown { .. }
+        ));
         assert!(matches!(
             registry.require_compaction_permit(&capture.capture_id),
             Err(HandoffRecoveryError::Checkpoint(
@@ -794,8 +802,8 @@ mod tests {
 
         // A second, different operation for the same checkpoint identity, built
         // past the ledger so the registry is the owner that refuses it.
-        let foreign = OperationId::new("handoff-capture:other-operation")
-            .expect("foreign operation id");
+        let foreign =
+            OperationId::new("handoff-capture:other-operation").expect("foreign operation id");
         let stolen = foreign_capture(foreign.clone());
 
         // The ledger refuses the same boundary and attempt under it too.
@@ -860,8 +868,7 @@ mod tests {
         let source = other
             .checkpoint
             .capture_source(
-                OperationId::new("handoff-capture:second-identity")
-                    .expect("second operation id"),
+                OperationId::new("handoff-capture:second-identity").expect("second operation id"),
                 other.boundary,
             )
             .expect("second source snapshot");
@@ -979,7 +986,10 @@ mod tests {
             &mut owner,
             &mut registry,
             &mut ledger,
-            &capture_request_for(HandoffCaptureBoundary::DurableWorkUnitResume, "checkpoint-2"),
+            &capture_request_for(
+                HandoffCaptureBoundary::DurableWorkUnitResume,
+                "checkpoint-2",
+            ),
         )
         .expect("the non-destructive boundary reaches the same durable readback");
 
@@ -999,7 +1009,10 @@ mod tests {
     #[test]
     fn every_controlled_boundary_names_a_product_caller_symbol() {
         let census = controlled_boundary_census(&HandoffCaptureLedger::new());
-        assert_eq!(census.len(), HandoffCaptureBoundary::CONTROLLED_BOUNDARIES.len());
+        assert_eq!(
+            census.len(),
+            HandoffCaptureBoundary::CONTROLLED_BOUNDARIES.len()
+        );
         for row in census {
             assert!(row.caller_symbol.contains("::"), "{row:?}");
             assert!(!row.caller_symbol.contains("STITCH"), "{row:?}");
@@ -1128,7 +1141,10 @@ mod tests {
             if cause == "the acknowledgement was never observed"
         ));
         // The bound link carries the revalidation reference the run proved.
-        let bound_link = output.bound_link.as_ref().expect("an admitted resume binds its link");
+        let bound_link = output
+            .bound_link
+            .as_ref()
+            .expect("an admitted resume binds its link");
         assert!(bound_link.post_resume_revalidation_ref.is_some());
         assert_eq!(bound.status, HandoffResumeStatus::ResumeAdmitted);
     }
@@ -1169,9 +1185,11 @@ mod tests {
         crossed.handoff_id = HandoffId::new("handoff-other").expect("other handoff id");
         assert!(matches!(
             resume_captured_handoff(&captured.owner, &request, &mut crossed),
-            Err(HandoffCaptureCallerError::Resume(HandoffResumeError::Recovery(
-                HandoffRecoveryError::Checkpoint(HandoffCheckpointError::StaleResumeRequest { .. })
-            )))
+            Err(HandoffCaptureCallerError::Resume(
+                HandoffResumeError::Recovery(HandoffRecoveryError::Checkpoint(
+                    HandoffCheckpointError::StaleResumeRequest { .. }
+                ))
+            ))
         ));
 
         // A live read the owner cannot satisfy refuses before any authority.
