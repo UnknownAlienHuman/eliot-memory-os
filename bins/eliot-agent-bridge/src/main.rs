@@ -28,14 +28,14 @@ use eliot_contracts::{
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
     HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
-    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId, McpResponse,
-    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
-    WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
-    build_host_cancellation, build_host_invocation, decode_cancel_notification,
-    decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
-    gateway_error_to_wire, initialize_result, negotiate_wire_version, render_accepted_result,
-    render_error, render_rejected_result, render_rejection, render_responded_result, render_result,
-    tools_list_result,
+    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
+    KernelHostRequestPort, McpResponse, NegotiatedWireVersion, PortFailure, ToolRequest,
+    WIRE_INTERNAL_ERROR, WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND,
+    WIRE_REQUEST_CANCELLED, build_host_cancellation, build_host_invocation,
+    decode_cancel_notification, decode_initialize_version, decode_resource_uri, decode_tools_call,
+    decode_wire_request, gateway_error_to_wire, initialize_result, negotiate_wire_version,
+    render_accepted_result, render_error, render_rejected_result, render_rejection,
+    render_responded_result, render_result, tools_list_result,
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
@@ -5434,8 +5434,7 @@ mod tests {
             &mut self,
             _request: &HostInvocationRequest,
         ) -> Result<HostInvocationPortOutcome, PortFailure> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(PortFailure::PlanGap {
                 missing_capability: "http-test.invoke".to_owned(),
                 reason: "the HTTP handler proof must not invoke the host port".to_owned(),
@@ -5446,8 +5445,7 @@ mod tests {
             &mut self,
             _request: &HostCancellationRequest,
         ) -> Result<HostCancellationPortOutcome, PortFailure> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(PortFailure::PlanGap {
                 missing_capability: "http-test.cancel".to_owned(),
                 reason: "the HTTP handler proof must not invoke the host port".to_owned(),
@@ -5478,11 +5476,9 @@ mod tests {
         std::net::SocketAddr,
         LoopbackHttpProfile,
     ) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("test listener binds loopback");
-        let endpoint = listener
-            .local_addr()
-            .expect("listener has a local address");
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds loopback");
+        let endpoint = listener.local_addr().expect("listener has a local address");
         let profile = eliot_agent_bridge::admit_loopback_http(
             &endpoint.to_string(),
             HTTP_TEST_TOKEN,
