@@ -2113,7 +2113,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         request: &UserAutomationStoreRequest,
     ) -> Result<(PreparedTransition, eliot_store_api::OperationManifestDigest), StoreError> {
         let parameters = self.mutation_parameters(request).await?;
-        Self::build_transition_with_parameters(request, parameters)
+        Self::build_transition_with_parameters(request, parameters, false)
     }
 
     /// Builds the one canonical transition that retains a genuine Kernel
@@ -2143,7 +2143,13 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             envelope_json,
             original_request_json,
         );
-        Self::build_transition_with_parameters(request, parameters)
+        // NormalizeSchedule is a read-only Kernel request, so its original
+        // OperationIdentity intentionally carries no canonical request hash.
+        // The retaining Store transaction has a distinct identity: derive
+        // that digest from the exact prepared mutation before validation while
+        // keeping the original request and its identity verbatim in the
+        // retained normalization parameters.
+        Self::build_transition_with_parameters(request, parameters, true)
     }
 
     /// Applies a prepared normalization-retention leg through the same
@@ -2151,17 +2157,21 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
     pub async fn apply_normalization_transition(
         &self,
         context: &RequestMetadata,
-        mut transition: PreparedTransition,
+        transition: PreparedTransition,
         manifest_digest: eliot_store_api::OperationManifestDigest,
     ) -> Result<WriteReceipt, StoreError> {
-        if transition.state_fence != context.state_fence
-            || !transition.identity.canonical_request_hash.is_empty()
-        {
+        if transition.state_fence != context.state_fence {
             return Err(StoreError::IdentityConflict);
         }
+        transition.validate()?;
         let view = CanonicalRequestView::from_apply(context, &transition, &[], &[]);
         let request_hash = canonical_request_hash(&view)?;
-        transition.identity.canonical_request_hash = request_hash.clone();
+        if transition.identity.canonical_request_hash != request_hash {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: transition.identity.canonical_request_hash.clone(),
+                observed: request_hash,
+            });
+        }
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         let state_fence = transition.state_fence.clone();
@@ -2195,6 +2205,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
     fn build_transition_with_parameters(
         request: &UserAutomationStoreRequest,
         parameters: BTreeMap<String, Value>,
+        derive_canonical_request_hash: bool,
     ) -> Result<(PreparedTransition, eliot_store_api::OperationManifestDigest), StoreError> {
         let operation = automation_mutation_request(parameters);
         let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)?;
@@ -2227,6 +2238,10 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             required_proof_and_approval_refs: Vec::new(),
         };
         eliot_store_api::bind_issue18_digests(&mut transition)?;
+        if derive_canonical_request_hash {
+            let view = CanonicalRequestView::from_apply(&request.context, &transition, &[], &[]);
+            transition.identity.canonical_request_hash = canonical_request_hash(&view)?;
+        }
         transition.validate()?;
         Ok((transition, manifest_digest))
     }

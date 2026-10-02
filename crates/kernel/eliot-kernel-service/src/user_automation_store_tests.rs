@@ -137,9 +137,11 @@ fn valid_revision(
     }
 }
 
-/// Runs the production Kernel schedule normalizer and returns its exact
-/// normalized revision and owner-issued receipt as one fixture value.
-fn normalized_revision_and_receipt(
+/// Runs the production Kernel schedule normalizer, retains its exact input and
+/// output through the canonical Store transition, then reads that row back
+/// through the same named owner selector Create/Edit use.
+async fn normalized_revision_and_receipt(
+    port: &CanonicalUserAutomationStore<FakeStore>,
     revision: UserAutomationRevision,
     operation_id: &str,
 ) -> (UserAutomationRevision, Box<eliot_receipts::ReceiptEnvelope>) {
@@ -168,7 +170,59 @@ fn normalized_revision_and_receipt(
             &revision,
         )
         .expect("normalization envelope binds the produced revision");
-    (revision, Box::new(envelope))
+    let original_request_json =
+        serde_json::to_string(&request).expect("normalization request serializes exactly");
+    let store_request = UserAutomationStoreRequest {
+        context: request.context.clone(),
+        authenticated_principal: request.authenticated_principal.clone(),
+        identity: request.identity.clone(),
+        intent: request.intent.clone(),
+    };
+    let (transition, manifest_digest) =
+        CanonicalUserAutomationStore::<FakeStore>::build_normalization_transition(
+            &store_request,
+            &revision,
+            &envelope,
+            original_request_json.clone(),
+        )
+        .expect("normalization retention transition builds from production output");
+    assert!(
+        request.identity.canonical_request_hash.is_empty(),
+        "the original read-only normalization identity remains unchanged"
+    );
+    assert_eq!(
+        transition.identity.canonical_request_hash.len(),
+        64,
+        "the distinct retaining transaction carries its canonical digest"
+    );
+    port.apply_normalization_transition(&request.context, transition, manifest_digest)
+        .await
+        .expect("canonical owner retains the normalization result");
+    let record = port
+        .read_normalization_record(
+            &request.context.state_fence,
+            &revision.automation_id,
+            &revision.revision,
+        )
+        .await
+        .expect("exact normalization owner read succeeds")
+        .expect("normalization owner serves the retained record");
+    assert_eq!(record.revision_json, serde_json::to_string(&revision).expect("revision JSON"));
+    assert_eq!(record.normalization_request_json, original_request_json);
+    assert_eq!(record.normalization_receipt_json, serde_json::to_value(&envelope).expect("envelope JSON"));
+    assert_eq!(record.operation_id, request.identity.operation_id);
+    assert_eq!(record.idempotency_key, request.identity.idempotency_key);
+    assert_ne!(record.canonical_request_hash, request.identity.canonical_request_hash);
+    assert_eq!(record.scope_id, eliot_store_api::USER_AUTOMATION_SCOPE);
+    assert_eq!(record.state_fence, request.context.state_fence);
+    let retained_revision: UserAutomationRevision =
+        serde_json::from_str(&record.revision_json).expect("owner-retained revision decodes");
+    let retained_envelope: eliot_receipts::ReceiptEnvelope =
+        serde_json::from_value(record.normalization_receipt_json)
+            .expect("owner-retained envelope decodes");
+    assert_eq!(retained_revision, revision);
+    assert_eq!(retained_envelope, envelope);
+    (retained_revision, Box::new(retained_envelope))
 }
 
 /// Builds the owner-issued denominator completeness block this double
@@ -265,6 +319,7 @@ impl FakeStore {
         let mut currents: BTreeMap<String, (String, String, String)> = BTreeMap::new();
         let mut revisions: Vec<(String, String, String)> = Vec::new();
         let mut invocations: Vec<(String, String, String)> = Vec::new();
+        let mut normalizations: Vec<Value> = Vec::new();
         for transition in applied.iter() {
             for command in &transition.named_operations {
                 let params = &command.parameters;
@@ -319,6 +374,26 @@ impl FakeStore {
                             text("invocation_json"),
                         ));
                     }
+                    eliot_store_api::AUTOMATION_OPERATION_RETAIN_NORMALIZATION => {
+                        normalizations.push(serde_json::json!({
+                            "automation_id": text("automation_id"),
+                            "revision": text("revision"),
+                            "revision_json": text("revision_json"),
+                            "normalization_receipt_json": params
+                                .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "normalization_request_json": text(
+                                eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON
+                            ),
+                            "operation_id": transition.identity.operation_id.to_string(),
+                            "idempotency_key": transition.identity.idempotency_key,
+                            "canonical_request_hash": transition.identity.canonical_request_hash,
+                            "state_fence": transition.state_fence,
+                            "scope_id": transition.scope_id.to_string(),
+                            "task_id": transition.task_id,
+                        }));
+                    }
                     _ => {}
                 }
             }
@@ -327,6 +402,7 @@ impl FakeStore {
             currents,
             revisions,
             invocations,
+            normalizations,
         }
     }
 }
@@ -335,6 +411,7 @@ struct FakeProjection {
     currents: BTreeMap<String, (String, String, String)>,
     revisions: Vec<(String, String, String)>,
     invocations: Vec<(String, String, String)>,
+    normalizations: Vec<Value>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -494,6 +571,23 @@ impl CanonicalStoreClient for FakeStore {
                 "revision": 0,
                 "state_fence": query.state_fence,
             }),
+            "normalization" => {
+                let automation_id = decoded.automation_id.as_deref().unwrap_or_default();
+                let revision = decoded.requested_revision.as_deref().unwrap_or_default();
+                let entries: Vec<Value> = projection
+                    .normalizations
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("automation_id").and_then(Value::as_str) == Some(automation_id)
+                            && entry.get("revision").and_then(Value::as_str) == Some(revision)
+                    })
+                    .cloned()
+                    .collect();
+                serde_json::json!({
+                    "normalization_records": entries,
+                    "state_fence": query.state_fence,
+                })
+            }
             _ => return Err(StoreError::UnknownOperation),
         };
         Ok(eliot_store_api::NamedReadResponse {
@@ -575,9 +669,11 @@ async fn create_lists_and_reads_back_typed_revision() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
     let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        &port,
         valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
         "port-create-1",
-    );
+    )
+    .await;
     let response = admitted_response(
         &port,
         "op-port-create-1",
@@ -666,9 +762,11 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
     let (first, first_normalization_receipt) = normalized_revision_and_receipt(
+        &port,
         valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
         "port-create-2",
-    );
+    )
+    .await;
     admitted_response(
         &port,
         "op-port-create-2",
@@ -682,7 +780,7 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
         valid_revision("auto-1", "r-2", UserAutomationConfigurationState::Active);
     second_draft.supersedes = Some("r-1".to_owned());
     let (second, second_normalization_receipt) =
-        normalized_revision_and_receipt(second_draft, "port-edit-2");
+        normalized_revision_and_receipt(&port, second_draft, "port-edit-2").await;
     let response = admitted_response(
         &port,
         "op-port-edit-2",
@@ -759,9 +857,11 @@ async fn run_now_projects_invocation_and_pending_wake() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
     let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        &port,
         valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
         "port-create-3",
-    );
+    )
+    .await;
     admitted_response(
         &port,
         "op-port-create-3",
@@ -871,9 +971,11 @@ async fn replay_reports_replayed_without_remutation() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
     let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        &port,
         valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
         "port-replay-4",
-    );
+    )
+    .await;
     let operation = UserAutomationOperation::Create {
         revision: Box::new(revision.clone()),
         normalization_receipt_envelope: normalization_receipt,
@@ -907,9 +1009,11 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
     let fake = FakeStore::new();
     let port = CanonicalUserAutomationStore::new(fake);
     let (revision, normalization_receipt) = normalized_revision_and_receipt(
+        &port,
         valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active),
         "port-sealed-5",
-    );
+    )
+    .await;
     admitted_response(
         &port,
         "op-port-sealed-5",
