@@ -198,6 +198,10 @@ pub struct StateInput {
     /// Named projection fields requested by the caller.
     #[serde(default)]
     pub include: Vec<String>,
+    /// Explicit onboarding claims for the authenticated `eliot.state`
+    /// bootstrap route. Owner evidence is never accepted in this object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<serde_json::Value>,
 }
 
 impl StateInput {

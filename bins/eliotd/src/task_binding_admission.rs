@@ -312,6 +312,10 @@ pub struct ExplicitColdStartOwnerInput<'a> {
     pub now: u64,
     pub activation: Option<&'a eliot_governor::GovernorActivationSnapshot>,
     pub acceptance_set: Option<&'a eliot_store_api::TaskContractAcceptanceSet>,
+    /// Original task-binding act emitted by an authenticated promotion owner.
+    /// This is required to support delegated task claims; plan IDs and
+    /// acceptance digests are not substitutes for selection provenance.
+    pub current_binding: Option<&'a TaskBindingState>,
     pub owner_candidates: &'a [GoverningSourceCandidate],
     pub scope_ref: &'a str,
     pub generation: u64,
@@ -393,15 +397,33 @@ pub fn build_explicit_source_admission_request(
             }
         }
     }
-    if candidates.len() != input.owner_candidates.len() {
+    let declared_refs: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.source_ref.as_str())
+        .collect();
+    if declared_refs.len() != candidates.len() {
+        return Err(TaskBindingError::selection_required(
+            "explicit source declarations contain duplicate source identities",
+        ));
+    }
+    let owner_refs: std::collections::BTreeSet<_> = input
+        .owner_candidates
+        .iter()
+        .map(|candidate| candidate.source_ref.as_str())
+        .collect();
+    if owner_refs.len() != input.owner_candidates.len() || declared_refs != owner_refs {
         return Err(TaskBindingError::scope_incompatible(
-            "live source-owner candidates must be explicitly named; implicit source selection is forbidden",
+            "declared source identities must exactly cover unique live owner candidates",
         ));
     }
 
-    let proven_current_bindings = match (input.activation, input.acceptance_set) {
-        (None, None) => Vec::new(),
-        (Some(activation), Some(acceptance_set)) => {
+    let proven_current_bindings = match (
+        input.activation,
+        input.acceptance_set,
+        input.current_binding,
+    ) {
+        (None, None, None) => Vec::new(),
+        (Some(activation), Some(acceptance_set), current_binding) => {
             acceptance_set.validate().map_err(|error| {
                 TaskBindingError::scope_incompatible(format!(
                     "live TaskContract acceptance-set owner read is invalid: {error}"
@@ -411,6 +433,7 @@ pub fn build_explicit_source_admission_request(
                 || acceptance_set.read_state_fence != *input.live_fence
                 || activation.principal_id != input.principal_ref
                 || activation.session_id != input.session_ref
+                || activation.work_scope_id != input.scope_ref
                 || activation.task_id != acceptance_set.task_id
                 || activation.task_revision != acceptance_set.task_revision
                 || acceptance_set.acceptance_digest.trim().is_empty()
@@ -419,15 +442,50 @@ pub fn build_explicit_source_admission_request(
                     "live activation and TaskContract acceptance owner reads disagree",
                 ));
             }
-            vec![TaskBindingState::CurrentTaskContract {
-                task_ref: activation.task_id.to_string(),
-                task_revision: activation.task_revision,
-                acceptance_digest: acceptance_set.acceptance_digest.clone(),
-                selection_source_ref: activation.plan_id.clone(),
-                evidence_ref: acceptance_set.acceptance_digest.clone(),
-            }]
+            if input.request.sources.iter().any(|source| {
+                matches!(
+                    &source.claim,
+                    Some(AuthorityBasis::DelegatedTaskBinding { .. })
+                )
+            }) && current_binding.is_none()
+            {
+                return Err(TaskBindingError::selection_required(
+                    "delegated task source claim has no original owner-admitted selection act",
+                ));
+            }
+            match current_binding {
+                Some(binding) => match binding {
+                    TaskBindingState::CurrentTaskContract {
+                        task_ref,
+                        task_revision,
+                        acceptance_digest,
+                        ..
+                    } if task_ref == &activation.task_id.to_string()
+                        && *task_revision == activation.task_revision
+                        && acceptance_digest == &acceptance_set.acceptance_digest =>
+                    {
+                        vec![binding.clone()]
+                    }
+                    _ => {
+                        return Err(TaskBindingError::scope_incompatible(
+                            "owner-admitted task binding differs from the live activation or acceptance set",
+                        ));
+                    }
+                },
+                None if input.request.sources.iter().any(|source| {
+                    matches!(
+                        &source.claim,
+                        Some(AuthorityBasis::DelegatedTaskBinding { .. })
+                    )
+                }) => {
+                    return Err(TaskBindingError::scope_incompatible(
+                        "delegated task source claim has no original owner-admitted selection act",
+                    ));
+                }
+                None => Vec::new(),
+            }
         }
-        _ => {
+        (None, None, Some(_)) | (Some(_), None, _) | (None, Some(_), _) => {
             return Err(TaskBindingError::selection_required(
                 "live activation and TaskContract acceptance set must be read together",
             ));
@@ -439,7 +497,7 @@ pub fn build_explicit_source_admission_request(
         generation: input.generation,
         candidates,
         precedences: input.request.precedences.clone(),
-        required_owner_ref: input.principal_ref.to_owned(),
+        required_owner_ref: input.required_owner_ref.to_owned(),
         proven_current_bindings,
         proven_contracts: Vec::new(),
         absence_reason_ref: input.request.absence_reason_ref.clone(),
