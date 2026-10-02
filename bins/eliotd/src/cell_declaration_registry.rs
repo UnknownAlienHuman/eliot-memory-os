@@ -603,6 +603,37 @@ mod tests {
     }
 
     #[test]
+    fn owner_row_without_its_ref_is_refs_owners_mismatch() {
+        // Arm: the real `governor.daemon.operator-replay` owner row is renamed
+        // to a cell the declaration does not declare, so refs and owner rows
+        // stop being the same set and the guard fails closed on that exact
+        // disagreement rather than on list length.
+        let result = enforce_mutated_manifest(
+            &owner_row(
+                "governor.daemon.operator-replay",
+                "operator-replay",
+                "eliotd::controlboard_adapters::SharedOperatorReplay",
+            ),
+            &owner_row(
+                "governor.daemon.undeclared-state",
+                "operator-replay",
+                "eliotd::controlboard_adapters::SharedOperatorReplay",
+            ),
+        );
+
+        let Err(error) = result else {
+            panic!("an owner row for an undeclared cell must not parse");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::RefsOwnersMismatch {
+                detail: "owner row governor.daemon.undeclared-state has no ref".to_owned(),
+            },
+            "the typed refusal must name the owner row that lost its ref"
+        );
+    }
+
+    #[test]
     fn missing_contract_end_marker_is_malformed_contract() {
         // Arm: the GENERATED block's end marker is gone, so the contract
         // projection has no lower bound and the guard fails closed instead of
