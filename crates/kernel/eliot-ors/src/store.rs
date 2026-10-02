@@ -21026,7 +21026,7 @@ impl RedbRecoveryStore {
             }
             let owner_receipt_joined = owner_receipt
                 .as_ref()
-                .is_some_and(|receipt| receipt.retires(row, owner));
+                .is_some_and(|receipt| receipt.retires(row, &owner));
             if !owner_receipt_joined {
                 receipt_blocked_at = Some(row.sequence);
                 break;
