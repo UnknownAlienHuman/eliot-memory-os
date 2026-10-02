@@ -5113,10 +5113,19 @@ impl AgentBridgeCore {
         })
     }
 
+    /// Forwards only the session-scoped host observation admitted by the
+    /// closed normalized-host-event contract. Execution-unit events need
+    /// their existing admitted `EventEnvelope` owner route; this hook has no
+    /// #361 execution binding or #369 route receipt with which to attribute
+    /// them safely.
     pub fn forward_hook(&mut self, event: &HostEventEnvelope) -> Result<(), BridgeError> {
         self.ensure_forwardable()?;
         event
             .validate()
+            .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+        event
+            .normalized()
+            .and_then(|normalized| normalized.validate_as_session_observation())
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         self.observe_host_event(event)?;
         let binding = self.binding()?.clone();

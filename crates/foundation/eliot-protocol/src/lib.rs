@@ -1095,19 +1095,31 @@ impl EventEnvelope {
 /// string and must change together.
 pub const OPENCODE_HOST_EVENT_PAYLOAD_TYPE: &str = "eliot.opencode.host-event.v1";
 
+/// Payload type for a bridge-forwarded, owner-normalized provider host event.
+///
+/// The payload is the exact validated `HostEventEnvelope`, including its
+/// original normalization receipt. It is a durable observation only; it does
+/// not carry task, effect, or completion authority.
+pub const NORMALIZED_HOST_EVENT_PAYLOAD_TYPE: &str = "eliot.agent.normalized-host-event.v1";
+
 /// Returns whether an event payload type is produced by a known owner.
 ///
 /// The closed registry names exactly the production [`EventEnvelope`]
 /// producers: the reactive-context route ([`REACTIVE_CONTEXT_PAYLOAD_TYPE`]),
-/// the backup route ([`BACKUP_PAYLOAD_TYPE`]), and the `OpenCode` bridge route
-/// ([`OPENCODE_HOST_EVENT_PAYLOAD_TYPE`]). Receivers reject anything else via
-/// [`EventEnvelope::require_known_payload_type`] without minting a new event
-/// identity.
+/// the backup route ([`BACKUP_PAYLOAD_TYPE`]), the `OpenCode` bridge route
+/// ([`OPENCODE_HOST_EVENT_PAYLOAD_TYPE`]), and the authenticated bridge's
+/// normalized host-event observation route
+/// ([`NORMALIZED_HOST_EVENT_PAYLOAD_TYPE`]). Receivers reject anything else
+/// via [`EventEnvelope::require_known_payload_type`] without minting a new
+/// event identity.
 #[must_use]
 pub fn is_known_event_payload_type(payload_type: &str) -> bool {
     matches!(
         payload_type,
-        REACTIVE_CONTEXT_PAYLOAD_TYPE | BACKUP_PAYLOAD_TYPE | OPENCODE_HOST_EVENT_PAYLOAD_TYPE
+        REACTIVE_CONTEXT_PAYLOAD_TYPE
+            | BACKUP_PAYLOAD_TYPE
+            | OPENCODE_HOST_EVENT_PAYLOAD_TYPE
+            | NORMALIZED_HOST_EVENT_PAYLOAD_TYPE
     )
 }
 

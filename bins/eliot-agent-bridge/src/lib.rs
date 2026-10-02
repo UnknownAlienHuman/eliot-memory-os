@@ -48,6 +48,7 @@ use eliot_contracts::{
     BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
     BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
     RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
+    ResourceGeneration,
 };
 use eliot_governor::{
     ActualRouteReceipt, CapabilityRouteRegistry, ExecutionIdentity, ObservedRoute,
@@ -57,8 +58,8 @@ use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
     AGENT_BRIDGE_MODULE_ID, AckPhase, AgentBridgeClientDeclaration,
     AgentBridgePeerAdmissionReceipt, AgentBridgePeerChallenge, ContinuityKind, EncodingProfile,
-    EventEnvelope, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
-    RequestIdentity,
+    EventEnvelope, EventPayload, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolVersion,
+    RequestIdentity, NORMALIZED_HOST_EVENT_PAYLOAD_TYPE,
 };
 use eliot_receipts::RequestBinding;
 use eliot_receipts::tool_exposure::{ResultDelivery, ToolExposureError, ToolExposureHistoryEntry};
@@ -3385,14 +3386,14 @@ fn check_expected_continuation(
 ///
 /// | method | Kernel request | authority check | operational staging |
 /// |---|---|---|---|
-/// | `forward_hook` | `agent_bridge_hook_forward` | attach session continuity + hook digest bind | none (RECEIVED observation only; hook carries no ack) |
+/// | `forward_hook` | `agent_bridge_hook_forward` | attach session continuity + exact original host envelope + normalized durable-observation carrier | owner ORS phase/disposition readback |
 /// | `forward_event` | `agent_bridge_event_forward` | attach session + producer/generation/fence coherence, live generation fencing | ORS bridge-event row before the DURABLE answer |
 /// | `forward_gap` | `agent_bridge_event_gap` | attach session continuity + gap identity/interval | durable gap row; never moves a cursor |
 /// | `reconcile_external` | `agent_bridge_event_reconcile` | attach session continuity + presenting-connection scope | reads ownership/cursors/pages; applies the consumed frontier |
 ///
 /// | method | provider normalizer | Governor ingest | result readback |
 /// |---|---|---|---|
-/// | `forward_hook` | closed typed observation required and validated by its owner (`HostEventEnvelope::validate` -> `HostEventEnvelope::normalized`); the wire's generic `normalized_payload` is never interpreted (issue #228 A6) | none (transport observation) | RECEIVED echo bound to the hook digest |
+/// | `forward_hook` | closed session-only typed observation required and validated by its owner (`HostEventEnvelope::validate` -> `HostEventEnvelope::normalized`); the wire's generic `normalized_payload` remains raw evidence (issue #228 A6) | exact original envelope retained as an Inline JSON durable observation | owner phase/disposition and envelope digest readback |
 /// | `forward_event` | `normalize_acp_event` for raw producer bytes (ACP owner); forwarded `EventEnvelope` linkage re-validated Kernel-side | coordinator `observe_committed_intake` over `CommittedHostEventIntake` (ACP/commit path) | owner phase/disposition/cursors from the ORS row |
 /// | `forward_gap` | gap identity/interval validation (no normalization) | none (coverage accounting) | gap acceptance bound to the gap identity |
 /// | `reconcile_external` | none (read path) | none (read path) | ownership/cursor/page facts plus the bound reconciliation key |
@@ -3421,7 +3422,11 @@ fn check_expected_continuation(
 /// invocation intent and are not event delivery; a refused event is never
 /// resubmitted as a host request.
 struct KernelMcpForwardingPort {
-    shared: SharedTransport,
+    shared: Option<SharedTransport>,
+    #[cfg(test)]
+    test_facts: Option<BridgeEventTransportFacts>,
+    #[cfg(test)]
+    test_exchange: Option<Box<dyn FnMut(&Frame) -> Result<Frame, ProviderFailure>>>,
 }
 
 /// Typed refusal for a contested reconciliation-import commit (issue #2799):
@@ -3450,7 +3455,17 @@ impl KernelMcpForwardingPort {
     /// session returns `Ok(())` so the caller proceeds to the admitted event
     /// entry; it never implies durability, normalization, or application.
     fn check_continuity(&self, binding: &AttachBinding) -> Result<(), ProviderFailure> {
-        let owner = self.shared.try_borrow().map_err(|_| {
+        let Some(shared) = &self.shared else {
+            #[cfg(test)]
+            if self.test_facts.as_ref().is_some_and(|facts| {
+                facts.session.as_deref() == Some(binding.session_id().as_str())
+                    && facts.connection_id == binding.connection_id().as_str()
+            }) {
+                return Ok(());
+            }
+            return Err(event_transport_failure());
+        };
+        let owner = shared.try_borrow().map_err(|_| {
             ProviderFailure::new(
                 "eliot-kernel-front-door",
                 "event continuity check unavailable: retained transport owner is mutably borrowed",
@@ -3514,8 +3529,8 @@ impl KernelMcpForwardingPort {
                  reconcile_external, never by relabeling history",
             ));
         }
-        let adopted_producer = {
-            let owner = self.shared.try_borrow().map_err(|_| {
+        let adopted_producer = if let Some(shared) = &self.shared {
+            let owner = shared.try_borrow().map_err(|_| {
                 ProviderFailure::new(
                     "eliot-kernel-front-door",
                     "event binding check unavailable: retained transport owner is mutably \
@@ -3526,6 +3541,8 @@ impl KernelMcpForwardingPort {
                 .owner_identity
                 .get(event.stream_id.as_str())
                 .map(|identity| identity.producer_id.clone())
+        } else {
+            None
         };
         // A stream with no adopted identity imposes no constraint; anything
         // adopted contradicts only on a real substitution.
@@ -3550,7 +3567,13 @@ impl KernelMcpForwardingPort {
     /// an unknown outcome — never a phase — so the caller fails without
     /// claiming anything and the producer's at-least-once retry stays sound.
     fn exchange(&mut self, frame: &Frame) -> Result<Frame, ProviderFailure> {
+        #[cfg(test)]
+        if let Some(exchange) = &mut self.test_exchange {
+            return exchange(frame);
+        }
         self.shared
+            .as_ref()
+            .ok_or_else(event_transport_failure)?
             .try_borrow_mut()
             .map_err(|_| event_transport_failure())?
             .exchange_bridge_event_frame(frame)
@@ -3558,8 +3581,18 @@ impl KernelMcpForwardingPort {
 
     /// Snapshots the Kernel-issued transport facts for one event frame.
     fn transport_facts(&self) -> Result<BridgeEventTransportFacts, ProviderFailure> {
+        #[cfg(test)]
+        if let Some(facts) = &self.test_facts {
+            return Ok(BridgeEventTransportFacts {
+                connection_id: facts.connection_id.clone(),
+                state_fence: facts.state_fence.clone(),
+                session: facts.session.clone(),
+            });
+        }
         let owner = self
             .shared
+            .as_ref()
+            .ok_or_else(event_transport_failure)?
             .try_borrow()
             .map_err(|_| event_transport_failure())?;
         Ok(BridgeEventTransportFacts {
@@ -3585,7 +3618,10 @@ impl KernelMcpForwardingPort {
         if sequence == 0 {
             return;
         }
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        let Ok(mut owner) = shared.try_borrow_mut() else {
             return;
         };
         if !owner.delivered_sequences.contains_key(stream_id)
@@ -3740,7 +3776,10 @@ impl KernelMcpForwardingPort {
             ConsumedOfferDisposition::OwnerConfirmed,
             "transport observations never confirm an offer",
         );
-        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        let Ok(mut owner) = shared.try_borrow_mut() else {
             return;
         };
         let Some(offer) = owner.consumed_offer.as_mut() else {
@@ -4176,6 +4215,95 @@ impl KernelMcpForwardingPort {
     }
 }
 
+/// Converts a validated session-only host event into the existing durable
+/// event carrier. Identity comes from the normalized source and the live
+/// attachment; the original event is embedded unchanged, including its
+/// normalization receipt and raw-source binding.
+fn normalized_host_event_carrier(
+    binding: &AttachBinding,
+    event: &HostEventEnvelope,
+) -> Result<EventEnvelope, ProviderFailure> {
+    event.validate().map_err(|_| {
+        event_shape_failure(
+            "host hook refused: the original event failed closed envelope validation",
+        )
+    })?;
+    let normalized = event.normalized().map_err(|_| {
+        event_shape_failure(
+            "host hook refused: the original normalized observation failed validation",
+        )
+    })?;
+    normalized
+        .validate_as_session_observation()
+        .map_err(|_| {
+            event_shape_failure(
+                "host hook refused: only a session-scoped, non-attributable observation can be forwarded",
+            )
+        })?;
+    if normalized.event_id != event.event_id
+        || normalized.sequence != event.sequence
+        || normalized.cursor != event.cursor
+        || normalized.producer_adapter_identity.trim().is_empty()
+    {
+        return Err(event_shape_failure(
+            "host hook refused: source identity differs from its validated normalized observation",
+        ));
+    }
+    let stream_id = match &normalized.lineage {
+        eliot_agent_bridge_core::ProviderObservationLineage::SessionObservation(observation) => {
+            match &observation.native {
+                eliot_agent_bridge_core::NativeSession::Native(locator) => {
+                    locator.locator.clone()
+                }
+                eliot_agent_bridge_core::NativeSession::Sessionless => {
+                    return Err(event_shape_failure(
+                        "host hook refused: durable forwarding requires the source session stream identity",
+                    ));
+                }
+            }
+        }
+        eliot_agent_bridge_core::ProviderObservationLineage::ExecutionUnitObservation(_) => {
+            return Err(event_shape_failure(
+                "host hook refused: execution-unit observations require their existing admitted-event owner",
+            ));
+        }
+    };
+    let generation = ResourceGeneration::new(binding.activation_generation().value())
+        .map_err(|_| event_transport_failure())?;
+    if generation.get() != binding.state_fence().generation().value() {
+        return Err(event_shape_failure(
+            "host hook refused: live activation generation differs from the authenticated fence",
+        ));
+    }
+    let authority_epoch = binding.state_fence().authority_epoch().clone();
+    let state_fence = StateFence::new(authority_epoch.clone(), generation);
+    let original_value = serde_json::to_value(event).map_err(|_| event_transport_failure())?;
+    let envelope = EventEnvelope {
+        stream_id,
+        producer_id: normalized.producer_adapter_identity.clone(),
+        producer_generation: generation,
+        authority_epoch,
+        event_id: event.event_id.as_str().to_owned(),
+        sequence: event.sequence,
+        causal_predecessor_refs: normalized
+            .causal_predecessors
+            .iter()
+            .map(|event_id| event_id.as_str().to_owned())
+            .collect(),
+        delivery_class: DeliveryClass::DurableObservation,
+        ack_required: true,
+        payload_type: NORMALIZED_HOST_EVENT_PAYLOAD_TYPE.to_owned(),
+        payload_or_blob_ref: EventPayload::Inline(Box::new(ProtocolPayload::Json(original_value))),
+        state_fence,
+        trace_context: BTreeMap::new(),
+    };
+    envelope
+        .validate()
+        .and_then(|()| envelope.require_known_payload_type())
+        .map_err(|_| event_transport_failure())?;
+    Ok(envelope)
+}
+
 impl McpForwardingPort for KernelMcpForwardingPort {
     fn forward_hook(
         &mut self,
@@ -4196,10 +4324,17 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                  event delivery",
             ));
         }
+        let owner_event = normalized_host_event_carrier(binding, event)?;
+        self.check_event_binding(binding, &owner_event)?;
         let now_ms = bridge_event_unix_ms()?;
         let hook_bytes = canonical_json_bytes(event).map_err(|_| event_transport_failure())?;
         let hook_digest = sha256_hex(&hook_bytes);
         let hook_value = serde_json::to_value(event).map_err(|_| event_transport_failure())?;
+        let owner_event_bytes = canonical_json_bytes(&owner_event)
+            .map_err(|_| event_transport_failure())?;
+        let owner_event_digest = sha256_hex(&owner_event_bytes);
+        let owner_event_value =
+            serde_json::to_value(&owner_event).map_err(|_| event_transport_failure())?;
         let correlation = format!("bridge-hook:{}", event.event_id.as_str());
         let frame = bridge_event_frame_for_operation(
             &correlation,
@@ -4208,16 +4343,30 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 "operation": BridgeEventMethod::Hook.kernel_operation(),
                 "hook_envelope": hook_value,
                 "hook_digest": hook_digest,
+                "event_envelope": owner_event_value,
+                "envelope_sha256": owner_event_digest,
             }),
             now_ms,
         )?;
         let reply = self.exchange(&frame)?;
         let value = decode_bridge_event_reply(&reply, &frame)?;
-        if value.get("accepted").and_then(serde_json::Value::as_bool) != Some(true)
-            || value.get("received").and_then(serde_json::Value::as_bool) != Some(true)
-            || value.get("hook_digest").and_then(serde_json::Value::as_str) != Some(&hook_digest)
-        {
-            return Err(event_transport_failure());
+        let outcome =
+            decode_event_port_outcome(&owner_event, &value, &owner_event_digest, self)?;
+        match outcome {
+            EventPortOutcome::Acknowledged(ack)
+                if matches!(
+                    ack.phase(),
+                    AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
+                )
+                    && matches!(
+                        ack.disposition(),
+                        EventDisposition::Accepted | EventDisposition::Duplicate
+                    ) => {}
+            _ => {
+                return Err(event_shape_failure(
+                    "hook forwarding refused: owner did not confirm normalized durable observation",
+                ));
+            }
         }
         Ok(())
     }
@@ -4818,7 +4967,11 @@ fn kernel_faces_from_admission(
         shared: owner.clone(),
     };
     let fwd: Box<dyn McpForwardingPort> = Box::new(KernelMcpForwardingPort {
-        shared: owner.clone(),
+        shared: Some(owner.clone()),
+        #[cfg(test)]
+        test_facts: None,
+        #[cfg(test)]
+        test_exchange: None,
     });
     (host, host_request, fwd)
 }
@@ -7233,10 +7386,11 @@ mod tests {
     mod reactive_runner_tests {
         use super::super::{
             AdmissionBasis, AttachBinding, AttachRequest, BridgeError, BridgeRunner, ConnectionId,
-            CueOrigin, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
+            BridgeEventTransportFacts, CueOrigin, DeliveryPoint, DemandId, FiringEvidence, HostActivationPort,
             HostEventEnvelope, ItemDisposition, McpForwardingPort, NormalizedCue, Profile,
-            ProviderFailure, ProviderReadiness, ReactiveInjectionLedger, RiskTier, Severity,
-            UseOutcome,
+            KernelMcpForwardingPort, ProviderFailure, ProviderReadiness,
+            ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
+            normalized_host_event_carrier,
         };
         use super::test_epoch;
         use eliot_agent_bridge_core::{
@@ -7476,6 +7630,212 @@ mod tests {
             )
             .expect("normalized observation serializes");
             serde_json::from_value(wire).expect("valid hook fixture")
+        }
+
+        fn kernel_hook_port(
+            binding: &AttachBinding,
+            accepted: bool,
+        ) -> KernelMcpForwardingPort {
+            let generation = eliot_contracts::ResourceGeneration::new(
+                binding.activation_generation().value(),
+            )
+            .expect("test generation is nonzero");
+            let test_facts = BridgeEventTransportFacts {
+                connection_id: binding.connection_id().as_str().to_owned(),
+                state_fence: eliot_contracts::StateFence::new(
+                    binding.state_fence().authority_epoch().clone(),
+                    generation,
+                ),
+                session: Some(binding.session_id().as_str().to_owned()),
+            };
+            let test_exchange: Box<
+                dyn FnMut(&eliot_protocol::Frame) -> Result<eliot_protocol::Frame, ProviderFailure>,
+            > = Box::new(move |request: &eliot_protocol::Frame| {
+                let eliot_protocol::ProtocolPayload::Json(payload) = &request.payload else {
+                    return Err(ProviderFailure::new(
+                        "test-kernel",
+                        "hook request payload was not JSON",
+                    ));
+                };
+                assert_eq!(
+                    payload.get("operation").and_then(serde_json::Value::as_str),
+                    Some("agent_bridge_hook_forward")
+                );
+                let hook_value = payload
+                    .get("hook_envelope")
+                    .expect("original host envelope is forwarded");
+                let event: HostEventEnvelope = serde_json::from_value(hook_value.clone())
+                    .expect("original host envelope remains typed");
+                assert_eq!(
+                    payload.get("event_envelope").and_then(|value| {
+                        value
+                            .get("event_id")
+                            .and_then(serde_json::Value::as_str)
+                    }),
+                    Some(event.event_id.as_str())
+                );
+                let digest = payload
+                    .get("envelope_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("carrier digest accompanies the owner event");
+                let owner_event: eliot_protocol::EventEnvelope = serde_json::from_value(
+                    payload
+                        .get("event_envelope")
+                        .expect("normalized host carrier is sent"),
+                )
+                .expect("carrier envelope remains typed");
+                assert_eq!(
+                    owner_event.payload_or_blob_ref,
+                    eliot_protocol::EventPayload::Inline(Box::new(
+                        eliot_protocol::ProtocolPayload::Json(hook_value.clone()),
+                    )),
+                    "the staged carrier contains the exact original hook JSON"
+                );
+                let mut value = serde_json::json!({
+                    "accepted": accepted,
+                    "stream_id": owner_event.stream_id.clone(),
+                    "event_id": owner_event.event_id.clone(),
+                    "sequence": owner_event.sequence,
+                    "phase": if accepted { "DURABLE" } else { "REJECTED" },
+                    "disposition": if accepted { "accepted" } else { "conflict" },
+                });
+                if accepted {
+                    value["envelope_sha256"] = serde_json::Value::String(digest.to_owned());
+                }
+                Ok(eliot_protocol::Frame {
+                    protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+                    encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+                    connection_id: request.connection_id.clone(),
+                    request_id: request.request_id.clone(),
+                    kind: eliot_protocol::FrameKind::Response,
+                    message_type: eliot_protocol::MessageType::Result,
+                    request_identity: None,
+                    payload: eliot_protocol::ProtocolPayload::Json(serde_json::json!({
+                        "status": "known",
+                        "value": value,
+                    })),
+                    trace_context: Default::default(),
+                })
+            });
+            KernelMcpForwardingPort {
+                shared: None,
+                test_facts: Some(test_facts),
+                test_exchange: Some(test_exchange),
+            }
+        }
+
+        #[test]
+        fn normalized_hook_carrier_preserves_source_under_live_fence() {
+            let runner = reactive_runner(true);
+            let binding = runner
+                .attach_view()
+                .expect("attached runner has owner binding")
+                .binding()
+                .clone();
+            let event = hook_event("hook-owner-carrier-1", 1);
+            let expected_normalization_digest = event
+                .normalized()
+                .expect("fixture normalization validates")
+                .normalization
+                .output_digest
+                .clone();
+
+            let carrier = normalized_host_event_carrier(&binding, &event)
+                .expect("valid session observation becomes durable owner carrier");
+            assert_eq!(carrier.event_id, event.event_id.as_str());
+            assert_eq!(carrier.sequence, event.sequence);
+            assert_eq!(carrier.stream_id, "thread-hook-owner-carrier-1");
+            assert_eq!(carrier.producer_id, "bridge-fixture");
+            assert_eq!(
+                carrier.delivery_class,
+                eliot_protocol::DeliveryClass::DurableObservation
+            );
+            assert!(carrier.ack_required);
+            assert_eq!(
+                carrier.payload_type,
+                eliot_protocol::NORMALIZED_HOST_EVENT_PAYLOAD_TYPE
+            );
+            assert_eq!(
+                carrier.state_fence.authority_epoch,
+                *binding.state_fence().authority_epoch()
+            );
+            assert_eq!(
+                carrier.state_fence.resource_generation,
+                eliot_contracts::ResourceGeneration::new(
+                    binding.state_fence().generation().value(),
+                )
+                    .expect("test generation is nonzero")
+            );
+            assert!(matches!(
+                carrier.payload_or_blob_ref,
+                eliot_protocol::EventPayload::Inline(_)
+            ));
+            let eliot_protocol::EventPayload::Inline(payload) = carrier.payload_or_blob_ref else {
+                return;
+            };
+            assert!(matches!(
+                *payload,
+                eliot_protocol::ProtocolPayload::Json(_)
+            ));
+            let eliot_protocol::ProtocolPayload::Json(original) = *payload else {
+                return;
+            };
+            let carried: HostEventEnvelope =
+                serde_json::from_value(original).expect("original envelope remains typed");
+            assert_eq!(carried, event);
+            assert_eq!(
+                carried
+                    .normalized()
+                    .expect("original normalized receipt remains valid")
+                    .normalization
+                    .output_digest,
+                expected_normalization_digest,
+                "the producer's original normalization digest is preserved"
+            );
+        }
+
+        #[test]
+        fn normalized_hook_carrier_refuses_changed_host_identity_without_resealing() {
+            let runner = reactive_runner(true);
+            let binding = runner
+                .attach_view()
+                .expect("attached runner has owner binding")
+                .binding()
+                .clone();
+            let mut event = hook_event("hook-owner-carrier-2", 1);
+            event.sequence = 2;
+
+            let refusal = normalized_host_event_carrier(&binding, &event);
+            assert!(refusal.is_err());
+        }
+
+        #[test]
+        fn kernel_hook_adapter_accepts_standard_durable_owner_reply() {
+            let runner = reactive_runner(true);
+            let binding = runner
+                .attach_view()
+                .expect("attached runner has owner binding")
+                .binding()
+                .clone();
+            let event = hook_event("hook-owner-adapter-1", 1);
+            let mut port = kernel_hook_port(&binding, true);
+
+            McpForwardingPort::forward_hook(&mut port, &binding, &event)
+                .expect("standard durable owner acknowledgement is accepted");
+        }
+
+        #[test]
+        fn kernel_hook_adapter_refuses_standard_owner_conflict() {
+            let runner = reactive_runner(true);
+            let binding = runner
+                .attach_view()
+                .expect("attached runner has owner binding")
+                .binding()
+                .clone();
+            let event = hook_event("hook-owner-adapter-2", 1);
+            let mut port = kernel_hook_port(&binding, false);
+
+            assert!(McpForwardingPort::forward_hook(&mut port, &binding, &event).is_err());
         }
 
         fn attention_ids(runner: &BridgeRunner) -> Vec<String> {
