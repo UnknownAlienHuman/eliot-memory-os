@@ -102,7 +102,7 @@ use eliot_store_api::{
 
 use crate::Governor;
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
-use crate::learning_admission::{LearningAdmissionPermit, verify_learning_admission};
+use crate::learning_admission::{VerifiedLearningAdmission, verify_learning_admission};
 
 /// Builds the closed `RecordLearningRecord` mutation request for one
 /// validated stored delta.
@@ -149,26 +149,40 @@ pub fn learning_record_mutation_request_for_delta(
 /// Governor admission.
 ///
 /// A durable-but-unadmitted record (or a stale permit) stays non-effective
-/// (A3): returns `true` only when the caller-observed `admitted` flag and
-/// admission-receipt presence both hold AND `permit` is present AND
-/// [`verify_learning_admission`] rebinds it to the live owner
-/// epoch/generation and `current_fence`. Any refusal means no behavioral
-/// effect, even though the record itself remains durable. Delivery still
-/// travels the existing `delivery_allowed` / `delta_delivery_allowed` path.
+/// (A3). The verdict is now DERIVED from the admission itself rather than
+/// announced by a caller:
+///
+/// - `admitted` is the presence of a [`VerifiedLearningAdmission`], whose
+///   private field means only [`verify_learning_admission`] can produce one,
+///   so no caller can assert that an admission happened.
+/// - `admission_receipt_present` is the owner-issued admission digest bound
+///   into the permit, which the re-verification below recomputes; a permit
+///   that cannot produce a usable receipt identity is not an admission.
+/// - and the permit is re-bound to the live owner epoch/generation and to
+///   `current_fence` HERE, not merely re-presented, so a handle minted against
+///   an earlier fence is not effectiveness today.
+///
+/// The two caller-supplied booleans this used to take are gone rather than
+/// re-typed: they were satisfied with the literals `false` at every
+/// production call site, so the gate short-circuited before the permit was
+/// ever read and the real verdict was a constant on every contour. There is no
+/// weaker contour now — the guard is the same re-verification, with the
+/// caller-controlled constants removed. Any refusal means no behavioral effect,
+/// even though the record itself remains durable. Delivery still travels the
+/// existing `delivery_allowed` / `delta_delivery_allowed` path.
 pub fn learning_effective_under_admission(
     governor: &Governor,
-    permit: Option<&LearningAdmissionPermit>,
+    admission: Option<&VerifiedLearningAdmission<'_>>,
     current_fence: &StateFence,
-    admitted: bool,
-    admission_receipt_present: bool,
 ) -> bool {
-    if !admitted || !admission_receipt_present {
-        return false;
-    }
-    let Some(permit) = permit else {
+    let Some(verified) = admission else {
         return false;
     };
-    verify_learning_admission(governor, permit, current_fence).is_ok()
+    let permit = verified.permit();
+    if verify_learning_admission(governor, permit, current_fence).is_err() {
+        return false;
+    }
+    !permit.digest().trim().is_empty()
 }
 
 /// Fail-closed freshness check over the owner-returned receipt (issue #223

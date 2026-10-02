@@ -1503,6 +1503,18 @@ impl DaemonComposition {
     /// [`eliot_governor::learning_effective_under_admission`](eliot_governor::learning_effective_under_admission)
     /// against the live fence, and a durable-but-unadmitted record stays
     /// non-effective.
+    ///
+    /// `admission` must be the [`VerifiedLearningAdmission`](eliot_governor::VerifiedLearningAdmission)
+    /// the daemon obtained from `verify_learning_admission` for THIS record.
+    /// That handle is the only thing the verdict is read from: it is
+    /// constructible nowhere outside the Governor's own verifier, and the
+    /// Governor re-binds the permit it holds to live owner state and the live
+    /// fence here. This method previously also accepted two caller-supplied
+    /// booleans (`admitted`, `admission_receipt_present`); both are REMOVED,
+    /// because every production call site passed the literals `false`, the
+    /// guard returned on them before it ever looked at a permit, and the
+    /// verdict was consequently a constant on every contour. They are not
+    /// re-added at a higher level: a caller now states nothing at all.
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_learning_record(
         &mut self,
@@ -1510,9 +1522,7 @@ impl DaemonComposition {
         request: eliot_store_api::NamedMutationRequest,
         scope_id: eliot_store_api::ScopeId,
         proof_refs: Vec<String>,
-        permit: Option<&eliot_governor::LearningAdmissionPermit>,
-        admitted: bool,
-        admission_receipt_present: bool,
+        admission: Option<&eliot_governor::VerifiedLearningAdmission<'_>>,
         expected_revision_heads: Vec<eliot_store_api::RevisionHeadExpectation>,
         expected_ordering_heads: Vec<eliot_store_api::OrderingHeadExpectation>,
     ) -> Result<(eliot_store_api::WriteReceipt, bool), DaemonError> {
@@ -1538,10 +1548,8 @@ impl DaemonComposition {
         let live_fence = self.governor.kernel_snapshot().state_fence();
         let effective = eliot_governor::learning_effective_under_admission(
             self.governor.governor(),
-            permit,
+            admission,
             &live_fence,
-            admitted,
-            admission_receipt_present,
         );
         Ok((receipt, effective))
     }

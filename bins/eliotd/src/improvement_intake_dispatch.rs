@@ -2188,7 +2188,6 @@ pub fn improvement_bound_idempotency_key(
 }
 
 /// Result of the governed improvement admission over one real observation.
-#[derive(Clone, Debug)]
 pub struct GovernedImprovementAdmission {
     /// Outcome of the bound-enforced admission or lineage merge.
     pub report: AdmitReport,
@@ -2200,6 +2199,14 @@ pub struct GovernedImprovementAdmission {
     /// durable record, so the persisted artifact names the admission it was
     /// admitted under rather than only that some admission happened.
     pub admission_digest: String,
+    /// The owner-issued permit itself, carried so the durable commits below can
+    /// be bound to THIS admission rather than to a literal.
+    ///
+    /// It is the permit `verify_learning_admission` returned
+    /// [`VerifiedLearningAdmission`] over for this exact pass fence, so it is
+    /// owner-issued and fence-bound by construction and not a value the caller
+    /// of [`admit_improvement_artifact`] chose.
+    pub permit: LearningAdmissionPermit,
     /// The surviving backlog entry exactly as
     /// [`BoundedBacklog::admit_reporting_pressure`] left it, when this
     /// admission deduplicated by evidence lineage; `None` when the candidate
@@ -2289,6 +2296,7 @@ pub fn admit_improvement_artifact(
         report,
         bound,
         admission_digest: permit.digest().to_owned(),
+        permit,
         merged_survivor,
     })
 }
@@ -2940,6 +2948,7 @@ pub async fn commit_improvement_artifact(
                 absorbed_candidate_id,
                 &scope,
                 state_fence,
+                &admitted.permit,
             )
             .await?;
         }
@@ -2956,6 +2965,17 @@ pub async fn commit_improvement_artifact(
     }
     // The durable commit is the whole point of this path: any refusal is a
     // typed diagnostic, never a silent drop.
+    //
+    // The admission handed to the seam is RE-VERIFIED here, against the live
+    // Governor and the live fence, and only the resulting
+    // [`VerifiedLearningAdmission`] is passed. That is what the two removed
+    // booleans used to assert: a caller could pass `None, false, false` and
+    // nothing downstream ever looked at an admission at all. Here the permit
+    // comes from the admission that actually admitted this candidate, and a
+    // stale epoch, a drifted fence or a Governor that stopped admitting makes
+    // the record non-effective instead of being claimed effective.
+    let admission =
+        verify_learning_admission(composition.improvement_governor(), &admitted.permit, state_fence)?;
     let (receipt, effective) = composition
         .commit_learning_record(
             &identity,
@@ -2963,16 +2983,21 @@ pub async fn commit_improvement_artifact(
             scope.clone(),
             // Proof refs: the candidate's own evidence lineage, verbatim.
             artifact.candidate.evidence_refs.clone(),
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
         .await
         .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
     for archived in &admitted.report.archived {
-        commit_archive_receipt(composition, archived, &scope, state_fence).await?;
+        commit_archive_receipt(
+            composition,
+            archived,
+            &scope,
+            state_fence,
+            &admitted.permit,
+        )
+        .await?;
     }
     Ok((receipt, effective))
 }
@@ -3033,6 +3058,7 @@ async fn commit_lineage_merge_receipt(
     absorbed_candidate_id: &str,
     scope: &ScopeId,
     state_fence: &StateFence,
+    permit: &LearningAdmissionPermit,
 ) -> Result<eliot_store_api::WriteReceipt, ImprovementDispatchError> {
     let record = serde_json::json!({
         "merged_survivor": survivor,
@@ -3059,15 +3085,24 @@ async fn commit_lineage_merge_receipt(
     // Proof refs: the SURVIVING entry's own evidence refs, which are the union
     // the merge produced, so the receipt cites the accumulated lineage rather
     // than the incoming candidate's.
+    //
+    // The merge is a disposition of the SAME governed admission that admitted
+    // the incoming candidate, so the receipt is bound to that owner-issued
+    // permit, re-verified against the live owner and fence. It previously
+    // passed `None, false, false`, which made the record permanently
+    // non-effective for want of an admission rather than by a verdict on one.
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        permit,
+        state_fence,
+    )?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
             request,
             scope.clone(),
             survivor.candidate.evidence_refs.clone(),
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
@@ -3110,6 +3145,7 @@ async fn commit_archive_receipt(
     archived: &ArchivedCandidate,
     scope: &ScopeId,
     state_fence: &StateFence,
+    permit: &LearningAdmissionPermit,
 ) -> Result<eliot_store_api::WriteReceipt, ImprovementDispatchError> {
     let record = serde_json::json!({
         "archived_candidate": archived,
@@ -3136,15 +3172,24 @@ async fn commit_archive_receipt(
     // Proof refs: the archived candidate's own canonical evidence lineage, so
     // the receipt cites exactly the evidence whose retention review produced
     // it.
+    //
+    // The archival is the bound-relief half of the SAME governed admission that
+    // admitted the candidate (it is what `admit_reporting_pressure` performed
+    // to make room), so the receipt is bound to that owner-issued permit,
+    // re-verified against the live owner and fence. It previously passed
+    // `None, false, false`.
+    let admission = verify_learning_admission(
+        composition.improvement_governor(),
+        permit,
+        state_fence,
+    )?;
     let (receipt, _effective) = composition
         .commit_learning_record(
             &identity,
             request,
             scope.clone(),
             archived.evidence_lineage.clone(),
-            None,
-            false,
-            false,
+            Some(&admission),
             Vec::new(),
             Vec::new(),
         )
