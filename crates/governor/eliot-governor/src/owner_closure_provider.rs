@@ -2506,15 +2506,33 @@ mod owner_closure_provider_tests {
         }
     }
 
-    fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
+    /// Builds one canonical delegation edge.
+    ///
+    /// `operations` is an explicit parameter because the narrowing validator
+    /// requires a child's authority to be a STRICT subset of its parent's: a
+    /// child that repeats its parent's operations is refused, and
+    /// [`GrantGraph::from_grants`] rejects the whole graph before any test
+    /// assertion runs. `grant:child` therefore drops `op.write`.
+    ///
+    /// The issuer is the principal that holds the grant, which is what the
+    /// narrowing clauses require of a delegation edge: a child's issuer must
+    /// be its parent's holder. Every `holder_principal` in these fixtures
+    /// stays `principal:holder`, so both sides of that clause keep the same
+    /// principal and no downstream holder assertion changes.
+    fn grant_entry(
+        fence: &StateFence,
+        grant_id: &str,
+        parent: Option<&str>,
+        operations: &[&str],
+    ) -> CapabilityGrant {
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
             authority_root_ref: "root:alpha".to_owned(),
-            issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
+            issuer: PrincipalRef::new("principal:holder").expect("issuer"),
             holder: PrincipalRef::new("principal:holder").expect("holder"),
             authority: AuthoritySet::new(
-                ["op.read".to_owned()],
+                operations.iter().map(|operation| (*operation).to_owned()),
                 ["res:1".to_owned()],
                 EffectClass::Read,
             )
@@ -2536,8 +2554,13 @@ mod owner_closure_provider_tests {
     fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
         let graph = GrantGraph::from_grants(
             [
-                grant_entry(fence, "grant:origin", None),
-                grant_entry(fence, "grant:child", Some("grant:origin")),
+                grant_entry(fence, "grant:origin", None, &["op.read", "op.write"]),
+                grant_entry(
+                    fence,
+                    "grant:child",
+                    Some("grant:origin"),
+                    &["op.read"],
+                ),
             ],
             7,
         )
