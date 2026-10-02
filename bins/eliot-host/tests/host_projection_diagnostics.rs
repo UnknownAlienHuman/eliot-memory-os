@@ -4,8 +4,21 @@
 //! real `materialize_phase_b` contour); T2 covers 6/7/8/10/11 (redaction +
 //! noninterference + rollback disposition). No matrix; Event Log stays
 //! typed-Unavailable (#984). Each proof names its actual caller.
+//!
+//! Audit 5909832545 defect 6: the executed proofs below never manufacture the
+//! record under test. Every case hands the production facade a literal or a
+//! real typed owner value and asserts on what production emitted back; the
+//! source scans that remain are supplementary emission-binding only.
+//! `decode_marker`/`decode_envelope` (`pub(super)` in `credential_control`)
+//! and `phase_b_restore_or_remove`/`phase_b_remove_rollback_backup`
+//! (`use`-only import in `lib.rs`, private `mod phase_b_materialization`) are
+//! unreachable from an integration-test crate, so their contours are not
+//! claimed here; the reachable proof for the rollback dispositions is the
+//! executed projection case below, which proves an unknown/failed outcome can
+//! never be emitted as a positive claim.
 use eliot_host::host_diagnostics::{
-    EntrypointStage, observe_entrypoint_with_detail, observe_terminal_error,
+    EntrypointStage, HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES,
+    observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
 };
 use serde_json::Value;
 use std::io::Write;
@@ -94,12 +107,23 @@ fn projection_01_propagation_single_terminal() {
         13,
         "codec stopped observing"
     );
+    // Executed proof of the shared facade only: literals go in, the facade's
+    // own record comes back. No production record is manufactured here, and
+    // the detail is no longer assembled from a fixture field, so what is
+    // asserted is exactly what production emitted for that literal.
     let c = "corr-980-1";
     let t = emit(|| {
-        observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, &format!("{inner} {c}"));
+        observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, inner);
+        observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, c);
         observe_terminal_error(term);
     });
     assert!(t.contains(inner) && t.contains(term));
+    assert_eq!(count(&t, inner), 1, "detail must not be duplicated: {t}");
+    assert_eq!(
+        count(&t, f["entrypoint_event"].as_str().expect("event name")),
+        2,
+        "each subordinate literal emits one entrypoint record: {t}"
+    );
     assert_eq!(
         count(&t, f["terminal_event"].as_str().expect("ev")),
         1,
@@ -167,4 +191,93 @@ fn projection_02_redaction_noninterference_rollback() {
         assert!(!t.contains(c.as_str()), "canary {c:?} in capture");
     }
     assert_eq!(f["stdout_protocol_contamination"].as_bool(), Some(false));
+}
+
+// Executed case: the rollback disposition the audit demands cannot be forged
+// through the emission surface. `HostRequestProjection` is the production type
+// every Host request record is built from, so an unknown / unattributed
+// rollback outcome reaching it is projected as missing evidence, never as a
+// positive restoration, removal or cleanup claim.
+#[test]
+fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
+    let positives = [
+        "restored verified",
+        "uncommitted removal verified",
+        "cleanup completed",
+        "removal verified",
+        "durable_committed",
+        "process_started",
+        "semantically_ready",
+    ];
+    let unknown = emit(|| {
+        observe_host_request(&HostRequestProjection::unknown(EntrypointStage::ScmDispatch));
+    });
+    assert!(unknown.contains("host.request"), "no projection record: {unknown}");
+    assert!(unknown.contains("evidence=unknown"), "evidence must be unknown: {unknown}");
+    assert!(unknown.contains("reason_missing=true"), "no reason may be invented: {unknown}");
+    assert!(unknown.contains("running_missing=true"), "running must stay missing: {unknown}");
+    assert!(unknown.contains("process_missing=true"), "process must stay missing: {unknown}");
+    assert!(unknown.contains("generation_missing=true"), "generation must stay missing: {unknown}");
+    assert!(
+        !unknown.contains("host.terminal_error"),
+        "a projection is never a terminal: {unknown}"
+    );
+    for positive in positives {
+        assert!(
+            !unknown.contains(positive),
+            "unknown rollback disposition claimed {positive:?}: {unknown}"
+        );
+    }
+    // The failed-before-verification sibling disposition: the typed reason is
+    // kept, the payload is not, and no positive claim rides along with it.
+    let unattributed = emit(|| {
+        observe_host_request(&HostRequestProjection::failed_without_reason(
+            EntrypointStage::ScmDispatch,
+        ));
+    });
+    assert!(unattributed.contains("evidence=failed"), "got: {unattributed}");
+    assert!(unattributed.contains("reason_missing=true"), "got: {unattributed}");
+    for positive in positives {
+        assert!(
+            !unattributed.contains(positive),
+            "unattributed rollback disposition claimed {positive:?}: {unattributed}"
+        );
+    }
+    // Dispositions that genuinely are proven stay reachable and distinct, so
+    // the pair above is a real distinction and not a blanket denial.
+    let committed = emit(|| {
+        observe_host_request(&HostRequestProjection::durable_committed(
+            EntrypointStage::ShutdownDrain,
+        ));
+    });
+    assert!(committed.contains("evidence=durable_committed"), "got: {committed}");
+    assert!(committed.contains("stage=shutdown_drain"), "got: {committed}");
+}
+
+// Executed case: bounded static detail is honoured by the real formatter, so
+// the redaction contract T2 asserts on source is also asserted on the record
+// production actually wrote. The oversized literal is truncated with an honest
+// byte count rather than dropped or emitted whole.
+#[test]
+fn projection_06_detail_is_truncated_with_honest_byte_accounting() {
+    let oversized = "host.phase-b rollback ".repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
+    assert!(oversized.len() > MAX_DIAGNOSTIC_DETAIL_BYTES);
+    let t = emit(|| {
+        observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, &oversized);
+    });
+    assert!(t.contains("host.entrypoint_stage"), "no entrypoint record: {t}");
+    assert!(
+        t.contains(&format!("detail_bytes={}", oversized.len())),
+        "original byte count must be reported: {t}"
+    );
+    assert!(t.contains("detail_truncated=true"), "truncation must be reported: {t}");
+    let retained = MAX_DIAGNOSTIC_DETAIL_BYTES.min(oversized.len());
+    assert!(
+        t.contains(&oversized[..retained]),
+        "the bounded prefix must be retained: {t}"
+    );
+    assert!(
+        !t.contains("detail_truncated=false"),
+        "an oversized detail must never claim it was whole: {t}"
+    );
 }

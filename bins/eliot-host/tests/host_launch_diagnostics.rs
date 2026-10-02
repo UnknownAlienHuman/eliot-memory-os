@@ -24,8 +24,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
-    DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, bound_detail, bound_field,
-    observe_entrypoint_with_detail, observe_terminal_error, sink_status,
+    DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, HostRequestProjection, bound_detail,
+    bound_field, observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
+    sink_status,
 };
 use eliot_host::windows_event_log::{AdmittedEvent, event_log_sink_status, report_event};
 use serde_json::Value;
@@ -925,4 +926,91 @@ fn launch_14_source_guard_stays_diagnostics_only() {
             "F-LOG-HOST-3 must not touch sibling item scope {other}"
         );
     }
+}
+
+// Executed case for external audit 5909832545 defect 4: a rollback positive
+// (`host.phase-b rollback *`) is only ever projected when the owner's own
+// evidence proves the operation, and an unproven rollback disposition reaches
+// neither a positive record nor the OS Event Log. Driven through the real
+// `observe_host_request` -> `publish_projected_event_log_record` ->
+// `try_admit_admitted_event` path with real `HostRequestProjection` values, so
+// a projection that started forwarding unproven outcomes fails here.
+#[test]
+fn launch_15_rollback_positive_requires_owner_evidence() {
+    let unknown = capture_emit(|| {
+        observe_host_request(
+            &HostRequestProjection::unknown(EntrypointStage::Startup)
+                .with_operation(AdmittedEvent::ServiceStart),
+        );
+    });
+    assert!(unknown.contains("host.request"), "no projection record: {unknown}");
+    assert!(unknown.contains("evidence=unknown"), "got: {unknown}");
+    assert!(unknown.contains("reason_missing=true"), "got: {unknown}");
+    assert_eq!(
+        count_occurrences(&unknown, "host.event_log_admission"),
+        0,
+        "an unproven rollback disposition must never reach the Event Log: {unknown}"
+    );
+    // Same projection with owner evidence does record: the absence above is a
+    // decision production made, not a dead or unreachable path.
+    let started = capture_emit(|| {
+        observe_host_request(
+            &HostRequestProjection::process_started(EntrypointStage::Startup, 4242)
+                .with_operation(AdmittedEvent::ServiceStart),
+        );
+    });
+    assert!(started.contains("evidence=process_started"), "got: {started}");
+    assert!(started.contains("process=4242"), "got: {started}");
+    assert!(started.contains("process_missing=false"), "got: {started}");
+    assert!(
+        started.contains("host.event_log_admission"),
+        "proven start must be admitted: {started}"
+    );
+    assert!(started.contains("operation=service_start"), "got: {started}");
+    // A verified durable effect (the disposition a rollback restoration may
+    // reach once its readback proved it) stays distinguishable from the
+    // unproven pair, and a proven no-effect stop admits nothing.
+    let committed = capture_emit(|| {
+        observe_host_request(
+            &HostRequestProjection::durable_committed(EntrypointStage::ShutdownDrain)
+                .with_operation(AdmittedEvent::ServiceStop),
+        );
+    });
+    assert!(committed.contains("evidence=durable_committed"), "got: {committed}");
+    assert!(committed.contains("operation=service_stop"), "got: {committed}");
+    let cancelled = capture_emit(|| {
+        observe_host_request(
+            &HostRequestProjection::cancelled(EntrypointStage::Startup)
+                .with_operation(AdmittedEvent::ServiceStop),
+        );
+    });
+    assert!(cancelled.contains("evidence=cancelled"), "got: {cancelled}");
+    assert_eq!(
+        count_occurrences(&cancelled, "host.event_log_admission"),
+        0,
+        "a vacuous disposition must not state a completed operation: {cancelled}"
+    );
+    // Failure before verification keeps its exact typed reason and still
+    // admits only the failure event, never a stop.
+    let failed = capture_emit(|| {
+        observe_host_request(
+            &HostRequestProjection::failed(
+                EntrypointStage::Startup,
+                &eliot_host::HostError::RecoveryRequired("unread-back".to_owned()),
+            )
+            .with_operation(AdmittedEvent::ServiceFailure),
+        );
+    });
+    assert!(failed.contains("evidence=failed"), "got: {failed}");
+    assert!(failed.contains("reason=recovery_required"), "got: {failed}");
+    assert!(failed.contains("reason_missing=false"), "got: {failed}");
+    assert!(failed.contains("operation=service_failure"), "got: {failed}");
+    assert!(
+        !failed.contains("unread-back"),
+        "the error payload must not cross the record: {failed}"
+    );
+    assert!(
+        !failed.contains("host.terminal_error"),
+        "a failed projection is subordinate, never a second terminal: {failed}"
+    );
 }
