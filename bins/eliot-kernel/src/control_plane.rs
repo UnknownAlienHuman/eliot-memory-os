@@ -526,10 +526,15 @@ impl KernelComposition {
             .command
         {
             KernelControlCommand::RebindStore(handoff) => {
-                let receipt = self
-                    .rebind_store(handoff.clone(), request.payload_digest.clone())
-                    .await
-                    .map_err(|_| TransportError::SessionFenced)?;
+                // The rebind future is boxed rather than awaited inline. Holding
+                // it in this function's own future state is what pushed
+                // `apply_control_request`'s future past the crate's
+                // `large_futures` ceiling; boxing moves those bytes behind one
+                // pointer and changes no ordering, no admission and no result.
+                let receipt =
+                    Box::pin(self.rebind_store(handoff.clone(), request.payload_digest.clone()))
+                        .await
+                        .map_err(|_| TransportError::SessionFenced)?;
                 Some(receipt)
             }
             KernelControlCommand::ReconcileRebindStore(query) => {

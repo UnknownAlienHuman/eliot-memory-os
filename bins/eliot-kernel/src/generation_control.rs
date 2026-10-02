@@ -524,7 +524,7 @@ fn generation_cutover_terminal_code(error: &KernelServiceError) -> &'static str 
 /// "committed" stay three distinct answers on the real control-plane path.
 fn pre_gateway_refusal_outcome(
     request: &GenerationCutoverRequest,
-    error: KernelServiceError,
+    error: &KernelServiceError,
 ) -> GenerationCutoverOutcome {
     observe_generation_cutover(
         "kernel.generation.cutover_requested",
@@ -536,11 +536,11 @@ fn pre_gateway_refusal_outcome(
         "rejected",
         request.cutover_id.as_str(),
     );
-    super::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(&error));
+    super::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(error));
     GenerationCutoverOutcome {
         version: 1,
         cutover_id: request.cutover_id.clone(),
-        terminal_code: Some(generation_cutover_terminal_code(&error)),
+        terminal_code: Some(generation_cutover_terminal_code(error)),
         state_fence: request.state_fence.clone(),
         cutover_receipt: None,
     }
@@ -586,7 +586,7 @@ fn rollback_refusal_outcome(
     if !matches!(&error, KernelServiceError::GenerationFenced) {
         return Err(error);
     }
-    Ok(pre_gateway_refusal_outcome(request, error))
+    Ok(pre_gateway_refusal_outcome(request, &error))
 }
 
 #[derive(Clone, Copy)]
@@ -713,10 +713,7 @@ fn admit_cutover_candidate(
         i64::try_from(unix_ms()).unwrap_or(i64::MAX),
     )
     .map_err(|mismatch| refusal(&mismatch))?;
-    activation
-        .require_admitted()
-        .map(|_| ())
-        .map_err(|mismatch| refusal(mismatch))
+    activation.require_admitted().map(|_| ()).map_err(refusal)
 }
 
 impl ServiceFenceObservation {
@@ -1199,7 +1196,7 @@ impl KernelComposition {
             // projected on the authenticated reply by
             // `pre_gateway_refusal_outcome` with this frame's single terminal.
             if let Err(error) = self.admit_uncommitted_cutover_candidate(replacement) {
-                return Ok(pre_gateway_refusal_outcome(request, error));
+                return Ok(pre_gateway_refusal_outcome(request, &error));
             }
             // Same rule, and it has to run HERE: once this ingress writes the
             // row below, the route is switched from a record whose `migration`

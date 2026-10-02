@@ -347,7 +347,9 @@ impl AgentBridgeI65Declaration {
         self.state_fence
             .validate()
             .map_err(BridgeContractError::Contract)?;
-        self.contract.validate().map_err(BridgeContractError::Contract)?;
+        self.contract
+            .validate()
+            .map_err(BridgeContractError::Contract)?;
         if self.contract.bridge_id.as_str() != self.adapter_id.as_str() {
             return Err(BridgeContractError::InvalidDeclaration {
                 field: "contract.bridge_id",
@@ -576,7 +578,14 @@ mod tests {
 
     /// The declaration the owner issues for the fixture admitted generation.
     fn admitted_declaration() -> Result<AgentBridgeI65Declaration, Box<dyn std::error::Error>> {
-        issue_agent_bridge_declaration(&fixture_declaration(TEST_LINEAGE, 7)?)
+        // `issue_agent_bridge_declaration` answers with this module's own
+        // `BridgeContractError`, not with `Box<dyn Error>`; the `Ok(..)?` is what
+        // performs that widening. Returning it bare is the E0308 this line used
+        // to produce and is why the lib-test target did not compile.
+        Ok(issue_agent_bridge_declaration(&fixture_declaration(
+            TEST_LINEAGE,
+            7,
+        )?)?)
     }
 
     /// Asserts the owner-issued gate refuses `declaration`, and records the
@@ -656,7 +665,10 @@ mod tests {
         assert_eq!(declaration.adapter_revision, env!("CARGO_PKG_VERSION"));
         assert_eq!(declaration.module_generation, admitted.module_generation);
         assert_eq!(declaration.state_fence, fence);
-        assert_eq!(declaration.declaration_sha256, declaration.compute_digest()?);
+        assert_eq!(
+            declaration.declaration_sha256,
+            declaration.compute_digest()?
+        );
         declaration.validate()?;
         validate_agent_bridge_declaration(&declaration, &admitted, &fence)?;
         Ok(())
