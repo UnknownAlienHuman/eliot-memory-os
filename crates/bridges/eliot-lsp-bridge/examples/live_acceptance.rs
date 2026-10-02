@@ -4,13 +4,14 @@
 //! `WindowsProcessExecutor`, including its suspended launch and process
 //! evidence path. Its local dispatch permit fixture is deliberately limited
 //! to this module/edge proof; it is not evidence of the authenticated daemon
-//! queue or the original Kernel caller composition. The selected-source
-//! owner proof lives with the daemon caller tests.
+//! queue or the original Kernel caller composition. Selected-source owner
+//! proof requires the daemon's original caller tests.
 //!
 //! Arguments are explicit: `<rust-analyzer.exe> <scratch-root>
 //! <workspace-root> <output-root>`. The manager supplies lane-local roots,
-//! `TEMP`/`TMP`, and `CARGO_TARGET_DIR`; the example refuses paths outside
-//! those contours and leaves its proof fixture for review and cleanup.
+//! `TEMP`/`TMP`, and `CARGO_TARGET_DIR` under the CS2 target root; the example
+//! refuses paths outside those contours and leaves its proof fixture for
+//! review and cleanup.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -47,24 +48,13 @@ mod live {
     const LANE_SCRATCH_ROOT: &str =
         r"C:\Development\Rust\projects\eliot-swarm\control-20260923-impl\v2\workers\CS2\scratch";
     const LANE_TARGET_ROOT: &str =
-        r"C:\Development\Rust\projects\eliot-swarm\control-20260923-impl\v2\targets\CS2";
+        r"C:\Development\Rust\projects\eliot-swarm\targets\CS2";
     const EPOCH_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const STDOUT_LIMIT: u64 = 8 * 1024 * 1024;
     const STDERR_LIMIT: u64 = 2 * 1024 * 1024;
     const WALL_TIMEOUT_MS: u64 = 240_000;
 
     static NEXT_INVOCATION: AtomicU64 = AtomicU64::new(1);
-    const CHILD_ENV_ALLOWLIST: [&str; 8] = [
-        "PATH",
-        "RUSTUP_HOME",
-        "CARGO_HOME",
-        "RUSTC",
-        "USERPROFILE",
-        "SystemRoot",
-        "TEMP",
-        "TMP",
-    ];
-
     type RunResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
     #[derive(Default)]
@@ -316,6 +306,19 @@ mod live {
         Ok(path)
     }
 
+    fn find_worktree_root(start: &Path) -> RunResult<PathBuf> {
+        let mut current = std::fs::canonicalize(start)?;
+        loop {
+            if current.join(".git").exists() {
+                return Ok(current);
+            }
+            let Some(parent) = current.parent() else {
+                return Err("current directory is not inside a Git worktree".into());
+            };
+            current = parent.to_path_buf();
+        }
+    }
+
     fn validate_roots(
         scratch: &Path,
         workspace: &Path,
@@ -324,11 +327,17 @@ mod live {
         tmp: &Path,
         target: &Path,
     ) -> RunResult<()> {
-        let worktree = canonical_directory(std::env::current_dir()?, "current worktree")?;
-        let lane_scratch = canonical_directory(PathBuf::from(LANE_SCRATCH_ROOT), "CS2 lane scratch")?;
+        let worktree = find_worktree_root(&std::env::current_dir()?)?;
         let lane_target = canonical_directory(PathBuf::from(LANE_TARGET_ROOT), "CS2 target root")?;
-        if !scratch.starts_with(worktree) && !scratch.starts_with(lane_scratch) {
-            return Err("scratch root must be within this worktree or CS2 lane scratch".into());
+        if !scratch.starts_with(&worktree) {
+            let lane_scratch_path = PathBuf::from(LANE_SCRATCH_ROOT);
+            if !lane_scratch_path.exists() {
+                return Err("scratch root must be within this worktree or the available CS2 lane scratch".into());
+            }
+            let lane_scratch = canonical_directory(lane_scratch_path, "CS2 lane scratch")?;
+            if !scratch.starts_with(lane_scratch) {
+                return Err("scratch root must be within this worktree or CS2 lane scratch".into());
+            }
         }
         for (label, path) in [("workspace", workspace), ("output", output), ("TEMP", temp), ("TMP", tmp)] {
             if !path.starts_with(scratch) {
@@ -347,6 +356,15 @@ mod live {
             .map_or(0, |duration| {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
             })
+    }
+
+    fn original_invoked_at(evidence: &ProcessEvidence) -> RunResult<u64> {
+        evidence.validate()?;
+        evidence
+            .view()
+            .identity()
+            .map(|identity| identity.resumed_at_unix_ms())
+            .ok_or_else(|| "validated process evidence has no resumed process identity".into())
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -477,6 +495,7 @@ mod live {
         // shared executor, then bind the version line to the semantic result.
         let version_command = LspCommand::version(&config, &candidate)?;
         let version_evidence = execute(&bridge, &authority, Arc::clone(&sink), &version_command)?;
+        let version_invoked_at = original_invoked_at(&version_evidence)?;
         let version_stdout = LspBridge::<WindowsProcessExecutor>::stdout_bytes(&version_evidence);
         let version_result = finalize_version(
             &config,
@@ -485,12 +504,20 @@ mod live {
             false,
             LspBridge::<WindowsProcessExecutor>::exit_code(&version_evidence),
             true,
-            unix_ms(),
+            version_invoked_at,
         );
         let NormalizedResult::Version { version, receipt } = version_result else {
             return Err("version request did not produce a version result".into());
         };
-        if version.is_empty() || receipt.executable != executable_text {
+        if version.is_empty()
+            || receipt.executable != executable_text
+            || receipt.config_hash != config.config_hash()
+            || receipt.candidate != candidate.reference()
+            || receipt.invoked_at_unix_ms != version_invoked_at
+            || receipt.coverage != Coverage::ProbeOnly
+            || receipt.disposition != FailureDisposition::Success
+            || !matches!(&receipt.freshness, Freshness::Stale { .. })
+        {
             return Err("version result lost the exact executable identity".into());
         }
 
@@ -501,7 +528,7 @@ mod live {
             Arc::clone(&sink),
             &diagnostics_command,
         )?;
-        let invoked_at = unix_ms();
+        let invoked_at = original_invoked_at(&diagnostics_evidence)?;
         let diagnostics = finalize_diagnostics(
             &config,
             &candidate,
@@ -543,6 +570,10 @@ mod live {
         );
         let scip_command = LspCommand::scip(&config, &candidate)?;
         let scip_evidence = execute(&bridge, &authority, Arc::clone(&sink), &scip_command)?;
+        let scip_invoked_at = original_invoked_at(&scip_evidence)?;
+        if LspBridge::<WindowsProcessExecutor>::exit_code(&scip_evidence) != Some(0) {
+            return Err("rust-analyzer SCIP invocation did not exit successfully".into());
+        }
         let sidecar_path = config
             .scip_output_path
             .as_deref()
@@ -560,12 +591,23 @@ mod live {
             },
             &sidecar,
             sidecar_path,
-            unix_ms(),
+            scip_invoked_at,
             None,
         );
-        let NormalizedResult::Symbols { items, .. } = symbol_result else {
+        let NormalizedResult::Symbols { items, receipt: symbol_receipt } = symbol_result else {
             return Err("SCIP result did not normalize to symbols".into());
         };
+        if symbol_receipt.executable != executable_text
+            || symbol_receipt.config_hash != config.config_hash()
+            || symbol_receipt.candidate != candidate.reference()
+            || symbol_receipt.invoked_at_unix_ms != scip_invoked_at
+            || symbol_receipt.coverage
+                != (Coverage::SymbolSubset { path_scope: "src/lib.rs".to_owned() })
+            || !matches!(&symbol_receipt.freshness, Freshness::Stale { .. })
+            || symbol_receipt.disposition != FailureDisposition::Success
+        {
+            return Err("symbols receipt does not match the live SCIP invocation".into());
+        }
         let symbol = items
             .iter()
             .find(|item| item.display_name.as_deref() == Some("lsp_live_probe_symbol"))
@@ -581,7 +623,7 @@ mod live {
             },
             &sidecar,
             sidecar_path,
-            unix_ms(),
+            scip_invoked_at,
             None,
         );
         let NormalizedResult::Rename { candidate: edits, receipt: rename_receipt } = rename else {
@@ -593,6 +635,11 @@ mod live {
             || source_before != source_after
             || rename_receipt.executable != executable_text
             || rename_receipt.config_hash != config.config_hash()
+            || rename_receipt.candidate != candidate.reference()
+            || rename_receipt.invoked_at_unix_ms != scip_invoked_at
+            || rename_receipt.coverage != (Coverage::SingleSymbol { symbol: edits.symbol.clone() })
+            || !matches!(&rename_receipt.freshness, Freshness::Stale { .. })
+            || rename_receipt.disposition != FailureDisposition::Success
         {
             return Err("rename was applied, incomplete, or lost its request binding".into());
         }
