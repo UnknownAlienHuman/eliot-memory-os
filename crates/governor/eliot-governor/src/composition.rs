@@ -18,6 +18,11 @@ use crate::activation_outcome::{
 use crate::canonical_projections::{
     GovernorProjectionError, compose_canonical_projections, emit_canonical_projection_set,
 };
+use crate::capability_evidence::{CapabilityEvidenceRecord, OwnerEvidenceRevision};
+use crate::capability_registry::{
+    CapabilityProjectionInput, CapabilityRegistry, CapabilityRegistryError,
+    PolicySupervisionInput,
+};
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
@@ -96,14 +101,15 @@ use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
-    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
-    ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
+    CatalogPolicyView, ColdStartReadinessClaim, ColdStartReadinessOrsRecord,
+    ColdStartReadinessOwnerKey, ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
     ColdStartReadinessTerminalDisposition, ScanDisclosureRecordOwner,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
-    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState, RuntimeLease,
+    AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState, HealthDimension,
+    RuntimeLease,
 };
 use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
@@ -719,6 +725,18 @@ pub enum RecoveryOwner {
     Config,
     /// Policy projection (optional; served independently of [`RecoveryOwner::ALL`]).
     Policy,
+    /// Capability-evidence projection (optional; served independently of
+    /// [`RecoveryOwner::ALL`]).
+    ///
+    /// This is not a second read protocol. It is one more closed selector in
+    /// the same named-read vocabulary every other owner travels over, and it
+    /// exists because the I1.9 Capability Registry projection needs the real
+    /// retained `GetCapabilityEvidenceRecordRange` rows that no existing
+    /// `RecoveryOwner` carries. An unserved owner yields explicit `None`
+    /// (see [`GovernorRecoverySnapshot::capability_evidence_read`]), exactly as
+    /// [`RecoveryOwner::Policy`] does, so the absence is fail-closed instead of
+    /// a locally manufactured default.
+    CapabilityEvidence,
     /// Coordination projection.
     Coordination,
     /// Finish projection.
@@ -772,6 +790,7 @@ impl RecoveryOwner {
             Self::Budget => "budget",
             Self::Config => "config",
             Self::Policy => "policy",
+            Self::CapabilityEvidence => "capability_evidence",
             Self::Coordination => "coordination",
             Self::Finish => "finish",
             Self::Problem => "problem",
@@ -845,6 +864,15 @@ pub struct GovernorRecoverySnapshot {
     /// policy-gated evidence stays explicitly absent (fail-closed) and the
     /// required-set validation above is unaffected.
     pub policy_read: Option<KernelNamedReadReply>,
+    /// Optional capability-evidence named read, served independently of the
+    /// required owner set and decoded through the existing
+    /// `GetCapabilityEvidenceRecordRange` leg. `None` means the Kernel does not
+    /// serve durable capability evidence to the Governor yet: the I1.9
+    /// Capability Registry then projects no recorded evidence, which
+    /// [`capability_registry::evaluate_admission`] already refuses as
+    /// `PendingEvidence`. No record is ever copied, synthesised or defaulted in
+    /// its place.
+    pub capability_evidence_read: Option<KernelNamedReadReply>,
     /// Canonical revision/order heads recovered by the Kernel.
     pub canonical_scope: ScopeRevisionView,
     /// Exact terminal receipts available for operation replay/reconciliation.
@@ -4422,6 +4450,11 @@ pub struct GovernorOwners<P: ?Sized> {
     /// not serve the Policy named read; policy-gated evidence then stays
     /// explicitly absent (fail-closed), never defaulted.
     pub policy: Option<PolicyOwner>,
+    /// Retained durable capability evidence for the I1.9 Capability Registry
+    /// projection. `None` while the Kernel does not serve the
+    /// [`RecoveryOwner::CapabilityEvidence`] named read; the projection then
+    /// records no evidence and stays `PendingEvidence`, never defaulted.
+    pub capability_evidence: Option<CapabilityEvidenceOwner>,
     /// Durable application coordination owner.
     pub coordination: CoordinationOwner,
     /// Finish candidate projection owner.
@@ -4524,6 +4557,10 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let policy = match &recovery.policy_read {
             Some(reply) => Some(PolicyOwner::recover(reply, state_fence)?),
+            None => None,
+        };
+        let capability_evidence = match &recovery.capability_evidence_read {
+            Some(reply) => Some(decode_capability_evidence_owner(reply, state_fence)?),
             None => None,
         };
         let coordination_wire: CoordinationOwner =
@@ -4649,6 +4686,7 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
                 snapshot_digest: config_snapshot_digest,
             },
             policy,
+            capability_evidence,
             coordination,
             finish,
             problem: ProblemOwner {
@@ -4672,6 +4710,401 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
     pub const fn owner_ids(&self) -> [&'static str; 16] {
         OWNER_IDS
     }
+}
+
+/// One durable capability-evidence row as the store's
+/// `GetCapabilityEvidenceRecordRange` leg serves it.
+///
+/// This is the closed row shape both admitted providers project — the verbatim
+/// committed document, the owner-issued digest of exactly those bytes, and the
+/// store-issued revision the fenced compare-and-set assigned. The document
+/// stays an opaque string here and is decoded, and re-proved, by
+/// [`decode_capability_evidence_owner`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityEvidenceOwnerRow {
+    /// Exact capability identity of the evidence key.
+    skill_id: String,
+    /// Owner-issued digest of the exact route-scope fingerprint.
+    scope_key: String,
+    /// Presented digest of the committed record bytes.
+    record_digest: String,
+    /// Verbatim canonical evidence-record document.
+    record_json: String,
+    /// Store-issued owner revision that orders this key.
+    revision: u64,
+}
+
+/// The closed capability-evidence owner payload carried by one named read.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityEvidenceOwnerPayload {
+    state_fence: StateFence,
+    revision: u64,
+    records: Vec<CapabilityEvidenceOwnerRow>,
+}
+
+/// Retained durable capability evidence the I1.9 Capability Registry projection
+/// reads (issue #1883).
+///
+/// Every retained value is a real [`CapabilityEvidenceRecord`] decoded from the
+/// exact bytes the canonical store committed, paired with the store-issued
+/// [`OwnerEvidenceRevision`] that orders its key. Nothing here is copied,
+/// synthesised or defaulted: when the Kernel does not serve the
+/// [`RecoveryOwner::CapabilityEvidence`] read there is no owner at all
+/// ([`GovernorOwners::capability_evidence`] is `None`), which the projection
+/// reads as "no evidence recorded" rather than as an admitted capability.
+#[derive(Clone, Debug)]
+pub struct CapabilityEvidenceOwner {
+    state_fence: StateFence,
+    revision: u64,
+    /// Store-issued revisions and their exact decoded records, in served order.
+    records: Vec<(OwnerEvidenceRevision, CapabilityEvidenceRecord)>,
+}
+
+impl CapabilityEvidenceOwner {
+    /// Returns the fence every retained record was served under.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the durable owner revision the named read reported.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns every retained record, in the order the store served it.
+    #[must_use]
+    pub fn records(&self) -> Vec<&CapabilityEvidenceRecord> {
+        self.records
+            .iter()
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// Returns the store-issued owner revision of every retained record.
+    #[must_use]
+    pub fn owner_revisions(&self) -> Vec<OwnerEvidenceRevision> {
+        self.records
+            .iter()
+            .map(|(revision, _)| *revision)
+            .collect()
+    }
+
+    /// Returns the retained record for one exact capability identity.
+    ///
+    /// The lookup is an exact identity join on the same `skill_id` key the
+    /// canonical evidence read itself uses, so a record can never be attributed
+    /// to a module that did not declare that capability.
+    #[must_use]
+    pub fn record(&self, skill_id: &str) -> Option<&CapabilityEvidenceRecord> {
+        self.records
+            .iter()
+            .find(|(_, record)| record.skill_id == skill_id)
+            .map(|(_, record)| record)
+    }
+
+    /// Returns the number of retained records.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Returns true when no evidence record was retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+/// Decodes and re-proves one optional capability-evidence named read.
+///
+/// The order of the checks is the order of the guarantees, and it is the same
+/// order the store providers and the daemon-side evidence bridge already use
+/// for this leg, so a page accepted here carries exactly the owner authority it
+/// carried there:
+///
+/// 1. the reply answers exactly the requested owner, at the active fence, with a
+///    non-zero revision, the closed owner schema, a bounded payload and a
+///    `value_digest` that recomputes over those exact bytes;
+/// 2. the payload is canonical JSON and its own envelope revision agrees with
+///    the named read's revision, so a re-serialized or truncated body cannot
+///    pass as the served one;
+/// 3. every row's `record_digest` recomputes over the ORIGINAL recorded bytes,
+///    and the decoded record's own `(skill_id, scope_fingerprint)` reproduces
+///    the row's `scope_key` address and its `skill_id` selector;
+/// 4. the store-issued revision is admitted through
+///    [`OwnerEvidenceRevision::issued`], which is what proves the row is ordered
+///    rather than merely present.
+///
+/// A row that fails any re-proof refuses the whole read. Nothing partially
+/// decoded is retained.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] naming the failed owner or field.
+fn decode_capability_evidence_owner(
+    reply: &KernelNamedReadReply,
+    expected_fence: &StateFence,
+) -> Result<CapabilityEvidenceOwner, CompositionError> {
+    let owner = RecoveryOwner::CapabilityEvidence;
+    if reply.owner != owner {
+        return Err(CompositionError::Recovery(format!(
+            "capability evidence named read carries a foreign owner {}",
+            reply.owner.as_str()
+        )));
+    }
+    if reply.state_fence != *expected_fence
+        || reply.revision == 0
+        || reply.schema != OWNER_SNAPSHOT_SCHEMA
+        || reply.payload.is_empty()
+        || reply.payload.len() > MAX_OWNER_SNAPSHOT_BYTES
+        || !is_sha256(&reply.value_digest)
+        || sha256_hex(&reply.payload) != reply.value_digest
+    {
+        return Err(CompositionError::Recovery(format!(
+            "owner {} has invalid fence, revision, or payload digest",
+            owner.as_str()
+        )));
+    }
+    let wire: CapabilityEvidenceOwnerPayload = serde_json::from_slice(&reply.payload).map_err(
+        |error| {
+            CompositionError::Recovery(format!(
+                "owner {} payload schema rejected: {error}",
+                owner.as_str()
+            ))
+        },
+    )?;
+    let canonical = canonical_json_bytes(&wire).map_err(|error| {
+        CompositionError::Recovery(format!(
+            "owner {} payload could not be canonicalized: {error}",
+            owner.as_str()
+        ))
+    })?;
+    if canonical != reply.payload {
+        return Err(CompositionError::Recovery(format!(
+            "owner {} payload is not canonical JSON",
+            owner.as_str()
+        )));
+    }
+    if wire.revision != reply.revision {
+        return Err(CompositionError::Recovery(format!(
+            "owner {} snapshot revision does not match its named-read revision",
+            owner.as_str()
+        )));
+    }
+    if wire.state_fence != *expected_fence {
+        return Err(CompositionError::Recovery(format!(
+            "owner {} snapshot has a stale state fence",
+            owner.as_str()
+        )));
+    }
+    let mut records = Vec::with_capacity(wire.records.len());
+    for row in &wire.records {
+        if row.record_json.len() > eliot_store_api::MAX_CAPABILITY_EVIDENCE_RECORD_JSON_BYTES {
+            return Err(CompositionError::Recovery(format!(
+                "owner {} served an oversized evidence document",
+                owner.as_str()
+            )));
+        }
+        if sha256_hex(row.record_json.as_bytes()) != row.record_digest {
+            return Err(CompositionError::Recovery(format!(
+                "owner {} served an evidence row whose digest does not cover its own bytes",
+                owner.as_str()
+            )));
+        }
+        // The ORIGINAL recorded bytes are read, not a re-derivation over what we
+        // hold: the record is taken from the document the store committed under
+        // the digest it echoed, and the re-proofs above bind those exact bytes.
+        let record: CapabilityEvidenceRecord =
+            serde_json::from_str(&row.record_json).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "owner {} served an undecodable evidence document: {error}",
+                    owner.as_str()
+                ))
+            })?;
+        if record.skill_id != row.skill_id
+            || record.scope_fingerprint.reference_digest() != row.scope_key
+        {
+            return Err(CompositionError::Recovery(format!(
+                "owner {} served an evidence row that disagrees with its own key address",
+                owner.as_str()
+            )));
+        }
+        let revision = OwnerEvidenceRevision::issued(row.revision, &row.record_digest).map_err(
+            |error| {
+                CompositionError::Recovery(format!(
+                    "owner {} served an unorderable evidence revision: {error}",
+                    owner.as_str()
+                ))
+            },
+        )?;
+        if records
+            .iter()
+            .any(|(_, held): &(OwnerEvidenceRevision, CapabilityEvidenceRecord)| {
+                held.skill_id == record.skill_id
+                    && held.scope_fingerprint.reference_digest() == row.scope_key
+            })
+        {
+            return Err(CompositionError::Recovery(format!(
+                "owner {} served the same evidence key twice in one page",
+                owner.as_str()
+            )));
+        }
+        records.push((revision, record));
+    }
+    Ok(CapabilityEvidenceOwner {
+        state_fence: expected_fence.clone(),
+        revision: wire.revision,
+        records,
+    })
+}
+
+/// Selects the retained evidence a Module Catalog desired record declares.
+///
+/// The join is an exact identity join driven by the catalog's own
+/// `capability_intents.capability_id` list — the same key the canonical
+/// evidence read keys on — so the projection never inherits evidence from a
+/// capability the module did not declare.
+fn module_capability_evidence(
+    evidence: &CapabilityEvidenceOwner,
+    catalog: &eliot_module_registry::ModuleCatalogEntry,
+) -> Vec<CapabilityEvidenceRecord> {
+    let declared: BTreeSet<&str> = catalog
+        .manifest
+        .capability_intents
+        .iter()
+        .map(|intent| intent.capability_id.as_str())
+        .collect();
+    evidence
+        .records
+        .iter()
+        .filter(|(_, record)| declared.contains(record.skill_id.as_str()))
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
+/// Reads the Kernel's current Module Catalog/Policy view availability off the
+/// recovered Policy owner (issue #1883).
+///
+/// The view is `Current` exactly when the Kernel served the
+/// [`RecoveryOwner::Policy`] read at this fence — the Policy owner is the
+/// Governor's channel for the Host-approved Catalog/Policy view — and
+/// `Unavailable` when it did not. It is never reported `Stale`: the Governor has
+/// no channel that carries a superseded view, and reporting one would be a
+/// fabricated observation rather than a fail-closed absence.
+fn observed_catalog_policy_view<P: KernelDurableJobPort + ?Sized>(
+    owners: &GovernorOwners<P>,
+) -> CatalogPolicyView {
+    if owners.policy.is_some() {
+        CatalogPolicyView::Current
+    } else {
+        CatalogPolicyView::Unavailable
+    }
+}
+
+/// Severity rank used to fold the observed supervision health dimensions.
+const fn supervision_health_rank(dimension: HealthDimension) -> u8 {
+    match dimension {
+        HealthDimension::Healthy => 0,
+        HealthDimension::Unknown => 1,
+        HealthDimension::Degraded => 2,
+        HealthDimension::Failed => 3,
+    }
+}
+
+/// Reads the supervision health dimension the Capability Registry projects
+/// under, from the real Kernel service observations.
+///
+/// [`HealthVector::readiness`] is the dimension that states whether the
+/// capability may accept the declared work class, which is exactly the question
+/// a usability/admission projection asks, so that is the dimension read. The
+/// worst dimension observed across the ordered services wins, because admission
+/// cannot rest on one healthy service while another is degraded. With no
+/// observation at all the dimension is `Unknown`, which
+/// [`capability_registry::evaluate_admission`] refuses; a fabricated `Healthy`
+/// is never returned.
+fn observed_supervision_health(observations: &[KernelServiceRecovery]) -> HealthDimension {
+    observations
+        .iter()
+        .map(|recovered| recovered.observation.health.readiness)
+        .min_by_key(|dimension| supervision_health_rank(*dimension))
+        .unwrap_or(HealthDimension::Unknown)
+}
+
+/// Assembles the I1.9 Capability Registry from the three recovered input
+/// classes (issue #1883).
+///
+/// The projection is called once per Module Catalog desired/admission record,
+/// so the desired side is always real owner data recovered through
+/// [`GovernorOwners::from_recovery`]:
+///
+/// * **canonical manifests** — the catalog entry itself;
+/// * **policy/supervision** — [`observed_catalog_policy_view`] over the
+///   recovered Policy owner and [`observed_supervision_health`] over the
+///   recovered service observations;
+/// * **canonical evidence** — the retained rows of the recovered
+///   [`CapabilityEvidenceOwner`], selected by that entry's own declared
+///   capability intents.
+///
+/// **Named ceiling: the Kernel generation/health input is not reachable from
+/// this composition, so it is passed absent.** The Generation Registry is
+/// Kernel/ORS operational state and is reached today only through
+/// `bins/eliotd::dreamer_model_adapter::query_kernel_generation` under the
+/// `daemon_generation_projection` selector, which no Governor-crate port exposes
+/// (`KernelGenerationPort` has no query operation), and
+/// `RedbRecoveryStore::persist_admitted_kernel_execution_manifest` has no caller,
+/// so no `GenerationRegistryRecord` exists to read even if it did. The delivered
+/// [`capability_registry::project_capability`] turns that absence into
+/// [`CapabilityRegistryError::NoUsableInstallation`], which this function
+/// records rather than papers over: the desired generation stays absent from
+/// the registry until an operational record can actually be observed. No
+/// `GenerationRegistryRecord` is ever fabricated to fill it, and no desired
+/// generation is reported admitted without one.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Owner`] when the Module Catalog's own snapshot
+/// cannot be read back, or when the projection refuses a record for any reason
+/// other than the named generation-input ceiling.
+fn project_capability_registry<P: KernelDurableJobPort + ?Sized>(
+    owners: &GovernorOwners<P>,
+    supervision_health: HealthDimension,
+) -> Result<CapabilityRegistry, CompositionError> {
+    let catalog_view = observed_catalog_policy_view(owners);
+    let catalog = owners
+        .module_registry
+        .snapshot()
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let mut registry = CapabilityRegistry::new();
+    for entry in &catalog.entries {
+        let evidence = match owners.capability_evidence.as_ref() {
+            Some(owner) => module_capability_evidence(owner, entry),
+            // The optional owner read was not served. That is an absent owner,
+            // not a defaulted record set: the catalog declares no served
+            // evidence, and `evaluate_admission` refuses on an empty evidence
+            // set exactly as it would on served rows that declare nothing.
+            None => Vec::new(),
+        };
+        let input = CapabilityProjectionInput {
+            catalog: Some(entry.clone()),
+            evidence,
+            // Named ceiling, see the doc comment above.
+            generation: None,
+            policy: PolicySupervisionInput {
+                catalog_view,
+                supervision_health,
+            },
+        };
+        match registry.project(&input) {
+            Ok(_) => {}
+            Err(CapabilityRegistryError::NoUsableInstallation) => {}
+            Err(error) => return Err(CompositionError::Owner(error.to_string())),
+        }
+    }
+    Ok(registry)
 }
 
 /// Startup phase of the one Governor composition.
@@ -4738,6 +5171,13 @@ pub struct GovernorComposition<P: ?Sized> {
     /// [`Self::last_scope_quarantine`]; read the full bounded history with
     /// [`Self::scope_quarantine_history`].
     scope_quarantine: Vec<QuarantinedScopeRecord>,
+    /// I1.9 Capability Registry: the Governor-owned composite projection
+    /// assembled from the recovered owner inputs. It owns no lifecycle, never
+    /// mutates the Module Catalog or the Generation Registry, and cannot infer
+    /// process truth or authority from route availability. Read it with
+    /// [`Self::capability_registry`] and
+    /// [`Self::is_capability_admitted`].
+    capability_registry: CapabilityRegistry,
 }
 
 fn testd_finished_clock(job: &TestJob) -> ClockReading {
@@ -5436,6 +5876,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot.protected_snapshot_digest.clone(),
             &recovery,
         )?;
+        // The I1.9 Capability Registry is projected here, from the recovered
+        // owners and the recovered service observations, because that is the one
+        // point where all three input classes are simultaneously real owner
+        // data. It is a composite projection: it reads the Module Catalog, the
+        // retained capability evidence and the policy/supervision view, and it
+        // mutates none of them.
+        let capability_registry =
+            project_capability_registry(&owners, observed_supervision_health(&service_observations))?;
         Ok(Self {
             kernel,
             authority_activation,
@@ -5451,7 +5899,33 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             cold_start_readiness_contour: None,
             cold_start_readiness_claims: BTreeMap::new(),
             scope_quarantine: Vec::new(),
+            capability_registry,
         })
+    }
+
+    /// Returns the I1.9 Capability Registry: the Governor-owned composite
+    /// projection, independently inspectable without reading the Module Catalog
+    /// or the Generation Registry.
+    ///
+    /// The projection records, per `(module_id, generation)`, the usable
+    /// installation/route, the recorded evidence and limitations, and the
+    /// admission status. It owns no lifecycle: removing a projection record
+    /// removes only this registry.
+    #[must_use]
+    pub const fn capability_registry(&self) -> &CapabilityRegistry {
+        &self.capability_registry
+    }
+
+    /// Returns whether the Capability Registry admits one `(module_id,
+    /// generation)` as a usable capability.
+    ///
+    /// Admission requires recorded Governor evidence under a current
+    /// policy/supervision view; a merely running generation is `PendingEvidence`
+    /// and does not appear as admitted until the Governor projection records the
+    /// required evidence.
+    #[must_use]
+    pub fn is_capability_admitted(&self, module_id: &str, generation: ResourceGeneration) -> bool {
+        self.capability_registry.is_admitted(module_id, generation)
     }
 
     /// Returns the one owner set.
@@ -9412,9 +9886,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             protected_snapshot_digest.clone(),
             &recovery,
         )?;
+        // Re-projected from the same refreshed owner set and observations, so the
+        // Capability Registry can never describe a superseded owner read. The
+        // swap stays all-or-nothing with `owners`/`recovery`: a refusal leaves
+        // the previously published projection exactly as it was.
+        let capability_registry =
+            project_capability_registry(&owners, observed_supervision_health(&service_observations))?;
         self.owners = owners;
         self.recovery = recovery;
         self.service_observations = service_observations;
+        self.capability_registry = capability_registry;
         Ok(())
     }
 
@@ -10988,11 +11469,24 @@ fn recover_from_kernel<P: KernelRecoveryPort + ?Sized>(
             protected_snapshot_digest: protected_snapshot_digest.to_owned(),
         })
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+    // The capability-evidence read rides the same channel for the same reason:
+    // it is an owner input the I1.9 Capability Registry projection needs and no
+    // required owner carries, so an unserved owner yields explicit `None` and
+    // the projection stays fail-closed rather than gaining evidence nobody
+    // served. A transport failure still fails closed.
+    let capability_evidence_read = kernel
+        .named_read(KernelNamedReadRequest {
+            owner: RecoveryOwner::CapabilityEvidence,
+            state_fence: state_fence.clone(),
+            protected_snapshot_digest: protected_snapshot_digest.to_owned(),
+        })
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
     Ok(GovernorRecoverySnapshot {
         state_fence: state_fence.clone(),
         protected_snapshot_digest: protected_snapshot_digest.to_owned(),
         owner_reads,
         policy_read,
+        capability_evidence_read,
         canonical_scope,
         receipts,
         durable_jobs,
@@ -11671,6 +12165,12 @@ mod tests {
                 serde_json::to_value(eliot_change_monitor::ChangeMonitorSnapshot::default())
             }
             RecoveryOwner::Policy => serde_json::to_value(policy_owner_snapshot(state_fence)),
+            RecoveryOwner::CapabilityEvidence => {
+                serde_json::to_value(capability_evidence_owner_payload(
+                    state_fence,
+                    Vec::new(),
+                ))
+            }
         }
         .expect("owner payload");
         canonical_json_bytes(&value).expect("owner payload bytes")

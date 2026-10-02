@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.IO.Pipes;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Eliot.Operator.Protocol;
@@ -261,6 +264,223 @@ True(record.Length <= OperatorDiagnostics.MaxRecordChars, "diagnostic record bou
 True(OperatorDiagnostics.ShouldRotate(OperatorDiagnostics.MaxLogBytes + 1), "log rotates at the cap");
 True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
 
+// ---------------------------------------------------------------------------
+// #1777 acceptance: the authenticated WinUI session binding (I11.8, I11.3).
+//
+// One fixture serves all four cases. `BrokerWireDouble` is the OWNER side of
+// the broker pipe the production client connects to: it binds the owner-issued
+// pipe name, reads the owner's preface and the two requests the client writes,
+// and answers with the broker's own `challenge` and `redeemed` objects. Every
+// value it sends is either the endpoint the client presented, the Kernel
+// session token it minted for that one exchange, or the identity this process
+// actually observes. It introduces no DTO, no field name, no protocol step and
+// no fault code, and it does not stand in for the Kernel: what is proved here
+// is the client side of the binding, which is the only side this file owns.
+// ---------------------------------------------------------------------------
+
+var operatorIdentity = OperatorProcessIdentityProvider.Current;
+var operatorSessionId = operatorIdentity.LogonSessionId.ToString(CultureInfo.InvariantCulture);
+var openBrokerPipes = new List<BrokerWireDouble>();
+using var bindingWindow = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+// A fresh owner-issued handoff for each case: its own pipe name, its own nonce
+// and its own requested capability set, all bound to THIS process's observed
+// logon session so the client's session check is a real comparison and not a
+// tautology.
+OperatorEndpoint BrokerIssuedEndpoint(IReadOnlyList<string> capabilities) => new(
+    @"\\.\pipe\eliot\operator\binding-" + Guid.NewGuid().ToString("N"),
+    7,
+    operatorSessionId,
+    "nonce-" + Guid.NewGuid().ToString("N"),
+    OperatorCapabilityNames.HumanOperatorRole,
+    capabilities);
+
+// CASE 1 - POSITIVE. A binding redeemed from a fresh Kernel-backed handoff
+// yields exactly the granted role/capability set: no member of the requested
+// set is dropped and no member beyond it is added.
+var fullCapabilities = new[] { OperatorCapabilityNames.ControlboardRead, OperatorCapabilityNames.OperatorCommand };
+var freshEndpoint = BrokerIssuedEndpoint(fullCapabilities);
+var freshBroker = new BrokerWireDouble(freshEndpoint, "kernel-token-first", staleKernelSessionToken: null);
+openBrokerPipes.Add(freshBroker);
+var freshServing = freshBroker.ServeAsync(bindingWindow.Token);
+var freshSession = await BrokerPipeClient.RedeemOperatorHandoffAsync(
+    freshEndpoint, operatorIdentity, bindingWindow.Token);
+await freshServing;
+Equal(1, freshBroker.Challenges, "case 1: a fresh Kernel-backed binding runs one challenge exchange");
+Equal(1, freshBroker.Redemptions, "case 1: a fresh Kernel-backed binding is redeemed exactly once");
+var presentedEndpoint = freshBroker.PresentedEndpoint;
+True(presentedEndpoint is not null, "case 1: redemption presented the owner-issued endpoint");
+Equal(freshEndpoint.PipeName, presentedEndpoint!.PipeName, "case 1: redemption presented the owner-issued pipe name verbatim");
+Equal(freshEndpoint.HandoffNonce, presentedEndpoint!.HandoffNonce, "case 1: redemption presented the owner-issued handoff nonce verbatim");
+Equal(freshEndpoint.BrokerEpoch, presentedEndpoint!.BrokerEpoch, "case 1: redemption presented the owner-issued registration epoch verbatim");
+Equal("kernel-token-first", freshBroker.RedeemedKernelToken, "case 1: redemption presented this exchange's Kernel session token");
+var grantedPrincipal = BrokerPipeClient.RetainedPrincipal;
+True(grantedPrincipal is not null, "case 1: a redeemed binding retains the broker-issued Human principal");
+True(
+    ReferenceEquals(grantedPrincipal, freshSession.Principal),
+    "case 1: the retained principal is the one this exchange produced");
+Equal(operatorIdentity.UserSid, grantedPrincipal!.Principal, "case 1: the retained principal is this process's authenticated user SID");
+Equal(operatorSessionId, grantedPrincipal.InteractiveSessionId, "case 1: the retained principal is bound to this interactive session");
+Equal("kernel-token-first", grantedPrincipal.KernelSessionToken, "case 1: the retained principal carries this exchange's Kernel session token");
+Equal(OperatorCapabilityNames.HumanOperatorRole, grantedPrincipal.Grant.Role, "case 1: the granted role is the broker-granted role");
+Equal(fullCapabilities.Length, grantedPrincipal.Grant.Capabilities.Count, "case 1: the granted set carries no member beyond the requested set");
+for (var capability = 0; capability < fullCapabilities.Length; capability++)
+{
+    Equal(fullCapabilities[capability], grantedPrincipal.Grant.Capabilities[capability], $"case 1: granted capability {capability} is the requested capability");
+}
+True(grantedPrincipal.Grant.GrantsCommands, "case 1: the granted set grants operator.command");
+
+// The UI gates on that GRANT, so the same grant that redemption produced is
+// the one handed to the view model: nothing here is invented for the UI.
+var grantedClient = new FakeGovernorClient { GrantedBinding = grantedPrincipal.Grant };
+var grantedViewModel = new MainViewModel(grantedClient)
+{
+    ProjectId = "00000000-0000-0000-0000-000000000001",
+    TaskId = "00000000-0000-0000-0000-000000000002"
+};
+await grantedViewModel.SelectSectionAsync("autonomy");
+True(grantedViewModel.CanIssueCommands, "case 1: the broker-granted set lets the UI offer the command");
+grantedViewModel.SelectedRecord = grantedViewModel.Records[0];
+grantedViewModel.SelectedAction = grantedViewModel.SelectedRecord.Actions[0];
+await grantedViewModel.ExecuteSelectedActionAsync();
+Equal(1, grantedClient.CommandCount, "case 1: the authorized request is submitted once as a typed operator intent");
+
+// CASE 2 - RESTART. Releasing the binding is what `GovernorPipeClient.DisposeAsync`
+// does, so this is the restart shape: a new instance holds no retained principal
+// and has to earn a fresh challenge and a fresh Kernel session token, and nothing
+// from the previous instance survives into the new one.
+BrokerPipeClient.ReleaseOperatorBinding();
+True(BrokerPipeClient.RetainedPrincipal is null, "case 2: a released binding retains no Human principal");
+True(!freshSession.IsLive, "case 2: the previous instance's session is no longer live");
+await using (var restartedClient = new GovernorPipeClient(new RuntimeDiscoveryService()))
+{
+    True(restartedClient.GrantedBinding is null, "case 2: a new client instance holds no granted binding");
+}
+var restartedEndpoint = BrokerIssuedEndpoint(fullCapabilities);
+var restartedBroker = new BrokerWireDouble(restartedEndpoint, "kernel-token-second", staleKernelSessionToken: null);
+openBrokerPipes.Add(restartedBroker);
+var restartedServing = restartedBroker.ServeAsync(bindingWindow.Token);
+var restartedSession = await BrokerPipeClient.RedeemOperatorHandoffAsync(
+    restartedEndpoint, operatorIdentity, bindingWindow.Token);
+await restartedServing;
+var restartedPrincipal = BrokerPipeClient.RetainedPrincipal;
+True(restartedPrincipal is not null, "case 2: the restarted UI earns a fresh Kernel-backed binding");
+True(
+    ReferenceEquals(restartedPrincipal, restartedSession.Principal),
+    "case 2: the fresh binding is the one the new exchange produced");
+True(!ReferenceEquals(restartedPrincipal, grantedPrincipal), "case 2: nothing from the previous instance survives");
+Equal(1, restartedBroker.Challenges, "case 2: the restarted UI runs a fresh challenge, not the spent one");
+Equal("kernel-token-second", restartedBroker.RedeemedKernelToken, "case 2: the fresh exchange presented its own newly issued token");
+Equal("kernel-token-second", restartedPrincipal!.KernelSessionToken, "case 2: the restarted UI holds the newly issued Kernel session token");
+True(
+    restartedPrincipal.KernelSessionToken != grantedPrincipal.KernelSessionToken,
+    "case 2: the restarted UI holds a new Kernel session token, not the previous one");
+Equal(restartedEndpoint.HandoffNonce, restartedBroker.PresentedEndpoint?.HandoffNonce, "case 2: the fresh exchange ran against a fresh owner-issued handoff");
+
+// CASE 3 - REFUSAL, STALE/ABSENT. Two arms, both refused before any state
+// change and both reported as the dispositions the branch already publishes.
+//
+// (a) No retained principal and no inherited handoff: the state-changing route
+// is refused at establishment with the existing typed disposition. No new fault
+// code is introduced and no binding is established.
+BrokerPipeClient.ReleaseOperatorBinding();
+True(BrokerPipeClient.RetainedPrincipal is null, "case 3: no Human principal is retained before the refused command");
+Environment.SetEnvironmentVariable(RuntimeDiscoveryService.EndpointEnvironmentVariable, null);
+await using (var refusingClient = new GovernorPipeClient(new RuntimeDiscoveryService()))
+{
+    OperatorRestartRequiredException? refusal = null;
+    try
+    {
+        await refusingClient.CommandAsync(OperatorIntentEnvelope.Create(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            7,
+            JsonSerializer.SerializeToElement(new { command = "resume_run" })));
+    }
+    catch (OperatorRestartRequiredException error)
+    {
+        refusal = error;
+    }
+    True(refusal is not null, "case 3: a state-changing route with no retained principal is refused");
+    Equal(
+        OperatorHandoff.ReacquisitionRequirement,
+        refusal!.Reason,
+        "case 3: the refusal reports the existing reacquisition disposition, not a new fault code");
+    True(refusingClient.GrantedBinding is null, "case 3: the refused command established no binding and sent nothing");
+}
+
+// (b) A stale token: the exchange answers `redeemed` with the PREVIOUS
+// instance's Kernel session token instead of the one this challenge minted.
+// The redemption is refused and nothing is retained.
+var staleEndpoint = BrokerIssuedEndpoint(fullCapabilities);
+var staleBroker = new BrokerWireDouble(staleEndpoint, "kernel-token-third", staleKernelSessionToken: "kernel-token-second");
+openBrokerPipes.Add(staleBroker);
+var staleServing = staleBroker.ServeAsync(bindingWindow.Token);
+OperatorRestartRequiredException? staleRefusal = null;
+try
+{
+    await BrokerPipeClient.RedeemOperatorHandoffAsync(staleEndpoint, operatorIdentity, bindingWindow.Token);
+}
+catch (OperatorRestartRequiredException error)
+{
+    staleRefusal = error;
+}
+await staleServing;
+True(staleRefusal is not null, "case 3: a redemption answered with a stale Kernel session token is refused");
+Equal(
+    OperatorFaultReason.HandshakeRefused,
+    staleRefusal!.Reason,
+    "case 3: the stale-token refusal is the existing handshake-refused disposition");
+Equal(1, staleBroker.Redemptions, "case 3: the stale-token answer was refused at redemption");
+True(BrokerPipeClient.RetainedPrincipal is null, "case 3: a refused redemption retains no principal");
+
+// CASE 4 - REFUSAL, CAPABILITY. The read-only subset is a real admitted
+// endpoint shape (`RuntimeDiscoveryService.ValidateEndpoint` admits any
+// non-empty subset of the closed vocabulary), so a read-only broker-issued
+// binding is reachable and its `operator.command` is simply not granted. The
+// capability is compared against the GRANTED set, not against a shape, and the
+// UI withholds the command before anything is journaled or sent.
+var readOnlyCapabilities = new[] { OperatorCapabilityNames.ControlboardRead };
+var readOnlyEndpoint = BrokerIssuedEndpoint(readOnlyCapabilities);
+var readOnlyBroker = new BrokerWireDouble(readOnlyEndpoint, "kernel-token-readonly", staleKernelSessionToken: null);
+openBrokerPipes.Add(readOnlyBroker);
+var readOnlyServing = readOnlyBroker.ServeAsync(bindingWindow.Token);
+var readOnlySession = await BrokerPipeClient.RedeemOperatorHandoffAsync(
+    readOnlyEndpoint, operatorIdentity, bindingWindow.Token);
+await readOnlyServing;
+var readOnlyPrincipal = BrokerPipeClient.RetainedPrincipal;
+True(readOnlyPrincipal is not null, "case 4: the read-only broker-issued binding retains its own principal");
+True(
+    ReferenceEquals(readOnlyPrincipal, readOnlySession.Principal),
+    "case 4: the retained principal is the one the read-only exchange produced");
+Equal(readOnlyCapabilities.Length, readOnlyPrincipal!.Grant.Capabilities.Count, "case 4: the granted set carries exactly the read-only member");
+Equal(OperatorCapabilityNames.ControlboardRead, readOnlyPrincipal.Grant.Capabilities[0], "case 4: the granted member is controlboard.read");
+True(!readOnlyPrincipal.Grant.Grants(OperatorCapabilityNames.OperatorCommand), "case 4: operator.command is not granted to this role");
+True(!readOnlyPrincipal.Grant.GrantsCommands, "case 4: the granted set grants no command");
+
+var withheldClient = new FakeGovernorClient { GrantedBinding = readOnlyPrincipal.Grant };
+var withheldViewModel = new MainViewModel(withheldClient)
+{
+    ProjectId = "00000000-0000-0000-0000-000000000001",
+    TaskId = "00000000-0000-0000-0000-000000000002"
+};
+await withheldViewModel.SelectSectionAsync("autonomy");
+True(!withheldViewModel.CanIssueCommands, "case 4: the UI withholds the command from a role not granted operator.command");
+withheldViewModel.SelectedRecord = withheldViewModel.Records[0];
+withheldViewModel.SelectedAction = withheldViewModel.SelectedRecord.Actions[0];
+await withheldViewModel.ExecuteSelectedActionAsync();
+Equal(0, withheldClient.CommandCount, "case 4: the capability-expanded request is refused before any state change");
+Equal("Command withheld for this role", withheldViewModel.StatusTitle, "case 4: the refusal is stated rather than silently dropped");
+True(
+    withheldViewModel.StatusMessage.Contains("nothing was journaled and nothing was sent", StringComparison.Ordinal),
+    "case 4: nothing was journaled and nothing was sent");
+
+BrokerPipeClient.ReleaseOperatorBinding();
+foreach (var openBrokerPipe in openBrokerPipes)
+{
+    openBrokerPipe.Dispose();
+}
+
 // The live probe runs AFTER every conformance assertion, and its failure is
 // bounded to one typed line. A run that reaches here has already executed and
 // passed every assertion above; a live probe that throws must not turn that
@@ -357,13 +577,19 @@ sealed class FakeGovernorClient : IGovernorClient
     public bool ThrowUnknownOnce { get; set; }
     public bool RotateGeneration { get; set; }
 
-    // This fake has no broker-authenticated transport, so there is no
-    // redeemed grant to report. The production client reports null for any
+    // This fake has no broker-authenticated transport of its own, so it
+    // defaults to no binding: the production client reports null for any
     // connection that is not live and authenticated, and null never
     // authorizes: callers treat it as "let the transport authenticate",
     // never as a capability. Fabricating a binding here would grant the
     // harness capabilities no owner ever issued to it.
-    public OperatorRoleBinding? GrantedBinding => null;
+    //
+    // It is settable because the #1777 binding cases hand the view model the
+    // EXACT grant a real redemption against the owner-side pipe produced in
+    // this same run, and nothing else. A read-only broker-issued grant makes
+    // the UI withhold more authority than it did before, so no case can widen
+    // what this fake has.
+    public OperatorRoleBinding? GrantedBinding { get; set; }
 
     public Task<OperatorSnapshot> SnapshotAsync(
         string? projectId = null,
@@ -558,5 +784,165 @@ sealed class FakeGovernorClient : IGovernorClient
             executed = false,
             outcome = "typed_user_automation_operation_admitted"
         }));
+    }
+}
+
+/// The owner side of ONE broker-pipe exchange, for the #1777 session-binding
+/// cases. It binds the owner-issued pipe name, reads the owner's preface and
+/// the two requests the client writes, and answers with the broker's own
+/// `challenge` and `redeemed` objects, in the broker's field names and no
+/// others.
+///
+/// It is a fixture, not a stub of the Kernel: it never decides authority. The
+/// capability set it grants is exactly the set the endpoint asked for, because
+/// that is the only grant the owner's minting path produces for this client
+/// (`exact_operator_capabilities` in `eliot-user-broker-core`), and the Kernel
+/// session token is the one value it mints for that single exchange. A
+/// redemption that would have to be granted MORE than was asked for cannot be
+/// expressed here, because the owner cannot mint it; the capability arm of the
+/// acceptance is therefore proved on the admitted read-only subset, which the
+/// owner does mint.
+sealed class BrokerWireDouble : IDisposable
+{
+    private const string Preface = "ELIOT-BROKER-1";
+    private const int MaxBufferedBytes = 65_536;
+
+    private readonly NamedPipeServerStream _pipe;
+    private readonly OperatorEndpoint _endpoint;
+    private readonly string _kernelSessionToken;
+    private readonly string _answerKernelSessionToken;
+    private readonly string _userSid;
+    private readonly string _sessionId;
+    private readonly int _processId;
+    private readonly List<byte> _buffered = [];
+    private int _disposed;
+
+    public BrokerWireDouble(
+        OperatorEndpoint endpoint,
+        string kernelSessionToken,
+        string? staleKernelSessionToken)
+    {
+        ArgumentNullException.ThrowIfNull(endpoint);
+        _endpoint = endpoint;
+        _kernelSessionToken = kernelSessionToken;
+        // A stale token is what a restart must NOT reuse: the answer then
+        // carries the previous instance's token and the client must refuse it.
+        _answerKernelSessionToken = staleKernelSessionToken ?? kernelSessionToken;
+        var identity = OperatorProcessIdentityProvider.Current;
+        _userSid = identity.UserSid;
+        _sessionId = identity.LogonSessionId.ToString(CultureInfo.InvariantCulture);
+        _processId = Environment.ProcessId;
+        _pipe = new NamedPipeServerStream(
+            endpoint.PipeName.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase),
+            PipeDirection.InOut,
+            NamedPipeServerStream.MaxAllowedServerInstances,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+    }
+
+    public int Challenges { get; private set; }
+    public int Redemptions { get; private set; }
+    /// The endpoint the CLIENT presented, captured from its own request bytes.
+    public OperatorEndpoint? PresentedEndpoint { get; private set; }
+    /// The Kernel session token the client carried back into redemption.
+    public string? RedeemedKernelToken { get; private set; }
+
+    public async Task ServeAsync(CancellationToken cancellationToken)
+    {
+        await _pipe.WaitForConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var preface = await ReadLineAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(preface, Preface, StringComparison.Ordinal))
+        {
+            throw new IOException("the client did not send the broker preface");
+        }
+        Challenges++;
+
+        using (var challengeRequest = JsonDocument.Parse(await ReadLineAsync(cancellationToken).ConfigureAwait(false)))
+        {
+            PresentedEndpoint = challengeRequest.RootElement
+                .GetProperty("endpoint")
+                .Deserialize<OperatorEndpoint>(OperatorJson.Reader);
+        }
+
+        await WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            status = "challenge",
+            kernel_session_token = _kernelSessionToken,
+            broker_epoch = _endpoint.BrokerEpoch,
+            handoff_nonce = _endpoint.HandoffNonce,
+            role = _endpoint.Role,
+            capabilities = _endpoint.Capabilities
+        }, OperatorJson.Writer), cancellationToken).ConfigureAwait(false);
+
+        using var redeemRequest = JsonDocument.Parse(await ReadLineAsync(cancellationToken).ConfigureAwait(false));
+        RedeemedKernelToken = redeemRequest.RootElement
+            .GetProperty("client")
+            .GetProperty("kernel_session_token")
+            .GetString();
+        Redemptions++;
+
+        await WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            status = "redeemed",
+            principal = _userSid,
+            interactive_session_id = _sessionId,
+            client_process_id = _processId,
+            kernel_session_token = _answerKernelSessionToken,
+            role = _endpoint.Role,
+            capabilities = _endpoint.Capabilities
+        }, OperatorJson.Writer), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// Reads exactly one framed line, keeping any bytes that arrived past its
+    /// terminator: the client writes the preface and the first request without
+    /// waiting in between, so one read can carry both.
+    private async Task<string> ReadLineAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            for (var index = 0; index < _buffered.Count; index++)
+            {
+                if (_buffered[index] != (byte)'\n') continue;
+                var line = Encoding.UTF8.GetString(_buffered.GetRange(0, index).ToArray());
+                _buffered.RemoveRange(0, index + 1);
+                return line;
+            }
+            var chunk = new byte[512];
+            var read = await _pipe.ReadAsync(chunk.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                throw new IOException("the client closed the broker pipe before its request");
+            }
+            _buffered.AddRange(chunk.AsSpan(0, read).ToArray());
+            if (_buffered.Count > MaxBufferedBytes)
+            {
+                throw new IOException("a broker request exceeded the fixture's own buffer bound");
+            }
+        }
+    }
+
+    private async Task WriteLineAsync(string line, CancellationToken cancellationToken)
+    {
+        await _pipe
+            .WriteAsync(Encoding.UTF8.GetBytes(line + "\n").AsMemory(), cancellationToken)
+            .ConfigureAwait(false);
+        await _pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+        try
+        {
+            _pipe.Dispose();
+        }
+        catch (Exception)
+        {
+            // The exchange is finished with this pipe; a close failure here is
+            // not a conformance result and must not replace one.
+        }
     }
 }
