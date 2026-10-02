@@ -2225,7 +2225,7 @@ mod authority_identity_contour_tests {
             tracing::subscriber::with_default(subscriber, body);
             sink.bytes
                 .lock()
-                .map_err(|_| std::io::Error::other("capture poisoned"))?
+                .expect("capture is poisoned only by a panicking writer")
                 .clone()
         };
         String::from_utf8_lossy(&bytes).into_owned()

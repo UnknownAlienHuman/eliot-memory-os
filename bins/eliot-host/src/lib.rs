@@ -4169,6 +4169,7 @@ mod host_lifecycle_boundary_table_tests {
         let host = test_host();
         let mut fenced_names = (String::new(), String::new());
         let mut unfenced_binding_observed = false;
+        let mut unfenced_names = (String::new(), String::new());
         let fenced = capture_records(|| {
             let fenced = super::HostJobBranches::new_fenced(&host)
                 .expect("the fenced job projection must be constructible");
@@ -4188,6 +4189,10 @@ mod host_lifecycle_boundary_table_tests {
                 fenced.kernel_name().to_owned(),
                 fenced.store_name().to_owned(),
             );
+        });
+        // The live constructor records its own launch rows, so it is captured
+        // on its own: those rows must never reach the fenced record above.
+        let unfenced = capture_records(|| {
             let unfenced = super::HostJobBranches::new(&host)
                 .expect("the live job identities must be constructible");
             assert!(
@@ -4195,15 +4200,19 @@ mod host_lifecycle_boundary_table_tests {
                 "the live constructor is the only path that observes this process"
             );
             unfenced_binding_observed = true;
-            // The fence changes the evidence available to the observation, not
-            // the owner-scoped identities the two constructors hand back.
-            assert_eq!(fenced.kernel_name(), unfenced.kernel_name());
-            assert_eq!(fenced.store_name(), unfenced.store_name());
+            unfenced_names = (
+                unfenced.kernel_name().to_owned(),
+                unfenced.store_name().to_owned(),
+            );
         });
         assert!(
             unfenced_binding_observed && !fenced_names.0.is_empty(),
             "both constructors must have produced their owner-scoped identities"
         );
+        // The fence changes the evidence available to the observation, not
+        // the owner-scoped identities the two constructors hand back.
+        assert_eq!(fenced_names.0, unfenced_names.0);
+        assert_eq!(fenced_names.1, unfenced_names.1);
         assert_eq!(
             occurrences(&fenced, fenced_requested.event),
             1,
