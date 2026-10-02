@@ -28,6 +28,15 @@ use eliot_host_service::runtime_control::{BackupOwnerOutcome, BackupRuntimeContr
 /// error here until this registration table has reviewed it.
 pub use eliot_protocol::backup::{BackupOperationKind, BackupRole};
 
+/// The canonical `#954` replay types this endpoint's ingress decision reads.
+///
+/// These are imported as the owner's own definitions, never re-spelled here:
+/// `BackupError` is the single typed failure scheme for the whole backup
+/// vocabulary, and `BackupReplayDisposition` / `BackupReplayRefusal` are the
+/// owner's own answers and classes. This endpoint maps them onto its own
+/// [`BackupDispatchRefusal`] and adds no failure class of its own.
+use eliot_protocol::backup::{BackupError, BackupReplayDisposition, BackupReplayRefusal};
+
 /// One Host-accepted backup owner method.
 ///
 /// `wire_id` is the canonical `#954` wire ID for `op`; a payload claim
@@ -352,19 +361,194 @@ pub fn rehearsal_resolves_cutover() -> bool {
     })
 }
 
+/// Bounded refusal for a replayed envelope that fails its own canonical
+/// request-identity contract.
+///
+/// A replay observation can fail for a reason that is not one of the four
+/// replay classes - an unknown canonical request hash, a stale wire version, a
+/// zero deadline, a changed identity digest. Those are the request identity
+/// failing its own contract, not a replay class, and they are named as such
+/// rather than folded into one of the four.
+pub const BACKUP_REPLAY_IDENTITY_REFUSAL: &str =
+    "backup replay envelope does not satisfy the canonical request identity";
+
+/// Maps one canonical `#954` replay observation onto this endpoint's own
+/// pre-effect refusal, or `None` when the envelope may proceed to the owner.
+///
+/// This is the production ingress decision for replayed backup control
+/// envelopes, and it is the ONLY place this endpoint turns a replay
+/// observation into an answer. The observation itself is the canonical
+/// `BackupReplayLedger::observe_typed` result from
+/// `eliot-protocol/src/backup.rs`: this function reads that typed result and
+/// never recomputes a digest, re-keys a ledger, or re-decides which case
+/// occurred, so the endpoint cannot become a second source for the replay
+/// vocabulary.
+///
+/// The four replay classes the `#954` replay contract distinguishes are
+/// DUPLICATE (a byte-identical repeat of an envelope this endpoint already
+/// admitted), UNKNOWN (no canonical request hash to key a decision on), STALE
+/// (the bound deadline admits no currently observed evidence) and CHANGED
+/// (changed canonical content under one stable canonical request hash). Each
+/// carries its own bounded reason text, read from the owner through
+/// [`BackupReplayRefusal::as_str`], so the wire-visible refusal still says
+/// WHICH of the four refused the envelope and this endpoint never re-spells the
+/// vocabulary.
+#[must_use]
+pub fn backup_replay_refusal(
+    operation: BackupOperationKind,
+    observed: Result<BackupReplayDisposition, BackupError>,
+) -> Option<BackupDispatchRefusal> {
+    match observed {
+        Ok(BackupReplayDisposition::Accepted) => None,
+        // `observe_typed` never returns this disposition - it is the
+        // refusal-returning form - but the mapping is total over the owner's
+        // own enum, so if that vocabulary ever widened this arm still refuses a
+        // repeat rather than admitting one.
+        Ok(BackupReplayDisposition::Duplicate) => Some(BackupDispatchRefusal::new(
+            operation,
+            BackupReplayRefusal::Duplicate.as_str(),
+        )),
+        Err(BackupError::ReplayRefused { reason }) => {
+            Some(BackupDispatchRefusal::new(operation, reason.as_str()))
+        }
+        Err(_) => Some(BackupDispatchRefusal::new(
+            operation,
+            BACKUP_REPLAY_IDENTITY_REFUSAL,
+        )),
+    }
+}
+
 #[cfg(test)]
-mod rehearsal_cutover_tests {
+mod endpoint_backup_policy_tests {
     use super::{
-        BackupOperationKind, CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL, authority_matches, is_supported,
-        rehearsal_resolves_cutover, requires_cutover_admission, resolves_cutover_authority,
+        BackupDispatchRefusal, BackupError, BackupOperationKind, BackupReplayDisposition,
+        BackupReplayRefusal, BACKUP_REPLAY_IDENTITY_REFUSAL, backup_replay_refusal,
     };
 
-    /// The predicate the production admission gate compares is load-bearing for
-    /// every canonical operation, and it names cutover authority for exactly
-    /// one of them.
+    /// The production ingress maps ONE canonical replay observation to ONE
+    /// pre-effect refusal, and only a first observation reaches the owner.
+    ///
+    /// Load-bearing: this is the whole body of gate 4a in
+    /// `HostRuntimeControl::handle_backup_operation`, which is the only
+    /// production replay decision this endpoint makes. Delete it and the gate
+    /// either admits a replayed envelope (every refusal assertion below fails,
+    /// because there is no mapping to assert) or collapses the four classes into
+    /// one indistinguishable answer.
+    #[test]
+    fn replay_observation_maps_to_one_typed_refusal_and_only_the_first_passes() {
+        let operation = BackupOperationKind::PrepareIsolatedRestore;
+
+        // POSITIVE: the first observation of a canonical request hash is the
+        // only case that reaches the owner.
+        assert_eq!(
+            backup_replay_refusal(operation, Ok(BackupReplayDisposition::Accepted)),
+            None
+        );
+
+        // REFUSAL 1 - DUPLICATE, reported through the owner's own disposition.
+        // `observe_typed` never returns `Ok(Duplicate)`, so this arm is the
+        // belt-and-braces form: if the owner's vocabulary ever widened, the
+        // endpoint still refuses rather than admitting a repeat.
+        let duplicate = backup_replay_refusal(operation, Ok(BackupReplayDisposition::Duplicate))
+            .expect("a recorded repeat is refused");
+        assert_eq!(duplicate.operation, operation);
+        assert_eq!(duplicate.reason, BackupReplayRefusal::Duplicate.as_str());
+
+        // REFUSAL 2 - all four typed refusal classes the owner publishes.
+        for class in [
+            BackupReplayRefusal::Duplicate,
+            BackupReplayRefusal::Unknown,
+            BackupReplayRefusal::Stale,
+            BackupReplayRefusal::Changed,
+        ] {
+            let refused = backup_replay_refusal(operation, Err(BackupError::ReplayRefused { reason: class }))
+                .expect("a replayed envelope is refused");
+            assert_eq!(refused.operation, operation);
+            // The reason text is the OWNER's, read through `as_str`, never
+            // re-spelled here: this is what keeps the endpoint from becoming a
+            // second source for the replay vocabulary.
+            assert_eq!(refused.reason, class.as_str());
+            assert!(!refused.reason.is_empty());
+            assert!(!refused.reason.contains('\n'));
+        }
+
+        // REFUSAL 3 - an observation that failed for a reason that is not one of
+        // the four replay classes. This is the request identity failing its own
+        // canonical contract; it is NAMED as such rather than folded into a
+        // replay class, so a caller is never told a replay happened when none
+        // was decided.
+        let not_a_replay_class = backup_replay_refusal(
+            operation,
+            Err(BackupError::InvalidField {
+                field: "backup_request_identity.deadline_unix_ms",
+                reason: "must be greater than zero",
+            }),
+        )
+        .expect("an identity that fails its own contract is refused");
+        assert_eq!(not_a_replay_class.operation, operation);
+        assert_eq!(not_a_replay_class.reason, BACKUP_REPLAY_IDENTITY_REFUSAL);
+
+        // The refusals stay distinguishable: the four replay classes carry four
+        // distinct owner-supplied reasons, and the non-replay refusal is a fifth
+        // distinct one, so no two outcomes read the same way on the wire.
+        let reasons = [
+            BackupReplayRefusal::Duplicate.as_str(),
+            BackupReplayRefusal::Unknown.as_str(),
+            BackupReplayRefusal::Stale.as_str(),
+            BackupReplayRefusal::Changed.as_str(),
+            BACKUP_REPLAY_IDENTITY_REFUSAL,
+        ];
+        for (index, reason) in reasons.iter().enumerate() {
+            for other in reasons.iter().skip(index + 1) {
+                assert_ne!(reason, other);
+            }
+        }
+    }
+
+    /// Rehearsal completion selects no cutover authority, and the predicate
+    /// that says so is derived from the accepted table rather than asserted.
+    ///
+    /// Load-bearing: `rehearsal_resolves_cutover` is consulted by a release-mode
+    /// gate in `bins/eliot-host/src/lib.rs`. If it were replaced by the constant
+    /// `false` it used to be, the first assertion below would still pass and the
+    /// gate would carry nothing; the table-wide assertion is what fails, because
+    /// it shows the predicate reads the accepted table and the canonical
+    /// disposition rather than answering from a literal.
+    #[test]
+    fn rehearsal_selects_no_cutover_and_the_predicate_is_derived() {
+        assert!(!super::rehearsal_resolves_cutover());
+        // Rehearsal is refused by the accepted table and by the canonical
+        // disposition independently of the predicate, so the predicate's inputs
+        // really do exclude it.
+        assert!(!super::is_supported(BackupOperationKind::CompleteRehearsal));
+        assert!(
+            super::requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none()
+        );
+        // And rehearsal still carries its own wire identity, never cutover's.
+        assert!(!super::authority_matches(
+            BackupOperationKind::CompleteRehearsal,
+            BackupOperationKind::AdmitCutover.wire_id(),
+        ));
+        // Every accepted row that is not the admitted cutover request must have
+        // its cutover-admission bit clear; this is the table-wide form of what
+        // the predicate checks for rehearsal, run here so a future row cannot
+        // be added without this failing.
+        for method in super::accepted_host_backup_methods() {
+            assert_eq!(
+                method.needs_cutover_admission,
+                method.op == BackupOperationKind::AdmitCutover,
+                "accepted row {} cutover authority",
+                method.op
+            );
+        }
+    }
+
+    /// The cutover-authority predicate the production gate compares names
+    /// cutover authority for exactly one canonical operation, and the gate's
+    /// refusal class is bounded and non-empty.
     ///
     /// Load-bearing: delete gate 0a in `HostRuntimeControl::handle_backup_operation`
-    /// and this comparison stops happening, so an accepted row that resolved to
+    /// and the comparison stops happening, so an accepted row that resolved to
     /// cutover authority without being the admitted cutover request would reach
     /// a cutover owner. Delete `resolves_cutover_authority` and the gate cannot
     /// be written at all, because nothing else derives the relation from the
@@ -384,49 +568,31 @@ mod rehearsal_cutover_tests {
         ] {
             // This is the gate's own comparison, run for every variant.
             assert_eq!(
-                resolves_cutover_authority(op),
+                super::resolves_cutover_authority(op),
                 op == BackupOperationKind::AdmitCutover,
                 "cutover authority for {op}"
             );
         }
         // The refusal class is bounded, non-empty, and names the divergence.
-        assert!(!CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.is_empty());
-        assert!(CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.contains("cutover"));
-    }
-
-    /// Rehearsal completion selects no cutover authority, and the predicate
-    /// that says so is derived from the accepted table rather than asserted.
-    ///
-    /// Load-bearing: `rehearsal_resolves_cutover` is consulted by a release-mode
-    /// gate in `bins/eliot-host/src/lib.rs`. If it were replaced by the constant
-    /// `false` it used to be, the first assertion below would still pass and the
-    /// gate would carry nothing; the second assertion is what fails, because it
-    /// shows the predicate reads the accepted table and the canonical
-    /// disposition rather than answering from a literal.
-    #[test]
-    fn rehearsal_selects_no_cutover_and_the_predicate_is_derived() {
-        assert!(!rehearsal_resolves_cutover());
-        // Rehearsal is refused by the accepted table and by the canonical
-        // disposition independently of the predicate, so the predicate's inputs
-        // really do exclude it.
-        assert!(!is_supported(BackupOperationKind::CompleteRehearsal));
-        assert!(requires_cutover_admission(BackupOperationKind::CompleteRehearsal).is_none());
-        // And rehearsal still carries its own wire identity, never cutover's.
-        assert!(!authority_matches(
-            BackupOperationKind::CompleteRehearsal,
-            BackupOperationKind::AdmitCutover.wire_id(),
-        ));
-        // Every accepted row that is not the admitted cutover request must have
-        // its cutover-admission bit clear; this is the table-wide form of what
-        // the predicate checks for rehearsal, run here so a future row cannot
-        // be added without this failing.
-        for method in super::accepted_host_backup_methods() {
-            assert_eq!(
-                method.needs_cutover_admission,
-                method.op == BackupOperationKind::AdmitCutover,
-                "accepted row {} cutover authority",
-                method.op
-            );
-        }
+        assert!(!super::CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.is_empty());
+        assert!(super::CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL.contains("cutover"));
+        // And the refusal this module produces is the endpoint's own pre-effect
+        // type, not a bare string, so gate 4a and this test agree on the shape.
+        let refusal = backup_replay_refusal(
+            BackupOperationKind::PrepareIsolatedRestore,
+            Err(BackupError::ReplayRefused {
+                reason: BackupReplayRefusal::Changed,
+            }),
+        )
+        .expect("changed content is refused");
+        assert!(format!("{refusal}").contains("PREPARE_ISOLATED_RESTORE"));
+        let _: &dyn std::error::Error = &refusal;
+        assert_eq!(
+            refusal,
+            BackupDispatchRefusal::new(
+                BackupOperationKind::PrepareIsolatedRestore,
+                BackupReplayRefusal::Changed.as_str()
+            )
+        );
     }
 }

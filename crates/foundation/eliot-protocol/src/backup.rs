@@ -1485,69 +1485,6 @@ impl BackupIsolatedRestorePrepare {
         }
         Ok(())
     }
-
-    /// Validates the preparation against the separately authenticated
-    /// destination authority, and refuses a destination override there.
-    ///
-    /// [`BackupIsolatedRestorePrepare::validate`] already compares the declared
-    /// `destination_installation` against the bound
-    /// [`BackupRequestIdentity::dest_installation`]. That comparison is
-    /// necessary and it is not sufficient as a *fence*: both of those values
-    /// travel in the SAME presented request, so a caller that presents a
-    /// self-consistent forged identity satisfies it, and the destination it
-    /// names is still a caller-selected one. This method is the fence. It is
-    /// also the reason the preparation carries no standing authority of its
-    /// own: the destination it may write into is the one a separately
-    /// authenticated owner names, and the request only has the right to
-    /// confirm it.
-    ///
-    /// The comparison is against `destination_authority` exactly as it was
-    /// supplied by the caller from its own authenticated source. No digest is
-    /// recomputed, the destination is never inferred from the request, and the
-    /// ORIGINAL recorded `authority_owner` is the expected value; this is the
-    /// same shape [`BackupCutoverAdmission::validate_against`] and
-    /// [`BackupCutoverReceipt::validate_against`] already use, so this is the
-    /// one fence scheme in the crate rather than a second one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackupError::CapabilityDenied`] when the separately
-    /// authenticated role is not the preparation's own principal, does not
-    /// permit the preparation, or may not issue owner attestations at all;
-    /// [`BackupError::Mismatch`] on
-    /// `backup_isolated_restore_prepare.destination_installation` when the
-    /// declared destination overrides the owner-named one; and
-    /// [`BackupError::FenceMismatch`] when the owner binding is from a
-    /// different authority lineage than the request's own fence.
-    pub fn validate_against_destination(
-        &self,
-        authenticated_role: BackupRole,
-        destination_authority: &AuthorityBinding,
-    ) -> Result<(), BackupError> {
-        self.validate()?;
-        self.identity.check_authenticated_role(authenticated_role)?;
-        if !authenticated_role.permits(BackupOperationKind::PrepareIsolatedRestore) {
-            return Err(BackupError::CapabilityDenied);
-        }
-        if !authenticated_role.is_attesting_role() {
-            return Err(BackupError::CapabilityDenied);
-        }
-        // THE destination fence: the declared destination against the
-        // independently authenticated owner binding, not against the
-        // presented request's own identity.
-        if self.destination_installation != destination_authority.authority_owner {
-            return Err(BackupError::Mismatch {
-                field: "backup_isolated_restore_prepare.destination_installation",
-            });
-        }
-        if !destination_authority
-            .authority_epoch
-            .is_same_authority(&self.identity.fence.authority_epoch)
-        {
-            return Err(BackupError::FenceMismatch);
-        }
-        Ok(())
-    }
 }
 
 /// One operation-bound restore step executed by the owning phase owner.

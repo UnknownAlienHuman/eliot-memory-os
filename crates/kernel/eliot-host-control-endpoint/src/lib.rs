@@ -54,12 +54,13 @@ pub mod backup;
 pub mod responsiveness_challenge;
 pub use backup::{
     AcceptedOwnerMethod, BackupDispatchRefusal, BackupOperationKind, BackupRole,
-    CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL, HostBackupOwner, HostBackupOwnerRegistration,
-    accepted_host_backup_methods, authority_matches, is_supported, register_backup_methods,
-    rehearsal_resolves_cutover, requires_cutover_admission, resolves_cutover_authority,
+    BACKUP_REPLAY_IDENTITY_REFUSAL, CUTOVER_AUTHORITY_DIVERGENCE_REFUSAL, HostBackupOwner,
+    HostBackupOwnerRegistration, accepted_host_backup_methods, authority_matches,
+    backup_replay_refusal, is_supported, register_backup_methods, rehearsal_resolves_cutover,
+    requires_cutover_admission, resolves_cutover_authority,
 };
 
-use eliot_protocol::backup::{BackupError, BackupReplayLedger};
+use eliot_protocol::backup::BackupReplayLedger;
 
 pub const HOST_RUNTIME_CONTROL_PIPE: &str = r"\\.\pipe\eliot\host\runtime-control-v1";
 const MAX_QUEUE_DEPTH: usize = 32;
@@ -726,27 +727,13 @@ impl HostRuntimeControl {
         // an owner call.
         let observed = ledger.observe_typed(request.body.identity());
         drop(ledger);
-        match observed {
-            Ok(_) => {}
-            Err(BackupError::ReplayRefused { reason }) => {
-                // The typed class is read from the owner through
-                // `BackupReplayRefusal::as_str`, never re-spelled here, so this
-                // endpoint cannot become a second source for the reason
-                // vocabulary and the wire-visible reason still says WHICH of
-                // duplicate / unknown / stale / changed refused the envelope.
-                return Err(refusal(operation, reason.as_str()));
-            }
-            Err(_) => {
-                // Every other cause is the request identity failing its own
-                // canonical contract, which gate 0 above already refuses. It
-                // is handled here rather than dropped, so an identity that
-                // stopped satisfying that contract refuses on this path too
-                // instead of reaching the owner.
-                return Err(refusal(
-                    operation,
-                    "backup replay envelope does not satisfy the canonical request identity",
-                ));
-            }
+        // `backup::backup_replay_refusal` is the ONE place this endpoint turns
+        // a replay observation into an answer. It reads the owner's typed
+        // result and never recomputes a digest or re-decides which case
+        // occurred, so the endpoint cannot become a second source for the replay
+        // vocabulary; `None` is the only path that reaches the owner below.
+        if let Some(refused) = backup::backup_replay_refusal(operation, observed) {
+            return Err(refused);
         }
         // 5. Route to the one registered owner operation. Its typed outcome
         //    is the only source of the answer's disposition: pending,

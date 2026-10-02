@@ -24,7 +24,7 @@ use eliot_kernel_service::{
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::backup::{
-    BackupArtifactHandle, BackupCutoverAdmission, BackupError, BackupIsolatedRestorePrepare,
+    BackupArtifactHandle, BackupCutoverAdmission, BackupIsolatedRestorePrepare,
     BackupOperationKind, BackupPhaseAttestation, BackupRequestIdentity, BackupRestoreReconcile,
     BackupRestoreStatus, BackupStage, attesting_roles, operation_for_phase,
 };
@@ -1663,6 +1663,16 @@ const BACKUP_LEGACY_HEADER_WIRE: &str = HOST_BACKUP_RUNTIME_CONTROL_LEGACY_HEADE
 /// Bounded refusal reason for the retired header-only backup carrier.
 const BACKUP_LEGACY_HEADER_REFUSAL: &str = "legacy header-only backup carrier is unsupported";
 
+/// Bounded refusal reason for the restore-preparation destination fence.
+///
+/// This is the ONE reason a destination override is refused with on this seam,
+/// and it is deliberately distinct from the source-installation join: a
+/// destination substitution and a source substitution are two different
+/// events, and a caller reconciling a refusal needs to be able to tell which
+/// one happened.
+const BACKUP_DESTINATION_FENCE_REFUSAL: &str =
+    "backup destination fence refuses a destination the admitted envelope does not carry";
+
 /// Closed capability projection for one #954 backup operation. The envelope
 /// capability is always derived from the operation; a stored capability that
 /// diverges fails closed.
@@ -1836,33 +1846,25 @@ impl BackupOperationBody {
     /// invented here.
     ///
     /// This exists so the destination fence is a COMPARISON on the production
-    /// admission path instead of a value merely carried in a struct field. The
-    /// body is validated first, so an unvalidated body never reaches the
-    /// comparison and the returned destination is one the body's own canonical
-    /// contract already accepted.
+    /// admission path instead of a value merely carried in a struct field; see
+    /// [`BackupRuntimeControlRequest::validate_body_binding`].
     ///
-    /// # Errors
-    ///
-    /// Returns the body's own canonical validation error.
-    pub fn declared_destination(&self) -> Result<&str, BackupError> {
-        self.validate_destination_owner()?;
+    /// It is a PURE READ. It deliberately does not validate the body first, and
+    /// that is what makes the fence a decision rather than a report of
+    /// somebody else's error: if this read validated the preparation through
+    /// its own canonical contract, a body whose declared destination diverged
+    /// from its bound identity would fail here, and the fence's comparison would
+    /// never run - so the one refusal that names a destination override would
+    /// be unreachable on this seam. The body is still validated, in full, by
+    /// [`BackupOperationBody::validate`] on the same path and before any owner
+    /// is reached, so an unvalidated body can never be admitted.
+    #[must_use]
+    pub fn declared_destination(&self) -> &str {
         match self {
-            Self::PrepareIsolatedRestore(body) => Ok(body.destination_installation.as_str()),
+            Self::PrepareIsolatedRestore(body) => body.destination_installation.as_str(),
             Self::AdmitCutover(_) | Self::RestoreStatus(_) | Self::ReconcileRestore(_) => {
-                Ok(self.identity().dest_installation.as_str())
+                self.identity().dest_installation.as_str()
             }
-        }
-    }
-
-    /// Validates only the body variant that declares its own destination.
-    fn validate_destination_owner(&self) -> Result<(), BackupError> {
-        match self {
-            Self::PrepareIsolatedRestore(body) => body.validate(),
-            // The remaining three carry no destination field, so there is no
-            // declared destination to validate beyond the identity every body
-            // shares; `validate_body_binding` still validates each of them
-            // through its own contract on the path that reaches them.
-            Self::AdmitCutover(_) | Self::RestoreStatus(_) | Self::ReconcileRestore(_) => Ok(()),
         }
     }
 
@@ -2225,17 +2227,35 @@ impl BackupRuntimeControlRequest {
     /// The body is additionally committed by the envelope mutation digest,
     /// which is checked above over the body's own request digest, so a
     /// swapped body cannot keep a valid header.
+    ///
+    /// # The destination fence, and why it runs first
+    ///
+    /// The destination is fenced by ONE check, and that check runs BEFORE the
+    /// body's own canonical validation and BEFORE the identity's installation
+    /// join. It compares the destination the body declares against the
+    /// destination this envelope actually admitted.
+    ///
+    /// That order is the strengthening, not an accident. The two destination
+    /// values this seam has to reconcile were previously only joined
+    /// transitively - the body's own `validate()` compared the declared
+    /// destination against the bound identity, and a separate identity join
+    /// compared the bound identity against the envelope - so no destination
+    /// divergence could ever reach a destination-specific refusal: whichever
+    /// of those two earlier checks tripped first reported a reason that named
+    /// neither the destination fence nor the field that diverged. The fence was
+    /// therefore present but unreachable as a decision, and a caller could not
+    /// tell a destination override from a source substitution.
+    ///
+    /// Reading the declared destination ahead of validation is total:
+    /// [`BackupOperationBody::declared_destination`] is a pure read and plain
+    /// `String` equality cannot panic, so an unvalidated value can only fail
+    /// closed, and the body's own canonical contract runs below on the same
+    /// path before any owner is reached.
     fn validate_body_binding(&self) -> Result<(), String> {
-        self.body.validate()?;
         let identity = self.body.identity();
         if self.body.operation() != self.operation || identity.mutation.operation != self.operation
         {
             return Err("backup operation does not match the carried operation body".to_owned());
-        }
-        if identity.source_installation != self.source.as_str()
-            || identity.dest_installation != self.destination.as_str()
-        {
-            return Err("backup installations do not match the carried operation body".to_owned());
         }
         // The destination FENCE, compared here rather than merely carried in a
         // struct field. `BackupIsolatedRestorePrepare` is the one body that
@@ -2246,19 +2266,25 @@ impl BackupRuntimeControlRequest {
         // destination is now compared against the admitted envelope destination,
         // so a prepared destination override cannot ride in on a body that is
         // internally consistent about a different destination than the one this
-        // request was admitted for. The body validates itself first, so an
-        // unvalidated body never reaches this comparison.
-        if self
-            .body
-            .declared_destination()
-            .map_err(|error| error.to_string())?
-            != self.destination.as_str()
+        // request was admitted for.
+        if self.body.declared_destination() != self.destination.as_str()
+            || identity.dest_installation != self.destination.as_str()
         {
+            // The identity's own destination is the second place the wire
+            // carries it, and it is fenced by the SAME refusal: a request whose
+            // identity and envelope name different destinations is a
+            // destination override exactly as much as one whose body does.
+            return Err(BACKUP_DESTINATION_FENCE_REFUSAL.to_owned());
+        }
+        if identity.source_installation != self.source.as_str() {
             return Err(
-                "backup destination does not match the destination the operation body declares"
-                    .to_owned(),
+                "backup source installation does not match the carried operation body".to_owned(),
             );
         }
+        // The body's own canonical `#954` contract still runs, and still runs
+        // in full: the fence above only decides WHICH reason a destination
+        // divergence is reported as, never whether it is reported at all.
+        self.body.validate()?;
         if identity.principal.role != self.role
             || identity.principal.session_id != self.session_id.as_str()
         {
@@ -2544,6 +2570,14 @@ fn validate_production_trace_context(frame: &Frame) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::{ContractId, ContractIdentity, ContractVersion, ReceiptId, SessionId};
+    use eliot_protocol::backup::{
+        BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
+        BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+        BackupAdmissionRef, BackupAuthenticatedPrincipal, BackupClassWire, BackupMutationBinding,
+        BackupRole,
+    };
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling, WorkScopeBinding, WorkScopeId};
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value.to_owned()).unwrap()
@@ -2845,5 +2879,230 @@ mod tests {
         tampered.request_id =
             Some(RequestId::new(digest("wrong-ua-frame-id").as_str().to_owned()).unwrap());
         assert!(decode_runtime_control_response_frame(&tampered).is_err());
+    }
+
+    // ---- Restore-preparation destination fence (T3) ----
+    //
+    // These fixtures build the exact `#954` identity the fence reads, because
+    // the guarantee under test is a production JOIN between separately carried
+    // values. Nothing here stubs or shadows the fence: every assertion runs
+    // `BackupRuntimeControlRequest::validate`, which is the production entry the
+    // decoder (`decode_backup_request_frame`) and the endpoint's admission
+    // (`BackupAuthenticatedPeer::admit_request`) both call.
+
+    fn backup_contract(name: &str) -> ContractIdentity {
+        ContractIdentity {
+            name: ContractId::new(name).unwrap(),
+            version: ContractVersion::new(1, 0, 0),
+            shape_sha256: sha256_hex(name.as_bytes()),
+        }
+    }
+
+    /// The bound `#954` request identity a restore preparation carries.
+    fn prepare_identity(source: &str, destination: &str) -> BackupRequestIdentity {
+        let fence = test_fence();
+        BackupRequestIdentity {
+            wire_id: BACKUP_REQUEST_IDENTITY_WIRE_ID.to_owned(),
+            wire_version: BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
+            principal: BackupAuthenticatedPrincipal {
+                principal: "principal-001".to_owned(),
+                session_id: "session-001".to_owned(),
+                // Requester carries PREPARE_ISOLATED_RESTORE, so a fence
+                // refusal here can never be confused with a capability
+                // refusal from the role matrix.
+                role: BackupRole::Requester,
+                authority_epoch: fence.authority_epoch.clone(),
+            },
+            request: RequestIdentity {
+                request: RequestBinding {
+                    metadata: RequestMetadata {
+                        request_id: RequestId::new("backup-req-fence-001").unwrap(),
+                        session_id: Some(SessionId::new("session-001").unwrap()),
+                        task_id: None,
+                        product_id: ProductId::new("product-001").unwrap(),
+                        source_id: SourceId::new("source-001").unwrap(),
+                        state_fence: fence.clone(),
+                        clock: ClockReading::default(),
+                    },
+                    state_fence: fence.clone(),
+                },
+                idempotency_key: "transport-backup-req-fence-001".to_owned(),
+                deadline_unix_ms: 10_000,
+                cancellation_id: "cancel-001".to_owned(),
+            },
+            mutation: BackupMutationBinding {
+                operation: BackupOperationKind::PrepareIsolatedRestore,
+                canonical_request_hash: sha256_hex(b"mutation:prepare-isolated-restore"),
+            },
+            archive_id: "archive-001".to_owned(),
+            archive_contract: backup_contract("archive.owner"),
+            archive_digest: sha256_hex(b"archive-001"),
+            owner_contract: backup_contract("attesting.owner"),
+            schema_digest: sha256_hex(b"schema-001"),
+            build_digest: sha256_hex(b"build-001"),
+            source_installation: source.to_owned(),
+            dest_installation: destination.to_owned(),
+            class: BackupClassWire::FullRecovery,
+            fence: fence.clone(),
+            snapshot_digest: sha256_hex(b"snapshot-001"),
+            member_digest: sha256_hex(b"members-001"),
+            max_page_members: 16,
+            max_payload_bytes: 65_536,
+            deadline_unix_ms: 10_000,
+            cancellation_id: "cancel-001".to_owned(),
+            admission: BackupAdmissionRef {
+                authority: AuthorityBinding {
+                    authority_id: ContractId::new("admission-authority-001").unwrap(),
+                    authority_owner: "backup-admission-authority".to_owned(),
+                    authority_epoch: fence.authority_epoch.clone(),
+                    state_fence: fence.clone(),
+                    allowed_effect: EffectClass::Read,
+                    proof_ceiling: ProofCeiling::Observation,
+                },
+                scope: WorkScopeBinding {
+                    scope_id: WorkScopeId::new("scope-001").unwrap(),
+                    product_id: ProductId::new("product-001").unwrap(),
+                    resource_generation: fence.resource_generation,
+                    state_fence: fence.clone(),
+                },
+                capability: "backup.capture".to_owned(),
+                admission_receipt: ReceiptId::new("admission-001").unwrap(),
+            },
+            identity_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap()
+    }
+
+    /// The restore-preparation body, with its own recorded destination.
+    fn prepare_body(
+        identity: BackupRequestIdentity,
+        destination: &str,
+    ) -> BackupIsolatedRestorePrepare {
+        BackupIsolatedRestorePrepare {
+            wire_id: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID.to_owned(),
+            wire_version: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
+            identity,
+            operation: BackupOperationKind::PrepareIsolatedRestore,
+            destination_installation: destination.to_owned(),
+            max_restore_bytes: 4096,
+            request_digest: String::new(),
+        }
+        .with_computed_digest()
+        .unwrap()
+    }
+
+    /// Re-mints the envelope digests over the values the request now carries.
+    ///
+    /// Without this, a case that overrides a destination field would be refused
+    /// by the envelope's own digest join before reaching the destination fence,
+    /// and the test would prove nothing about the fence.
+    fn reseal_backup_envelope(request: &mut BackupRuntimeControlRequest) {
+        request.mutation_digest = handle(&backup_mutation_digest_for(
+            &request.wire,
+            &request.operation,
+            &request.request_id,
+            &request.session_id,
+            &request.nonce,
+            &request.generation,
+            &request.fence,
+            &request.source,
+            &request.destination,
+            &request.owner,
+            request.body.request_digest(),
+        ));
+        request.request_digest = handle(&backup_request_digest_for(
+            &request.wire,
+            &request.operation,
+            &request.request_id,
+            &request.mutation_digest,
+        ));
+    }
+
+    /// Builds one admitted restore-preparation envelope whose identity
+    /// destination, body destination and header destination are all
+    /// `destination`.
+    fn prepare_request(destination: &str, request_id: &str) -> BackupRuntimeControlRequest {
+        let identity = prepare_identity("src-001", destination);
+        let body =
+            BackupOperationBody::PrepareIsolatedRestore(prepare_body(identity, destination));
+        BackupRuntimeControlRequest::new_backup(
+            body,
+            handle("backup-owner-001"),
+            handle(request_id),
+            handle(&sha256_hex(b"nonce")),
+            handle(&sha256_hex(b"generation")),
+            handle(&sha256_hex(b"envelope-fence")),
+        )
+        .unwrap_or_else(|error| panic!("admitted prepare envelope rejected: {error}"))
+    }
+
+    /// POSITIVE + two REFUSALS for the production destination fence.
+    ///
+    /// Why this fails without the change: the fence existed, but its comparison
+    /// was unreachable as a decision. The body's own `validate()` compared the
+    /// declared destination against the bound identity FIRST and the identity's
+    /// installation join compared that against the envelope SECOND, so every
+    /// destination divergence was reported by whichever of those two tripped
+    /// first, with a reason naming neither the fence nor the field. Both refusal
+    /// assertions below therefore fail against the previous code: REFUSAL 1
+    /// reported the body's own canonical mismatch string, and REFUSAL 2 reported
+    /// `"backup installations do not match the carried operation body"`. The
+    /// positive case passes either way, so all of the load is in the refusals.
+    #[test]
+    fn prepare_destination_fence_refuses_both_override_sites_and_admits_the_bound_case() {
+        // POSITIVE: the admitted control. Every destination on the wire is the
+        // admitted one, so the fence passes and the request validates.
+        let admitted = prepare_request("dest-001", "prepare-fence-admitted");
+        admitted.validate().unwrap();
+
+        // REFUSAL 1: the preparation's OWN recorded destination - the value the
+        // owner would create - is overridden while the envelope still admits
+        // `dest-001`. The body's own request digest is re-minted so nothing but
+        // the destination fence can be what refuses.
+        let mut override_body = prepare_request("dest-001", "prepare-fence-override");
+        let BackupOperationBody::PrepareIsolatedRestore(body) = &mut override_body.body else {
+            panic!("fixture carried a non-prepare body");
+        };
+        body.destination_installation = "dest-override".to_owned();
+        body.request_digest = body.compute_digest().unwrap();
+        reseal_backup_envelope(&mut override_body);
+        assert_eq!(
+            override_body.validate().unwrap_err(),
+            BACKUP_DESTINATION_FENCE_REFUSAL.to_owned()
+        );
+
+        // REFUSAL 2: the ENVELOPE's destination is overridden while the body and
+        // the identity both still name `dest-001`. This is the other of the two
+        // sites the wire carries a destination, and it proves the fence reads
+        // the admitted destination and not only the body's field.
+        let mut override_header = prepare_request("dest-001", "prepare-fence-header");
+        override_header.destination = handle("dest-override");
+        reseal_backup_envelope(&mut override_header);
+        assert_eq!(
+            override_header.validate().unwrap_err(),
+            BACKUP_DESTINATION_FENCE_REFUSAL.to_owned()
+        );
+    }
+
+    /// The destination fence DISCRIMINATES: a source substitution is still
+    /// refused, and by its own reason.
+    ///
+    /// Why this fails without the change: the source join shared one refusal
+    /// string with the destination join, so a source substitution and a
+    /// destination override were indistinguishable on this seam. This assertion
+    /// pins that separating the destination fence did not simply rename one
+    /// combined check and lose the source reason.
+    #[test]
+    fn source_substitution_is_refused_by_its_own_reason_not_the_destination_fence() {
+        let mut substituted = prepare_request("dest-001", "prepare-fence-source");
+        substituted.source = handle("src-override");
+        reseal_backup_envelope(&mut substituted);
+        let refusal = substituted.validate().unwrap_err();
+        assert_eq!(
+            refusal,
+            "backup source installation does not match the carried operation body".to_owned()
+        );
+        assert_ne!(refusal, BACKUP_DESTINATION_FENCE_REFUSAL.to_owned());
     }
 }
