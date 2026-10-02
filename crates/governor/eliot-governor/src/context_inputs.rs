@@ -52,8 +52,14 @@
 //! scan are reported as `Unavailable`/`Unknown`/`Partial` — never as empty.
 //! Each role response is bound to the requested operation, scope, selector and
 //! payload version before it becomes a disposition, so a response answering a
-//! different task/problem/skill is never adopted just because its operation
-//! and fence match.
+//! different task/problem/skill/position is never adopted just because its
+//! operation and fence match. The four task-bound envelopes echo their
+//! selector as an envelope member ([`classify_role_envelope`]); the evidence
+//! pack echoes `subject` and `scope_id` ([`classify_evidence_payload`]); the
+//! position read is not a selector envelope, so it is bound against the identity
+//! it carries itself — its own `EPISTEMIC_REVISION_SCHEMA`, the scope its
+//! candidate and transition carry, and the position its transition and every
+//! admitted row name ([`bind_position_payload`]).
 //!
 //! Content discipline: that binding decides the disposition AND whether the
 //! response's records are admissible. Only a response whose version, scope,
@@ -102,7 +108,8 @@ use eliot_read::{
 };
 use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency, RevisionHead, RevisionKey,
-    ScopeId, ScopeRevisionView, WriteReceiptStatus, epistemic_revision::EpistemicPositionReadback,
+    ScopeId, ScopeRevisionView, WriteReceiptStatus,
+    epistemic_revision::{EPISTEMIC_REVISION_SCHEMA, EpistemicPositionReadback},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -932,7 +939,11 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
                 ));
             }
         };
-        let (state, readback) = decode_epistemic_payload(&response.view.payload);
+        let (state, readback) = decode_epistemic_payload(
+            &response.view.payload,
+            &request.scope_id,
+            &request.epistemic_position,
+        );
         Ok((
             RoleAcquisition::from_response(
                 response.view.operation,
@@ -1420,16 +1431,36 @@ fn classify_role_envelope(
     }
 }
 
-/// Decodes the current-position payload into the T11.2 readback shape.
+/// Decodes the current-position payload into the T11.2 readback shape, bound to
+/// the exact `position` selector and scope this reconstruction asked for.
 ///
-/// `None` from a successful read is an authoritative empty positions view.
-/// A non-committed or undecodable payload is `Unavailable`, never empty and
-/// never promoted: only an external receipt proves an admitted position.
+/// A `null` payload is the source's own authoritative empty positions view: the
+/// Store keys the lookup by `position_key(scope, position)`, so it already
+/// answers THIS selector and there is no echoed identity left to compare.
+///
+/// Every other payload is bound by [`bind_position_payload`] before it is
+/// interpreted, because a readback for another position is as foreign as a
+/// readback with another `task_id`. A payload that fails the binding, does not
+/// decode, or carries no committed receipt is `Unavailable` with no readback
+/// exposed — never empty, never promoted: only an external receipt proves an
+/// admitted position.
 fn decode_epistemic_payload(
     payload: &Value,
+    scope: &ScopeId,
+    position: &str,
 ) -> (ProjectionState, Option<EpistemicPositionReadback>) {
-    let readback: Option<EpistemicPositionReadback> = match serde_json::from_value(payload.clone())
-    {
+    if payload.is_null() {
+        return (ProjectionState::KnownEmpty, None);
+    }
+    if let Some(reason) = bind_position_payload(payload, scope, position) {
+        return (
+            ProjectionState::Unavailable {
+                reason: bounded_reason("position readback is not this request", reason),
+            },
+            None,
+        );
+    }
+    let readback: EpistemicPositionReadback = match serde_json::from_value(payload.clone()) {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -1440,16 +1471,62 @@ fn decode_epistemic_payload(
             );
         }
     };
-    match readback {
-        None => (ProjectionState::KnownEmpty, None),
-        Some(readback) if readback.receipt.status != WriteReceiptStatus::Committed => (
+    if readback.receipt.status != WriteReceiptStatus::Committed {
+        return (
             ProjectionState::Unavailable {
                 reason: "position readback carries no committed receipt".to_owned(),
             },
             None,
-        ),
-        Some(readback) => (ProjectionState::Complete, Some(readback)),
+        );
     }
+    (ProjectionState::Complete, Some(readback))
+}
+
+/// Returns why one current-position payload does not answer the requested
+/// `position` selector under `scope`, or `None` when it does.
+///
+/// The position read answers with the T11.2 readback rather than a selector
+/// envelope, so the echoed identity is read out of the same bytes the typed
+/// decode consumes: the declared readback `schema`, the scope its candidate and
+/// transition carry, the position its transition names, and the position every
+/// admitted row repeats on its own `AdmittedReceipt`. This is the same
+/// comparison [`classify_role_envelope`] makes on `version`/`scope_id`/
+/// `<selector>`, and it is a binding check rather than a second decode: every
+/// value is compared as recorded, and the typed decode with the contracts' own
+/// `validate()` still decides whether the page is usable at all.
+fn bind_position_payload(
+    payload: &Value,
+    scope: &ScopeId,
+    position: &str,
+) -> Option<&'static str> {
+    let echoes = |pointer: &str, expected: &str| {
+        payload.pointer(pointer).and_then(Value::as_str) == Some(expected)
+    };
+    if payload.get("schema").and_then(Value::as_str) != Some(EPISTEMIC_REVISION_SCHEMA) {
+        return Some("unsupported position readback schema");
+    }
+    if !echoes("/candidate/scope", scope.as_str())
+        || !echoes("/candidate/work_scope/scope_id", scope.as_str())
+        || !echoes("/transition/work_scope/scope_id", scope.as_str())
+    {
+        return Some("position scope mismatch");
+    }
+    if !echoes("/transition/position", position) || !echoes("/candidate/proposition", position) {
+        return Some("position selector mismatch");
+    }
+    let Some(admitted) = payload
+        .get("positions")
+        .and_then(Value::as_array)
+        .filter(|positions| !positions.is_empty())
+    else {
+        return Some("position readback served no admitted position");
+    };
+    if admitted.iter().any(|view| {
+        view.pointer("/admission/position").and_then(Value::as_str) != Some(position)
+    }) {
+        return Some("an admitted position does not repeat the requested position");
+    }
+    None
 }
 
 /// Classifies an evidence-pack payload against its authoritative provenance.
@@ -1598,6 +1675,64 @@ mod reconstruction_tests {
             "records": [{"revision": 1}],
             "provenance": {"matched_total": 1, "returned": 1, "truncated": false},
         })
+    }
+
+    /// The identity a current-position readback echoes for one exact `position`
+    /// selector, at the shape the Store's position handler returns.
+    fn echoed_position(scope: &str, position: &str) -> Value {
+        serde_json::json!({
+            "schema": EPISTEMIC_REVISION_SCHEMA,
+            "positions": [{"admission": {"scope": scope, "position": position}}],
+            "candidate": {
+                "scope": scope,
+                "proposition": position,
+                "work_scope": {"scope_id": scope},
+            },
+            "transition": {
+                "position": position,
+                "work_scope": {"scope_id": scope},
+            },
+        })
+    }
+
+    #[test]
+    fn a_position_readback_is_bound_to_the_selector_and_scope_it_was_asked_for() -> ProofResult {
+        let scope = ScopeId::new("scope-a")?;
+        // Positive: the response's own schema, candidate/transition scope and
+        // transition position all name what this read asked for, so the binding
+        // admits it and the page reaches the typed decode — which is the only
+        // stage allowed to refuse it after that. The source's own empty answer
+        // for that same `position_key` stays an authoritative `KnownEmpty`.
+        let bound = echoed_position("scope-a", "position-a");
+        assert_eq!(
+            bind_position_payload(&bound, &scope, "position-a"),
+            None
+        );
+        let (state, readback) = decode_epistemic_payload(&bound, &scope, "position-a");
+        assert!(matches!(
+            state,
+            ProjectionState::Unavailable { ref reason } if reason.contains("not a readback")
+        ));
+        assert!(readback.is_none());
+        let (empty, readback) = decode_epistemic_payload(&Value::Null, &scope, "position-a");
+        assert_eq!(empty, ProjectionState::KnownEmpty);
+        assert!(readback.is_none());
+
+        // Refusal: the same readback answering another position proves nothing
+        // about this request, so it is `Unavailable` on the binding itself and
+        // exposes no readback.
+        let foreign = echoed_position("scope-a", "position-b");
+        assert_eq!(
+            bind_position_payload(&foreign, &scope, "position-a"),
+            Some("position selector mismatch")
+        );
+        let (state, readback) = decode_epistemic_payload(&foreign, &scope, "position-a");
+        assert!(matches!(
+            state,
+            ProjectionState::Unavailable { ref reason } if reason.contains("not this request")
+        ));
+        assert!(readback.is_none());
+        Ok(())
     }
 
     /// The binding the `task_frame` slot was requested with.
