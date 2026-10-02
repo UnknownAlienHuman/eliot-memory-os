@@ -184,22 +184,20 @@ impl QualityRequest {
     pub fn validate(&self) -> Result<(), QualityError> {
         check_consumed_freeze()?;
         self.batch.validate()?;
-        self.applicable.validate()?;
-        if self.applicable.binding != self.batch.binding {
-            return Err(QualityError::BindingMismatch {
-                left: "applicable.binding",
-                right: "batch.binding",
-            });
+        // The denominator is the batch owner's fact, so its absence is
+        // reported as the owner's typed refusal before the verdict is asked
+        // to carry a proof ceiling for it.
+        if !matches!(
+            self.batch.coverage.denominator,
+            DenominatorState::Known { .. }
+        ) {
+            return Err(QualityError::MissingDenominator);
         }
-        if self.applicable.denominator != self.batch.coverage.denominator
-            || self.applicable.truncated != self.batch.coverage.truncated
-            || self.applicable.revalidation_required != self.batch.coverage.revalidation_required
-        {
-            return Err(QualityError::BindingMismatch {
-                left: "applicable.denominator",
-                right: "batch.coverage",
-            });
-        }
+        // The owner's own join proves the verdict covers exactly this batch:
+        // its echoes match and its dispositions equal the projected handles.
+        // It replaces the separate echo comparison and handle-union walk that
+        // previously restated the same rule here.
+        self.applicable.validate_against_batch(&self.batch)?;
         self.projections.validate()?;
         let projection_binding = &self.projections.binding;
         if projection_binding.task_id != self.batch.binding.task_id
@@ -245,41 +243,7 @@ impl QualityRequest {
                 });
             }
         }
-        // The set verdict must cover exactly the batch records: neither a
-        // bare caller handle smuggled in nor a projected record left without
-        // a verdict is promoted to an accepted fact.
-        let batch_handles: BTreeSet<&str> = self
-            .batch
-            .records
-            .iter()
-            .map(|record| record.handle.as_str())
-            .collect();
-        let mut set_handles = BTreeSet::new();
-        for entry in self
-            .applicable
-            .applicable
-            .iter()
-            .map(|entry| entry.handle.as_str())
-            .chain(
-                self.applicable
-                    .excluded
-                    .iter()
-                    .map(|entry| entry.handle.as_str()),
-            )
-        {
-            if !set_handles.insert(entry) {
-                return Err(QualityError::HandleMismatch {
-                    field: "applicable",
-                    reason: "duplicate handle across the verdict lists",
-                });
-            }
-        }
-        if set_handles != batch_handles {
-            return Err(QualityError::HandleMismatch {
-                field: "applicable",
-                reason: "verdict handles must equal exactly the batch record handles",
-            });
-        }
+        // The verdict-must-cover-the-batch rule is enforced above, at its owner.
         Ok(())
     }
 }
@@ -503,9 +467,10 @@ const CLOSED_RULES: [&str; 12] = [
 ///
 /// Every count reconciles exactly: the denominator total equals assessed
 /// plus omitted plus unaccounted volume, applicable plus excluded equals
-/// assessed, and rule counts sum to excluded. No rate, ratio, or score is
-/// derived: cold-capture ratios and weak-claim rates stay proof fixtures
-/// with their own horizons, not assessment fields.
+/// assessed, rule counts sum to excluded, and `unaccounted_volume` equals the
+/// carried frontier remainder whose identities name it. No rate, ratio, or
+/// score is derived: cold-capture ratios and weak-claim rates stay proof
+/// fixtures with their own horizons, not assessment fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CounterMetrics {
@@ -515,7 +480,8 @@ pub struct CounterMetrics {
     pub records_assessed: usize,
     /// Named batch omissions carried alongside the records.
     pub omissions_carried: usize,
-    /// Declared volume with no carried record or omission: unaccounted.
+    /// Declared volume represented by no assessed record and no named
+    /// omission: exactly the carried resume-frontier remainder.
     pub unaccounted_volume: usize,
     /// Admitted projection omissions carried alongside the batch.
     pub projection_omissions: usize,
@@ -672,6 +638,7 @@ impl MemoryEcologyAssessment {
             }
         }
         self.validate_section_handles(&seen)?;
+        self.validate_recovery_partition(&seen)?;
         for observation in &self.receipts {
             observation.validate()?;
         }
@@ -700,6 +667,82 @@ impl MemoryEcologyAssessment {
                     reason: "maintenance notes must name assessed records",
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validate that the carried recovery identities are unique, disjoint from
+    /// the assessed records, and account for exactly the known denominator.
+    ///
+    /// The batch owner proved this partition once, over the batch it produced;
+    /// this assessment is independently deserializable and persists its own
+    /// copy of the frontier and the named omissions, so it must be able to
+    /// recheck the partition against itself. Without this, a persisted
+    /// assessment could name a frontier handle that is also an assessed item,
+    /// or leave `unaccounted_volume` inconsistent with the identities that
+    /// account for it, while every carried count still reconciled.
+    fn validate_recovery_partition(&self, assessed: &BTreeSet<String>) -> Result<(), QualityError> {
+        let mut recovery = BTreeSet::new();
+        for handle in &self.frontier {
+            text(handle, "assessment.frontier")?;
+            if !recovery.insert(handle.clone()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.frontier",
+                    reason: "frontier handles must be unique",
+                });
+            }
+        }
+        for omission in &self.batch_omissions {
+            omission.validate()?;
+            if !recovery.insert(omission.handle.as_str().to_owned()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.batch_omissions",
+                    reason: "batch omission handles must be unique and disjoint from the frontier",
+                });
+            }
+        }
+        if assessed.iter().any(|handle| recovery.contains(handle)) {
+            return Err(QualityError::HandleMismatch {
+                field: "assessment.coverage",
+                reason: "recovery identities cannot overlap assessed records",
+            });
+        }
+        let accounted = self
+            .items
+            .len()
+            .checked_add(self.batch_omissions.len())
+            .and_then(|volume| volume.checked_add(self.frontier.len()))
+            .ok_or(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "recovery-accounting volume overflows",
+            })?;
+        let DenominatorState::Known { total } = &self.denominator else {
+            return Err(QualityError::MissingDenominator);
+        };
+        if *total != accounted {
+            return Err(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "known denominator must exactly partition items, omissions, and frontier",
+            });
+        }
+        if self.truncated == self.frontier.is_empty() {
+            return Err(QualityError::InvalidField {
+                field: "assessment.truncated",
+                reason: "truncation must match frontier presence exactly",
+            });
+        }
+        let lossy_recovery = self.truncated || !self.batch_omissions.is_empty();
+        if lossy_recovery && !self.revalidation_required {
+            return Err(QualityError::InvalidField {
+                field: "assessment.revalidation_required",
+                reason: "lossy recovery requires revalidation",
+            });
+        }
+        if self.counter_metrics.unaccounted_volume != self.frontier.len() {
+            return Err(QualityError::InvalidField {
+                field: "counter_metrics.unaccounted_volume",
+                reason: "unaccounted volume must equal the carried frontier remainder",
+            });
         }
         Ok(())
     }
@@ -995,8 +1038,13 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
         verdicts.insert(entry.handle.as_str(), (Some(&entry.reason), entry.cue_hit));
     }
     let (items, gravity, maintenance, rules) = derive_sections(request, &verdicts)?;
-    let unaccounted_volume =
-        total.saturating_sub(request.batch.records.len() + request.batch.coverage.omissions.len());
+    // `MemoryProjectionBatch::validate` already proved the exact
+    // projected/omitted/deferred partition, so the residual this metric
+    // reports is precisely the deferred frontier remainder. Reading it as
+    // `total - records - omissions` would be the same number by that proof,
+    // but deriving it from the identities keeps the metric honest if the
+    // partition rule ever admits a fourth disposition.
+    let unaccounted_volume = request.batch.coverage.frontier.len();
     let lossy = request.batch.coverage.truncated
         || !request.batch.coverage.omissions.is_empty()
         || !request.projections.omissions.is_empty()
