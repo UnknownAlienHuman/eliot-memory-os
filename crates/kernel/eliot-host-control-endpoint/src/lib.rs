@@ -48,7 +48,6 @@ pub use eliot_host_service::{
 };
 use eliot_host_service::{UserAutomationHostExecutionSession, UserAutomationHostOwnerBinding};
 use eliot_ipc::{NamedPipeServer, PeerIdentity, TransportLimits};
-use eliot_protocol::backup::{BackupError, BackupReplayDisposition, BackupReplayLedger};
 use tokio::sync::oneshot;
 
 pub mod backup;
@@ -314,23 +313,6 @@ pub struct HostRuntimeControl {
     user_automation_queue: HostUserAutomationExecutionQueue,
     user_automation_owner: Option<UserAutomationHostOwnerBinding>,
     backup_owner: Option<HostBackupOwnerRegistration>,
-    /// The canonical `#954` replay ledger over the backup control requests this
-    /// endpoint admits.
-    ///
-    /// It lives on the endpoint rather than inside one request because the
-    /// endpoint is the long-lived owner of the canonical Host runtime-control
-    /// pipe: `Self::serve_one` is driven in a loop by the Host composition
-    /// for the life of the process, so this ledger observes every admitted
-    /// backup request across frames and a replayed request is refused against
-    /// the ORIGINAL accepted content.
-    ///
-    /// This is the protocol owner's ledger used as it stands
-    /// (`BackupReplayLedger::observe`), so this endpoint introduces no second
-    /// replay scheme, spells no second replay reason vocabulary, and never
-    /// recomputes a digest to decide one. It is not durable storage:
-    /// cross-restart reconciliation and durability stay with the owner's
-    /// journal, and this ledger refuses a replay inside one endpoint lifetime.
-    backup_replay: Mutex<BackupReplayLedger>,
 }
 
 impl HostRuntimeControl {
@@ -360,7 +342,6 @@ impl HostRuntimeControl {
             user_automation_queue,
             user_automation_owner: None,
             backup_owner: None,
-            backup_replay: Mutex::new(BackupReplayLedger::new()),
         })
     }
 
@@ -381,7 +362,6 @@ impl HostRuntimeControl {
             user_automation_queue,
             user_automation_owner: Some(owner),
             backup_owner: None,
-            backup_replay: Mutex::new(BackupReplayLedger::new()),
         })
     }
 
@@ -398,76 +378,6 @@ impl HostRuntimeControl {
     pub fn with_backup_owner(mut self, owner: HostBackupOwnerRegistration) -> Self {
         self.backup_owner = Some(owner);
         self
-    }
-
-    /// Records one backup control request against the canonical `#954` replay
-    /// ledger and refuses every replay of it, before the owner is called.
-    ///
-    /// I5.27 defines idempotency over canonical bytes and states that reusing
-    /// one idempotency key with a different canonical request hash is an
-    /// `IDENTITY_CONFLICT` that performs no transition. The canonical owner of
-    /// that rule is `eliot-protocol`'s `BackupReplayLedger`, which already
-    /// keys on `BackupMutationBinding::canonical_request_hash` and returns
-    /// `BackupError::ReplayConflict` before any semantic handling. Before
-    /// this gate existed that ledger had NO production call site anywhere in
-    /// the workspace, so a replayed Host backup request was admitted a second
-    /// time and dispatched to the owner again: every per-request validator
-    /// checks self-consistency, and a byte-identical or
-    /// changed-content-replay envelope is self-consistent by construction.
-    ///
-    /// The request identity handed to the ledger is the one the carried
-    /// operation body binds, and the ledger's own `observe` runs that
-    /// identity's `validate()` first, so an identity that does not satisfy its
-    /// own canonical contract refuses here too. No digest is recomputed here
-    /// and no evidence is inferred from the existence or shape of a value.
-    ///
-    /// The observation is taken under the lock and the guard is dropped before
-    /// the owner is called, so no ledger guard is ever held across an owner
-    /// call. It is not undone by a later pre-effect owner refusal: that is the
-    /// price of closing the window in which two identical requests reach one
-    /// owner, and it is fail-closed because a requester that sees a refusal
-    /// reconciles the original operation instead of starting a second one.
-    ///
-    /// # Errors
-    ///
-    /// Returns this operation's typed pre-effect [`BackupDispatchRefusal`] when
-    /// the ledger cannot be locked, when the observed identity is a
-    /// byte-identical repeat of one this endpoint already admitted, when it
-    /// reuses one admitted canonical request hash with changed content, or when
-    /// it does not satisfy its own canonical request-identity contract. Every
-    /// one of those is produced before any owner effect.
-    fn observe_backup_replay(
-        &self,
-        request: &BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
-        let operation = request.operation;
-        let Ok(mut ledger) = self.backup_replay.lock() else {
-            return Err(BackupDispatchRefusal::new(
-                operation,
-                "backup replay ledger is unavailable",
-            ));
-        };
-        let observed = ledger.observe(request.body.identity());
-        drop(ledger);
-        match observed {
-            Ok(BackupReplayDisposition::Accepted) => Ok(()),
-            Ok(BackupReplayDisposition::Duplicate) => Err(BackupDispatchRefusal::new(
-                operation,
-                "backup request replays an identity this endpoint already admitted",
-            )),
-            Err(BackupError::ReplayConflict) => Err(BackupDispatchRefusal::new(
-                operation,
-                "backup request reuses one admitted identity with changed content",
-            )),
-            // Every other cause is the request identity failing its own
-            // canonical contract. It is refused here rather than dropped, so a
-            // ledger decision is never reached by an identity that does not
-            // satisfy that contract.
-            Err(_) => Err(BackupDispatchRefusal::new(
-                operation,
-                "backup request identity does not satisfy its own canonical contract",
-            )),
-        }
     }
 
     pub fn queue(&self) -> HostRuntimeControlQueue {
@@ -758,17 +668,6 @@ impl HostRuntimeControl {
                 "registered cutover admission diverges from the accepted Host backup table",
             ));
         }
-        // 4a. Replay. The canonical `#954` replay ledger observes this request's
-        //     bound identity against the ORIGINAL content this endpoint already
-        //     admitted for that canonical request hash, and a byte-identical
-        //     repeat or a changed-content reuse of one hash is refused here. It
-        //     runs after every gate above has admitted the request and before
-        //     the owner is called, so the refusal is exact and pre-effect:
-        //     nothing has transitioned, and the caller reconciles the original
-        //     operation instead of starting a second one. Without this gate the
-        //     ledger had no production call site and a replay reached the owner
-        //     a second time.
-        self.observe_backup_replay(request)?;
         // 5. Route to the one registered owner operation. Its typed outcome
         //    is the only source of the answer's disposition: pending,
         //    completed with the owner's receipt, or possible-effect. A
@@ -894,256 +793,11 @@ impl HostRuntimeControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{
-        ClockReading, ContractId, ContractIdentity, ContractVersion, EpochId, EpochLineageId,
-        ProductId, ReceiptId, RequestId, RequestMetadata, ResourceGeneration, SessionId, SourceId,
-        StateFence, sha256_hex,
-    };
     use eliot_host_service::runtime_control::runtime_control_request_frame;
     use eliot_platform::PlatformHandle;
-    use eliot_protocol::backup::{
-        BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID, BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
-        BACKUP_REQUEST_IDENTITY_WIRE_ID, BACKUP_REQUEST_IDENTITY_WIRE_VERSION, BackupAdmissionRef,
-        BackupAuthenticatedPrincipal, BackupClassWire, BackupIsolatedRestorePrepare,
-        BackupMutationBinding, BackupReplayLedger, BackupRequestIdentity,
-    };
-    use eliot_receipts::{
-        AuthorityBinding, EffectClass, ProofCeiling, RequestBinding, WorkScopeBinding, WorkScopeId,
-    };
-    use std::num::NonZeroU64;
-    use std::sync::{Arc, Mutex};
 
     fn handle(value: &str) -> PlatformHandle {
         PlatformHandle::new(value.to_owned()).unwrap_or_else(|_| unreachable!())
-    }
-
-    fn sha(seed: &str) -> String {
-        sha256_hex(seed.as_bytes())
-    }
-
-    fn replay_epoch() -> EpochId {
-        EpochId::new(
-            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
-            NonZeroU64::new(1).expect("sequence"),
-        )
-        .expect("epoch")
-    }
-
-    fn replay_fence() -> StateFence {
-        StateFence::new(
-            replay_epoch(),
-            ResourceGeneration::new(1).expect("generation"),
-        )
-    }
-
-    fn replay_contract(name: &str) -> ContractIdentity {
-        ContractIdentity {
-            name: ContractId::new(name).expect("contract name"),
-            version: ContractVersion::new(1, 0, 0),
-            shape_sha256: sha(name),
-        }
-    }
-
-    /// One `PrepareIsolatedRestore` request identity.
-    ///
-    /// `snapshot_seed` is the ONLY thing that varies between calls, and the
-    /// canonical request hash is deliberately the SAME in every call: the
-    /// canonical replay ledger keys on that value alone, so reusing one hash
-    /// with different content is exactly the replay it must refuse.
-    fn replay_identity(snapshot_seed: &str) -> BackupRequestIdentity {
-        let state_fence = replay_fence();
-        BackupRequestIdentity {
-            wire_id: BACKUP_REQUEST_IDENTITY_WIRE_ID.to_owned(),
-            wire_version: BACKUP_REQUEST_IDENTITY_WIRE_VERSION,
-            principal: BackupAuthenticatedPrincipal {
-                principal: "principal-001".to_owned(),
-                session_id: "session-001".to_owned(),
-                role: BackupRole::Requester,
-                authority_epoch: replay_epoch(),
-            },
-            request: eliot_protocol::RequestIdentity {
-                request: RequestBinding {
-                    metadata: RequestMetadata {
-                        request_id: RequestId::new("backup-req-replay").expect("request id"),
-                        session_id: Some(SessionId::new("session-001").expect("session")),
-                        task_id: None,
-                        product_id: ProductId::new("product-001").expect("product"),
-                        source_id: SourceId::new("source-001").expect("source"),
-                        state_fence: state_fence.clone(),
-                        clock: ClockReading::default(),
-                    },
-                    state_fence: state_fence.clone(),
-                },
-                idempotency_key: "transport-backup-req-replay".to_owned(),
-                deadline_unix_ms: 10_000,
-                cancellation_id: "cancel-001".to_owned(),
-            },
-            mutation: BackupMutationBinding {
-                operation: BackupOperationKind::PrepareIsolatedRestore,
-                canonical_request_hash: sha("mutation:prepare"),
-            },
-            archive_id: "archive-001".to_owned(),
-            archive_contract: replay_contract("archive.owner"),
-            archive_digest: sha("archive-001"),
-            owner_contract: replay_contract("attesting.owner"),
-            schema_digest: sha("schema-001"),
-            build_digest: sha("build-001"),
-            source_installation: "src-001".to_owned(),
-            dest_installation: "dest-001".to_owned(),
-            class: BackupClassWire::FullRecovery,
-            fence: state_fence,
-            snapshot_digest: sha(snapshot_seed),
-            member_digest: sha("members-001"),
-            max_page_members: 16,
-            max_payload_bytes: 65_536,
-            deadline_unix_ms: 10_000,
-            cancellation_id: "cancel-001".to_owned(),
-            admission: BackupAdmissionRef {
-                authority: AuthorityBinding {
-                    authority_id: ContractId::new("admission-authority-001").expect("authority id"),
-                    authority_owner: "backup-admission-authority".to_owned(),
-                    authority_epoch: replay_epoch(),
-                    state_fence: replay_fence(),
-                    allowed_effect: EffectClass::Read,
-                    proof_ceiling: ProofCeiling::Observation,
-                },
-                scope: WorkScopeBinding {
-                    scope_id: WorkScopeId::new("scope-001").expect("scope"),
-                    product_id: ProductId::new("product-001").expect("product"),
-                    resource_generation: ResourceGeneration::new(1).expect("generation"),
-                    state_fence: replay_fence(),
-                },
-                capability: "backup.prepare".to_owned(),
-                admission_receipt: ReceiptId::new("admission-001").expect("admission receipt"),
-            },
-            identity_digest: String::new(),
-        }
-        .with_computed_digest()
-        .expect("identity digest")
-    }
-
-    /// One fully admitted `PrepareIsolatedRestore` `BackupRuntimeControlRequest`
-    /// envelope over the identity above.
-    fn replay_request(snapshot_seed: &str) -> BackupRuntimeControlRequest {
-        let identity = replay_identity(snapshot_seed);
-        let prepare = BackupIsolatedRestorePrepare {
-            wire_id: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_ID.to_owned(),
-            wire_version: BACKUP_ISOLATED_RESTORE_PREPARE_WIRE_VERSION,
-            identity: identity.clone(),
-            operation: BackupOperationKind::PrepareIsolatedRestore,
-            destination_installation: identity.dest_installation.clone(),
-            max_restore_bytes: 4096,
-            request_digest: String::new(),
-        }
-        .with_computed_digest()
-        .expect("prepare digest");
-        BackupRuntimeControlRequest::new_backup(
-            BackupOperationBody::PrepareIsolatedRestore(prepare),
-            handle("host-restore-owner"),
-            handle("host-replay-request"),
-            handle("host-replay-nonce"),
-            handle(&sha("generation-001")),
-            handle(&sha("fence-001")),
-        )
-        .expect("admitted backup request")
-    }
-
-    /// One endpoint with no owner registered, so nothing but the admission
-    /// gates can answer a request in these cases.
-    fn replay_endpoint() -> HostRuntimeControl {
-        HostRuntimeControl {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-            user_automation_queue: Arc::new(Mutex::new(VecDeque::new())),
-            user_automation_owner: None,
-            backup_owner: None,
-            backup_replay: Mutex::new(BackupReplayLedger::new()),
-        }
-    }
-
-    fn recorded_identities(endpoint: &HostRuntimeControl) -> usize {
-        endpoint.backup_replay.lock().expect("ledger").len()
-    }
-
-    /// Positive case: the FIRST observation of one identity is admitted and
-    /// recorded, and the owner seam is reached.
-    ///
-    /// Fails without `HostRuntimeControl::observe_backup_replay`: at base the
-    /// endpoint held no replay state at all, so `recorded_identities` had no
-    /// state to read and no admission decision was ever taken against one.
-    #[test]
-    fn first_prepare_admission_is_recorded_by_the_replay_gate() {
-        let endpoint = replay_endpoint();
-        let request = replay_request("snapshot-001");
-        // The envelope is fully self-consistent, which is what makes the replay
-        // cases below reachable at all.
-        assert!(request.validate().is_ok());
-        assert_eq!(recorded_identities(&endpoint), 0);
-        assert!(endpoint.observe_backup_replay(&request).is_ok());
-        assert_eq!(recorded_identities(&endpoint), 1);
-    }
-
-    /// Refusal case 1: a byte-identical second envelope is refused before the
-    /// owner seam, and the original entry is left untouched.
-    ///
-    /// Fails without the gate: at base this envelope passes
-    /// `BackupRuntimeControlRequest::validate` — every per-request check is a
-    /// self-consistency check, and a byte-identical replay is self-consistent by
-    /// construction — so `handle_backup_operation` continued to
-    /// `registration.dispatch` and the owner operation ran a second time.
-    #[test]
-    fn byte_identical_prepare_replay_is_refused_before_the_owner_seam() {
-        let endpoint = replay_endpoint();
-        assert!(
-            endpoint
-                .observe_backup_replay(&replay_request("snapshot-001"))
-                .is_ok()
-        );
-        let replayed = replay_request("snapshot-001");
-        assert!(replayed.validate().is_ok());
-        let refusal = endpoint
-            .observe_backup_replay(&replayed)
-            .expect_err("a byte-identical replay must be refused");
-        assert_eq!(
-            refusal.operation,
-            BackupOperationKind::PrepareIsolatedRestore
-        );
-        assert_eq!(
-            refusal.reason,
-            "backup request replays an identity this endpoint already admitted"
-        );
-        assert_eq!(recorded_identities(&endpoint), 1);
-    }
-
-    /// Refusal case 2: one canonical request hash reused with CHANGED canonical
-    /// content is refused, and the already-recorded entry is not overwritten.
-    ///
-    /// I5.27 makes this `IDENTITY_CONFLICT` with no transition. Fails without
-    /// the gate: this envelope is also fully self-consistent — the identity
-    /// digest, the prepare digest and both envelope digests are recomputed over
-    /// the changed content — so at base `handle_backup_operation` dispatched it
-    /// to the owner as a second, different effect under one stable identity.
-    #[test]
-    fn changed_content_prepare_replay_under_one_identity_is_refused() {
-        let endpoint = replay_endpoint();
-        assert!(
-            endpoint
-                .observe_backup_replay(&replay_request("snapshot-001"))
-                .is_ok()
-        );
-        let changed = replay_request("snapshot-changed");
-        assert!(changed.validate().is_ok());
-        let refusal = endpoint
-            .observe_backup_replay(&changed)
-            .expect_err("a changed-content replay must be refused");
-        assert_eq!(
-            refusal.operation,
-            BackupOperationKind::PrepareIsolatedRestore
-        );
-        assert_eq!(
-            refusal.reason,
-            "backup request reuses one admitted identity with changed content"
-        );
-        assert_eq!(recorded_identities(&endpoint), 1);
     }
 
     #[test]

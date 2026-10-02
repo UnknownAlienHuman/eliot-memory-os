@@ -2078,13 +2078,11 @@ dependencies = [
 name = "eliot-host-control-endpoint"
 version = "0.1.0"
 dependencies = [
- "eliot-contracts",
  "eliot-host-service",
  "eliot-ipc",
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-protocol",
- "eliot-receipts",
  "serde_json",
  "tokio",
 ]
