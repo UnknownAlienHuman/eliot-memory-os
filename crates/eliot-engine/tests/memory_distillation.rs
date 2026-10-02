@@ -357,7 +357,7 @@ fn verified_episode_groups_only_propose_a_pattern() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn exact_distillation_reduces_active_bytes_without_losing_current_truth()
+fn exact_distillation_reduces_estimated_covering_active_bytes_without_losing_current_truth()
 -> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let snapshot_revision = MemoryRevision::new(12);
@@ -380,8 +380,9 @@ fn exact_distillation_reduces_active_bytes_without_losing_current_truth()
         empty_ledger(project_id, snapshot_revision, true),
     )?;
 
-    let before = plan.corpus_profile_before.active_bytes;
-    let after = i64::try_from(before)? + plan.expected_active_bytes_delta;
+    let before = plan.corpus_profile_before.estimated_covering_active_bytes;
+    let after =
+        i64::try_from(before)? + plan.expected_estimated_covering_active_bytes_delta;
     assert!(before > 0);
     assert!(after >= 0);
     assert!(after * 100 <= i64::try_from(before)? * 60);

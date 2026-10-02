@@ -177,8 +177,16 @@ pub struct MemoryDistillationCorpusItem {
 pub struct MemoryDistillationCorpusProfile {
     pub physical_records: usize,
     pub logical_items: usize,
-    pub total_bytes: u64,
-    pub active_bytes: u64,
+    /// Sum of the covering byte estimates of every item's measured
+    /// `token_units`, byte-denominated so one integer cannot mean two units.
+    /// It is a COVERING estimate, not an observed storage byte count: no item
+    /// carries a serialized length, so every actual length lies in
+    /// `[3u - 2, 3u]` for its item and this total is the sum of one
+    /// whole-multiple member of each such range.
+    pub estimated_covering_bytes: u64,
+    /// The same covering estimate as [`Self::estimated_covering_bytes`],
+    /// restricted to the hot and warm tiers.
+    pub estimated_covering_active_bytes: u64,
     #[serde(deserialize_with = "deserialize_strict_btree_map")]
     pub tier_counts: BTreeMap<MemoryTier, usize>,
 }
@@ -248,7 +256,11 @@ pub struct MemoryDistillationPlan {
     pub corpus_profile_before: MemoryDistillationCorpusProfile,
     pub candidates: Vec<MemoryDistillationCandidate>,
     pub protected_refs: Vec<String>,
-    pub expected_active_bytes_delta: i64,
+    /// Expected change in [`MemoryDistillationCorpusProfile::estimated_covering_active_bytes`]
+    /// if every automatically applicable candidate were applied. Like that
+    /// field it is a delta of a COVERING estimate, not of observed storage
+    /// bytes, and it is signed only by direction of change.
+    pub expected_estimated_covering_active_bytes_delta: i64,
     pub expected_reconstruction_delta: i64,
     pub unresolved_items: Vec<String>,
 }
@@ -381,7 +393,7 @@ mod tests {
         for required in [
             "snapshot_revision",
             "protected_refs",
-            "expected_active_bytes_delta",
+            "expected_estimated_covering_active_bytes_delta",
             "unresolved_items",
         ] {
             assert!(plan.contains(required));

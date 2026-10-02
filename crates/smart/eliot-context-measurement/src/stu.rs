@@ -22,14 +22,22 @@ pub fn stu_for_bytes(len: u64) -> Result<u64, ContextError> {
         .ok_or(ContextError::Overflow)
 }
 
-/// Compute the smallest UTF-8 byte length whose [`stu_for_bytes`] estimate is
-/// at least `units`.
+/// Compute a covering UTF-8 byte length for `units`: one whose
+/// [`stu_for_bytes`] estimate is at least `units`, and which need not be the
+/// smallest such length.
 ///
-/// This is the covering inverse of the normative `STU(bytes) = ceil(bytes / 3)`
-/// owned by this module: for `u`, the smallest `b` with `ceil(b / 3) >= u` is
-/// exactly `3 * u`, because `ceil(3u / 3) = u` and `ceil((3u - 1) / 3) = u - 1`.
-/// It therefore round-trips: `stu_for_bytes(bytes_for_stu(u)?) == u` for every
-/// `u` this function accepts.
+/// This is a COVERING length for the normative `STU(bytes) = ceil(bytes / 3)`
+/// owned by this module, not the smallest one. `ceil(b / 3) >= u` holds exactly
+/// when `b >= 3u - 2`, so the smallest covering length is `3u - 2` for
+/// `u >= 1` (`1` for `u = 1`). `3 * u` is the whole-multiple member of that
+/// covering set - it never under-covers - and this function returns it so the
+/// ratio stays exactly three bytes per unit. It therefore round-trips:
+/// `stu_for_bytes(bytes_for_stu(u)?) == u` for every `u` this function
+/// accepts.
+///
+/// `STU` is many-to-one, so the returned length is never an exact inverse and
+/// no value of it recovers an observed length: `u = 64` is produced by every
+/// `b` in `190..=192`, and all of them round-trip to `192` here.
 ///
 /// This is a length, not a measurement. It never converts a measured unit
 /// count into an observed byte count; it only names the byte length a caller
