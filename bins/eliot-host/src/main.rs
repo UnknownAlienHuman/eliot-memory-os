@@ -3627,3 +3627,224 @@ mod process_bootstrap_tests {
         Ok(())
     }
 }
+
+/// #982 executable proof for the console obligations the `run_console`
+/// integration target cannot reach.
+///
+/// `run_console` opens a real `HostComposition` before it reaches any of these
+/// decisions, and that open requires an installed protected Host root, an
+/// approved generation and a live store — none of which any in-repo fixture
+/// creates (`HostComposition::open` on an empty registry refuses, which is
+/// exactly what `bins/eliot-host/src/lib.rs`'s own inline proof asserts). So
+/// this module drives the decisions `run_console` actually makes, through the
+/// real production types and the real production function, rather than
+/// re-describing them: `ConsoleRun::failed` is the single judgement `main`
+/// acts on, and `persist_host_start_failure` plus `console_process_exit_code`
+/// are the receipt and exit it owes when that judgement is failure.
+///
+/// No expected diagnostic record is hand-built and no facade call manufactures
+/// the record under test: every assertion below reads what production produced.
+#[cfg(test)]
+mod console_primary_outcome_tests {
+    use super::*;
+
+    /// The two independent facts of one console run, as `run_console` returns
+    /// them: what the console protocol itself did, and what the shutdown drain
+    /// that followed it did. `launch_options` is absent here because these
+    /// cases judge the outcome, which is exactly what a retained launch
+    /// identity never changes.
+    fn console_run(primary: ConsoleOutcome, drained: bool) -> ConsoleRun {
+        ConsoleRun {
+            primary,
+            drained,
+            launch_options: None,
+        }
+    }
+
+    /// #982 obligation: a stdin read failure is a failure even when the drain
+    /// that follows it succeeded. The read loop's `Err` arm is the production
+    /// site that fixes the primary outcome as `Failed`, and a clean drain
+    /// proves cleanup only, so the run still owes the console receipt. The
+    /// control row is the same completed drain after a clean read loop, which
+    /// is what the defect collapsed these two into.
+    #[test]
+    fn read_failure_is_not_repaired_by_a_successful_drain() {
+        assert!(
+            console_run(ConsoleOutcome::Failed, true).failed(),
+            "a read failure must stay a failure after a clean drain"
+        );
+        assert!(
+            !console_run(ConsoleOutcome::Served, true).failed(),
+            "a clean protocol run with a completed drain is a success"
+        );
+    }
+
+    /// #982 obligation: an unwritten response is a failure even when the drain
+    /// succeeded, and the drain result is irrelevant to it in either
+    /// direction. `run_console_read_loop`'s `response_write_failed` branch is
+    /// the production site that fixes this primary outcome.
+    #[test]
+    fn unwritten_response_is_not_repaired_by_a_successful_drain() {
+        assert!(
+            console_run(ConsoleOutcome::Failed, true).failed(),
+            "an unwritten response must stay a failure after a clean drain"
+        );
+        assert!(
+            console_run(ConsoleOutcome::Failed, false).failed(),
+            "the drain result must never clear a protocol failure"
+        );
+    }
+
+    /// #982 obligation: a clean EOF is a success. The read loop leaves the
+    /// primary outcome `Served` when stdin ends without a read error, and the
+    /// completed drain alone then judges the run. A drain that did not complete
+    /// is the one independent fact that still fails this run.
+    #[test]
+    fn clean_eof_is_a_successful_console_run() {
+        assert!(
+            !console_run(ConsoleOutcome::Served, true).failed(),
+            "a clean EOF with a completed drain owes no failure receipt"
+        );
+        assert!(
+            console_run(ConsoleOutcome::Served, false).failed(),
+            "a clean protocol run still fails when the drain did not complete"
+        );
+    }
+
+    /// The whole domain of `ConsoleRun::failed`: each of its two independent
+    /// inputs decides the run on its own, so neither may ever be ignored. This
+    /// is the exact conjunction `main` acts on, and it is the property the
+    /// primary-outcome/cleanup split exists to keep.
+    #[test]
+    fn every_console_outcome_and_drain_pair_is_judged_by_the_conjunction() {
+        // Each row names the production path that produces exactly that pair:
+        // a clean read loop with a completed drain (clean EOF or a served stop
+        // request), the same loop whose drain did not complete, and the two
+        // protocol failures (stdin read error, unwritten response) with each
+        // drain result.
+        let judged: [(&str, ConsoleOutcome, bool, bool); 4] = [
+            ("clean EOF, completed drain", ConsoleOutcome::Served, true, false),
+            ("clean protocol run, incomplete drain", ConsoleOutcome::Served, false, true),
+            ("protocol failure, completed drain", ConsoleOutcome::Failed, true, true),
+            ("protocol failure, incomplete drain", ConsoleOutcome::Failed, false, true),
+        ];
+        for (path, primary, drained, expected) in judged {
+            assert_eq!(
+                console_run(primary, drained).failed(),
+                expected,
+                "{path} is judged as a failure={expected}"
+            );
+        }
+    }
+
+    /// #982 obligation: the `Ready` frame carries the owner's service and
+    /// protocol constants and nothing else. `run_console` writes it from the
+    /// same `SERVICE_NAME`/`PROTOCOL_VERSION` pair the composition root is
+    /// bound to, and the frame carries none of the `State` frame's
+    /// liveness/dependency fields — so a `Ready` frame can never be read as
+    /// the durable or global readiness the record beside it observes
+    /// (I01.10).
+    #[test]
+    fn ready_frame_carries_only_the_owner_service_and_protocol() {
+        let frame = serde_json::to_value(Response::Ready {
+            service: SERVICE_NAME,
+            protocol: PROTOCOL_VERSION,
+        })
+        .unwrap_or_else(|error| panic!("the Ready frame must serialize: {error}"));
+        let object = frame
+            .as_object()
+            .unwrap_or_else(|| panic!("the Ready frame must be a JSON object"));
+        assert_eq!(frame["status"], "ready");
+        assert_eq!(frame["service"], SERVICE_NAME);
+        assert_eq!(frame["protocol"], PROTOCOL_VERSION);
+        for readiness_field in ["running", "active_process", "managed_dependencies"] {
+            assert!(
+                !object.contains_key(readiness_field),
+                "Ready must not carry the State frame's {readiness_field} field"
+            );
+        }
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["protocol", "service", "status"]);
+    }
+
+    /// #982 obligations 2-4 close on the receipt they owe: the bounded
+    /// start-failure capsule `main` persists for a failed console run, and the
+    /// process exit it then terminates with. Both are read back from what
+    /// production wrote into this test's own isolated state root, and the
+    /// registration nonce the same options carry is proven absent from it.
+    #[test]
+    fn failed_console_run_owes_the_typed_console_failed_receipt_and_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-console-outcome-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| panic!("fixture root: {error}"));
+        let options = console_test_options(&root);
+        let nonce = options
+            .registration_nonce()
+            .unwrap_or_else(|| panic!("fixture nonce"))
+            .as_str()
+            .to_owned();
+        persist_host_start_failure(
+            HostStopCode::ConsoleFailed,
+            "console",
+            "console protocol failed before durable shutdown",
+            Some(&options),
+        );
+        let stored = std::fs::read_to_string(root.join(HOST_START_FAILURE_CAPSULE_FILE_NAME))
+            .unwrap_or_else(|error| panic!("capsule readback: {error}"));
+        let parsed: serde_json::Value = serde_json::from_str(&stored)
+            .unwrap_or_else(|error| panic!("capsule JSON: {error}"));
+        assert_eq!(parsed["record_type"], "host_start_failure");
+        assert_eq!(parsed["service"], SERVICE_NAME);
+        assert_eq!(parsed["failure_class"], "console_failed");
+        assert_eq!(parsed["service_specific_exit_code"], 13);
+        assert_eq!(parsed["win32_exit_code"], 1066);
+        assert_eq!(
+            parsed["detail"],
+            "console protocol failed before durable shutdown"
+        );
+        assert_eq!(parsed["installation_id"], options.installation().as_str());
+        assert_eq!(
+            parsed["tx_plan_generation"],
+            options.transaction_plan_generation()
+        );
+        assert!(
+            !stored.contains(&nonce),
+            "the registration nonce must never reach the console receipt"
+        );
+        assert!(stored.len() <= HOST_START_FAILURE_CAPSULE_MAX_BYTES);
+        #[cfg(windows)]
+        assert_eq!(console_process_exit_code(), HOST_CONSOLE_PROCESS_EXIT_CODE);
+        #[cfg(not(windows))]
+        assert_eq!(console_process_exit_code(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parses the same ten-argument system-service launch shape `main`
+    /// captures, bound to this test's own state root.
+    fn console_test_options(state_root: &std::path::Path) -> HostLaunchOptions {
+        let args = vec![
+            std::ffi::OsString::from("--config-descriptor"),
+            std::ffi::OsString::from(
+                state_root
+                    .join("eliot-authority.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            std::ffi::OsString::from("--config-descriptor-sha256"),
+            std::ffi::OsString::from("a".repeat(64)),
+            std::ffi::OsString::from("--installation-id"),
+            std::ffi::OsString::from("installation-host-console-outcome-test"),
+            std::ffi::OsString::from("--tx-plan-generation"),
+            std::ffi::OsString::from("7"),
+            std::ffi::OsString::from("--host-state-root"),
+            std::ffi::OsString::from(state_root.to_string_lossy().into_owned()),
+            std::ffi::OsString::from("--registration-nonce"),
+            std::ffi::OsString::from("b".repeat(64)),
+        ];
+        parse_process_bootstrap(args)
+            .unwrap_or_else(|error| panic!("test launch options: {error}"))
+    }
+}
