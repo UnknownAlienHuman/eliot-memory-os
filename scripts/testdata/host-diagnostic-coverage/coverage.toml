@@ -706,7 +706,7 @@ sha256 = "e3f3990054f582b02d12e876aff053b676bad21750bfbf31415094a7e1e965e1"
 
 [[input]]
 path = "bins/eliot-host/tests/host_lifecycle_diagnostics.rs"
-sha256 = "8ed54a708a939772c1fbd2c0ffe6ee0244e7c91dac0b559da4214eeb9c7f7623"
+sha256 = "81787a22a804bf521830234254ce6ab0485170b16b36a6edf00b1c1a53b64704"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
