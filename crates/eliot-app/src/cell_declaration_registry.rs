@@ -337,6 +337,26 @@ mod tests {
     }
 
     #[test]
+    fn a_projection_naming_another_owner_than_the_manifest_is_refused() {
+        // Arm: the real projected row for `governor.daemon.skill-catalogue`
+        // keeps its cell and its provenance, but names a different
+        // mutable-state owner than the real manifest row. Both directions of
+        // the mirror still find exactly one row per cell, so only the owner
+        // comparison can catch a second owner being claimed, and it must
+        // report both the projected and the manifest owner.
+        let result = mirror_of_mutated_contract(
+            "mutable_state_owner = \"eliot_skill::SkillCatalogue\"\n",
+            "mutable_state_owner = \"eliot_skill::RenamedSkillCatalogue\"\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("contract projection for cell governor.daemon.skill-catalogue names mutable-state owner eliot_skill::RenamedSkillCatalogue but the manifest names eliot_skill::SkillCatalogue".to_owned()),
+            "a projection claiming another owner must be refused, naming both owners"
+        );
+    }
+
+    #[test]
     fn a_projection_pointing_elsewhere_than_the_source_is_refused() {
         // Arm (I2.23 forbids a second handwritten owner list): the real
         // projected row for `governor.daemon.composition` keeps the right cell
