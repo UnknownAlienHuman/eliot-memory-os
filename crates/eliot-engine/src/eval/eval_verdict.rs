@@ -265,13 +265,19 @@ impl EvalVerdictService {
                 let passed = u32_count(
                     family_results
                         .iter()
-                        .filter(|result| result.status == EvalCaseStatus::Passed)
+                        .filter(|result| {
+                            result.status == EvalCaseStatus::Passed
+                                && super::case_result_has_measurement_evidence(result)
+                        })
                         .count(),
                 );
                 let failed = u32_count(
                     family_results
                         .iter()
-                        .filter(|result| result.status == EvalCaseStatus::Failed)
+                        .filter(|result| {
+                            result.status == EvalCaseStatus::Failed
+                                && super::case_result_has_measurement_evidence(result)
+                        })
                         .count(),
                 );
                 let blocked = total.saturating_sub(passed).saturating_sub(failed);

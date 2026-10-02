@@ -222,6 +222,15 @@ fn fabricated_measurements_cannot_override_the_retained_integrity_receipt() {
     let verdict = EvalVerdictService::verdict(&run);
     assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
     assert!(verdict.failure_clusters.is_empty());
+    let family_score = verdict
+        .family_scores
+        .iter()
+        .find(|score| score.family == run.case_results[0].family)
+        .expect("the fabricated result remains visible in its family denominator");
+    assert_eq!(family_score.total, 1);
+    assert_eq!(family_score.passed, 0);
+    assert_eq!(family_score.blocked, 1);
+    assert_eq!(family_score.score_percent, 0);
 
     let mut forged_receipt_run = serde_json::to_value(&run).expect("run serializes");
     let receipt = &mut forged_receipt_run["case_results"][0]["evaluation_integrity_receipt"];
