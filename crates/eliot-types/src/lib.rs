@@ -139,8 +139,9 @@ pub use delegation::{
     DelegationJobState, DelegationOrigin, DelegationOriginChain, DelegationOutcome,
     DelegationOutcomeStatus, DelegationProviderPreference, DelegationPublicStatus,
     DelegationReason, DelegationRequest, DelegationReviewKind, DelegationReviewResponse,
-    DelegationRootOrigin, DelegationState, ProviderCallBudgetState, ProviderCallLedger,
-    ProviderCallReservation, ProviderCallReservationState,
+    DelegationRootOrigin, DelegationState, PROTECTED_DELEGATION_IDENTITY_MAX_CHARS,
+    PROVIDER_CALL_CAMPAIGN_SCHEMA_VERSION, ProviderCallBudgetState, ProviderCallLedger,
+    ProviderCallReservation, ProviderCallReservationState, protected_delegation_identity_is_valid,
 };
 pub use delegation_calibration::{
     CalibrationCompleteness, CalibrationCorpusEligibility, CalibrationCorpusSampleKind,

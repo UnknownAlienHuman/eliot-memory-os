@@ -47,6 +47,17 @@ pub enum EngineError {
     #[error("write rejected: {0}")]
     WriteRejected(String),
 
+    /// The persisted provider-call ledger exists but could not be decoded and
+    /// validated, so its historical coverage is unknown.
+    ///
+    /// This is its own variant and not a `WriteRejected` string so an operator
+    /// can match the refusal and hold new provider calls, instead of reading an
+    /// unknown ledger as one more rejected write. The payload is the bounded
+    /// refusal `delegation::ProviderCallLedgerUnknown` renders: candidate codes
+    /// and fault codes only, never ledger contents, field values or file bytes.
+    #[error("{0}")]
+    ProviderCallLedgerUnknown(String),
+
     #[error("encoding rejected")]
     EncodingRejected {
         violations: Vec<eliot_types::TextEncodingViolation>,
