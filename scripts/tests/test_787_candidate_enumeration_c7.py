@@ -20,6 +20,27 @@ normal #866 ``sync``: the file digest refreshes, the fixed denominator still
 emits only its declared signals, the helper receives no row, and #787 reported
 no ``UNACCOUNTED_CANDIDATE`` for it. These tests bind the repaired behaviour.
 
+Scope note: this file is an UNMARKED SUPPORTING matrix. It creates and claims
+NO ``# WORK_UNIT_CASE: 787/<N>`` marker and never did compete for that
+namespace legitimately: issue #787's "Required test matrix" declares exactly
+ONE marker for each case 1..32, and names
+``scripts/tests/test_audit_context_measurement_ownership.py`` -- not this file
+-- as its exclusive mutable test suite for that denominator. That suite is the
+sole owner of ``787/1..787/32``.
+
+Those markers used to appear here as well, on all nine tests below. Two files
+claiming the same case number is a hard marker-namespace collision:
+``scripts/work_unit_gate/case_binding.py`` binds Python markers with
+``^#\\s*WORK_UNIT_CASE:\\s*(\\d+)/(\\d+)\\s*$`` and its
+``reconcile_case_bindings`` raises ``DUPLICATE_CASE`` on a repeated case number
+while requiring exactly ``1..N`` with no gap. With the markers present, cases
+1..9 had two owners and NO gate could pass. They have been removed; the C7
+clause itself is proved at case ``787/7`` of the dedicated suite, which carries
+the multiline, typed-finding, negative-control, accounting, fail-closed and
+determinism assertions this file previously supplied, and pins the ``use ...
+as`` alias limitation there too. The tests below remain as extra unmarked
+coverage of the same production function.
+
 What is bound
 -------------
 * :func:`oracle._enumerated_unaccounted` must emit a typed
@@ -156,7 +177,6 @@ def _enumerated(source: str) -> list[dict[str, object]]:
 class ProducerCandidateEnumerationC7Test(unittest.TestCase):
     """C7: the universe must be enumerated from source, not from stored rows."""
 
-    # WORK_UNIT_CASE: 787/1
     def test_audit_c7_helper_without_any_stored_row_is_detected(self) -> None:
         """The audit's exact helper, appended with NO denominator row.
 
@@ -196,7 +216,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
         # The span must land on the byte/char ratio line, which is line 2.
         self.assertEqual(int(finding["span_start"]), 2, "the ratio line is the measured site")
 
-    # WORK_UNIT_CASE: 787/2
     def test_c7_helper_is_found_with_no_rows_and_not_seeded_from_them(self) -> None:
         """The enumeration sees the helper even when the stored rows are empty.
 
@@ -220,7 +239,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
                 "no stored row declares this fixture, so no candidate may be 'known'",
             )
 
-    # WORK_UNIT_CASE: 787/3
     def test_multiline_split_expression_is_detected(self) -> None:
         """The same expression split across lines is still detected.
 
@@ -252,7 +270,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
             "both the declaration and the ratio line are unaccounted",
         )
 
-    # WORK_UNIT_CASE: 787/4
     def test_finding_is_typed_complete_and_rendered_in_both_projections(self) -> None:
         """A typed finding must carry code, path, span and rule end to end.
 
@@ -280,7 +297,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
         self.assertIn(f"rule={raw['rule']}", locator, "the locator must print the firing rule")
         self.assertIn(":2-2", locator, "the locator must print the span")
 
-    # WORK_UNIT_CASE: 787/5
     def test_benign_helper_is_not_reported(self) -> None:
         """A helper with no ratio and no estimator name is NOT a candidate.
 
@@ -299,7 +315,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
             "a benign helper must never produce an unaccounted candidate",
         )
 
-    # WORK_UNIT_CASE: 787/6
     def test_a_stored_row_at_the_same_span_is_accounted(self) -> None:
         """A stored row AT the enumerated span makes the site accounted.
 
@@ -319,7 +334,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
             "a stored row at the enumerated span accounts for the site",
         )
 
-    # WORK_UNIT_CASE: 787/7
     def test_use_alias_to_differently_named_estimator_is_not_enumerated(self) -> None:
         """PINNED LIMITATION: the ``use``-alias variant is NOT detected.
 
@@ -348,7 +362,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
             "accepted rules, so no finding can be produced for it",
         )
 
-    # WORK_UNIT_CASE: 787/8
     def test_the_oracle_requires_the_producer_enumeration_api(self) -> None:
         """A #866 producer without the enumeration API fails closed.
 
@@ -371,7 +384,6 @@ class ProducerCandidateEnumerationC7Test(unittest.TestCase):
         # The producer's own self-test must still accept the widened API.
         self.assertEqual(producer.run_self_tests(), 0, "the #866 producer self-test must still pass")
 
-    # WORK_UNIT_CASE: 787/9
     def test_enumeration_is_deterministic_and_order_free(self) -> None:
         """Enumeration is byte-identical across repeated and reordered calls.
 
