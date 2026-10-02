@@ -5412,20 +5412,27 @@ impl HostJobBranches {
         host: &HostInstallationEpoch,
     ) -> Result<CutoverLaunchOutcome, HostError> {
         self.terminate_store_then_kernel()?;
-        match self.start_approved(
-            candidate_kernel,
-            candidate_store,
-            candidate_generation,
-            candidate_config_digest,
-            candidate_config_path,
-            candidate_kernel_path,
-            candidate_store_path,
-            candidate_approved_config_path,
-            candidate_kernel_artifact,
-            candidate_store_artifact,
-            host,
-            candidate_launch,
-        ) {
+        // Single terminal for the physical launch (audit #5910159678 defect 2):
+        // no enclosing #891 operation guard covers this contour, so each launch
+        // call below owns its own terminal and `start_approved` stays
+        // phase-only. One failed launch emits exactly one terminal.
+        let candidate = host_job_launch::observe_launch_terminal(|| {
+            self.start_approved(
+                candidate_kernel,
+                candidate_store,
+                candidate_generation,
+                candidate_config_digest,
+                candidate_config_path,
+                candidate_kernel_path,
+                candidate_store_path,
+                candidate_approved_config_path,
+                candidate_kernel_artifact,
+                candidate_store_artifact,
+                host,
+                candidate_launch,
+            )
+        });
+        match candidate {
             Ok(()) => Ok(CutoverLaunchOutcome::Candidate),
             Err(candidate_error) => {
                 // F-LOG-HOST-1: rollback requested versus verified
@@ -5433,8 +5440,8 @@ impl HostJobBranches {
                 // prior approved contour is now requested; the pair
                 // completes at `host.cutover-rollback restored` below.
                 host_lifecycle_observe_requested(BOUNDARY_CUTOVER_ROLLBACK_REQUESTED);
-                let rollback = self
-                    .start_approved(
+                let rollback = host_job_launch::observe_launch_terminal(|| {
+                    self.start_approved(
                         prior_kernel,
                         prior_store,
                         prior_generation,
@@ -5448,11 +5455,12 @@ impl HostJobBranches {
                         host,
                         prior_launch,
                     )
-                    .map_err(|error| {
-                        HostError::ProcessContour(format!(
-                            "candidate failed ({candidate_error}); rollback failed ({error})"
-                        ))
-                    });
+                })
+                .map_err(|error| {
+                    HostError::ProcessContour(format!(
+                        "candidate failed ({candidate_error}); rollback failed ({error})"
+                    ))
+                });
                 rollback.map(|()| {
                     // F-LOG-HOST-1: prior contour relaunched, so the
                     // requested restoration is verified by its owner.
@@ -10393,8 +10401,9 @@ impl HostComposition {
         store_executable: impl AsRef<Path>,
     ) -> Result<(), HostError> {
         // F-LOG-HOST-1: request vs admitted vs started vs ready preserved.
-        // Single terminal via guard; inner `start_manifest_contour` is phase
-        // only and shares correlation without its own terminal.
+        // Single terminal via guard: this contour owns it, and every phase below
+        // it — including the `start_approved` launch — is phase-only and shares
+        // correlation without a terminal of its own (audit #5910159678 defect 2).
         host_lifecycle_observe_requested(BOUNDARY_START_REQUESTED);
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_START_TERMINAL);
         let active =
@@ -10807,9 +10816,10 @@ impl HostComposition {
         store_artifact: &PlatformHandle,
         pending: Option<&eliot_installation::PendingActivation>,
     ) -> Result<(), HostError> {
-        // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`
-        // owns the single terminal. Requested vs started vs ready preserved:
-        // started here is never readiness.
+        // F-LOG-HOST-1: inner phase only; outer `start_approved_contour`/`open`/
+        // resume owns the single terminal, as does `start_approved` down to the
+        // physical launch. Requested vs started vs ready preserved: started here
+        // is never readiness.
         host_lifecycle_observe_requested(BOUNDARY_START_MANIFEST_REQUESTED);
         Self::validate_launch_options_for_manifest(&self.launch_options, manifest)?;
         let manifest_digest = phase_b_manifest_digest(manifest)?;
@@ -11278,20 +11288,24 @@ impl HostComposition {
                 .clone(),
         ) {
             self.jobs.terminate_store_then_kernel()?;
-            self.jobs.start_approved(
-                prior_kernel.as_ref(),
-                prior_store.as_ref(),
-                &prior.manifest.generation,
-                &prior.manifest.config_digest,
-                &prior_config_locator,
-                prior_kernel_path,
-                prior_store_path,
-                prior_config_path,
-                prior_kernel_artifact,
-                prior_store_artifact,
-                &self.host,
-                &prior.manifest.runtime_launch,
-            )?;
+            // Single terminal for this relaunch (audit #5910159678 defect 2):
+            // the call site owns it and `start_approved` stays phase-only.
+            host_job_launch::observe_launch_terminal(|| {
+                self.jobs.start_approved(
+                    prior_kernel.as_ref(),
+                    prior_store.as_ref(),
+                    &prior.manifest.generation,
+                    &prior.manifest.config_digest,
+                    &prior_config_locator,
+                    prior_kernel_path,
+                    prior_store_path,
+                    prior_config_path,
+                    prior_kernel_artifact,
+                    prior_store_artifact,
+                    &self.host,
+                    &prior.manifest.runtime_launch,
+                )
+            })?;
             if let Err(rollback_error) = self.activate_launched_kernel(
                 &prior.manifest.generation,
                 prior
