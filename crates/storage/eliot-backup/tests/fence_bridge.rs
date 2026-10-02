@@ -141,7 +141,11 @@ fn interchange_fence(
             count: 3,
         },
         blob_reachability_manifest: Some(BlobReachabilityObservation {
-            residency_key_digests: if reachable { vec![residency_key()] } else { Vec::new() },
+            residency_key_digests: if reachable {
+                vec![residency_key()]
+            } else {
+                Vec::new()
+            },
             observation: SourceObservation {
                 observed_by: "store-adapter-under-test".to_owned(),
                 observed_at: fence.clone(),
@@ -269,9 +273,9 @@ fn generation_read_at_another_boundary_is_refused() {
                 "the refusal must name the generation observation, got {reason:?}"
             );
         }
-        other => panic!(
-            "expected a carried-fence refusal for the boundary mismatch, got {other:?}"
-        ),
+        other => {
+            panic!("expected a carried-fence refusal for the boundary mismatch, got {other:?}")
+        }
     }
 }
 
@@ -295,8 +299,6 @@ fn populated_residency_reachability_is_still_refused() {
 
     match ExportFence::try_from(&source) {
         Err(FenceBridgeRefusal::ResidencyKeyIsNotContentIdentity) => {}
-        other => panic!(
-            "expected the residency-versus-content refusal, got {other:?}"
-        ),
+        other => panic!("expected the residency-versus-content refusal, got {other:?}"),
     }
 }
