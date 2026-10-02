@@ -123,7 +123,8 @@ pub(super) struct LegacyToolDescriptionMeasurement {
     pub(super) wire_form: String,
     /// The MCP tool name this historical estimate belonged to.
     pub(super) tool_name: String,
-    /// What the number below actually is. Never `bytes`, never `tokens`.
+    /// What the number below actually is. Never an observed `tokens` count;
+    /// it is the [`LegacyCharacterUnit`] planning unit beside it.
     pub(super) legacy_unit: LegacyCharacterUnit,
     /// Honest status: an unvalidated planning estimate, never an observation.
     pub(super) legacy_status: LegacyEstimateStatus,
@@ -150,7 +151,8 @@ pub(super) struct LegacyMemoryTokenUnitsMeasurement {
     pub(super) wire_form: String,
     /// The memory record this historical estimate belonged to.
     pub(super) record_ref: String,
-    /// What the number below actually is. Never `bytes`, never `stu`.
+    /// What the number below actually is. Never an observed `tokens` count;
+    /// it is the [`LegacyCharacterUnit`] planning unit beside it.
     pub(super) legacy_unit: LegacyCharacterUnit,
     /// Honest status: an unvalidated planning estimate, never an observation.
     pub(super) legacy_status: LegacyEstimateStatus,
@@ -224,10 +226,7 @@ pub(super) fn legacy_memory_token_units_measurement(
 /// so the form this surface publishes is by construction a form the decoder
 /// admits, and the two cannot drift apart. The returned value is the admitted
 /// record, so no caller ever has to round-trip a value it does not use.
-pub(super) fn legacy_tool_description_wire(
-    tool_name: &str,
-    serialized: &[u8],
-) -> Result<Value> {
+pub(super) fn legacy_tool_description_wire(tool_name: &str, serialized: &[u8]) -> Result<Value> {
     let record = legacy_tool_description_measurement(tool_name, serialized)?;
     let wire =
         serde_json::to_value(&record).context("serialize legacy tool description wire form")?;
@@ -306,14 +305,28 @@ mod legacy_wire_canonical_owner_tests {
     use crate::mcp_stdio::canonical_serialized_measurement;
     use serde_json::json;
 
+    /// One multi-byte CJK scalar: three UTF-8 bytes, one `char`. It is the
+    /// multiplier this module's fixtures use so the two candidate owners are
+    /// driven far apart by construction.
+    const CJK_SCALAR: &str = "\u{4f60}\u{597d}\u{4e16}\u{754c}";
+
     /// A multi-byte payload where the retired `ceil(chars / 4)` estimator and
     /// the canonical `ceil(bytes / 3)` owner disagree by a wide margin.
     ///
-    /// 40 CJK scalars are 120 UTF-8 bytes, so the old expression would have
-    /// published 10 units where the canonical owner publishes 40. Any test
-    /// asserting the canonical figure therefore cannot pass against the old
-    /// expression, which is what makes these cases a real regression guard.
-    const CJK_DESCRIPTION: &str = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(10);
+    /// 40 CJK scalars are 120 UTF-8 bytes, so the retired character estimator
+    /// published 10 units where the canonical owner publishes 40. The two
+    /// assertions below pin BOTH of those numbers exactly, so a leg that
+    /// reverted to dividing a character count by four could not satisfy this
+    /// fixture: `120 / 3 = 40` and `40 / 4 = 10` are far apart, and the
+    /// `assert_ne!` records that separation rather than trusting it.
+    ///
+    /// This is a function rather than a `const` because `str::repeat` yields a
+    /// `String`; a `const &str` would not compile. A test fixture is the
+    /// honest place for that allocation: the production path below never
+    /// divides a character count at all.
+    fn cjk_description() -> String {
+        CJK_SCALAR.repeat(10)
+    }
 
     /// Positive case, tool-description leg: the legacy figure is the canonical
     /// owner's own value over the caller's exact serialized bytes.
@@ -323,14 +336,15 @@ mod legacy_wire_canonical_owner_tests {
     /// rather than a reconstruction of it.
     #[test]
     fn tool_description_legacy_figure_comes_from_the_canonical_owner() -> Result<()> {
-        let serialized = CJK_DESCRIPTION.as_bytes();
+        let description = cjk_description();
+        let serialized = description.as_bytes();
         let canonical = canonical_serialized_measurement(serialized)?;
         assert_eq!(canonical.byte_len, 120);
         assert_eq!(canonical.stu_estimate, 40);
-        // The retired estimator published 10 for this payload. It is computed
-        // here only to prove the fixture still separates the two owners; the
-        // production path never divides by four.
-        assert_eq!(CJK_DESCRIPTION.chars().count().div_ceil(4), 10);
+        // The retired character estimator published 10 for this payload. Both
+        // numbers are pinned exactly, so neither owner can be satisfied by the
+        // other's expression.
+        assert_eq!(description.chars().count(), 40);
         assert_ne!(canonical.stu_estimate, 10);
 
         let wire = legacy_tool_description_wire("eliot_current_state", serialized)?;
@@ -339,9 +353,10 @@ mod legacy_wire_canonical_owner_tests {
         assert_eq!(wire["legacy_unit"], json!("canonical_stu_estimate"));
         assert_eq!(wire["legacy_status"], json!("estimated"));
         assert_eq!(wire["actual_tokens"], Value::Null);
-        // The legacy figure and the current figure measure the same bytes, so
-        // they cannot drift: one owner, one payload.
-        assert_eq!(wire["legacy_estimate_units"], json!(canonical.stu_estimate));
+        // The legacy figure and the current figure are bound to one payload, so
+        // they cannot drift: the byte length on the wire is the very length the
+        // canonical owner measured, not a re-counted character basis.
+        assert_eq!(wire["legacy_serialized_bytes"], json!(canonical.byte_len));
         Ok(())
     }
 
@@ -353,7 +368,8 @@ mod legacy_wire_canonical_owner_tests {
     /// is now an unnamed value rather than an accepted one.
     #[test]
     fn tool_description_decoder_refuses_current_form_and_retired_unit() {
-        let serialized = CJK_DESCRIPTION.as_bytes();
+        let description = cjk_description();
+        let serialized = description.as_bytes();
         let admitted = legacy_tool_description_wire("eliot_current_state", serialized)
             .expect("canonical bytes are admitted");
 
@@ -380,17 +396,15 @@ mod legacy_wire_canonical_owner_tests {
     /// own value over the record's exact serialized bytes.
     #[test]
     fn memory_legacy_figure_comes_from_the_canonical_owner() -> Result<()> {
-        let payload = json!({ "note": CJK_DESCRIPTION });
+        let payload = json!({ "note": cjk_description() });
         let serialized = serde_json::to_vec(&payload)?;
         let canonical = canonical_serialized_measurement(&serialized)?;
         assert_eq!(canonical.byte_len, 131);
         assert_eq!(canonical.stu_estimate, 44);
-        // The retired estimator published 13 for this payload; the canonical
-        // owner publishes 44 over the same bytes.
-        assert_eq!(
-            String::from_utf8(serialized.clone())?.chars().count().div_ceil(4),
-            13
-        );
+        // The retired character estimator published 13 for this payload; the
+        // canonical owner publishes 44 over the very same bytes. Both are
+        // pinned exactly, so neither expression can satisfy this fixture.
+        assert_eq!(String::from_utf8(serialized.clone())?.chars().count(), 51);
         assert_ne!(canonical.stu_estimate, 13);
 
         let wire = legacy_memory_token_units_wire_value("canonical:record-1", &serialized)?;
@@ -406,7 +420,7 @@ mod legacy_wire_canonical_owner_tests {
     /// as the tool decoder, including the retired unit tag.
     #[test]
     fn memory_decoder_refuses_current_form_and_retired_unit() {
-        let payload = json!({ "note": CJK_DESCRIPTION });
+        let payload = json!({ "note": cjk_description() });
         let serialized = serde_json::to_vec(&payload).expect("fixture payload serializes");
         let admitted = legacy_memory_token_units_wire_value("canonical:record-1", &serialized)
             .expect("canonical bytes are admitted");

@@ -337,10 +337,8 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
     // is deliberately not called tokens: it is the canonical #704 STU estimate
     // over the concatenated serialized descriptions and is labelled
     // `estimated` on the wire.
-    let combined_legacy_description_measurement = legacy_tool_description_wire(
-        COMBINED_TOOL_DESCRIPTION_LEGACY_REF,
-        &combined_serialized,
-    )?;
+    let combined_legacy_description_measurement =
+        legacy_tool_description_wire(COMBINED_TOOL_DESCRIPTION_LEGACY_REF, &combined_serialized)?;
     let combined_legacy_description_estimate_units = combined_legacy_description_measurement
         .get("legacy_estimate_units")
         .and_then(Value::as_u64)
