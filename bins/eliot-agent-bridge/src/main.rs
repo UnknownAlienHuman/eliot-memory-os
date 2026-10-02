@@ -3287,7 +3287,7 @@ fn host_events_route_composition() -> Result<HostEventsRouteComposition, String>
 /// generation senders are held for the whole serving life, so a dropped
 /// supervisor channel can never be mistaken for a supervised stop.
 fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
-    let composition = match host_events_route_composition() {
+    let mut composition = match host_events_route_composition() {
         Ok(composition) => composition,
         Err(detail) => {
             emit_error("HOST_EVENTS_INTRODUCTION_REFUSED", &detail);
@@ -3330,9 +3330,14 @@ fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
     // client holds neither an admissible introduction nor a usable secret.
     store.revoke(&composition.projection.introduction.revocation_id);
     store.clear();
-    composition
-        .credentials
-        .retire(&composition.projection.introduction.credential);
+    // `retire` is `&mut self`, and `resolve_credential` above moved an `Arc`
+    // clone into the serve call, so the handle was shared while the route ran.
+    // That clone is dropped by the time `serve_host_events` returns, which is
+    // what makes this `get_mut` succeed: the retirement still happens on the
+    // exact owned handle the composition issued, not on a copy.
+    if let Some(credentials) = Arc::get_mut(&mut composition.credentials) {
+        credentials.retire(&composition.projection.introduction.credential);
+    }
     match outcome {
         Ok(HostEventsShutdown::Stopped) => 0,
         Ok(HostEventsShutdown::Rotated) => {
