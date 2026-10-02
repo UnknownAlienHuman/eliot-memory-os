@@ -8871,22 +8871,22 @@ impl HostComposition {
         // (restart receipt or typed Unknown; one terminal on failure) ->
         // persisted owner result (the `HostRuntimeControlResponse` built
         // from `request`) -> ordinary consumer (the SCM reader of that
-        // response). Named missing links, never filled: `request` (no
-        // console-request value fits an SCM dispatch); `reason` (no
-        // `HostError` in hand at an entry sighting - failure attribution
-        // stays with the terminal boundary). The request's `req_id`/
-        // `mutation`/`req` digests are held by `request` and are absent from
-        // THIS projection by design — it has no digest slot — so they are not
-        // projected onto this entry sighting. They are bound instead where the
-        // owner actually uses them: the terminals below carry them through
-        // `runtime_control_request_terminal_correlation` (F-LOG-HOST-2, #893
-        // D3). Fence/recovery stays with the store-recovery/Phase-B owners.
+        // response). The request's `req_id`/`mutation`/`req` digests are bound
+        // here from the very same `runtime_control_request_terminal_correlation`
+        // projection the eight kernel-restart terminals below carry
+        // (F-LOG-HOST-2, #893 D3), so this entry sighting and its terminal
+        // join by exact field equality rather than by stage order. Named
+        // missing links, never filled: `reason` (no `HostError` in hand at an
+        // entry sighting - failure attribution stays with the terminal
+        // boundary). Fence/recovery stays with the store-recovery/Phase-B
+        // owners.
         host_lifecycle_observe_identity(
             &host_diagnostics::HostRequestProjection::observed(
                 host_diagnostics::EntrypointStage::ScmDispatch,
             )
             .with_launch_options(&self.launch_options)
-            .with_process(std::process::id()),
+            .with_process(std::process::id())
+            .with_request_identity(&runtime_control_request_terminal_correlation(request)),
         );
         if request.operation == HostRuntimeControlOperation::ReconcileKernelRestart {
             // Reconcile is query-only replay, not another restart commit.
