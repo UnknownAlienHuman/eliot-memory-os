@@ -558,49 +558,65 @@ fn launch_06_store_before_kernel() {
     for required in [
         "fn launch_store_then_kernel",
         "host.store-launch requested",
-        "host.store-launch store-ready observed",
+        "host.store-launch store-live observed",
         "host.kernel-launch requested",
-        "host.kernel-launch kernel-ready observed",
+        "host.kernel-launch kernel-launched observed; activation evidence unavailable",
     ] {
         assert!(
             sequence.contains(required),
             "sequence must pin {required:?}"
         );
     }
+    // The two barrier records project Store liveness (exact Job membership plus
+    // a running process) and Kernel launch success, never semantic readiness,
+    // so the retired readiness vocabulary must stay gone from this leaf: Kernel
+    // readiness belongs to its owner evidence in `kernel_activation_driver::active`
+    // (I01.10).
+    for retired in [
+        "host.store-launch store-ready observed",
+        "host.kernel-launch kernel-ready observed",
+    ] {
+        assert!(
+            !sequence.contains(retired),
+            "sequence must not claim readiness through this leaf: {retired:?}"
+        );
+    }
     let requested = sequence
         .find("host.store-launch requested")
         .expect("must pin store request");
-    let store_ready = sequence
-        .find("host.store-launch store-ready observed")
-        .expect("must pin store-ready");
+    let store_live = sequence
+        .find("host.store-launch store-live observed")
+        .expect("must pin store-live");
     let kernel_requested = sequence
         .find("host.kernel-launch requested")
         .expect("must pin kernel request");
-    let kernel_ready = sequence
-        .find("host.kernel-launch kernel-ready observed")
-        .expect("must pin kernel-ready");
+    let kernel_launched = sequence
+        .find("host.kernel-launch kernel-launched observed; activation evidence unavailable")
+        .expect("must pin kernel-launched");
     assert!(
-        requested < store_ready
-            && store_ready < kernel_requested
-            && kernel_requested < kernel_ready,
+        requested < store_live
+            && store_live < kernel_requested
+            && kernel_requested < kernel_launched,
         "Store-before-Kernel order must be observed separately"
     );
     assert_ne!(
-        "host.store-launch store-ready observed",
-        "host.kernel-launch kernel-ready observed"
+        "host.store-launch store-live observed",
+        "host.kernel-launch kernel-launched observed; activation evidence unavailable"
     );
     let text = capture_emit(|| {
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.kernel-launch kernel-ready observed",
+            "host.kernel-launch kernel-launched observed; activation evidence unavailable",
         );
     });
-    assert!(text.contains("host.store-launch store-ready observed"));
-    assert!(text.contains("host.kernel-launch kernel-ready observed"));
+    assert!(text.contains("host.store-launch store-live observed"));
+    assert!(text.contains(
+        "host.kernel-launch kernel-launched observed; activation evidence unavailable"
+    ));
 }
 
 // WORK_UNIT_CASE: 978/7
@@ -710,7 +726,10 @@ fn launch_08_readiness_needs_owner_evidence() {
     });
     assert!(text.contains("host.kernel-activation readiness requested"));
     assert!(text.contains("host.kernel-activation readiness observed"));
-    assert!(!text.contains("host.kernel-launch kernel-ready observed"));
+    // Kernel launch success is a distinct record from Kernel readiness: the
+    // Store/Kernel sequence contour states launch only and names the activation
+    // evidence it does not hold as unavailable.
+    assert!(!text.contains("host.kernel-launch kernel-launched observed"));
 }
 
 // WORK_UNIT_CASE: 978/9
@@ -839,8 +858,8 @@ fn launch_13_deterministic_semantic_fields() {
     for required in [
         "host.scm-launch probe requested",
         "HOST_SCM_TRANSIENT_MAX_INSPECTIONS",
-        "host.store-launch store-ready observed",
-        "host.kernel-launch kernel-ready observed",
+        "host.store-launch store-live observed",
+        "host.kernel-launch kernel-launched observed; activation evidence unavailable",
         "host.kernel-activation nonce issued",
         "host.kernel-activation readiness observed",
     ] {
@@ -856,7 +875,7 @@ fn launch_13_deterministic_semantic_fields() {
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
     });
     let second = capture_emit(|| {
@@ -866,7 +885,7 @@ fn launch_13_deterministic_semantic_fields() {
         );
         observe_entrypoint_with_detail(
             EntrypointStage::Startup,
-            "host.store-launch store-ready observed",
+            "host.store-launch store-live observed",
         );
     });
     assert_eq!(
@@ -954,6 +973,51 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         0,
         "an unproven rollback disposition must never reach the Event Log: {unknown}"
     );
+    // The rollback positives this case forbids are the CURRENT frozen labels of
+    // the rollback owner's contour map (`RollbackContour::label` in
+    // `phase_b_materialization/rollback_backup.rs`): a prepared sidecar, a
+    // verified restoration, a verified uncommitted removal, and a completed
+    // sidecar cleanup. That owner is unreachable from an integration-test crate
+    // (`mod phase_b_materialization` is private, and `phase_b_restore_or_remove`
+    // / `phase_b_remove_rollback_backup` are `pub` only inside it), so the
+    // labels are bound here by source scan and the positive-claim invariant is
+    // proved on the records production actually emitted.
+    let rollback = manifest_source("src/phase_b_materialization/rollback_backup.rs");
+    let rollback_positives = [
+        "host.phase-b rollback backup prepared",
+        "host.phase-b rollback restored verified",
+        "host.phase-b rollback uncommitted removal verified",
+        "host.phase-b rollback backup cleanup completed",
+    ];
+    for positive in rollback_positives {
+        assert!(
+            rollback.contains(&format!("\"{positive}\"")),
+            "rollback owner must still name {positive:?}"
+        );
+        assert!(
+            !unknown.contains(positive),
+            "unknown rollback disposition claimed {positive:?}: {unknown}"
+        );
+    }
+    // The owner's unproven dispositions are what an unproven outcome may name,
+    // and they stay a distinct vocabulary: none of them carries a positive.
+    for unproven in [
+        "host.phase-b rollback backup unknown retained",
+        "host.phase-b rollback uncommitted removal absence unproven",
+        "host.phase-b rollback uncommitted removal absence unknown",
+        "host.phase-b rollback backup cleanup absence unproven",
+    ] {
+        assert!(
+            rollback.contains(&format!("\"{unproven}\"")),
+            "rollback owner must still name {unproven:?}"
+        );
+        for positive in rollback_positives {
+            assert!(
+                !unproven.contains(positive),
+                "unproven disposition {unproven:?} must not carry the positive {positive:?}"
+            );
+        }
+    }
     // Same projection with owner evidence does record: the absence above is a
     // decision production made, not a dead or unreachable path.
     let started = capture_emit(|| {
@@ -1031,4 +1095,13 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
         !failed.contains("host.terminal_error"),
         "a failed projection is subordinate, never a second terminal: {failed}"
     );
+    // Failure before verification is not owner evidence either, so it carries
+    // no rollback positive: the restoration / removal / cleanup claims stay
+    // unreachable from it exactly as they are from an unknown outcome.
+    for positive in rollback_positives {
+        assert!(
+            !failed.contains(positive),
+            "failed rollback disposition claimed {positive:?}: {failed}"
+        );
+    }
 }

@@ -209,6 +209,26 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         "process_started",
         "semantically_ready",
     ];
+    // The rollback halves of that list are the CURRENT frozen labels of the
+    // rollback owner's contour map (`RollbackContour::label` in
+    // `phase_b_materialization/rollback_backup.rs`), which stays unreachable
+    // from an integration-test crate: `mod phase_b_materialization` is private
+    // and `phase_b_restore_or_remove` / `phase_b_remove_rollback_backup` are
+    // `pub` only inside it. So each positive is bound here to the exact
+    // production label it abbreviates, and the denial below is proved on the
+    // record production emitted, never on a guessed spelling.
+    let rollback = src("src/phase_b_materialization/rollback_backup.rs");
+    for label in [
+        "host.phase-b rollback backup prepared",
+        "host.phase-b rollback restored verified",
+        "host.phase-b rollback uncommitted removal verified",
+        "host.phase-b rollback backup cleanup completed",
+    ] {
+        assert!(
+            rollback.contains(&format!("\"{label}\"")),
+            "rollback owner must still name {label:?}"
+        );
+    }
     let unknown = emit(|| {
         observe_host_request(&HostRequestProjection::unknown(
             EntrypointStage::ScmDispatch,
@@ -280,9 +300,16 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         committed.contains("evidence=durable_committed"),
         "got: {committed}"
     );
+    // `observe_host_request` renders the frozen phase under the `phase` key;
+    // `stage` is the `host.entrypoint_stage` key and is never projected here,
+    // so the pin follows the field production actually writes.
     assert!(
-        committed.contains("stage=shutdown_drain"),
+        committed.contains("phase=shutdown_drain"),
         "got: {committed}"
+    );
+    assert!(
+        !committed.contains("host.phase-b"),
+        "a projection record carries no rollback contour detail: {committed}"
     );
 }
 
