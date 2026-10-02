@@ -2733,6 +2733,65 @@ impl DaemonKernelClient {
         Ok(pair)
     }
 
+    /// Claims one queued admitted `eliot.state` pair from the dedicated State
+    /// queue (issue #1739 W5). The query poller cannot consume this claim.
+    ///
+    /// Mirrors [`claim_campaign_packet_pair_async`](Self::claim_campaign_packet_pair_async)
+    /// on the separate `"local_state_claim"` wire operation: the same
+    /// session/auth/ready/fence gates, the same single-`operation`-key payload
+    /// and the same null poll (not an error) when the queue is empty. The
+    /// closed gate is stricter than the packet twin's in exactly the way the
+    /// carrier form requires: only `eliot.state` is claimable here, and the
+    /// tool name must equal the envelope capability, so a query or Skill pair
+    /// can never be answered out of the State projection lane.
+    ///
+    /// The claimed pair carries the Kernel-minted fenced attempt capability,
+    /// which the caller must present back on the `local_state_result` submit
+    /// leg; its closed linkage and fence binding are re-proved inside
+    /// [`serve_state_projection_pair`](super::serve_state_projection_pair)
+    /// before any read or submit touches it.
+    #[cfg(windows)]
+    pub async fn claim_local_state_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "local_state_claim",
+                serde_json::json!({ "operation": "local_state_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != crate::state_projection_owner::STATE_CAPABILITY
+                || tool.get("name").and_then(serde_json::Value::as_str)
+                    != Some(crate::state_projection_owner::STATE_CAPABILITY)
+        }) {
+            // Issue #1839: structured route-mismatch evidence for the live
+            // claim. The pair is rejected closed without execution.
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel local_state_claim returned a non-state pair",
+            )
+            .emit();
+            return Err(super::DaemonError::Kernel(
+                "Kernel local_state_claim returned a pair outside the state tool".to_owned(),
+            ));
+        }
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
+        Ok(pair)
+    }
+
     /// Claims one queued admitted Task Controller invocation and its distinct
     /// Kernel-issued attempt capability.
     #[cfg(windows)]
@@ -2788,6 +2847,14 @@ impl DaemonKernelClient {
         body: &HostRequestResultBody,
     ) -> Result<LocalReadSubmitOutcome, super::DaemonError> {
         body.validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        // Issue #1739 W5: the producer-side half of the Kernel's state receipt
+        // gate, applied BEFORE transport so a body this daemon could never
+        // honestly claim is never put on the wire at all. The Kernel gate
+        // (`host_request_route/state_projection.rs::check_state_result_receipt`)
+        // stays authoritative; this is the same rule one layer earlier, and it
+        // only ever refuses — it cannot admit anything the Kernel would not.
+        crate::state_projection_owner::check_state_result_receipt(body)
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let value = self
             .transact_async("local_state_result", serde_json::json!({ "result": body }))

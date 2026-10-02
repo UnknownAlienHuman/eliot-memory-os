@@ -510,6 +510,55 @@ enum CampaignPacketCompletion {
     Settled(Result<CampaignPacketPollOutcome, String>),
 }
 
+/// Settled outcome of one `eliot.state` poll step (issue #1739 W5).
+///
+/// The State row has its own queue, claim, attempt type and result leg on the
+/// bounded local-read carrier, so it never shares a completion with the query or
+/// campaign-packet flights. `IdleBackoff` is the null poll; `Accepted` means the
+/// owner-receipted result persisted (an exact replay included); `Expired` is the
+/// expected claim/submit race; `StaleAttempt` quarantines a superseded
+/// capability and the next claim mints the current generation anew.
+enum StateProjectionPollOutcome {
+    IdleBackoff,
+    Accepted,
+    Expired,
+    StaleAttempt,
+}
+
+/// Completion of one in-flight state step. Claim, owner serve and submit share
+/// one flight branch so health and shutdown stay pollable while the step is
+/// outstanding; the step handles at most one pair per tick.
+enum StateProjectionCompletion {
+    Settled(Result<StateProjectionPollOutcome, String>),
+}
+
+struct StateProjectionFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = StateProjectionCompletion>>>,
+}
+
+/// Sole owner of `eliot.state` poll state in `run_loop`, mirroring
+/// [`LocalReadFlight`] and [`CampaignPacketFlight`]. `Idle` means no state work
+/// is outstanding; `InFlight` holds the one pending poll step. No second owner
+/// and no second concurrent state step exist.
+enum StateProjectionFlight {
+    Idle,
+    InFlight(StateProjectionFlightState),
+}
+
+/// Pure tick gate: the state timer starts work only when the flight is idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateProjectionTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_state_projection_tick(flight: &StateProjectionFlight) -> StateProjectionTickDecision {
+    match flight {
+        StateProjectionFlight::Idle => StateProjectionTickDecision::StartPoll,
+        StateProjectionFlight::InFlight(_) => StateProjectionTickDecision::SkipInFlight,
+    }
+}
+
 struct CampaignPacketFlightState {
     future: Pin<Box<dyn std::future::Future<Output = CampaignPacketCompletion>>>,
 }
@@ -1666,6 +1715,11 @@ async fn run_loop(
     // Campaign packets have their own queue, claim, compile, and result
     // flight. They are never consumed by the query poller.
     let mut campaign_packet_flight = CampaignPacketFlight::Idle;
+    // `eliot.state` has its own queue, claim operation, attempt type and result
+    // operation on the bounded local-read carrier (issue #1739 W5). It is driven
+    // independently of the query Gateway and the campaign-packet flight, so a
+    // state claim can never be answered out of either of those lanes.
+    let mut state_projection_flight = StateProjectionFlight::Idle;
     // Task Controller claims ride the same bounded cadence. The owner path is
     // real and independent: one authenticated claim, one Governor transition,
     // and one fenced result submit per tick.
@@ -1809,6 +1863,10 @@ async fn run_loop(
                 // its own queue and attempt type. Both drain on their own
                 // bounded budgets after the shared flights settle.
                 drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
+                // #1739 W5: the state flight keeps the same claim/serve/submit
+                // contour and drains on its own bounded budget after the shared
+                // flights settle.
+                drain_state_projection_on_shutdown(&mut state_projection_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
                 drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
@@ -1833,6 +1891,11 @@ async fn run_loop(
                 // Campaign packets ride the same tick under their own gate and
                 // are never consumed by the query poller.
                 maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
+                // #1739 W5: the state row rides the same tick under its own
+                // gate; it is claimed on `local_state_claim` and submitted on
+                // `local_state_result`, so it never shares the query or packet
+                // completion branch.
+                maybe_start_state_projection_poll(&kernel, &mut state_projection_flight);
                 // Task Controller uses a separate queue and attempt type;
                 // start it on the same cadence without sharing the local-read
                 // completion branch.
@@ -1937,6 +2000,17 @@ async fn run_loop(
                 settle_campaign_packet_completion(
                     campaign_packet_completion,
                     &mut campaign_packet_flight,
+                )?;
+            }
+            // #1739 W5: the state step settles in its own branch, never the
+            // query or campaign-packet one, so a refused or degraded projection
+            // cannot delay those lanes and neither can answer a state claim.
+            state_projection_completion =
+                next_state_projection_completion(&mut state_projection_flight) =>
+            {
+                settle_state_projection_completion(
+                    state_projection_completion,
+                    &mut state_projection_flight,
                 )?;
             }
             task_controller_completion =
@@ -5161,6 +5235,134 @@ async fn drain_campaign_packet_on_shutdown(
     };
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
+/// Starts one `eliot.state` claim/serve/result step. The State row keeps its own
+/// queue, claim operation, attempt type and result operation, so it is driven
+/// independently of the query Gateway and the campaign-packet flight.
+fn start_state_projection_poll(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Pin<Box<dyn std::future::Future<Output = StateProjectionCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        StateProjectionCompletion::Settled(run_state_projection_poll(&kernel_clone).await)
+    })
+}
+
+fn maybe_start_state_projection_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    flight: &mut StateProjectionFlight,
+) {
+    if decide_state_projection_tick(flight) == StateProjectionTickDecision::StartPoll {
+        *flight = StateProjectionFlight::InFlight(StateProjectionFlightState {
+            future: start_state_projection_poll(kernel),
+        });
+    }
+}
+
+async fn next_state_projection_completion(
+    flight: &mut StateProjectionFlight,
+) -> StateProjectionCompletion {
+    match flight {
+        StateProjectionFlight::Idle => std::future::pending::<StateProjectionCompletion>().await,
+        StateProjectionFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+fn settle_state_projection_completion(
+    completion: StateProjectionCompletion,
+    flight: &mut StateProjectionFlight,
+) -> Result<(), String> {
+    match completion {
+        StateProjectionCompletion::Settled(Ok(step)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.state_settled",
+                outcome = state_projection_outcome_name(&step),
+            );
+            *flight = StateProjectionFlight::Idle;
+            Ok(())
+        }
+        StateProjectionCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Names one settled state poll outcome for the loop's own record.
+fn state_projection_outcome_name(outcome: &StateProjectionPollOutcome) -> &'static str {
+    match outcome {
+        StateProjectionPollOutcome::IdleBackoff => "idle_backoff",
+        StateProjectionPollOutcome::Accepted => "accepted",
+        StateProjectionPollOutcome::Expired => "expired",
+        StateProjectionPollOutcome::StaleAttempt => "stale_attempt",
+    }
+}
+
+/// Runs one `eliot.state` poll step: `local_state_claim` (pair plus fenced
+/// attempt capability, or null meaning backoff), then
+/// [`serve_state_projection_pair`] for the admitted pair under that attempt,
+/// then `local_state_result` with the returned [`HostRequestResultBody`]
+/// (accepted, the expected expiry race, or the stale-attempt quarantine).
+/// Exact replays stay idempotent by Kernel contract. Any step failure fails the
+/// daemon closed — a claimed pair that cannot be served or submitted is never
+/// silently discarded. A stale capability is never retried: the step settles and
+/// the next tick claims the current generation anew.
+async fn run_state_projection_poll(
+    kernel: &DaemonKernelClient,
+) -> Result<StateProjectionPollOutcome, String> {
+    let _span = tracing::info_span!("eliotd.state_projection_poll").entered();
+    let pair = kernel
+        .claim_local_state_pair_async()
+        .await
+        .map_err(|error| format!("Kernel state pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        return Ok(StateProjectionPollOutcome::IdleBackoff);
+    };
+    let body = eliotd::serve_state_projection_pair(kernel, &envelope, &tool, &attempt)
+        .await
+        .map_err(|error| format!("daemon state projection: {error}"))?;
+    match submit_local_state_result_idempotent(kernel, &body).await? {
+        LocalReadSubmitOutcome::Accepted => Ok(StateProjectionPollOutcome::Accepted),
+        LocalReadSubmitOutcome::Expired => Ok(StateProjectionPollOutcome::Expired),
+        LocalReadSubmitOutcome::StaleAttempt => Ok(StateProjectionPollOutcome::StaleAttempt),
+    }
+}
+
+/// Submits one owner-receipted state result, retrying once with the
+/// byte-identical body when the first submit fails.
+///
+/// This is the state-row twin of the local-read lost-acknowledgement reconcile:
+/// the retained body is reused verbatim, never recomputed, and no local replay
+/// cache or timer is introduced. The retry is safe because the Kernel submit leg
+/// is exact-replay idempotent AND receipt-bound — an identical body carrying the
+/// same projection owner's receipt persists once and replays, never duplicates.
+/// Only transport failures retry: `Expired` and `StaleAttempt` are settled
+/// outcomes, so a quarantined capability is never resubmitted.
+async fn submit_local_state_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<LocalReadSubmitOutcome, String> {
+    match kernel.submit_local_state_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_local_state_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel state result submit: {first_error}; retry: {error}")
+            }),
+    }
+}
+
+async fn drain_state_projection_on_shutdown(
+    flight: &mut StateProjectionFlight,
+) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, StateProjectionFlight::Idle);
+    let StateProjectionFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(StateProjectionCompletion::Settled(Err(error))) => Err(error),
         _ => Ok(RunLoopExit::Shutdown),
     }
 }

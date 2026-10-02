@@ -152,6 +152,7 @@ mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
 pub mod solo_agent_driver;
 pub mod staffing_policy;
+pub mod state_projection_owner;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
 pub mod startup_readiness;
@@ -356,6 +357,10 @@ pub use startup_evidence_producer::{
     publish_daemon_startup_evidence, summarize_retained_capabilities,
 };
 pub use store_failure_projection::{GovernorStoreFailureProjection, GovernorStoreProjectionError};
+pub use state_projection_owner::{
+    is_state_projection_request, project_state_projection, serve_state_projection_pair,
+    state_projection_fields, StateProjectionError, StateProjectionField,
+};
 pub use supervision_progress::{
     DAEMON_SUPERVISION_PROGRESS_OPERATION, DaemonReadySupervision, STORE_DEPENDENCY_WAIT_NAME,
     SupervisionProducerDeps, SupervisionProgressAnswer, SupervisionProgressHead,
