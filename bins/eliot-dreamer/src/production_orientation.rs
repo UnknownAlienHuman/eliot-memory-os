@@ -46,7 +46,7 @@
 //! five hits, and not one of them calls it. They are its own definition
 //! (composition.rs:6184), the internal `compose_canonical_projections` call
 //! inside its own body (composition.rs:6206), that composer's definition
-//! (canonical_projections.rs:526), and the unrelated
+//! `canonical_projections.rs:526`), and the unrelated
 //! `derive_canonical_projections` definition and its single caller
 //! (eliot-context-candidates/src/derive.rs:744 and src/mapper.rs:500). Nothing
 //! in `eliotd` ever asks the composition for a projection set:
