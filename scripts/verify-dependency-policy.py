@@ -5608,6 +5608,46 @@ def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict |
     return None
 
 
+_EXTERNAL_DISPOSITION_STRING_FIELDS = ("consumer", "owner", "trust_model", "removal_boundary")
+
+
+def _external_executable_disposition(entry: dict) -> dict | None:
+    """Join an `[external_executables]` entry to the disposition the SBOM may publish.
+
+    docs/DEPENDENCY_POLICY.md:120-121 governs this surface separately from the
+    third-party inventory: "**External executables**: Shipped or runtime
+    services such as SurrealDB, inventoried with version, digest, license,
+    trust model, and removal boundary." The entry therefore carries its own
+    disposition vocabulary, and `trust_model`/`removal_boundary` stand where
+    the third-party inventory declares `reason`/`removal_plan`;
+    `_DIRECT_DISPOSITION_STRING_FIELDS` covers the two both surfaces share, so
+    no second rule is defined here.
+
+    This is the same treatment :func:`_inventory_disposition` gives a
+    `direct_dependencies` entry and for the same reason: the SBOM may publish
+    only evidence the run actually validated. The presence-only
+    `_collect_external_evidence` loop proves a key exists, not that it carries a
+    value, so a blank disposition is reported as absent rather than published as
+    blank evidence under any envelope, exactly as a refused direct-dependency
+    disposition is. `advisory_findings` stays a verbatim list: it is the observed
+    advisory identity set, not an ownership/control field.
+    """
+
+    missing = [field for field in _EXTERNAL_DISPOSITION_STRING_FIELDS if field not in entry]
+    malformed = _malformed_disposition_fields(entry, require_features=False)
+    if missing or malformed:
+        # An unvalidated external-executable disposition is reported as absent,
+        # never published as blank evidence under the run's PASS envelope.
+        return None
+    return {
+        "consumer": entry.get("consumer"),
+        "owner": entry.get("owner"),
+        "trust_model": entry.get("trust_model"),
+        "removal_boundary": entry.get("removal_boundary"),
+        "advisory_ids": entry.get("advisory_findings", []),
+    }
+
+
 def build_sbom_artifact(
     receipt: dict,
     manifest_data: dict,
@@ -5728,13 +5768,7 @@ def build_sbom_artifact(
                     "integrity": {"algorithm": "sha256", "digest": entry.get("sha256")},
                     "license": entry.get("license"),
                     "direct": True,
-                    "disposition": {
-                        "consumer": entry.get("consumer"),
-                        "owner": entry.get("owner"),
-                        "trust_model": entry.get("trust_model"),
-                        "removal_boundary": entry.get("removal_boundary"),
-                        "advisory_ids": entry.get("advisory_findings", []),
-                    },
+                    "disposition": _external_executable_disposition(entry),
                 }
             )
 
@@ -5836,12 +5870,66 @@ def build_license_report_artifact(
     return artifact
 
 
+def _validated_exceptions(manifest_data: dict) -> list[dict]:
+    """Publish only the exceptions :func:`check_exceptions` accepts.
+
+    The advisory artifact and the canonical receipt both carry `exceptions` as
+    the bound "structured exceptions" of docs/DEPENDENCY_POLICY.md:228, and
+    `exceptions_digest` is taken over exactly what they publish. :func:`check_exceptions`
+    now refuses a keyed-but-blank exception field as "missing valid fields"
+    (:data:`_EXCEPTION_REQUIRED_FIELDS`), so an unvalidated row is an exception
+    the run does not admit.
+
+    Re-publishing such a row verbatim would let a blank owner, compensating
+    control, expiry or removal condition ship as if it were an admitted
+    exception, under any envelope: the envelope's non-PASS status says the run
+    found a problem, not that the shipped value is an admission. The verdict
+    channel is already complete without this, because `check_exceptions` and
+    `check_exception_lock_drift` findings are republished as DEP-010 in
+    `exception_findings`; this closes the value channel the same way
+    :func:`_inventory_disposition` does for a disposition. Only fields the
+    validator requires are judged, by the validator's own constant, so the rule
+    is never re-implemented here.
+    """
+
+    exceptions = manifest_data.get("exceptions", [])
+    if not isinstance(exceptions, list):
+        return []
+    validated: list[dict] = []
+    for entry in exceptions:
+        if not isinstance(entry, dict):
+            continue
+        missing = [field for field in _EXCEPTION_REQUIRED_FIELDS if field not in entry]
+        malformed = [
+            field
+            for field in _EXCEPTION_REQUIRED_FIELDS
+            if field in entry
+            and (not isinstance(entry.get(field), str) or not entry[field].strip())
+        ]
+        if missing or malformed:
+            # An unvalidated exception is reported as absent from the published
+            # exception state, never shipped as a blank admission; the run's
+            # DEP-010 finding is what reports it.
+            continue
+        validated.append(entry)
+    return validated
+
+
 def build_advisory_report_artifact(
     receipt: dict,
     manifest_data: dict,
     release_binding: dict[str, str] | None = None,
 ) -> dict:
-    """Build the advisory run artifact from snapshot and exception evidence (issue #1229 W7)."""
+    """Build the advisory run artifact from snapshot and exception evidence (issue #1229 W7).
+
+    The artifact binds the Rust advisory snapshot (current-advisories only;
+    offline reports `not_assessed`), scanner policy findings, the exception
+    state and SurrealDB OSV evidence, and states that no advisory feed is
+    configured for NuGet/Python/Node. The exception state is the validated
+    subset from :func:`_validated_exceptions`; every DEP-010 the run produced is
+    republished verbatim in `exception_findings`, so a refused exception is
+    reported as a finding and never published as an admitted blank value.
+    """
 
     receipt = receipt if isinstance(receipt, dict) else {}
     manifest_data = manifest_data if isinstance(manifest_data, dict) else {}
@@ -5882,7 +5970,7 @@ def build_advisory_report_artifact(
                 "advisories_summary": scanner_summary.get("advisories"),
             },
             "scanner_policy_findings": policy_findings,
-            "exceptions": manifest_data.get("exceptions", []),
+            "exceptions": _validated_exceptions(manifest_data),
             "exceptions_digest": receipt.get("exceptions_digest"),
             "exception_findings": exception_findings,
             "exception_policy": "exact package/version/advisory scope, owned, expiring; drift and expiry fail",
@@ -5951,6 +6039,15 @@ def build_receipt(
     external_evidence: dict | None = None,
     ecosystem_denominator: dict | None = None,
 ) -> dict:
+    """Build the canonical receipt for the executed run.
+
+    The receipt's `exceptions` field is the bound exception state, so it
+    publishes the validated subset from :func:`_validated_exceptions` and
+    `exceptions_digest` is taken over exactly the published rows; a refused
+    exception stays visible as its DEP-010 finding, never as a blank value
+    inside the bound state.
+    """
+
     source_sha, source_provenance, source_finding = _git_source_provenance(root)
     if source_finding is not None:
         findings.append(source_finding)
@@ -6076,8 +6173,8 @@ def build_receipt(
         "preparation": build_preparation_record(profile),
         "input_digests": digests,
         "missing_inputs": missing_inputs,
-        "exceptions": manifest_data.get("exceptions", []),
-        "exceptions_digest": _canonical_digest(manifest_data.get("exceptions", [])),
+        "exceptions": _validated_exceptions(manifest_data),
+        "exceptions_digest": _canonical_digest(_validated_exceptions(manifest_data)),
         "direct_dependency_identity": cargo_summary.get("_direct_dependency_identity", {})
         if isinstance(cargo_summary, dict)
         else {},

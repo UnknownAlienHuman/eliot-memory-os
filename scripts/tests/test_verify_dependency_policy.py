@@ -367,7 +367,7 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         )
         return root
 
-    def _receipt_for(self, manifest_fixture: dict, findings: list) -> dict:
+    def _receipt_for(self, manifest_fixture: dict, findings: list, *, prepare=None) -> dict:
         """Build the executed receipt the artifact path actually consumes.
 
         The receipt is built over an isolated minimal root so that the only
@@ -375,12 +375,19 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         real input digests, a real source commit and the configured Node surface
         from the root it is given, so the repository root would otherwise
         contribute findings unrelated to this case.
+
+        `prepare` receives that root so a case whose manifest declares further
+        real inputs (an external-executable catalogue, a provisioning receipt)
+        can materialise them instead of carrying an unrelated DEP-013
+        missing-input finding into a status assertion.
         """
 
         root = self._artifact_root()
         contract = root / "integrations" / "plugin-bridge-contract.json"
         contract.write_text(json.dumps({"surface": "integrations/surface.js"}) + "\n", encoding="utf-8")
         (root / "integrations" / "surface.js").write_text("// no external imports\n", encoding="utf-8")
+        if prepare is not None:
+            prepare(root)
 
         manifest_with_inputs = dict(manifest_fixture)
         manifest_with_inputs["ecosystems"] = {
@@ -603,13 +610,217 @@ class TestVerifyDependencyPolicy(unittest.TestCase):
         report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
         self.assertNotEqual(report["status"], STATUS_PASS)
         self.assertTrue(report["exception_findings"])
+        # The digest binds exactly the exception state the artifact publishes,
+        # which no longer carries the refused row (see
+        # `test_advisory_report_publishes_no_blank_exception_value`).
+        self.assertEqual(report["exceptions"], [])
         self.assertEqual(
-            report["exceptions_digest"], vdp._canonical_digest(manifest_fixture["exceptions"])
+            report["exceptions_digest"], vdp._canonical_digest(report["exceptions"])
         )
+
+    # --- `[external_executables]`: the same value channel as a direct
+    #     dependency, on the surface docs/DEPENDENCY_POLICY.md:120-121
+    #     governs separately ("inventoried with version, digest, license,
+    #     trust model, and removal boundary") ---
+
+    def _materialize_external_inputs(self, entry: dict):
+        """Create the real inputs an `[external_executables]` entry declares.
+
+        `build_receipt` binds every declared external-executable input, so the
+        catalogue path and the provisioning receipt must exist in the fixture
+        root or the receipt carries an unrelated DEP-013 missing-input finding
+        and stops being a PASS.
+        """
+
+        def prepare(root: Path) -> None:
+            catalog = root / Path(entry["catalog"])
+            catalog.parent.mkdir(parents=True, exist_ok=True)
+            catalog.write_text("{}\n", encoding="utf-8")
+            provisioning = root / ".eliot" / "dependency-policy" / "surrealdb"
+            provisioning.mkdir(parents=True, exist_ok=True)
+            (provisioning / "provisioning-receipt.json").write_text("{}\n", encoding="utf-8")
+
+        return prepare
+
+    def _external_receipt_for(self, manifest_fixture: dict, findings: list) -> dict:
+        entry = manifest_fixture["external_executables"]["surrealdb"]
+        return self._receipt_for(manifest_fixture, findings, prepare=self._materialize_external_inputs(entry))
+
+    def _external_executable_fixture(self, entry: dict) -> dict:
+        return {"external_executables": {"surrealdb": entry}}
+
+    def _populated_external_executable(self) -> dict:
+        return {
+            "name": "surreal.exe",
+            "version": "3.1.4",
+            "license": "BSL-1.1",
+            "sha256": "b" * 64,
+            "catalog": "docs/release/SURREALDB_WINDOWS_X64.lock.json",
+            "release_asset": "https://example.invalid/surreal-v3.1.4.windows-amd64.exe",
+            "consumer": "crates/storage/eliot-store-surreal",
+            "owner": "crates/storage/eliot-store-surreal",
+            "trust_model": "local-loopback-service-only",
+            "removal_boundary": "pluggable-storage-facade",
+            "advisory_findings": ["GHSA-848m-r628-vrxw"],
+        }
+
+    def _blank_external_executable(self) -> dict:
+        entry = self._populated_external_executable()
+        for field in self._EXTERNAL_DISPOSITION_FIELDS:
+            entry[field] = ""
+        return entry
+
+    def _external_component(self, sbom: dict) -> dict:
+        matches = [c for c in sbom["components"] if c.get("ecosystem") == "external-executable"]
+        self.assertEqual(len(matches), 1, sbom["components"])
+        return matches[0]
+
+    def test_sbom_never_publishes_an_empty_external_executable_disposition(self) -> None:
+        # The only gate on `[external_executables]` is a presence-only loop in
+        # `_collect_external_evidence` (`for req in required: if req not in
+        # surreal`), so all four disposition fields present-but-empty reaches
+        # the SBOM as blank evidence. `_external_executable_disposition`
+        # reuses the same `_malformed_disposition_fields` rule the
+        # `direct_dependencies` join uses, so a blank entry is reported absent
+        # whatever verdict the enclosing run carries.
+        manifest_fixture = self._external_executable_fixture(self._blank_external_executable())
+        entry = manifest_fixture["external_executables"]["surrealdb"]
+        self.assertEqual(
+            vdp._external_executable_disposition(entry),
+            None,
+            "a blank external-executable disposition must not be published",
+        )
+
+        # Every disposition field is blank under the presence-only gate, so
+        # that gate alone cannot report the entry; the SBOM path is the guard
+        # under test and must be silent about the blank values.
+        receipt = self._external_receipt_for(manifest_fixture, [])
+        self.assertEqual(receipt["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        component = self._external_component(sbom)
+        self.assertIsNone(
+            component.get("disposition"), "a blank external disposition must be omitted, not published blank"
+        )
+        # The component itself is still published, so a reader sees the
+        # executable and its absence of validated disposition rather than a
+        # fabricated blank one.
+        self.assertEqual(component["name"], "surreal.exe")
+        self.assertEqual(component["version"], "3.1.4")
+
+    def test_sbom_publishes_every_field_of_a_populated_external_executable(self) -> None:
+        # The positive control: a fully populated external executable publishes
+        # every disposition field, so the refusal above is a property of the
+        # blank evidence and not of the artifact shape.
+        manifest_fixture = self._external_executable_fixture(self._populated_external_executable())
+        self.assertEqual(
+            vdp._external_executable_disposition(
+                manifest_fixture["external_executables"]["surrealdb"]
+            ),
+            {
+                "consumer": "crates/storage/eliot-store-surreal",
+                "owner": "crates/storage/eliot-store-surreal",
+                "trust_model": "local-loopback-service-only",
+                "removal_boundary": "pluggable-storage-facade",
+                "advisory_ids": ["GHSA-848m-r628-vrxw"],
+            },
+        )
+
+        receipt = self._external_receipt_for(manifest_fixture, [])
+        self.assertEqual(receipt["status"], STATUS_PASS)
+        sbom = vdp.build_sbom_artifact(receipt, manifest_fixture)
+        component = self._external_component(sbom)
+        self.assertEqual(component["name"], "surreal.exe")
+        self.assertEqual(component["version"], "3.1.4")
+        self.assertEqual(component["license"], "BSL-1.1")
+        self.assertEqual(component["integrity"]["digest"], "b" * 64)
+        disposition = component.get("disposition")
+        self.assertIsInstance(disposition, dict)
+        for field, value in (
+            ("consumer", "crates/storage/eliot-store-surreal"),
+            ("owner", "crates/storage/eliot-store-surreal"),
+            ("trust_model", "local-loopback-service-only"),
+            ("removal_boundary", "pluggable-storage-facade"),
+        ):
+            self.assertEqual(disposition[field], value)
+        self.assertEqual(disposition["advisory_ids"], ["GHSA-848m-r628-vrxw"])
+        self.assertFalse(self._is_empty_disposition(disposition))
+
+    def test_advisory_report_publishes_no_blank_exception_value(self) -> None:
+        # `build_advisory_report_artifact` published the RAW table, so an
+        # all-empty exception shipped its blank owner/control/expiry verbatim.
+        # `_validated_exceptions` reuses the validator's own
+        # `_EXCEPTION_REQUIRED_FIELDS` rule, so a refused row is reported as
+        # absent; the DEP-010 verdict channel still publishes the finding.
+        entry = self._populated_exception()
+        for field in self._EXCEPTION_BLANK_FIELDS:
+            entry[field] = ""
+        manifest_fixture = self._exception_fixture(entry)
+        findings = check_exceptions(
+            manifest_fixture, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)
+        )
+        self.assertTrue(findings, "an exception with no evidence must not verify")
+
+        receipt = self._receipt_for(manifest_fixture, findings)
+        self.assertEqual(receipt["exceptions"], [], "a refused exception must not enter the bound state")
+        report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
+        self.assertEqual(report["exceptions"], [])
+        self.assertEqual(
+            report["exceptions_digest"], vdp._canonical_digest(report["exceptions"])
+        )
+        # The verdict channel is untouched by the value-channel guard.
+        self.assertTrue(report["exception_findings"])
+        self.assertIn(findings[0].detail, {f["detail"] for f in report["exception_findings"]})
+
+    def test_advisory_report_publishes_a_validated_exception_verbatim(self) -> None:
+        # The positive control: a fully populated, unexpired exception is
+        # published verbatim and its digest still binds the published rows.
+        manifest_fixture = self._exception_fixture(self._populated_exception())
+        self.assertEqual(
+            check_exceptions(manifest_fixture, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)), []
+        )
+
+        receipt = self._receipt_for(manifest_fixture, [])
+        self.assertEqual(receipt["exceptions"], manifest_fixture["exceptions"])
+        self.assertEqual(
+            receipt["exceptions_digest"], vdp._canonical_digest(manifest_fixture["exceptions"])
+        )
+        report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
+        self.assertEqual(report["exceptions"], manifest_fixture["exceptions"])
+        self.assertEqual(
+            report["exceptions_digest"], vdp._canonical_digest(report["exceptions"])
+        )
+        self.assertEqual(report["exception_findings"], [])
+
+    def test_advisory_report_keeps_the_digest_bound_to_the_published_state(self) -> None:
+        # The digest must bind exactly the rows the artifact publishes, so a
+        # reader can recompute it from `exceptions` alone.
+        populated = self._exception_fixture(self._populated_exception())
+        refused = self._populated_exception()
+        for field in self._EXCEPTION_BLANK_FIELDS:
+            refused[field] = "  "
+        mixed = {"exceptions": [self._populated_exception(), refused]}
+
+        for manifest_fixture in (populated, mixed):
+            findings = check_exceptions(
+                manifest_fixture, now_dt=datetime(2026, 9, 13, tzinfo=timezone.utc)
+            )
+            receipt = self._receipt_for(manifest_fixture, findings)
+            report = vdp.build_advisory_report_artifact(receipt, manifest_fixture)
+            self.assertEqual(
+                report["exceptions_digest"], vdp._canonical_digest(report["exceptions"])
+            )
+            # The refused row is the only one dropped from a mixed table.
+            self.assertEqual(report["exceptions"], [self._populated_exception()])
 
     # --- issue #1229 A6: advisory exception evidence ---
 
     _EXCEPTION_BLANK_FIELDS = ("owner", "compensating_control", "removal_condition", "expires_at")
+
+    # `docs/DEPENDENCY_POLICY.md:120-121`: an external executable is
+    # "inventoried with version, digest, license, trust model, and removal
+    # boundary"; its consumer/owner come from the shared admission rule
+    # (`:11` "a real current consumer and owner").
+    _EXTERNAL_DISPOSITION_FIELDS = ("consumer", "owner", "trust_model", "removal_boundary")
 
     def _exception_fixture(self, entry: dict) -> dict:
         return {"exceptions": [entry]}
