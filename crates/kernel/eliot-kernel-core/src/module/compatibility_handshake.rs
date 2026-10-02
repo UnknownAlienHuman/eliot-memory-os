@@ -56,6 +56,26 @@
 //!   `ServerHandshakePolicy.module_generation`, the registry-selected
 //!   generation the server owner holds.
 //!
+//! # Single-field admission, and why it exists beside `admit_handshake`
+//!
+//! [`admit_contract_set_digest`], [`admit_canonical_format_range`],
+//! [`admit_architecture_source_digest`], [`admit_normative_pair_receipt`] and
+//! [`admit_migration_class`] are the single comparison of each of those fields in
+//! this crate: [`admit_handshake`] and [`admit_rollback`] CALL them rather than
+//! restating the comparisons, so one definition decides what "compatible" means
+//! for each field however many boundaries ask.
+//!
+//! They are public because a process handshake does not always arrive as a whole
+//! [`CompatibilityEnvelope`]. The `eliotd` front door reads the same envelope
+//! items out of the free-form `ServerHello` `config_snapshot` object, next to
+//! four items it holds in a different place (the module generation and the
+//! Authority Epoch come from the Host-approved launch descriptor, and the
+//! capability set is the granted intersection the Kernel computed). Building a
+//! `CompatibilityEnvelope` there to reach `admit_handshake` would make those four
+//! arms self-comparisons, so that boundary compares the envelope's own fields
+//! through these functions instead - with a receiver-held operand it actually
+//! holds, which is the property that makes them bindings rather than echoes.
+//!
 //! # Who owns each field a producer must supply
 //!
 //! These owners are PUBLIC exports, so they are not a secrecy boundary and must
@@ -981,6 +1001,133 @@ impl AcceptedCompatibilityEvidence {
     }
 }
 
+/// Admits one presented I1.12 `contract-set digest` against a receiver-held
+/// durable digest.
+///
+/// This is the SINGLE comparison of that field in this crate: [`admit_handshake`]
+/// calls it rather than restating the comparison, so a boundary that cannot
+/// build a whole [`CompatibilityEnvelope`] - a process handshake whose wire
+/// carries the envelope's fields inside a free-form `ServerHello`
+/// `config_snapshot` object, for instance - reads the owner's admission rule
+/// instead of holding a private spelling of it.
+///
+/// `durable` is state the receiver did not take from the candidate, so a
+/// candidate cannot satisfy this by echoing anything. The comparison is exact:
+/// I1.12 admits a candidate only when it is compatible with current durable
+/// state, and a contract set is either the admitted public surface set or it is
+/// not.
+pub fn admit_contract_set_digest(
+    presented: &str,
+    durable: &str,
+) -> Result<(), CompatibilityMismatch> {
+    if presented == durable {
+        return Ok(());
+    }
+    Err(CompatibilityMismatch::new(
+        MismatchField::ContractSetDigest,
+        "contract-set digest differs from durable state",
+    ))
+}
+
+/// Admits one presented I1.12 `canonical format range` against a receiver-held
+/// durable range, and returns the negotiated format revision.
+///
+/// The relation is OVERLAP, not equality, and this is the owner-side statement
+/// of that: [`VersionRange::negotiate`] admits two ranges exactly when they
+/// share at least one revision and returns the highest such revision. I1.12
+/// requires rollback to be admitted only to an artifact compatible with current
+/// durable formats, so a range that shares no revision with durable state is a
+/// refusal rather than a downgrade, and the refusal names
+/// [`MismatchField::CanonicalFormatRange`].
+///
+/// [`admit_handshake`] calls this rather than restating the comparison.
+pub fn admit_canonical_format_range(
+    presented: VersionRange,
+    durable: VersionRange,
+) -> Result<u32, CompatibilityMismatch> {
+    presented.negotiate(durable).ok_or_else(|| {
+        CompatibilityMismatch::new(
+            MismatchField::CanonicalFormatRange,
+            "canonical format ranges share no version",
+        )
+    })
+}
+
+/// Admits one presented I1.12 `Architecture source digest` against a
+/// receiver-held durable digest.
+///
+/// This comparison is what establishes a candidate's identity, because
+/// `durable` is state the receiver did not take from the candidate.
+/// [`admit_handshake`] calls this rather than restating the comparison.
+pub fn admit_architecture_source_digest(
+    presented: &str,
+    durable: &str,
+) -> Result<(), CompatibilityMismatch> {
+    if presented == durable {
+        return Ok(());
+    }
+    Err(CompatibilityMismatch::new(
+        MismatchField::ArchitectureDigest,
+        "architecture source digest differs from durable state",
+    ))
+}
+
+/// Admits one presented `NormativePairIdentity` receipt against a
+/// receiver-held Architecture source digest.
+///
+/// Two comparisons, in this order, and the second is the only one that
+/// constrains the tag:
+///
+/// 1. the digest the receipt is presented as sealing must equal the
+///    receiver-held Architecture source digest. Both operands here are NOT
+///    peer-supplied - `durable_architecture_source_digest` is the receiver's
+///    own value - so this arm is independent, and it is what refuses a
+///    self-consistent receipt minted over a FOREIGN Architecture digest.
+/// 2. [`NormativePairReceipt::verifies`], which recomputes the tag from the
+///    PRESENTED digest. Both of its operands are peer-supplied, so it is a
+///    self-consistency check on one field of one message and adds no assurance
+///    about identity beyond the first comparison. See [`expected_seal_tag`] for
+///    the precise statement of what the seal can and cannot prove.
+///
+/// [`admit_handshake`] calls this rather than restating the comparison.
+pub fn admit_normative_pair_receipt(
+    presented: &NormativePairReceipt,
+    durable_architecture_source_digest: &str,
+) -> Result<(), CompatibilityMismatch> {
+    if presented.architecture_source_digest() != durable_architecture_source_digest
+        || !presented.verifies()
+    {
+        return Err(CompatibilityMismatch::new(
+            MismatchField::NormativeSeal,
+            "normative-pair seal does not verify against the architecture digest",
+        ));
+    }
+    Ok(())
+}
+
+/// Admits one presented I1.12 `state migration class` against a receiver-held
+/// durable class.
+///
+/// The comparison is exact, so a candidate that declares a different class is
+/// refused under [`MismatchField::MigrationClass`]. What the class is *supposed*
+/// to assert about a durable format remains undefined, because I1.12 names the
+/// field and defines no vocabulary; read [`StateMigrationClass`] for why this
+/// crate owns no derived value and every boundary supplies its own declaration.
+///
+/// [`admit_handshake`] calls this rather than restating the comparison.
+pub fn admit_migration_class(
+    presented: StateMigrationClass,
+    durable: StateMigrationClass,
+) -> Result<(), CompatibilityMismatch> {
+    if presented == durable {
+        return Ok(());
+    }
+    Err(CompatibilityMismatch::new(
+        MismatchField::MigrationClass,
+        "state migration class differs from durable state",
+    ))
+}
+
 /// Admits a process handshake against the current durable state.
 ///
 /// Every I1.12 field is gated in order and the first incompatibility is
@@ -1086,36 +1233,26 @@ pub fn admit_handshake(
             "protocol ranges share no version",
         ));
     };
-    if candidate.contract_set_digest() != durable.contract_set_digest() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::ContractSetDigest,
-            "contract-set digest differs from durable state",
-        ));
-    }
-    let Some(canonical_format_version) = candidate
-        .canonical_format_range()
-        .negotiate(durable.canonical_format_range())
-    else {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::CanonicalFormatRange,
-            "canonical format ranges share no version",
-        ));
-    };
-    if candidate.architecture_source_digest() != durable.architecture_source_digest() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::ArchitectureDigest,
-            "architecture source digest differs from durable state",
-        ));
-    }
-    if candidate.normative_receipt().architecture_source_digest()
-        != durable.architecture_source_digest()
-        || !candidate.normative_receipt().verifies()
-    {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::NormativeSeal,
-            "normative-pair seal does not verify against the architecture digest",
-        ));
-    }
+    // Each of the five envelope-field comparisons below is the owner's single
+    // comparison of that field, called rather than restated here, so this
+    // function and a boundary that admits the fields one at a time cannot
+    // disagree about what "compatible" means for any of them.
+    admit_contract_set_digest(
+        candidate.contract_set_digest(),
+        durable.contract_set_digest(),
+    )?;
+    let canonical_format_version = admit_canonical_format_range(
+        candidate.canonical_format_range(),
+        durable.canonical_format_range(),
+    )?;
+    admit_architecture_source_digest(
+        candidate.architecture_source_digest(),
+        durable.architecture_source_digest(),
+    )?;
+    admit_normative_pair_receipt(
+        candidate.normative_receipt(),
+        durable.architecture_source_digest(),
+    )?;
     if !candidate
         .authority_epoch()
         .is_same_authority(durable.authority_epoch())
@@ -1141,12 +1278,7 @@ pub fn admit_handshake(
             format!("durable required capability '{missing}' is not offered"),
         ));
     }
-    if candidate.migration_class() != durable.migration_class() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::MigrationClass,
-            "state migration class differs from durable state",
-        ));
-    }
+    admit_migration_class(candidate.migration_class(), durable.migration_class())?;
     Ok(AcceptedCompatibilityEvidence {
         envelope_version: HANDSHAKE_ENVELOPE_VERSION,
         protocol_version,
@@ -1480,12 +1612,7 @@ pub fn admit_rollback(
             "recorded protocol version is outside the durable range",
         ));
     }
-    if evidence.contract_set_digest != durable.contract_set_digest() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::ContractSetDigest,
-            "recorded contract-set digest differs from durable state",
-        ));
-    }
+    admit_contract_set_digest(&evidence.contract_set_digest, durable.contract_set_digest())?;
     if !durable
         .canonical_format_range()
         .contains(evidence.canonical_format_version)
@@ -1495,12 +1622,10 @@ pub fn admit_rollback(
             "recorded canonical format version is outside the durable range",
         ));
     }
-    if evidence.architecture_source_digest != durable.architecture_source_digest() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::ArchitectureDigest,
-            "recorded architecture digest differs from durable state",
-        ));
-    }
+    admit_architecture_source_digest(
+        &evidence.architecture_source_digest,
+        durable.architecture_source_digest(),
+    )?;
     if evidence.seal_tag != expected_seal_tag(&evidence.architecture_source_digest) {
         return Err(CompatibilityMismatch::new(
             MismatchField::NormativeSeal,
@@ -1513,12 +1638,7 @@ pub fn admit_rollback(
             "recorded epoch lineage differs from the durable lineage",
         ));
     }
-    if evidence.migration_class != durable.migration_class() {
-        return Err(CompatibilityMismatch::new(
-            MismatchField::MigrationClass,
-            "recorded migration class differs from durable state",
-        ));
-    }
+    admit_migration_class(evidence.migration_class, durable.migration_class())?;
     admit_recorded_store_api_contract_set(
         durable.store_api_contract_set_digest(),
         evidence.store_api_contract_set_digest.as_deref(),

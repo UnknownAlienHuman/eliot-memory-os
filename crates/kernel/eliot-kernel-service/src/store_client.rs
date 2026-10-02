@@ -242,6 +242,38 @@ pub struct EbpCanonicalStoreClient<T> {
     /// [`kernel_store_api_contract_set_digest`], which this binary derives from
     /// its own compiled `eliot_store_api`.
     presented_store_api_contract_set_digest: Option<String>,
+    /// The blob ROOT IDENTITY the store presented: the `root_id` member of the
+    /// `blob_root_owner` object in the SAME `ServerHello` `config_snapshot`,
+    /// projected once here and retained verbatim (issue #1968, I1.12 /
+    /// I1.2 §6).
+    ///
+    /// The store does not publish a root path string under that key. It
+    /// publishes an OBJECT - `bins/eliot-store-surreal/src/main.rs:558-563`
+    /// builds `{root_id, owner_id, process_id, claim_id}` from one
+    /// `BlobRootOwner` (`crates/storage/eliot-blob/src/lib.rs:114-122`) and
+    /// `bins/eliot-store-surreal/src/lib.rs:1650` writes it into
+    /// `config_snapshot` beside `operation_manifest_set_digest`. `root_id` is
+    /// the one member of that claim that names the data root the Kernel holds
+    /// an approved value for, so it is the member compared; `owner_id`,
+    /// `process_id` and `claim_id` describe the claiming PROCESS and have no
+    /// Kernel-held counterpart on this boundary.
+    ///
+    /// It is a plain `String`, never a substitute: an absent or non-string
+    /// `root_id` projects to `None`, which is a REFUSAL CONDITION the admitting
+    /// boundary must apply - `BlobStoreController::record_ready` refuses it
+    /// naming `blob_root_owner` - and never a default. This client cannot
+    /// invent a root identity: it holds no approved root, and a default here
+    /// would be exactly the self-comparison I1.12 forbids. It does not fail the
+    /// handshake itself, because that would make one Blob Store field refuse
+    /// the whole store-bridge handshake before the caller that knows whether
+    /// the field is required there has decided.
+    ///
+    /// Retained verbatim, never derived: it is what the peer said, and the
+    /// verdict belongs to the boundary that admits the blob generation, which
+    /// compares it against the Kernel-held `BlobStoreManifest::data_root` in
+    /// `bins/eliot-kernel/src/blob_store_controller.rs`
+    /// (`BlobStoreController::record_ready`).
+    presented_blob_root_owner_root_id: Option<String>,
 }
 
 impl<T> std::fmt::Debug for EbpCanonicalStoreClient<T> {
@@ -293,6 +325,30 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .get("operation_manifest_set_digest")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
+        // Same `config_snapshot` object, same single decode chain, same
+        // `serde_json::Value` accessor style the contract-set digest above uses
+        // - there is no second decode path, no lenient fallback parser and no
+        // discarded error. The store publishes `blob_root_owner` as an OBJECT
+        // (`bins/eliot-store-surreal/src/main.rs:558-563`: `root_id`,
+        // `owner_id`, `process_id`, `claim_id`), so the value that has a
+        // Kernel-held counterpart is its `root_id` member; comparing the whole
+        // object to a root path would refuse every real handshake. Projecting
+        // it here keeps the single read of this `config_snapshot` in the one
+        // function that already reads it.
+        //
+        // An absent or non-string `root_id` projects to `None`: the
+        // root identity was never presented, which is reported rather than
+        // defaulted. Nothing is substituted for it here - this client holds no
+        // approved root to substitute from, and the boundary that does hold one
+        // (`BlobStoreController::record_ready`) refuses the `None` naming
+        // `blob_root_owner`.
+        let presented_blob_root_owner_root_id = server
+            .config_snapshot
+            .get("blob_root_owner")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|owner| owner.get("root_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let client = Self {
             transport: Arc::new(Mutex::new(transport)),
             requirement,
@@ -301,6 +357,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             request_counter: AtomicU64::new(1),
             fault: AtomicU8::new(StoreClientFault::NONE),
             presented_store_api_contract_set_digest,
+            presented_blob_root_owner_root_id,
         };
         client.verify_readiness().await?;
         Ok(client)
@@ -347,6 +404,27 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     #[must_use]
     pub fn presented_store_api_contract_set_digest(&self) -> Option<&str> {
         self.presented_store_api_contract_set_digest.as_deref()
+    }
+
+    /// The blob ROOT IDENTITY the store presented: the `root_id` member of the
+    /// `blob_root_owner` object in its `ServerHello` `config_snapshot`, exactly
+    /// as it arrived (issue #1968).
+    ///
+    /// This is a string, not the whole owner claim: `owner_id`, `process_id`
+    /// and `claim_id` describe the claiming process and are not compared on
+    /// this boundary.
+    ///
+    /// `None` when the published claim carried no string `root_id`. That is an
+    /// honest report, not a default: nothing is filled in on the peer's behalf,
+    /// and the admitting boundary refuses the absence naming `blob_root_owner`.
+    ///
+    /// The admitting boundary compares the presented value against the
+    /// Kernel-side operand it holds; this client neither performs that
+    /// comparison nor knows that operand, which is the approved
+    /// `BlobStoreManifest::data_root` held by `BlobStoreController`.
+    #[must_use]
+    pub fn presented_blob_root_owner_root_id(&self) -> Option<&str> {
+        self.presented_blob_root_owner_root_id.as_deref()
     }
 
     async fn verify_readiness(&self) -> Result<(), StoreClientError> {
@@ -1224,6 +1302,12 @@ mod tests {
         apply_calls: usize,
         reserved_apply_calls: usize,
         receipt_requests: Vec<OperationId>,
+        /// Extra keys the fake store ADDS TO or OVERRIDES in its `ServerHello`
+        /// `config_snapshot`, so a test can present a claim that differs from
+        /// the production one (`bins/eliot-store-surreal/src/lib.rs:1649-1650`)
+        /// without inventing a second fake transport. Default is empty: no
+        /// fixture key is invented for tests that do not ask for it.
+        extra_config_fields: BTreeMap<String, serde_json::Value>,
     }
 
     impl FakeEbpStoreTransport {
@@ -1243,7 +1327,14 @@ mod tests {
                 apply_calls: 0,
                 reserved_apply_calls: 0,
                 receipt_requests: Vec::new(),
+                extra_config_fields: BTreeMap::new(),
             }
+        }
+
+        /// Adds one key to the fake store's `ServerHello` `config_snapshot`.
+        fn with_config_snapshot_field(mut self, name: &str, value: serde_json::Value) -> Self {
+            self.extra_config_fields.insert(name.to_owned(), value);
+            self
         }
 
         fn with_recovery_response(mut self, response: StoreResponse) -> Self {
@@ -1330,10 +1421,21 @@ mod tests {
                         .map(|value| (*value).to_owned())
                         .collect(),
                     allowed_effects: EFFECTS.iter().map(|value| (*value).to_owned()).collect(),
-                    config_snapshot: json!({
-                        "config_hash": self.requirement.approved_config_hash.as_str(),
-                        "artifact_hash": self.requirement.approved_artifact_hash.as_str(),
-                    }),
+                    config_snapshot: {
+                        let mut snapshot = json!({
+                            "config_hash": self.requirement.approved_config_hash.as_str(),
+                            "artifact_hash": self.requirement.approved_artifact_hash.as_str(),
+                            // The real store bridge publishes this key on every
+                            // handshake, so the fake does too: `connect`
+                            // projects `root_id` out of it and refuses the
+                            // handshake when it is absent.
+                            "blob_root_owner": fake_store_blob_root_owner(),
+                        });
+                        for (name, value) in &self.extra_config_fields {
+                            snapshot[name.as_str()] = value.clone();
+                        }
+                        snapshot
+                    },
                     heartbeat_ms: 1_000,
                     control_channel: "fake-store-control".to_owned(),
                     rejection_reason: None,
@@ -1813,6 +1915,102 @@ mod tests {
         );
         receipt.validate().expect("apply receipt");
         receipt
+    }
+
+    /// The `blob_root_owner` claim the real store bridge publishes on EVERY
+    /// handshake (`bins/eliot-store-surreal/src/main.rs:558-563`), built from
+    /// one `BlobRootOwner` (`crates/storage/eliot-blob/src/lib.rs:114-122`):
+    /// `root_id` is the data-root identity and the other three members describe
+    /// the claiming process. The configured root is `store_data_root/blob`
+    /// (`crates/kernel/eliot-installation/src/package_planner.rs:4280-4283`),
+    /// so the fixture spells `root_id` in that position.
+    ///
+    /// A blob root owner claim is something the store asserts about ITSELF, so
+    /// the four values are the peer's own identity and are not a Kernel-held
+    /// expectation. The Kernel side of the comparison lives in
+    /// `BlobStoreController::record_ready`.
+    fn fake_store_blob_root_owner() -> serde_json::Value {
+        json!({
+            "root_id": "C:/ProgramData/Eliot/blob",
+            "owner_id": "blob-root-owner-1",
+            "process_id": 1_704,
+            "claim_id": "process:1704:root:C:/ProgramData/Eliot/blob:owner:blob-root-owner-1:lease:lease-token-1",
+        })
+    }
+
+    /// Issue #1968: the store bridge publishes `operation_manifest_set_digest`
+    /// and `blob_root_owner` as two keys of ONE `ServerHello`
+    /// `config_snapshot` (`bins/eliot-store-surreal/src/lib.rs:1649-1650`).
+    /// Before this change the Kernel retained only the first and discarded the
+    /// second, so a store's blob root identity never reached any comparison.
+    /// What is retained is the `root_id` member of that claim, because that is
+    /// the only member with a Kernel-held counterpart.
+    #[tokio::test]
+    async fn handshake_projects_the_root_id_member_the_store_published_under_blob_root_owner() {
+        let requirement = requirement();
+        let published = fake_store_blob_root_owner();
+        let published_root_id = published
+            .get("root_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("the published claim carries a string root_id")
+            .to_owned();
+        let presented_digest = kernel_store_api_contract_set_digest()
+            .expect("this build's own contract-set digest is derivable");
+        let transport = FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+            .with_config_snapshot_field(
+                "operation_manifest_set_digest",
+                json!(presented_digest.as_str()),
+            )
+            .with_config_snapshot_field("blob_root_owner", published);
+        let client = EbpCanonicalStoreClient::connect(transport, requirement)
+            .await
+            .expect("fake handshake and readiness");
+
+        assert_eq!(
+            client.presented_blob_root_owner_root_id(),
+            Some(published_root_id.as_str()),
+            "the retained operand must be the root_id member the store published"
+        );
+        assert_eq!(
+            client.presented_store_api_contract_set_digest(),
+            Some(presented_digest.as_str())
+        );
+    }
+
+    /// The refusal half: the published claim keeps its process members but
+    /// carries no `root_id`, so no root identity was presented at all. The
+    /// projection reports that absence as `None` rather than substituting a
+    /// value, which is the condition
+    /// `BlobStoreController::record_ready` refuses naming `blob_root_owner`.
+    /// A lenient parser could have read a root out of `owner_id` or
+    /// `claim_id`; the assertion pins that it did not.
+    #[tokio::test]
+    async fn handshake_projects_no_root_identity_when_the_claim_carries_no_root_id() {
+        let requirement = requirement();
+        let mut published_without_root_id = fake_store_blob_root_owner();
+        let claim = published_without_root_id
+            .as_object_mut()
+            .expect("the published claim is an object");
+        let omitted_root_id = claim.remove("root_id");
+        assert!(
+            omitted_root_id.is_some(),
+            "the refusal case must actually drop the root_id member"
+        );
+        assert!(
+            claim.contains_key("owner_id") && claim.contains_key("claim_id"),
+            "the refusal case must keep the process members a lenient parser could have used"
+        );
+        let transport = FakeEbpStoreTransport::new(requirement.clone(), SnapshotFault::Valid)
+            .with_config_snapshot_field("blob_root_owner", published_without_root_id);
+        let client = EbpCanonicalStoreClient::connect(transport, requirement)
+            .await
+            .expect("the handshake itself is admitted; the missing field is refused downstream");
+
+        assert_eq!(
+            client.presented_blob_root_owner_root_id(),
+            None,
+            "a claim with no root_id must project to no root identity, never a substitute"
+        );
     }
 
     #[tokio::test]

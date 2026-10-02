@@ -9,31 +9,62 @@
 //! seam ([`super::canonical_store_runtime`]), and the generation-cutover
 //! candidate ([`super::generation_control::admit_cutover_candidate`]).
 //!
-//! Not every process handshake reaches it, and naming the ones that do not is
-//! part of the claim rather than a caveat to it. The `eliotd` process boundary
-//! is gated at the peer, in `eliotd`'s own
+//! Not every process handshake reaches this module, and saying where each one
+//! IS gated is part of the claim rather than a caveat to it. The `eliotd`
+//! process boundary is gated in the OTHER process, at `eliotd`'s own
 //! `daemon_kernel_client::handshake::admit_kernel_peer_compatibility`, which
-//! runs in the OTHER process, constructs no `CompatibilityEnvelope`, calls
-//! neither `admit_handshake` nor this module. It compares THREE of the I1.12
-//! items — protocol range, Authority Epoch and the required capability — and
-//! records the FIVE its `ServerHello` does not present
-//! (`UNPRESENTED_HANDSHAKE_FIELDS` there) rather than comparing them. That
-//! ceiling was measured to be movable and was NOT moved, for a reason worth
-//! stating here: `config_snapshot` is a free-form JSON object and could carry
-//! the five, but three whole-object SHA-256 pins compare it against
-//! installation-owned declarations — `agent_bridge::begin_agent_bridge_inner`,
-//! `verify_harness_kernel_policy` and `eliot-cli`'s `expected_config_snapshot_
-//! sha256` — and two closed decoders (`eliot-cli`'s `KernelConfigSnapshot`,
-//! issue #1810; `eliot-mod-research`'s `ServerConfigSnapshot`, issue #24) would
-//! reject the added keys outright. Reissuing the pins is an installation
-//! concern and `application-client.json` has no in-tree producer at all.
-//! Binding those two fields on that boundary is therefore real work on other
-//! issues' paths, and fabricating them from the daemon's own values would make
-//! each one a self-comparison. The Blob Store generation is not routed through
-//! this module at
-//! all: `blob_store_controller` admits it from the approved manifest, a
-//! readiness/integrity probe and a durable receipt whose generation must match,
-//! with no envelope, no contract-set digest and no epoch-lineage comparison.
+//! constructs no `CompatibilityEnvelope` and calls neither `admit_handshake`
+//! nor this module. It compares the peer's presented values against values
+//! THIS binary holds, using the owner admissions in `eliot_kernel_core`
+//! (`admit_contract_set_digest`, `admit_canonical_format_range`,
+//! `admit_architecture_source_digest`, `admit_normative_pair_receipt`,
+//! `admit_migration_class`), and it REFUSES the absence of any of the five.
+//!
+//! Those five reach it because this binary publishes them into the daemon's
+//! `ServerHello.config_snapshot` - a free-form JSON object - in a per-session
+//! CLONE of the front-door policy, extended only when
+//! `client.module_bridge_identity == ACTIVE_DAEMON_CALLER`. The clone is the
+//! whole point and it is not incidental: `agent_bridge::begin_agent_bridge_inner`
+//! computes a SHA-256 over the WHOLE stored policy object, and its receiver-held
+//! half is built by installation-owned six-key literals
+//! (`crates/kernel/eliot-installation/src/agent_bridge_profile.rs`,
+//! `package_planner.rs`). Putting a key in the STORED object would change those
+//! bytes for six binaries; extending a per-session copy leaves them identical.
+//! The same asymmetry keeps the two closed decoders - `eliot-cli`'s
+//! `KernelConfigSnapshot` (issue #1810) and `eliot-mod-research`'s
+//! `ServerConfigSnapshot` (issue #24) - valid, because they bind other session
+//! kinds and never see the daemon's extended copy.
+//!
+//! ## The Blob Store generation: a measured absence with a named owner
+//!
+//! #1968 names the Blob Store generation among the boundaries this Kernel
+//! admits. Measured on this tree it is not a PROCESS handshake yet, so there is
+//! no envelope to gate here, and none is fabricated from this module's own
+//! constants - that would make every field a self-comparison:
+//!
+//! - There is no Blob Store process. `eliot-blob` and `eliot-blob-api` are
+//!   library workspace members (`Cargo.toml:42-43`), no `eliot-blob` binary
+//!   exists under `bins/`, and `BlobStoreService` is constructed only inside
+//!   `crates/storage/eliot-blob`'s own tests. I1.2 and I05-02 keep the Blob
+//!   Store co-located behind the store/daemon contract during D1, so a separate
+//!   `eliot-blob.exe` generation is a measured extraction option rather than a
+//!   D1 obligation; `workstreams/core-daemons/T3.md` records that decision
+//!   under T3-B, owner issue #19.
+//! - Nothing in production reaches the admission that does exist.
+//!   `KernelComposition::demand_blob_store`
+//!   (`bins/eliot-kernel/src/blob_store_controller.rs:566`) is called only from
+//!   that binary's own tests, and `BlobStoreController::record_ready` compares
+//!   only a caller-INJECTED probe generation string against the manifest's
+//!   `approved_generation` - there is no peer operand for any other I1.12 item.
+//! - No verdict could be durable for it: a blob generation is routed under no
+//!   `RouteScope`, so [`persist_generation_compatibility`] has no key to write
+//!   under and `generation_recovery::admit_generation_rollback` could not read
+//!   one back.
+//!
+//! Gating that boundary is therefore work on the #19 extraction path: a real
+//! process handshake, an owner-issued envelope, a durable route scope and a
+//! production call site. This module records the absence instead of inventing
+//! the missing pieces.
 //!
 //! The verdict this module admits travels with the candidate's generation and
 //! Authority Epoch lineage and is persisted in ORS, which is what makes a later

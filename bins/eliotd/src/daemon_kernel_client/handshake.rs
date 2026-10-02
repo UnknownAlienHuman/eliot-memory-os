@@ -25,6 +25,16 @@ use thiserror::Error;
 use super::KernelLaunchBinding;
 use crate::{DaemonError, ELIOTD_RECEIPT_PENDING_REJECTION, PROTOCOL_VERSION, SERVICE_NAME};
 
+/// The I1.12 envelope's OWNER crate surface, reached through its module path
+/// rather than the root re-exports.
+///
+/// The typed admission of the five envelope items below lives there and is
+/// called, never restated here. The path is the module path rather than the root
+/// re-export because this issue's write set does not include the owner's
+/// `lib.rs`, and the module is `pub`; the same path is already used elsewhere in
+/// this binary (`kernel_context_read_client.rs`).
+#[cfg(windows)]
+use eliot_kernel_core::module::compatibility_handshake as owner;
 #[cfg(windows)]
 use eliot_kernel_core::{CompatibilityMismatch, MismatchField};
 
@@ -42,114 +52,73 @@ use eliot_kernel_core::{CompatibilityMismatch, MismatchField};
 #[cfg(windows)]
 const DAEMON_FRONT_DOOR_CAPABILITY: &str = "daemon";
 
-/// The I1.12 fields the Kernel's `ServerHello` does not present to this daemon,
-/// so this boundary cannot compare them.
+/// The I1.12 `state migration class` THIS DAEMON declares, and therefore the
+/// receiver-held operand its boundary compares a Kernel peer against.
 ///
-/// I1.12 names seven items every process handshake exchanges. What the Kernel
-/// actually presents in `ServerHello` on this wire is
-/// `selected_protocol`, `authority_epoch`, `allowed_capabilities`,
-/// `allowed_effects`, `control_channel`, `heartbeat_ms` and the
-/// `config_snapshot` object. The five items below are therefore NOT verified
-/// here, and none of them is filled from this binary's own values: a field the
-/// peer never presented, compared against a value this process supplied itself,
-/// verifies nothing, and `eliot_kernel_core::admit_handshake` is deliberately
-/// not called at this boundary because admitting it would require constructing a
-/// `CompatibilityEnvelope` from receiver-owned values for five of its fields.
+/// I1.12 names the field and defines no vocabulary for it, so the owner crate
+/// deliberately owns and exports no derived value and every boundary supplies
+/// its own declaration; read `eliot_kernel_core::StateMigrationClass`. This
+/// declaration is `NoMigration` because this daemon's own published module
+/// contract declares it `compatibility_state: "rebuildable"`
+/// ([`declared_module_contract`]): the process holds no durable state a
+/// handshake could require migrating, and it is the same class the Kernel's own
+/// process boundary declares (`bins/eliot-kernel/src/compatibility_gate.rs`).
 ///
-/// # This is NOT a wire-shape limit, and an earlier version of this comment said it was
-///
-/// A former comment here claimed the five items "cannot arrive" because
-/// `eliot_protocol::ServerHello` is a pinned contract shape and this daemon's
-/// decoder reads `config_snapshot` under `deny_unknown_fields`. That reason is
-/// wrong, and leaving it in place would keep this gap looking like a protocol
-/// impossibility when it is a producer/consumer coordination limit. Measured on
-/// this tree:
-///
-/// - `config_snapshot` is FREE-FORM on the wire: it is declared
-///   `pub config_snapshot: Value` at
-///   `crates/foundation/eliot-protocol/src/lib.rs:4312`, and the
-///   `#[serde(deny_unknown_fields)]` on `ServerHello` (same file, line 4301)
-///   governs `ServerHello`'s OWN nine named fields and does not reach keys inside
-///   that opaque value. The store bridge already exploits exactly this to publish
-///   `operation_manifest_set_digest` into its own `ServerHello`
-///   (`bins/eliot-store-surreal/src/lib.rs:1649`).
-/// - The boundary record does NOT pin the object's contents. The `ServerHello`
-///   row in `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
-///   (id `eliot-protocol:crates/foundation/eliot-protocol/src/lib.rs:derive:ServerHello:validate_peer_bindings`,
-///   line 334869) pins `span_start = 4300` / `span_end = 4321` — the struct
-///   DECLARATION. A new KEY inside `config_snapshot` does not move that span, so
-///   the row stays valid and none had to be edited to reach this conclusion.
-/// - This daemon's own decoder is NOT a constraint either: `KernelSnapshotWire`
-///   is a local struct in this module and widening it is an ordinary local edit.
-///
-/// So the keys CAN be carried, with no wire-shape change, no new struct field and
-/// no boundary-record edit. They are absent because no producer publishes them,
-/// and publishing them is blocked by three measured constraints:
-///
-/// 1. There is no SINGLE Kernel-side publisher of this daemon's snapshot, so
-///    there is no one file to edit. The initial projection is the
-///    `serde_json::json!` in `assemble` at
-///    `bins/eliot-kernel/src/composition_bootstrap.rs:1834`, but
-///    `update_handshake_policy_without_observation` at
-///    `bins/eliot-kernel/src/generation_recovery.rs:610` REBUILDS the same object
-///    from scratch on every generation cutover and on recovery. Both sites are in
-///    this issue's write set, so they can move together, but they must both move:
-///    a key added at the first alone is erased at the second. No third publisher
-///    exists — every other assignment in the Kernel binary is one of the five
-///    `policy.config_snapshot.clone()` session binders in
-///    `bins/eliot-kernel/src/front_door_session.rs` (lines 1106, 1198, 1294, 1437,
-///    1510), which COPY the object rather than build it.
-/// 2. The snapshot is SHARED with closed decoders this issue does not own.
-///    `KernelConfigSnapshot` at `crates/surfaces/eliot-cli/src/lib.rs:625` and
-///    `ServerConfigSnapshot` at `bins/eliot-mod-research/src/kernel_client.rs:144`
-///    each declare their five keys under `deny_unknown_fields` and are decoded
-///    from this same object (`eliot-cli/src/lib.rs:1026` and
-///    `kernel_client.rs:647`). Neither file is in this issue's write set, so
-///    adding a key widens two contracts this lane cannot edit. Note the
-///    corroborating asymmetry that already exists: neither closed struct names
-///    `protected_snapshot_digest`, while `composition_bootstrap.rs:1844` adds that
-///    key on the daemon-launch path.
-/// 3. The same object is DIGEST-PINNED, and the digest is over the WHOLE object,
-///    not a subset. This is the decisive measurement, so it is stated exactly:
-///    `bins/eliot-kernel/src/agent_bridge.rs:495` computes
-///    `sha256_json(&kernel_policy.config_snapshot)` over the entire
-///    `serde_json::Value`, so no subset survives an added key. Its receiver-held
-///    half, `declaration.expected_kernel_config_snapshot_sha256`, has exactly one
-///    producer in this repository —
-///    `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:398` — which
-///    builds the expected object as a LITERAL `serde_json::json!` naming exactly
-///    six keys (`service`, `protocol`, `generation`, `authority_epoch`,
-///    `artifact_digest`, `protected_snapshot_digest`) and hashes those bytes. That
-///    crate is outside this issue's write set, so a seventh key makes the Kernel's
-///    live object and the installation's expected object differ by construction and
-///    `agent_bridge.rs:504` refuses with `TransportError::SessionFenced`.
-///    `crates/surfaces/eliot-cli/src/lib.rs:1009-1012` and
-///    `bins/eliot-mod-research/src/kernel_client.rs:668-671` hash the same whole
-///    object against installed declarations (`Eliot/kernel/application-client.json`
-///    has no producer anywhere in this repository). So all three consumers hash
-///    the whole object and all three operands live outside this write set.
-///
-/// Publishing the five fields is therefore the correct fix, and it is a migration
-/// across two publisher sites, two closed decoders and three installed digest
-/// declarations. It is not reachable from this boundary, or from this issue's
-/// write set, at all. Until it lands, this daemon verifies four of I1.12's seven
-/// items directly and names the five it cannot verify — so an incomplete
-/// handshake stays visible rather than being read as a complete one.
-///
-/// Refusing on their absence is also not available, and the reason is measured
-/// rather than assumed: NOTHING this daemon presents can make the Kernel publish
-/// them, so the absence a refusal would reject is the ordinary state of every
-/// real handshake. Failing closed on it would refuse every integrated startup
-/// rather than verify a peer. Each is recorded at the boundary by
-/// [`record_unpresented_handshake_fields`] instead.
+/// It is a DECLARATION, not a derived truth, and the comparison it feeds is
+/// therefore only as strong as the agreement between two declarations. That
+/// limit is the owner crate's, stated there and not restated as a stronger
+/// guarantee here.
 #[cfg(windows)]
-const UNPRESENTED_HANDSHAKE_FIELDS: [MismatchField; 5] = [
-    MismatchField::ContractSetDigest,
-    MismatchField::CanonicalFormatRange,
-    MismatchField::ArchitectureDigest,
-    MismatchField::NormativeSeal,
-    MismatchField::MigrationClass,
-];
+const DAEMON_STATE_MIGRATION_CLASS: owner::StateMigrationClass =
+    owner::StateMigrationClass::NoMigration;
+
+/// The receiver-held half of the five I1.12 comparisons this boundary makes.
+///
+/// Every value here is compiled into `eliotd` or derived from what `eliotd`
+/// compiles in. None of them can be influenced by what the peer presents, which
+/// is what makes the five comparisons at
+/// [`admit_kernel_peer_compatibility`] bindings rather than echoes.
+#[cfg(windows)]
+struct DaemonCompatibilityReceiver {
+    contract_set_digest: String,
+    canonical_format_range: owner::VersionRange,
+}
+
+/// Derives this daemon's own receiver-held envelope values.
+///
+/// The two derivable ones are read from their owners in `eliot_kernel_core`
+/// rather than restated here, so this binary holds no private spelling of any
+/// value a producer in another binary also presents. The Architecture source
+/// digest and the migration class need no derivation: the first is a compiled
+/// constant and the second is this binary's declaration.
+#[cfg(windows)]
+fn daemon_compatibility_receiver() -> Result<DaemonCompatibilityReceiver, KernelClientError> {
+    let identities = [
+        eliot_kernel_core::contract_identity().map_err(contract_identity_failure)?,
+        eliot_kernel_service::contract_identity().map_err(contract_identity_failure)?,
+        eliot_protocol::protocol_contract_identity().map_err(contract_identity_failure)?,
+        eliot_runtime_contracts::contract_identity().map_err(contract_identity_failure)?,
+    ];
+    Ok(DaemonCompatibilityReceiver {
+        contract_set_digest: eliot_kernel_core::contract_set_digest(&identities)
+            .map_err(contract_identity_failure)?,
+        canonical_format_range: eliot_kernel_core::handshake_canonical_format_range()
+            .map_err(contract_identity_failure)?,
+    })
+}
+
+/// Renders a failed receiver-side contract-identity derivation as this
+/// boundary's existing typed failure.
+///
+/// One refusal shape for all four identity owners, because they fail for the
+/// same reason and report the same class of problem; the reasons themselves are
+/// each owner crate's own `Display`.
+#[cfg(windows)]
+fn contract_identity_failure(error: impl std::fmt::Display) -> KernelClientError {
+    KernelClientError::Contract(format!(
+        "this daemon could not derive its own I1.12 envelope identity: {error}"
+    ))
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum KernelClientError {
@@ -188,6 +157,22 @@ pub(crate) enum WireOutcome {
     },
 }
 
+/// The Kernel's `ServerHello.config_snapshot` as this boundary decodes it.
+///
+/// The first six fields are the generation snapshot this daemon already compared
+/// against the Host-approved launch descriptor. The last five are the remaining
+/// I1.12 envelope items, which the Kernel-side producer publishes into this same
+/// free-form object under the names I1.12 uses for them.
+///
+/// They are held as `Option<serde_json::Value>` rather than as their owner types
+/// for ONE reason: a value that is absent and a value that cannot be decoded must
+/// both be refusals that NAME the mismatching field through
+/// [`MismatchField`], and a whole-struct serde failure names neither. Each is
+/// therefore decoded from this raw value by the owner's own type inside its own
+/// comparison, so the typed refusal survives every shape of disagreement.
+///
+/// `deny_unknown_fields` is unchanged: a snapshot carrying a key this boundary
+/// does not read is still refused rather than partially believed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KernelSnapshotWire {
@@ -197,6 +182,11 @@ struct KernelSnapshotWire {
     authority_epoch: EpochId,
     artifact_digest: String,
     protected_snapshot_digest: String,
+    contract_set_digest: Option<serde_json::Value>,
+    canonical_format_range: Option<serde_json::Value>,
+    architecture_source_digest: Option<serde_json::Value>,
+    normative_pair_receipt: Option<serde_json::Value>,
+    state_migration_class: Option<serde_json::Value>,
 }
 
 pub(super) fn expected_snapshot(
@@ -407,36 +397,65 @@ pub(crate) fn is_pre_admission_pending_rejection(
 /// module generation, is already refused by the snapshot comparison in
 /// [`validate_server_hello`] — `snapshot.generation` against
 /// `launch.kernel.generation`, one operand from the running Kernel and one from
-/// the Host-approved descriptor — and is left there because
-/// [`UNPRESENTED_HANDSHAKE_FIELDS`] is not the place for it and the shared
-/// [`MismatchField`] vocabulary has no generation label.
+/// the Host-approved descriptor — and is left there because the shared
+/// [`MismatchField`] vocabulary has no generation label. Inventing one here would
+/// have created a second refusal vocabulary beside the shared one.
 ///
 /// The Authority Epoch arm requires BOTH peer-presented epoch values to match,
 /// because `ServerHello` carries the epoch twice (`authority_epoch` and the
 /// `config_snapshot` copy) and a Kernel whose two copies disagree is refused
 /// rather than decided by whichever copy happens to be read first.
 ///
-/// # What this arm is NOT
+/// # The remaining five, and why they are admitted here rather than skipped
 ///
-/// It does not construct a `CompatibilityEnvelope` and it does not call
-/// `eliot_kernel_core::admit_handshake`. See
-/// [`UNPRESENTED_HANDSHAKE_FIELDS`]: the Kernel's `ServerHello` carries no
-/// contract-set digest, canonical-format range, Architecture source digest,
-/// `NormativePairIdentity` receipt or migration class, and building those five
-/// fields from this binary's own values to satisfy the envelope constructor
-/// would make every one of them a self-comparison that changes no outcome. The
-/// structured refusal type is still the shared
-/// [`CompatibilityMismatch`], so the reason a caller reads is the same value
-/// the Kernel, store-bridge and generation gates report, not a second scheme.
+/// The five other I1.12 items reach this boundary inside the free-form
+/// `config_snapshot` object, and each is compared against a value THIS PROCESS
+/// compiled in, never against a value it read from the peer in the same
+/// expression and never by re-hashing the peer's own value and comparing it with
+/// itself:
+///
+/// | I1.12 field | Receiver-held operand | Peer-presented operand | Owner helper |
+/// |---|---|---|---|
+/// | contract-set digest | `daemon_compatibility_receiver`, which derives it with `eliot_kernel_core::contract_set_digest` over the SAME four public contract identities the Kernel's own production caller uses (`bins/eliot-kernel/src/frame_dispatch.rs::runtime_contract_set_digest`) | `config_snapshot.contract_set_digest` | `owner::admit_contract_set_digest` |
+/// | canonical format range | `eliot_kernel_core::handshake_canonical_format_range()` | `config_snapshot.canonical_format_range`, decoded by the owner's `VersionRange` | `owner::admit_canonical_format_range` |
+/// | Architecture source digest | `eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST`, compiled into `eliotd` | `config_snapshot.architecture_source_digest` | `owner::admit_architecture_source_digest` |
+/// | sealed `NormativePairIdentity` receipt | the same compiled Architecture source digest | `config_snapshot.normative_pair_receipt`, decoded by the owner's `NormativePairReceipt` | `owner::admit_normative_pair_receipt` |
+/// | state migration class | [`DAEMON_STATE_MIGRATION_CLASS`], this binary's own declaration | `config_snapshot.state_migration_class`, decoded by the owner's `StateMigrationClass` | `owner::admit_migration_class` |
+///
+/// Each of those five helpers is the owner's SINGLE comparison of its field, and
+/// the owner's own `admit_handshake` calls the same five, so this boundary and
+/// the Kernel's own gate cannot disagree about what "compatible" means. This
+/// boundary does NOT construct a `CompatibilityEnvelope` and does NOT call
+/// `admit_handshake`: four of the envelope's fields are not presented as an
+/// envelope here (the generation and the epoch are compared against the
+/// Host-approved launch descriptor, and the capability set is the Kernel's
+/// granted intersection), so building one would make those four arms
+/// self-comparisons. The comparisons themselves are the owner's, and the
+/// structured refusal type is still the shared [`CompatibilityMismatch`], so the
+/// reason a caller reads is the same value the Kernel, store-bridge and
+/// generation gates report, not a second scheme.
+///
+/// # Absence is a refusal, not a default
+///
+/// A Kernel that presents none of those five has NOT exchanged the envelope, so
+/// each absent item is refused under its own [`MismatchField`]. That is the
+/// fail-closed reading I1.12's acceptance demands, and it is safe here because
+/// the Kernel-side producer of these keys lands in this same delivery.
 #[cfg(windows)]
 fn admit_kernel_peer_compatibility(
     launch: &GovernorLaunchConfig,
     hello: &ServerHello,
     snapshot: &KernelSnapshotWire,
+    receiver: &DaemonCompatibilityReceiver,
 ) -> Result<(), CompatibilityMismatch> {
     admit_protocol_range(hello)?;
     admit_authority_epoch(launch, hello, snapshot)?;
-    admit_required_capability(hello)
+    admit_required_capability(hello)?;
+    admit_peer_contract_set_digest(snapshot, receiver)?;
+    admit_peer_canonical_format_range(snapshot, receiver)?;
+    admit_peer_architecture_source_digest(snapshot)?;
+    admit_peer_normative_pair_receipt(snapshot)?;
+    admit_peer_state_migration_class(snapshot)
 }
 
 /// I1.12 `protocol range`: the negotiated protocol the Kernel selected against
@@ -507,22 +526,145 @@ fn admit_required_capability(hello: &ServerHello) -> Result<(), CompatibilityMis
     ))
 }
 
-/// Records, at this boundary, that the Kernel's `ServerHello` presented no
-/// value for the I1.12 items in [`UNPRESENTED_HANDSHAKE_FIELDS`].
+/// I1.12 `contract-set digest`, verified against the digest THIS BUILD produces
+/// over the same four public contract identities.
 ///
-/// One bounded observation per field, carrying only the stable
-/// [`MismatchField`] label — never a digest, epoch tuple, path or descriptor
-/// material. This is a record of an INCOMPLETE handshake, not a refusal: it is
-/// what keeps "the pipe answered" from being read as "the envelope was
-/// exchanged".
+/// The argument list is the one the existing production caller uses, read from
+/// `bins/eliot-kernel/src/frame_dispatch.rs::runtime_contract_set_digest`:
+/// `eliot-kernel-core`, `eliot-kernel-service`, `eliot-protocol` and
+/// `eliot-runtime-contracts` in that order. That order, the arity and the
+/// hashing belong to `eliot_kernel_core::contract_set_digest`, so this binary
+/// holds no private spelling; what this binary supplies is only WHICH public
+/// surfaces it compiles in.
 #[cfg(windows)]
-fn record_unpresented_handshake_fields() {
-    for field in UNPRESENTED_HANDSHAKE_FIELDS {
-        tracing::warn!(
-            target: "eliotd::diagnostics",
-            "eliotd.kernel_handshake.compatibility_field_unpresented:{field}"
-        );
-    }
+fn admit_peer_contract_set_digest(
+    snapshot: &KernelSnapshotWire,
+    receiver: &DaemonCompatibilityReceiver,
+) -> Result<(), CompatibilityMismatch> {
+    let presented: String = presented_compatibility_field(
+        MismatchField::ContractSetDigest,
+        "contract_set_digest",
+        snapshot.contract_set_digest.as_ref(),
+    )?;
+    owner::admit_contract_set_digest(&presented, &receiver.contract_set_digest)
+}
+
+/// I1.12 `canonical format range`, compared by OVERLAP and not by equality.
+///
+/// The peer may legitimately present a wider range than this build speaks, so the
+/// owner's relation is the right one and is applied by the owner.
+#[cfg(windows)]
+fn admit_peer_canonical_format_range(
+    snapshot: &KernelSnapshotWire,
+    receiver: &DaemonCompatibilityReceiver,
+) -> Result<(), CompatibilityMismatch> {
+    let presented: owner::VersionRange = presented_compatibility_field(
+        MismatchField::CanonicalFormatRange,
+        "canonical_format_range",
+        snapshot.canonical_format_range.as_ref(),
+    )?;
+    // The negotiated revision is this boundary's to use only to prove the two
+    // ranges share one; no daemon state is keyed on it, so it is not carried.
+    let _negotiated =
+        owner::admit_canonical_format_range(presented, receiver.canonical_format_range)?;
+    Ok(())
+}
+
+/// I1.12 `Architecture source digest`, against the constant compiled into this
+/// daemon.
+///
+/// This is the comparison that establishes the peer's identity, because the
+/// operand is one this process did not take from the peer.
+#[cfg(windows)]
+fn admit_peer_architecture_source_digest(
+    snapshot: &KernelSnapshotWire,
+) -> Result<(), CompatibilityMismatch> {
+    let presented: String = presented_compatibility_field(
+        MismatchField::ArchitectureDigest,
+        "architecture_source_digest",
+        snapshot.architecture_source_digest.as_ref(),
+    )?;
+    owner::admit_architecture_source_digest(
+        &presented,
+        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+    )
+}
+
+/// I1.12 `NormativePairIdentity` receipt, presented as externally sealed.
+///
+/// Two checks, and the honest statement of which one carries weight:
+///
+/// - The DIGEST half is the real check. The receipt's
+///   `architecture_source_digest()` is compared against THIS daemon's own
+///   `CURRENT_ARCHITECTURE_SOURCE_DIGEST`, an operand the peer never supplied,
+///   so a receipt minted over a FOREIGN Architecture digest is refused here even
+///   when its own seal tag is perfectly correct.
+/// - The TAG half is NOT an independent seal. `expected_seal_tag` is unkeyed
+///   SHA-256 over published constants, so `NormativePairReceipt::verifies()`
+///   compares two peer-supplied values with each other and can only prove the
+///   peer agrees with itself. It is still run, because it is the only constraint
+///   on the presented tag at all - deleting it would admit a receipt whose tag is
+///   arbitrary - and because it is the owner's own check, but it establishes
+///   nothing about identity that the digest half has not already established. No
+///   external seal issuer exists in this repository; that is the owner crate's
+///   own statement in `expected_seal_tag`, not a gap introduced here.
+#[cfg(windows)]
+fn admit_peer_normative_pair_receipt(
+    snapshot: &KernelSnapshotWire,
+) -> Result<(), CompatibilityMismatch> {
+    let presented: owner::NormativePairReceipt = presented_compatibility_field(
+        MismatchField::NormativeSeal,
+        "normative_pair_receipt",
+        snapshot.normative_pair_receipt.as_ref(),
+    )?;
+    owner::admit_normative_pair_receipt(
+        &presented,
+        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+    )
+}
+
+/// I1.12 `state migration class`, against [`DAEMON_STATE_MIGRATION_CLASS`].
+///
+/// The comparison is exact and lives in the owner, so a Kernel that declares a
+/// different class is refused by name. What a class asserts about a durable
+/// format is still undefined, because I1.12 names the field and defines no
+/// vocabulary - see the owner crate's `StateMigrationClass` documentation.
+#[cfg(windows)]
+fn admit_peer_state_migration_class(
+    snapshot: &KernelSnapshotWire,
+) -> Result<(), CompatibilityMismatch> {
+    let presented: owner::StateMigrationClass = presented_compatibility_field(
+        MismatchField::MigrationClass,
+        "state_migration_class",
+        snapshot.state_migration_class.as_ref(),
+    )?;
+    owner::admit_migration_class(presented, DAEMON_STATE_MIGRATION_CLASS)
+}
+
+/// Decodes one presented I1.12 item, refusing absence AND unreadability under
+/// the SAME [`MismatchField`].
+///
+/// Both failures are refusals that must name the field, so neither may become a
+/// whole-struct serde error that names nothing. The decoding type is the owner's
+/// own type for that field, so the accepted shape is the owner's shape.
+#[cfg(windows)]
+fn presented_compatibility_field<T: serde::de::DeserializeOwned>(
+    field: MismatchField,
+    key: &'static str,
+    presented: Option<&serde_json::Value>,
+) -> Result<T, CompatibilityMismatch> {
+    let Some(presented) = presented else {
+        return Err(CompatibilityMismatch::new(
+            field,
+            format!("the Kernel's ServerHello presented no {key}"),
+        ));
+    };
+    serde_json::from_value(presented.clone()).map_err(|error| {
+        CompatibilityMismatch::new(
+            field,
+            format!("the Kernel's ServerHello presented an unreadable {key}: {error}"),
+        )
+    })
 }
 
 /// Renders one structured I1.12 refusal as the daemon's existing typed Kernel
@@ -547,14 +689,13 @@ pub(crate) fn validate_server_hello(
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let snapshot: KernelSnapshotWire = serde_json::from_value(hello.config_snapshot.clone())
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-    // I1.12 (#1968): the Kernel peer is admitted against the I1.12 fields it
-    // actually presents, BEFORE the validated session binding is retained, so an
+    // I1.12 (#1968): the Kernel peer is admitted against the WHOLE compatibility
+    // envelope BEFORE the validated session binding is retained, so an
     // incompatible Kernel generation never becomes the peer this live daemon
-    // runs against. The I1.12 items the `ServerHello` wire shape cannot carry
-    // are recorded as unpresented rather than filled from this binary.
-    admit_kernel_peer_compatibility(launch, hello, &snapshot)
+    // runs against. The receiver half of every comparison is derived from this
+    // daemon's own compiled identity, never from anything the peer presented.
+    admit_kernel_peer_compatibility(launch, hello, &snapshot, &daemon_compatibility_receiver()?)
         .map_err(|mismatch| compatibility_refusal(&mismatch))?;
-    record_unpresented_handshake_fields();
     if hello.session_principal_binding
         != format!(
             "sid={};session={}",
@@ -588,6 +729,12 @@ pub(crate) fn validate_server_hello(
 /// are deliberately NOT copies of the receiver-held values: each substitutes a
 /// value the receiver does not hold, so the proof fails if a comparison ever
 /// degenerates into this daemon checking its own constant against itself.
+///
+/// Every expected value in this module is read from the OWNER crate
+/// (`eliot_kernel_core`) rather than typed here. That is what keeps these
+/// fixtures meaning what they claim: a proof built from literals would keep
+/// passing after the owners moved, and would then be asserting that a stale
+/// literal is admitted.
 #[cfg(all(test, windows))]
 mod kernel_peer_compatibility_tests {
     use eliot_contracts::{EpochId, EpochLineageId};
@@ -596,12 +743,89 @@ mod kernel_peer_compatibility_tests {
     use std::num::NonZeroU64;
 
     use super::{
-        DAEMON_FRONT_DOOR_CAPABILITY, KernelSnapshotWire, UNPRESENTED_HANDSHAKE_FIELDS,
-        admit_kernel_peer_compatibility,
+        DAEMON_FRONT_DOOR_CAPABILITY, DAEMON_STATE_MIGRATION_CLASS, KernelSnapshotWire,
+        admit_kernel_peer_compatibility, daemon_compatibility_receiver, owner,
+        presented_compatibility_field,
     };
 
     const ADMITTED_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
     const FOREIGN_LINEAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    /// The five I1.12 envelope items, each built from its owner exactly as the
+    /// Kernel-side producer builds them.
+    fn presented_envelope_items()
+    -> Result<serde_json::Map<String, serde_json::Value>, Box<dyn std::error::Error>> {
+        let identities = [
+            eliot_kernel_core::contract_identity()?,
+            eliot_kernel_service::contract_identity()?,
+            eliot_protocol::protocol_contract_identity()?,
+            eliot_runtime_contracts::contract_identity()?,
+        ];
+        let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
+        let receipt = owner::NormativePairReceipt::new(
+            architecture_source_digest,
+            eliot_kernel_core::expected_seal_tag(architecture_source_digest),
+        )?;
+        serde_json::json!({
+            "contract_set_digest": eliot_kernel_core::contract_set_digest(&identities)?,
+            "canonical_format_range": eliot_kernel_core::handshake_canonical_format_range()?,
+            "architecture_source_digest": architecture_source_digest,
+            "normative_pair_receipt": receipt,
+            "state_migration_class": DAEMON_STATE_MIGRATION_CLASS,
+        })
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "the five presented items must project to a JSON object".into())
+    }
+
+    /// The `config_snapshot` object a Kernel peer publishes on this wire: the
+    /// six generation-snapshot keys plus the five I1.12 envelope items.
+    fn published_snapshot(
+        launch: &GovernorLaunchConfig,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, Box<dyn std::error::Error>> {
+        let mut object = serde_json::json!({
+            "service": launch.kernel.service,
+            "protocol": launch.kernel.protocol,
+            "generation": launch.kernel.generation.value(),
+            "authority_epoch": launch.kernel.authority_epoch,
+            "artifact_digest": launch.kernel.artifact_digest,
+            "protected_snapshot_digest": launch.protected_snapshot_digest,
+        })
+        .as_object()
+        .cloned()
+        .ok_or("the generation snapshot must be a JSON object")?;
+        object.extend(presented_envelope_items()?);
+        Ok(object)
+    }
+
+    fn snapshot_of(
+        object: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<KernelSnapshotWire, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_value(serde_json::Value::Object(object))?)
+    }
+
+    fn admitted_snapshot(
+        launch: &GovernorLaunchConfig,
+    ) -> Result<KernelSnapshotWire, Box<dyn std::error::Error>> {
+        snapshot_of(published_snapshot(launch)?)
+    }
+
+    fn admitted_hello(
+        launch: &GovernorLaunchConfig,
+        granted: Vec<String>,
+    ) -> Result<eliot_protocol::ServerHello, Box<dyn std::error::Error>> {
+        Ok(eliot_protocol::ServerHello {
+            selected_protocol: eliot_protocol::ProtocolVersion::CURRENT,
+            session_principal_binding: "sid=S-1-5-19;session=0".to_owned(),
+            allowed_capabilities: granted,
+            allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+            config_snapshot: serde_json::Value::Object(published_snapshot(launch)?),
+            heartbeat_ms: 1_000,
+            control_channel: "eliot-kernel".to_owned(),
+            rejection_reason: None,
+            authority_epoch: launch.kernel.authority_epoch.clone(),
+        })
+    }
 
     /// Returns the structured refusal, or a test failure naming the case.
     fn refused_by(
@@ -610,7 +834,8 @@ mod kernel_peer_compatibility_tests {
         snapshot: &KernelSnapshotWire,
         case: &str,
     ) -> Result<MismatchField, Box<dyn std::error::Error>> {
-        match admit_kernel_peer_compatibility(launch, hello, snapshot) {
+        let receiver = daemon_compatibility_receiver()?;
+        match admit_kernel_peer_compatibility(launch, hello, snapshot, &receiver) {
             Ok(()) => Err(format!("{case} was admitted but must be refused").into()),
             Err(refusal) => Ok(refusal.field()),
         }
@@ -639,50 +864,18 @@ mod kernel_peer_compatibility_tests {
         })
     }
 
-    fn admitted_snapshot(
-        launch: &GovernorLaunchConfig,
-    ) -> Result<KernelSnapshotWire, Box<dyn std::error::Error>> {
-        Ok(serde_json::from_value(serde_json::json!({
-            "service": launch.kernel.service,
-            "protocol": launch.kernel.protocol,
-            "generation": launch.kernel.generation.value(),
-            "authority_epoch": launch.kernel.authority_epoch,
-            "artifact_digest": launch.kernel.artifact_digest,
-            "protected_snapshot_digest": launch.protected_snapshot_digest,
-        }))?)
-    }
-
-    fn admitted_hello(
-        launch: &GovernorLaunchConfig,
-        granted: Vec<String>,
-    ) -> eliot_protocol::ServerHello {
-        eliot_protocol::ServerHello {
-            selected_protocol: eliot_protocol::ProtocolVersion::CURRENT,
-            session_principal_binding: "sid=S-1-5-19;session=0".to_owned(),
-            allowed_capabilities: granted,
-            allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
-            config_snapshot: serde_json::json!({
-                "service": launch.kernel.service,
-                "protocol": launch.kernel.protocol,
-                "generation": launch.kernel.generation.value(),
-                "authority_epoch": launch.kernel.authority_epoch,
-                "artifact_digest": launch.kernel.artifact_digest,
-                "protected_snapshot_digest": launch.protected_snapshot_digest,
-            }),
-            heartbeat_ms: 1_000,
-            control_channel: "eliot-kernel".to_owned(),
-            rejection_reason: None,
-            authority_epoch: launch.kernel.authority_epoch.clone(),
-        }
-    }
-
     #[test]
     fn admitted_kernel_peer_carries_the_required_capability_and_admitted_epoch()
     -> Result<(), Box<dyn std::error::Error>> {
         let launch = launch_config()?;
         let snapshot = admitted_snapshot(&launch)?;
-        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
-        admit_kernel_peer_compatibility(&launch, &hello, &snapshot)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        admit_kernel_peer_compatibility(
+            &launch,
+            &hello,
+            &snapshot,
+            &daemon_compatibility_receiver()?,
+        )?;
         Ok(())
     }
 
@@ -691,7 +884,7 @@ mod kernel_peer_compatibility_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let launch = launch_config()?;
         let snapshot = admitted_snapshot(&launch)?;
-        let mut hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
+        let mut hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
         hello.selected_protocol = eliot_protocol::ProtocolVersion { major: 9, minor: 9 };
         assert_eq!(
             refused_by(&launch, &hello, &snapshot, "a foreign protocol version")?,
@@ -706,7 +899,7 @@ mod kernel_peer_compatibility_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let launch = launch_config()?;
         let mut snapshot = admitted_snapshot(&launch)?;
-        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
         // The snapshot copy of the epoch is substituted, so the arm that fires is
         // proved to read the peer-presented copy rather than the
         // `ServerHello.authority_epoch` this daemon also compares.
@@ -726,14 +919,14 @@ mod kernel_peer_compatibility_tests {
         let snapshot = admitted_snapshot(&launch)?;
         // An EMPTY granted set is the absence case: it must be refused, never
         // read as a Kernel that agreed this daemon requires nothing.
-        let absent = admitted_hello(&launch, Vec::new());
+        let absent = admitted_hello(&launch, Vec::new())?;
         assert_eq!(
             refused_by(&launch, &absent, &snapshot, "an absent granted capability")?,
             MismatchField::RequiredCapability,
             "the refusal must name the I1.12 required-capability field"
         );
 
-        let unrelated = admitted_hello(&launch, vec!["some-other-capability".to_owned()]);
+        let unrelated = admitted_hello(&launch, vec!["some-other-capability".to_owned()])?;
         assert_eq!(
             refused_by(&launch, &unrelated, &snapshot, "an unrelated capability")?,
             MismatchField::RequiredCapability
@@ -741,82 +934,351 @@ mod kernel_peer_compatibility_tests {
         Ok(())
     }
 
+    // ---------------------------------------------------------------------
+    // The five envelope items this boundary now verifies (issue #1968, W1).
+    // ---------------------------------------------------------------------
+
+    /// POSITIVE case: a peer presenting all five items as their OWNERS produce
+    /// them is admitted, and each presented value is proven equal to the
+    /// receiver-held owner value this boundary compared it against.
+    ///
+    /// Asserting the equality as well as the admission is what stops this case
+    /// from passing vacuously: if a comparison silently stopped reading the
+    /// presented value, the admission would still succeed and only these
+    /// assertions would fail.
     #[test]
-    fn the_envelope_items_this_wire_cannot_present_are_named_not_filled()
+    fn every_presented_envelope_item_is_admitted_when_it_matches_its_owner()
     -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            UNPRESENTED_HANDSHAKE_FIELDS,
-            [
-                MismatchField::ContractSetDigest,
-                MismatchField::CanonicalFormatRange,
-                MismatchField::ArchitectureDigest,
-                MismatchField::NormativeSeal,
-                MismatchField::MigrationClass,
-            ],
-            "the unpresented set is the measured `ServerHello` gap, not a preference"
-        );
-        // A Kernel peer that presented none of those five is still admitted on
-        // the fields it does present; the gap is recorded, never defaulted into
-        // agreement and never backfilled from this binary.
         let launch = launch_config()?;
         let snapshot = admitted_snapshot(&launch)?;
-        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
-        admit_kernel_peer_compatibility(&launch, &hello, &snapshot)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        let receiver = daemon_compatibility_receiver()?;
+
+        let presented: String = presented_compatibility_field(
+            MismatchField::ContractSetDigest,
+            "contract_set_digest",
+            snapshot.contract_set_digest.as_ref(),
+        )?;
+        assert_eq!(
+            presented, receiver.contract_set_digest,
+            "the presented contract-set digest must be the one this build derives"
+        );
+
+        let presented: owner::VersionRange = presented_compatibility_field(
+            MismatchField::CanonicalFormatRange,
+            "canonical_format_range",
+            snapshot.canonical_format_range.as_ref(),
+        )?;
+        assert!(
+            owner::admit_canonical_format_range(presented, receiver.canonical_format_range).is_ok(),
+            "the presented canonical-format range must overlap this build's own"
+        );
+
+        let presented: String = presented_compatibility_field(
+            MismatchField::ArchitectureDigest,
+            "architecture_source_digest",
+            snapshot.architecture_source_digest.as_ref(),
+        )?;
+        assert_eq!(
+            presented,
+            eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+            "the presented Architecture source digest must be this build's own constant"
+        );
+
+        let presented: owner::NormativePairReceipt = presented_compatibility_field(
+            MismatchField::NormativeSeal,
+            "normative_pair_receipt",
+            snapshot.normative_pair_receipt.as_ref(),
+        )?;
+        owner::admit_normative_pair_receipt(
+            &presented,
+            eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+        )?;
+
+        let presented: owner::StateMigrationClass = presented_compatibility_field(
+            MismatchField::MigrationClass,
+            "state_migration_class",
+            snapshot.state_migration_class.as_ref(),
+        )?;
+        assert_eq!(
+            presented, DAEMON_STATE_MIGRATION_CLASS,
+            "the presented migration class must be this daemon's own declaration"
+        );
+
+        admit_kernel_peer_compatibility(&launch, &hello, &snapshot, &receiver)?;
         Ok(())
     }
 
-    // ---------------------------------------------------------------------
-    // The measurements the ceiling rests on (issue #1968, this lane).
-    // ---------------------------------------------------------------------
-
-    /// POSITIVE case: `ServerHello.config_snapshot` is FREE-FORM, so the five
-    /// unproduced keys CAN be carried on this wire today.
-    ///
-    /// This is the proof that keeps the ceiling honest. It pins that all five
-    /// keys survive a full JSON round trip through the pinned `ServerHello`
-    /// contract shape and that `ServerHello::validate` accepts the widened
-    /// object — so no future reader can honestly claim the PROTOCOL SHAPE is what
-    /// blocks publishing them. The blocker is the digest pin, which is a
-    /// consumer-side migration, and this test is what distinguishes the two.
-    ///
-    /// It also pins the store-bridge precedent generalising to this boundary:
-    /// `operation_manifest_set_digest` travels the same way.
     #[test]
-    fn config_snapshot_carries_all_five_keys_so_the_gap_is_not_a_wire_limit()
+    fn a_foreign_contract_set_digest_names_the_contract_set_field()
     -> Result<(), Box<dyn std::error::Error>> {
         let launch = launch_config()?;
-        let mut hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
-        let serde_json::Value::Object(snapshot) = &mut hello.config_snapshot else {
-            return Err("the Kernel config snapshot must be a JSON object".into());
-        };
-        // Every one of the five items, under the key its owner would publish it
-        // under. Each value is one THIS daemon does not hold, so a receiver that
-        // ever compared them against itself would be refused rather than agree.
-        for (key, value) in [
-            ("contract_set_digest", serde_json::json!("1".repeat(64))),
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        snapshot.contract_set_digest = Some(serde_json::Value::String("1".repeat(64)));
+        assert_eq!(
+            refused_by(&launch, &hello, &snapshot, "a foreign contract-set digest")?,
+            MismatchField::ContractSetDigest,
+            "the refusal must name the I1.12 contract-set digest field"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_disjoint_canonical_format_range_names_the_canonical_format_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        // Disjoint by construction: `u32::MAX` is outside any range this build's
+        // owner currently produces, whatever that range is.
+        snapshot.canonical_format_range = Some(serde_json::to_value(owner::VersionRange::new(
+            u32::MAX,
+            u32::MAX,
+        )?)?);
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "a disjoint canonical format range"
+            )?,
+            MismatchField::CanonicalFormatRange,
+            "the refusal must name the I1.12 canonical format range field"
+        );
+        Ok(())
+    }
+
+    /// The canonical-format arm is an OVERLAP comparison, not equality: a peer
+    /// presenting a strictly WIDER range that still shares this build's revision
+    /// is compatible and must be admitted. This is the case an equality
+    /// comparison would wrongly refuse.
+    #[test]
+    fn a_wider_overlapping_canonical_format_range_is_admitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        let receiver = daemon_compatibility_receiver()?;
+        let own = receiver.canonical_format_range;
+        let wider = owner::VersionRange::new(
+            own.min(),
+            own.max()
+                .checked_add(8)
+                .ok_or("room above the owned revision")?,
+        )?;
+        assert_ne!(wider, own, "the substituted range must be strictly wider");
+        snapshot.canonical_format_range = Some(serde_json::to_value(wider)?);
+        admit_kernel_peer_compatibility(&launch, &hello, &snapshot, &receiver)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_architecture_source_digest_names_the_architecture_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        snapshot.architecture_source_digest = Some(serde_json::Value::String("2".repeat(64)));
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "a foreign architecture source digest"
+            )?,
+            MismatchField::ArchitectureDigest,
+            "the refusal must name the I1.12 Architecture source digest field"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_receipt_with_a_forged_seal_tag_names_the_normative_seal_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        // The DIGEST half is correct, so only the tag half can refuse this. The
+        // tag is the owner's own unkeyed recomputation over published
+        // constants, and this value is not it.
+        let forged = owner::NormativePairReceipt::new(
+            eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+            "3".repeat(64),
+        )?;
+        assert!(
+            !forged.verifies(),
+            "the substituted tag must fail the owner's own recomputation"
+        );
+        snapshot.normative_pair_receipt = Some(serde_json::to_value(forged)?);
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "a forged normative-pair seal tag"
+            )?,
+            MismatchField::NormativeSeal,
+            "the refusal must name the I1.12 sealed normative-pair receipt field"
+        );
+        Ok(())
+    }
+
+    /// FORGERY case: a receipt entirely SELF-CONSISTENT over a FOREIGN
+    /// Architecture source digest - the foreign digest, and the owner's own
+    /// correct tag FOR that digest - is still refused.
+    ///
+    /// This is the case that proves the DIGEST half, and not the tag half, is
+    /// what binds the receipt to this receiver. A boundary that re-hashed the
+    /// peer's own digest and compared the result with itself would admit exactly
+    /// this message.
+    #[test]
+    fn a_self_consistent_receipt_over_a_foreign_architecture_digest_is_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        let foreign = "4".repeat(64);
+        assert_ne!(
+            foreign,
+            eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+            "the forged digest must be foreign to this build"
+        );
+        let forged = owner::NormativePairReceipt::new(
+            foreign.clone(),
+            eliot_kernel_core::expected_seal_tag(&foreign),
+        )?;
+        assert!(
+            forged.verifies(),
+            "the forged receipt must be self-consistent, or this proves nothing"
+        );
+        snapshot.normative_pair_receipt = Some(serde_json::to_value(forged)?);
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "a receipt over a foreign digest"
+            )?,
+            MismatchField::NormativeSeal,
+            "the receiver-held Architecture digest must refuse a foreign receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_state_migration_class_names_the_migration_class_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        assert_ne!(
+            owner::StateMigrationClass::BreakingRebase,
+            DAEMON_STATE_MIGRATION_CLASS,
+            "the substituted class must differ from this daemon's own declaration"
+        );
+        snapshot.state_migration_class = Some(serde_json::to_value(
+            owner::StateMigrationClass::BreakingRebase,
+        )?);
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "a foreign state migration class"
+            )?,
+            MismatchField::MigrationClass,
+            "the refusal must name the I1.12 state migration class field"
+        );
+        Ok(())
+    }
+
+    /// FAIL-CLOSED case: each of the five items, ABSENT, is a refusal under its
+    /// own field label.
+    ///
+    /// Every other case in this module varies a VALUE. This one removes the KEY,
+    /// because that is the shape a Kernel which never exchanged the envelope
+    /// presents, and admitting it would be admitting "the pipe answered". The
+    /// loop runs once per key so no item can be exempted without it showing.
+    #[test]
+    fn an_absent_envelope_item_is_refused_and_names_its_own_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let published = published_snapshot(&launch)?;
+        let admitted = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        let receiver = daemon_compatibility_receiver()?;
+        for (key, field) in [
+            ("contract_set_digest", MismatchField::ContractSetDigest),
             (
                 "canonical_format_range",
-                serde_json::json!({ "min": 1, "max": 1 }),
+                MismatchField::CanonicalFormatRange,
             ),
             (
                 "architecture_source_digest",
-                serde_json::json!("2".repeat(64)),
+                MismatchField::ArchitectureDigest,
             ),
-            (
-                "normative_pair_receipt",
-                serde_json::json!({ "seal_tag": "3".repeat(64) }),
-            ),
-            ("migration_class", serde_json::json!("BREAKING_REBASE")),
+            ("normative_pair_receipt", MismatchField::NormativeSeal),
+            ("state_migration_class", MismatchField::MigrationClass),
+        ] {
+            let mut absent = published.clone();
+            assert!(
+                absent.remove(key).is_some(),
+                "{key} must be published in the base fixture for this case to mean anything"
+            );
+            let snapshot = snapshot_of(absent)?;
+            let Err(refusal) =
+                admit_kernel_peer_compatibility(&launch, &admitted, &snapshot, &receiver)
+            else {
+                return Err(format!("an absent {key} was admitted but must be refused").into());
+            };
+            assert_eq!(refusal.field(), field, "the refusal must name {key}");
+        }
+        Ok(())
+    }
+
+    /// A value that is PRESENT but unreadable is refused under the same field
+    /// label as an absent one, so a malformed presentation never becomes an
+    /// anonymous wire error that names nothing.
+    #[test]
+    fn an_unreadable_envelope_item_names_its_own_field() -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        snapshot.contract_set_digest = Some(serde_json::json!({ "not": "a digest" }));
+        assert_eq!(
+            refused_by(
+                &launch,
+                &hello,
+                &snapshot,
+                "an unreadable contract-set digest"
+            )?,
+            MismatchField::ContractSetDigest,
+            "an unreadable value must name its field exactly as an absent one does"
+        );
+        Ok(())
+    }
+
+    /// The five keys travel inside the FREE-FORM `config_snapshot` object, so the
+    /// pinned `ServerHello` contract shape carries them unchanged. That is what
+    /// makes the fail-closed case above a producer obligation rather than a
+    /// protocol impossibility.
+    #[test]
+    fn all_five_keys_survive_the_pinned_server_hello_contract_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()])?;
+        for key in [
+            "contract_set_digest",
+            "canonical_format_range",
+            "architecture_source_digest",
+            "normative_pair_receipt",
+            "state_migration_class",
         ] {
             assert!(
-                !UNPRESENTED_HANDSHAKE_FIELDS.is_empty(),
-                "the gap list must stay populated for this proof to mean anything"
+                hello.config_snapshot.get(key).is_some(),
+                "{key} must travel inside config_snapshot"
             );
-            snapshot.insert(key.to_owned(), value);
         }
-        // The pinned contract shape ACCEPTS the widened object, and every key
-        // survives the wire unchanged. This is the measurement that the gap is a
-        // producer/consumer limit and NOT a wire-shape impossibility.
         hello.validate()?;
         let encoded = serde_json::to_value(&hello)?;
         let decoded: eliot_protocol::ServerHello = serde_json::from_value(encoded)?;
@@ -824,52 +1286,6 @@ mod kernel_peer_compatibility_tests {
             decoded.config_snapshot, hello.config_snapshot,
             "all five keys must survive the pinned `ServerHello` round trip"
         );
-        assert_eq!(
-            decoded.config_snapshot["migration_class"],
-            serde_json::json!("BREAKING_REBASE"),
-            "an arbitrary extra key must survive the wire unchanged"
-        );
-        Ok(())
-    }
-
-    /// The refusal case that pairs with the proof above, and the load-bearing
-    /// one for this lane's ceiling: a real Kernel peer that publishes NONE of
-    /// the five keys is ADMITTED, with the gap recorded rather than fatal.
-    ///
-    /// This is not a weakened expectation. It is the measured state of the
-    /// system: across the Kernel binary neither `"canonical_format_range"` nor
-    /// `"normative_pair_receipt"` appears in any publisher of
-    /// `ServerHello.config_snapshot`, and the Kernel's whole-object SHA-256 pin
-    /// at `bins/eliot-kernel/src/agent_bridge.rs:495` is recomputed from a
-    /// six-key literal at
-    /// `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:398`, so
-    /// publishing a seventh key would fence the agent-bridge seam outright.
-    ///
-    /// A boundary that REFUSED these five absences would therefore refuse this
-    /// exact peer — and with it every integrated `eliotd` startup — while
-    /// verifying nothing. That is the failure this test pins shut, and it is why
-    /// the gap list is a recorder rather than a refusal.
-    #[test]
-    fn a_real_kernel_peer_publishing_none_of_the_five_keys_is_admitted_and_named()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let launch = launch_config()?;
-        let snapshot = admitted_snapshot(&launch)?;
-        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
-        // This fixture carries exactly the keys a real Kernel publishes today and
-        // no others, so admitting it is admitting the production shape rather
-        // than a permissive fixture. `KernelSnapshotWire` declares no I1.12
-        // compatibility field at all on this boundary, which is precisely the
-        // measured gap: those five items arrive as keys this struct does not
-        // name, so they are recorded rather than compared.
-        admit_kernel_peer_compatibility(&launch, &hello, &snapshot)?;
-        // And each of the five is still named, so the incomplete handshake stays
-        // visible instead of being read as a complete one.
-        for field in UNPRESENTED_HANDSHAKE_FIELDS {
-            assert!(
-                UNPRESENTED_HANDSHAKE_FIELDS.contains(&field),
-                "every unpresented field must remain named"
-            );
-        }
         Ok(())
     }
 }

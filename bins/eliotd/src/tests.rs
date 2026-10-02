@@ -220,14 +220,7 @@ fn production_server_hello_requires_observed_sid_and_session_binding()
         ),
         allowed_capabilities: vec!["daemon".to_owned()],
         allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
-        config_snapshot: serde_json::json!({
-            "service": launch.kernel.service,
-            "protocol": launch.kernel.protocol,
-            "generation": launch.kernel.generation.value(),
-            "authority_epoch": launch.kernel.authority_epoch.clone(),
-            "artifact_digest": launch.kernel.artifact_digest,
-            "protected_snapshot_digest": launch.protected_snapshot_digest,
-        }),
+        config_snapshot: published_kernel_snapshot(&launch)?,
         heartbeat_ms: 1_000,
         control_channel: KERNEL_PIPE_NAME.to_owned(),
         rejection_reason: None,
@@ -257,6 +250,121 @@ fn production_server_hello_requires_observed_sid_and_session_binding()
 
     hello.session_principal_binding = "local-user".to_owned();
     assert!(validate_server_hello(&launch, &config.kernel_binding, &hello).is_err());
+    Ok(())
+}
+
+/// The `ServerHello.config_snapshot` a Kernel peer publishes on this wire: the
+/// six generation-snapshot keys plus the five I1.12 compatibility-envelope items.
+///
+/// The five are built from their OWNERS in `eliot_kernel_core`, never from
+/// literals, so a fixture built here keeps asserting that this daemon's OWN
+/// identity is what a Kernel presents and is compared against. Writing them as
+/// literals would make this a test that a stale constant is accepted.
+#[cfg(windows)]
+fn published_kernel_snapshot(
+    launch: &GovernorLaunchConfig,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let identities = [
+        eliot_kernel_core::contract_identity()?,
+        eliot_kernel_service::contract_identity()?,
+        eliot_protocol::protocol_contract_identity()?,
+        eliot_runtime_contracts::contract_identity()?,
+    ];
+    let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
+    let receipt = eliot_kernel_core::NormativePairReceipt::new(
+        architecture_source_digest,
+        eliot_kernel_core::expected_seal_tag(architecture_source_digest),
+    )?;
+    Ok(serde_json::json!({
+        "service": launch.kernel.service,
+        "protocol": launch.kernel.protocol,
+        "generation": launch.kernel.generation.value(),
+        "authority_epoch": launch.kernel.authority_epoch.clone(),
+        "artifact_digest": launch.kernel.artifact_digest,
+        "protected_snapshot_digest": launch.protected_snapshot_digest,
+        "contract_set_digest": eliot_kernel_core::contract_set_digest(&identities)?,
+        "canonical_format_range": eliot_kernel_core::handshake_canonical_format_range()?,
+        "architecture_source_digest": architecture_source_digest,
+        "normative_pair_receipt": receipt,
+        // The class the Kernel's own process boundary declares for a process
+        // handshake (`bins/eliot-kernel/src/compatibility_gate.rs`), which is
+        // the same class this daemon declares as its receiver-held operand.
+        "state_migration_class": eliot_kernel_core::StateMigrationClass::NoMigration,
+    }))
+}
+
+/// I1.12 (#1968), the fail-closed reading at the PRODUCTION entry point: a
+/// Kernel whose `ServerHello` omits any one of the five compatibility-envelope
+/// items is refused by `validate_server_hello`, before the validated session
+/// binding is retained in `DaemonKernelClient::connect_transport`.
+///
+/// Every other case in this file varies a presented VALUE. This one removes the
+/// KEY, because that is the shape a Kernel which never exchanged the envelope
+/// presents, and admitting it would be admitting "the pipe answered".
+#[cfg(windows)]
+#[test]
+fn production_server_hello_refuses_a_snapshot_missing_any_envelope_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let launch = valid_launch_config()?;
+    let config = DaemonConfig::from_launch_with_binding(
+        launch.clone(),
+        PathBuf::from(r"C:\ProgramData\Eliot\governor\eliotd.json"),
+        "eliotd:0123456789abcdef0123456789abcdef",
+        &"c".repeat(64),
+    )?;
+    let published = published_kernel_snapshot(&launch)?;
+    let hello_for = |snapshot: serde_json::Value| ServerHello {
+        selected_protocol: ProtocolVersion::CURRENT,
+        session_principal_binding: format!(
+            "sid={};session={}",
+            config.kernel_binding.expected_kernel_sid,
+            config.kernel_binding.expected_kernel_session_id
+        ),
+        allowed_capabilities: vec!["daemon".to_owned()],
+        allowed_effects: vec!["REVERSIBLE_MUTATION".to_owned()],
+        config_snapshot: snapshot,
+        heartbeat_ms: 1_000,
+        control_channel: KERNEL_PIPE_NAME.to_owned(),
+        rejection_reason: None,
+        authority_epoch: launch.kernel.authority_epoch.clone(),
+    };
+
+    // The full envelope is admitted, so every refusal below is caused by the
+    // removal and by nothing else.
+    validate_server_hello(
+        &launch,
+        &config.kernel_binding,
+        &hello_for(published.clone()),
+    )?;
+
+    for key in [
+        "contract_set_digest",
+        "canonical_format_range",
+        "architecture_source_digest",
+        "normative_pair_receipt",
+        "state_migration_class",
+    ] {
+        let serde_json::Value::Object(mut absent) = published.clone() else {
+            return Err("snapshot object expected".into());
+        };
+        assert!(
+            absent.remove(key).is_some(),
+            "{key} must be published in the base fixture for this case to mean anything"
+        );
+        let Err(error) = validate_server_hello(
+            &launch,
+            &config.kernel_binding,
+            &hello_for(serde_json::Value::Object(absent)),
+        ) else {
+            return Err(
+                format!("a snapshot missing {key} was admitted but must be refused").into(),
+            );
+        };
+        assert!(
+            error.to_string().contains("compatibility mismatch"),
+            "the refusal for {key} must be the structured I1.12 refusal, was: {error}"
+        );
+    }
     Ok(())
 }
 

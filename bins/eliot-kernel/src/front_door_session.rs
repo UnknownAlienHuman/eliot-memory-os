@@ -2,13 +2,20 @@
 //!
 //! Traceability: Architecture A2.3, A12.2, A12.3, A13.2;
 //! principles ARCH-AUTH-01, ARCH-SEC-01, ARCH-SEC-02.
-//! Implementation I1.2, I1.8, I7.1, I7.3, I7.5, I7.14, I15.2, P.3, I2.23.
+//! Implementation I1.2, I1.8, I1.12, I7.1, I7.3, I7.5, I7.14, I15.2, P.3, I2.23.
 //!
 //! This module owns the Windows-first transport selection and limits,
 //! authenticated peer-set construction/snapshot, and Kernel-side session
 //! binding. It validates generation-bound `eliotd` identity and fails closed
 //! on poisoned or stale state; it does not dispatch frames, grant semantic
 //! authority, or persist canonical transitions.
+//!
+//! It is also where the I1.12 compatibility envelope is PUBLISHED on the one
+//! process boundary that requires it: `front_door_handshake_policy` adds the
+//! five remaining envelope items to a per-session CLONE of the front-door
+//! policy when - and only when - the caller is the daemon identity. The stored
+//! policy object is deliberately left untouched because its whole-object digest
+//! is pinned elsewhere.
 
 use super::user_broker_registration_route::{
     USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION, USER_BROKER_FENCE_OPERATION,
@@ -184,6 +191,153 @@ fn front_door_watchdog_peer_profile(
     NamedPipePeerProfile::new(NamedPipePeerKind::Watchdog, expectation, None)
         .map(Some)
         .map_err(|error| KernelBuildError::Principal(error.to_string()))
+}
+
+/// Selects the handshake policy ONE session hands to
+/// [`Session::establish_with_server`].
+///
+/// I1.12 (#1968) requires every process handshake to exchange the whole
+/// compatibility envelope, and this is the producer half of it for the one
+/// caller that requires it. `eliot-ipc` cannot publish the envelope itself:
+/// that crate does not depend on `eliot-kernel-core`, so the envelope's owner
+/// crate is absent from its closure, and `Session::establish_with_server` only
+/// copies `policy.config_snapshot` into the `ServerHello` it builds. This binary
+/// holds both the owner crate and [`ACTIVE_DAEMON_CALLER`], so the envelope is
+/// projected here instead.
+///
+/// # The five values are this Kernel's own compiled identity
+///
+/// Nothing here is derived from the peer, and nothing is restated. All five are
+/// read from their owners in `eliot-kernel-core` through the ONE durable-state
+/// derivation this binary already gates its own boundaries with,
+/// `super::compatibility_gate::durable_compatibility_state`:
+///
+/// - `contract_set_digest`, `canonical_format_range` and
+///   `architecture_source_digest` are that state's own accessors, and it
+///   derives the digest from `super::frame_dispatch::runtime_contract_set_digest`
+///   over the same four public contract identities (`eliot-kernel-core`,
+///   `eliot-kernel-service`, `eliot-protocol`, `eliot-runtime-contracts`) the
+///   owner defines the digest over. No argument list is spelled here.
+/// - `normative_pair_receipt` is the owner's `NormativePairReceipt` over that
+///   same digest, projected through its own `architecture_source_digest()` and
+///   `seal_tag()` accessors, so the published shape is the owner's shape.
+/// - `state_migration_class` is the owner's `StateMigrationClass` value this
+///   Kernel's durable compatibility state declares - the same declaration
+///   `compatibility_gate::durable_compatibility_state` makes, not a second
+///   spelling of it.
+///
+/// # The STORED policy is deliberately untouched, and why
+///
+/// `super::agent_bridge::begin_agent_bridge_inner` pins the WHOLE stored policy
+/// object: it hashes `sha256_json(&kernel_policy.config_snapshot)` and compares
+/// that with `declaration.expected_kernel_config_snapshot_sha256`, whose in-tree
+/// producers (`eliot-installation`'s `agent_bridge_profile` and
+/// `package_planner`) hash a literal naming exactly six keys (`service`,
+/// `protocol`, `generation`, `authority_epoch`, `artifact_digest`,
+/// `protected_snapshot_digest`). Inserting one key into the stored object
+/// changes those bytes and refuses six binaries at activation. This function
+/// therefore extends a per-session CLONE only, and the stored object keeps
+/// exactly the six keys `composition_bootstrap::front_door_config_snapshot`
+/// builds. That asymmetry is the whole reason the producer lives beside the
+/// session rather than inside the policy builder.
+///
+/// # A missing digest-pinned key is NOT refused here, and that is stated rather
+/// # than assumed
+///
+/// The stored object is supposed to name exactly six keys, but nothing on this
+/// path verifies that: `composition_bootstrap::front_door_config_snapshot` OMITS
+/// `artifact_digest` and `protected_snapshot_digest` when it has no value for
+/// them (it takes both as `Option`), and `Session::establish_with_server`
+/// publishes whatever object the policy holds without inspecting its keys. So a
+/// policy object missing one of the six is published to the daemon today, with
+/// the five envelope keys added on top. This function neither invents the
+/// missing key nor refuses the session, because adding that gate is a separate
+/// decision from publishing the envelope and would fence every Kernel that
+/// currently starts without an artifact or protected-snapshot digest. It is
+/// recorded here instead: the refusal that such an object actually meets is the
+/// receiver's - `eliotd`'s `KernelSnapshotWire` and `eliot-cli`'s
+/// `KernelConfigSnapshot` both declare these keys as REQUIRED, and the
+/// agent-bridge whole-object digest refuses it too. The
+/// `a_policy_missing_a_digest_pinned_key_is_published_not_repaired` test pins
+/// that measured state.
+///
+/// # Why only the daemon caller receives the five keys
+///
+/// The extension is gated on [`ACTIVE_DAEMON_CALLER`] alone. `eliotd` is the one
+/// receiver that REQUIRES the five items - it refuses their absence by name
+/// (`bins/eliotd/src/daemon_kernel_client/handshake.rs`,
+/// `admit_kernel_peer_compatibility`) - and two other consumers decode this same
+/// `ServerHello.config_snapshot` under `#[serde(deny_unknown_fields)]` against
+/// their own closed key set: the operator CLI (`crates/surfaces/eliot-cli`) and
+/// the governed research client (`bins/eliot-mod-research`). For those two an
+/// added key is a refusal, not a widened contract, so every non-daemon caller
+/// of [`Session::establish_with_server`] keeps receiving the object with exactly
+/// its original keys.
+///
+/// # The seal tag is not an independent seal
+///
+/// `eliot_kernel_core::expected_seal_tag` is unkeyed SHA-256 over published
+/// constants, so the TAG half of the published receipt is not an independent
+/// seal: it proves only that its holder can compute a published hash, and no
+/// external seal issuer exists in this repository. It is still published because
+/// it is the only constraint the receiver has on the presented tag. The DIGEST
+/// half is what binds the receipt to a peer at all: a receiver compares the
+/// presented `architecture_source_digest` against its OWN compiled
+/// `CURRENT_ARCHITECTURE_SOURCE_DIGEST`, which is an operand the peer never
+/// supplied.
+///
+/// # Errors
+///
+/// Returns a stable refusal cause when this build cannot derive its own envelope
+/// (the durable compatibility state or the receipt does not construct) or when
+/// the stored snapshot is not a JSON object the envelope could be added to. Both
+/// are fences: a daemon session that cannot present a full envelope is refused
+/// rather than admitted with a partial one.
+fn front_door_handshake_policy(
+    stored: &ServerHandshakePolicy,
+    client: &eliot_protocol::ClientHello,
+) -> Result<ServerHandshakePolicy, &'static str> {
+    let mut policy = stored.clone();
+    if client.module_bridge_identity != ACTIVE_DAEMON_CALLER {
+        return Ok(policy);
+    }
+    let durable = super::compatibility_gate::durable_compatibility_state(
+        &policy.module_generation.state_fence.authority_epoch,
+    )
+    .map_err(|_| "kernel.compatibility_envelope_underivable")?;
+    let normative_pair_receipt = eliot_kernel_core::NormativePairReceipt::new(
+        durable.architecture_source_digest(),
+        eliot_kernel_core::expected_seal_tag(durable.architecture_source_digest()),
+    )
+    .map_err(|_| "kernel.compatibility_envelope_underivable")?;
+    let serde_json::Value::Object(mut config_snapshot) = policy.config_snapshot else {
+        return Err("kernel.compatibility_snapshot_not_an_object");
+    };
+    config_snapshot.insert(
+        "contract_set_digest".to_owned(),
+        serde_json::json!(durable.contract_set_digest()),
+    );
+    config_snapshot.insert(
+        "canonical_format_range".to_owned(),
+        serde_json::json!(durable.canonical_format_range()),
+    );
+    config_snapshot.insert(
+        "architecture_source_digest".to_owned(),
+        serde_json::json!(durable.architecture_source_digest()),
+    );
+    config_snapshot.insert(
+        "normative_pair_receipt".to_owned(),
+        serde_json::json!({
+            "architecture_source_digest": normative_pair_receipt.architecture_source_digest(),
+            "seal_tag": normative_pair_receipt.seal_tag(),
+        }),
+    );
+    config_snapshot.insert(
+        "state_migration_class".to_owned(),
+        serde_json::json!(durable.migration_class()),
+    );
+    policy.config_snapshot = serde_json::Value::Object(config_snapshot);
+    Ok(policy)
 }
 
 /// The only transport implementation admitted by the Windows-first Kernel.
@@ -773,9 +927,22 @@ impl KernelComposition {
             // they establish the evidence needed to publish step 10.
             return Err(TransportError::SessionFenced);
         }
-        let Ok(policy) = self.front_door_policy.lock() else {
+        let Ok(stored_policy) = self.front_door_policy.lock() else {
             audit_evidence.refuse(client, "kernel.handshake_policy_unavailable");
             return Err(TransportError::SessionFenced);
+        };
+        // I1.12 (#1968): the policy this session establishes with is a
+        // per-session CLONE, and only a daemon client receives the five
+        // compatibility envelope items in its `config_snapshot`. The stored
+        // object is left exactly as `front_door_config_snapshot` built it
+        // because the whole object is pinned by digest elsewhere; see
+        // `front_door_handshake_policy`.
+        let policy = match front_door_handshake_policy(&stored_policy, client) {
+            Ok(policy) => policy,
+            Err(cause) => {
+                audit_evidence.refuse(client, cause);
+                return Err(TransportError::SessionFenced);
+            }
         };
         let result = Session::establish_with_server(connection_id, peer, client, &policy);
         if result.is_err() {
@@ -1553,5 +1720,372 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         Ok(())
+    }
+}
+
+/// I1.12 (#1968): the daemon-facing compatibility envelope producer, and the
+/// closed shape every other caller must keep receiving.
+///
+/// Every expected value here is read from the OWNER crate
+/// (`eliot_kernel_core`), never typed here, so a fixture cannot keep asserting
+/// that a stale literal is published.
+#[cfg(test)]
+mod compatibility_envelope_projection_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use eliot_contracts::ContractVersion;
+    use eliot_runtime_contracts::ModuleContract;
+    use serde::Deserialize;
+
+    /// The five I1.12 items this producer adds, by the exact wire name the
+    /// daemon receiver decodes them under.
+    const ENVELOPE_KEYS: [&str; 5] = [
+        "contract_set_digest",
+        "canonical_format_range",
+        "architecture_source_digest",
+        "normative_pair_receipt",
+        "state_migration_class",
+    ];
+
+    /// A closed mirror of the `config_snapshot` shape the two other consumers
+    /// decode under `#[serde(deny_unknown_fields)]` (`eliot-cli`'s
+    /// `KernelConfigSnapshot` and `eliot-mod-research`'s `ServerConfigSnapshot`).
+    ///
+    /// It is mirrored here rather than imported so the refusal an added key
+    /// causes is observable in this file's own proof: decoding the daemon's
+    /// extended object under this shape must fail. Both real decoders name
+    /// exactly these keys, and `protected_snapshot_digest` is absent here
+    /// because the composition under test is built with no daemon launch.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ClosedGenerationSnapshot {
+        service: String,
+        protocol: String,
+        generation: u64,
+        authority_epoch: eliot_contracts::EpochId,
+        artifact_digest: String,
+    }
+
+    fn temp_root(slug: &str) -> std::path::PathBuf {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-daemon-envelope-{slug}-{}-{ms}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        root
+    }
+
+    /// The STORED front-door policy, exactly as the composition built it.
+    fn stored_front_door_policy(root: &std::path::Path) -> ServerHandshakePolicy {
+        let kernel = KernelComposition::new(KernelConfig::new(root)).expect("kernel composition");
+        let policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy")
+            .clone();
+        drop(kernel);
+        policy
+    }
+
+    /// A `ClientHello` that matches the stored policy exactly, so
+    /// `Session::establish_with_server` admits it for every field except the
+    /// caller identity under test.
+    fn client_hello_for(policy: &ServerHandshakePolicy) -> eliot_protocol::ClientHello {
+        eliot_protocol::ClientHello {
+            protocol_range: policy.protocol_range,
+            module_bridge_identity: policy.module_id.clone(),
+            artifact_hash: policy.module_generation.artifact_id.clone(),
+            module_contract: ModuleContract {
+                module_id: policy.module_generation.module_id.clone(),
+                version: ContractVersion::new(1, 0, 0),
+                artifact_id: policy.module_generation.artifact_id.clone(),
+                protocols: vec![PROTOCOL_VERSION.to_owned()],
+                capabilities: Vec::new(),
+                required_capabilities: Vec::new(),
+                optional_capabilities: Vec::new(),
+                advisory_capabilities: Vec::new(),
+                state_owner: SERVICE_NAME.to_owned(),
+                failure_domain: SERVICE_NAME.to_owned(),
+                owner: SERVICE_NAME.to_owned(),
+                hot_replace: false,
+                startup_after: Vec::new(),
+                drain_before: Vec::new(),
+                invalidation_triggers: Vec::new(),
+                supervision_plan: "one_for_one".to_owned(),
+                child_restart: "transient".to_owned(),
+                restart_intensity: "3/10m".to_owned(),
+                resource_profile: "background-medium".to_owned(),
+                privacy_classes: vec!["PUBLIC".to_owned()],
+                permissions: Vec::new(),
+                health_contract: "health/test-v1".to_owned(),
+                checkpoint_contract: "checkpoint/test-v1".to_owned(),
+                compatibility_state: "rebuildable".to_owned(),
+                independent_test_profile: "module/test".to_owned(),
+                contract_fixture_set: "eliot.kernel.v1/test".to_owned(),
+                affected_test_tags: vec!["test".to_owned()],
+                architecture: Vec::new(),
+                telemetry: "telemetry/test-v1".to_owned(),
+                removal_boundary: SERVICE_NAME.to_owned(),
+            },
+            module_generation: policy.module_generation.clone(),
+            launch_nonce: policy.launch_nonce.clone(),
+            capabilities: policy.allowed_capabilities.clone(),
+            privacy_classes: policy.allowed_privacy_classes.clone(),
+            max_frame: policy.max_frame,
+            authority_epoch: policy.module_generation.state_fence.authority_epoch.clone(),
+        }
+    }
+
+    fn authenticated_peer() -> eliot_ipc::PeerIdentity {
+        eliot_ipc::PeerIdentity::authenticated_for_test(
+            eliot_ipc::ProcessBinding::from_observation(
+                7,
+                9,
+                r"C:\eliot\kernel-test.exe".to_owned(),
+            )
+            .expect("process binding"),
+            "S-1-5-19".to_owned(),
+            "0x1".to_owned(),
+        )
+        .expect("authenticated peer")
+    }
+
+    /// This build's own contract-set digest, derived through the owner crate
+    /// directly rather than through this binary's own adapter, so the assertion
+    /// is not the producer compared with itself.
+    fn owned_contract_set_digest() -> String {
+        let identities = [
+            eliot_kernel_core::contract_identity().expect("kernel-core identity"),
+            eliot_kernel_service::contract_identity().expect("kernel-service identity"),
+            eliot_protocol::protocol_contract_identity().expect("protocol identity"),
+            eliot_runtime_contracts::contract_identity().expect("runtime-contracts identity"),
+        ];
+        eliot_kernel_core::contract_set_digest(&identities).expect("contract-set digest")
+    }
+
+    /// POSITIVE case: a daemon `ClientHello` yields a real `ServerHello` whose
+    /// `config_snapshot` carries all five owner values, and the stored policy is
+    /// byte-for-byte unchanged by producing them.
+    ///
+    /// Asserting the stored snapshot is unchanged is part of this case: the
+    /// whole-object digest pin in `agent_bridge` compares against installation
+    /// literals, so a producer that reached into the shared object would pass
+    /// every assertion below and still refuse six binaries.
+    #[test]
+    fn a_daemon_client_hello_receives_the_five_owner_compatibility_items() {
+        let root = temp_root("daemon");
+        let stored = stored_front_door_policy(&root);
+        let stored_snapshot = stored.config_snapshot.clone();
+        let mut client = client_hello_for(&stored);
+        client.module_bridge_identity = ACTIVE_DAEMON_CALLER.to_owned();
+        assert_eq!(
+            client.module_bridge_identity, stored.module_id,
+            "the daemon identity is the front-door policy's own module identity"
+        );
+
+        let policy = front_door_handshake_policy(&stored, &client)
+            .expect("this build must derive its own compatibility envelope");
+        let handshake = Session::establish_with_server(
+            "daemon-envelope",
+            authenticated_peer(),
+            &client,
+            &policy,
+        )
+        .expect("daemon handshake");
+        let published = handshake
+            .server_hello
+            .config_snapshot
+            .as_object()
+            .expect("the config_snapshot must be a JSON object");
+
+        assert_eq!(
+            published["contract_set_digest"],
+            serde_json::json!(owned_contract_set_digest()),
+            "the published contract-set digest must be the one this build derives"
+        );
+        assert_eq!(
+            published["canonical_format_range"],
+            serde_json::json!(
+                eliot_kernel_core::handshake_canonical_format_range()
+                    .expect("canonical format range")
+            ),
+            "the published canonical format range must be this build's own"
+        );
+        assert_eq!(
+            published["architecture_source_digest"],
+            serde_json::json!(eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST),
+            "the published Architecture source digest must be this build's own constant"
+        );
+        let receipt: eliot_kernel_core::NormativePairReceipt =
+            serde_json::from_value(published["normative_pair_receipt"].clone())
+                .expect("the receipt must decode under the owner's own shape");
+        assert_eq!(
+            receipt.architecture_source_digest(),
+            eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
+            "the receipt must be minted over this build's own Architecture digest"
+        );
+        assert!(
+            receipt.verifies(),
+            "the published seal tag must be the owner's own recomputation"
+        );
+        assert_eq!(
+            published["state_migration_class"],
+            serde_json::json!(eliot_kernel_core::StateMigrationClass::NoMigration),
+            "the published migration class must be the class this Kernel declares"
+        );
+
+        assert_eq!(
+            stored.config_snapshot, stored_snapshot,
+            "the stored policy object must be untouched by the per-session extension"
+        );
+        for key in ENVELOPE_KEYS {
+            assert!(
+                !stored_snapshot
+                    .as_object()
+                    .expect("the stored snapshot is an object")
+                    .contains_key(key),
+                "the stored policy must never carry {key}: the whole-object digest pin covers it"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// NEGATIVE case: a NON-daemon client hello keeps receiving the object with
+    /// exactly its original keys.
+    ///
+    /// This is the case that protects the two closed decoders
+    /// (`eliot-cli`, `eliot-mod-research`): the extended object is shown to be
+    /// genuinely undecodable under their shape, so an extension that were not
+    /// gated on the daemon identity would be observable here as a changed
+    /// outcome rather than only as a different wire body.
+    #[test]
+    fn a_non_daemon_client_hello_receives_the_object_without_them() {
+        let root = temp_root("non-daemon");
+        let stored = stored_front_door_policy(&root);
+        let mut client = client_hello_for(&stored);
+        client.module_bridge_identity = eliot_kernel_service::STORE_MODULE_IDENTITY.to_owned();
+
+        let policy = front_door_handshake_policy(&stored, &client)
+            .expect("a non-daemon caller needs no envelope derivation");
+        assert_eq!(
+            policy.config_snapshot, stored.config_snapshot,
+            "a non-daemon caller must receive the stored object byte-for-byte"
+        );
+        let object = policy
+            .config_snapshot
+            .as_object()
+            .expect("the config_snapshot must be a JSON object");
+        for key in ENVELOPE_KEYS {
+            assert!(
+                !object.contains_key(key),
+                "a non-daemon caller must not receive {key}"
+            );
+        }
+        let stored_artifact = stored.config_snapshot["artifact_digest"]
+            .as_str()
+            .expect("the stored snapshot carries the artifact digest")
+            .to_owned();
+        let closed: ClosedGenerationSnapshot =
+            serde_json::from_value(policy.config_snapshot.clone())
+                .expect("the closed generation-snapshot shape must still decode");
+        assert_eq!(closed.service, SERVICE_NAME);
+        assert_eq!(closed.protocol, PROTOCOL_VERSION);
+        assert_eq!(
+            closed.generation,
+            stored.module_generation.generation.value(),
+            "the object handed to a non-daemon caller is still this Kernel's own"
+        );
+        assert_eq!(
+            closed.authority_epoch,
+            stored.module_generation.state_fence.authority_epoch.clone()
+        );
+        assert_eq!(closed.artifact_digest, stored_artifact);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The gate itself: the daemon's extended object really is refused by the
+    /// closed shape, so gating on the daemon identity is load-bearing rather
+    /// than cosmetic.
+    #[test]
+    fn the_daemon_extension_is_itself_refused_by_the_closed_shape() {
+        let root = temp_root("closed-shape");
+        let stored = stored_front_door_policy(&root);
+        let mut client = client_hello_for(&stored);
+        client.module_bridge_identity = ACTIVE_DAEMON_CALLER.to_owned();
+        let policy = front_door_handshake_policy(&stored, &client)
+            .expect("this build must derive its own compatibility envelope");
+
+        assert!(
+            serde_json::from_value::<ClosedGenerationSnapshot>(policy.config_snapshot).is_err(),
+            "the extended object must be refused by the closed six-key decoders"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// REFUSAL CASE, and the measured ceiling it states: a policy object missing
+    /// one of the six digest-pinned keys is PUBLISHED to the daemon, not repaired
+    /// and not refused by this producer.
+    ///
+    /// `composition_bootstrap::front_door_config_snapshot` omits
+    /// `protected_snapshot_digest` when the composition has no daemon launch, and
+    /// nothing between it and `Session::establish_with_server` inspects the
+    /// object's keys, so a `ServerHello` carrying only five of the six keys is
+    /// what the daemon actually receives in that configuration. This test names
+    /// that state instead of asserting a gate that does not exist: the refusal
+    /// belongs to the receiver, whose decoder declares the key REQUIRED.
+    ///
+    /// What this producer does guarantee is the half it owns: it never INVENTS
+    /// the missing digest-pinned key, so the object's absence stays visible to
+    /// the receiver's own decode rather than being masked by a value the
+    /// producer chose.
+    #[test]
+    fn a_policy_missing_a_digest_pinned_key_is_published_not_repaired() {
+        let root = temp_root("missing-digest-pinned-key");
+        let stored = stored_front_door_policy(&root);
+        // The stored policy under test carries no `protected_snapshot_digest`:
+        // this composition was built with no daemon launch, so the owner omits
+        // it rather than defaulting one.
+        let stored_object = stored
+            .config_snapshot
+            .as_object()
+            .expect("the stored snapshot is an object");
+        assert!(
+            !stored_object.contains_key("protected_snapshot_digest"),
+            "this fixture must actually be missing the digest-pinned key it claims to lose"
+        );
+
+        let mut client = client_hello_for(&stored);
+        client.module_bridge_identity = ACTIVE_DAEMON_CALLER.to_owned();
+        let policy = front_door_handshake_policy(&stored, &client)
+            .expect("this build must derive its own compatibility envelope");
+
+        let published = policy
+            .config_snapshot
+            .as_object()
+            .expect("the published snapshot is an object");
+        assert!(
+            !published.contains_key("protected_snapshot_digest"),
+            "the producer must never invent a digest-pinned key it was not given"
+        );
+        for key in ENVELOPE_KEYS {
+            assert!(
+                published.contains_key(key),
+                "the five envelope items are still published alongside the incomplete object: {key}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<ClosedGenerationSnapshot>(policy.config_snapshot).is_err(),
+            "the incomplete object must remain undecodable under the receiver's closed shape, \
+             so its absence is the receiver's refusal rather than a silent repair"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

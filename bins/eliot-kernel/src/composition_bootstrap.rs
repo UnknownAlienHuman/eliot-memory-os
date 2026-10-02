@@ -430,12 +430,13 @@ impl KernelComposition {
 /// protocol identity, the active generation, the complete typed Authority Epoch,
 /// and the artifact plus protected-snapshot digests. It publishes NO I1.12
 /// compatibility field (contract-set digest, canonical format range, Architecture
-/// source digest, sealed receipt or migration class), because doing so is
-/// currently blocked and must not be started here: the whole object is hashed by
-/// `bins/eliot-kernel/src/agent_bridge.rs:495` and by the two front-door
-/// application clients, and those digests are recomputed from six-key literals
-/// outside this write set. See the ceiling recorded on
-/// `bins/eliotd/src/daemon_kernel_client/handshake.rs::UNPRESENTED_HANDSHAKE_FIELDS`.
+/// source digest, sealed receipt or migration class), and that is deliberate:
+/// THIS object is the stored front-door policy, and the whole object is hashed by
+/// `bins/eliot-kernel/src/agent_bridge.rs:495` against installation-owned six-key
+/// literals, so a key added here would change those bytes for six binaries. The
+/// five I1.12 items reach the `eliotd` boundary through a per-session CLONE of
+/// this policy, extended in `front_door_session.rs` only for a daemon client.
+/// See `bins/eliot-kernel/src/compatibility_gate.rs` for the measured reason.
 ///
 /// # The two optional operands
 ///

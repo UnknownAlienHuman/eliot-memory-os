@@ -558,6 +558,455 @@ fn handshake_policy_update_rejects_invalid_protected_digest_without_mutation() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1968 — the digest-pinned front-door `config_snapshot` object.
+//
+// `bins/eliot-kernel/src/agent_bridge.rs:495` hashes the WHOLE
+// `serde_json::Value` with `sha256_json`, so an ADDED key changes the digest and
+// no subset survives. The expected half of that comparison is produced by two
+// in-repo literals, both naming exactly six keys
+// (`crates/kernel/eliot-installation/src/agent_bridge_profile.rs:387-397` and
+// `crates/kernel/eliot-installation/src/package_planner.rs:1869-1879`), and two
+// closed decoders read the same object under `#[serde(deny_unknown_fields)]`
+// (`crates/surfaces/eliot-cli/src/lib.rs:625`, decoded at `:1026`, and
+// `bins/eliot-mod-research/src/kernel_client.rs:144`, decoded at `:647`). The
+// four proofs below hold those three facts down.
+// ---------------------------------------------------------------------------
+
+/// The exact key set both in-repo producers name, and the set
+/// `composition_bootstrap::front_door_config_snapshot` must therefore keep.
+///
+/// Measured from `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:387-397`
+/// (hashed at `:398`) and
+/// `crates/kernel/eliot-installation/src/package_planner.rs:1869-1879`
+/// (hashed at `:1880`).
+const I112_DIGEST_PINNED_SNAPSHOT_KEYS: [&str; 6] = [
+    "artifact_digest",
+    "authority_epoch",
+    "generation",
+    "protocol",
+    "protected_snapshot_digest",
+    "service",
+];
+
+/// The five I1.12 items
+/// (`docs/architecture/I01-12-compatibility-and-rollback-boundary.md`) that must
+/// never enter the STORED digest-pinned object, whatever any binder publishes.
+///
+/// The Kernel reaches `eliotd` by extending a PER-SESSION CLONE in
+/// `bins/eliot-kernel/src/front_door_session.rs::front_door_handshake_policy`
+/// (`:296`), which is gated on `ACTIVE_DAEMON_CALLER` alone. These names are the
+/// exact wire spellings that producer inserts (`:317-336`) and that
+/// `bins/eliotd/src/daemon_kernel_client/handshake.rs` decodes them under.
+const I112_ENVELOPE_KEYS: [&str; 5] = [
+    "contract_set_digest",
+    "canonical_format_range",
+    "architecture_source_digest",
+    "normative_pair_receipt",
+    "state_migration_class",
+];
+
+/// Sorted key list of one `serde_json` object.
+///
+/// A `serde_json::Value` object is a map, so this reads the real key set rather
+/// than asserting against a re-spelled literal list.
+fn sorted_snapshot_keys(snapshot: &serde_json::Value) -> Vec<String> {
+    let mut keys = snapshot
+        .as_object()
+        .expect("front-door config_snapshot is a JSON object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn the_digest_pinned_policy_object_carries_exactly_its_six_keys() {
+    // PROVED HALF: the single owner that builds this object. Both build sites
+    // call it — `composition_bootstrap::assemble`
+    // (`bins/eliot-kernel/src/composition_bootstrap.rs:1896`) and the cutover
+    // rebuild `generation_recovery::update_handshake_policy_without_observation`
+    // (`bins/eliot-kernel/src/generation_recovery.rs:628`) — so proving the
+    // owner proves every published instance of the object. It is reached here
+    // without a live transport because it is a pure projection over four
+    // operands.
+    let epoch = test_epoch(1);
+    let artifact = "a".repeat(64);
+    let protected = "b".repeat(64);
+    let snapshot = crate::composition_bootstrap::front_door_config_snapshot(
+        1,
+        &epoch,
+        Some(serde_json::Value::String(artifact.clone())),
+        Some(serde_json::Value::String(protected.clone())),
+    );
+
+    assert_eq!(
+        sorted_snapshot_keys(&snapshot),
+        I112_DIGEST_PINNED_SNAPSHOT_KEYS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>(),
+        "the digest-pinned object must carry EXACTLY the six keys both in-repo \
+         producers hash: a seventh key changes the whole-object digest compared \
+         at bins/eliot-kernel/src/agent_bridge.rs:502 and breaks the two \
+         deny_unknown_fields decoders"
+    );
+
+    // The three fixed keys are read through the production constants, not
+    // re-spelled: `SERVICE_NAME`/`PROTOCOL_VERSION` are what the owner emits.
+    assert_eq!(
+        snapshot["service"].as_str(),
+        Some(SERVICE_NAME),
+        "service identity is the production constant, not a test literal"
+    );
+    assert_eq!(
+        snapshot["protocol"].as_str(),
+        Some(PROTOCOL_VERSION),
+        "protocol identity is the production constant, not a test literal"
+    );
+
+    // The CORROBORATING HALF, taken from the live composition: without an
+    // injected daemon launch there is no approved protected-snapshot identity,
+    // so `front_door_config_snapshot` OMITS that key rather than defaulting it
+    // (`composition_bootstrap.rs:463-468`). The live object is therefore the
+    // six-key set minus `protected_snapshot_digest`, and that omission is the
+    // same asymmetry `crates/surfaces/eliot-cli/src/lib.rs:625` and
+    // `bins/eliot-mod-research/src/kernel_client.rs:144` already live with.
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-i112-snapshot-keys-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let live = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy lock")
+        .config_snapshot
+        .clone();
+    assert_eq!(
+        sorted_snapshot_keys(&live),
+        vec![
+            "artifact_digest".to_owned(),
+            "authority_epoch".to_owned(),
+            "generation".to_owned(),
+            "protocol".to_owned(),
+            "service".to_owned(),
+        ],
+        "the live policy object must carry no key beyond the digest-pinned six; \
+         `protected_snapshot_digest` is omitted when no daemon launch supplies it"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_digest_pinned_object_hashes_to_the_installations_expected_value() {
+    // MIRROR NOTICE: the expected value below is a deliberate MIRROR of the
+    // literal `serde_json::json!` at
+    // `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:387-397`,
+    // hashed at `:398` by `eliot_contracts::sha256_hex`. The second in-repo
+    // producer, identical in shape, is
+    // `crates/kernel/eliot-installation/src/package_planner.rs:1869-1879`,
+    // hashed at `:1880` by `hex_digest`.
+    //
+    // Why a mirror and not the real producer: both literals are LOCAL bindings
+    // inside a producer function, not exposed values.
+    // `agent_bridge_source_plan_from_observed_kernel` reaches its expected digest
+    // only by way of a `RetainedAgentBridgeSource` — a live no-follow OS file
+    // lease whose digest it re-observes — so the only way to read the real
+    // expected value is to retain a real executable and drive a whole
+    // installation plan. This proof is about the two literals agreeing with the
+    // Kernel's object, so it states the installation side as the literal it is
+    // and lets a divergence show up here rather than behind a fixture. If either
+    // side adds, drops or reorders a key, the two digests diverge in this test
+    // instead of at a live handshake.
+    //
+    // The digest helper is the crate's own: `sha256_hex` at
+    // `bins/eliot-kernel/src/lib.rs:5679`, which is the same lowercase-hex
+    // SHA-256 over `serde_json::to_vec` bytes both producers compute. It is
+    // spelled out rather than reusing `sha256_json` (`lib.rs:5691`) so that the
+    // installation side is hashed by the identical expression it uses.
+    let kernel_artifact_sha256 = "a".repeat(64);
+    let protected_snapshot_digest = "b".repeat(64);
+    let installation_epoch = test_epoch(1);
+
+    // The Kernel's live object, built by its single owner.
+    let kernel_snapshot = crate::composition_bootstrap::front_door_config_snapshot(
+        1,
+        &installation_epoch,
+        Some(serde_json::Value::String(kernel_artifact_sha256.clone())),
+        Some(serde_json::Value::String(protected_snapshot_digest.clone())),
+    );
+
+    // The mirrored installation-side literal. `service`/`protocol` are written
+    // as the INSTALLATION crate spells them, not as this crate's
+    // `SERVICE_NAME`/`PROTOCOL_VERSION`: the first assertion below is what
+    // proves the two spellings agree, and re-using the constants here would
+    // make that comparison impossible to fail.
+    let mirrored_installation_snapshot = serde_json::json!({
+        "service": "eliot-kernel",
+        "protocol": "eliot.kernel.v1",
+        "generation": 1,
+        "authority_epoch": {
+            "lineage_id": installation_epoch.lineage_id.as_str(),
+            "sequence": installation_epoch.sequence.get(),
+        },
+        "artifact_digest": kernel_artifact_sha256,
+        "protected_snapshot_digest": protected_snapshot_digest,
+    });
+
+    // Byte-for-byte shape agreement first, so a digest match can only mean the
+    // two objects are the same object.
+    assert_eq!(
+        kernel_snapshot, mirrored_installation_snapshot,
+        "the Kernel's published object and the installation crate's mirrored \
+         literal must be the same six-key object"
+    );
+
+    assert_eq!(
+        sha256_hex(&serde_json::to_vec(&kernel_snapshot).expect("kernel snapshot bytes")),
+        sha256_hex(
+            &serde_json::to_vec(&mirrored_installation_snapshot)
+                .expect("installation snapshot bytes")
+        ),
+        "the whole-object digest the Kernel computes at \
+         bins/eliot-kernel/src/agent_bridge.rs:495 must equal the digest the \
+         installation crate computes for the same six keys"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the proof must keep the reachable binder, the unreachable daemon binder's stated scope, and the stored-object refusal in one fixture so a reader sees which half is measured and which is not"
+)]
+fn the_daemon_front_door_session_presents_the_i112_items_and_other_sessions_do_not() {
+    // MEASURED SCOPE, stated rather than assumed.
+    //
+    // The daemon's five I1.12 items are produced by
+    // `front_door_handshake_policy`
+    // (`bins/eliot-kernel/src/front_door_session.rs:296`), which extends a
+    // PER-SESSION CLONE and returns it early for any non-daemon identity
+    // (`:301`). That function is private to `front_door_session`, so it is not
+    // callable from here.
+    //
+    // The `eliotd` BINDER is likewise unreachable from a unit test:
+    // `KernelComposition::bind_session` (`:960`) reaches `bind_session_inner`
+    // (`:836`), and for `ACTIVE_DAEMON_CALLER` (`:877`) that runs
+    // `validate_eliotd_peer`, which requires an admitted
+    // `EliotdLaunchDescriptor`, a published process receipt and live Job
+    // membership. So the daemon's POSITIVE half — that its `ServerHello`
+    // `config_snapshot` carries all five items — is
+    // unproven-in-unit-test from this file and is reported as such rather than
+    // faked. Its owner proves it in its own module
+    // (`front_door_session.rs::compatibility_envelope_projection_tests`).
+    //
+    // What IS provable here, and is the half that keeps the two closed decoders
+    // valid, is the NEGATIVE half plus the fact the whole delivery rests on:
+    // every non-daemon binder presents the STORED digest-pinned object
+    // unchanged. The Doctor binder is the reachable representative — it builds
+    // its own `ServerHello` by copying `policy.config_snapshot` verbatim
+    // (`front_door_session.rs:1273`) and needs no launch descriptor, no process
+    // receipt and no Job proof.
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-i112-binder-projection-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy lock")
+        .clone();
+    let stored_snapshot = policy.config_snapshot.clone();
+
+    let mut client = test_client(&policy);
+    client.module_bridge_identity = crate::front_door_session::DOCTOR_MODULE_ID.to_owned();
+    let peer = PeerIdentity::authenticated_for_test(
+        eliot_ipc::ProcessBinding::from_observation(7, 9, r"C:\eliot\doctor.exe".to_owned())
+            .expect("process binding"),
+        "S-1-5-18".to_owned(),
+        "0".to_owned(),
+    )
+    .expect("authenticated doctor peer");
+    let handshake = kernel
+        .bind_session("i112-doctor-binder", peer, &client)
+        .expect("doctor binder handshake");
+    let doctor_snapshot = handshake.server_hello.config_snapshot.clone();
+
+    assert_eq!(
+        doctor_snapshot, stored_snapshot,
+        "a non-daemon binder must present the stored digest-pinned object \
+         byte-for-byte, so the closed decoders at \
+         crates/surfaces/eliot-cli/src/lib.rs:625 and \
+         bins/eliot-mod-research/src/kernel_client.rs:144 stay valid"
+    );
+    assert_eq!(
+        sorted_snapshot_keys(&doctor_snapshot),
+        I112_DIGEST_PINNED_SNAPSHOT_KEYS
+            .iter()
+            .filter(|key| **key != "protected_snapshot_digest")
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>(),
+        "a non-daemon binder's ServerHello must not carry a key outside the \
+         digest-pinned six"
+    );
+
+    // The shared constructor, on its own, adds nothing: it copies whatever the
+    // policy holds and inspects no key
+    // (`crates/kernel/eliot-ipc/src/lib.rs:1834`). The I1.12 items reach `eliotd`
+    // only because `bind_session_inner` hands this constructor an already
+    // EXTENDED clone (`front_door_session.rs:940-947`). Driving it with the
+    // stored policy therefore shows the object a caller that was not extended
+    // receives, which is what keeps the two closed decoders valid.
+    let unextended_client = test_client(&policy);
+    let unextended_peer = PeerIdentity::authenticated_for_test(
+        eliot_ipc::ProcessBinding::from_observation(7, 9, r"C:\eliot\client.exe".to_owned())
+            .expect("process binding"),
+        "S-1-5-18".to_owned(),
+        "0".to_owned(),
+    )
+    .expect("authenticated peer");
+    let unextended_handshake = Session::establish_with_server(
+        "i112-unextended-binder",
+        unextended_peer,
+        &unextended_client,
+        &policy,
+    )
+    .expect("unextended front-door handshake");
+    assert_eq!(
+        unextended_handshake.server_hello.config_snapshot, stored_snapshot,
+        "the shared ServerHello constructor must publish the digest-pinned \
+         policy object unchanged for a caller that was not extended"
+    );
+
+    // The load-bearing refusal: the STORED object carries NONE of the five
+    // items, so the digest `agent_bridge.rs:495` computes over it still matches
+    // the six-key literals `eliot-installation` hashes.
+    for key in I112_ENVELOPE_KEYS {
+        assert!(
+            stored_snapshot.get(key).is_none(),
+            "the stored digest-pinned object must never carry the I1.12 item \
+             `{key}`: the whole-object digest compared at \
+             bins/eliot-kernel/src/agent_bridge.rs:502 is computed over the six \
+             in-repo keys only"
+        );
+        assert!(
+            doctor_snapshot.get(key).is_none(),
+            "a non-daemon binder must not receive the I1.12 item `{key}`"
+        );
+        assert!(
+            unextended_handshake
+                .server_hello
+                .config_snapshot
+                .get(key)
+                .is_none(),
+            "a caller that was not extended must not receive `{key}` either"
+        );
+    }
+
+    // And producing any binder's `ServerHello` must not have mutated the stored
+    // object, which is what the digest pin reads.
+    let after = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy lock")
+        .config_snapshot
+        .clone();
+    assert_eq!(
+        after, stored_snapshot,
+        "no binder may write into the stored digest-pinned object"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn one_altered_digest_pinned_key_breaks_the_installation_digest_comparison() {
+    // The refusal case, driven through the real hashes of both objects rather
+    // than through a live transport refusal this test cannot produce. The
+    // comparison being exercised is exactly
+    // `declaration.expected_kernel_config_snapshot_sha256 != kernel_config_snapshot_sha256`
+    // at `bins/eliot-kernel/src/agent_bridge.rs:502`, whose `Err` arm is
+    // `TransportError::SessionFenced` (`:504`).
+    let kernel_artifact_sha256 = "a".repeat(64);
+    let protected_snapshot_digest = "b".repeat(64);
+    let installation_epoch = test_epoch(1);
+
+    let installation_expected = sha256_hex(
+        &serde_json::to_vec(&serde_json::json!({
+            "service": "eliot-kernel",
+            "protocol": "eliot.kernel.v1",
+            "generation": 1,
+            "authority_epoch": {
+                "lineage_id": installation_epoch.lineage_id.as_str(),
+                "sequence": installation_epoch.sequence.get(),
+            },
+            "artifact_digest": kernel_artifact_sha256,
+            "protected_snapshot_digest": protected_snapshot_digest,
+        }))
+        .expect("installation snapshot bytes"),
+    );
+
+    let unchanged = crate::composition_bootstrap::front_door_config_snapshot(
+        1,
+        &installation_epoch,
+        Some(serde_json::Value::String(kernel_artifact_sha256.clone())),
+        Some(serde_json::Value::String(protected_snapshot_digest.clone())),
+    );
+    assert_eq!(
+        sha256_hex(&serde_json::to_vec(&unchanged).expect("unchanged snapshot bytes")),
+        installation_expected,
+        "baseline: the unchanged six-key object is what the installation expects"
+    );
+
+    // One changed value in one of the six digest-pinned keys. The object is
+    // still six-key and still valid JSON, so nothing but the DIGEST comparison
+    // can catch it, which is the whole reason that comparison exists.
+    let altered = crate::composition_bootstrap::front_door_config_snapshot(
+        1,
+        &installation_epoch,
+        Some(serde_json::Value::String("c".repeat(64))),
+        Some(serde_json::Value::String(protected_snapshot_digest)),
+    );
+    assert_eq!(
+        sorted_snapshot_keys(&altered),
+        I112_DIGEST_PINNED_SNAPSHOT_KEYS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>(),
+        "the altered object is still the six-key shape, so only its digest differs"
+    );
+    assert_ne!(
+        sha256_hex(&serde_json::to_vec(&altered).expect("altered snapshot bytes")),
+        installation_expected,
+        "a changed value in a digest-pinned key must change the whole-object \
+         digest, so agent_bridge.rs:502 refuses the handshake"
+    );
+
+    // One MISSING key, which is the shape a binder would publish if it dropped
+    // `protected_snapshot_digest`. The digest must differ for the same reason.
+    let missing = crate::composition_bootstrap::front_door_config_snapshot(
+        1,
+        &installation_epoch,
+        Some(serde_json::Value::String("a".repeat(64))),
+        None,
+    );
+    assert_ne!(
+        sha256_hex(&serde_json::to_vec(&missing).expect("missing-key snapshot bytes")),
+        installation_expected,
+        "omitting a digest-pinned key must also change the whole-object digest, \
+         so the comparison is a real check rather than a shape echo"
+    );
+}
+
 #[test]
 fn ready_receipt_rejects_absent_running_degraded_and_fatal_daemon_states() {
     assert!(daemon_status_proves_ready(&DaemonRuntimeStatus::Ready));
