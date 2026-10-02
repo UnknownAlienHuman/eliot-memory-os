@@ -19,7 +19,13 @@ use eliot_contracts::{
 };
 use eliot_evidence::EvidenceEnvelope;
 use eliot_instrument_api::{InstrumentInvocation, VerificationRun};
-use eliot_receipts::{ProofCeiling, ReceiptEnvelope, ReceiptKind, RequestBinding};
+use eliot_receipts::{ProofCeiling, ReceiptEnvelope, ReceiptKind};
+// `RequestIdentity` names `eliot_receipts::RequestBinding` in its public
+// surface, so the binding type is re-exported here: without it a consumer of
+// this crate cannot construct the request identity the protocol requires on
+// every request-bearing frame. This is a facade re-export of an existing
+// workspace type, not a second type.
+pub use eliot_receipts::RequestBinding;
 pub use eliot_runtime_contracts::ModuleGeneration as ProtocolModuleGeneration;
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, RecoveryDirective};
 use eliot_security_contracts::{
@@ -1342,8 +1348,9 @@ impl ReplayLedger {
 
 /// Explicit module lifecycle phase for the I7.4 control flows.
 ///
-/// The phase only moves through [`ModuleLifecycle::apply`]: control frames
-/// are explicit transitions, never inferred process behavior.
+/// The phase only moves through [`ModuleLifecycle::apply`] and
+/// [`ModuleLifecycle::fatal`]: control frames are explicit transitions, never
+/// inferred process behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum ModuleLifecyclePhase {
     /// Accepting ordinary work.
@@ -1363,9 +1370,10 @@ pub enum ModuleLifecyclePhase {
 /// the restart as a new uncorrelated request. `bytes` are the exact
 /// canonical snapshot bytes the module published in the `Checkpoint` frame
 /// payload, retained verbatim as the persisted owner result: they survive a
-/// restart through [`ModuleLifecycle::checkpoint`] readback and
-/// [`ModuleLifecycle::restore_retained`], so generation restart/restore/resume
-/// replays the same bytes instead of a fabricated empty checkpoint.
+/// restart through [`ModuleLifecycle::checkpoint`] readback and both
+/// [`ModuleLifecycle::restore`] and [`ModuleLifecycle::restore_retained`], so
+/// generation restart/restore/resume replays the same bytes instead of a
+/// fabricated empty checkpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleCheckpoint {
@@ -1481,30 +1489,148 @@ pub enum ModuleControlEffect {
     ExecuteRecorded(ExecuteDisposition),
 }
 
-/// Recorded outcome of one effectful lifecycle control request.
+/// Versioned canonical encoding bound into every lifecycle request hash.
+///
+/// Lifecycle idempotency is defined over canonical bytes, not over caller
+/// spelling or an unversioned hash (I5.27 `canonical_encoding_version`), so
+/// [`lifecycle_request_hash`] binds this label into the digest it computes.
+pub const LIFECYCLE_CANONICAL_ENCODING: &str = "eliot.module-lifecycle.canonical.v1";
+
+/// Retention and collision window of one [`ModuleLifecycle`] owner's retained
+/// idempotency records (I5.27 `retention_and_collision_window`).
+///
+/// An owner that already holds this many distinct idempotency identities
+/// refuses a further effectful control rather than growing without bound. A
+/// caller that needs a wider window persists
+/// [`ModuleLifecycle::snapshot`] and rebuilds the owner through
+/// [`ModuleLifecycle::restore`] instead of raising this bound.
+pub const MAX_LIFECYCLE_RETAINED_OPERATIONS: usize = 1024;
+
+/// Projects the versioned canonical bytes one lifecycle request's idempotency
+/// identity is defined over (I5.27 `canonical_request_hash`).
+///
+/// The projection binds the semantic command kind, the authority fence the
+/// request was admitted under, and the effect-bearing payload. It deliberately
+/// excludes the transport correlation (`request_id`, connection identity,
+/// protocol version, trace context) and the request clock
+/// (`deadline_unix_ms`, `cancellation_id`): a retry is a fresh transport
+/// correlation of the same operation, so binding those fields would make every
+/// legitimate retry hash as a different request and surface
+/// [`ProtocolError::ReplayConflict`] instead of the recorded disposition.
+fn lifecycle_canonical_request_bytes(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or(ProtocolError::InvalidField {
+            field: "request_identity",
+            reason: "required for a canonical lifecycle request hash",
+        })?;
+    canonical_json_bytes(&(
+        LIFECYCLE_CANONICAL_ENCODING,
+        frame.message_type,
+        identity.request.state_fence,
+        frame.payload,
+    ))
+    .map_err(|error| ProtocolError::Json(error.to_string()))
+}
+
+/// Canonical request hash of one lifecycle request frame.
+///
+/// Reusing an idempotency key under a different canonical request hash is an
+/// identity conflict, not a replay (I5.27), and surfaces
+/// [`ProtocolError::ReplayConflict`] without performing any transition.
+pub fn lifecycle_request_hash(frame: &Frame) -> Result<String, ProtocolError> {
+    Ok(eliot_contracts::sha256_hex(
+        &lifecycle_canonical_request_bytes(frame)?,
+    ))
+}
+
+/// Retained record of one admitted lifecycle operation.
 ///
 /// Keyed by the validated [`RequestIdentity::idempotency_key`] inside the
-/// [`ModuleLifecycle`] owner: a retried control carrying the same key and
-/// message replays this outcome instead of a second effect (a repeated
-/// `Quiesce` returns the earlier disposition even though the phase already
-/// moved), while the same key under a different message surfaces
-/// [`ProtocolError::ReplayConflict`]. This is idempotent-outcome replay, not
-/// a second event journal: no sequences, no cursors, no acknowledgement
-/// phases. `DrainStatus` reads are never recorded here because each read must
-/// observe the live denominator, and `Fatal` carries no request identity on
-/// its control frame so the `Failed` phase itself is the fence. `Execute` is
-/// recorded in this same map: it is the one and only replay mechanism for a
-/// lifecycle request's idempotency identity, and a replayed `Execute` returns
-/// the recorded request identity as [`ExecuteDisposition::Duplicate`] rather
-/// than the stored [`ExecuteDisposition::New`] verbatim, so the retrying
-/// caller learns that no second effect ran. The map is process-local: no
-/// snapshot or store readback restores it across a restart.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LifecycleControlReplay {
+/// [`ModuleLifecycle`] owner: a retried control carrying the same key, message
+/// and canonical request hash replays this outcome instead of a second effect
+/// (a repeated `Quiesce` returns the earlier disposition even though the
+/// phase already moved), while the same key under a different message or a
+/// different canonical request hash surfaces [`ProtocolError::ReplayConflict`].
+/// This is idempotent-outcome replay, not a second event journal: no
+/// sequences, no cursors, no acknowledgement phases. `DrainStatus` reads are
+/// never recorded here because each read must observe the live denominator,
+/// and `Fatal` carries no request identity on its control frame so the
+/// `Failed` phase itself is the fence. `Execute` is recorded in this same map:
+/// it is the one and only replay mechanism for a lifecycle request's
+/// idempotency identity, and a replayed `Execute` returns the recorded request
+/// identity as [`ExecuteDisposition::Duplicate`] rather than the stored
+/// [`ExecuteDisposition::New`] verbatim, so the retrying caller learns that no
+/// second effect ran.
+///
+/// The record is serializable on purpose: it travels in
+/// [`ModuleLifecycleSnapshot`] and is read back through
+/// [`ModuleLifecycle::restore`], so a lifecycle rebuilt in a new process
+/// observes the same idempotency identity as an already recorded operation
+/// rather than admitting it as a first admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleOperationRecord {
     /// Control message the recorded outcome belongs to.
-    message: MessageType,
+    pub message: MessageType,
+    /// Canonical request hash of the admitted frame.
+    pub canonical_request_hash: String,
     /// Previously recorded outcome replayed on retry.
-    effect: ModuleControlEffect,
+    pub effect: ModuleControlEffect,
+}
+
+impl LifecycleOperationRecord {
+    /// Validates the retained record shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        lowercase_sha256(
+            &self.canonical_request_hash,
+            "lifecycle_operation_record.canonical_request_hash",
+        )
+    }
+}
+
+/// Durable readback of one [`ModuleLifecycle`] owner.
+///
+/// The snapshot is the owner's persistence surface: it carries the explicit
+/// phase, the retained checkpoint, the observed in-flight denominator, and
+/// every retained idempotency record. A lifecycle rebuilt through
+/// [`ModuleLifecycle::restore`] from this snapshot therefore admits a
+/// previously used idempotency key as a replay, not as a first admission.
+/// Persisting the snapshot itself remains the caller's duty: this crate does
+/// not open a store (I7.2 leaves persistence with the receiver's durable
+/// owner).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleLifecycleSnapshot {
+    /// Explicit lifecycle phase at snapshot time.
+    pub phase: ModuleLifecyclePhase,
+    /// Retained checkpoint, if any.
+    pub checkpoint: Option<ModuleCheckpoint>,
+    /// Observed in-flight operation denominator at snapshot time.
+    pub active_operations: u64,
+    /// Retained idempotency records keyed by validated idempotency key.
+    pub control_effects: BTreeMap<String, LifecycleOperationRecord>,
+}
+
+impl ModuleLifecycleSnapshot {
+    /// Validates the readback shape, retained checkpoint and retained records.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.control_effects.len() > MAX_LIFECYCLE_RETAINED_OPERATIONS {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle_snapshot.control_effects",
+                reason: "exceeds the retained lifecycle operation bound",
+            });
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.validate()?;
+        }
+        for (key, record) in &self.control_effects {
+            text(key, "module_lifecycle_snapshot.control_effects.key")?;
+            record.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Explicit owner for the I7.4 quiesce/checkpoint/restore/drain/shutdown/fatal
@@ -1522,28 +1648,32 @@ struct LifecycleControlReplay {
 /// The owner retains idempotency/outcomes for the effectful controls and for
 /// `Execute`: the first outcome per idempotency key is recorded and replayed
 /// on retry, so a repeated `Quiesce` or `Execute` returns the earlier
-/// disposition and a key reused under a different message surfaces
-/// [`ProtocolError::ReplayConflict`]. A repeated `Execute` reports that
-/// standing record as [`ExecuteDisposition::Duplicate`] over the recorded
-/// request identity, so the retrying caller can tell that no second effect
-/// ran.
+/// disposition and a key reused under a different message or a different
+/// canonical request hash surfaces [`ProtocolError::ReplayConflict`]. A
+/// repeated `Execute` reports that standing record as
+/// [`ExecuteDisposition::Duplicate`] over the recorded request identity, so the
+/// retrying caller can tell that no second effect ran.
 ///
-/// That retention is process-local and bounded to this owner's memory: no
-/// snapshot, journal or store readback carries `control_effects`, and
-/// [`ModuleLifecycle::restore_retained`] restores only the phase and the
-/// retained checkpoint. A lifecycle rebuilt in a new process therefore starts
-/// with an empty record and admits an `Execute` under a previously used key as
-/// a first admission. Closing that gap requires a persistence owner for these
-/// records that does not exist yet; until it does, callers must not read
-/// cross-restart `Execute` idempotency as guaranteed.
+/// That retention is durable and not process-local:
+/// [`ModuleLifecycle::snapshot`] projects the phase, the retained checkpoint
+/// and every retained idempotency record, and [`ModuleLifecycle::restore`]
+/// rebuilds the owner from that readback. A lifecycle rebuilt in a new process
+/// therefore replays a previously used idempotency key instead of admitting it
+/// as a first admission, so a retry after a crash cannot double-apply a
+/// recorded effect. Persisting the snapshot is the caller's duty and lives
+/// outside this crate; a caller that persists only the checkpoint and restores
+/// through [`ModuleLifecycle::restore_retained`] gets checkpoint-only
+/// readback and no idempotency records.
 ///
 /// `Checkpoint` retains the published snapshot bytes verbatim (bounded by
 /// [`MAX_FRAME_BYTES`]); a fresh publication under a new key supersedes the
 /// retained checkpoint and moves correlation to the new key. `DrainStatus`
 /// always reports the live in-flight denominator from its requesting frame.
-/// `RestoreCheckpoint` resumes the module to `Active`. `Fatal` on a
-/// `Terminated`/`Failed` lifecycle is refused: the terminal phase is the
-/// fence.
+/// `RestoreCheckpoint` resumes the module to `Active`. [`Self::fatal`] is the
+/// explicit `Fatal` control flow: it requires a `Control`-kind `Fatal` frame,
+/// records the terminal failure, and refuses a second fatal on a terminated or
+/// failed lifecycle, so the terminal phase survives a restart through the
+/// snapshot instead of being inferred from process state.
 ///
 /// `apply` takes no clock: presenting-deadline expiry is detected by the
 /// caller, which owns the clock, and recorded through the cancellation owner
@@ -1551,14 +1681,13 @@ struct LifecycleControlReplay {
 /// Unknown callers are never resolved here: every control requires its
 /// validated frame identity, and no manifest is fabricated for an unknown
 /// module. Bridge generation update paths call these same operations rather
-/// than ad-hoc flows; the transport-loop invocation, the restart-path
-/// restore, the admission-path predicate consult, and the bridge update call
+/// than ad-hoc flows; the transport-loop invocation and the bridge update call
 /// sites live outside this crate (named STITCH with their owners).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleLifecycle {
     phase: ModuleLifecyclePhase,
     checkpoint: Option<ModuleCheckpoint>,
-    control_effects: BTreeMap<String, LifecycleControlReplay>,
+    control_effects: BTreeMap<String, LifecycleOperationRecord>,
     active_operations: u64,
 }
 
@@ -1571,6 +1700,59 @@ impl ModuleLifecycle {
             control_effects: BTreeMap::new(),
             active_operations: 0,
         }
+    }
+
+    /// Projects the durable readback of this owner.
+    ///
+    /// The projection is the owner's persistence surface: persisting it and
+    /// rebuilding through [`ModuleLifecycle::restore`] is what carries the
+    /// phase, the retained checkpoint and every retained idempotency record
+    /// across a process restart.
+    #[must_use]
+    pub fn snapshot(&self) -> ModuleLifecycleSnapshot {
+        ModuleLifecycleSnapshot {
+            phase: self.phase,
+            checkpoint: self.checkpoint.clone(),
+            active_operations: self.active_operations,
+            control_effects: self.control_effects.clone(),
+        }
+    }
+
+    /// Rebuilds a lifecycle from its durable readback (restart readback).
+    ///
+    /// The readback is validated before it is adopted: the retained window
+    /// bound, the retained checkpoint and every retained idempotency record
+    /// must all hold, so a truncated, fabricated or oversized readback is
+    /// refused instead of producing a lifecycle that admits an already used
+    /// idempotency key as a first admission. Because the records are restored,
+    /// a `Failed` phase restored from the snapshot still fences a repeated
+    /// `Fatal` and a `Quiesced` phase still refuses new `Execute` work, exactly
+    /// as the owner that produced the snapshot did.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed protocol failure for an invalid readback.
+    pub fn restore(snapshot: ModuleLifecycleSnapshot) -> Result<Self, ProtocolError> {
+        snapshot.validate()?;
+        Ok(Self {
+            phase: snapshot.phase,
+            checkpoint: snapshot.checkpoint,
+            control_effects: snapshot.control_effects,
+            active_operations: snapshot.active_operations,
+        })
+    }
+
+    /// Returns the standing disposition recorded for one idempotency key.
+    ///
+    /// Observing never advances state, so a retrying caller can read the
+    /// recorded disposition before deciding whether a deadline or cancellation
+    /// terminal applies to it. An unrecorded key reports `None` rather than
+    /// minting a record.
+    #[must_use]
+    pub fn recorded_control(&self, idempotency_key: &str) -> Option<&ModuleControlEffect> {
+        self.control_effects
+            .get(idempotency_key)
+            .map(|record| &record.effect)
     }
 
     /// Reports whether ordinary work admission is open (quiesce/admission stop).
@@ -1597,8 +1779,14 @@ impl ModuleLifecycle {
     /// overwriting owner state. The restored lifecycle is quiesced with the
     /// checkpoint retained, so the correlated `RestoreCheckpoint` (which
     /// resumes to active) or `Start` resume must still carry the checkpoint
-    /// `idempotency_key`. The restart-path call site lives outside this crate
-    /// (named STITCH).
+    /// `idempotency_key`.
+    ///
+    /// This is the checkpoint-only readback: it restores the phase and the
+    /// retained checkpoint and nothing else, so it carries no idempotency
+    /// records. A caller that wants the retained idempotency/outcome records
+    /// across the restart persists [`ModuleLifecycle::snapshot`] and rebuilds
+    /// through [`ModuleLifecycle::restore`] instead. The restart-path call
+    /// sites live outside this crate (named STITCH).
     ///
     /// # Errors
     ///
@@ -1660,9 +1848,10 @@ impl ModuleLifecycle {
     /// control replays its stored disposition verbatim.
     /// `Checkpoint` retains the module-published snapshot bytes; `DrainStatus`
     /// always reports the live denominator from its frame and is never
-    /// replayed; `RestoreCheckpoint` resumes to `Active`; `Fatal` fences on the
-    /// terminal phase. The production caller is the IPC control dispatcher;
-    /// transport-loop invocation stays outside this crate (named STITCH).
+    /// replayed; `RestoreCheckpoint` resumes to `Active`; `Fatal` routes to
+    /// [`ModuleLifecycle::fatal`], which fences on the terminal phase. The
+    /// production caller is the IPC control dispatcher; transport-loop
+    /// invocation stays outside this crate (named STITCH).
     pub fn apply(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         frame.validate()?;
         match frame.message_type {
@@ -1671,7 +1860,7 @@ impl ModuleLifecycle {
             MessageType::RestoreCheckpoint => self.apply_restore(frame),
             MessageType::DrainStatus => self.apply_drain(frame),
             MessageType::Shutdown => self.apply_shutdown(frame),
-            MessageType::Fatal => self.apply_fatal(frame),
+            MessageType::Fatal => self.fatal(frame),
             MessageType::Start => self.apply_resume(frame),
             MessageType::Execute => self.apply_execute(frame),
             _ => Err(ProtocolError::InvalidField {
@@ -1681,54 +1870,52 @@ impl ModuleLifecycle {
         }
     }
 
-    fn control_identity(frame: &Frame) -> Result<&RequestIdentity, ProtocolError> {
-        let identity = frame
-            .request_identity
-            .as_ref()
-            .ok_or(ProtocolError::InvalidField {
-                field: "request_identity",
-                reason: "required for lifecycle control requests",
-            })?;
-        identity.validate()?;
-        if frame.request_id.is_none() {
-            return Err(ProtocolError::InvalidField {
-                field: "request_id",
-                reason: "required for lifecycle control requests",
-            });
-        }
-        Ok(identity)
-    }
-
     fn replay_control(
         &self,
         frame: &Frame,
         identity: &RequestIdentity,
     ) -> Result<Option<ModuleControlEffect>, ProtocolError> {
+        let canonical_request_hash = lifecycle_request_hash(frame)?;
         match self.control_effects.get(&identity.idempotency_key) {
             None => Ok(None),
-            Some(record) if record.message == frame.message_type => Ok(Some(record.effect.clone())),
+            Some(record)
+                if record.message == frame.message_type
+                    && record.canonical_request_hash == canonical_request_hash =>
+            {
+                Ok(Some(record.effect.clone()))
+            }
             Some(_) => Err(ProtocolError::ReplayConflict),
         }
     }
 
     fn record_control(
         &mut self,
-        key: &str,
-        message: MessageType,
+        frame: &Frame,
+        identity: &RequestIdentity,
         effect: ModuleControlEffect,
-    ) -> ModuleControlEffect {
+    ) -> Result<ModuleControlEffect, ProtocolError> {
+        let canonical_request_hash = lifecycle_request_hash(frame)?;
+        if !self.control_effects.contains_key(&identity.idempotency_key)
+            && self.control_effects.len() >= MAX_LIFECYCLE_RETAINED_OPERATIONS
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.control_effects",
+                reason: "retained lifecycle operation records are full: persist the snapshot and restore a fresh owner",
+            });
+        }
         self.control_effects.insert(
-            key.to_owned(),
-            LifecycleControlReplay {
-                message,
+            identity.idempotency_key.clone(),
+            LifecycleOperationRecord {
+                message: frame.message_type,
+                canonical_request_hash,
                 effect: effect.clone(),
             },
         );
-        effect
+        Ok(effect)
     }
 
     fn apply_quiesce(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
             return Ok(effect);
         }
@@ -1740,11 +1927,11 @@ impl ModuleLifecycle {
         }
         self.phase = ModuleLifecyclePhase::Quiesced;
         let effect = ModuleControlEffect::Quiesced;
-        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+        self.record_control(frame, identity, effect)
     }
 
     fn apply_checkpoint(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
             return Ok(effect);
         }
@@ -1784,11 +1971,11 @@ impl ModuleLifecycle {
         checkpoint.validate()?;
         self.checkpoint = Some(checkpoint.clone());
         let effect = ModuleControlEffect::CheckpointRecorded(checkpoint);
-        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+        self.record_control(frame, identity, effect)
     }
 
     fn apply_restore(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
             return Ok(effect);
         }
@@ -1814,7 +2001,7 @@ impl ModuleLifecycle {
         }
         let effect = ModuleControlEffect::CheckpointRestored(checkpoint.clone());
         self.phase = ModuleLifecyclePhase::Active;
-        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+        self.record_control(frame, identity, effect)
     }
 
     /// Admits one lifecycle `Execute` request and records its disposition.
@@ -1826,7 +2013,8 @@ impl ModuleLifecycle {
     /// second effect and returns
     /// [`ModuleControlEffect::ExecuteRecorded`] carrying
     /// [`ExecuteDisposition::Duplicate`] over the request identity already
-    /// recorded in the owner's `control_effects`, while the first admission
+    /// recorded in the owner's retained [`LifecycleOperationRecord`]s, while the
+    /// first admission
     /// returns [`ExecuteDisposition::New`]. That recorded key presented under
     /// a different message is refused as [`ProtocolError::ReplayConflict`]. A
     /// first-seen `Execute` is admitted only from the
@@ -1834,7 +2022,7 @@ impl ModuleLifecycle {
     /// lifecycle refuses new work. The recorded value is the request identity
     /// this owner validated for the admitted effect.
     fn apply_execute(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
             return Ok(Self::as_replayed(effect));
         }
@@ -1858,7 +2046,7 @@ impl ModuleLifecycle {
             });
         }
         let effect = ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(request_id));
-        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+        self.record_control(frame, identity, effect)
     }
 
     /// Marks a replayed recorded `Execute` as a duplicate.
@@ -1877,7 +2065,7 @@ impl ModuleLifecycle {
     }
 
     fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        Self::control_identity(frame)?;
+        require_lifecycle_request_identity(frame)?;
         let active_operations = match &frame.payload {
             ProtocolPayload::Json(Value::Object(object)) => object
                 .get("active_operations")
@@ -1906,12 +2094,12 @@ impl ModuleLifecycle {
     /// require the request form; that check therefore precedes the
     /// idempotency replay lookup. A `Control`-kind `Start` presenting a
     /// recorded resume key is refused here rather than answered from
-    /// `control_effects`: a recorded `Resumed` reports an effect this frame
+    /// retained records: a recorded `Resumed` reports an effect this frame
     /// never requested and would answer a handshake as if it were the
     /// correlated restart. A legitimate `Request` retry passes this check
     /// unchanged and still replays its recorded `Resumed` disposition.
     fn apply_resume(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if frame.kind != FrameKind::Request {
             return Err(ProtocolError::InvalidField {
                 field: "kind/message_type",
@@ -1943,11 +2131,11 @@ impl ModuleLifecycle {
         }
         self.phase = ModuleLifecyclePhase::Active;
         let effect = ModuleControlEffect::Resumed;
-        Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+        self.record_control(frame, identity, effect)
     }
 
     fn apply_shutdown(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        let identity = Self::control_identity(frame)?;
+        let identity = require_lifecycle_request_identity(frame)?;
         if let Some(effect) = self.replay_control(frame, identity)? {
             return Ok(effect);
         }
@@ -1955,7 +2143,7 @@ impl ModuleLifecycle {
             ModuleLifecyclePhase::Active | ModuleLifecyclePhase::Quiesced => {
                 self.phase = ModuleLifecyclePhase::Terminated;
                 let effect = ModuleControlEffect::ShutdownStarted;
-                Ok(self.record_control(&identity.idempotency_key, frame.message_type, effect))
+                self.record_control(frame, identity, effect)
             }
             _ => Err(ProtocolError::InvalidField {
                 field: "module_lifecycle.phase",
@@ -1964,17 +2152,40 @@ impl ModuleLifecycle {
         }
     }
 
-    /// Records a fatal failure as the terminal fence.
+    /// Applies the explicit `Fatal` control flow (I7.4 `Fatal`).
     ///
-    /// `Fatal` arrives as a control frame carrying no request identity, so it
-    /// is deliberately not idempotency-keyed in the control replay store: the
-    /// `Failed` phase itself is the fence. The first `Fatal` from any
-    /// non-terminal phase records the failure; every later `Fatal` is refused
-    /// instead of double-recording.
-    fn apply_fatal(&mut self, _frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        if self.phase == ModuleLifecyclePhase::Terminated
-            || self.phase == ModuleLifecyclePhase::Failed
-        {
+    /// `Fatal` is an explicit control flow, never inferred process behaviour:
+    /// the frame must validate and must be the canonical `Control`-kind `Fatal`
+    /// frame, so a `Fatal` presented as any other kind or message is refused
+    /// rather than recorded. The transition moves a non-terminal lifecycle to
+    /// [`ModuleLifecyclePhase::Failed`] and reports
+    /// [`ModuleControlEffect::FatalRecorded`]; a lifecycle that is already
+    /// `Terminated` or `Failed` refuses the frame instead of double-recording,
+    /// because the terminal phase is the fence.
+    ///
+    /// `Fatal` carries no request identity on its control frame, so it is not
+    /// keyed in the retained idempotency records. The `Failed` phase is
+    /// therefore the durable fence: it travels in
+    /// [`ModuleLifecycle::snapshot`] and a lifecycle rebuilt through
+    /// [`ModuleLifecycle::restore`] still refuses a repeated `Fatal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed protocol failure for an invalid frame, for a frame
+    /// that is not the canonical `Control`-kind `Fatal` frame, and for a
+    /// terminal lifecycle.
+    pub fn fatal(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        frame.validate()?;
+        if (frame.kind, frame.message_type) != (FrameKind::Control, MessageType::Fatal) {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle Fatal requires a Control frame carrying a Fatal message",
+            });
+        }
+        if matches!(
+            self.phase,
+            ModuleLifecyclePhase::Terminated | ModuleLifecyclePhase::Failed
+        ) {
             return Err(ProtocolError::InvalidField {
                 field: "module_lifecycle.phase",
                 reason: "fatal requires a non-terminal phase",
@@ -1989,6 +2200,74 @@ impl Default for ModuleLifecycle {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reports whether an I7.4 message has a request form: a lifecycle request that
+/// must carry the full I7.4 request contract (idempotency identity, deadline
+/// and cancellation semantics).
+///
+/// `Start` and `Health` have a request form as well as their `Control`
+/// handshake and `Heartbeat` observation forms; only the request form carries
+/// the contract. `Ready`, `Result`, `Event`, `EventAck` and `Fatal` have no
+/// request form at all, so no request contract applies to them. Refusing a
+/// request-bearing lifecycle message that does not carry the contract is
+/// [`require_lifecycle_request_identity`]'s job.
+#[must_use]
+pub const fn is_request_bearing_lifecycle_message(message_type: MessageType) -> bool {
+    matches!(
+        message_type,
+        MessageType::Start
+            | MessageType::Health
+            | MessageType::Execute
+            | MessageType::Cancel
+            | MessageType::Quiesce
+            | MessageType::Checkpoint
+            | MessageType::RestoreCheckpoint
+            | MessageType::DrainStatus
+            | MessageType::Shutdown
+    )
+}
+
+/// Returns the validated [`RequestIdentity`] a request-bearing lifecycle frame
+/// must carry, or refuses the frame.
+///
+/// I7.4 states that every request has idempotency identity, deadline and
+/// cancellation semantics, so this is the single explicit gate for that
+/// contract: the frame must be a validated request-bearing lifecycle message,
+/// it must carry a [`RequestIdentity`], that identity must pass
+/// [`RequestIdentity::validate`] — which rejects a blank `idempotency_key`, a
+/// zero `deadline_unix_ms` and a blank `cancellation_id` — and the frame must
+/// carry the matching `request_id`. Every request-bearing lifecycle message
+/// reaches its effect only through this gate, so a missing field is refused
+/// rather than defaulted.
+///
+/// # Errors
+///
+/// Returns the typed protocol failure naming the absent or malformed field.
+pub fn require_lifecycle_request_identity(
+    frame: &Frame,
+) -> Result<&RequestIdentity, ProtocolError> {
+    if !is_request_bearing_lifecycle_message(frame.message_type) {
+        return Err(ProtocolError::InvalidField {
+            field: "message_type",
+            reason: "not a request-bearing lifecycle message",
+        });
+    }
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or(ProtocolError::InvalidField {
+            field: "request_identity",
+            reason: "required for lifecycle control requests",
+        })?;
+    identity.validate()?;
+    if frame.request_id.is_none() {
+        return Err(ProtocolError::InvalidField {
+            field: "request_id",
+            reason: "required for lifecycle control requests",
+        });
+    }
+    Ok(identity)
 }
 
 /// Routes one lifecycle `Event` frame through the durable replay/ack envelope
@@ -8235,6 +8514,283 @@ mod tests {
             event_replay_key("s", "e"),
             EventReplayKey::new("s", "e").canonical_key()
         );
+    }
+
+    fn lifecycle_frame(
+        message_type: MessageType,
+        idempotency_key: &str,
+        payload: serde_json::Value,
+    ) -> Result<Frame, ProtocolError> {
+        let mut frame = frame()?;
+        frame.message_type = message_type;
+        frame.kind = match message_type {
+            MessageType::Execute
+            | MessageType::Quiesce
+            | MessageType::Checkpoint
+            | MessageType::RestoreCheckpoint
+            | MessageType::DrainStatus
+            | MessageType::Shutdown => FrameKind::Request,
+            MessageType::Fatal => FrameKind::Control,
+            _ => FrameKind::Request,
+        };
+        let Some(identity) = frame.request_identity.as_mut() else {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "the shared request frame carries a request identity",
+            });
+        };
+        identity.idempotency_key = idempotency_key.to_owned();
+        frame.payload = ProtocolPayload::Json(payload);
+        if frame.kind == FrameKind::Control {
+            // A control frame carries no request identity: `Fatal` is not a
+            // request-bearing lifecycle message.
+            frame.request_id = None;
+            frame.request_identity = None;
+        }
+        Ok(frame)
+    }
+
+    #[test]
+    fn lifecycle_snapshot_roundtrip_preserves_the_idempotency_record()
+    -> Result<(), ProtocolError> {
+        let quiesce = lifecycle_frame(
+            MessageType::Quiesce,
+            "idem-quiesce",
+            serde_json::json!({"command":"quiesce"}),
+        )?;
+        let mut lifecycle = ModuleLifecycle::new();
+        assert_eq!(
+            lifecycle.apply(&quiesce)?,
+            ModuleControlEffect::Quiesced
+        );
+
+        // The snapshot is the durable surface: it must survive a JSON
+        // roundtrip, not just a clone, because the readback crosses a process
+        // boundary.
+        let encoded =
+            serde_json::to_string(&lifecycle.snapshot()).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let decoded: ModuleLifecycleSnapshot =
+            serde_json::from_str(&encoded).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let mut restored = ModuleLifecycle::restore(decoded)?;
+
+        assert_eq!(restored.phase(), ModuleLifecyclePhase::Quiesced);
+        assert_eq!(
+            restored.recorded_control("idem-quiesce"),
+            Some(&ModuleControlEffect::Quiesced)
+        );
+        // The retry replays the recorded disposition; it does not move a phase
+        // that already moved and it does not admit a second effect.
+        assert_eq!(
+            restored.apply(&quiesce)?,
+            ModuleControlEffect::Quiesced
+        );
+
+        // A lifecycle rebuilt from the snapshot still refuses new Execute work
+        // because the quiesced phase travelled with the records.
+        let execute = lifecycle_frame(
+            MessageType::Execute,
+            "idem-execute",
+            serde_json::json!({"command":"health"}),
+        )?;
+        let restore_checkpoint = lifecycle_frame(
+            MessageType::RestoreCheckpoint,
+            "idem-quiesce",
+            serde_json::json!({"command":"restore"}),
+        )?;
+        assert!(matches!(
+            restored.apply(&execute),
+            Err(ProtocolError::InvalidField { .. })
+        ));
+        assert!(
+            matches!(
+                restored.apply(&restore_checkpoint),
+                Err(ProtocolError::ReplayConflict)
+            ),
+            "the retained key is already recorded under Quiesce, so a different \
+             message under it is an identity conflict"
+        );
+        assert_eq!(
+            ModuleLifecycle::restore(lifecycle.snapshot())?.phase(),
+            ModuleLifecyclePhase::Quiesced
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reused_idempotency_key_with_a_different_request_is_an_identity_conflict()
+    -> Result<(), ProtocolError> {
+        let first = lifecycle_frame(
+            MessageType::Execute,
+            "idem-shared",
+            serde_json::json!({"command":"one"}),
+        )?;
+        let mut other = first.clone();
+        other.payload = ProtocolPayload::Json(serde_json::json!({"command":"two"}));
+        let mut lifecycle = ModuleLifecycle::new();
+        assert!(matches!(
+            lifecycle.apply(&first)?,
+            ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(_))
+        ));
+        assert_eq!(
+            lifecycle.apply(&other),
+            Err(ProtocolError::ReplayConflict)
+        );
+        // A pure transport retry of the same request is still a replay: the
+        // canonical request hash excludes the correlation and the clock.
+        let mut retry = first.clone();
+        retry.request_id = Some(RequestId::new("request-2")?);
+        retry.connection_id = "connection-2".to_owned();
+        if let Some(identity) = retry.request_identity.as_mut() {
+            identity.deadline_unix_ms = 99;
+            identity.cancellation_id = "cancel-2".to_owned();
+            identity.request.metadata.request_id = RequestId::new("request-2")?;
+        }
+        assert!(matches!(
+            lifecycle.apply(&retry)?,
+            ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::Duplicate(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn request_bearing_lifecycle_messages_reject_a_missing_request_contract()
+    -> Result<(), ProtocolError> {
+        for (message_type, kind) in [
+            (MessageType::Start, FrameKind::Request),
+            (MessageType::Health, FrameKind::Heartbeat),
+            (MessageType::Execute, FrameKind::Request),
+            (MessageType::Cancel, FrameKind::Cancel),
+            (MessageType::Quiesce, FrameKind::Request),
+            (MessageType::Checkpoint, FrameKind::Request),
+            (MessageType::RestoreCheckpoint, FrameKind::Request),
+            (MessageType::DrainStatus, FrameKind::Request),
+            (MessageType::Shutdown, FrameKind::Request),
+        ] {
+            assert!(
+                is_request_bearing_lifecycle_message(message_type),
+                "{message_type:?} is request-bearing"
+            );
+            let mut presented = frame()?;
+            presented.message_type = message_type;
+            presented.kind = kind;
+            let key = presented
+                .request_identity
+                .as_mut()
+                .map(|identity| identity.idempotency_key.clone())
+                .ok_or(ProtocolError::InvalidField {
+                    field: "request_identity",
+                    reason: "the shared request frame carries a request identity",
+                })?;
+            assert_eq!(
+                require_lifecycle_request_identity(&presented)?.idempotency_key,
+                key
+            );
+
+            // Each of the three I7.4 request-contract fields is required: drop
+            // it and the request is refused, never defaulted.
+            let Some(identity) = presented.request_identity.as_mut() else {
+                return Err(ProtocolError::InvalidField {
+                    field: "request_identity",
+                    reason: "the shared request frame carries a request identity",
+                });
+            };
+            identity.idempotency_key = " ".to_owned();
+            assert!(matches!(
+                require_lifecycle_request_identity(&presented),
+                Err(ProtocolError::InvalidField { field, .. }) if field == "idempotency_key"
+            ));
+
+            let mut no_deadline = frame()?;
+            no_deadline.message_type = message_type;
+            no_deadline.kind = kind;
+            let Some(identity) = no_deadline.request_identity.as_mut() else {
+                return Err(ProtocolError::InvalidField {
+                    field: "request_identity",
+                    reason: "the shared request frame carries a request identity",
+                });
+            };
+            identity.deadline_unix_ms = 0;
+            assert!(matches!(
+                require_lifecycle_request_identity(&no_deadline),
+                Err(ProtocolError::InvalidField { field, .. }) if field == "deadline_unix_ms"
+            ));
+
+            let mut no_cancellation = frame()?;
+            no_cancellation.message_type = message_type;
+            no_cancellation.kind = kind;
+            let Some(identity) = no_cancellation.request_identity.as_mut() else {
+                return Err(ProtocolError::InvalidField {
+                    field: "request_identity",
+                    reason: "the shared request frame carries a request identity",
+                });
+            };
+            identity.cancellation_id = String::new();
+            assert!(matches!(
+                require_lifecycle_request_identity(&no_cancellation),
+                Err(ProtocolError::InvalidField { field, .. }) if field == "cancellation_id"
+            ));
+        }
+        // A lifecycle message with no request form carries no request contract.
+        for message_type in [
+            MessageType::Event,
+            MessageType::Fatal,
+            MessageType::Result,
+            MessageType::EventAck,
+            MessageType::Ready,
+        ] {
+            assert!(!is_request_bearing_lifecycle_message(message_type));
+            assert!(matches!(
+                require_lifecycle_request_identity(&Frame {
+                    message_type,
+                    ..frame()?
+                }),
+                Err(ProtocolError::InvalidField { field, .. }) if field == "message_type"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fatal_is_an_explicit_control_flow_that_fences_a_restored_lifecycle()
+    -> Result<(), ProtocolError> {
+        let fatal = lifecycle_frame(
+            MessageType::Fatal,
+            "idem-fatal",
+            serde_json::json!({"command":"fatal"}),
+        )?;
+        let mut lifecycle = ModuleLifecycle::new();
+        assert_eq!(
+            lifecycle.fatal(&fatal)?,
+            ModuleControlEffect::FatalRecorded
+        );
+        assert_eq!(lifecycle.phase(), ModuleLifecyclePhase::Failed);
+        assert_eq!(
+            lifecycle.fatal(&fatal),
+            Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "fatal requires a non-terminal phase",
+            })
+        );
+        // The Failed phase is the durable fence, not inferred process state: a
+        // lifecycle rebuilt from the snapshot still refuses the fatal.
+        let restored = ModuleLifecycle::restore(lifecycle.snapshot())?;
+        assert_eq!(restored.phase(), ModuleLifecyclePhase::Failed);
+        assert!(matches!(
+            restored.fatal(&fatal),
+            Err(ProtocolError::InvalidField { field, .. }) if field == "module_lifecycle.phase"
+        ));
+        assert!(!restored.admits_execute());
+
+        // Fatal presented as any other frame shape is refused, never recorded.
+        let mut as_request = fatal.clone();
+        as_request.kind = FrameKind::Request;
+        as_request.request_id = Some(RequestId::new("request-1")?);
+        as_request.request_identity = frame()?.request_identity;
+        assert!(matches!(
+            ModuleLifecycle::new().fatal(&as_request),
+            Err(ProtocolError::InvalidField { field, .. }) if field == "kind/message_type"
+        ));
+        Ok(())
     }
 
     #[test]
