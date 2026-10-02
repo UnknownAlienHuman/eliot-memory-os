@@ -73,7 +73,9 @@ use eliot_agent_contracts::{
     HandoffCheckpoint, HandoffCheckpointError, HandoffCheckpointId, HandoffLeaseRelease,
     HandoffRecoveryOutput, HandoffResumeIntent,
 };
-use eliot_contracts::{EpochId, OperationId, ResourceGeneration, StateFence};
+use eliot_contracts::{
+    ContractError as ReceiptContractError, EpochId, OperationId, ResourceGeneration, StateFence,
+};
 use thiserror::Error;
 
 use super::{
@@ -106,6 +108,23 @@ pub enum HandoffCaptureCallerError {
     /// The resume was refused, already typed by the resume owner.
     #[error(transparent)]
     Resume(#[from] HandoffResumeError),
+    /// The capture operation identity was refused by the receipt contract on a
+    /// ground the agent-contract family does not admit.
+    ///
+    /// `eliot-contracts` and `eliot-agent-contracts` each own a distinct
+    /// `ContractError`, and neither is a supertype, an alias, or convertible
+    /// into the other. A foundation rejection with no agent-contract
+    /// counterpart is therefore *named* here rather than translated into a
+    /// rejection that would misdescribe it. Only the failing field label and a
+    /// fixed reason word are carried, both `&'static str` drawn from the
+    /// refusing crate, so no rejected identity text is retained here.
+    #[error("capture operation identity refused by the receipt contract: {field} {reason}")]
+    ReceiptContractRefused {
+        /// Label of the field the receipt contract refused.
+        field: &'static str,
+        /// Fixed, content-free description of the refusal ground.
+        reason: &'static str,
+    },
 }
 
 /// The request one controlled boundary hands to the capture caller.
@@ -240,6 +259,10 @@ pub fn resume_captured_handoff(
 /// It is derived from the payload's own identity and the boundary, so the same
 /// checkpoint at the same boundary always reconciles the same operation and can
 /// never be captured under two.
+///
+/// A receipt-contract rejection of that identity is a refusal, never a coerced
+/// success: [`capture_identity_refusal`] maps it without changing what the
+/// check decided.
 fn capture_operation_id(
     request: &HandoffCaptureRequest,
 ) -> Result<OperationId, HandoffCaptureCallerError> {
@@ -248,9 +271,62 @@ fn capture_operation_id(
         request.boundary.caller_symbol(),
         request.checkpoint.checkpoint_id.as_str()
     );
-    OperationId::new(identity).map_err(|error| {
-        HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(error))
-    })
+    OperationId::new(identity).map_err(capture_identity_refusal)
+}
+
+/// Maps a receipt-contract rejection of the capture operation identity.
+///
+/// The two `ContractError` families are distinct types in distinct packages:
+/// `eliot_contracts::ContractError` (structure variants) and
+/// `eliot_agent_contracts::ContractError` (tuple variants). Only the two
+/// rejections an identity string can actually produce are translated, and each
+/// translation keeps the *same* refusal — a blank identity stays
+/// [`ContractError::Blank`](eliot_agent_contracts::ContractError::Blank) and a
+/// control-character identity stays
+/// [`ContractError::ControlCharacter`](eliot_agent_contracts::ContractError::ControlCharacter),
+/// so neither becomes an admitted operation. Every other variant is matched
+/// explicitly and named by
+/// [`HandoffCaptureCallerError::ReceiptContractRefused`] with its failing field
+/// label and a fixed reason; no error is discarded, and none is turned into a
+/// successful operation identity.
+///
+/// The match is exhaustive over today's receipt-contract enum, so a new variant
+/// there is a compile error in this file rather than a silently swallowed
+/// refusal.
+fn capture_identity_refusal(error: ReceiptContractError) -> HandoffCaptureCallerError {
+    let refusal = |field: &'static str, reason: &'static str| {
+        HandoffCaptureCallerError::ReceiptContractRefused { field, reason }
+    };
+    match error {
+        ReceiptContractError::Blank { field } => {
+            HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
+                eliot_agent_contracts::ContractError::Blank(field),
+            ))
+        }
+        ReceiptContractError::ControlCharacter { field } => {
+            HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
+                eliot_agent_contracts::ContractError::ControlCharacter(field),
+            ))
+        }
+        ReceiptContractError::TooLong { field, .. } => {
+            refusal(field, "exceeds the bounded identity length")
+        }
+        ReceiptContractError::Zero { field } => refusal(field, "must be greater than zero"),
+        ReceiptContractError::InvalidInterval { field } => refusal(field, "has an invalid interval"),
+        ReceiptContractError::EmptyFence => {
+            refusal("state_fence", "must contain at least one dependency")
+        }
+        ReceiptContractError::IncompleteFenceKeyReceipt { key } => {
+            refusal(key, "has no single named owner receipt")
+        }
+        ReceiptContractError::MissingRequestId => refusal("request_id", "must be present"),
+        ReceiptContractError::InvalidDigest { field } => {
+            refusal(field, "must be a lowercase SHA-256 hex digest")
+        }
+        ReceiptContractError::VersionOutOfRange => {
+            refusal("contract_version", "has a component out of range")
+        }
+    }
 }
 
 /// Registers the bounded snapshot against the one capture operation.
@@ -812,6 +888,46 @@ mod tests {
             ))
         ));
         assert_eq!(unregistered_controlled_boundaries(&ledger).len(), 4);
+    }
+
+    #[test]
+    fn a_receipt_contract_refusal_of_the_capture_identity_is_still_refused() {
+        // The two contract-error families are distinct types in distinct
+        // packages, so the mapping is explicit rather than a conversion: a
+        // blank identity is still Blank and a control-character identity is
+        // still ControlCharacter, so neither becomes an admitted operation.
+        assert!(matches!(
+            capture_identity_refusal(ReceiptContractError::Blank {
+                field: "operation_id"
+            }),
+            HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
+                ContractError::Blank("operation_id")
+            ))
+        ));
+        assert!(matches!(
+            capture_identity_refusal(ReceiptContractError::ControlCharacter {
+                field: "operation_id"
+            }),
+            HandoffCaptureCallerError::Checkpoint(HandoffCheckpointError::Contract(
+                ContractError::ControlCharacter("operation_id")
+            ))
+        ));
+
+        // A ground the agent-contract family does not admit is named by its
+        // failing field, not translated into a rejection that misdescribes it,
+        // and the refused value itself is not carried.
+        let refused = capture_identity_refusal(ReceiptContractError::TooLong {
+            field: "operation_id",
+            maximum_bytes: 64,
+        });
+        assert_eq!(
+            refused,
+            HandoffCaptureCallerError::ReceiptContractRefused {
+                field: "operation_id",
+                reason: "exceeds the bounded identity length"
+            }
+        );
+        assert!(!refused.to_string().contains('64'));
     }
 
     #[test]
