@@ -643,7 +643,10 @@ fn admission_naming_another_journal_channel_refuses_before_any_effect() {
         require_production_admitted(&foreign_channel).is_ok(),
         "the refusal under test must not be the fixture-flag gate"
     );
-    assert_ne!(foreign_channel.journal_identity_ref, RESTORE_JOURNAL_IDENTITY);
+    assert_ne!(
+        foreign_channel.journal_identity_ref,
+        RESTORE_JOURNAL_IDENTITY
+    );
     // The destination is admitted exactly as in the positive case, so the only
     // difference between the two runs is the channel field. Without that, the
     // case could be passing for the destination gate instead.
@@ -673,7 +676,10 @@ fn admission_naming_another_journal_channel_refuses_before_any_effect() {
     // write: the refusal sits beside the admission gate, before the effect
     // fence and before `KernelIsolatedDestination::open` constructs the root.
     let area = root.join(".eliot").join(RESTORE_ISOLATED_AREA);
-    assert!(!area.join(target).exists(), "destination must not be constructed");
+    assert!(
+        !area.join(target).exists(),
+        "destination must not be constructed"
+    );
     assert!(
         journal.record.is_none(),
         "no journal row may be written before the refusal"

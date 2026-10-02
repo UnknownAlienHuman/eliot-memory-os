@@ -16,8 +16,8 @@
 use eliot_contracts::StateFence;
 use eliot_governor::{
     GrantClosureCanonicalLinkPort, GrantClosureSecondPhaseLink, KernelDurableJobPort,
-    KernelGenerationSnapshot, KernelGenerationSnapshotProvider, KernelPortError,
-    KernelPortFuture, KernelServiceObservationPort, KernelServiceRecovery,
+    KernelGenerationSnapshot, KernelGenerationSnapshotProvider, KernelPortError, KernelPortFuture,
+    KernelServiceObservationPort, KernelServiceRecovery,
 };
 use eliot_maintenance::{MaintenanceJob, prove_job_intent_durable};
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
@@ -267,7 +267,10 @@ impl GrantClosureCanonicalLinkPort for DaemonKernelClient {
                     "canonical closure receipt link read-back disagrees".to_owned(),
                 ));
             }
-            Ok(GrantClosureSecondPhaseLink::new(readback.commit, second_phase))
+            Ok(GrantClosureSecondPhaseLink::new(
+                readback.commit,
+                second_phase,
+            ))
         })
     }
 }

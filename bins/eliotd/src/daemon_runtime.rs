@@ -4116,7 +4116,10 @@ async fn report_authority_revocation_ingress(
         eliotd::capture_authority_revocation_ingress_plan(&guard)
     };
     let state_fence = plan.as_ref().ok().map(|plan| plan.state_fence().clone());
-    let revision = plan.as_ref().ok().map(eliotd::AuthorityRevocationIngressPlan::revision);
+    let revision = plan
+        .as_ref()
+        .ok()
+        .map(eliotd::AuthorityRevocationIngressPlan::revision);
     let report = match plan {
         Ok(plan) => eliotd::scan_authority_revocation_ingress(plan, kernel).await,
         Err(error) => Err(error),
@@ -4214,25 +4217,21 @@ async fn drive_admitted_canonical_revocations(
     admitted: &[&eliotd::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation],
     failure_guard: &mut RepeatedFailureGuard,
 ) {
-    let resumes = match eliotd::admit_canonical_revocation_resumes(
-        state_fence,
-        revision,
-        admitted,
-        kernel,
-    ) {
-        Ok(resumes) => resumes,
-        Err(error) => {
-            if failure_guard.should_emit() {
-                let _ = eliotd::diagnostics::ErrorRecord::of(
-                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
-                    "authority-revocation-resume-admission",
-                    &error.to_string(),
-                )
-                .emit();
+    let resumes =
+        match eliotd::admit_canonical_revocation_resumes(state_fence, revision, admitted, kernel) {
+            Ok(resumes) => resumes,
+            Err(error) => {
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "authority-revocation-resume-admission",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
     let durable_link: &dyn eliot_governor::GrantClosureCanonicalLinkPort = kernel.as_ref();
     for resume in &resumes {
         let grant_id = eliotd::diagnostics::sanitize_identity(resume.request().grant_id.as_str());

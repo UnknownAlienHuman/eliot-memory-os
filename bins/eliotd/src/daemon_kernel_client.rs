@@ -3790,7 +3790,10 @@ mod tests {
     }
 
     fn test_client(fence: &StateFence) -> Result<DaemonKernelClient, Box<dyn std::error::Error>> {
-        Ok(DaemonKernelClient::new_for_test(test_epoch(1)?, fence.clone()))
+        Ok(DaemonKernelClient::new_for_test(
+            test_epoch(1)?,
+            fence.clone(),
+        ))
     }
 
     /// Minimal in-test evidence table. It stores captured subjects in capture

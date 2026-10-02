@@ -156,8 +156,7 @@ const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identit
 /// canonical second phase is real, actionable, durable state. Reporting it
 /// without naming the blocker would present an unfinished obligation as a
 /// handled one.
-pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str =
-    "canonical second phase cannot complete: the Store catalogue keeps \
+pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str = "canonical second phase cannot complete: the Store catalogue keeps \
      NamedMutationOperation::RecordAuthorityRevocation known-but-unsupported, so the canonical \
      revocation commit fails closed and the obligation stays pending instead of becoming a \
      recorded revocation";
@@ -466,7 +465,8 @@ pub fn admit_canonical_revocation_resumes(
             admitted.len()
         ))
     })?;
-    let observing_receipt = observed_closure_receipt_read_identity(state_fence, revision, admitted)?;
+    let observing_receipt =
+        observed_closure_receipt_read_identity(state_fence, revision, admitted)?;
     let epoch = state_fence.authority_epoch.clone();
     let generation = format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence.get());
     // The resume is the installation's own recovery work, not product task
@@ -484,9 +484,11 @@ pub fn admit_canonical_revocation_resumes(
         // obligation is the same canonical operation, while a changed closure
         // under it is the I5.27 changed-payload conflict rather than a second
         // operation.
-        let canonical_operation_id =
-            OperationId::new(format!("{CANONICAL_REVOCATION_RESUME_OPERATION}:{}", row.closure_operation_id()))
-                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let canonical_operation_id = OperationId::new(format!(
+            "{CANONICAL_REVOCATION_RESUME_OPERATION}:{}",
+            row.closure_operation_id()
+        ))
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
         // The canonical request bytes are the owner's own committed closure the
         // resume is about to record against. Nothing is re-derived, so a changed
         // closure derives a different request identity under the same operation.
@@ -813,7 +815,10 @@ mod tests {
 
     /// One committed revoked first phase whose canonical second phase has not
     /// been linked, in exactly the shape the closure receipt contract requires.
-    fn committed_pending_closure(fence: &StateFence, idempotency_digest: &str) -> GrantClosureReceipt {
+    fn committed_pending_closure(
+        fence: &StateFence,
+        idempotency_digest: &str,
+    ) -> GrantClosureReceipt {
         let closure = GrantClosureReceipt {
             schema: eliot_receipts::GRANT_CLOSURE_SCHEMA.to_owned(),
             version: eliot_receipts::GRANT_CLOSURE_VERSION,
@@ -886,13 +891,11 @@ mod tests {
         let fence = test_fence();
         let kernel = kernel_with_session(&fence);
         let closure = committed_pending_closure(&fence, &"d".repeat(64));
-        let admitted =
-            AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
-                .expect("the committed closure is an admissible pending obligation");
+        let admitted = AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
+            .expect("the committed closure is an admissible pending obligation");
 
-        let resumes =
-            admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
-                .expect("an admitted pending closure composes a resume handoff");
+        let resumes = admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
+            .expect("an admitted pending closure composes a resume handoff");
         assert_eq!(resumes.len(), 1, "one admitted row is one resume handoff");
         let resume = &resumes[0];
         // The owner's own committed bytes travel verbatim; nothing is re-derived.
@@ -904,12 +907,14 @@ mod tests {
         // the same canonical operation.
         assert_eq!(
             resume.canonical_operation_id().as_str(),
-            format!("{CANONICAL_REVOCATION_RESUME_OPERATION}:{}", closure.operation_id)
+            format!(
+                "{CANONICAL_REVOCATION_RESUME_OPERATION}:{}",
+                closure.operation_id
+            )
         );
 
-        let replayed =
-            admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
-                .expect("an exact replay composes the same handoff");
+        let replayed = admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
+            .expect("an exact replay composes the same handoff");
         assert_eq!(
             replayed[0].canonical_operation_id(),
             resume.canonical_operation_id(),
@@ -933,9 +938,8 @@ mod tests {
         let changed_admitted =
             AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &changed)
                 .expect("the changed committed closure is still admissible");
-        let conflict =
-            admit_canonical_revocation_resumes(&fence, 7, &[&changed_admitted], &kernel)
-                .expect("a changed payload still composes the same canonical operation");
+        let conflict = admit_canonical_revocation_resumes(&fence, 7, &[&changed_admitted], &kernel)
+            .expect("a changed payload still composes the same canonical operation");
         assert_eq!(
             conflict[0].canonical_operation_id(),
             resume.canonical_operation_id(),
@@ -970,9 +974,8 @@ mod tests {
         ));
         assert!(kernel.validated_session_binding().is_none());
         let closure = committed_pending_closure(&fence, &"d".repeat(64));
-        let admitted =
-            AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
-                .expect("the committed closure is an admissible pending obligation");
+        let admitted = AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
+            .expect("the committed closure is an admissible pending obligation");
 
         // A pass that admitted nothing composes nothing, without needing a
         // principal: no identity is minted for an absent obligation.
