@@ -233,7 +233,11 @@ fn host_epoch_observe_reopen(observation: &HostEpochReopenObservation<'_>) {
     push_epoch_observation_field(&mut detail, "fence", observation.fence);
     push_epoch_observation_count(&mut detail, "fence_bindings", observation.fence_bindings);
     push_epoch_observation_count(&mut detail, "pending", observation.pending);
-    push_epoch_observation_count(&mut detail, "pending_committed", observation.pending_committed);
+    push_epoch_observation_count(
+        &mut detail,
+        "pending_committed",
+        observation.pending_committed,
+    );
     host_epoch_observe(&detail);
 }
 
