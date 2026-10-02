@@ -1360,37 +1360,43 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
 
 /// Derives the update proposal a presented execution revision claims.
 ///
-/// A `SwarmExecutionRevision` carries only two of the six frozen dimensions on
-/// the record itself — its `wave` and its `root_context_revision`. The other
-/// four (work graph, objective, acceptance, budget/privacy/route ceilings, stop
-/// conditions) live on the frozen `SwarmPlanDefinition` and are named by the
-/// `definition_digest` this revision binds. So a revision presented against a
-/// definition claims exactly that frozen content, and the proposal it yields
-/// carries:
+/// `Some(..)` means CLAIMED — the proposal asserts that exact value, and
+/// [`check_execution_update`] refuses the update when it differs from the
+/// frozen content (`None` would assert nothing and be unchecked). So every
+/// field a coordinator present names is claimed here, and a revision that
+/// moves a frozen dimension cannot reach currency unchecked.
 ///
-/// - the presented `wave` and `root_context_revision` verbatim, so the guard
-///   compares them against the stored execution's wave and the frozen root and
-///   refuses a drifted one with `SemanticDrift`;
-/// - the definition digest the revision binds, through the guard's own
-///   execution-binding check — a revision whose digest is no longer the frozen
-///   one is not this execution's plan and is refused;
-/// - `None` for the four dimensions the revision cannot restate, which is the
-///   contract's "advance mechanically, change nothing" reading: absent means
-///   unclaimed, so the guard has nothing to compare and the update stays
-///   mechanical.
+/// A `SwarmExecutionRevision` names two of the six frozen dimensions on the
+/// record itself — its `wave` and its `root_context_revision` — so those are
+/// claimed verbatim from the presented revision and the guard compares them
+/// against the stored execution's wave and the frozen root.
+///
+/// The other four live on the frozen `SwarmPlanDefinition` this revision
+/// binds, which is the admission's own definition: the update path has already
+/// fetched that definition by the presented revision's own `definition_id`,
+/// and the guard independently refuses a presented revision whose
+/// `definition_digest` is no longer this one (`check_execution_update`'s
+/// execution-binding check), so a digest that names other semantics never
+/// reaches this derivation. Naming the frozen content verbatim therefore
+/// claims EXACTLY what the revision is running under — it asserts no new
+/// value, and takes no position the guard does not already own.
 ///
 /// This is a derivation, not a comparison. Every field-vs-frozen decision is
 /// made once, by the contract owner, inside
 /// [`check_semantic_execution_update`].
-fn execution_update_proposal(execution: &SwarmExecutionRevision) -> ExecutionUpdateProposal {
+fn execution_update_proposal(
+    definition: &SwarmPlanDefinition,
+    admission: &SwarmPlanAdmission,
+    execution: &SwarmExecutionRevision,
+) -> ExecutionUpdateProposal {
     ExecutionUpdateProposal {
         execution_id: execution.execution_id.clone(),
         wave: execution.wave.clone(),
-        work_graph_digest: None,
-        objective_ref: None,
-        acceptance_refs: None,
-        ceilings: None,
-        stop_conditions_digest: None,
+        work_graph_digest: Some(definition.work_graph_digest.clone()),
+        objective_ref: Some(definition.objective_ref.clone()),
+        acceptance_refs: Some(definition.acceptance_refs.clone()),
+        ceilings: Some(admission.admitted_ceilings.clone()),
+        stop_conditions_digest: Some(definition.stop_conditions_digest.clone()),
         root_context_revision: Some(execution.root_context_revision.clone()),
     }
 }
@@ -3345,7 +3351,7 @@ impl AgentFabric {
             self.check_semantic_execution_update(
                 &execution.admission_id,
                 &execution.execution_id,
-                &execution_update_proposal(&execution),
+                &execution_update_proposal(&definition, &admission, &execution),
                 coordinator_holder,
                 coordinator_epoch,
             )?;
