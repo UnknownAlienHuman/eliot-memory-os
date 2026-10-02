@@ -344,6 +344,25 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_generated_executable_registry_is_refused() {
+        // Arm: the real contract's `implementation_support` drops the
+        // executable-registry residual and claims a generated registry, which
+        // the contract's own `[confirmed_gap]` contradicts. Status and ceiling
+        // are untouched, so only the support-marker check can catch this
+        // overclaim; it must refuse while #13's registry is still absent.
+        let result = markers_of_mutated_contract(
+            "implementation_support = \"ROUTING_METADATA_PRESENT_DAEMON_CELLS_DECLARED_EXECUTABLE_REGISTRY_MISSING\"\n",
+            "implementation_support = \"ROUTING_METADATA_PRESENT_EXECUTABLE_REGISTRY_GENERATED\"\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("cell contract claims implementation_support ROUTING_METADATA_PRESENT_EXECUTABLE_REGISTRY_GENERATED without the executable-registry residual; only a declaration projection exists".to_owned()),
+            "claiming a generated executable registry must be refused"
+        );
+    }
+
+    #[test]
     fn raising_the_proof_ceiling_without_the_registry_is_refused() {
         // Arm: the real contract's `proof_ceiling` is raised to a generated
         // registry ceiling while the executable `CapabilityCellRegistry` is
