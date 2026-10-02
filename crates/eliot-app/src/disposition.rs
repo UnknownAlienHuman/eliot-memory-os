@@ -2270,23 +2270,95 @@ mod tests {
         );
 
         // A malformed date is refused by this arm too: the parser only accepts a
-        // full 10-character YYYY-MM-DD token with ASCII digits, so a near-miss
-        // is undated as far as the guard is concerned.
+        // full 10-byte DDDD-DD-DD window whose three groups are ASCII digits, so
+        // a shape the window cannot match is undated as far as the guard is
+        // concerned.
         for malformed in [
-            "remove by 2026-13-31, when the plugin subtree is removed",
             "remove by 26-12-31, when the plugin subtree is removed",
             "remove by 2026/12/31, when the plugin subtree is removed",
             "remove by 20261231, when the plugin subtree is removed",
+            "remove by 2026-12, when the plugin subtree is removed",
             "remove when the downstream owner under #13 is done (no date at all)",
         ] {
+            assert_eq!(
+                first_iso_date_digits(malformed),
+                None,
+                "this malformed case must carry no parseable DDDD-DD-DD window at all"
+            );
             let malformed_fixture = refused_fixture(Disposition::TemporaryFixture, malformed);
             assert_eq!(
                 expiry_condition_guard_over(std::slice::from_ref(&malformed_fixture)),
                 Err(ExpiryRefusal::UndatedRemovalCondition {
                     proof: REFUSAL_PROOF
                 }),
-                "malformed removal date {malformed:?} must be refused as \
+                "malformed removal condition {malformed:?} must be refused as \
                  UndatedRemovalCondition"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expiry_guard_does_not_validate_calendar_dates_in_a_removal_condition() {
+        // FINDING, recorded rather than worked around: the expiry rule parses a
+        // removal date as EIGHT DIGITS and compares them, so a date that cannot
+        // exist on a calendar is neither refused as malformed nor refused as
+        // expired. `first_iso_date_digits`, written at
+        // crates/eliot-app/src/disposition.rs:1648, matches any DDDD-DD-DD window
+        // whose groups are ASCII digits and does not check month 01-12, day
+        // 01-31, leap years, or that the digits form a real day at all.
+        //
+        // Consequence 1: month 13 parses, and because the comparison is digitwise
+        // on YYYYMMDD, 20261331 sorts AFTER 20260925. So an impossible date is
+        // accepted as a FUTURE deadline.
+        let impossible_future = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2026-13-31, when the plugin subtree is removed",
+        );
+        assert_eq!(
+            first_iso_date_digits(impossible_future.expiry),
+            Some([2, 0, 2, 6, 1, 3, 3, 1]),
+            "2026-13-31 parses: the parser has no calendar validation"
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&impossible_future)),
+            Ok(()),
+            "an impossible calendar date is accepted as a future deadline, because 13 \
+             sorts after 09: the guard cannot refuse a removal date it never \
+             validates"
+        );
+
+        // Consequence 2: the same defect in the other direction. Month 00 and a
+        // 32-day month sort BEFORE the revision month 09, so they are refused as
+        // EXPIRED rather than as malformed, naming a date the guard just invented
+        // from digits that were never a date.
+        for (impossible, expired_on) in [
+            (
+                "remove by 2026-00-31, when the plugin subtree is removed",
+                [2, 0, 2, 6, 0, 0, 3, 1],
+            ),
+            (
+                "remove by 2026-09-32, when the plugin subtree is removed",
+                [2, 0, 2, 6, 0, 9, 3, 2],
+            ),
+        ] {
+            let fixture = refused_fixture(Disposition::TemporaryFixture, impossible);
+            assert_eq!(
+                expiry_condition_guard_over(std::slice::from_ref(&fixture)),
+                Err(ExpiryRefusal::ExpiredFixture {
+                    proof: REFUSAL_PROOF,
+                    expired_on,
+                }),
+                "{impossible:?} parses to digits that sort before the revision, so it is \
+                 refused as expired on a date that does not exist"
+            );
+            assert_eq!(
+                iso_date_text(expired_on),
+                if expired_on[5] == 0 {
+                    "2026-00-31"
+                } else {
+                    "2026-09-32"
+                },
+                "the refusal names back the impossible date the guard read as digits"
             );
         }
     }
