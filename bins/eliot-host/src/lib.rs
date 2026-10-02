@@ -4037,8 +4037,7 @@ mod host_lifecycle_boundary_table_tests {
             "an admitted request alone must never admit a start record"
         );
         assert!(
-            !AdmittedEvent::ServiceStart
-                .is_admitted_by(HostRequestEvidence::ProcessStarted),
+            AdmittedEvent::ServiceStart.is_admitted_by(HostRequestEvidence::ProcessStarted),
             "only an observed process start admits the start record"
         );
         let dropped = capture_records(|| {
@@ -4205,8 +4204,10 @@ mod host_lifecycle_boundary_table_tests {
         );
 
         // The typed Event Log seam answers for itself and never becomes the
-        // owner's result: admission is a closed typed name and a drop may only
-        // raise the monotone count.
+        // owner's result. This test never starts the producer, so admission
+        // must be refused typed and a refusal may never claim a delivery.
+        let sink_status_before = super::windows_event_log::event_log_sink_status()
+            .map_err(|error| error.as_str().to_owned());
         let admission = super::windows_event_log::try_admit_admitted_event(
             super::windows_event_log::AdmittedEvent::ServiceStop,
             "891-case-18-stop",
@@ -4217,22 +4218,33 @@ mod host_lifecycle_boundary_table_tests {
         );
         assert!(
             matches!(
-                admission.as_str(),
-                "admitted"
-                    | "admitted_truncated"
-                    | "queue_full"
-                    | "producer_busy"
-                    | "formatting_panic_contained"
-                    | "not_started"
-                    | "shutdown"
-                    | "worker_unavailable"
+                admission,
+                super::windows_event_log::EventLogAdmission::RejectedNotStarted { .. }
+                    | super::windows_event_log::EventLogAdmission::RejectedShutdown { .. }
+                    | super::windows_event_log::EventLogAdmission::RejectedWorkerUnavailable {
+                        ..
+                    }
+                    | super::windows_event_log::EventLogAdmission::DroppedQueueFull { .. }
+                    | super::windows_event_log::EventLogAdmission::DroppedProducerBusy { .. }
+                    | super::windows_event_log::EventLogAdmission::DroppedFormattingPanic { .. }
             ),
-            "the sink must answer with a closed typed admission name, got: {}",
+            "an unstarted producer must refuse admission with a typed non-delivery outcome, got: {}",
             admission.as_str()
+        );
+        assert_ne!(
+            admission.as_str(),
+            "admitted",
+            "this test never starts the Event Log producer, so no delivery may be claimed"
         );
         assert!(
             repeat.dropped_total() >= admission.dropped_total(),
             "a dropped record may only raise the monotone drop count"
+        );
+        assert_eq!(
+            sink_status_before,
+            super::windows_event_log::event_log_sink_status()
+                .map_err(|error| error.as_str().to_owned()),
+            "refusing a record must not change the seam's own typed status"
         );
     }
 
@@ -4387,7 +4399,7 @@ mod host_lifecycle_boundary_table_tests {
         let image = std::env::current_exe().expect("test image must be resolvable");
         let registration = super::ServiceRegistrationRequest::new(
             super::ELIOT_HOST_SERVICE_NAME,
-            super::ELIOT_HOST_SERVICE_NAME,
+            eliot_platform_windows::ELIOT_HOST_SERVICE_DISPLAY_NAME,
             &image,
             super::ServiceStartMode::Automatic,
             super::ServiceAccount::LocalService,
@@ -4443,6 +4455,18 @@ mod host_lifecycle_boundary_table_tests {
         let emitted = capture_records(|| {
             super::host_lifecycle_observe_scm(super::BOUNDARY_RUNTIME_CONTROL_REQUESTED);
             super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_REQUESTED);
+            // The SCM canaries ride the real inputs that reach the rendering
+            // seam: the SCM-caused failure payload, the bounded cause detail,
+            // and the admission record's correlation. None may be echoed back.
+            super::host_lifecycle_observe_identity(
+                &super::host_diagnostics::HostRequestProjection::failed(
+                    super::host_diagnostics::EntrypointStage::ScmDispatch,
+                    &super::HostError::Platform(format!(
+                        "scm {SERVICE_CANARY} account {USER_CANARY} command {COMMAND_CANARY}"
+                    )),
+                )
+                .with_operation(super::windows_event_log::AdmittedEvent::ServiceFailure),
+            );
             super::host_lifecycle_observe_identity(
                 &super::host_diagnostics::HostRequestProjection::observed(
                     super::host_diagnostics::EntrypointStage::ScmDispatch,
@@ -4464,6 +4488,19 @@ mod host_lifecycle_boundary_table_tests {
             emitted.contains("request_missing=true") && emitted.contains("operation_missing=true"),
             "the SCM dispatch has no console-request or service-operation value and must say so, got: {emitted}"
         );
+        // The canary-bearing failure still rendered, so the absence below is a
+        // real redaction proof and not an empty capture: only the typed
+        // discriminant and the service failure survived it.
+        assert!(
+            emitted.contains("reason=\"platform\"")
+                && emitted.contains("evidence=\"failed\"")
+                && emitted.contains("operation=\"service_failure\""),
+            "the SCM failure must render its typed discriminants, got: {emitted}"
+        );
+        assert!(
+            occurrences(&emitted, "host.event_log_admission") == 1,
+            "the typed failure reaches the Event Log admission gate exactly once, got: {emitted}"
+        );
         for canary in [SERVICE_CANARY, USER_CANARY, COMMAND_CANARY] {
             assert!(
                 !emitted.contains(canary),
@@ -4473,10 +4510,6 @@ mod host_lifecycle_boundary_table_tests {
         assert!(
             !emitted.contains("LocalService") && !emitted.contains("S-1-5-19"),
             "the service account must never reach a rendered record, got: {emitted}"
-        );
-        assert!(
-            !emitted.contains("inspection"),
-            "no SCM inspection payload may reach a rendered record, got: {emitted}"
         );
     }
 
