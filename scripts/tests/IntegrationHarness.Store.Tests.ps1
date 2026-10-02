@@ -1202,6 +1202,14 @@ function Test-StoreCase19 {
     Assert-StoreTrue $Failures ([string]$incomplete['failure'] -match '^stop-ownership-unproven:STORE-DESCENDANT-CLOSURE-INCOMPLETE:') ('19-incomplete-closure-typed: ' + [string]$incomplete['failure'])
     Assert-StoreTrue $Failures ([int]$incomplete['ownedPid'] -eq $ownedPid) '19-incomplete-closure-keeps-owner'
     Assert-StoreTrue $Failures ($incompleteCalls['count'] -eq 0) '19-incomplete-closure-no-forced-kill'
+    # That refusal left an unresolved stop record on this allocation's own run
+    # root, and the guard refuses any later operation onto that root until the
+    # owner resolves it. This case owns the root it just dirtied, so it resolves
+    # it before returning -- exactly what a caller holding this refusal has to
+    # do. Asserting the refusal above is unchanged; this only clears the record
+    # the assertion itself produced.
+    [void](Complete-StoreTestFixtureReconciliation -Binding $binding -Allocation $allocation `
+        -Resolution '19-case-asserted-the-incomplete-closure-refusal')
 }
 
 # ---------------------------------------------------------------------------
