@@ -1957,9 +1957,10 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSUMER_SURFACES, Disposition, INVENTORY_REVISION, assert_inventory_entries_are_live,
-        baked_surface, consumer_disposition_guard, current_consumer_inventory,
-        expiry_condition_guard, first_iso_date_digits, inventory_entries_for, iso_date_text,
+        CONSUMER_SURFACES, ConsumerEntry, Disposition, INVENTORY_REVISION,
+        assert_inventory_entries_are_live, baked_surface, consumer_disposition_guard,
+        current_consumer_inventory, expiry_condition_guard, first_iso_date_digits,
+        inventory_entries_for, iso_date_text,
     };
 
     /// Digits of the first `YYYY-MM-DD` token in `text`, decoded to integers.
@@ -2029,8 +2030,9 @@ mod tests {
         // The skip runs before any `Err` can be produced, so an undated row is
         // decided by the data, not by the guard. This reads that condition back
         // over the shipped inventory and pins what it actually does.
-        let (extract_rows, fixture_rows) =
-            current_consumer_inventory()
+        let inventory = current_consumer_inventory();
+        let (extract_rows, fixture_rows): (Vec<&ConsumerEntry>, Vec<&ConsumerEntry>) =
+            inventory
                 .iter()
                 .partition(|entry| entry.disposition == Disposition::ExtractToCurrentOwner);
 
