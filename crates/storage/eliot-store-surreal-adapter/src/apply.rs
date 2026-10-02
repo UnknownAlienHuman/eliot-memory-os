@@ -1128,6 +1128,11 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
         AdapterError::UnknownOutcome { .. }
         | AdapterError::PartialOutcome
         | AdapterError::UnknownMigrationOutcome { .. }
+        // A refused provider frame carries the provider's own `kind` and code
+        // but states no outcome, so it is treated exactly like the transport
+        // `ProviderUnavailable` arm rather than being given a retry class the
+        // provider never asserted.
+        | AdapterError::ProviderRefused { .. }
         | AdapterError::ProviderUnavailable => AttemptOutcome::Unknown { retry_after_ms: 0 },
     }
 }

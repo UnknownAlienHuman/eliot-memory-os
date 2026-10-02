@@ -223,6 +223,7 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
         // share `Unavailable` here. Live migration paths keep their exact
         // outcome via `map_schema_bootstrap_error`.
         AdapterError::ProviderUnavailable
+        | AdapterError::ProviderRefused { .. }
         | AdapterError::AllocationContention { .. }
         | AdapterError::MigrationRequired
         | AdapterError::UnknownMigrationOutcome { .. } => {
