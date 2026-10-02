@@ -329,6 +329,30 @@ mod tests {
     }
 
     #[test]
+    fn one_cell_with_two_mutable_state_owners_is_refused() {
+        // Arm (the audit 5848256288 P2 shape): the real declaration gives
+        // `governor.daemon.composition` a second mutable-state owner row. The
+        // ref list is untouched, so the cell is still declared exactly once
+        // and nothing is malformed; only the "exactly one owner per mutable
+        // state" rule can catch a second owner, and it must refuse rather than
+        // accept the row and keep going.
+        let first = "  { cell = \"governor.daemon.composition\", state = \"daemon-composition\", owner = \"eliotd::DaemonComposition\" },\n";
+        let result = owners_of_mutated_manifest(
+            first,
+            &format!(
+                "{first}  {{ cell = \"governor.daemon.composition\", state = \
+                 \"daemon-composition-contender\", owner = \"eliotd::SecondComposition\" }},\n"
+            ),
+        );
+
+        assert_eq!(
+            result,
+            Err("capability cell governor.daemon.composition carries two mutable-state owners; exactly one owner per state is required".to_owned()),
+            "a second owner row for one cell must be refused by name"
+        );
+    }
+
+    #[test]
     fn real_generated_declarations_satisfy_the_facade_guard() {
         // The positive case is the shipped one: the real eliotd declaration
         // and its real contract projection agree, one owner per declared cell
