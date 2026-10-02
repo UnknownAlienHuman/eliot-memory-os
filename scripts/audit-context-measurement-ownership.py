@@ -709,6 +709,13 @@ class OwnershipResult:
     baseline_reconciled: int
     baseline_expected: int
     baseline_dispositions: dict[str, int]
+    #: The unresolved bucket split by the arm of
+    #: :func:`_derive_baseline_disposition` that produced it, each mapped to the
+    #: case refs it counted. Both projections read THIS field, so the text
+    #: summary and the JSON body cannot diverge. Keyed in the fixed
+    #: :data:`BASELINE_UNRESOLVED_ARMS` order, with an empty list for an arm no
+    #: row took, so an absent key is never ambiguous with a missing one.
+    baseline_unresolved_arms: dict[str, list[str]]
     unaccounted_candidate_count: int
     canonical_measurement_owners: tuple[str, ...]
     canonical_schema_owners: tuple[str, ...]
@@ -734,6 +741,32 @@ class OwnershipResult:
             "finding_count": self.finding_count,
         }
 
+    def unresolved_breakdown(self) -> dict[str, dict[str, Any]]:
+        """The ONE derived per-arm breakdown that both projections render.
+
+        Returned in the fixed :data:`BASELINE_UNRESOLVED_ARMS` order, so the text
+        summary and the JSON body iterate the same sequence in the same order
+        rather than each sorting a dict its own way. Every entry carries the
+        count, the case refs it counted and the plain-language meaning, and an
+        arm no row took is present with ``count == 0`` and an empty list -- an
+        absent key would be indistinguishable from a key that was never
+        measured, which is precisely the ambiguity this breakdown removes.
+
+        Deriving it here, once, from the immutable result's own
+        ``baseline_dispositions`` and ``baseline_unresolved_arms``, is what makes
+        the two projections provably non-divergent: there is one value and two
+        renderings of it, never two computations.
+        """
+        breakdown: dict[str, dict[str, Any]] = {}
+        for arm in BASELINE_UNRESOLVED_ARMS:
+            rows = list(self.baseline_unresolved_arms.get(arm, ()))
+            breakdown[arm] = {
+                "count": len(rows),
+                "rows": rows,
+                "meaning": BASELINE_UNRESOLVED_ARM_MEANING[arm],
+            }
+        return breakdown
+
     def result_body(self) -> dict[str, object]:
         return {
             "result_schema": self.result_schema,
@@ -756,6 +789,13 @@ class OwnershipResult:
             },
             "counts": self._counts(),
             "baseline_dispositions": dict(sorted(self.baseline_dispositions.items())),
+            # The per-arm breakdown of the unresolved bucket. It sits INSIDE the
+            # digested body, next to the tally it explains, so the JSON
+            # projection carries it under the same digest the text projection
+            # prints -- one immutable result, two renderings, and the
+            # explanation cannot be edited or dropped without changing the
+            # digest a consumer already accepted.
+            "baseline_unresolved": self.unresolved_breakdown(),
             "canonical_measurement_owners": list(self.canonical_measurement_owners),
             "canonical_schema_owners": list(self.canonical_schema_owners),
             "dependency_proofs": {
@@ -2440,6 +2480,10 @@ def evaluate(root: Path) -> OwnershipResult:
             # an honest all-zero: the artifact is malformed, not a tree whose
             # baseline happens to be empty.
             baseline_dispositions={d: 0 for d in BASELINE_DISPOSITIONS},
+            # Likewise no unresolved row was read, so every per-arm bucket is
+            # honestly empty rather than absent. The breakdown still renders, and
+            # still reconciles to the all-zero tally.
+            baseline_unresolved_arms={arm: [] for arm in BASELINE_UNRESOLVED_ARMS},
         )
 
     # The scan universe is the artifact's own declared case set: #866's own
@@ -3049,6 +3093,13 @@ def evaluate(root: Path) -> OwnershipResult:
     # before/after consumer EVIDENCE. Without it the derivation could only read
     # ``owner``/``status``/``classification`` off the row, which is precisely the
     # "owned means migrated" shortcut audit defect 5 names.
+    #
+    # The reconciliation returns BOTH the disposition tally and the per-arm
+    # breakdown of the unresolved bucket, measured in the same pass. Both are
+    # handed to ``_finalize`` so the one immutable result carries them together
+    # and both projections render that same pair -- the breakdown cannot drift
+    # from the tally it explains, because there is only one of each.
+    dispositions, unresolved_arms = _baseline_findings(rows, by_case, add, proven)
     return _finalize(
         root,
         findings,
@@ -3063,7 +3114,8 @@ def evaluate(root: Path) -> OwnershipResult:
         schema_sites=schema_sites,
         owner_sites=owner_sites,
         dependency_proofs=proven,
-        baseline_dispositions=_baseline_findings(rows, by_case, add, proven),
+        baseline_dispositions=dispositions,
+        baseline_unresolved_arms=unresolved_arms,
     )
 
 
@@ -3405,14 +3457,76 @@ def _derive_baseline_disposition(
     return "explicit-unresolved"
 
 
+#: The three arms of :func:`_derive_baseline_disposition` that can return
+#: ``explicit-unresolved``. This is a closed, internal read-side vocabulary that
+#: makes the silent ones NAMABLE in the per-arm breakdown: it introduces no
+#: disposition, no finding and no new row fact, it only labels which of the
+#: already-decided arms a counted row took. ``"reconciled"`` is the residual
+#: label for every row that is not unresolved (arms 2 and 3) and is not a fourth
+#: arm of the derivation.
+BASELINE_UNRESOLVED_ARMS: tuple[str, ...] = (
+    "unproven-owner-consumer",
+    "live-legacy-classification",
+    "unowned",
+)
+BASELINE_RECONCILED_ARM = "reconciled"
+
+#: What each unresolved arm MEANS, printed verbatim in the text summary so the
+#: tally reconciles to a reader with no access to the source. Wording is
+#: disclosure only: it asserts the already-measured fact, and changes no count.
+BASELINE_UNRESOLVED_ARM_MEANING: dict[str, str] = {
+    "unproven-owner-consumer": (
+        "by unproven-owner-consumer evidence (each named CONSUMER_EVIDENCE_MISSING)"
+    ),
+    "live-legacy-classification": (
+        "by live legacy classification (not a missing consumer dependency)"
+    ),
+    "unowned": "by unowned row (no owner, reported as INVENTORY_INCOMPLETE)",
+}
+
+
+def _unresolved_arm(
+    row: Mapping[str, Any],
+    proven: bool,
+) -> str:
+    """Which arm of :func:`_derive_baseline_disposition` made this row
+    ``explicit-unresolved``, decided by re-running that function's OWN
+    predicates in their OWN order.
+
+    This is a read-side labelling of an already-derived decision, not a second
+    derivation: the caller has the real ``disposition`` in hand and only asks
+    ``_unresolved_arm`` when it is exactly ``explicit-unresolved``, and the
+    three arms are mutually exclusive first-match predicates by construction, so
+    the arm named here is the one that fired. It is kept as its own function --
+    rather than folded into the derivation -- so the dispositions themselves
+    stay byte-for-byte what they were.
+
+    ``proven`` is the caller's already-measured
+    :func:`_canonical_reach_proven` answer for this row's own path, passed in so
+    the reach proof is measured once per row and the breakdown and the finding
+    gate cannot disagree about it.
+    """
+    if str(row["status"]) == "unresolved" or str(row["owner"]) == "unresolved":
+        return "unowned"
+    if str(row["classification"]) in _LIVE_LEGACY_CLASSIFICATIONS:
+        return "live-legacy-classification"
+    if not (str(row.get("item_scope", "production")) != "test" and proven):
+        return "unproven-owner-consumer"
+    # A row with a proven, on-path, non-live-legacy owner is reconciled, so the
+    # caller never reaches here with it; the label is returned rather than
+    # raising so a widened derivation fails as a visible arithmetic mismatch in
+    # the breakdown, not as a crash.
+    return BASELINE_RECONCILED_ARM
+
+
 def _baseline_findings(
     rows: list[dict[str, Any]],
     by_case: dict[str, dict[str, Any]],
     add: Any,
     dependency_proofs: Mapping[str, Mapping[str, Any]] | None = None,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Baseline reconciliation: every frozen baseline row must survive with an
-    explicit disposition. Returns the disposition tally.
+    explicit disposition. Returns ``(disposition tally, per-arm breakdown)``.
 
     An erased baseline row (removed requirement) is rejected. Every surviving
     row's disposition comes from :func:`_derive_baseline_disposition`, which
@@ -3427,6 +3541,23 @@ def _baseline_findings(
     canonical dependency also carries a ``CONSUMER_EVIDENCE_MISSING`` finding, so
     the reconciliation never quietly shrinks the canonical bucket: the row is
     counted once, as unresolved, and the missing conjunct is named per row.
+
+    The per-arm breakdown is the OTHER half of that same promise, and it is what
+    makes the tally reconcile to a reader holding only the output.
+    ``CONSUMER_EVIDENCE_MISSING`` is deliberately silent for the arm-1 and arm-2b
+    rows (see the gate comment below), so ``explicit-unresolved`` is deliberately
+    LARGER than the number of those findings. Without naming the silent rows a
+    reader cannot tell that difference apart from a miscount, and an independent
+    audit did exactly that. The breakdown therefore partitions the unresolved
+    bucket across :data:`BASELINE_UNRESOLVED_ARMS` and lists the case refs in
+    each, so ``sum(arm counts) == explicit-unresolved`` and
+    ``unproven-owner-consumer == #CONSUMER_EVIDENCE_MISSING`` are both checkable
+    from the output.
+
+    It is derived here, in the SAME single pass and from the SAME row facts that
+    derive the dispositions and emit the findings, so the two cannot describe
+    two different runs. No new measurement, no new rule and no new finding is
+    introduced: the counts and the case refs are facts the loop already had.
     """
     # --- The denominator must itself be complete before it can reconcile
     # anything.
@@ -3454,6 +3585,12 @@ def _baseline_findings(
         )
 
     dispositions: dict[str, int] = {d: 0 for d in BASELINE_DISPOSITIONS}
+    # The per-arm split of the unresolved bucket. Every arm is pre-seeded to an
+    # empty list, in the fixed :data:`BASELINE_UNRESOLVED_ARMS` order, so the
+    # projection is stable and shows an arm with zero rows as an explicit 0
+    # rather than omitting it -- a reader must be able to see that arm 1 is
+    # empty, not infer it from an absent key.
+    unresolved_arms: dict[str, list[str]] = {arm: [] for arm in BASELINE_UNRESOLVED_ARMS}
     lost = 0
     for case_ref, expected_owner in EXPECTED_BASELINE_ROWS:
         row = by_case.get(case_ref)
@@ -3503,14 +3640,52 @@ def _baseline_findings(
         # A row that could not demonstrate a canonical migration must say so out
         # loud. Without this the reconciliation would still be arithmetically
         # complete (the row is counted, once, as unresolved) while a reader of
-        # the tally alone could not tell WHY the canonical bucket shrank. The
-        # finding is emitted only for the arm-4 case -- a row the producer
-        # attributed but whose consumer evidence is absent -- and never for an
-        # arm-1 row, which is already reported as INVENTORY_INCOMPLETE.
+        # the tally alone could not tell WHY the canonical bucket shrank.
+        #
+        # The finding is emitted for exactly ONE of the three arms of
+        # :func:`_derive_baseline_disposition` that can return
+        # ``explicit-unresolved`` -- the arm-4 case, a row the producer
+        # attributed but whose CONSUMER dependency is unproven -- and is
+        # deliberately silent for the other two. All three are named here so the
+        # silence is documented rather than indistinguishable from a bug:
+        #
+        # * arm 1 (``status``/``owner`` unresolved): nobody owns the row, so
+        #   there is no owner whose dependency could be missing. It is already
+        #   reported as INVENTORY_INCOMPLETE by the producer's own coverage
+        #   verdict, and emitting here would double-report one fact.
+        # * arm 2b (``classification in _LIVE_LEGACY_CLASSIFICATIONS``): the
+        #   row is unresolved because the producer still classifies this span as
+        #   a live legacy local estimator, NOT because an owner lacks a proven
+        #   dependency. ``CONSUMER_EVIDENCE_MISSING`` means "this row's OWNER
+        #   lacks a proven canonical dependency"; for #704's own rows the owner
+        #   IS the canonical measurement port itself, so its reach is proven at
+        #   their own path and there is no missing consumer dependency to
+        #   report -- emitting one would assert a falsehood. These rows are
+        #   counted and NAMED in the per-arm ``baseline_unresolved`` breakdown
+        #   instead, which is what closes the reconciliation gap this silence
+        #   would otherwise leave.
+        # * arm 4: the only case the finding is for.
+        #
+        # The canonical reach is measured ONCE below and the single answer feeds
+        # both the finding gate and the per-arm label, so the named rows in the
+        # breakdown and the emitted findings cannot describe two different
+        # runs. ``_canonical_reach_proven`` is a pure read of the measured proof
+        # map, so measuring it for a row whose owner drifted is the same value
+        # the gate would have read; it adds no measurement, only one read that
+        # replaces two.
+        _proven, reach_reason = _canonical_reach_proven(
+            actual_owner, str(row["path"]), dependency_proofs
+        )
+        if disposition == "explicit-unresolved":
+            arm = _unresolved_arm(row, _proven)
+            if arm not in unresolved_arms:
+                raise OracleError(
+                    "DETERMINISTIC_INTERNAL_DEFECT",
+                    f"baseline row {case_ref} labelled unresolved by {arm!r}, which is "
+                    f"outside the closed set {sorted(unresolved_arms)}",
+                )
+            unresolved_arms[arm].append(case_ref)
         if disposition == "explicit-unresolved" and actual_owner == expected_owner:
-            _proven, reach_reason = _canonical_reach_proven(
-                actual_owner, str(row["path"]), dependency_proofs
-            )
             if not _proven:
                 add(
                     "CONSUMER_EVIDENCE_MISSING",
@@ -3546,7 +3721,37 @@ def _baseline_findings(
             f"baseline reconciliation covers {reconciled} + {lost} rows but the frozen "
             f"denominator holds {EXPECTED_BASELINE_COUNT}",
         )
-    return dispositions
+
+    # --- The per-arm breakdown must account for the WHOLE unresolved bucket.
+    #
+    # This is the invariant that makes the breakdown worth reporting. The arms
+    # are a partition of the ``explicit-unresolved`` rows and nothing else, so
+    # ``sum(len(rows per arm)) == dispositions["explicit-unresolved"]`` must hold
+    # exactly. A shortfall would mean a row was counted as unresolved without
+    # being attributable to any arm -- the reader is left holding an unexplained
+    # number, which is the very gap this breakdown exists to close. An excess
+    # would mean a row was labelled unresolved that the tally did not count, so
+    # the two projections would be describing different runs.
+    #
+    # No case ref may appear in two arms either: the arms are first-match, so a
+    # repeat would mean the labelling is not a partition.
+    breakdown_total = sum(len(refs) for refs in unresolved_arms.values())
+    unresolved_total = dispositions["explicit-unresolved"]
+    if breakdown_total != unresolved_total:
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"the per-arm unresolved breakdown accounts for {breakdown_total} rows but the "
+            f"tally counts {unresolved_total} explicit-unresolved rows",
+        )
+    every_ref = [ref for refs in unresolved_arms.values() for ref in refs]
+    if len(set(every_ref)) != len(every_ref):
+        repeated = sorted({ref for ref in every_ref if every_ref.count(ref) > 1})
+        raise OracleError(
+            "DETERMINISTIC_INTERNAL_DEFECT",
+            f"the per-arm unresolved breakdown repeats case identity(ies) {repeated}; the "
+            "arms are first-match and must partition the bucket",
+        )
+    return dispositions, unresolved_arms
 
 
 def _record(
@@ -3580,6 +3785,7 @@ def _finalize(
     schema_sites: list[dict[str, Any]],
     owner_sites: list[dict[str, Any]],
     baseline_dispositions: dict[str, int],
+    baseline_unresolved_arms: dict[str, list[str]] | None = None,
     dependency_proofs: dict[str, dict[str, Any]] | None = None,
 ) -> OwnershipResult:
     """Assemble the single immutable result, computing its digest over the
@@ -3625,6 +3831,30 @@ def _finalize(
         )
     dispositions = {d: int(baseline_dispositions[d]) for d in BASELINE_DISPOSITIONS}
 
+    # The per-arm breakdown is carried, not recomputed, for the same reason the
+    # tally is: it was measured in the ONE reconciliation pass inside
+    # :func:`evaluate` and must be reported from that pass. The keys are checked
+    # against the closed arm vocabulary and each list is copied, so the result
+    # cannot be mutated afterwards by anything that still holds a reference to
+    # the loop's accumulator.
+    if baseline_unresolved_arms is None:
+        # A caller that reconciled no row (malformed artifact, typed defect
+        # before the loop) reports the honest all-empty breakdown rather than
+        # inventing a split for rows that were never read.
+        unresolved_arms: dict[str, list[str]] = {arm: [] for arm in BASELINE_UNRESOLVED_ARMS}
+    else:
+        if set(baseline_unresolved_arms) != set(BASELINE_UNRESOLVED_ARMS):
+            raise OracleError(
+                "DETERMINISTIC_INTERNAL_DEFECT",
+                "the per-arm unresolved breakdown keys "
+                f"{sorted(baseline_unresolved_arms)} instead of the closed set "
+                f"{sorted(BASELINE_UNRESOLVED_ARMS)}",
+            )
+        unresolved_arms = {
+            arm: [str(ref) for ref in baseline_unresolved_arms[arm]]
+            for arm in BASELINE_UNRESOLVED_ARMS
+        }
+
     ordered = tuple(sorted(findings, key=lambda f: (f.code, f.case_ref, f.path, f.span_start)))
     result = OwnershipResult(
         result_schema=RESULT_SCHEMA,
@@ -3648,6 +3878,7 @@ def _finalize(
         baseline_reconciled=sum(dispositions.values()),
         baseline_expected=EXPECTED_BASELINE_COUNT,
         baseline_dispositions=dispositions,
+        baseline_unresolved_arms=unresolved_arms,
         unaccounted_candidate_count=len(unaccounted),
         canonical_measurement_owners=tuple(sorted({s["path"] for s in owner_sites})),
         canonical_schema_owners=tuple(sorted({s["path"] for s in schema_sites})),
@@ -3700,6 +3931,30 @@ def render_text(result: OwnershipResult) -> str:
         f"  baseline             = {result.baseline_reconciled}/{result.baseline_expected} "
         + " ".join(f"{k}={v}" for k, v in sorted(result.baseline_dispositions.items()))
     )
+    # The per-arm breakdown of the unresolved bucket, rendered from the SAME
+    # ``unresolved_breakdown()`` value the JSON body serialises -- one derived
+    # value, two projections, so neither can disagree with the other or with the
+    # tally above.
+    #
+    # It exists because ``CONSUMER_EVIDENCE_MISSING`` is deliberately silent for
+    # the arm-1 and arm-2b rows, so the ``explicit-unresolved`` count is
+    # deliberately LARGER than the number of those findings. Naming the silent
+    # rows here is what lets a reader reconcile
+    # ``explicit-unresolved == (named findings) + (rows named below)`` from this
+    # output alone, with no access to the source and no way to mistake the
+    # difference for a miscount.
+    breakdown = result.unresolved_breakdown()
+    terms = [
+        f"{entry['count']} {entry['meaning']}" for entry in breakdown.values()
+    ]
+    lines.append(f"  baseline_unresolved   = {result.baseline_dispositions['explicit-unresolved']}")
+    for index, term in enumerate(terms):
+        lines.append(f"                        {'+ ' if index == 0 else '  '}{term}")
+    for arm, entry in breakdown.items():
+        rows = entry["rows"]
+        if not rows:
+            continue
+        lines.append(f"    baseline_unresolved[{arm}] = {rows}")
     lines.append(f"  unaccounted          = {result.unaccounted_candidate_count}")
     lines.append(f"  measurement_owners   = {list(result.canonical_measurement_owners)}")
     lines.append(f"  schema_owners        = {list(result.canonical_schema_owners)}")
@@ -3834,6 +4089,7 @@ def run_self_test() -> int:
         baseline_reconciled=31,
         baseline_expected=31,
         baseline_dispositions={d: 0 for d in BASELINE_DISPOSITIONS},
+        baseline_unresolved_arms={arm: [] for arm in BASELINE_UNRESOLVED_ARMS},
         unaccounted_candidate_count=2,
         canonical_measurement_owners=("crates/smart/eliot-context-measurement/src/stu.rs",),
         canonical_schema_owners=(CANONICAL_SCHEMA_PATH,),
@@ -4223,6 +4479,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_reconciled=0,
             baseline_expected=EXPECTED_BASELINE_COUNT,
             baseline_dispositions={d: 0 for d in BASELINE_DISPOSITIONS},
+            baseline_unresolved_arms={arm: [] for arm in BASELINE_UNRESOLVED_ARMS},
             unaccounted_candidate_count=0,
             canonical_measurement_owners=(),
             canonical_schema_owners=(),

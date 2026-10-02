@@ -2398,6 +2398,19 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         ``canonical-port-owner`` record that names NO declared ``source_paths``
         proves nothing at any path -- a proof lacking the scope must not fall
         back to owner-scoping.
+
+        The THIRD limb is the tally's own internal reconciliation. Every
+        ``explicit-unresolved`` row is dispositioned by exactly one arm of
+        :func:`oracle._derive_baseline_disposition`, and
+        ``CONSUMER_EVIDENCE_MISSING`` is deliberately silent for two of those
+        arms (arm 1 and arm 2b), so the unresolved bucket is deliberately larger
+        than the number of those findings. The per-arm breakdown is what makes
+        that difference readable instead of merely present, and this case
+        asserts it reconciles: the arms partition the bucket, the arm-4 rows are
+        exactly the named findings, the arm-2b rows are counted and identifiable
+        and carry no finding (their owner is the canonical port itself, so no
+        consumer dependency is missing), and both projections of the one
+        immutable result carry the same numbers under the same digest.
         """
         with _tree() as tree:
             tree.copy_producer()
@@ -2724,6 +2737,199 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
                 canonical,
                 "at least one baseline row must reconcile as a canonical consumer, "
                 "or the canonical bucket has silently emptied",
+            )
+
+            # --- The unresolved bucket must RECONCILE against its own output.
+            #
+            # ``CONSUMER_EVIDENCE_MISSING`` is deliberately silent for the arm-1
+            # and arm-2b rows, so ``explicit-unresolved`` is deliberately LARGER
+            # than the number of those findings. Before the per-arm breakdown
+            # existed nothing in either projection named the silent rows, so the
+            # difference was indistinguishable from a miscount -- which is
+            # exactly how an independent audit read ``24 - 22 = 2`` as a defect.
+            # This block asserts the difference is fully accounted for, and that
+            # the arm-2b rows are counted AND identifiable, from the returned
+            # result alone.
+            #
+            # Every value asserted here is DERIVED from the real run and from the
+            # real producer rows -- the arm label is re-derived by calling the
+            # real :func:`oracle._derive_baseline_disposition` and the real
+            # :func:`oracle._unresolved_arm` on the real stored rows with the
+            # real measured proofs. No constant is copied and nothing is
+            # hard-coded to make this pass: if the tree changed such that a
+            # different row took arm 2b, these assertions follow it.
+            breakdown = result.unresolved_breakdown()
+            self.assertEqual(
+                list(breakdown),
+                list(oracle.BASELINE_UNRESOLVED_ARMS),
+                "the breakdown must carry exactly the closed arm vocabulary, in the "
+                f"fixed order, so an absent key is never ambiguous with a missing one: "
+                f"{list(breakdown)}",
+            )
+            self.assertEqual(
+                sum(entry["count"] for entry in breakdown.values()),
+                result.baseline_dispositions["explicit-unresolved"],
+                "every explicit-unresolved row must be accounted for by exactly one "
+                "arm: the arms are a partition of the bucket, not a subset of it",
+            )
+            # Each arm's own list must match its own count, or a reader counting
+            # the named rows would get a different number from the summary.
+            for arm, entry in breakdown.items():
+                self.assertEqual(
+                    entry["count"],
+                    len(entry["rows"]),
+                    f"arm {arm} counts {entry['count']} rows but names {len(entry['rows'])}",
+                )
+                self.assertTrue(
+                    entry["meaning"],
+                    f"arm {arm} must state what it means, or the count still cannot be "
+                    "reconciled by a reader with no access to the source",
+                )
+            # Partition, not multiset: no case ref may be claimed twice.
+            named_refs = [ref for entry in breakdown.values() for ref in entry["rows"]]
+            self.assertEqual(
+                len(named_refs),
+                len(set(named_refs)),
+                f"a case ref was claimed by two arms: {sorted(named_refs)}",
+            )
+            # The arm-4 bucket IS the named findings, one for one. This is the
+            # relation the gate's own comment used to leave unstated.
+            named_findings = _finding_codes(result, "CONSUMER_EVIDENCE_MISSING")
+            self.assertEqual(
+                breakdown["unproven-owner-consumer"]["count"],
+                len(named_findings),
+                "the unproven-owner-consumer arm must be exactly the rows that carry "
+                "a CONSUMER_EVIDENCE_MISSING finding",
+            )
+            self.assertEqual(
+                sorted(breakdown["unproven-owner-consumer"]["rows"]),
+                sorted(finding.case_ref for finding in named_findings),
+                "every arm-4 row must be named by a finding and every such finding "
+                "must name an arm-4 row",
+            )
+            # Re-derive each frozen row's arm from the REAL derivation and the
+            # REAL measured proofs, and require the returned breakdown to match
+            # arm for arm. This is the check that the breakdown is a projection
+            # of the real dispositions rather than a second, drifting tally.
+            derived: dict[str, list[str]] = {
+                arm: [] for arm in oracle.BASELINE_UNRESOLVED_ARMS
+            }
+            for case_ref, _owner in oracle.EXPECTED_BASELINE_ROWS:
+                row = next(r for r in live_rows if str(r["case_ref"]) == case_ref)
+                if (
+                    oracle._derive_baseline_disposition(
+                        row, result.dependency_proofs
+                    )
+                    != "explicit-unresolved"
+                ):
+                    continue
+                derived[
+                    oracle._unresolved_arm(
+                        row,
+                        oracle._canonical_reach_proven(
+                            str(row["owner"]),
+                            str(row["path"]),
+                            result.dependency_proofs,
+                        )[0],
+                    )
+                ].append(case_ref)
+            self.assertEqual(
+                {arm: sorted(refs) for arm, refs in derived.items()},
+                {arm: entry["rows"] for arm, entry in breakdown.items()},
+                "the reported breakdown must equal the arms re-derived from the real "
+                "dispositions and the real measured proofs",
+            )
+            # The arm-2b rows must be COUNTED and IDENTIFIABLE, and they must
+            # be #704's own rows: #704 IS the canonical measurement owner, so its
+            # reach is proven at their own path and no consumer dependency is
+            # missing. Asserting the reason is what stops a future writer from
+            # "fixing" this silence by emitting a finding that would assert a
+            # falsehood.
+            live_legacy = breakdown["live-legacy-classification"]["rows"]
+            self.assertTrue(
+                live_legacy,
+                "the live-legacy-classification arm must be exercised by this tree, or "
+                "the arm-2b silence this case reconciles is not under test at all",
+            )
+            for case_ref in live_legacy:
+                row = next(r for r in live_rows if str(r["case_ref"]) == case_ref)
+                self.assertIn(
+                    str(row["classification"]),
+                    oracle._LIVE_LEGACY_CLASSIFICATIONS,
+                    f"{case_ref} is named by the live-legacy arm but its classification "
+                    f"{row['classification']!r} is not a live legacy classification",
+                )
+                self.assertTrue(
+                    oracle._canonical_reach_proven(
+                        str(row["owner"]), str(row["path"]), result.dependency_proofs
+                    )[0],
+                    f"{case_ref} exits at arm 2b, whose owner is the canonical port "
+                    "itself: emitting CONSUMER_EVIDENCE_MISSING for it would assert a "
+                    "missing dependency that is not missing",
+                )
+                self.assertNotIn(
+                    case_ref,
+                    [finding.case_ref for finding in named_findings],
+                    f"{case_ref} is an arm-2b row and must NOT carry a "
+                    "CONSUMER_EVIDENCE_MISSING finding",
+                )
+            # The arm-2b rows are counted in the unresolved tally, exactly once
+            # each -- neither dropped nor double-counted to hide the difference.
+            self.assertEqual(
+                len(live_legacy),
+                result.baseline_dispositions["explicit-unresolved"]
+                - len(named_findings),
+                "explicit-unresolved must exceed the named findings by exactly the "
+                "arm-2b rows, and by nothing else",
+            )
+            # The same reconciliation must be readable from BOTH projections of
+            # the ONE immutable result: the numbers a reader takes from the text
+            # summary and from the JSON body must be the same numbers.
+            text_projection = oracle.render_text(result)
+            json_projection = json.loads(oracle.render_json(result))
+            self.assertEqual(
+                json_projection["result_digest"], result.result_digest
+            )
+            self.assertIn(
+                f"result_digest        = {result.result_digest}", text_projection
+            )
+            for arm, entry in breakdown.items():
+                if not entry["rows"]:
+                    continue
+                self.assertEqual(
+                    json_projection["baseline_unresolved"][arm]["rows"],
+                    entry["rows"],
+                    f"the JSON projection must name the same {arm} rows as the result",
+                )
+                self.assertIn(
+                    f"baseline_unresolved[{arm}] = {entry['rows']}", text_projection
+                )
+            # The same term text must appear in BOTH projections: the text
+            # summary prints it, and the JSON body carries the identical
+            # ``meaning`` string beside the identical count. Two renderings of
+            # one derived value, so they cannot drift.
+            json_terms = " | ".join(
+                f"{v['count']} {v['meaning']}"
+                for v in json_projection["baseline_unresolved"].values()
+            )
+            for entry in breakdown.values():
+                term = f"{entry['count']} {entry['meaning']}"
+                self.assertIn(
+                    term,
+                    text_projection,
+                    "the text summary must print every arm's count and meaning",
+                )
+                self.assertIn(
+                    term,
+                    json_terms,
+                    "the JSON projection must carry the same term text as the text "
+                    f"summary: {term}",
+                )
+            self.assertEqual(
+                sum(v["count"] for v in json_projection["baseline_unresolved"].values()),
+                json_projection["baseline_dispositions"]["explicit-unresolved"],
+                "the JSON projection's own breakdown must reconcile against the JSON "
+                "projection's own tally, not only against the in-memory result",
             )
 
         # Now erase one frozen requirement.
