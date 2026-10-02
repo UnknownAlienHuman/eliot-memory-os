@@ -1531,6 +1531,13 @@ pub const MAX_LIFECYCLE_RETAINED_OPERATIONS: usize = 1024;
 /// correlation of the same operation, so binding those fields would make every
 /// legitimate retry hash as a different request and surface
 /// [`ProtocolError::ReplayConflict`] instead of the recorded disposition.
+///
+/// The fence and the payload are bound **by reference**, not cloned: the
+/// projection only needs their serde shapes, and serde's `Serialize for &T`
+/// delegates to the owned value's own `Serialize`, so a borrowed element
+/// serializes to exactly the same bytes a cloned one would. Cloning a whole
+/// `ProtocolPayload` to hash it would duplicate every allocation in the effect
+/// being bound for no canonical difference.
 fn lifecycle_canonical_request_bytes(frame: &Frame) -> Result<Vec<u8>, ProtocolError> {
     let identity = frame
         .request_identity
@@ -1542,8 +1549,8 @@ fn lifecycle_canonical_request_bytes(frame: &Frame) -> Result<Vec<u8>, ProtocolE
     canonical_json_bytes(&(
         LIFECYCLE_CANONICAL_ENCODING,
         frame.message_type,
-        identity.request.state_fence,
-        frame.payload,
+        &identity.request.state_fence,
+        &frame.payload,
     ))
     .map_err(|error| ProtocolError::Json(error.to_string()))
 }
@@ -8625,26 +8632,23 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_snapshot_roundtrip_preserves_the_idempotency_record()
-    -> Result<(), ProtocolError> {
+    fn lifecycle_snapshot_roundtrip_preserves_the_idempotency_record() -> Result<(), ProtocolError>
+    {
         let quiesce = lifecycle_frame(
             MessageType::Quiesce,
             "idem-quiesce",
             serde_json::json!({"command":"quiesce"}),
         )?;
         let mut lifecycle = ModuleLifecycle::new();
-        assert_eq!(
-            lifecycle.apply(&quiesce)?,
-            ModuleControlEffect::Quiesced
-        );
+        assert_eq!(lifecycle.apply(&quiesce)?, ModuleControlEffect::Quiesced);
 
         // The snapshot is the durable surface: it must survive a JSON
         // roundtrip, not just a clone, because the readback crosses a process
         // boundary.
-        let encoded =
-            serde_json::to_string(&lifecycle.snapshot()).map_err(|error| ProtocolError::Json(error.to_string()))?;
-        let decoded: ModuleLifecycleSnapshot =
-            serde_json::from_str(&encoded).map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let encoded = serde_json::to_string(&lifecycle.snapshot())
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        let decoded: ModuleLifecycleSnapshot = serde_json::from_str(&encoded)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
         let mut restored = ModuleLifecycle::restore(decoded)?;
 
         assert_eq!(restored.phase(), ModuleLifecyclePhase::Quiesced);
@@ -8654,10 +8658,7 @@ mod tests {
         );
         // The retry replays the recorded disposition; it does not move a phase
         // that already moved and it does not admit a second effect.
-        assert_eq!(
-            restored.apply(&quiesce)?,
-            ModuleControlEffect::Quiesced
-        );
+        assert_eq!(restored.apply(&quiesce)?, ModuleControlEffect::Quiesced);
 
         // A lifecycle rebuilt from the snapshot still refuses new Execute work
         // because the quiesced phase travelled with the records.
@@ -8705,10 +8706,7 @@ mod tests {
             lifecycle.apply(&first)?,
             ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::New(_))
         ));
-        assert_eq!(
-            lifecycle.apply(&other),
-            Err(ProtocolError::ReplayConflict)
-        );
+        assert_eq!(lifecycle.apply(&other), Err(ProtocolError::ReplayConflict));
         // A pure transport retry of the same request is still a replay: the
         // canonical request hash excludes the correlation and the clock.
         let mut retry = first.clone();
@@ -8833,10 +8831,7 @@ mod tests {
             serde_json::json!({"command":"fatal"}),
         )?;
         let mut lifecycle = ModuleLifecycle::new();
-        assert_eq!(
-            lifecycle.fatal(&fatal)?,
-            ModuleControlEffect::FatalRecorded
-        );
+        assert_eq!(lifecycle.fatal(&fatal)?, ModuleControlEffect::FatalRecorded);
         assert_eq!(lifecycle.phase(), ModuleLifecyclePhase::Failed);
         assert_eq!(
             lifecycle.fatal(&fatal),
@@ -8847,7 +8842,7 @@ mod tests {
         );
         // The Failed phase is the durable fence, not inferred process state: a
         // lifecycle rebuilt from the snapshot still refuses the fatal.
-        let restored = ModuleLifecycle::restore(lifecycle.snapshot())?;
+        let mut restored = ModuleLifecycle::restore(lifecycle.snapshot())?;
         assert_eq!(restored.phase(), ModuleLifecyclePhase::Failed);
         assert!(matches!(
             restored.fatal(&fatal),
@@ -8868,8 +8863,8 @@ mod tests {
     }
 
     #[test]
-    fn execute_replay_reports_duplicate_over_the_recorded_request_id()
-    -> Result<(), ProtocolError> {
+    fn execute_replay_reports_duplicate_over_the_recorded_request_id() -> Result<(), ProtocolError>
+    {
         let request_id = RequestId::new("request-1")?;
         let mut lifecycle = ModuleLifecycle::new();
         let execute = frame()?;
