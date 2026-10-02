@@ -39,6 +39,11 @@ mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
 mod capability_evidence_commit;
+/// I1.9 Capability Registry: the Governor-owned composite capability
+/// projection. This is the only owner of the usability/admission view; it has
+/// no lifecycle ownership and cannot infer process truth or authority merely
+/// from route availability.
+pub mod capability_registry;
 mod cold_start_surface;
 mod cold_start_trigger;
 mod composition;

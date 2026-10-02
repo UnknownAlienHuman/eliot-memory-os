@@ -1786,18 +1786,14 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::WorkerReplayAckMismatch { .. } => mismatch("worker_replay_ack"),
         OrsError::RecoverySnapshotMoved { .. } => mismatch("recovery_inventory_revision"),
         // An ORS field rejection already has this crate's exact refusal shape.
-        OrsError::InvalidField { field, reason } => {
-            KernelServiceError::InvalidField { field, reason }
-        }
-        // The free-form classes: their payload is text in the source type, so
-        // this is the only place a string is honest.
+        OrsError::InvalidField { field, reason } => invalid_field_passthrough(field, reason),
         OrsError::Contract(_)
         | OrsError::CanonicalEvidence(_)
         | OrsError::MigrationRequired { .. }
         | OrsError::IntegrityProblem { .. }
         | OrsError::Storage(_)
         | OrsError::Encoding(_)
-        | OrsError::StagingNotDurable(_) => KernelServiceError::Platform(error.to_string()),
+        | OrsError::StagingNotDurable(_) => free_form_refusal(error),
         // Stale or unbound lease lineage is a presented-record mismatch.
         OrsError::SupervisionLeaseStaleRevision => mismatch("lease_revision_stale"),
         OrsError::SupervisionLeaseBindingMismatch => mismatch("lease_binding"),
@@ -1821,6 +1817,7 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::DuplicateConflict => invalid_field("durable_state_duplicate"),
         OrsError::AlreadyTerminalWrite(_) => invalid_field("reservation_already_terminal"),
         OrsError::ReservationNotFound => invalid_field("reservation_missing"),
+        OrsError::GenerationRegistryRecordNotFound => generation_registry_record_refusal(),
         OrsError::InvalidTransition => invalid_field("reservation_lifecycle"),
         OrsError::PredecessorPending => invalid_field("ordering_scope_predecessor"),
         OrsError::ScopeRecoveryRequired => invalid_field("ordering_scope_reconciliation"),
@@ -1894,4 +1891,31 @@ fn invalid_field(field: &'static str) -> KernelServiceError {
         field,
         reason: "rejected by the durable ORS owner",
     }
+}
+
+/// Projects an ORS field rejection onto the crate's identical refusal shape.
+///
+/// [`OrsError::InvalidField`] already carries both values, so they map across
+/// verbatim instead of being replaced by this module's shared reason.
+fn invalid_field_passthrough(field: &'static str, reason: &'static str) -> KernelServiceError {
+    KernelServiceError::InvalidField { field, reason }
+}
+
+/// Names an absent I1.9 Generation Registry row on the crate's typed field refusal.
+///
+/// An absent row is a missing durable record, not a presented-record mismatch:
+/// the ORS states it holds no record for the key, and grants nothing to
+/// compare an epoch or fence against. It keeps its own `field`, so it stays
+/// distinguishable from every other refusal this module reports.
+fn generation_registry_record_refusal() -> KernelServiceError {
+    invalid_field("generation_registry_record_missing")
+}
+
+/// Projects one free-form ORS refusal onto [`KernelServiceError::Platform`].
+///
+/// The free-form classes' payload is text in the source type, so this is the
+/// only place a string is honest: there is nothing typed left to preserve in
+/// them.
+fn free_form_refusal(error: &OrsError) -> KernelServiceError {
+    KernelServiceError::Platform(error.to_string())
 }

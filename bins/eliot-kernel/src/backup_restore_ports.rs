@@ -2298,6 +2298,12 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
         },
         OrsError::UnknownReceiptCannotResolve
         | OrsError::ReservationNotFound
+        // I1.9 (#1883): the Generation Registry holds no record for the requested
+        // (module_id, generation) key. That is a not-found for an owned record, the
+        // same cause class as `ReservationNotFound` above, so it takes that arm's
+        // disposition rather than a new seam variant: the restore cannot state what
+        // generation was active, and an absent record is not evidence that none ran.
+        | OrsError::GenerationRegistryRecordNotFound
         | OrsError::PredecessorPending
         | OrsError::StagingNotDurable(_)
         | OrsError::StagingCommitOutcomeUnknown { .. } => BackupError::RestoreRollbackRequired,
