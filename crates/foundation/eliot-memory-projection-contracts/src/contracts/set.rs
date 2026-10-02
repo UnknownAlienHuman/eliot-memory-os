@@ -7,6 +7,14 @@
 //! per-disposition flag only: a cue hit never promotes a record into
 //! `applicable`, and exclusion always names the rule that excluded the
 //! record, never the cue hit itself.
+//!
+//! The set is independently deserializable, so it carries the proof ceiling
+//! for a result it cannot fully recheck: the exact omission and frontier
+//! identities stay on the [`MemoryProjectionBatch`] that produced it, and a
+//! verdict that accounts for less than its known denominator is admissible
+//! only while it declares the revalidation that incomplete state requires.
+//! [`validate_against_batch`](ApplicableMemorySet::validate_against_batch) is
+//! the single owner of the join between the two.
 
 use std::collections::BTreeSet;
 
@@ -14,7 +22,7 @@ use eliot_contracts::ArtifactId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::batch::DenominatorState;
+use crate::contracts::batch::{DenominatorState, MemoryProjectionBatch};
 use crate::contracts::error::MemoryProjectionError;
 use crate::contracts::record::{MemoryKind, MemoryRole, MemoryScopeBinding};
 
@@ -160,6 +168,13 @@ impl ExcludedMemory {
 }
 
 /// Task-local applicability verdict over one projection batch.
+///
+/// The frozen set shape carries disposition handles and the proof-ceiling
+/// flags only. Exact omission and frontier identities remain owned by the
+/// [`MemoryProjectionBatch`] that produced this verdict, so a standalone set
+/// cannot recheck a lossy remainder and must never be read as a complete
+/// coverage artifact; [`validate_against_batch`](Self::validate_against_batch)
+/// is the join that rechecks the verdict against that batch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicableMemorySet {
@@ -182,8 +197,18 @@ pub struct ApplicableMemorySet {
 }
 
 impl ApplicableMemorySet {
-    /// Validate set shape: binding, handle uniqueness across both lists, and
-    /// exclusion reasons.
+    /// Validate set shape, handle uniqueness, exclusion reasons, and the
+    /// verdict's own coverage ceiling.
+    ///
+    /// A known denominator is required: an applicability verdict states which
+    /// members of an observed population it covers, and a verdict over an
+    /// unknown population is not a verdict. The disposition volume may fall
+    /// short of the denominator only while `revalidation_required` declares
+    /// that incomplete state, which is the proof ceiling this frozen shape can
+    /// actually carry: it holds no omission or frontier identity to recheck the
+    /// shortfall against. A verdict that both claims the exact denominator and
+    /// closes revalidation while accounting for less is refused here rather
+    /// than reconciled later by whichever consumer happens to read it.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(MemoryProjectionError::VersionMismatch);
@@ -207,6 +232,88 @@ impl ApplicableMemorySet {
                     value: record.handle.as_str().to_owned(),
                 });
             }
+        }
+        let accounted = self
+            .applicable
+            .len()
+            .checked_add(self.excluded.len())
+            .ok_or(MemoryProjectionError::CoverageMismatch {
+                reason: "set disposition volume overflows",
+            })?;
+        if self.truncated && !self.revalidation_required {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "a truncated verdict must require revalidation",
+            });
+        }
+        let DenominatorState::Known { total } = &self.denominator else {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "an applicability verdict requires a known denominator",
+            });
+        };
+        if accounted > *total {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "set dispositions exceed the known denominator",
+            });
+        }
+        if !self.revalidation_required && accounted != *total {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "a closed verdict must account for the exact known denominator",
+            });
+        }
+        Ok(())
+    }
+
+    /// Revalidate this verdict against the exact batch it describes.
+    ///
+    /// [`validate`](Self::validate) proves the verdict is internally coherent
+    /// and carries an honest proof ceiling; this is the join that proves the
+    /// verdict is *about* that batch. It revalidates the batch, compares the
+    /// batch's own coverage echoes, and requires the disposition handles to
+    /// equal exactly the batch record handles, so a shape-valid verdict
+    /// cannot be paired with another read's denominator or truncation posture,
+    /// and no projected record can be left without a disposition or given a
+    /// disposition for a record the batch never carried.
+    ///
+    /// The repeated per-entry `kind` and `roles` are deliberately not
+    /// compared here. They are echoes, not authority: the batch record is the
+    /// canonical identity and consumers must derive from it, so a verdict
+    /// that repeats a stale `kind` is wrong at the consumer that reads it, not
+    /// at this join. The batch also owns the omitted and deferred identities;
+    /// nothing here reconstructs or re-derives them.
+    pub fn validate_against_batch(
+        &self,
+        batch: &MemoryProjectionBatch,
+    ) -> Result<(), MemoryProjectionError> {
+        self.validate()?;
+        batch.validate()?;
+        if self.binding != batch.binding
+            || self.denominator != batch.coverage.denominator
+            || self.truncated != batch.coverage.truncated
+            || self.revalidation_required != batch.coverage.revalidation_required
+        {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "set coverage echoes do not match the bound batch",
+            });
+        }
+        let batch_handles: BTreeSet<&str> = batch
+            .records
+            .iter()
+            .map(|record| record.handle.as_str())
+            .collect();
+        let dispositions: BTreeSet<&str> = self
+            .applicable
+            .iter()
+            .map(|entry| entry.handle.as_str())
+            .chain(self.excluded.iter().map(|entry| entry.handle.as_str()))
+            .collect();
+        if dispositions.len() != batch_handles.len()
+            || batch_handles
+                .iter()
+                .any(|handle| !dispositions.contains(handle))
+        {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "set dispositions must equal exactly the bound batch record handles",
+            });
         }
         Ok(())
     }

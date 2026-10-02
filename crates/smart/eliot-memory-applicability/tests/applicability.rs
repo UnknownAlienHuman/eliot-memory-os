@@ -262,6 +262,7 @@ fn missing_denominator_fails_closed() {
 #[test]
 fn truncation_and_revalidation_echo_to_the_set() {
     let mut candidate = request(vec![record("mem-1")]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 2 };
     candidate.batch.coverage.truncated = true;
     candidate.batch.coverage.frontier = vec!["resume-after-mem-1".to_owned()];
     candidate.batch.coverage.revalidation_required = true;
@@ -269,6 +270,99 @@ fn truncation_and_revalidation_echo_to_the_set() {
     assert!(set.truncated);
     assert!(set.revalidation_required);
     assert_eq!(set.applicable.len(), 1);
+    // The recovery identities stay on the batch this operation consumed; the
+    // verdict carries only the ceiling that says the result is incomplete.
+    assert_eq!(
+        candidate.batch.coverage.frontier,
+        vec!["resume-after-mem-1"]
+    );
+    set.validate()
+        .expect("the incomplete verdict declares its proof ceiling");
+}
+
+#[test]
+fn unaccounted_known_remainder_fails_before_evaluation() {
+    // The empty/total-one counterexample: a batch that declares one observed
+    // record, projects none of it, and neither omits nor defers it.
+    let mut candidate = request(vec![]);
+    candidate.batch.coverage.denominator = DenominatorState::Known { total: 1 };
+    let error = evaluate_applicability(&candidate)
+        .expect_err("an unaccounted known remainder must fail closed");
+    assert!(matches!(
+        error,
+        eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. }
+        )
+    ));
+}
+
+#[test]
+fn duplicate_and_overlapping_recovery_identities_are_refused() {
+    let mut duplicated = request(vec![record("mem-1")]);
+    duplicated.batch.coverage.denominator = DenominatorState::Known { total: 3 };
+    duplicated.batch.coverage.revalidation_required = true;
+    duplicated.batch.coverage.omissions = vec![
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "fence-mismatch".to_owned(),
+        },
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-2"),
+            reason: "scope-mismatch".to_owned(),
+        },
+    ];
+    assert!(matches!(
+        evaluate_applicability(&duplicated),
+        Err(eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+        ))
+    ));
+
+    let mut overlapping = request(vec![record("mem-1")]);
+    overlapping.batch.coverage.denominator = DenominatorState::Known { total: 2 };
+    overlapping.batch.coverage.revalidation_required = true;
+    overlapping.batch.coverage.omissions = vec![
+        eliot_memory_projection_contracts::CoverageOmission {
+            handle: aid("mem-1"),
+            reason: "fence-mismatch".to_owned(),
+        },
+    ];
+    assert!(matches!(
+        evaluate_applicability(&overlapping),
+        Err(eliot_memory_applicability::ApplicabilityError::Projection(
+            eliot_memory_projection_contracts::MemoryProjectionError::Duplicate { .. }
+        ))
+    ));
+}
+
+#[test]
+fn a_standalone_verdict_cannot_claim_a_short_closed_denominator() {
+    // The set is independently deserializable, so this proves the ceiling is
+    // checked on the verdict itself, not only while the evaluator runs.
+    let set = evaluate(vec![record("mem-1")]);
+    set.validate().expect("the exact verdict is closed and complete");
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] = serde_json::json!({ "state": "KNOWN", "total": 2 });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    assert!(matches!(
+        decoded.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_standalone_verdict_over_an_unknown_denominator_fails_closed() {
+    let set = evaluate(vec![record("mem-1")]);
+    let mut wire = serde_json::to_value(&set).expect("serialize set");
+    wire["denominator"] =
+        serde_json::json!({ "state": "UNKNOWN", "reason": "read side could not count" });
+    let decoded: ApplicableMemorySet =
+        serde_json::from_value(wire).expect("deserialize set independently");
+    assert!(matches!(
+        decoded.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch { .. })
+    ));
 }
 
 #[test]
