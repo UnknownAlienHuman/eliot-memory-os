@@ -23,26 +23,40 @@ use super::super::{
 // implemented here (#984 still open).
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never digests,
-// paths, lease/nonce material, or arbitrary error text — so bounding limits
+// the semantic owner through the family's ONE closed typed observation
+// (`WatchdogPublicationObservation` + `watchdog_publication_render_bound` in
+// the parent), so a decoded publication is recorded with the exact
+// installation, generation, scope, lease, ORS record, ORS receipt and lease
+// revision it holds, and a boundary that holds none keeps the explicit
+// unavailable disposition. Never a digest over secret-bearing bytes, a raw
+// path, lease/nonce material, or arbitrary error text, so bounding limits
 // size, not sensitivity (I15.4). Sink outcome never alters
 // result/order/status/cleanup. There is no mutable global dedup cache and no
 // terminal guard here: the single designated terminal per failed operation
 // stays with the outer #891/#893 operation that owns the failure decision;
-// these phase observations correlate by stage order only and never emit a
-// terminal.
+// these phase observations never emit a terminal.
 #[cfg(windows)]
 fn watchdog_observation_note_event_log_unavailable() {
     let _ = super::super::windows_event_log::event_log_sink_status();
 }
 
 #[cfg(windows)]
-fn watchdog_observation_observe(detail: &str) {
+fn watchdog_observation_observe(observation: &super::WatchdogPublicationObservation<'_>) {
     watchdog_observation_note_event_log_unavailable();
-    super::super::host_diagnostics::observe_entrypoint_with_detail(
-        super::super::host_diagnostics::EntrypointStage::Startup,
-        detail,
-    );
+    super::watchdog_publication_render_bound(observation, |detail| {
+        super::super::host_diagnostics::observe_entrypoint_with_detail(
+            super::super::host_diagnostics::EntrypointStage::Startup,
+            detail,
+        );
+    });
+}
+
+/// The decoding child's own use of the family observation: a boundary reached
+/// before the marker is decoded holds no identity and stays explicitly
+/// unavailable.
+#[cfg(windows)]
+fn watchdog_observation_unavailable(label: &'static str) {
+    watchdog_observation_observe(&super::WatchdogPublicationObservation::unavailable(label));
 }
 
 #[cfg(windows)]
@@ -68,73 +82,94 @@ pub(super) fn decode_watchdog_publication_observation(
         .bytes(WATCHDOG_ADMISSION_FILE_NAME)
         .ok_or_else(|| {
             // WORK_UNIT_CASE: 979/3 — absent publication child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child absent");
+            watchdog_observation_unavailable("watchdog.publication child absent");
             HostError::RecoveryRequired("Watchdog admission child is absent".to_owned())
         })?;
     let lease_bytes = observation
         .bytes(SUPERVISION_LEASE_FILE_NAME)
         .ok_or_else(|| {
             // WORK_UNIT_CASE: 979/3 — absent publication child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child absent");
+            watchdog_observation_unavailable("watchdog.publication child absent");
             HostError::RecoveryRequired("Watchdog lease child is absent".to_owned())
         })?;
     let marker_bytes = observation
         .bytes(WATCHDOG_PUBLICATION_FILE_NAME)
         .ok_or_else(|| {
             // WORK_UNIT_CASE: 979/3 — absent publication child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child absent");
+            watchdog_observation_unavailable("watchdog.publication child absent");
             HostError::RecoveryRequired("Watchdog publication marker is absent".to_owned())
         })?;
     let admission: WatchdogAdmissionTemplate =
         serde_json::from_slice(admission_bytes).map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — undecodable child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child decode rejected");
+            watchdog_observation_unavailable("watchdog.publication child decode rejected");
             HostError::RecoveryRequired(format!("Watchdog admission decode failed: {error}"))
         })?;
     let marker: WatchdogPublicationBundle =
         serde_json::from_slice(marker_bytes).map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — undecodable child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child decode rejected");
+            watchdog_observation_unavailable("watchdog.publication child decode rejected");
             HostError::RecoveryRequired(format!("Watchdog marker decode failed: {error}"))
         })?;
     let lease: SignedSupervisionLease = serde_json::from_slice(lease_bytes).map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — undecodable child, never ready/current.
-        watchdog_observation_observe("watchdog.publication child decode rejected");
+        watchdog_observation_unavailable("watchdog.publication child decode rejected");
         HostError::RecoveryRequired(format!("Watchdog lease decode failed: {error}"))
     })?;
     admission.validate().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — invalid child, never ready/current.
-        watchdog_observation_observe("watchdog.publication child validation rejected");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_template(
+            "watchdog.publication child validation rejected",
+            &admission,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     marker.validate().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — invalid child, never ready/current.
-        watchdog_observation_observe("watchdog.publication child validation rejected");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+            "watchdog.publication child validation rejected",
+            &marker,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     lease.validate().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — invalid child, never ready/current.
-        watchdog_observation_observe("watchdog.publication child validation rejected");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+            "watchdog.publication child validation rejected",
+            &marker,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     if admission.canonical_bytes().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — uncanonicalizable child, never ready/current.
-        watchdog_observation_observe("watchdog.publication child canonical rejected");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_template(
+            "watchdog.publication child canonical rejected",
+            &admission,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })? != admission_bytes
         || marker.canonical_bytes().map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — uncanonicalizable child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child canonical rejected");
+            watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                "watchdog.publication child canonical rejected",
+                &marker,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })? != marker_bytes
         || serde_json::to_vec(&lease).map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — uncanonicalizable child, never ready/current.
-            watchdog_observation_observe("watchdog.publication child canonical rejected");
+            watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                "watchdog.publication child canonical rejected",
+                &marker,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })? != lease_bytes
     {
         // WORK_UNIT_CASE: 979/3 — non-canonical children, never ready/current.
-        watchdog_observation_observe("watchdog.publication children not canonical");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+            "watchdog.publication children not canonical",
+            &marker,
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog publication children are not canonical".to_owned(),
         ));
@@ -143,7 +178,10 @@ pub(super) fn decode_watchdog_publication_observation(
         .verify_bytes(admission_bytes, lease_bytes)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unverified marker, never ready/current.
-            watchdog_observation_observe("watchdog.publication marker signature rejected");
+            watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                "watchdog.publication marker signature rejected",
+                &marker,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     if marker.installation_id != admission.installation_id
@@ -152,7 +190,10 @@ pub(super) fn decode_watchdog_publication_observation(
         || marker.supervision_lease_id != lease.payload.lease_id
     {
         // WORK_UNIT_CASE: 979/3 — conflicting marker/admission binding, never current.
-        watchdog_observation_observe("watchdog.publication marker binding conflicting");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+            "watchdog.publication marker binding conflicting",
+            &marker,
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog marker is not bound to its admission template".to_owned(),
         ));
@@ -160,7 +201,10 @@ pub(super) fn decode_watchdog_publication_observation(
     if require_final_name {
         let expected_name = marker.directory_name().map_err(|error| {
             // WORK_UNIT_CASE: 979/4 — directory name not derivable, identity unproven.
-            watchdog_observation_observe("watchdog.publication directory name rejected");
+            watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                "watchdog.publication directory name rejected",
+                &marker,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
         let actual_name = path
@@ -168,12 +212,18 @@ pub(super) fn decode_watchdog_publication_observation(
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
                 // WORK_UNIT_CASE: 979/4 — path name unusable, identity unproven.
-                watchdog_observation_observe("watchdog.publication directory name rejected");
+                watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                    "watchdog.publication directory name rejected",
+                    &marker,
+                ));
                 HostError::RecoveryRequired("Watchdog publication path is not canonical".to_owned())
             })?;
         if !actual_name.eq_ignore_ascii_case(&expected_name) {
             // WORK_UNIT_CASE: 979/3 — conflicting directory name, never current.
-            watchdog_observation_observe("watchdog.publication directory name conflicting");
+            watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+                "watchdog.publication directory name conflicting",
+                &marker,
+            ));
             return Err(HostError::RecoveryRequired(
                 "Watchdog publication directory is not content-addressed by its ORS receipt"
                     .to_owned(),
@@ -182,7 +232,10 @@ pub(super) fn decode_watchdog_publication_observation(
     }
     // WORK_UNIT_CASE: 979/2 — decoded owner-observed publication with exact identity.
     // WORK_UNIT_CASE: 979/4 — service/process-start/generation identity preserved.
-    watchdog_observation_observe("watchdog.publication decoded");
+    watchdog_observation_observe(&super::WatchdogPublicationObservation::for_marker(
+        "watchdog.publication decoded",
+        &marker,
+    ));
     Ok(HostWatchdogPublicationObservation {
         path: path.to_path_buf(),
         marker,
@@ -207,11 +260,14 @@ pub fn observe_host_watchdog_publication(
     )
     .map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — unreadable publication directory, never ready/current.
-        watchdog_observation_observe("watchdog.publication directory unreadable");
+        // No child has been decoded yet, so no identity is held here.
+        watchdog_observation_unavailable("watchdog.publication directory unreadable");
         HostError::RecoveryRequired(error.to_string())
     })?;
-    // WORK_UNIT_CASE: 979/2 — owner-observed publication directory, distinct from verified current.
-    watchdog_observation_observe("watchdog.publication directory observed");
+    // WORK_UNIT_CASE: 979/2 — owner-observed publication directory, distinct from
+    // verified current; the directory is not yet decoded, so no identity is
+    // held and every slot stays explicitly unavailable.
+    watchdog_observation_unavailable("watchdog.publication directory observed");
     decode_watchdog_publication_observation(path, &observation, true)
 }
 
@@ -229,13 +285,21 @@ pub fn verify_exact_current_watchdog_publication(
     {
         // WORK_UNIT_CASE: 979/2 — observed publication is not the exact current head.
         // WORK_UNIT_CASE: 979/3 — stale/conflicting publication, never ready/current.
-        watchdog_observation_observe("watchdog.publication not exact current");
+        watchdog_observation_observe(&super::WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication not exact current",
+            template,
+            current,
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog publication is not the exact authoritative ORS head".to_owned(),
         ));
     }
     // WORK_UNIT_CASE: 979/2 — publication verified as the exact authoritative ORS head.
-    watchdog_observation_observe("watchdog.publication exact current verified");
+    watchdog_observation_observe(&super::WatchdogPublicationObservation::for_snapshot(
+        "watchdog.publication exact current verified",
+        template,
+        current,
+    ));
     Ok(())
 }
 
@@ -246,12 +310,12 @@ pub(super) fn scan_host_watchdog_publications(
     let mut observed = Vec::new();
     for entry in std::fs::read_dir(host_state_root).map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — unreadable spool root, never ready/current.
-        watchdog_observation_observe("watchdog.publication spool unreadable");
+        watchdog_observation_unavailable("watchdog.publication spool unreadable");
         HostError::RecoveryRequired(error.to_string())
     })? {
         let entry = entry.map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unreadable spool entry, never ready/current.
-            watchdog_observation_observe("watchdog.publication spool unreadable");
+            watchdog_observation_unavailable("watchdog.publication spool unreadable");
             HostError::RecoveryRequired(error.to_string())
         })?;
         let name = entry
@@ -260,7 +324,7 @@ pub(super) fn scan_host_watchdog_publications(
             .map(ToOwned::to_owned)
             .ok_or_else(|| {
                 // WORK_UNIT_CASE: 979/4 — non-Unicode spool name, identity unproven.
-                watchdog_observation_observe("watchdog.publication spool name rejected");
+                watchdog_observation_unavailable("watchdog.publication spool name rejected");
                 HostError::RecoveryRequired("Host state child name is not Unicode".to_owned())
             })?;
         if !name
@@ -274,6 +338,13 @@ pub(super) fn scan_host_watchdog_publications(
     }
     observed.sort_by(|left, right| left.path.cmp(&right.path));
     // WORK_UNIT_CASE: 979/2 — ordered spool scan of owner-observed publications.
-    watchdog_observation_observe("watchdog.publication spool scanned");
+    // A scan observes a SET, never one publication, so no single publication
+    // identity is bound: the owner holds no single marker at this boundary and
+    // every identity slot stays explicitly unavailable. The retained count is
+    // the one owner-held fact, and it keeps two different spools apart.
+    watchdog_observation_observe(
+        &super::WatchdogPublicationObservation::unavailable("watchdog.publication spool scanned")
+            .with_retained(u64::try_from(observed.len()).unwrap_or(u64::MAX)),
+    );
     Ok(observed)
 }

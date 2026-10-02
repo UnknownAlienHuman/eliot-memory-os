@@ -29,15 +29,23 @@ use observation::{decode_watchdog_publication_observation, scan_host_watchdog_pu
 // (#984 still open).
 //
 // Observation-only contract: every helper projects facts already produced by
-// the semantic owner. Arguments are static literals only — never digests,
-// paths, lease/nonce material, or arbitrary error text — so bounding limits
-// size, not sensitivity (I15.4). Sink outcome never alters
+// the semantic owner through ONE closed typed observation
+// (`WatchdogPublicationObservation` + `watchdog_publication_render_bound`,
+// which the decoding child also uses, so there is no second emitter and no
+// second bounding scheme). Each record carries the exact installation,
+// approved generation, supervision lease scope, activation, lease, ORS record,
+// ORS receipt, publication digest, lease revision and retained count the owner
+// already holds at that boundary; an identity the owner does not hold stays an
+// explicit unavailable field rather than a static sentence pretending to be an
+// identity, so two concurrent publications can never share one record (I7.20).
+// Never a digest over secret-bearing bytes, a raw path, lease/nonce material,
+// credential or key material, argv, or arbitrary `Debug`/serde error text, so
+// bounding limits size, not sensitivity (I15.4). Sink outcome never alters
 // result/order/status/cleanup. There is no mutable global dedup cache and no
 // terminal guard here: the single designated terminal per failed operation
 // stays with the outer #891/#893 operation that owns the failure decision;
-// these phase observations correlate by stage order only and never emit a
-// terminal. A bare `?` on an already-observed inner boundary propagates
-// without a second record.
+// these phase observations never emit a terminal. A bare `?` on an
+// already-observed inner boundary propagates without a second record.
 #[cfg(windows)]
 fn watchdog_publication_note_event_log_unavailable() {
     let _ = super::windows_event_log::event_log_sink_status();
@@ -50,6 +58,258 @@ fn watchdog_publication_observe(detail: &str) {
         super::host_diagnostics::EntrypointStage::Startup,
         detail,
     );
+}
+
+/// The explicit disposition of one publication identity this boundary does
+/// not hold (F-LOG-HOST-4, #979).
+///
+/// It stays a real slot value in the record: never a fabricated, defaulted,
+/// recomputed, or statically-worded stand-in for an identity the owner never
+/// produced, so a reader can always tell an absent identity from a present
+/// one.
+#[cfg(windows)]
+const WATCHDOG_PUBLICATION_IDENTITY_UNAVAILABLE: &str = "unavailable";
+
+/// The closed set of nonsecret publication identities this owner may bind to
+/// one Watchdog publication observation (F-LOG-HOST-4, #979).
+///
+/// Every slot is either the exact value the semantic owner already produced
+/// for the live admission template, the current ORS supervision head, the
+/// decoded publication marker, the observed spool entry, or the projected
+/// `PublishedSupervisionIdentity`, or the explicit
+/// [`WATCHDOG_PUBLICATION_IDENTITY_UNAVAILABLE`] disposition. Never signed
+/// lease bytes, the registration nonce, credential or key material, argv, a
+/// raw destination path, or arbitrary `Debug`/serde error text, so bounding
+/// limits size, not sensitivity (I15.4). Temporal adjacency alone can never
+/// tell two concurrent publications apart, so the identities travel with the
+/// label (I7.20 same-operation rule).
+#[cfg(windows)]
+struct WatchdogPublicationObservation<'a> {
+    label: &'static str,
+    install: Option<&'a str>,
+    generation: Option<&'a str>,
+    scope: Option<&'a str>,
+    activation: Option<&'a str>,
+    lease: Option<&'a str>,
+    record: Option<&'a str>,
+    receipt: Option<&'a str>,
+    publication: Option<&'a str>,
+    revision: Option<u64>,
+    /// How many publications this owner currently retains, where the boundary
+    /// observes a whole set rather than one publication.
+    retained: Option<u64>,
+}
+
+#[cfg(windows)]
+impl<'a> WatchdogPublicationObservation<'a> {
+    /// The observation of a boundary reached before this owner holds any
+    /// publication identity at all.
+    fn unavailable(label: &'static str) -> Self {
+        Self {
+            label,
+            install: None,
+            generation: None,
+            scope: None,
+            activation: None,
+            lease: None,
+            record: None,
+            receipt: None,
+            publication: None,
+            revision: None,
+            retained: None,
+        }
+    }
+
+    /// Binds how many publications the owner retains, for a boundary that
+    /// observes a whole spool rather than one publication.
+    fn with_retained(mut self, retained: u64) -> Self {
+        self.retained = Some(retained);
+        self
+    }
+
+    /// Binds the installation and activation identities the live obligation
+    /// census was asked about, before any spool entry is decoded.
+    fn for_requested(
+        label: &'static str,
+        installation: &'a PlatformHandle,
+        activation: &'a PlatformHandle,
+    ) -> Self {
+        Self {
+            label,
+            install: Some(installation.as_str()),
+            activation: Some(activation.as_str()),
+            ..Self::unavailable(label)
+        }
+    }
+
+    /// Binds the validated admission template identities.
+    fn for_template(label: &'static str, template: &'a WatchdogAdmissionTemplate) -> Self {
+        Self {
+            install: Some(template.installation_id.as_str()),
+            generation: Some(template.approved_generation.as_str()),
+            scope: Some(template.supervision_lease_scope_id.as_str()),
+            ..Self::unavailable(label)
+        }
+    }
+
+    /// Binds the approved manifest identities of a read that has not yet
+    /// produced an ORS head.
+    fn for_manifest(label: &'static str, manifest: &'a CandidateManifest) -> Self {
+        Self {
+            install: Some(
+                manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    .as_str(),
+            ),
+            generation: Some(manifest.generation.as_str()),
+            scope: Some(manifest.runtime_launch.supervision_lease_scope_id()),
+            ..Self::unavailable(label)
+        }
+    }
+
+    /// Binds the exact current ORS supervision head the owner already read
+    /// and validated. The snapshot's own recorded values are copied; no
+    /// digest is recomputed here.
+    fn with_current(mut self, current: &'a eliot_ors::SupervisionLeaseSnapshot) -> Self {
+        self.lease = Some(current.record.lease_id.as_str());
+        self.record = Some(current.record.record_id.as_str());
+        self.receipt = Some(current.receipt.receipt_sha256.as_str());
+        self.revision = Some(current.record.revision);
+        self
+    }
+
+    /// Binds the admission template plus the exact current ORS supervision
+    /// head, which between them carry every publication identity the owner
+    /// holds: the publication digest is a projection over the marker this pair
+    /// already produces, never a value this module recomputes.
+    fn for_snapshot(
+        label: &'static str,
+        template: &'a WatchdogAdmissionTemplate,
+        current: &'a eliot_ors::SupervisionLeaseSnapshot,
+    ) -> Self {
+        Self::for_template(label, template).with_current(current)
+    }
+
+    /// Binds the content-addressed publication marker the owner holds. The
+    /// marker carries no publication digest of its own, so that slot stays
+    /// explicitly unavailable instead of being recomputed here.
+    fn for_marker(label: &'static str, marker: &'a WatchdogPublicationBundle) -> Self {
+        Self {
+            install: Some(marker.installation_id.as_str()),
+            generation: Some(marker.approved_generation.as_str()),
+            scope: Some(marker.supervision_lease_scope_id.as_str()),
+            lease: Some(marker.supervision_lease_id.as_str()),
+            record: Some(marker.ors_record_id.as_str()),
+            receipt: Some(marker.ors_receipt_sha256.as_str()),
+            revision: Some(marker.lease_revision),
+            ..Self::unavailable(label)
+        }
+    }
+
+    /// Binds the publication marker plus the exact retained ORS receipt
+    /// digest this retirement step targets.
+    fn for_retired(
+        label: &'static str,
+        marker: &'a WatchdogPublicationBundle,
+        retired_receipt: &'a str,
+    ) -> Self {
+        Self {
+            receipt: Some(retired_receipt),
+            ..Self::for_marker(label, marker)
+        }
+    }
+
+    /// Binds the requested obligation identities plus the decoded spool
+    /// entry's marker, and the lease identity only once the owner has proved
+    /// it usable.
+    fn for_obligation(
+        label: &'static str,
+        installation: &'a PlatformHandle,
+        activation: &'a PlatformHandle,
+        lease: Option<&'a str>,
+        observed: &'a HostWatchdogPublicationObservation,
+    ) -> Self {
+        let mut observation = Self::for_marker(label, &observed.marker);
+        observation.install = Some(installation.as_str());
+        observation.activation = Some(activation.as_str());
+        observation.lease = lease;
+        observation
+    }
+
+    /// Binds the exact three-identity published supervision record the owner
+    /// just projected. Its fields are copied, never re-derived.
+    fn for_published(
+        label: &'static str,
+        identity: &'a PublishedSupervisionIdentity,
+    ) -> Self {
+        Self {
+            lease: Some(identity.lease_id.as_str()),
+            receipt: Some(identity.ors_receipt_digest.as_str()),
+            publication: Some(identity.publication_digest.as_str()),
+            ..Self::unavailable(label)
+        }
+    }
+}
+
+/// Renders one identity-bound Watchdog publication detail and hands it to
+/// `emit`.
+///
+/// The frozen boundary label stays first so label-prefix consumers keep
+/// matching; the closed identity slots follow as `key=value` pairs, each
+/// individually bounded by the facade helper. An identity the owner does not
+/// hold renders the explicit unavailable disposition in its own slot, so no
+/// slot can be read as an identity this boundary never produced. The whole
+/// detail is bounded by the facade with its truncation honesty record. This is
+/// the one bounding scheme for the family: the decoding child renders through
+/// it too, so it never introduces a second emitter.
+#[cfg(windows)]
+fn watchdog_publication_render_bound(
+    observation: &WatchdogPublicationObservation<'_>,
+    emit: impl FnOnce(&str),
+) {
+    let mut detail = String::from(observation.label);
+    for (key, value) in [
+        ("install", observation.install),
+        ("gen", observation.generation),
+        ("scope", observation.scope),
+        ("activation", observation.activation),
+        ("lease", observation.lease),
+        ("record", observation.record),
+        ("receipt", observation.receipt),
+        ("pub", observation.publication),
+    ] {
+        detail.push(' ');
+        detail.push_str(key);
+        detail.push('=');
+        detail.push_str(match value {
+            Some(text) => super::host_diagnostics::bound_field(text).text(),
+            None => WATCHDOG_PUBLICATION_IDENTITY_UNAVAILABLE,
+        });
+    }
+    for (key, value) in [
+        ("rev", observation.revision),
+        ("retained", observation.retained),
+    ] {
+        detail.push(' ');
+        detail.push_str(key);
+        detail.push('=');
+        match value {
+            Some(number) => {
+                detail.push_str(&number.to_string());
+            }
+            None => detail.push_str(WATCHDOG_PUBLICATION_IDENTITY_UNAVAILABLE),
+        }
+    }
+    emit(&detail);
+}
+
+/// Emits one identity-bound Watchdog publication observation through the
+/// #889 facade.
+#[cfg(windows)]
+fn watchdog_publication_observe_bound(observation: &WatchdogPublicationObservation<'_>) {
+    watchdog_publication_render_bound(observation, watchdog_publication_observe);
 }
 
 #[cfg(windows)]
@@ -66,7 +326,11 @@ pub(super) fn write_watchdog_publication_child(path: &Path, bytes: &[u8]) -> Res
 
     if bytes.len() as u64 > WATCHDOG_PUBLICATION_CHILD_LIMIT {
         // WORK_UNIT_CASE: 979/4 — oversize child, bounded identity preserved.
-        watchdog_publication_observe("watchdog.publication child oversize rejected");
+        // The child writer holds no admission, ORS or publication identity of
+        // its own, so every slot stays explicitly unavailable.
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child oversize rejected",
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog publication child exceeds the bounded size".to_owned(),
         ));
@@ -80,19 +344,25 @@ pub(super) fn write_watchdog_publication_child(path: &Path, bytes: &[u8]) -> Res
         .open(path)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/1 — child create/open boundary.
-            watchdog_publication_observe("watchdog.publication child write failed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+                "watchdog.publication child write failed",
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/1 — child write/sync boundary.
-            watchdog_publication_observe("watchdog.publication child write failed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+                "watchdog.publication child write failed",
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     let metadata = file.metadata().map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — child metadata boundary.
-        watchdog_publication_observe("watchdog.publication child write failed");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child write failed",
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     if !metadata.is_file()
@@ -100,31 +370,41 @@ pub(super) fn write_watchdog_publication_child(path: &Path, bytes: &[u8]) -> Res
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         // WORK_UNIT_CASE: 979/4 — invalid child identity, never committed.
-        watchdog_publication_observe("watchdog.publication child identity rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child identity rejected",
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog publication child identity is invalid".to_owned(),
         ));
     }
     file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — child readback seek boundary.
-        watchdog_publication_observe("watchdog.publication child write failed");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child write failed",
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let mut readback = Vec::with_capacity(bytes.len());
     file.read_to_end(&mut readback).map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — child readback read boundary.
-        watchdog_publication_observe("watchdog.publication child write failed");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child write failed",
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     if readback != bytes {
         // WORK_UNIT_CASE: 979/4 — readback changed, exact identity preserved by rejection.
-        watchdog_publication_observe("watchdog.publication child readback changed");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+            "watchdog.publication child readback changed",
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog publication child readback changed".to_owned(),
         ));
     }
     // WORK_UNIT_CASE: 979/2 — child written with exact readback identity.
-    watchdog_publication_observe("watchdog.publication child committed");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::unavailable(
+        "watchdog.publication child committed",
+    ));
     Ok(())
 }
 
@@ -135,7 +415,10 @@ pub(super) fn read_manifest_current_supervision_lease(
 ) -> Result<eliot_ors::SupervisionLeaseSnapshot, HostError> {
     let lease_id = OperationIdentity::new(lease_id.to_owned()).map_err(|error| {
         // WORK_UNIT_CASE: 979/4 — unusable lease identity, never read.
-        watchdog_publication_observe("watchdog.publication lease identity rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+            "watchdog.publication lease identity rejected",
+            manifest,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let ors_path = PathBuf::from(
@@ -149,12 +432,18 @@ pub(super) fn read_manifest_current_supervision_lease(
     let retained =
         ProtectedRuntimePathLease::open_existing_absolute(&ors_path).map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unopenable ORS, no head observed.
-            watchdog_publication_observe("watchdog.publication ORS open failed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+                "watchdog.publication ORS open failed",
+                manifest,
+            ));
             HostError::RecoveryRequired(format!("Kernel ORS open failed: {error}"))
         })?;
     if !windows_paths_equal(retained.path(), &ors_path) {
         // WORK_UNIT_CASE: 979/3 — conflicting ORS selection, never read.
-        watchdog_publication_observe("watchdog.publication ORS selection conflicting");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+            "watchdog.publication ORS selection conflicting",
+            manifest,
+        ));
         return Err(HostError::RecoveryRequired(
             "Kernel ORS path is not the manifest-selected child".to_owned(),
         ));
@@ -164,18 +453,27 @@ pub(super) fn read_manifest_current_supervision_lease(
         .and_then(|()| retained.verify_path_identity())
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — ORS identity changed before the read.
-            watchdog_publication_observe("watchdog.publication ORS identity changed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+                "watchdog.publication ORS identity changed",
+                manifest,
+            ));
             HostError::RecoveryRequired(format!("Kernel ORS changed: {error}"))
         })?;
     let current = eliot_ors::read_current_supervision_lease_read_only(retained.path(), &lease_id)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unreadable ORS, no head observed.
-            watchdog_publication_observe("watchdog.publication ORS read failed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+                "watchdog.publication ORS read failed",
+                manifest,
+            ));
             HostError::RecoveryRequired(format!("Kernel ORS read failed: {error}"))
         })?
         .ok_or_else(|| {
             // WORK_UNIT_CASE: 979/3 — absent ORS head, never ready/current.
-            watchdog_publication_observe("watchdog.publication ORS head absent");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+                "watchdog.publication ORS head absent",
+                manifest,
+            ));
             HostError::RecoveryRequired("Kernel ORS has no current supervision lease".to_owned())
         })?;
     retained
@@ -183,16 +481,26 @@ pub(super) fn read_manifest_current_supervision_lease(
         .and_then(|()| retained.verify_path_identity())
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — ORS identity changed across the read.
-            watchdog_publication_observe("watchdog.publication ORS identity changed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+                "watchdog.publication ORS identity changed",
+                manifest,
+            ));
             HostError::RecoveryRequired(format!("Kernel ORS changed: {error}"))
         })?;
     current.validate().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — invalid ORS snapshot, never ready/current.
-        watchdog_publication_observe("watchdog.publication ORS snapshot validation rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+            "watchdog.publication ORS snapshot validation rejected",
+            manifest,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     // WORK_UNIT_CASE: 979/2 — owner-observed exact current ORS supervision head.
-    watchdog_publication_observe("watchdog.publication ORS head read");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_manifest(
+        "watchdog.publication ORS head read",
+        manifest,
+    )
+    .with_current(&current));
     Ok(current)
 }
 
@@ -233,19 +541,35 @@ pub(super) fn live_supervision_obligation(
             continue;
         }
         return PlatformHandle::new(payload.lease_id.clone())
-            .inspect(|_lease| {
+            .inspect(|lease| {
                 // WORK_UNIT_CASE: 979/2 — live supervision obligation observed.
-                watchdog_publication_observe("watchdog.publication live obligation observed");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_obligation(
+                    "watchdog.publication live obligation observed",
+                    installation,
+                    activation_id,
+                    Some(lease.as_str()),
+                    &observation,
+                ));
             })
             .map(Some)
             .map_err(|error| {
                 // WORK_UNIT_CASE: 979/4 — unusable live lease identity, never reported.
-                watchdog_publication_observe("watchdog.publication lease identity rejected");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_obligation(
+                    "watchdog.publication lease identity rejected",
+                    installation,
+                    activation_id,
+                    None,
+                    &observation,
+                ));
                 HostError::RecoveryRequired(error.to_string())
             });
     }
     // WORK_UNIT_CASE: 979/2 — no live supervision obligation; stale spool is not coverage.
-    watchdog_publication_observe("watchdog.publication no live obligation");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_requested(
+        "watchdog.publication no live obligation",
+        installation,
+        activation_id,
+    ));
     Ok(None)
 }
 
@@ -256,7 +580,11 @@ pub(super) fn supervision_publication_identity(
 ) -> Result<PublishedSupervisionIdentity, HostError> {
     let lease_bytes = serde_json::to_vec(&current.record.artifact).map_err(|error| {
         // WORK_UNIT_CASE: 979/4 — unserializable lease, identity unprojected.
-        watchdog_publication_observe("watchdog.publication identity serialization rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication identity serialization rejected",
+            template,
+            current,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let marker = WatchdogPublicationBundle::new(
@@ -268,30 +596,49 @@ pub(super) fn supervision_publication_identity(
     )
     .map_err(|error| {
         // WORK_UNIT_CASE: 979/4 — unbindable marker, identity unprojected.
-        watchdog_publication_observe("watchdog.publication identity binding rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication identity binding rejected",
+            template,
+            current,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let identity = PublishedSupervisionIdentity {
         lease_id: PlatformHandle::new(current.record.lease_id.as_str()).map_err(|error| {
             // WORK_UNIT_CASE: 979/4 — unusable identity handle, never reported.
-            watchdog_publication_observe("watchdog.publication identity handle rejected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication identity handle rejected",
+                template,
+                current,
+            ));
             HostError::Platform(error.to_string())
         })?,
         ors_receipt_digest: PlatformHandle::new(current.receipt.receipt_sha256.clone()).map_err(
             |error| {
                 // WORK_UNIT_CASE: 979/4 — unusable identity handle, never reported.
-                watchdog_publication_observe("watchdog.publication identity handle rejected");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                    "watchdog.publication identity handle rejected",
+                    template,
+                    current,
+                ));
                 HostError::Platform(error.to_string())
             },
         )?,
         publication_digest: PlatformHandle::new(sha256_json(&marker)?).map_err(|error| {
             // WORK_UNIT_CASE: 979/4 — unusable identity handle, never reported.
-            watchdog_publication_observe("watchdog.publication identity handle rejected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication identity handle rejected",
+                template,
+                current,
+            ));
             HostError::Platform(error.to_string())
         })?,
     };
     // WORK_UNIT_CASE: 979/4 — publication identity projected with exact digests.
-    watchdog_publication_observe("watchdog.publication identity projected");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_published(
+        "watchdog.publication identity projected",
+        &identity,
+    ));
     Ok(identity)
 }
 
@@ -308,20 +655,33 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     kernel_snapshot: &eliot_ors::SupervisionLeaseSnapshot,
 ) -> Result<PublishedSupervisionIdentity, HostError> {
     // WORK_UNIT_CASE: 979/2 — publication requested, distinct from owner-observed.
-    watchdog_publication_observe("watchdog.publication requested");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+        "watchdog.publication requested",
+        template,
+        kernel_snapshot,
+    ));
     template.validate().map_err(|error| {
         // WORK_UNIT_CASE: 979/3 — invalid template, never published.
-        watchdog_publication_observe("watchdog.publication template validation rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_template(
+            "watchdog.publication template validation rejected",
+            template,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     if template.digest().map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — template digest boundary.
-        watchdog_publication_observe("watchdog.publication template validation rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_template(
+            "watchdog.publication template validation rejected",
+            template,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })? != expected_template_digest
     {
         // WORK_UNIT_CASE: 979/3 — conflicting provisioned template, never published.
-        watchdog_publication_observe("watchdog.publication template digest conflicting");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_template(
+            "watchdog.publication template digest conflicting",
+            template,
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog admission template does not match the provisioned Phase-B digest".to_owned(),
         ));
@@ -333,7 +693,11 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     )?;
     if current != *kernel_snapshot {
         // WORK_UNIT_CASE: 979/3 — stale ProbeReady snapshot, never published.
-        watchdog_publication_observe("watchdog.publication snapshot stale");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication snapshot stale",
+            template,
+            &current,
+        ));
         return Err(HostError::RecoveryRequired(
             "Kernel ProbeReady supervision snapshot is not the current ORS head".to_owned(),
         ));
@@ -342,21 +706,33 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/1 — verification clock boundary.
-            watchdog_publication_observe("watchdog.publication clock unavailable");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication clock unavailable",
+                template,
+                &current,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?
         .as_millis()
         .try_into()
         .map_err(|_| {
             // WORK_UNIT_CASE: 979/1 — verification clock boundary.
-            watchdog_publication_observe("watchdog.publication clock unavailable");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication clock unavailable",
+                template,
+                &current,
+            ));
             HostError::RecoveryRequired("system time exceeds u64".to_owned())
         })?;
     let verification_context = current
         .active_verification_context(template.trust_anchor.public_key_fingerprint(), now_ms)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unverifiable snapshot, never published.
-            watchdog_publication_observe("watchdog.publication verification context rejected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication verification context rejected",
+                template,
+                &current,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     template
@@ -364,17 +740,29 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         .verify(&current.record.artifact, &verification_context)
         .map_err(|error| {
             // WORK_UNIT_CASE: 979/3 — unverified lease, never published.
-            watchdog_publication_observe("watchdog.publication lease verification rejected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication lease verification rejected",
+                template,
+                &current,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     let admission_bytes = template.canonical_bytes().map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — bundle serialization boundary.
-        watchdog_publication_observe("watchdog.publication bundle serialization rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication bundle serialization rejected",
+            template,
+            &current,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let lease_bytes = serde_json::to_vec(&current.record.artifact).map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — bundle serialization boundary.
-        watchdog_publication_observe("watchdog.publication bundle serialization rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication bundle serialization rejected",
+            template,
+            &current,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let marker = WatchdogPublicationBundle::new(
@@ -386,17 +774,27 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     )
     .map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — bundle binding boundary.
-        watchdog_publication_observe("watchdog.publication bundle binding rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+            "watchdog.publication bundle binding rejected",
+            template,
+            &current,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let marker_bytes = marker.canonical_bytes().map_err(|error| {
         // WORK_UNIT_CASE: 979/1 — bundle serialization boundary.
-        watchdog_publication_observe("watchdog.publication bundle serialization rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+            "watchdog.publication bundle serialization rejected",
+            &marker,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?;
     let destination = host_state_root.join(marker.directory_name().map_err(|error| {
         // WORK_UNIT_CASE: 979/4 — directory name not derivable, identity unproven.
-        watchdog_publication_observe("watchdog.publication directory name rejected");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+            "watchdog.publication directory name rejected",
+            &marker,
+        ));
         HostError::RecoveryRequired(error.to_string())
     })?);
 
@@ -427,7 +825,10 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             )
             .map_err(|error| {
                 // WORK_UNIT_CASE: 979/3 — unreadable precommit directory, never committed.
-                watchdog_publication_observe("watchdog.publication precommit unreadable");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                    "watchdog.publication precommit unreadable",
+                    &marker,
+                ));
                 HostError::RecoveryRequired(error.to_string())
             })?;
             // `?` propagates the already-observed inner decode/verify boundaries.
@@ -435,7 +836,10 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             verify_exact_current_watchdog_publication(&decoded, template, &current)?;
             if precommit.directory_identity != publication.temporary_identity() {
                 // WORK_UNIT_CASE: 979/3 — changed temporary identity, never committed.
-                watchdog_publication_observe("watchdog.publication temporary identity changed");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                    "watchdog.publication temporary identity changed",
+                    &marker,
+                ));
                 return Err(HostError::RecoveryRequired(
                     "Watchdog publication temporary directory identity changed".to_owned(),
                 ));
@@ -446,19 +850,31 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             match publication.publish(precommit.directory_identity) {
                 Ok(DirectoryPublicationOutcome::Published(_)) => {
                     // WORK_UNIT_CASE: 979/2 — directory committed, pending retained readback.
-                    watchdog_publication_observe("watchdog.publication committed");
+                    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                        "watchdog.publication committed",
+                        &marker,
+                    ));
                 }
                 Ok(DirectoryPublicationOutcome::CommittedUnknown(_)) => {
                     // WORK_UNIT_CASE: 979/7 — commit outcome unknown; readback below decides.
-                    watchdog_publication_observe("watchdog.publication commit unknown");
+                    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                        "watchdog.publication commit unknown",
+                        &marker,
+                    ));
                 }
                 Err(DirectoryPublicationError::AlreadyExists) => {
                     // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-                    watchdog_publication_observe("watchdog.publication replay retained");
+                    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                        "watchdog.publication replay retained",
+                        &marker,
+                    ));
                 }
                 Err(error) => {
                     // WORK_UNIT_CASE: 979/1 — directory commit boundary.
-                    watchdog_publication_observe("watchdog.publication commit rejected");
+                    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                        "watchdog.publication commit rejected",
+                        &marker,
+                    ));
                     return Err(HostError::RecoveryRequired(format!(
                         "Watchdog directory publication failed before commit: {error}"
                     )));
@@ -467,11 +883,17 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         }
         Err(DirectoryPublicationError::AlreadyExists) => {
             // WORK_UNIT_CASE: 979/8 — concurrent exact replay retained, no new publication.
-            watchdog_publication_observe("watchdog.publication replay retained");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                "watchdog.publication replay retained",
+                &marker,
+            ));
         }
         Err(error) => {
             // WORK_UNIT_CASE: 979/1 — directory preparation boundary.
-            watchdog_publication_observe("watchdog.publication preparation failed");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                "watchdog.publication preparation failed",
+                &marker,
+            ));
             return Err(HostError::RecoveryRequired(format!(
                 "Watchdog directory preparation failed: {error}"
             )));
@@ -485,13 +907,19 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         != current
     {
         // WORK_UNIT_CASE: 979/3 — ORS head changed across publication, never current.
-        watchdog_publication_observe("watchdog.publication ORS head changed");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+            "watchdog.publication ORS head changed",
+            &marker,
+        ));
         return Err(HostError::RecoveryRequired(
             "Kernel ORS head changed during Watchdog publication".to_owned(),
         ));
     }
     // WORK_UNIT_CASE: 979/2 — retained publication read back as the exact current head.
-    watchdog_publication_observe("watchdog.publication observed");
+    watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+        "watchdog.publication observed",
+        &published.marker,
+    ));
 
     // Retirement begins only after the new exact current bundle is durable.
     let observed = scan_host_watchdog_publications(host_state_root)?;
@@ -502,13 +930,20 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     let plan =
         WatchdogPublicationRetentionPlan::for_current(&marker, &markers).map_err(|error| {
             // WORK_UNIT_CASE: 979/1 — retention plan boundary.
-            watchdog_publication_observe("watchdog.publication retention plan rejected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+                "watchdog.publication retention plan rejected",
+                &marker,
+            ));
             HostError::RecoveryRequired(error.to_string())
         })?;
     for digest in plan.retired_receipt_digests() {
         if digest == &current.receipt.receipt_sha256 {
             // WORK_UNIT_CASE: 979/4 — current bundle protected from retirement.
-            watchdog_publication_observe("watchdog.publication retention current protected");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_retired(
+                "watchdog.publication retention current protected",
+                &marker,
+                digest,
+            ));
             return Err(HostError::RecoveryRequired(
                 "Watchdog retention attempted to retire the current ORS bundle".to_owned(),
             ));
@@ -518,7 +953,11 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
             .find(|bundle| bundle.marker.ors_receipt_sha256 == *digest)
             .ok_or_else(|| {
                 // WORK_UNIT_CASE: 979/3 — absent retirement candidate, never retired.
-                watchdog_publication_observe("watchdog.publication retirement candidate absent");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_retired(
+                    "watchdog.publication retirement candidate absent",
+                    &marker,
+                    digest,
+                ));
                 HostError::RecoveryRequired(
                     "Watchdog retirement candidate disappeared before exact retirement".to_owned(),
                 )
@@ -526,17 +965,29 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         match retire_owned_directory_exact(&candidate.path, &candidate.retirement).map_err(
             |error| {
                 // WORK_UNIT_CASE: 979/1 — exact retirement boundary.
-                watchdog_publication_observe("watchdog.publication retirement failed");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_retired(
+                    "watchdog.publication retirement failed",
+                    &marker,
+                    digest,
+                ));
                 HostError::RecoveryRequired(error.to_string())
             },
         )? {
             OwnedDirectoryRetirementOutcome::Retired => {
                 // WORK_UNIT_CASE: 979/2 — stale bundle retired; replay identity retained.
-                watchdog_publication_observe("watchdog.publication stale retired");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_retired(
+                    "watchdog.publication stale retired",
+                    &marker,
+                    digest,
+                ));
             }
             OwnedDirectoryRetirementOutcome::CommittedUnknown(_) => {
                 // WORK_UNIT_CASE: 979/7 — retirement committed unknown; absence unproven.
-                watchdog_publication_observe("watchdog.publication retirement unknown");
+                watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_retired(
+                    "watchdog.publication retirement unknown",
+                    &marker,
+                    digest,
+                ));
                 return Err(HostError::RecoveryRequired(
                     "Watchdog spool cleanup committed with unknown final absence".to_owned(),
                 ));
@@ -547,7 +998,10 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
     let after = scan_host_watchdog_publications(host_state_root)?;
     if after.len() > WATCHDOG_PUBLICATION_RETAINED_LIMIT {
         // WORK_UNIT_CASE: 979/3 — spool above its fixed bound, never accepted.
-        watchdog_publication_observe("watchdog.publication spool above bound");
+        watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_marker(
+            "watchdog.publication spool above bound",
+            &marker,
+        ));
         return Err(HostError::RecoveryRequired(
             "Watchdog protected spool remains above its fixed retention bound".to_owned(),
         ));
@@ -557,7 +1011,11 @@ pub(super) fn publish_current_watchdog_supervision_bundle(
         .find(|bundle| bundle.marker.ors_receipt_sha256 == current.receipt.receipt_sha256)
         .ok_or_else(|| {
             // WORK_UNIT_CASE: 979/3 — current bundle absent after retention, never accepted.
-            watchdog_publication_observe("watchdog.publication current absent");
+            watchdog_publication_observe_bound(&WatchdogPublicationObservation::for_snapshot(
+                "watchdog.publication current absent",
+                template,
+                &current,
+            ));
             HostError::RecoveryRequired(
                 "Watchdog current bundle disappeared during retention".to_owned(),
             )
