@@ -8,6 +8,12 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
+# The Windows Job Object mechanics owner (issue #1888): the owned SurrealDB
+# server is assigned to a kill-on-close Job at launch so an owned server ends
+# with its owner. This is the existing declared `process_owner` for Windows
+# process/Job mechanics in `config/architecture-boundaries.toml`; no second Job
+# wrapper is introduced.
+eliot-platform-windows.workspace = true
 eliot-types.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-windows-ipc.workspace = true
