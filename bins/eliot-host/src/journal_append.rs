@@ -668,8 +668,17 @@ pub(super) fn append_store_rebind_terminal<B: JournalBackend>(
             StoreRebindState::Pending => unreachable!(),
         }
     ))?;
-    append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
-    host_journal_observe("host.journal rebind terminal appended");
+    let receipt = append_reconciled(journal, HostStateRecord::StoreRebind(record))?;
+    // This tail records THIS call's appended terminal, so it is truthful only
+    // for a NEW durable commit. When the owner returned `Replayed`, this call
+    // read back the already committed terminal and created no new effect
+    // (I14.20 `RECONCILING` cannot create a new effect; case 11);
+    // `observe_append_outcome` inside `append_reconciled` already named that
+    // replay distinctly, so announcing an append here would collapse the
+    // readback into another durable append.
+    if receipt.disposition() == AppendDisposition::Applied {
+        host_journal_observe("host.journal rebind terminal appended");
+    }
     Ok(())
 }
 
@@ -723,8 +732,14 @@ pub(super) fn persist_store_rebind_disposition<B: JournalBackend>(
     ))?;
     terminal.receipt_request_digest = None;
     terminal.receipt_store_fence = None;
-    append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
-    host_journal_observe("host.journal rebind disposition appended");
+    let receipt = append_reconciled(journal, HostStateRecord::StoreRebind(terminal))?;
+    // Same disposition split as the terminal tail above: only a NEW durable
+    // commit is an append. A `Replayed` receipt is the readback of the already
+    // committed disposition, and `observe_append_outcome` already recorded it
+    // as such (I14.20; case 11).
+    if receipt.disposition() == AppendDisposition::Applied {
+        host_journal_observe("host.journal rebind disposition appended");
+    }
     Ok(())
 }
 
