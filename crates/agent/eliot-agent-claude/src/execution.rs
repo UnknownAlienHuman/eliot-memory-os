@@ -9,14 +9,15 @@
 //! [`ProcessRequest`](eliot_process::ProcessRequest), a credential
 //! [`SecretRef`](eliot_process::SecretRef) reference (never a raw secret),
 //! the prior idempotency record and the
-//! [`UnknownOutcomeGate`](crate::UnknownOutcomeGate). From those, `prepare`
-//! derives the I6.5 [`BridgeContract`](eliot_contracts::BridgeContract)
-//! declaration bound to the exact admitted route generation and validates the
-//! declaration's own completeness. That declaration is derived here, not
-//! issued by an owner, so it is a completeness check rather than an admission
-//! gate; [`crate::bridge_contract`] records the named ceiling and the missing
-//! declaration issuer. Every rejection happens before any process or
-//! credential acquisition.
+//! [`UnknownOutcomeGate`](crate::UnknownOutcomeGate), and the owner-issued
+//! I6.5 [`ClaudeSidecarBridgeDeclaration`](crate::bridge_contract::ClaudeSidecarBridgeDeclaration)
+//! for the installed sidecar generation. `prepare` does not derive that
+//! declaration: it gates on it, so an owner-issued generation, epoch or
+//! capability that was never admitted for this attempt is refused before any
+//! process or credential acquisition. See [`crate::bridge_contract`] for the
+//! issuer, the exact bound, and why the gate is load-bearing rather than
+//! implied by the admitted-path checks that run before it. Every rejection
+//! happens before any process or credential acquisition.
 //!
 //! [`ClaudeSidecarFactory`] then drives exactly one immutable sidecar
 //! generation through the shared
@@ -56,6 +57,7 @@ use eliot_process::{
     SecretRef,
 };
 
+use crate::bridge_contract::ClaudeSidecarBridgeDeclaration;
 use crate::{
     CLAUDE_SIDECAR_ADAPTER_ID, CLAUDE_SIDECAR_HOST_FAMILY, CLAUDE_SIDECAR_PROTOCOL_VERSION,
     CLAUDE_SIDECAR_TRANSPORT, CancellationEnvelope, ClaudeCandidateDisposition,
@@ -230,6 +232,13 @@ pub struct ClaudeFactoryInput {
     pub runtime_generation: ResourceGeneration,
     /// Exact adapter/factory/route revision expectation.
     pub descriptor: ClaudeAdapterDescriptor,
+    /// Owner-issued I6.5 declaration for the installed sidecar generation,
+    /// presented by composition. It is never derived from the fields above:
+    /// the adapter owner issues it for the generation it admitted, and
+    /// `prepare` refuses a declaration that names another route generation,
+    /// another authority epoch, another factory revision, or any field edited
+    /// after issuance. See [`crate::bridge_contract`].
+    pub declaration: ClaudeSidecarBridgeDeclaration,
     /// Inert NDJSON request projection (query only).
     pub request: ClaudeSidecarRequest,
     /// Sealed X2 process binding; executable identity comes from admission.
@@ -253,6 +262,7 @@ impl std::fmt::Debug for ClaudeFactoryInput {
             .field("current_fence", &self.current_fence)
             .field("runtime_generation", &self.runtime_generation)
             .field("descriptor", &self.descriptor)
+            .field("declaration", &self.declaration)
             .field("request", &self.request)
             .field("process_request", &self.process_request)
             .field("credential", &"[redacted credential reference]")
@@ -360,9 +370,9 @@ pub enum ClaudeFactoryOutcome {
 
 /// Admit one exact attempt from frozen inputs. Order is load-bearing: request
 /// shape, Claude family, attempt/lease/fence/generation agreement, exact
-/// descriptor revision, the I6.5 bridge contract bound to that admitted
-/// descriptor and route generation, sealed process binding, idempotency, and
-/// the unknown-outcome gate are all decided before anything is acquired. This
+/// descriptor revision, the owner-issued I6.5 bridge declaration for the
+/// installed sidecar generation, sealed process binding, idempotency, and the
+/// unknown-outcome gate are all decided before anything is acquired. This
 /// function cannot contact an executor: preparation starts no process.
 pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, ClaudeSidecarError> {
     if input.request.kind != ClaudeRequestKind::Query {
@@ -381,35 +391,7 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
     .map_err(map_agent_contract)?;
     input.admitted.validate().map_err(map_agent_contract)?;
     input.descriptor.validate_for(&input.binding)?;
-    // I6.5 (issue #1797 A1/W5): derive the Claude sidecar declaration from the
-    // exact admitted descriptor and the exact route of the admitted attempt,
-    // then validate the declaration itself.
-    //
-    // This is a DECLARATION-COMPLETENESS check, not a generation gate, and it
-    // is not claimed to be one. No owner-issued declaration is presented at
-    // this layer: `ClaudeFactoryInput` carries no contract field, and the
-    // declaration is built from the same two values
-    // `validate_claude_route`, `validate_execution_binding` and
-    // `ClaudeAdapterDescriptor::validate_for` have already proved mutually
-    // equal and current. Every binding branch inside
-    // `validate_claude_adapter_contract` is therefore implied, and deleting
-    // this call changes no outcome. What it still refuses is a declaration
-    // whose declared metadata is incomplete or malformed - the
-    // `BridgeContract::validate` field groups that construction does not
-    // itself check - and a route whose owner digest cannot be recomputed. The
-    // refusal is typed and lands before the sealed process binding is consumed
-    // and before any operation identity, credential or task decision exists.
-    // `crate::bridge_contract` names the missing declaration issuer.
-    let admitted_route = &input.admitted.route;
-    let contract =
-        crate::bridge_contract::claude_adapter_contract(&input.descriptor, admitted_route)
-            .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))?;
-    crate::bridge_contract::validate_claude_adapter_contract(
-        &contract,
-        &input.descriptor,
-        admitted_route,
-    )
-    .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))?;
+    admit_owner_declaration(&input)?;
     input
         .process_request
         .validate()
@@ -466,6 +448,23 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
             process_request: Some(input.process_request),
         },
     )))
+}
+
+/// Gates the attempt on the owner-issued I6.5 bridge declaration.
+///
+/// The declaration arrives from composition and is never derived here, so this
+/// is the one check on the prepare path whose inputs the adapter cannot
+/// reconstruct from the attempt it is judging. It runs after the admitted-path
+/// checks (which prove the attempt itself is well formed) and before the
+/// sealed process binding is consumed, so no operation identity, credential
+/// acquisition or task decision exists when it refuses.
+fn admit_owner_declaration(input: &ClaudeFactoryInput) -> Result<(), ClaudeSidecarError> {
+    crate::bridge_contract::validate_claude_sidecar_declaration(
+        &input.declaration,
+        &input.admitted.route,
+        &input.current_fence,
+    )
+    .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))
 }
 
 /// Render the exact NDJSON stdin line for a prepared attempt. The line is
@@ -1228,6 +1227,7 @@ mod tests {
         ResourceLimits, SessionId as ProcessSessionId, SuspendedProcessIdentity,
     };
 
+    use crate::bridge_contract::CLAUDE_SIDECAR_DECLARATION_WIRE_ID;
     use crate::{
         AdmittedHandle, ClaudeAllowedTool, ClaudeArgv, ClaudeEnvAllowlist, ClaudeLaunchPort,
         ClaudePermissionMode, ClaudeRequestKind, ClaudeResponseKind, ClaudeSidecarLaunchPlan,
@@ -1471,6 +1471,16 @@ mod tests {
         Ok(ProcessRequest::new(intent, permit)?)
     }
 
+    fn declaration_fixture(
+        binding: &ProviderExecutionBinding,
+    ) -> ClaudeSidecarBridgeDeclaration {
+        crate::bridge_contract::issue_claude_sidecar_declaration(
+            &binding.route,
+            &binding.state_fence,
+        )
+        .expect("owner-issued declaration for the fixture generation")
+    }
+
     fn input_fixture(
         binding: ProviderExecutionBinding,
         admitted: AgentAttempt,
@@ -1479,6 +1489,7 @@ mod tests {
         prior: Option<StoredIdempotencyKey>,
         gate: Option<UnknownOutcomeGate>,
     ) -> ClaudeFactoryInput {
+        let declaration = declaration_fixture(&binding);
         let route = binding.route.clone();
         let fence = binding.state_fence.clone();
         let generation = binding.runtime_generation;
@@ -1488,6 +1499,7 @@ mod tests {
             current_fence: fence,
             runtime_generation: generation,
             descriptor: ClaudeAdapterDescriptor::current(route),
+            declaration,
             request,
             process_request,
             credential: eliot_process::SecretRef::new("test-broker", "claude-api-key")
@@ -1854,6 +1866,140 @@ mod tests {
             prepare(input),
             Err(ClaudeSidecarError::MalformedFrame(_))
         ));
+        Ok(())
+    }
+
+    /// The owner-issued declaration gate: every case below is refused by
+    /// `prepare` only because the declaration came from outside.
+    ///
+    /// Each case is a declaration the owner issued for a DIFFERENT generation
+    /// than the attempt was admitted under. Without the gate `prepare` returned
+    /// `Prepared` for all of them, because the old layer re-derived the
+    /// declaration from the attempt itself and therefore always agreed with it.
+    #[test]
+    fn prepare_refuses_owner_declaration_for_another_generation() -> TestResult {
+        // A declaration issued for a different route generation.
+        let mut input = fresh_input()?;
+        let mut other_route = input.binding.route.clone();
+        other_route.model = "other-generation-model".into();
+        input.declaration =
+            crate::bridge_contract::issue_claude_sidecar_declaration(
+                &other_route,
+                &input.binding.state_fence,
+            )?;
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+
+        // A declaration issued under a different authority epoch (I6.10).
+        let mut input = fresh_input()?;
+        input.declaration = crate::bridge_contract::issue_claude_sidecar_declaration(
+            &input.binding.route,
+            &StateFence::new(
+                test_epoch(OTHER_LINEAGE),
+                eliot_agent_api::ResourceGeneration::new(1)?,
+            ),
+        )?;
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+
+        // A declaration issued for a different adapter factory revision.
+        let mut input = fresh_input()?;
+        input.declaration.factory_revision = CLAUDE_SIDECAR_FACTORY_REVISION + 1;
+        input.declaration = input.declaration.with_computed_digest()?;
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+
+        // A declaration edited after issuance without re-deriving its digest.
+        let mut input = fresh_input()?;
+        input.declaration.contract.side_effects[0].authority =
+            "caller-selected-authority".to_owned();
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+
+        // A declaration whose declared contract was dropped entirely.
+        let mut input = fresh_input()?;
+        input.declaration.contract.eliot_capabilities.clear();
+        input.declaration = input.declaration.with_computed_digest()?;
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+
+        // A declaration whose route digest was swapped for another
+        // generation's, with a consistent outer digest.
+        let mut input = fresh_input()?;
+        input.declaration.contract.admitted_binding_digest =
+            Some(eliot_agent_api::route_fingerprint_digest_for(&other_route)?);
+        input.declaration = input.declaration.with_computed_digest()?;
+        assert!(matches!(
+            prepare(input),
+            Err(ClaudeSidecarError::BindingMismatch(_))
+        ));
+        Ok(())
+    }
+
+    /// The owner-issued declaration for the exact admitted generation is
+    /// admitted, and it is the ONLY input shape that makes `prepare` succeed:
+    /// no declaration means no prepared attempt.
+    #[test]
+    fn owner_declaration_binds_the_exact_admitted_generation() -> TestResult {
+        let binding = binding_fixture()?;
+        let declaration = declaration_fixture(&binding);
+        assert_eq!(declaration.wire_id, CLAUDE_SIDECAR_DECLARATION_WIRE_ID);
+        assert_eq!(declaration.adapter_id, CLAUDE_SIDECAR_ADAPTER_ID);
+        assert_eq!(
+            declaration.factory_revision,
+            CLAUDE_SIDECAR_FACTORY_REVISION
+        );
+        assert_eq!(declaration.route, binding.route);
+        assert_eq!(declaration.state_fence, binding.state_fence);
+        assert_eq!(
+            declaration.declaration_sha256,
+            declaration.compute_digest()?
+        );
+        declaration.validate()?;
+        // The contract binds the admitted generation through the route owner's
+        // own digest, not a self-reported version.
+        assert!(
+            declaration
+                .contract
+                .binds_admitted_generation(&eliot_agent_api::route_fingerprint_digest_for(
+                    &binding.route
+                )?)
+        );
+        crate::bridge_contract::validate_claude_sidecar_declaration(
+            &declaration,
+            &binding.route,
+            &binding.state_fence,
+        )?;
+        prepared_fixture()?;
+        Ok(())
+    }
+
+    /// Owner-issued declarations are versioned wire records, so an unknown
+    /// shape or an unknown field is refused rather than reinterpreted.
+    #[test]
+    fn owner_declaration_wire_is_closed_and_versioned() -> TestResult {
+        let declaration = declaration_fixture(&binding_fixture()?);
+        let bytes = serde_json::to_vec(&declaration)?;
+        let decoded: ClaudeSidecarBridgeDeclaration = serde_json::from_slice(&bytes)?;
+        assert_eq!(decoded, declaration);
+
+        let mut stale = serde_json::to_value(&declaration)?;
+        stale["wire_version"] = serde_json::json!(u16::MAX);
+        let stale: ClaudeSidecarBridgeDeclaration = serde_json::from_value(stale)?;
+        assert!(stale.validate().is_err());
+        let mut forbidden = serde_json::to_value(&declaration)?;
+        forbidden["effect_authority"] = serde_json::json!("caller-selected");
+        assert!(serde_json::from_value::<ClaudeSidecarBridgeDeclaration>(forbidden).is_err());
         Ok(())
     }
 
