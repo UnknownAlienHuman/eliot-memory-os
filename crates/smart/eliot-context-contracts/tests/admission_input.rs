@@ -729,3 +729,89 @@ fn omission_handle_binding_mismatch_is_rejected() {
         Err(ContextError::OmissionHandleInvalid)
     );
 }
+
+/// Re-seal a complete result after its receipt was edited in place.
+///
+/// The receipt is re-hashed into `receipt_digest`, mirrored into the decision
+/// evidence and the whole envelope into `result_digest`, so the edited result is
+/// independently well-formed and self-consistent. Nothing here recomputes a
+/// recipe or policy digest; it only re-seals the records that changed, which is
+/// exactly what an attacker or a wrong owner would be able to do.
+fn reseal_complete_result(result: &mut AdmissionResult) {
+    let ContextOutcome::Complete(admitted) = &mut result.outcome else {
+        panic!("complete result carries an admitted set");
+    };
+    let mut unsigned_receipt = admitted.economy.clone();
+    unsigned_receipt.receipt_digest = "0".repeat(64);
+    admitted.economy.receipt_digest =
+        canonical_digest(&unsigned_receipt).expect("resealed receipt digest");
+    result.evidence.economy = Some(admitted.economy.clone());
+    let mut unsigned_result = result.clone();
+    unsigned_result.result_digest = "0".repeat(64);
+    result.result_digest = canonical_digest(&unsigned_result).expect("resealed result");
+}
+
+fn complete_economy_recipe_identity(result: &AdmissionResult) -> (String, String) {
+    let ContextOutcome::Complete(admitted) = &result.outcome else {
+        panic!("complete result carries an admitted set");
+    };
+    (
+        admitted.economy.recipe_digest.clone(),
+        admitted.economy.policy_sha256.clone(),
+    )
+}
+
+fn set_complete_economy_recipe_identity(result: &mut AdmissionResult, recipe_digest: &str) {
+    let ContextOutcome::Complete(admitted) = &mut result.outcome else {
+        panic!("complete result carries an admitted set");
+    };
+    admitted.economy.recipe_digest = recipe_digest.to_owned();
+}
+
+/// #1724 A2 — positive case. The delivered receipt names THIS admission's exact
+/// recipe instance and the exact approved policy revision that instance was
+/// issued under, both read unchanged off the recipe the owner passed in.
+#[test]
+fn complete_receipt_names_this_admissions_exact_recipe_identity() {
+    let input = input();
+    let result = complete_result(&input);
+    let (recipe_digest, policy_sha256) = complete_economy_recipe_identity(&result);
+    assert_eq!(recipe_digest, input.recipe.recipe_sha256);
+    assert_eq!(policy_sha256, input.recipe.decision.policy_sha256);
+    result
+        .validate_for(&input)
+        .expect("a receipt naming this operation's recipe identity validates");
+}
+
+/// #1724 A2 — refusal case. A receipt re-sealed under a different recipe instance
+/// or a different approved policy revision is refused, even though it is
+/// independently valid: well-formed digests, conserved membership, a correct
+/// `receipt_digest` and a correct `result_digest`.
+#[test]
+fn complete_receipt_naming_another_recipe_identity_is_refused() {
+    let input = input();
+    let baseline = complete_result(&input);
+
+    let mut other_instance = baseline.clone();
+    set_complete_economy_recipe_identity(&mut other_instance, &"b".repeat(64));
+    reseal_complete_result(&mut other_instance);
+    assert_ne!(
+        complete_economy_recipe_identity(&other_instance).0,
+        baseline.recipe_digest
+    );
+    assert_eq!(
+        other_instance.validate_for(&input),
+        Err(ContextError::IdentityConflict)
+    );
+
+    let mut other_policy = baseline;
+    let ContextOutcome::Complete(admitted) = &mut other_policy.outcome else {
+        panic!("complete result carries an admitted set");
+    };
+    admitted.economy.policy_sha256 = "c".repeat(64);
+    reseal_complete_result(&mut other_policy);
+    assert_eq!(
+        other_policy.validate_for(&input),
+        Err(ContextError::IdentityConflict)
+    );
+}
