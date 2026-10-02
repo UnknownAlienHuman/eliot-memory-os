@@ -2,14 +2,36 @@
 //!
 //! Every process handshake exchanges the full compatibility envelope: the
 //! protocol range, the contract-set digest, the canonical format range, the
-//! Architecture source digest plus the externally sealed
-//! `NormativePairIdentity` receipt, the module generation and Authority
-//! Epoch, the required and optional capabilities, and the state migration
-//! class. A candidate is admitted only when every field is compatible with
-//! the current durable state; rollback is admitted only when the recorded
-//! compatibility evidence still matches the current durable formats and
-//! epoch lineage. "Last known good" means verified compatible with current
-//! state, never merely previously launched.
+//! Architecture source digest plus the `NormativePairIdentity` receipt I1.12
+//! calls externally sealed, the module generation and Authority Epoch, the
+//! required and optional capabilities, and the state migration class. A
+//! candidate is admitted only when every field is compatible with the current
+//! durable state; rollback is admitted only when the recorded compatibility
+//! evidence still matches the current durable formats and epoch lineage. "Last
+//! known good" means verified compatible with current state, never merely
+//! previously launched.
+//!
+//! # What the normative-pair seal does and does not prove
+//!
+//! [`expected_seal_tag`] is a published, unkeyed recomputation, and this module
+//! treats it as one rather than as an attestation by an external issuer. Read
+//! [`expected_seal_tag`] for the precise statement; two properties are worth
+//! repeating here:
+//!
+//! - The seal check is strictly redundant with the Architecture-digest check
+//!   against durable state. Every seal verification in this crate compares two
+//!   peer-supplied operands ([`NormativePairReceipt::verifies`]) or recomputes
+//!   from a recorded peer value ([`admit_rollback`],
+//!   `KernelRuntimeHealthEvidence::validate`), so a peer presenting a
+//!   self-consistent pair passes both. The seal therefore contributes no
+//!   assurance the digest check does not already contribute. It is retained
+//!   because redundancy that a threat model can retire is not this module's to
+//!   remove.
+//! - What is genuinely independent of peer-supplied values is
+//!   `Session::establish_with_server` in `eliot-ipc`, which compares the peer's
+//!   `artifact_hash` and `module_generation` against
+//!   `ServerHandshakePolicy.module_generation`, the registry-selected
+//!   generation the server owner holds.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,19 +49,48 @@ pub const HANDSHAKE_ENVELOPE_VERSION: u32 = 1;
 /// Seal domain from the accepted external normative-pair receipt
 /// (`docs/normative-pair.toml`, `pair_key_algorithm =
 /// "sha256-domain-separated-v1"`).
+///
+/// The value is published here, so it separates the digest from other uses of
+/// SHA-256 but is not secret and confers no secrecy on anything.
 pub const NORMATIVE_SEAL_DOMAIN: &str = "eliot-normative-pair-v1";
 
-/// Computes the externally sealed pair tag expected for an Architecture digest.
+/// Computes the pair tag expected for an Architecture digest.
 ///
-/// The tag is the `NormativePairIdentity` pair key of the accepted external
-/// receipt: SHA-256 over the seal domain and the lowercase Architecture and
-/// Implementation digests, separated and terminated by NUL bytes
-/// (`docs/normative-pair.toml`, `pair_key_input`; I0.14). The Implementation
-/// half is the accepted receipt value owned by [`super::runtime_health`],
-/// never a peer-supplied string, so a receipt sealed against one normative
-/// pair never verifies as another. The Kernel never mints seals; it only
-/// verifies a presented tag against this function and the operation's durable
-/// state.
+/// The algorithm is the one the normative-pair receipt names
+/// (`docs/normative-pair.toml`, `pair_key_algorithm =
+/// "sha256-domain-separated-v1"`, `pair_key_input`; I0.14): SHA-256 over the
+/// seal domain and the lowercase Architecture and Implementation digests,
+/// separated and terminated by NUL bytes. The Implementation half is the
+/// compiled constant [`super::runtime_health::CURRENT_IMPLEMENTATION_SOURCE_DIGEST`],
+/// never a peer-supplied string.
+///
+/// # This is not a secret, and there is no issuer
+///
+/// The domain string, the digest constant, the NUL framing and SHA-256 itself
+/// are all published in this repository's source. No key, secret or signature
+/// participates, so the function is computable by anyone for any input; it
+/// cannot witness that a holder of anything proved anything. Production does in
+/// fact call it to derive the very tag it later verifies
+/// (`bins/eliot-kernel/src/compatibility_gate.rs` builds the process envelope's
+/// receipt by calling `expected_seal_tag`). A former comment here asserted the
+/// opposite - "The Kernel never mints seals" - and was false in production.
+///
+/// The precise statement, verified and not overstated:
+///
+/// > "Anyone can mint a valid tag for any digest" is true of the function but is
+/// > **not an admission bypass**, and reads as one. Demonstration: with
+/// > `D = "b"*64`, `expected_seal_tag(D)` computes fine,
+/// > `NormativePairReceipt::new(D, expected_seal_tag(D))` succeeds, but
+/// > `admit_handshake` **refuses at the architecture-digest check** before the
+/// > seal check, because durable state in production is the receiver's own
+/// > constant. Precise statement: **the seal is not a forged-secret bypass; it is
+/// > the absence of any issuer.**
+///
+/// Minting is not an admission bypass precisely because the Architecture-digest
+/// check against durable state runs first and holds a value the receiver did not
+/// take from the peer. Given that, the seal check in [`admit_handshake`] is
+/// strictly redundant with it and is kept anyway: redundancy that a later change
+/// with a full threat model can retire is not this module's to remove.
 #[must_use]
 pub fn expected_seal_tag(architecture_source_digest: &str) -> String {
     sha256_hex(
@@ -175,7 +226,8 @@ pub enum MismatchField {
     CanonicalFormatRange,
     /// The Architecture source digest differs from durable state.
     ArchitectureDigest,
-    /// The normative-pair seal does not verify against the source digest.
+    /// The presented normative-pair tag is not the recomputed tag of the
+    /// presented Architecture source digest.
     NormativeSeal,
     /// The Authority Epoch is not the current durable epoch.
     AuthorityEpoch,
@@ -256,12 +308,17 @@ impl fmt::Display for CompatibilityMismatch {
 
 impl std::error::Error for CompatibilityMismatch {}
 
-/// The externally sealed `NormativePairIdentity` receipt.
+/// The `NormativePairIdentity` receipt I1.12 describes as externally sealed.
 ///
-/// The receipt binds an Architecture source digest to the external pair-key
-/// seal tag issued with the accepted normative pair outside the Kernel. The
-/// Kernel never mints seals; it only verifies the presented tag against
-/// [`expected_seal_tag`].
+/// The receipt carries two peer-supplied values: an Architecture source digest
+/// and the pair-key tag derived from it by [`expected_seal_tag`]. Both are
+/// published algorithm, so the tag proves that its holder can compute a
+/// published hash - it is not a signature and there is no external issuer behind
+/// it. Production derives the tag from the build's own identity with
+/// [`expected_seal_tag`] rather than reading it from the receipt, so "issued
+/// outside the Kernel" is not what this type carries in practice. See
+/// [`expected_seal_tag`] for the precise statement and for why minting a tag is
+/// not an admission bypass.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormativePairReceipt {
@@ -272,8 +329,8 @@ pub struct NormativePairReceipt {
 impl NormativePairReceipt {
     /// Creates a well-formed receipt without verifying the seal.
     ///
-    /// Seal verification happens in [`admit_handshake`] so a forged seal is
-    /// reported as a structured [`MismatchField::NormativeSeal`] refusal
+    /// Seal verification happens in [`admit_handshake`] so an inconsistent seal
+    /// is reported as a structured [`MismatchField::NormativeSeal`] refusal
     /// rather than a malformed-envelope error.
     ///
     /// # Errors
@@ -302,14 +359,24 @@ impl NormativePairReceipt {
         &self.architecture_source_digest
     }
 
-    /// Returns the externally issued seal tag.
+    /// Returns the presented pair tag, exactly as the peer supplied it.
+    ///
+    /// Nothing is consulted to answer this: the value is the peer-supplied field
+    /// itself, so a caller that treats it as an issued seal is reading the peer's
+    /// own claim.
     #[must_use]
     pub fn seal_tag(&self) -> &str {
         &self.seal_tag
     }
 
-    /// Returns `true` only when the tag is the external pair key sealing
-    /// this digest under the accepted normative pair.
+    /// Returns `true` when the presented tag equals
+    /// [`expected_seal_tag`] of the presented digest.
+    ///
+    /// Both operands are peer-supplied: nothing the receiver holds is consulted,
+    /// so this is a self-consistency check between two fields of one peer message
+    /// and not a check against receiver-held truth. It is strictly redundant with
+    /// the Architecture-digest comparison [`admit_handshake`] performs against
+    /// durable state, which is the check that can actually refuse a peer.
     #[must_use]
     pub fn verifies(&self) -> bool {
         self.seal_tag == expected_seal_tag(&self.architecture_source_digest)
@@ -612,7 +679,11 @@ impl AcceptedCompatibilityEvidence {
         &self.architecture_source_digest
     }
 
-    /// Returns the verified seal tag.
+    /// Returns the pair tag recorded with this evidence, as presented.
+    ///
+    /// It is the tag that [`admit_handshake`] accepted, stored verbatim rather
+    /// than recomputed, so a later reader can re-derive it against the recorded
+    /// digest.
     #[must_use]
     pub fn seal_tag(&self) -> &str {
         &self.seal_tag
@@ -642,8 +713,16 @@ impl AcceptedCompatibilityEvidence {
 /// Every I1.12 field is gated in order and the first incompatibility is
 /// returned with its exact [`MismatchField`]. Overlapping protocol ranges
 /// are negotiated to the highest mutual version; every other field must
-/// match the durable state exactly, and the normative-pair seal must verify
-/// against the Architecture source digest before the peer is accepted.
+/// match the durable state exactly, and the presented normative-pair tag must
+/// be the recomputed tag of the presented Architecture source digest before the
+/// peer is accepted.
+///
+/// The Architecture-digest comparison against `durable` is the check that can
+/// refuse a peer, because `durable` is state the receiver did not take from the
+/// peer. The seal comparison that follows it reads only peer-supplied operands
+/// ([`NormativePairReceipt::verifies`]) and is therefore strictly redundant
+/// with the digest comparison just made; it is retained, not relied upon. See
+/// [`expected_seal_tag`] for the precise statement.
 pub fn admit_handshake(
     candidate: &CompatibilityEnvelope,
     durable: &DurableCompatibilityState,
@@ -965,9 +1044,16 @@ fn recorded_migration_class(value: &str) -> Result<StateMigrationClass, Compatib
 ///
 /// A previously launched artifact is not "last known good" on its own: its
 /// recorded protocol and canonical format versions must lie inside the
-/// current durable ranges, its digests, seal and migration class must match,
-/// and its epoch lineage must be the durable lineage. Any drift is refused
-/// with the exact mismatching field.
+/// current durable ranges, its digests and migration class must match, and its
+/// epoch lineage must be the durable lineage. Any drift is refused with the
+/// exact mismatching field.
+///
+/// The recorded tag is re-derived here exactly as [`NormativePairReceipt::verifies`]
+/// derives it: from the recorded digest, which came from the peer at admission
+/// time. It is a consistency check on the stored record, not an independent
+/// attestation, and it is redundant with the recorded-architecture-digest
+/// comparison above it. It is retained so a corrupted or rewritten ORS row is
+/// still refused.
 pub fn admit_rollback(
     evidence: &AcceptedCompatibilityEvidence,
     durable: &DurableCompatibilityState,
@@ -1225,8 +1311,8 @@ mod tests {
     /// SAME durable record that carries the generation and epoch lineage, so a
     /// later rollback re-verifies that verdict instead of "it launched once".
     #[test]
-    fn refused_candidate_activation_keeps_evidence_and_names_the_field()
-    -> Result<(), KernelError> {
+    fn refused_candidate_activation_keeps_evidence_and_names_the_field() -> Result<(), KernelError>
+    {
         let activation = admit_candidate_activation(
             &envelope(
                 VersionRange::new(8, 9).unwrap(),
@@ -1267,10 +1353,12 @@ mod tests {
             &durable(),
             1_700_000_000_000,
         )?;
-        let evidence = admitted.require_admitted().map_err(|_| KernelError::InvalidField {
-            field: "compatibility_envelope",
-            reason: "compatible candidate must be admitted",
-        })?;
+        let evidence = admitted
+            .require_admitted()
+            .map_err(|_| KernelError::InvalidField {
+                field: "compatibility_envelope",
+                reason: "compatible candidate must be admitted",
+            })?;
         assert_eq!(evidence.admitted_canonical_format_version(), Some(7));
         assert_eq!(evidence.refusal(), None);
         assert_eq!(evidence.migration_class(), "ADDITIVE");

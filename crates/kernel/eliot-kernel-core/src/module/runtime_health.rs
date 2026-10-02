@@ -4,6 +4,11 @@
 //! currency, and the two lifecycle machines in one typed wire projection.
 //! Producers must supply the evidence from their owning runtime state; this
 //! module validates the projection and never derives authority from `status`.
+//!
+//! "Authenticated" here refers to the session that carried the carrier, not to
+//! the normative-pair seal inside it: the seal is a published recomputation over
+//! two peer-supplied values and no issuer stands behind it. See
+//! `super::compatibility_handshake::expected_seal_tag`.
 
 use std::collections::BTreeSet;
 
@@ -18,13 +23,42 @@ use super::compatibility_handshake::{
 use super::process_health::{CapabilityHealth, CapabilityReadiness, ProcessHealthStatus};
 use crate::error::{KernelError, KernelResult};
 
-/// Architecture digest from the accepted normative-pair receipt.
+/// Compiled Architecture digest, intended to equal `architecture_sha256` in
+/// `docs/normative-pair.toml`.
+///
+/// It currently does NOT: the receipt declares
+/// `a3c5b2028d9df89a53cd565f8ff493484be74078e4efd7b534c0f1c3169577c7` under the
+/// sharded `eliot-normative-pair-v2-sharded` layout. This constant is not a
+/// drift-free statement of the accepted receipt and must not be read as one.
+/// Owned by issue #1067, whose acceptance item 3 is the test that reads the
+/// receipt and fails if any compiled pair constant disagrees; that acceptance
+/// text is itself stale against the sharded receipt, because it still names the
+/// pre-shard pair. The constant is left exactly as compiled: correcting it is a
+/// behaviour change this lane must not make. The stale Architecture digest also
+/// appears in `workstreams/core-daemons/capability-cell-registry.contract.toml`.
 pub const CURRENT_ARCHITECTURE_SOURCE_DIGEST: &str =
     "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a";
-/// Implementation digest from the accepted normative-pair receipt.
+/// Compiled Implementation digest, intended to equal `implementation_sha256` in
+/// `docs/normative-pair.toml`.
+///
+/// It currently does NOT: the receipt declares
+/// `ead4ceff2db254e4202c8fa7ae167225a6f65b720c222075ada61fc45fc407a4`. Same
+/// owner, same stale acceptance, and the same prohibition on correcting it here;
+/// see [`CURRENT_ARCHITECTURE_SOURCE_DIGEST`]. This file is the only place the
+/// stale Implementation digest appears in the repository.
 pub const CURRENT_IMPLEMENTATION_SOURCE_DIGEST: &str =
     "40b0908a637f46ba6c7c51db08e008673f9232ed74d510d3a4f38489d05d4e89";
-/// Pair identity from `docs/normative-pair.toml`.
+/// Compiled pair key, intended to equal `pair_key` in `docs/normative-pair.toml`.
+///
+/// It currently does NOT: the receipt declares
+/// `sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1`.
+/// Owned by issue #1067 as above. The stale key additionally appears in
+/// `scripts/verify-core-daemon-inventory.py`,
+/// `workstreams/core-daemons/inventory.json`,
+/// `docs/migration/1860-migration-inventory.md`,
+/// `crates/smart/cognitive-rev12-contract-schema-freeze.toml` and
+/// `crates/smart/cognitive-wave-10.toml`, which are all outside this lane and
+/// are reported, not fixed, here.
 pub const CURRENT_NORMATIVE_PAIR_KEY: &str =
     "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea";
 
@@ -44,7 +78,12 @@ pub struct KernelRuntimeHealthEvidence {
     pub module_generation: ResourceGeneration,
     /// Kernel-admitted compatibility result for the same generation/epoch.
     pub compatibility_evidence: AcceptedCompatibilityEvidence,
-    /// Exact external normative-pair identity used by the producer.
+    /// Exact normative-pair identity the producer stamped on the carrier.
+    ///
+    /// The word "external" is the receipt's, not a guarantee about this value:
+    /// the producer supplies it and [`KernelRuntimeHealthEvidence::validate`]
+    /// compares it against the compiled [`CURRENT_NORMATIVE_PAIR_KEY`], so it is
+    /// checked, not trusted.
     pub normative_pair_key: String,
     /// Implementation document digest paired with the architecture digest.
     pub implementation_source_digest: String,
@@ -86,6 +125,16 @@ impl KernelRuntimeHealthEvidence {
     }
 
     /// Revalidates a deserialized carrier at a consumer boundary.
+    ///
+    /// The normative-pair seal is re-derived here from the carrier's own
+    /// architecture digest and its own tag, so both operands come from the same
+    /// producer-supplied message and the re-derivation adds no assurance beyond
+    /// the carrier's internal consistency. What does carry assurance is the
+    /// separate comparison below against the receiver-held
+    /// [`CURRENT_ARCHITECTURE_SOURCE_DIGEST`], [`CURRENT_NORMATIVE_PAIR_KEY`]
+    /// and [`CURRENT_IMPLEMENTATION_SOURCE_DIGEST`], which the producer cannot
+    /// choose. The seal re-derivation is retained so a corrupted carrier is
+    /// still refused, not because it is a second independent gate.
     pub fn validate(&self) -> KernelResult<()> {
         if self.status != "OPEN" {
             return Err(KernelError::InvalidField {
@@ -103,6 +152,9 @@ impl KernelRuntimeHealthEvidence {
                 reason: "contains an unsupported or zero version",
             });
         }
+        // The seal re-derivation below reads two producer-supplied operands, so
+        // it checks this carrier's internal consistency only. The receiver-held
+        // constants compared further down are what a producer cannot choose.
         if !is_lower_sha256(compatibility.contract_set_digest())
             || !is_lower_sha256(compatibility.architecture_source_digest())
             || !is_lower_sha256(compatibility.seal_tag())
