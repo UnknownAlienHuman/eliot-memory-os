@@ -65,6 +65,7 @@ fn context() -> RequestMeta {
 }
 
 fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransition {
+    let manifests = eliot_store_api::generated_operation_manifests().unwrap();
     let mut transition = eliot_store_api::PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
@@ -81,8 +82,10 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
+        admission_contract_set_digest:
+            eliot_store_api::supported_admission_contract_set_digest().unwrap(),
+        operation_manifest_digest: eliot_store_api::operation_manifest_set_digest(&manifests)
+            .unwrap(),
         // Derived bindings, never placeholders. The envelope path renders
         // the admitted expected heads; every request built on this
         // transition below carries exactly `revision_heads()`.
@@ -296,6 +299,7 @@ fn valid_bounded_projection_and_request_round_trip() {
     assert_eq!(reencoded, encoded, "canonical raw bytes are stable");
     let fixture = include_str!("data/write_admission.json");
     let from_fixture: ReservedWriteRequest = serde_json::from_str(fixture).unwrap();
+    let manifests = eliot_store_api::generated_operation_manifests().unwrap();
     // Independent fixture contract: every committed field is asserted
     // literally, so fixture drift fails here even if the builder helpers
     // above changed in lockstep (no tautological builder equality).
@@ -313,21 +317,38 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea"
+        "b65218b42694a3daf3d4a4878e0c971c2d4b47378db17d1022fe33750ac38775"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3"
+        "492e2e7951923788e1bbf8b842cd8482e1997ad7e998481bcd58777e115b344f"
     );
     // Issue #18: the frozen transition carries derived (never defaulted)
     // decision/plan digests plus the rendered source revisions.
     assert_eq!(
         from_fixture.transition.admission_digest,
-        "85c55439e5ab7cab499f106a2cfad50fe9a7dd0c3d6796b15278963bb02ff7e4"
+        "7cb3f14c0b151b309388d27e51d5892863428e54d10aed766a50660bbea38023"
     );
     assert_eq!(
         from_fixture.transition.mutation_plan_digest,
         "f67bc87634ad01aa2ccbdcd3bb8546e379fed288e3886193c42942c648cbbae2"
+    );
+    assert_eq!(
+        from_fixture.transition.admission_contract_set_digest,
+        eliot_store_api::supported_admission_contract_set_digest().unwrap(),
+        "the raw fixture names the current supported contract set"
+    );
+    assert_eq!(
+        from_fixture.transition.operation_manifest_digest,
+        eliot_store_api::operation_manifest_set_digest(&manifests).unwrap(),
+        "the raw fixture names the complete generated manifest set"
+    );
+    assert!(
+        from_fixture
+            .transition
+            .validate_against_catalogue(&manifests)
+            .is_ok(),
+        "the raw prepared transition passes the current operation catalogue owner"
     );
     assert_eq!(
         from_fixture.transition.semantic_source_revisions,
@@ -1283,14 +1304,12 @@ fn exported_api_surface_exposes_no_reserved_write_authority() {
     // proof is the declared-but-unadvertised capability in 990/10. This test
     // pins the rest: the advertised capability and effect sets.
     assert!(
-        CAPABILITIES
-            .iter()
-            .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
-        "no hidden capability activation: {CAPABILITIES:?}"
-    );
-    assert!(
         !CAPABILITIES.contains(&eliot_store_api::CAPABILITY_RESERVED_WRITE),
         "the declared reserved-write capability stays unadvertised until the backend slice"
+    );
+    assert!(
+        CAPABILITIES.contains(&"store.dreamer_job.record_admission"),
+        "reserved-write checks leave the unrelated Dreamer record-admission capability intact"
     );
     assert_eq!(
         EFFECTS,
