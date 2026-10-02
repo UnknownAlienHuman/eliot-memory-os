@@ -589,7 +589,7 @@ pub mod kernel_client {
     /// operation binding.
     pub const OPERATOR_LAUNCH_OPERATION: &str = "operator.launch";
 
-    /// The operator-initiated ControlBoard status read this client sends.
+    /// The operator-initiated `ControlBoard` status read this client sends.
     ///
     /// The wire identity is the runtime-status owner's
     /// [`eliot_runtime_status::CONTROLBOARD_STATUS_OPERATION`]; it is re-declared

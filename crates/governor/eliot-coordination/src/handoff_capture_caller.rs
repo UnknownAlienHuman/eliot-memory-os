@@ -293,6 +293,9 @@ fn capture_operation_id(
 /// The match is exhaustive over today's receipt-contract enum, so a new variant
 /// there is a compile error in this file rather than a silently swallowed
 /// refusal.
+// Taken by value because it is composed as a `map_err` function reference, which
+// hands the error over; the match then only borrows its `&'static str` fields.
+#[allow(clippy::needless_pass_by_value)]
 fn capture_identity_refusal(error: ReceiptContractError) -> HandoffCaptureCallerError {
     let refusal = |field: &'static str, reason: &'static str| {
         HandoffCaptureCallerError::ReceiptContractRefused { field, reason }

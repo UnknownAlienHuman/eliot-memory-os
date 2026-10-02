@@ -140,9 +140,9 @@ pub struct HandoffResumeAuthorityQuery<'a> {
 /// The returned value is an observation, not authority: `lease_is_current`
 /// still has to hold before the presenter is treated as the current holder, and
 /// the gate still refuses when `authority_readback_available` is false.
-pub fn read_resume_authority_observations<'a>(
+pub fn read_resume_authority_observations(
     owner: &CoordinationOwner,
-    query: &HandoffResumeAuthorityQuery<'a>,
+    query: &HandoffResumeAuthorityQuery<'_>,
 ) -> Result<HandoffAuthorityObservations, HandoffResumeError> {
     let projection = owner.read_active_work_lease(
         query.work_item_id,

@@ -21,7 +21,7 @@
 //!   transport binding this composition itself established. It is bound into
 //!   [`RequestMetadata::session_id`] and into the request id, so an identity is
 //!   useless on any other connection.
-//! * **generation / Authority Epoch / StateFence** — the *current* front-door
+//! * **generation / Authority Epoch / `StateFence`** — the *current* front-door
 //!   policy generation (`front_door_policy.module_generation.state_fence`),
 //!   re-read live under the same lock the closed gateway uses. The presented
 //!   session must be compatible with it, so a replaced or expired generation
@@ -241,6 +241,10 @@ impl KernelComposition {
     /// live admission instead of being asserted by the caller. Every gate
     /// fails closed with [`TransportError::SessionFenced`], and no failure
     /// produces an identity.
+    // The whole issuance is one authority decision: read the peer, re-read the fence,
+    // intersect the capabilities and mint. Splitting it would put a boundary between
+    // two halves of a single decision.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn issue_operator_request_identity(
         &self,
         session: &Session,
@@ -368,7 +372,7 @@ impl KernelComposition {
             issued_at_unix_ms,
             expires_at_unix_ms,
             authority_epoch: state_fence.authority_epoch.clone(),
-            resource_generation: state_fence.resource_generation.clone(),
+            resource_generation: state_fence.resource_generation,
             state_fence,
             role,
             capabilities,
@@ -447,6 +451,11 @@ fn observed_peer(session: &Session) -> Result<PeerObservation, TransportError> {
 /// Every argument is owner-derived; nothing here reads a caller value except
 /// the closed operation selector, and the id/key/cancellation strings are
 /// derived here rather than supplied.
+// One parameter per fact the identity is bound to: the requested role and its
+// capabilities, the connection and session it is scoped to, the operation, the
+// per-operation ordinal, the live fence, and the issuance window. Grouping them
+// into a struct would only move the same facts one indirection away.
+#[allow(clippy::too_many_arguments)]
 fn mint_operator_request_identity(
     role: &str,
     capabilities: &[String],
