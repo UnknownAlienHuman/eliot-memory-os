@@ -158,9 +158,9 @@ pub const ADVERTISED_INSTRUMENTS: &[AdvertisedInstrument] = &[
 /// as a dependency of the runner would change the locked dependency graph
 /// for no behavioural gain. The literals are exact copies of
 /// `eliot_build_test_graph::CONTRACT_NAME` and
-/// `eliot_test_selection::TEST_SELECTION_INSTRUMENT`; they are covered by
-/// the shared conformance corpus identity check, not by a compile-time
-/// reference.
+/// `eliot_test_selection::TEST_SELECTION_INSTRUMENT`; their identities remain
+/// visible in the declared denominator without creating compile-time
+/// references.
 pub const UNMAPPED_IN_PROCESS_INSTRUMENTS: &[AdvertisedInstrument] = &[
     AdvertisedInstrument::new(
         "eliot.instrument.build-test-graph",
@@ -798,13 +798,43 @@ pub enum ConformanceError {
         /// Conflicting case identity.
         case_id: String,
     },
-    /// A case names a provider that is not in the declared denominator.
-    #[error("conformance case '{case_id}' names unmapped provider '{instrument}'")]
+    /// A case names a provider outside the advertised provider set.
+    #[error("conformance case '{case_id}' names unknown provider '{instrument}'")]
     UnknownProvider {
         /// Offending case identity.
         case_id: String,
-        /// Unmapped instrument contract name.
+        /// Unknown instrument contract name.
         instrument: String,
+    },
+    /// An advertised denominator provider has no case in the common corpus.
+    #[error("conformance corpus has no case for advertised provider '{instrument}'")]
+    MissingProvider {
+        /// Advertised instrument contract name absent from the corpus.
+        instrument: String,
+    },
+    /// A corpus case expects dispatch when its provider/class is unavailable.
+    #[error("conformance case expects unavailable provider '{instrument}' to dispatch")]
+    UnavailableProvider {
+        /// Advertised instrument contract name with no registry entry.
+        instrument: String,
+    },
+    /// The denominator was derived from a different registry identity.
+    #[error("conformance denominator does not match registry provider '{instrument}'")]
+    RegistryMismatch {
+        /// Provider whose mapped entry or declared ownership differs.
+        instrument: String,
+    },
+    /// The corpus dispatch expectation disagrees with current typed availability.
+    #[error(
+        "conformance case for '{instrument}' expects dispatchable={expected}, current availability is {actual}"
+    )]
+    DispatchabilityMismatch {
+        /// Provider whose expected dispatchability differs.
+        instrument: String,
+        /// Dispatchability declared by the corpus case.
+        expected: bool,
+        /// Dispatchability resolved from the registry and current inputs.
+        actual: bool,
     },
     /// The corpus or fixture set was written for another registry identity.
     #[error("conformance corpus is bound to generation {expected}, registry is at {found}")]
@@ -849,15 +879,21 @@ pub struct ConformanceCorpus {
 impl ConformanceCorpus {
     /// Validates the corpus shape and its binding to the current registry.
     ///
-    /// Every case must name an advertised provider that the denominator
-    /// maps, so a corpus can never claim conformance for an identity the
-    /// registry does not own.
+    /// Every independently declared provider identity must have a case,
+    /// including identities deliberately left unmapped. The supplied
+    /// denominator must be exactly the one derived from this registry, and
+    /// each case's expected dispatchability must match the current typed
+    /// availability for its declared instrument kind.
     ///
     /// # Errors
     ///
     /// Returns [`ConformanceError::InvalidText`],
     /// [`ConformanceError::DuplicateCase`],
     /// [`ConformanceError::UnknownProvider`],
+    /// [`ConformanceError::MissingProvider`],
+    /// [`ConformanceError::UnavailableProvider`],
+    /// [`ConformanceError::RegistryMismatch`],
+    /// [`ConformanceError::DispatchabilityMismatch`],
     /// [`ConformanceError::StaleGeneration`],
     /// [`ConformanceError::StaleNormativePair`], or
     /// [`ConformanceError::StaleFingerprint`].
@@ -872,20 +908,8 @@ impl ConformanceCorpus {
                 field: CORPUS_FIELD,
             });
         }
-        let mut seen = std::collections::BTreeSet::new();
-        for case in &self.cases {
-            case.validate()?;
-            if !seen.insert(case.case_id.clone()) {
-                return Err(ConformanceError::DuplicateCase {
-                    case_id: case.case_id.clone(),
-                });
-            }
-            if denominator.entry(&case.instrument).is_none() {
-                return Err(ConformanceError::UnknownProvider {
-                    case_id: case.case_id.clone(),
-                    instrument: case.instrument.clone(),
-                });
-            }
+        if self.cases.is_empty() {
+            return Err(ConformanceError::InvalidText { field: "cases" });
         }
         if self.generation != registry.generation() {
             return Err(ConformanceError::StaleGeneration {
@@ -893,17 +917,102 @@ impl ConformanceCorpus {
                 found: registry.generation(),
             });
         }
+        if denominator.generation() != registry.generation() {
+            return Err(ConformanceError::StaleGeneration {
+                expected: self.generation,
+                found: denominator.generation(),
+            });
+        }
         if self.normative_pair_digest != registry.normative_pair_digest() {
             return Err(ConformanceError::StaleNormativePair);
         }
-        if let Some(field) = self
-            .fingerprints
-            .mismatch(entry_fingerprints(denominator, &self.cases))
-        {
-            return Err(ConformanceError::StaleFingerprint { field });
+        for entry in registry {
+            if let Some(field) = self.fingerprints.mismatch(&entry.invalidation) {
+                return Err(ConformanceError::StaleFingerprint { field });
+            }
+        }
+        validate_current_denominator(registry, denominator)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut covered = std::collections::BTreeSet::new();
+        for case in &self.cases {
+            case.validate()?;
+            if !seen.insert(case.case_id.clone()) {
+                return Err(ConformanceError::DuplicateCase {
+                    case_id: case.case_id.clone(),
+                });
+            }
+            if !declared_instruments().any(|advertised| advertised.contract == case.instrument) {
+                return Err(ConformanceError::UnknownProvider {
+                    case_id: case.case_id.clone(),
+                    instrument: case.instrument.clone(),
+                });
+            }
+            let instrument = denominator
+                .entry(&case.instrument)
+                .map(|entry| entry.instrument.clone())
+                .or_else(|| ContractId::new(&case.instrument).ok());
+            let actual_dispatchable = instrument.is_some_and(|instrument| {
+                registry
+                    .availability_parts(
+                        &instrument,
+                        case.kind,
+                        &AvailabilityInputs {
+                            generation: self.generation,
+                            normative_pair_digest: &self.normative_pair_digest,
+                            fingerprints: &self.fingerprints,
+                            platform: host_platform(),
+                        },
+                    )
+                    .is_available()
+            });
+            if case.expected_dispatchable && !actual_dispatchable {
+                return Err(ConformanceError::UnavailableProvider {
+                    instrument: case.instrument.clone(),
+                });
+            }
+            if !case.expected_dispatchable && actual_dispatchable {
+                return Err(ConformanceError::DispatchabilityMismatch {
+                    instrument: case.instrument.clone(),
+                    expected: false,
+                    actual: true,
+                });
+            }
+            covered.insert(case.instrument.as_str());
+        }
+        for advertised in declared_instruments() {
+            if !covered.contains(advertised.contract) {
+                return Err(ConformanceError::MissingProvider {
+                    instrument: advertised.contract.to_owned(),
+                });
+            }
         }
         Ok(())
     }
+}
+
+fn validate_current_denominator(
+    registry: &crate::registry::ProviderRegistry,
+    denominator: &ProviderDenominator,
+) -> Result<(), ConformanceError> {
+    let current_denominator =
+        ProviderDenominator::current(registry).map_err(|_| ConformanceError::RegistryMismatch {
+            instrument: "<registry-denominator>".to_owned(),
+        })?;
+    if denominator != &current_denominator {
+        let instrument = declared_instruments()
+            .find(|advertised| {
+                denominator.entry(advertised.contract)
+                    != current_denominator.entry(advertised.contract)
+                    || denominator.owner(advertised.contract)
+                        != current_denominator.owner(advertised.contract)
+            })
+            .map_or_else(
+                || "<registry-denominator>".to_owned(),
+                |row| row.contract.to_owned(),
+            );
+        return Err(ConformanceError::RegistryMismatch { instrument });
+    }
+    Ok(())
 }
 
 /// Real-execution fixture set bound to one provider identity.
@@ -935,7 +1044,9 @@ impl ProviderFixtureSet {
     ///
     /// # Errors
     ///
-    /// Returns [`ConformanceError::InvalidText`] for a blank identity, or
+    /// Returns [`ConformanceError::InvalidText`] for a blank identity or
+    /// malformed real case identity, [`ConformanceError::DuplicateCase`] for
+    /// repeated real case identities, or
     /// [`ConformanceError::StaleGeneration`] /
     /// [`ConformanceError::StaleFingerprint`] when the binding moved.
     pub fn validate(&self, entry: &RegistryEntry) -> Result<(), ConformanceError> {
@@ -950,6 +1061,22 @@ impl ProviderFixtureSet {
                 instrument: self.instrument.clone(),
             });
         }
+        if self.real_cases.is_empty() {
+            return Err(ConformanceError::InvalidText {
+                field: "real_cases",
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for case_id in &self.real_cases {
+            if case_id.trim().is_empty() || case_id.chars().any(char::is_control) {
+                return Err(ConformanceError::InvalidText { field: "real_case" });
+            }
+            if !seen.insert(case_id) {
+                return Err(ConformanceError::DuplicateCase {
+                    case_id: case_id.clone(),
+                });
+            }
+        }
         if self.generation != entry.generation {
             return Err(ConformanceError::StaleGeneration {
                 expected: self.generation,
@@ -962,45 +1089,3 @@ impl ProviderFixtureSet {
         Ok(())
     }
 }
-
-/// The invalidation set shared by the corpus cases' owning entries.
-///
-/// Every mapped provider entry is attested with the same caller-supplied
-/// fingerprints, so one comparison is sufficient; a registry that ever
-/// carries per-entry fingerprints fails closed here rather than silently
-/// validating against an unrelated entry.
-fn entry_fingerprints<'a>(
-    denominator: &'a ProviderDenominator,
-    cases: &'a [ConformanceCase],
-) -> &'a InvalidationSet {
-    let mut selected: Option<&InvalidationSet> = None;
-    for case in cases {
-        let Some(entry) = denominator.entry(&case.instrument) else {
-            continue;
-        };
-        match selected {
-            None => selected = Some(&entry.invalidation),
-            Some(existing) if *existing == entry.invalidation => {}
-            Some(_) => {
-                // Unreachable through ProviderRegistry::ready, which clones
-                // one caller-attested set into every entry. Returned as a
-                // distinct synthetic set so the mismatch is reported instead
-                // of validated against the first entry.
-                return &DIVERGED_FINGERPRINTS;
-            }
-        }
-    }
-    selected.unwrap_or(&DIVERGED_FINGERPRINTS)
-}
-
-/// Sentinel used when entries no longer share one attested fingerprint set.
-static DIVERGED_FINGERPRINTS: std::sync::LazyLock<InvalidationSet> =
-    std::sync::LazyLock::new(|| InvalidationSet {
-        source: String::new(),
-        lock: String::new(),
-        toolchain: String::new(),
-        env: String::new(),
-        exe: String::new(),
-        profile: String::new(),
-        parser: String::new(),
-    });
