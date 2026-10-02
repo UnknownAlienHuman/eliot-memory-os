@@ -781,7 +781,7 @@ fn derive_attribution(
             .into());
         }
     }
-    if &basis.basis_route == subject_id || basis.owner_receipt == subject_id {
+    if basis.basis_route == subject_id || basis.owner_receipt == subject_id {
         return Err(LearningContractError::ScopeMismatch {
             field: "attribution.basis_independence",
         }
