@@ -14,12 +14,19 @@
 //! (expected sources, observable split, denominator origin, completeness,
 //! invalidation) — those arrive in the caller plan, which the run owner that
 //! knows the fingerprint supplies per fingerprint.
+//!
+//! [`run_ingest_for_fingerprint`] is the execution-unit ingest entry: it drives
+//! [`produce_execution_unit_events`] first, so the execution-unit producer runs
+//! on real events with the run owner's own binding/admission/observation
+//! material before the reconnect/intake/coverage stages consume them.
 
 use eliot_evaluation_contracts::ObservationCoverageManifest;
 
 use crate::{
-    AllowedHostManifestView, CoverageManifestPlan, DurableHostEventJournal, IngestError,
-    ObservedReconnectOutcome, ReplayItem, ResolvedHostComplianceFacts, drive_reconnect_observed,
+    AllowedHostManifestView, CoverageManifestPlan, DurableHostEventJournal,
+    ExecutionUnitDriverEvent, ExecutionUnitRunError, IngestError, ObservedReconnectOutcome,
+    ProducedExecutionUnitEvent, ReplayItem, ResolvedHostComplianceFacts, drive_reconnect_observed,
+    produce_execution_unit_events,
 };
 
 /// Journal-owner run input for one product/session/attempt/route fingerprint
@@ -98,6 +105,11 @@ pub fn run_coverage_manifest(
 /// fingerprint.
 #[derive(Clone, Debug)]
 pub struct FingerprintIngestRunOutcome {
+    /// Execution-unit events produced by the execution-unit producer at the
+    /// start of this run, in declared order, each with its producer outcome and
+    /// the route evidence read back from the committed record and re-verified
+    /// against that event's own binding/admission/observation.
+    pub produced: Vec<ProducedExecutionUnitEvent>,
     /// Observed reconnect drive per stream of the fingerprint, in roster
     /// order: commit recovery, downstream delivery, intake projection, and
     /// drop gaps.
@@ -107,28 +119,46 @@ pub struct FingerprintIngestRunOutcome {
 }
 
 /// Runs the host-event ingestion run flow for one product/session/attempt/
-/// route fingerprint: drives the observed reconnect for every stream in the
-/// run roster, then persists the coverage denominator through
+/// route fingerprint: produces every declared execution-unit event through the
+/// execution-unit producer, drives the observed reconnect for every stream in
+/// the run roster, then persists the coverage denominator through
 /// [`run_coverage_manifest`].
 ///
-/// The drive comes first because it is the functional precondition of the
-/// denominator: commit recovery commits staged-but-uncommitted records, which
-/// would otherwise abort persistence with [`IngestError::NotCommitted`]
-/// before anything is retained. A refused downstream delivery stops only that
-/// stream's drive (`stopped_early`); its committed records still belong to
-/// the denominator, so the manifest run still proceeds. Every failure is
-/// typed and retains nothing partial.
+/// Production comes first so the run actually produces the execution-unit
+/// events it then consumes: each declared event carries the run owner's own
+/// #361 binding, #369 admission and applicable #369 physical observation, so
+/// the producer derives and stages the requested/actual route columns from
+/// those owners and commits. The drive then delivers those committed records
+/// downstream and projects them to coordinator intake, which is the ordinary
+/// consumption path — a produced event is never staged and dropped.
+///
+/// The drive stays the functional precondition of the denominator: commit
+/// recovery commits staged-but-uncommitted records, which would otherwise abort
+/// persistence with [`IngestError::NotCommitted`] before anything is retained.
+/// A refused downstream delivery stops only that stream's drive
+/// (`stopped_early`); its committed records still belong to the denominator, so
+/// the manifest run still proceeds. Every failure is typed and retains nothing
+/// partial.
+///
+/// A declared event on a stream outside `run.stream_ids` is refused before any
+/// mutation, because the drive below would never deliver it.
 pub fn run_ingest_for_fingerprint(
     owner: &mut DurableHostEventJournal,
     run: &CoverageManifestRun<'_>,
+    events: &[ExecutionUnitDriverEvent<'_>],
     mut deliver: impl FnMut(&ReplayItem) -> bool,
-) -> Result<FingerprintIngestRunOutcome, IngestError> {
+) -> Result<FingerprintIngestRunOutcome, ExecutionUnitRunError> {
+    let produced = produce_execution_unit_events(owner, events, run.stream_ids)?;
     let mut observed = Vec::with_capacity(run.stream_ids.len());
     for stream_id in run.stream_ids.iter().copied() {
         observed.push(drive_reconnect_observed(owner, stream_id, &mut deliver)?);
     }
     let manifest = run_coverage_manifest(owner, run)?;
-    Ok(FingerprintIngestRunOutcome { observed, manifest })
+    Ok(FingerprintIngestRunOutcome {
+        produced,
+        observed,
+        manifest,
+    })
 }
 
 /// Drives coverage-denominator production for one fingerprint: resolve facts

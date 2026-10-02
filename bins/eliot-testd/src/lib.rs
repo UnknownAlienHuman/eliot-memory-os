@@ -1993,6 +1993,13 @@ pub enum ValidatedDispatchDriveOutcome {
         /// Echo of the admitted job identity.
         job_id: String,
     },
+    /// Registry refused this provider before admission or worker claim.
+    ProviderRefused {
+        /// Echo of the admitted job identity.
+        job_id: String,
+        /// Exact runner disposition retained across the runtime boundary.
+        disposition: eliot_instrument_runner::ProviderDisposition,
+    },
 }
 
 /// Drives one validated dispatch file through the bounded admitted probe.
@@ -2063,6 +2070,7 @@ fn canonicalize_dispatch_roots(
     if observed_source != canonical_job_source
         || job.invocation.profile != material.profile
         || job.invocation.arguments != material.sealed_slot_suffix
+        || job.process.operation_id != material.operation_id
         || job.process.generation != material.generation
         || !job
             .process
@@ -2087,6 +2095,11 @@ fn ensure_dispatch_source_observation(
             if std::path::Path::new(&observation.repository_root) != canonical_job_source {
                 return Err(TestdError::InvalidBinding);
             }
+        } else if job.state.is_terminal() {
+            return Err(TestdError::Invalid {
+                field: "terminal_replay.source_observation",
+                reason: "terminal productive job has no original source observation",
+            });
         } else {
             let observation = TestdSourceObservation::capture(canonical_job_source, git)?;
             job = store.bind_source_observation_before_dispatch(
@@ -2099,17 +2112,65 @@ fn ensure_dispatch_source_observation(
     Ok(job)
 }
 
+fn capture_provider_registry_observations(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source: TestdSourceObservation,
+    intent: &ProcessIntent,
+    canonical_job_source: &Path,
+) -> Result<eliot_instrument_runner::TestdProviderRegistryObservations, TestdError> {
+    let lock_bytes = std::fs::read(canonical_job_source.join("Cargo.lock")).map_err(|_| {
+        TestdError::Invalid {
+            field: "provider_registry.lock",
+            reason: "canonical source Cargo.lock is unavailable",
+        }
+    })?;
+    let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
+    let selected = resolve_selected_toolchain(&rustup_home, canonical_job_source)?;
+    let profile_sha256 = if material.sealed_slot_suffix.is_empty() {
+        eliot_testd_core::testd_definition_digest_for_profile(&job.invocation.profile)?
+    } else {
+        eliot_testd_core::testd_definition_digest_for_slots(
+            &job.invocation.profile,
+            &material.sealed_slot_suffix,
+        )?
+    };
+    let parser_path = std::env::current_exe().map_err(|_| TestdError::Invalid {
+        field: "provider_registry.parser",
+        reason: "current Testd image path is unavailable",
+    })?;
+    let parser_bytes = std::fs::read(parser_path).map_err(|_| TestdError::Invalid {
+        field: "provider_registry.parser",
+        reason: "current Testd image bytes are unavailable",
+    })?;
+    let toolchain = eliot_testd_core::TestdToolObservation {
+        nextest_path: intent.executable().to_owned(),
+        nextest_sha256: intent.executable_sha256().to_owned(),
+        cargo_path: selected.cargo.path,
+        cargo_sha256: selected.cargo.sha256,
+        rustc_path: selected.rustc.path,
+        rustc_sha256: selected.rustc.sha256,
+        selected_toolchain: selected.toolchain,
+    };
+    Ok(eliot_instrument_runner::TestdProviderRegistryObservations {
+        source,
+        lock_sha256: eliot_testd_core::sha256_hex(&lock_bytes),
+        toolchain,
+        environment_projection_sha256: eliot_process_executor::environment_projection_digest(
+            intent.environment(),
+        ),
+        profile_sha256,
+        parser_image_sha256: eliot_testd_core::sha256_hex(&parser_bytes),
+    })
+}
+
 fn derive_dispatch_process_intent(
     job: &TestJob,
     material: &crate::testd_material::ValidatedTestdMaterial,
     canonical_job_source: &Path,
+    selected_program: &str,
 ) -> Result<ProcessIntent, TestdError> {
-    let program_path = if job.invocation.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
-        eliot_testd_core::TESTD_PROFILE_PROGRAM
-    } else {
-        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
-    };
-    let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
+    let tool = resolve_testd_tool_at(selected_program, canonical_job_source)?;
     let tool_environment = bind_tool_environment_to_roots(
         &job.invocation.profile,
         tool.environment,
@@ -2151,6 +2212,123 @@ fn derive_dispatch_process_intent(
         fixture_environment,
     };
     derive_testd_intent(&params)
+}
+
+fn derive_productive_dispatch_process_intent(
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    canonical_job_source: &Path,
+    registry: &eliot_instrument_runner::ProviderRegistry,
+    selected: &eliot_instrument_runner::RegistryEntry,
+) -> Result<ProcessIntent, TestdError> {
+    // The returned registry entry is the factory selector. Its complete
+    // profile, adapter/version, executable, environment and parser ownership
+    // must equal the accepted registry mapping for this closed Testd profile
+    // before the existing sealed profile/root/resource derivation can run.
+    let selected_program = eliot_instrument_runner::validate_testd_provider_factory(
+        registry,
+        &job.invocation.profile,
+        selected,
+    )?;
+    derive_dispatch_process_intent(job, material, canonical_job_source, &selected_program)
+}
+
+enum ProductiveProviderDispatchResolution {
+    Ready(Box<ProcessIntent>),
+    Refused(eliot_instrument_runner::ProviderDisposition),
+}
+
+fn resolve_productive_provider_dispatch(
+    store: &TestdStore,
+    job: &TestJob,
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    canonical_job_source: &Path,
+    git: &GovernedGitSourceObservation,
+) -> Result<ProductiveProviderDispatchResolution, TestdError> {
+    let snapshot_artifact = if let Some(snapshot) = job.provider_registry_snapshot.as_ref() {
+        snapshot.clone()
+    } else if job.state.is_terminal() {
+        return Err(TestdError::Invalid {
+            field: "terminal_replay.provider_registry_snapshot",
+            reason: "terminal productive job has no original provider registry snapshot",
+        });
+    } else {
+        let original_intent = derive_dispatch_process_intent(
+            job,
+            material,
+            canonical_job_source,
+            eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM,
+        )?;
+        let original_source = job
+            .source_observation_before
+            .as_ref()
+            .ok_or(TestdError::InvalidBinding)?;
+        let original_observations = capture_provider_registry_observations(
+            job,
+            material,
+            original_source.clone(),
+            &original_intent,
+            canonical_job_source,
+        )?;
+        let snapshot = eliot_instrument_runner::bind_testd_provider_registry_snapshot(
+            job,
+            &original_observations,
+        )?;
+        store
+            .bind_provider_registry_snapshot_before_dispatch(&job.job_id, snapshot, unix_ms())?
+            .provider_registry_snapshot
+            .ok_or(TestdError::InvalidBinding)?
+    };
+    let snapshot =
+        eliot_instrument_runner::decode_testd_provider_registry_snapshot(&snapshot_artifact, job)?;
+    let registry = eliot_instrument_runner::build_testd_provider_registry(&snapshot)?;
+    let intent = derive_dispatch_process_intent(
+        job,
+        material,
+        canonical_job_source,
+        eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM,
+    )?;
+    // This owner observation is independent from the baseline retained above
+    // and uses the same governed Git port and ProcessExecutor.
+    let current_source = TestdSourceObservation::capture(canonical_job_source, git)?;
+    let current_observations = capture_provider_registry_observations(
+        job,
+        material,
+        current_source,
+        &intent,
+        canonical_job_source,
+    )?;
+    let (_, _, current_normative_pair_key) =
+        eliot_instrument_runner::testd_registry::current_testd_normative_pair()?;
+    let current_fingerprints = current_observations.invalidation_set()?;
+    let availability = eliot_instrument_runner::AvailabilityInputs {
+        generation: eliot_instrument_runner::READY_PROVIDER_REGISTRY_GENERATION,
+        normative_pair_digest: &current_normative_pair_key,
+        fingerprints: &current_fingerprints,
+        platform: eliot_instrument_runner::host_platform(),
+    };
+    let dispatch = eliot_instrument_runner::compose_testd_provider_dispatch(
+        &registry,
+        &job.invocation.profile,
+        &availability,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    match dispatch {
+        eliot_instrument_runner::ProviderDispatch::Refused { disposition } => {
+            Ok(ProductiveProviderDispatchResolution::Refused(disposition))
+        }
+        eliot_instrument_runner::ProviderDispatch::Dispatch { entry } => {
+            Ok(ProductiveProviderDispatchResolution::Ready(Box::new(
+                derive_productive_dispatch_process_intent(
+                    job,
+                    material,
+                    canonical_job_source,
+                    &registry,
+                    &entry,
+                )?,
+            )))
+        }
+    }
 }
 
 fn present_dispatch_admission(
@@ -2212,6 +2390,83 @@ fn project_dispatch_receipt_state(
     }
 }
 
+fn replay_terminal_productive_dispatch(
+    job: &TestJob,
+    job_id: &str,
+    operation_id: &str,
+) -> Result<Option<ValidatedDispatchDriveOutcome>, TestdError> {
+    if !job.state.is_terminal() {
+        return Ok(None);
+    }
+    if job.job_id != job_id || job.process.operation_id != operation_id {
+        return Err(TestdError::InvalidBinding);
+    }
+    let verification_receipt = job
+        .verification_receipt
+        .as_ref()
+        .ok_or(TestdError::Invalid {
+            field: "terminal_replay.verification_receipt",
+            reason: "terminal productive job has no original verification receipt",
+        })?;
+    verification_receipt.validate(job)?;
+    let binding = job.receipt.as_ref().ok_or(TestdError::Invalid {
+        field: "terminal_replay.receipt_binding",
+        reason: "terminal productive job has no retained receipt binding",
+    })?;
+    if binding != &verification_receipt.binding()
+        || job.execution != Some(verification_receipt.execution)
+    {
+        return Err(TestdError::Invalid {
+            field: "terminal_replay.receipt_binding",
+            reason: "terminal job receipt identity or execution differs from its original receipt",
+        });
+    }
+    match (job.state, verification_receipt.execution) {
+        (
+            eliot_testd_core::JobState::Succeeded,
+            eliot_instrument_api::ExecutionStatus::Succeeded,
+        )
+        | (
+            eliot_testd_core::JobState::Failed,
+            eliot_instrument_api::ExecutionStatus::Failed
+            | eliot_instrument_api::ExecutionStatus::Unknown,
+        )
+        | (
+            eliot_testd_core::JobState::Cancelled,
+            eliot_instrument_api::ExecutionStatus::Cancelled,
+        ) => {}
+        _ => return Err(TestdError::InvalidBinding),
+    }
+    if verification_receipt.raw_artifacts.is_empty() {
+        return Err(TestdError::Invalid {
+            field: "terminal_replay.verification_receipt",
+            reason: "terminal productive job has no retained raw artifacts",
+        });
+    }
+    let snapshot_artifact = job
+        .provider_registry_snapshot
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    let snapshot =
+        eliot_instrument_runner::decode_testd_provider_registry_snapshot(snapshot_artifact, job)?;
+    let source = verification_receipt
+        .source_observation
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    let tool = verification_receipt
+        .tool_observation
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    if source.before != snapshot.original.source
+        || source.after != snapshot.original.source
+        || job.source_observation_before.as_ref() != Some(&snapshot.original.source)
+        || tool != &snapshot.original.toolchain
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    project_dispatch_receipt_state(&receipt(job)).map(Some)
+}
+
 // The `async` is the dispatch-wire seam this function is published as: the
 // binary drives it through `block_on_drive` and the terminal-publisher variant
 // awaits it, so the signature is part of the owner contract even where this
@@ -2222,10 +2477,22 @@ pub async fn drive_validated_dispatch_material(
     source_root: &str,
     now_unix_ms: u64,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    drive_validated_dispatch_material_inner(material, source_root, now_unix_ms)
+        .map(|(outcome, _)| outcome)
+}
+
+fn drive_validated_dispatch_material_inner(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+) -> Result<(ValidatedDispatchDriveOutcome, bool), TestdError> {
     if material.cancelled {
-        return Ok(ValidatedDispatchDriveOutcome::Cancelled {
-            job_id: material.job_id.clone(),
-        });
+        return Ok((
+            ValidatedDispatchDriveOutcome::Cancelled {
+                job_id: material.job_id.clone(),
+            },
+            false,
+        ));
     }
     let source_root = Path::new(source_root);
     let (store, job) = load_dispatch_job(material)?;
@@ -2245,7 +2512,40 @@ pub async fn drive_validated_dispatch_material(
     )?);
     let job =
         ensure_dispatch_source_observation(&store, job, &canonical_job_source, &*git, now_unix_ms)?;
-    let intent = derive_dispatch_process_intent(&job, material, &canonical_job_source)?;
+    let intent = if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+        match resolve_productive_provider_dispatch(
+            &store,
+            &job,
+            material,
+            &canonical_job_source,
+            &git,
+        )? {
+            ProductiveProviderDispatchResolution::Refused(disposition) => {
+                return Ok((
+                    ValidatedDispatchDriveOutcome::ProviderRefused {
+                        job_id: job.job_id.clone(),
+                        disposition,
+                    },
+                    false,
+                ));
+            }
+            ProductiveProviderDispatchResolution::Ready(intent) => *intent,
+        }
+    } else {
+        // Keep the harmless admitted cargo-test probe on its existing route.
+        derive_dispatch_process_intent(
+            &job,
+            material,
+            &canonical_job_source,
+            eliot_testd_core::TESTD_PROFILE_PROGRAM,
+        )?
+    };
+    if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile)
+        && let Some(outcome) =
+            replay_terminal_productive_dispatch(&job, &material.job_id, &material.operation_id)?
+    {
+        return Ok((outcome, true));
+    }
     // The productive tool permit is sealed by the same authority instance
     // that sealed the observation permits, and the tool child is launched
     // by the same `WindowsProcessExecutor`. Both permits carry distinct
@@ -2263,25 +2563,27 @@ pub async fn drive_validated_dispatch_material(
         ADMITTED_WORKER_LEASE_MS,
         now_unix_ms,
     )?;
-    project_dispatch_receipt_state(&receipt)
+    Ok((project_dispatch_receipt_state(&receipt)?, false))
 }
 
 /// Production one-shot entry: executes the durable admitted job and then
 /// waits on the same authenticated Kernel session for the daemon's committed
 /// verifier-fact `WriteReceipt`. Worker terminal state alone never maps to a
 /// successful return from this entry.
-pub async fn drive_validated_dispatch_material_with_terminal_publisher(
+pub fn drive_validated_dispatch_material_with_terminal_publisher(
     material: &crate::testd_material::ValidatedTestdMaterial,
     source_root: &str,
     now_unix_ms: u64,
     client: &mut crate::kernel_client::KernelTestdIpcClient,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
-    let outcome = drive_validated_dispatch_material(material, source_root, now_unix_ms).await?;
+    let (outcome, replayed) =
+        drive_validated_dispatch_material_inner(material, source_root, now_unix_ms)?;
     let job_id = match &outcome {
         ValidatedDispatchDriveOutcome::Completed { job_id }
         | ValidatedDispatchDriveOutcome::Failed { job_id }
         | ValidatedDispatchDriveOutcome::Cancelled { job_id } => Some(job_id.as_str()),
-        ValidatedDispatchDriveOutcome::ReconcileRequired { .. } => None,
+        ValidatedDispatchDriveOutcome::ReconcileRequired { .. }
+        | ValidatedDispatchDriveOutcome::ProviderRefused { .. } => None,
     };
     let Some(job_id) = job_id else {
         return Ok(outcome);
@@ -2296,6 +2598,31 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
             .as_ref()
             .ok_or(TestdError::InvalidBinding)?
             .clone();
+        if replayed {
+            binding.validate_for_job(&job)?;
+            let verification_receipt = job
+                .verification_receipt
+                .as_ref()
+                .ok_or(TestdError::InvalidBinding)?;
+            let receipt_sha256 = verification_receipt_sha256(verification_receipt)?;
+            let expected_operation = format!("{}/verifier-execution", binding.operation_id);
+            let expected_idempotency = format!(
+                "{}:verifier-execution",
+                binding.request_identity.idempotency_key
+            );
+            crate::kernel_client::read_committed_terminal_write_receipt(
+                job.terminal_publication.as_ref(),
+                &receipt_sha256,
+                &expected_operation,
+                &expected_idempotency,
+                &binding.request_identity.request.state_fence,
+            )
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if project_dispatch_receipt_state(&receipt(&job))? != outcome {
+                return Err(TestdError::InvalidBinding);
+            }
+            return Ok(outcome);
+        }
         let receipt = job
             .verification_receipt
             .as_ref()
@@ -2439,6 +2766,152 @@ mod tests {
             "eliot-testd-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    fn productive_terminal_job_fixture()
+    -> Result<(eliot_testd_core::TestJob, PathBuf), Box<dyn std::error::Error>> {
+        use eliot_testd_core::{JobClass, JobState, ProcessAdmission, TestdSourceObservation};
+
+        let base = test_root("moduleproof-terminal-replay");
+        let source = std::fs::canonicalize(std::env::current_dir()?)?;
+        let contour_dir = base.join("external");
+        let build_dir = contour_dir.join("build");
+        std::fs::create_dir_all(&build_dir)?;
+        let contour = std::fs::canonicalize(&contour_dir)?;
+        let build = std::fs::canonicalize(&build_dir)?;
+        let roots = eliot_testd_core::TargetRoots::new(
+            contour.to_string_lossy(),
+            source.to_string_lossy(),
+            build.to_string_lossy(),
+            build.to_string_lossy(),
+        )?;
+        let mut invocation = external_invocation();
+        invocation.instrument = eliot_contracts::ContractId::new("eliot.instrument.nextest")?;
+        invocation.profile = eliot_testd_core::TESTD_PRODUCTIVE_PROFILE.to_owned();
+        invocation.target = "workspace".to_owned();
+        invocation.arguments = vec!["--workspace".to_owned()];
+        invocation.request.request_id = eliot_contracts::RequestId::new("test-operation")?;
+        let source_observation = TestdSourceObservation {
+            repository_root: source.to_string_lossy().into_owned(),
+            branch: "main".to_owned(),
+            commit: "1".repeat(40),
+            dirty_state_sha256: "a".repeat(64),
+        };
+        let executable_path = std::env::current_exe()?.to_string_lossy().into_owned();
+        let tool_observation = eliot_testd_core::TestdToolObservation {
+            nextest_path: executable_path.clone(),
+            nextest_sha256: "d".repeat(64),
+            cargo_path: executable_path.clone(),
+            cargo_sha256: "1".repeat(64),
+            rustc_path: executable_path,
+            rustc_sha256: "2".repeat(64),
+            selected_toolchain: "selected-toolchain".to_owned(),
+        };
+        let process = ProcessAdmission {
+            job_id: "test-job".to_owned(),
+            operation_id: invocation.request.request_id.to_string(),
+            process_tree_id: "tree".to_owned(),
+            generation: 1,
+            authority_epoch: test_epoch(7),
+            invocation_digest: canonical_invocation_digest(&invocation)?,
+        };
+        let mut job = eliot_testd_core::TestJob {
+            job_id: process.job_id.clone(),
+            project_id: "project".to_owned(),
+            project_sequence: 1,
+            invocation,
+            process,
+            target_roots: roots,
+            target_layout: None,
+            work_envelope: None,
+            fixture_namespace: None,
+            priority: 0,
+            job_class: JobClass::Verification,
+            resource_profile: eliot_testd_core::TestResourceProfile::default(),
+            scheduling: None,
+            state: JobState::Cancelled,
+            attempts: 1,
+            not_before_ms: 1,
+            lease: None,
+            execution: Some(eliot_instrument_api::ExecutionStatus::Cancelled),
+            verification: None,
+            receipt: None,
+            verification_receipt: None,
+            verifier_dispatch: None,
+            source_observation_before: Some(source_observation.clone()),
+            provider_registry_snapshot: None,
+            terminal_publication: None,
+            updated_at_ms: 1,
+            payload_digest: "payload-digest".to_owned(),
+        };
+        let digest = |value: char| std::iter::repeat_n(value, 64).collect::<String>();
+        let observations =
+            eliot_instrument_runner::testd_registry::TestdProviderRegistryObservations {
+                source: source_observation,
+                lock_sha256: digest('b'),
+                toolchain: tool_observation,
+                environment_projection_sha256: digest('c'),
+                profile_sha256: digest('e'),
+                parser_image_sha256: digest('f'),
+            };
+        job.provider_registry_snapshot = Some(
+            eliot_instrument_runner::bind_testd_provider_registry_snapshot(&job, &observations)?,
+        );
+        Ok((job, base))
+    }
+
+    fn productive_terminal_receipt(
+        job: &eliot_testd_core::TestJob,
+    ) -> Result<VerificationReceipt, Box<dyn std::error::Error>> {
+        use eliot_instrument_api::ExecutionStatus;
+        use eliot_testd_core::{
+            EvidenceCollector, NormalizedEvidence, RawArtifact, RawArtifactStream,
+            TestdSourceObservationRange,
+        };
+
+        let snapshot = eliot_instrument_runner::decode_testd_provider_registry_snapshot(
+            job.provider_registry_snapshot
+                .as_ref()
+                .ok_or("missing fixture snapshot")?,
+            job,
+        )?;
+        let mut artifact = RawArtifact::from_bytes(
+            "stdout-handle",
+            "text/plain",
+            b"actual stdout".to_vec(),
+            false,
+        )?;
+        artifact.capture_sequence = 1;
+        artifact.stream = RawArtifactStream::Stdout;
+        let collector = EvidenceCollector::default();
+        collector.record_tool_observation(snapshot.original.toolchain.clone())?;
+        let mut receipt = collector.verification_receipt_at(
+            job,
+            ExecutionStatus::Cancelled,
+            eliot_contracts::ClockReading::default(),
+            eliot_contracts::ClockReading::default(),
+        );
+        receipt.source_observation = Some(TestdSourceObservationRange {
+            before: snapshot.original.source.clone(),
+            after: snapshot.original.source,
+        });
+        receipt.raw_artifacts = vec![artifact];
+        receipt.normalized = vec![NormalizedEvidence {
+            kind: "process.observation".to_owned(),
+            summary: "process lifecycle: Cancelled".to_owned(),
+            raw_handles: vec!["stdout-handle".to_owned()],
+            execution: ExecutionStatus::Cancelled,
+        }];
+        Ok(receipt)
+    }
+
+    fn productive_terminal_replay_fixture()
+    -> Result<(eliot_testd_core::TestJob, PathBuf), Box<dyn std::error::Error>> {
+        let (mut job, base) = productive_terminal_job_fixture()?;
+        let receipt = productive_terminal_receipt(&job)?;
+        job.receipt = Some(receipt.binding());
+        job.verification_receipt = Some(receipt);
+        Ok((job, base))
     }
 
     struct ExternalKernelProvider {
@@ -3080,6 +3553,114 @@ mod tests {
         assert_ne!(bare.effect_digest(), bound.effect_digest());
 
         std::fs::remove_dir_all(&cwd).expect("fixture env cwd must clean");
+    }
+
+    #[test]
+    fn productive_terminal_replay_returns_same_retained_projection_after_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (job, base) = productive_terminal_replay_fixture()?;
+        let retained_receipt = job.verification_receipt.clone();
+        let encoded = serde_json::to_vec(&job)?;
+        let readback: eliot_testd_core::TestJob = serde_json::from_slice(&encoded)?;
+        let first = super::replay_terminal_productive_dispatch(
+            &job,
+            &job.job_id,
+            &job.process.operation_id,
+        )?;
+        let repeated = super::replay_terminal_productive_dispatch(
+            &readback,
+            &readback.job_id,
+            &readback.process.operation_id,
+        )?;
+        assert_eq!(first, repeated);
+        assert_eq!(
+            first,
+            Some(super::ValidatedDispatchDriveOutcome::Cancelled {
+                job_id: job.job_id.clone(),
+            })
+        );
+        assert_eq!(readback.verification_receipt, retained_receipt);
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn productive_terminal_replay_rejects_corrupt_foreign_and_raw_empty_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (job, base) = productive_terminal_replay_fixture()?;
+        let mut corrupt = job.clone();
+        corrupt
+            .verification_receipt
+            .as_mut()
+            .ok_or("missing fixture receipt")?
+            .raw_artifacts[0]
+            .bytes[0] ^= 1;
+        assert!(
+            super::replay_terminal_productive_dispatch(
+                &corrupt,
+                &job.job_id,
+                &job.process.operation_id,
+            )
+            .is_err()
+        );
+
+        let mut foreign = job.clone();
+        foreign
+            .verification_receipt
+            .as_mut()
+            .ok_or("missing fixture receipt")?
+            .operation_id = "foreign-operation".to_owned();
+        assert!(
+            super::replay_terminal_productive_dispatch(
+                &foreign,
+                &job.job_id,
+                &job.process.operation_id,
+            )
+            .is_err()
+        );
+
+        let mut raw_empty = job.clone();
+        let receipt = raw_empty
+            .verification_receipt
+            .as_mut()
+            .ok_or("missing fixture receipt")?;
+        receipt.raw_artifacts.clear();
+        receipt.normalized.clear();
+        assert!(
+            super::replay_terminal_productive_dispatch(
+                &raw_empty,
+                &job.job_id,
+                &job.process.operation_id,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn productive_terminal_replay_refuses_changed_original_tool_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (job, base) = productive_terminal_replay_fixture()?;
+        let mut changed = job.clone();
+        changed
+            .verification_receipt
+            .as_mut()
+            .ok_or("missing fixture receipt")?
+            .tool_observation
+            .as_mut()
+            .ok_or("missing fixture tool observation")?
+            .nextest_sha256 = "f".repeat(64);
+        assert!(
+            super::replay_terminal_productive_dispatch(
+                &changed,
+                &job.job_id,
+                &job.process.operation_id,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(base)?;
+        Ok(())
     }
 
     /// The dispatch-wire drive seam projects cancellation without executing:

@@ -3124,24 +3124,21 @@ fn automation_history_payload(
         // Ascending revision identity is the denominator's total ordering, so
         // the exclusive continuation resumes strictly after the last served row
         // instead of skipping a fixed count over a moving set.
-        let mut eligible = Vec::new();
-        for row in state.automation_revisions.values() {
-            if row.automation_id != automation_id || row.state_fence != *fence {
-                continue;
-            }
-            if boundary
-                .as_deref()
-                .is_some_and(|tail| row.revision.as_str() <= tail)
-            {
-                continue;
-            }
-            // The scan stops as soon as it holds the one-over eligible probe
-            // row the shared slicing rule needs.
-            if eligible.len() > limit {
-                break;
-            }
-            eligible.push(row);
-        }
+        // Filter the automation, fence, and exclusive tail before taking the
+        // one-over eligible probe. `take` stops the source iterator as soon as
+        // that probe is collected, even when later stored rows are ineligible.
+        let eligible = state
+            .automation_revisions
+            .values()
+            .filter(|row| {
+                row.automation_id == automation_id
+                    && row.state_fence == *fence
+                    && boundary
+                        .as_deref()
+                        .is_none_or(|tail| row.revision.as_str() > tail)
+            })
+            .take(limit + 1)
+            .collect();
         let page = automation_page_slice(eligible, limit, |row| row.revision.as_str());
         truncated = page.truncated;
         last_row_id = page.last_row_id;
@@ -3227,24 +3224,21 @@ fn automation_invocations_payload(
         // Ascending occurrence identity is the denominator's total ordering, so
         // the exclusive continuation resumes strictly after the last served row
         // instead of skipping a fixed count over a moving set.
-        let mut eligible = Vec::new();
-        for row in state.automation_invocations.values() {
-            if row.automation_id != automation_id || row.state_fence != *fence {
-                continue;
-            }
-            if boundary
-                .as_deref()
-                .is_some_and(|tail| row.occurrence_id.as_str() <= tail)
-            {
-                continue;
-            }
-            // The scan stops as soon as it holds the one-over eligible probe
-            // row the shared slicing rule needs.
-            if eligible.len() > limit {
-                break;
-            }
-            eligible.push(row);
-        }
+        // Use the same bounded eligible-row collection as the revision page:
+        // only same-automation, same-fence rows after the exclusive tail count
+        // toward the one-over probe.
+        let eligible = state
+            .automation_invocations
+            .values()
+            .filter(|row| {
+                row.automation_id == automation_id
+                    && row.state_fence == *fence
+                    && boundary
+                        .as_deref()
+                        .is_none_or(|tail| row.occurrence_id.as_str() > tail)
+            })
+            .take(limit + 1)
+            .collect();
         let page = automation_page_slice(eligible, limit, |row| row.occurrence_id.as_str());
         truncated = page.truncated;
         last_row_id = page.last_row_id;
@@ -3640,11 +3634,12 @@ fn automation_verified_boundary(
     }
 }
 
-/// Mints the successor after page slicing, using the exact last returned row.
-/// Replaying a retained page returns its previously minted successor identifier.
+/// Mints the continuation after page slicing, using the exact last returned row.
+/// Replaying the same first or continued page returns its existing identifier.
 ///
 /// Issue #2860 A6: exact replay therefore preserves the same page and cursor
-/// identity — the already-linked successor is reused, and a changed tail or
+/// identity: a root page resolves its exact retained owner record, and a
+/// continued page resolves its parent's linked successor. A changed tail or
 /// binding fails closed instead of minting a fresh identity.
 fn memory_automation_continuation_mint(
     state: &mut MemoryState,
@@ -3654,9 +3649,22 @@ fn memory_automation_continuation_mint(
 ) -> Result<String, StoreError> {
     let now_ms = memory_continuation_now_ms()?;
     memory_continuation_reclaim(state, request, now_ms)?;
-    if let Some(wire) =
-        memory_continuation_existing_successor(state, parent_identifier, exclusive_returned_tail)?
-    {
+    let existing = match parent_identifier {
+        Some(parent_identifier) => memory_continuation_existing_successor(
+            state,
+            request,
+            parent_identifier,
+            exclusive_returned_tail,
+            now_ms,
+        )?,
+        None => memory_continuation_existing_first_page(
+            state,
+            request,
+            exclusive_returned_tail,
+            now_ms,
+        )?,
+    };
+    if let Some(wire) = existing {
         return Ok(wire);
     }
     let prepared = memory_continuation_prepare_mint(
@@ -3669,14 +3677,79 @@ fn memory_automation_continuation_mint(
     memory_continuation_commit_mint(state, prepared, parent_identifier)
 }
 
-fn memory_continuation_existing_successor(
+/// Reuses a retained root page only when the owner has the same complete
+/// request/snapshot binding and the same returned tail. Continued-page records
+/// remain linked to their parent and cannot be adopted by a no-cursor request.
+fn memory_continuation_existing_first_page(
     state: &MemoryState,
-    parent_identifier: Option<&str>,
+    request: &MemoryAutomationContinuationRequest<'_>,
     exclusive_returned_tail: &str,
+    now_ms: u64,
 ) -> Result<Option<String>, StoreError> {
-    let Some(parent_identifier) = parent_identifier else {
+    let linked_successors: BTreeSet<&str> = state
+        .automation_continuations
+        .values()
+        .filter_map(|entry| match entry {
+            MemoryAutomationContinuationEntry::Active(record) => {
+                record.successor_identifier.as_deref()
+            }
+            MemoryAutomationContinuationEntry::Terminal { .. } => None,
+        })
+        .collect();
+    let mut existing_root: Option<(u64, String)> = None;
+    for (identifier, entry) in &state.automation_continuations {
+        if linked_successors.contains(identifier.as_str()) {
+            continue;
+        }
+        let MemoryAutomationContinuationEntry::Active(record) = entry else {
+            continue;
+        };
+        let exact_request_binding = record.query == request.query
+            && record.include_retired == request.include_retired
+            && record.automation_id == request.automation_id
+            && record.read_revision == request.read_revision
+            && record.state_fence == *request.state_fence
+            && record.order == memory_continuation_order(request.query)
+            && record.max_records == request.max_records
+            && record.issuer_identity == MEMORY_AUTOMATION_CONTINUATION_ISSUER
+            && record.issuer_generation == state.continuation_issuer_generation;
+        if !exact_request_binding {
+            continue;
+        }
+        if record.exclusive_returned_tail != exclusive_returned_tail {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+            ));
+        }
+        let verified =
+            memory_continuation_verify_active_record(state, identifier, record, request, now_ms)?;
+        if verified.exclusive_returned_tail() != exclusive_returned_tail {
+            return Err(memory_continuation_error(
+                eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
+            ));
+        }
+        if existing_root
+            .as_ref()
+            .is_none_or(|(creation_revision, _)| record.creation_revision < *creation_revision)
+        {
+            existing_root = Some((record.creation_revision, identifier.to_owned()));
+        }
+    }
+    let Some((_, identifier)) = existing_root else {
         return Ok(None);
     };
+    eliot_store_api::AutomationContinuationRef::from_owner_identifier(identifier)?
+        .to_wire()
+        .map(Some)
+}
+
+fn memory_continuation_existing_successor(
+    state: &MemoryState,
+    request: &MemoryAutomationContinuationRequest<'_>,
+    parent_identifier: &str,
+    exclusive_returned_tail: &str,
+    now_ms: u64,
+) -> Result<Option<String>, StoreError> {
     let Some(MemoryAutomationContinuationEntry::Active(parent)) =
         state.automation_continuations.get(parent_identifier)
     else {
@@ -3689,21 +3762,19 @@ fn memory_continuation_existing_successor(
     };
     let successor_is_valid = match state.automation_continuations.get(successor_identifier) {
         Some(MemoryAutomationContinuationEntry::Active(successor)) => {
-            if successor.exclusive_returned_tail != exclusive_returned_tail {
+            let verified = memory_continuation_verify_active_record(
+                state,
+                successor_identifier,
+                successor,
+                request,
+                now_ms,
+            )?;
+            if verified.exclusive_returned_tail() != exclusive_returned_tail {
                 return Err(memory_continuation_error(
                     eliot_store_api::AutomationContinuationFailure::StaleSnapshot,
                 ));
             }
-            successor.query == parent.query
-                && successor.include_retired == parent.include_retired
-                && successor.automation_id == parent.automation_id
-                && successor.read_revision == parent.read_revision
-                && successor.state_fence == parent.state_fence
-                && successor.order == parent.order
-                && successor.max_records == parent.max_records
-                && successor.issuer_identity == parent.issuer_identity
-                && successor.issuer_generation == parent.issuer_generation
-                && successor.creation_revision > parent.creation_revision
+            successor.creation_revision > parent.creation_revision
                 && successor.created_at_unix_ms >= parent.created_at_unix_ms
                 && successor.created_at_unix_ms < parent.expires_at_unix_ms
                 && successor.expires_at_unix_ms == parent.expires_at_unix_ms
@@ -3722,6 +3793,50 @@ fn memory_continuation_existing_successor(
         successor_identifier.clone(),
     )?;
     reference.to_wire().map(Some)
+}
+
+fn memory_continuation_verify_active_record(
+    state: &MemoryState,
+    identifier: &str,
+    record: &MemoryAutomationContinuationRecord,
+    request: &MemoryAutomationContinuationRequest<'_>,
+    now_ms: u64,
+) -> Result<eliot_store_api::VerifiedAutomationContinuation, StoreError> {
+    use eliot_store_api::{
+        AutomationContinuationBinding, AutomationContinuationReadBinding,
+        AutomationContinuationRef, verify_automation_continuation,
+    };
+    let reference = AutomationContinuationRef::from_owner_identifier(identifier.to_owned())?;
+    let retained = AutomationContinuationBinding {
+        identifier,
+        read_operation: NamedReadOperation::GetUserAutomationState,
+        query: record.query,
+        include_retired: record.include_retired,
+        automation_id: &record.automation_id,
+        read_revision: &record.read_revision,
+        state_fence: &record.state_fence,
+        order: record.order,
+        exclusive_returned_tail: &record.exclusive_returned_tail,
+        max_records: record.max_records,
+        issuer_identity: &record.issuer_identity,
+        issuer_generation: record.issuer_generation,
+        creation_revision: record.creation_revision,
+        created_at_unix_ms: record.created_at_unix_ms,
+        expires_at_unix_ms: record.expires_at_unix_ms,
+    };
+    let current = AutomationContinuationReadBinding {
+        read_operation: NamedReadOperation::GetUserAutomationState,
+        query: request.query,
+        include_retired: request.include_retired,
+        automation_id: request.automation_id,
+        read_revision: request.read_revision,
+        state_fence: request.state_fence,
+        order: memory_continuation_order(request.query),
+        max_records: request.max_records,
+        issuer_identity: MEMORY_AUTOMATION_CONTINUATION_ISSUER,
+        issuer_generation: state.continuation_issuer_generation,
+    };
+    verify_automation_continuation(&reference, retained, current, now_ms)
 }
 
 fn memory_continuation_expiry(

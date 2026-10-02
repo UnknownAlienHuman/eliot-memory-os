@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, OnceCell, Semaphore};
 use tokio::time::Instant;
 
 use super::provider_owner::ProviderOwner;
+use super::rpc_parse::ResponseCeiling;
 use super::session::RpcSession;
 use super::{RpcResults, json_codec};
 use crate::config::ClientSetLimits;
@@ -517,6 +518,44 @@ impl SessionPool {
     pub fn provider(&self) -> &Arc<ProviderOwner> {
         &self.inner.owner
     }
+
+    /// Executes one closed named operation on a checked-out session of `role`
+    /// with the response admitted under an ELIOT-owned byte bound.
+    ///
+    /// The bounded capture entry point (issue #951). Lane admission is the same
+    /// A13.5 backpressure [`SessionPool::query`] applies — a saturated lane
+    /// sheds with `ProviderUnavailable` and an admitted-but-cold lane warms one
+    /// slot through the blocking checkout — so a bounded capture is refused or
+    /// admitted exactly like every other named operation on the same lane; only
+    /// the response frame's byte bound differs.
+    pub async fn query_bounded(
+        &self,
+        role: SessionRole,
+        operation: &'static str,
+        statement: &str,
+        bindings: Map<String, Value>,
+        ceiling: ResponseCeiling,
+    ) -> Result<RpcResults, AdapterError> {
+        // A13.5 backpressure, identical to the unbounded path: a saturated
+        // lane sheds here instead of queueing behind it.
+        if !self.admission(role).admitted() {
+            return Err(AdapterError::ProviderUnavailable);
+        }
+        if let Some(session) = self.try_checkout(role) {
+            return session
+                .query_bounded(operation, statement, bindings, ceiling)
+                .await;
+        }
+        // Rework2030b: the entry admission verdict is a point observation, so
+        // re-check it rather than blocking behind a lane a racer just filled.
+        if !self.admission(role).admitted() {
+            return Err(AdapterError::ProviderUnavailable);
+        }
+        let session = self.checkout(role).await?;
+        session
+            .query_bounded(operation, statement, bindings, ceiling)
+            .await
+    }
 }
 
 /// One checked-out pooled session. Dropping the guard returns the slot and
@@ -558,15 +597,52 @@ impl PooledSession {
         statement: &str,
         bindings: Map<String, Value>,
     ) -> Result<RpcResults, AdapterError> {
+        self.dispatch(operation, statement, bindings, None).await
+    }
+
+    /// Executes one closed named operation whose response is admitted under an
+    /// ELIOT-owned byte bound.
+    ///
+    /// The bounded capture path (issue #951). Lane admission, the session slot,
+    /// the binding codec and the result shape are exactly the ones
+    /// [`PooledSession::query`] uses; the only difference is that each frame the
+    /// response arrives in is charged against `ceiling` before it is copied or
+    /// decoded, so an over-budget provider response never becomes a
+    /// `serde_json::Value` tree. The pooled socket was itself constructed under
+    /// the ELIOT-issued transport bound, so an oversize frame is refused there
+    /// before this read sees it.
+    pub async fn query_bounded(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: Map<String, Value>,
+        ceiling: ResponseCeiling,
+    ) -> Result<RpcResults, AdapterError> {
+        self.dispatch(operation, statement, bindings, Some(ceiling))
+            .await
+    }
+
+    /// Shared dispatch for the unbounded and byte-bounded named query paths.
+    ///
+    /// Kept as one function so the bounded path cannot drift from the unbounded
+    /// one in lane admission, binding encoding or result shaping: only the
+    /// transport call differs.
+    async fn dispatch(
+        &self,
+        operation: &'static str,
+        statement: &str,
+        bindings: Map<String, Value>,
+        ceiling: Option<ResponseCeiling>,
+    ) -> Result<RpcResults, AdapterError> {
         let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
-        let value = self
-            .session()
-            .request(
-                operation,
-                "query",
-                json!([statement, Value::Object(bindings)]),
-            )
-            .await?;
+        let params = json!([statement, Value::Object(bindings)]);
+        let value = if let Some(ceiling) = ceiling {
+            self.session()
+                .request_bounded(operation, "query", params, ceiling)
+                .await?
+        } else {
+            self.session().request(operation, "query", params).await?
+        };
         let mut results = RpcResults::from_value(&value)?;
         if results.values_len() < prefix_len {
             return Err(AdapterError::Serialization(

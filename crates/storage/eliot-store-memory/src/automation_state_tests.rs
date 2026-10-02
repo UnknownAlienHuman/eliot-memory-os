@@ -41,6 +41,7 @@ use serde_json::Value;
 use super::MemoryStore;
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+const AUTOMATION_PAGE_LIMIT: u16 = 64;
 
 fn fence() -> StateFence {
     StateFence::new(
@@ -187,6 +188,8 @@ fn transition_with(
     parameters: BTreeMap<String, Value>,
 ) -> (RequestMeta, PreparedTransition) {
     let ctx = context(tag);
+    let admission_contract_set_digest =
+        eliot_store_api::supported_admission_contract_set_digest().unwrap();
     let manifest_digest =
         operation_manifest_set_digest(&eliot_store_api::generated_operation_manifests().unwrap())
             .unwrap();
@@ -203,7 +206,7 @@ fn transition_with(
         ordering_scopes: vec![OrderingScopeId::new("user-automation").expect("ordering")],
         transition_class: TransitionClass::UserAutomation,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        admission_contract_set_digest,
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
@@ -257,6 +260,395 @@ fn read(
         .execute_named_sync(&request)
         .expect("read executes")
         .payload
+}
+
+fn read_automation_page(
+    store: &MemoryStore,
+    query: &str,
+    automation_id: &str,
+    max_records: u16,
+    state_fence: &StateFence,
+    cursor: Option<&str>,
+) -> Result<Value, StoreError> {
+    let mut request = automation_read_request(
+        query.to_owned(),
+        Some(automation_id.to_owned()),
+        false,
+        max_records,
+        state_fence.clone(),
+    )?;
+    if let Some(cursor) = cursor {
+        request.parameters.insert(
+            eliot_store_api::AUTOMATION_PARAM_CURSOR.to_owned(),
+            Value::String(cursor.to_owned()),
+        );
+    }
+    Ok(store.execute_named_sync(&request)?.payload)
+}
+
+fn read_automation_selector(
+    store: &MemoryStore,
+    query: &str,
+    automation_id: &str,
+    max_records: u16,
+    state_fence: &StateFence,
+    selector: (&str, &str),
+    cursor: Option<&str>,
+) -> Result<Value, StoreError> {
+    let mut request = automation_read_request(
+        query.to_owned(),
+        Some(automation_id.to_owned()),
+        false,
+        max_records,
+        state_fence.clone(),
+    )?;
+    request
+        .parameters
+        .insert(selector.0.to_owned(), Value::String(selector.1.to_owned()));
+    if let Some(cursor) = cursor {
+        request.parameters.insert(
+            eliot_store_api::AUTOMATION_PARAM_CURSOR.to_owned(),
+            Value::String(cursor.to_owned()),
+        );
+    }
+    Ok(store.execute_named_sync(&request)?.payload)
+}
+
+fn automation_page_cursor(payload: &Value) -> &str {
+    payload
+        .get("completeness")
+        .and_then(|completeness| completeness.get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR))
+        .and_then(Value::as_str)
+        .expect("truncated page carries its owner cursor")
+}
+
+fn automation_page_row_ids(payload: &Value, query: &str) -> Vec<String> {
+    let (rows_field, identity_field) = match query {
+        eliot_store_api::AUTOMATION_QUERY_HISTORY => ("revisions", "revision"),
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => ("invocations", "occurrence_id"),
+        _ => panic!("page matrix query is history or invocations"),
+    };
+    payload
+        .get(rows_field)
+        .and_then(Value::as_array)
+        .expect("automation page rows are an array")
+        .iter()
+        .map(|row| {
+            row.get(identity_field)
+                .and_then(Value::as_str)
+                .expect("automation page row has its logical identity")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_automation_page(
+    payload: &Value,
+    query: &str,
+    expected_ids: &[String],
+    truncated: bool,
+) -> Vec<String> {
+    let actual_ids = automation_page_row_ids(payload, query);
+    assert!(
+        actual_ids.len() <= usize::from(AUTOMATION_PAGE_LIMIT),
+        "one page never exceeds max_records"
+    );
+    assert_eq!(
+        actual_ids.as_slice(),
+        expected_ids,
+        "page returns its expected logical slice"
+    );
+    assert_eq!(
+        actual_ids.last().map(String::as_str),
+        expected_ids.last().map(String::as_str),
+        "page tail is the last logical row in the expected slice"
+    );
+    assert_eq!(
+        payload.get("revision").and_then(Value::as_u64),
+        Some(actual_ids.len() as u64),
+        "page count matches its returned rows"
+    );
+    let completeness = payload
+        .get("completeness")
+        .expect("automation page has completeness metadata");
+    assert_eq!(
+        completeness.get("returned").and_then(Value::as_u64),
+        Some(actual_ids.len() as u64),
+        "completeness reports the returned page count"
+    );
+    assert_eq!(
+        completeness.get("coverage").and_then(Value::as_str),
+        Some(if truncated { "TRUNCATED" } else { "COMPLETE" }),
+        "coverage follows the independent eligible-row count"
+    );
+    let cursor = completeness.get(eliot_store_api::AUTOMATION_PAGE_NEXT_CURSOR);
+    assert_eq!(
+        cursor.is_some(),
+        truncated,
+        "only truncated pages carry a cursor"
+    );
+    if truncated {
+        assert!(
+            cursor.and_then(Value::as_str).is_some(),
+            "a truncated page carries its owner cursor"
+        );
+    }
+    actual_ids
+}
+
+fn create_automation_page_corpus(
+    store: &MemoryStore,
+    automation_id: &str,
+    record_count: usize,
+) -> (Vec<String>, Vec<String>) {
+    assert!(record_count > 0, "pagination corpus has at least one row");
+
+    let first_revision_id = "r-001".to_owned();
+    let mut previous = valid_revision(
+        automation_id,
+        &first_revision_id,
+        UserAutomationConfigurationState::Active,
+    );
+    let create = automation_mutation_request(automation_create_params(
+        automation_id.to_owned(),
+        previous.revision.clone(),
+        AUTOMATION_STATE_ACTIVE.to_owned(),
+        revision_json(&previous),
+    ));
+    apply(
+        store,
+        &format!("page-matrix-{record_count}-create"),
+        create.operation,
+        create.parameters,
+    )
+    .expect("initial pagination revision commits");
+
+    let mut expected_revision_ids = Vec::with_capacity(record_count);
+    expected_revision_ids.push(previous.revision.clone());
+    for revision_number in 2..=record_count {
+        let revision_id = format!("r-{revision_number:03}");
+        let mut next = valid_revision(
+            automation_id,
+            &revision_id,
+            UserAutomationConfigurationState::Active,
+        );
+        next.supersedes = Some(previous.revision.clone());
+        next.validate_supersedes(&previous)
+            .expect("pagination fixture lineage is valid");
+        let edit = automation_mutation_request(automation_edit_params(
+            automation_id.to_owned(),
+            previous.revision.clone(),
+            revision_id,
+            AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&next),
+        ));
+        apply(
+            store,
+            &format!("page-matrix-{record_count}-edit-{revision_number}"),
+            edit.operation,
+            edit.parameters,
+        )
+        .expect("pagination successor revision commits");
+        expected_revision_ids.push(next.revision.clone());
+        previous = next;
+    }
+    expected_revision_ids.sort_unstable();
+
+    let mut expected_occurrence_ids = Vec::with_capacity(record_count);
+    for (index, revision_id) in expected_revision_ids.iter().enumerate() {
+        let run_number = index + 1;
+        let nonce = format!("page-matrix-{record_count}-{run_number:03}");
+        let (occurrence_id, invocation) = invocation_for(automation_id, revision_id, &nonce);
+        let run = automation_mutation_request(automation_run_now_params(
+            automation_id.to_owned(),
+            revision_id.clone(),
+            occurrence_id.clone(),
+            invocation,
+        ));
+        apply(
+            store,
+            &format!("page-matrix-{record_count}-run-{run_number}"),
+            run.operation,
+            run.parameters,
+        )
+        .expect("pagination invocation commits");
+        expected_occurrence_ids.push(occurrence_id);
+    }
+    expected_occurrence_ids.sort_unstable();
+
+    (expected_revision_ids, expected_occurrence_ids)
+}
+
+fn read_automation_page_replay(
+    store: &MemoryStore,
+    query: &str,
+    automation_id: &str,
+    max_records: u16,
+    state_fence: &StateFence,
+    cursor: Option<&str>,
+    assertion_message: Option<&str>,
+) -> Value {
+    let payload = read_automation_page(
+        store,
+        query,
+        automation_id,
+        max_records,
+        state_fence,
+        cursor,
+    )
+    .expect("owner serves the page");
+    let replay = read_automation_page(
+        store,
+        query,
+        automation_id,
+        max_records,
+        state_fence,
+        cursor,
+    )
+    .expect("exact page replay succeeds");
+    if let Some(message) = assertion_message {
+        assert_eq!(payload, replay, "{message}");
+    } else {
+        assert_eq!(payload, replay);
+    }
+    payload
+}
+
+fn assert_automation_page_walk(
+    store: &MemoryStore,
+    query: &str,
+    automation_id: &str,
+    state_fence: &StateFence,
+    expected_ids: &[String],
+) -> Vec<(usize, bool)> {
+    assert!(!expected_ids.is_empty());
+    assert_eq!(
+        expected_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected_ids.len(),
+        "fixture logical identities are unique"
+    );
+
+    let limit = usize::from(AUTOMATION_PAGE_LIMIT);
+    let mut cursor: Option<String> = None;
+    let mut offset = 0;
+    let mut page_number = 0;
+    let mut walked_ids = Vec::with_capacity(expected_ids.len());
+    let mut page_shapes = Vec::new();
+    while offset < expected_ids.len() {
+        let expected_end = (offset + limit).min(expected_ids.len());
+        let expected_page = &expected_ids[offset..expected_end];
+        let truncated = expected_end < expected_ids.len();
+        let replay_message =
+            format!("replaying page {page_number} preserves page and cursor identity");
+        let payload = read_automation_page_replay(
+            store,
+            query,
+            automation_id,
+            AUTOMATION_PAGE_LIMIT,
+            state_fence,
+            cursor.as_deref(),
+            Some(&replay_message),
+        );
+        let page_ids = assert_automation_page(&payload, query, expected_page, truncated);
+        page_shapes.push((page_ids.len(), truncated));
+        if page_number == 1 {
+            assert_eq!(
+                page_ids.first().map(String::as_str),
+                expected_ids.get(limit).map(String::as_str),
+                "continuation resumes immediately after the 64-row prefix"
+            );
+        }
+        walked_ids.extend(page_ids);
+        offset = expected_end;
+        cursor = if truncated {
+            Some(automation_page_cursor(&payload).to_owned())
+        } else {
+            None
+        };
+        page_number += 1;
+    }
+
+    assert_eq!(
+        walked_ids.as_slice(),
+        expected_ids,
+        "page walk has no omissions or reordering"
+    );
+    assert_eq!(
+        walked_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        walked_ids.len(),
+        "page walk has no duplicate logical rows"
+    );
+    assert_eq!(
+        walked_ids.last().map(String::as_str),
+        expected_ids.last().map(String::as_str),
+        "page walk ends at the independently known logical tail"
+    );
+    page_shapes
+}
+
+fn assert_wrong_continuation_tail_refused(
+    store: &MemoryStore,
+    query: eliot_store_api::AutomationContinuationQuery,
+    automation_id: &str,
+    read_revision: &str,
+    state_fence: &StateFence,
+    cursor: &str,
+) {
+    let reference = eliot_store_api::AutomationContinuationRef::parse_wire(cursor)
+        .expect("backend issued a canonical continuation");
+    let request = super::MemoryAutomationContinuationRequest {
+        query,
+        include_retired: false,
+        automation_id,
+        read_revision,
+        state_fence,
+        max_records: 1,
+    };
+    let now_ms = super::memory_continuation_now_ms().expect("clock is available");
+    let state = store.lock_state().expect("memory state lock succeeds");
+    let retained_count = state.automation_continuations.len();
+    let first_page_result = super::memory_continuation_existing_first_page(
+        &state,
+        &request,
+        "wrong-returned-tail",
+        now_ms,
+    );
+    assert!(
+        matches!(
+            first_page_result,
+            Err(StoreError::AutomationContinuation(
+                eliot_store_api::AutomationContinuationFailure::StaleSnapshot
+            ))
+        ),
+        "a changed root-page boundary fails closed"
+    );
+    let result = super::memory_continuation_existing_successor(
+        &state,
+        &request,
+        reference.identifier(),
+        "wrong-returned-tail",
+        now_ms,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(StoreError::AutomationContinuation(
+                eliot_store_api::AutomationContinuationFailure::StaleSnapshot
+            ))
+        ),
+        "a changed returned boundary fails closed"
+    );
+    assert_eq!(
+        state.automation_continuations.len(),
+        retained_count,
+        "refusing a changed tail does not mint or retain another cursor"
+    );
 }
 
 fn check_domain_revision(payload_json: &str, automation_id: &str, revision: &str) {
@@ -433,6 +825,587 @@ fn run_now_records_invocations_by_occurrence() {
         apply(&store, "run-2", request.operation, request.parameters).is_err(),
         "unknown revisions cannot be invoked"
     );
+}
+
+type AutomationPageMatrixCase = (usize, String, Vec<String>, Vec<String>);
+
+fn create_automation_replay_corpus(store: &MemoryStore) -> (Vec<String>, Vec<String>) {
+    let mut previous = valid_revision(
+        "auto-page-replay",
+        "r-1",
+        UserAutomationConfigurationState::Active,
+    );
+    let mut expected_revision_ids = vec![previous.revision.clone()];
+    let create = automation_mutation_request(automation_create_params(
+        "auto-page-replay".to_owned(),
+        "r-1".to_owned(),
+        AUTOMATION_STATE_ACTIVE.to_owned(),
+        revision_json(&previous),
+    ));
+    apply(
+        store,
+        "page-replay-create",
+        create.operation,
+        create.parameters,
+    )
+    .expect("initial revision commits");
+    for revision_number in 2..=3 {
+        let revision = format!("r-{revision_number}");
+        let mut next = valid_revision(
+            "auto-page-replay",
+            &revision,
+            UserAutomationConfigurationState::Active,
+        );
+        next.supersedes = Some(previous.revision.clone());
+        next.validate_supersedes(&previous)
+            .expect("fixture lineage is valid");
+        let edit = automation_mutation_request(automation_edit_params(
+            "auto-page-replay".to_owned(),
+            previous.revision.clone(),
+            revision,
+            AUTOMATION_STATE_ACTIVE.to_owned(),
+            revision_json(&next),
+        ));
+        apply(
+            store,
+            &format!("page-replay-edit-{revision_number}"),
+            edit.operation,
+            edit.parameters,
+        )
+        .expect("successor revision commits");
+        expected_revision_ids.push(next.revision.clone());
+        previous = next;
+    }
+    expected_revision_ids.sort_unstable();
+
+    let mut expected_occurrence_ids = Vec::new();
+    for run_number in 1..=3 {
+        let nonce = format!("page-replay-{run_number}");
+        let (occurrence_id, invocation) = invocation_for("auto-page-replay", "r-3", &nonce);
+        expected_occurrence_ids.push(occurrence_id.clone());
+        let run = automation_mutation_request(automation_run_now_params(
+            "auto-page-replay".to_owned(),
+            "r-3".to_owned(),
+            occurrence_id,
+            invocation,
+        ));
+        apply(
+            store,
+            &format!("page-replay-run-{run_number}"),
+            run.operation,
+            run.parameters,
+        )
+        .expect("invocation commits");
+    }
+    expected_occurrence_ids.sort_unstable();
+    (expected_revision_ids, expected_occurrence_ids)
+}
+
+fn assert_retained_automation_cursor_count(
+    store: &MemoryStore,
+    expected_count: usize,
+    assertion_message: &str,
+) {
+    assert_eq!(
+        store
+            .lock_state()
+            .expect("memory state lock succeeds")
+            .automation_continuations
+            .len(),
+        expected_count,
+        "{assertion_message}"
+    );
+}
+
+fn assert_automation_root_page_replay(
+    store: &MemoryStore,
+    query: &str,
+    state_fence: &StateFence,
+    expected_cursor_count: usize,
+    cursor_count_message: &str,
+) -> (Value, String) {
+    let page =
+        read_automation_page_replay(store, query, "auto-page-replay", 1, state_fence, None, None);
+    if query == eliot_store_api::AUTOMATION_QUERY_HISTORY {
+        assert_eq!(
+            page.get("revision").and_then(Value::as_u64),
+            Some(1),
+            "history page returns only its one-row bound"
+        );
+    }
+    let cursor = automation_page_cursor(&page).to_owned();
+    assert_retained_automation_cursor_count(store, expected_cursor_count, cursor_count_message);
+    (page, cursor)
+}
+
+fn assert_automation_continuation_page_replay(
+    store: &MemoryStore,
+    query: &str,
+    state_fence: &StateFence,
+    cursor: &str,
+    coverage_message: &str,
+) -> String {
+    let page = read_automation_page_replay(
+        store,
+        query,
+        "auto-page-replay",
+        1,
+        state_fence,
+        Some(cursor),
+        None,
+    );
+    assert_eq!(
+        page["completeness"]["coverage"], "TRUNCATED",
+        "{coverage_message}"
+    );
+    automation_page_cursor(&page).to_owned()
+}
+
+fn assert_automation_root_page_identity_unchanged(
+    store: &MemoryStore,
+    query: &str,
+    state_fence: &StateFence,
+    expected_page: &Value,
+    assertion_message: &str,
+) {
+    let replay_expectation = match query {
+        eliot_store_api::AUTOMATION_QUERY_HISTORY => {
+            "history first-page replay after continuation reads"
+        }
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS => {
+            "invocation first-page replay after continuation reads"
+        }
+        _ => panic!("page identity query is history or invocations"),
+    };
+    assert_eq!(
+        read_automation_page(store, query, "auto-page-replay", 1, state_fence, None,)
+            .expect(replay_expectation),
+        *expected_page,
+        "{assertion_message}"
+    );
+}
+
+fn create_issue_2860_matrix_cases(store: &MemoryStore) -> Vec<AutomationPageMatrixCase> {
+    let mut cases = Vec::new();
+    for record_count in [63_usize, 64, 65, 66, 127, 128, 129, 130] {
+        let automation_id = format!("auto-page-matrix-{record_count}");
+        let (revision_ids, occurrence_ids) =
+            create_automation_page_corpus(store, &automation_id, record_count);
+        assert_eq!(revision_ids.len(), record_count);
+        assert_eq!(occurrence_ids.len(), record_count);
+        cases.push((record_count, automation_id, revision_ids, occurrence_ids));
+    }
+    cases
+}
+
+fn create_foreign_probe_corpus(store: &MemoryStore) -> (String, Vec<String>, Vec<String>) {
+    // This separately committed automation is a real same-fence row that is
+    // foreign to the 64-row target selector. Its high automation identity puts
+    // its history row after the target history rows in the owner's key order.
+    let automation_id = "z-auto-page-foreign-probe".to_owned();
+    let (revision_ids, occurrence_ids) = create_automation_page_corpus(store, &automation_id, 1);
+    (automation_id, revision_ids, occurrence_ids)
+}
+
+fn assert_issue_2860_matrix_walks(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    cases: &[AutomationPageMatrixCase],
+) {
+    // All source mutations precede reads so every continuation stays bound to
+    // the same owner-issued read revision throughout the matrix walk.
+    for (record_count, automation_id, revision_ids, occurrence_ids) in cases {
+        let history_page_shapes = assert_automation_page_walk(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            automation_id,
+            state_fence,
+            revision_ids,
+        );
+        let invocation_page_shapes = assert_automation_page_walk(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            automation_id,
+            state_fence,
+            occurrence_ids,
+        );
+        let expected_page_shapes: &[(usize, bool)] = match *record_count {
+            63 => &[(63, false)],
+            64 => &[(64, false)],
+            65 => &[(64, true), (1, false)],
+            66 => &[(64, true), (2, false)],
+            // Continued-page fixtures contain the 64-row prefix plus 63,
+            // 64, 65, or 66 remaining rows respectively.
+            127 => &[(64, true), (63, false)],
+            128 => &[(64, true), (64, false)],
+            129 => &[(64, true), (64, true), (1, false)],
+            130 => &[(64, true), (64, true), (2, false)],
+            _ => unreachable!("matrix has only the named boundary sizes"),
+        };
+        assert_eq!(history_page_shapes.as_slice(), expected_page_shapes);
+        assert_eq!(invocation_page_shapes.as_slice(), expected_page_shapes);
+    }
+}
+
+fn assert_foreign_probe_walks(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    automation_id: &str,
+    revision_ids: &[String],
+    occurrence_ids: &[String],
+) {
+    assert_eq!(
+        assert_automation_page_walk(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            automation_id,
+            state_fence,
+            revision_ids,
+        ),
+        vec![(1, false)],
+        "same-fence foreign history row is real owner data"
+    );
+    assert_eq!(
+        assert_automation_page_walk(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            automation_id,
+            state_fence,
+            occurrence_ids,
+        ),
+        vec![(1, false)],
+        "same-fence foreign invocation row is real owner data"
+    );
+}
+
+fn assert_exact_issue_2860_selectors(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    automation_id: &str,
+    revision_ids: &[String],
+    occurrence_ids: &[String],
+) {
+    let exact_revision_id = &revision_ids[63];
+    let history_cursor = automation_page_cursor(
+        &read_automation_page(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            automation_id,
+            AUTOMATION_PAGE_LIMIT,
+            state_fence,
+            None,
+        )
+        .expect("owner issues a history page cursor from ordinary writes"),
+    )
+    .to_owned();
+    assert_exact_selector_rejects_cursor(
+        store,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        automation_id,
+        state_fence,
+        (
+            eliot_store_api::AUTOMATION_PARAM_REVISION,
+            exact_revision_id,
+        ),
+        std::slice::from_ref(exact_revision_id),
+        history_cursor.as_str(),
+    );
+
+    let exact_occurrence_id = &occurrence_ids[63];
+    let invocation_cursor = automation_page_cursor(
+        &read_automation_page(
+            store,
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            automation_id,
+            AUTOMATION_PAGE_LIMIT,
+            state_fence,
+            None,
+        )
+        .expect("owner issues an invocation page cursor from ordinary writes"),
+    )
+    .to_owned();
+    assert_exact_selector_rejects_cursor(
+        store,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        automation_id,
+        state_fence,
+        (
+            eliot_store_api::AUTOMATION_PARAM_OCCURRENCE_ID,
+            exact_occurrence_id,
+        ),
+        std::slice::from_ref(exact_occurrence_id),
+        invocation_cursor.as_str(),
+    );
+}
+
+fn assert_exact_selector_rejects_cursor(
+    store: &MemoryStore,
+    query: &str,
+    automation_id: &str,
+    state_fence: &StateFence,
+    selector: (&str, &str),
+    expected_ids: &[String],
+    cursor: &str,
+) {
+    let exact = read_automation_selector(
+        store,
+        query,
+        automation_id,
+        AUTOMATION_PAGE_LIMIT,
+        state_fence,
+        selector,
+        None,
+    )
+    .expect("exact automation selector reads");
+    assert_automation_page(&exact, query, expected_ids, false);
+    assert!(
+        matches!(
+            read_automation_selector(
+                store,
+                query,
+                automation_id,
+                AUTOMATION_PAGE_LIMIT,
+                state_fence,
+                selector,
+                Some(cursor),
+            ),
+            Err(StoreError::AutomationContinuation(
+                eliot_store_api::AutomationContinuationFailure::InvalidOrUnknown
+            ))
+        ),
+        "an exact automation selector rejects its owner-issued page cursor"
+    );
+}
+
+fn assert_foreign_generation_refusals(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    automation_id: &str,
+) {
+    let foreign_generation_fence = StateFence::new(
+        state_fence.authority_epoch.clone(),
+        ResourceGeneration::new(9).expect("generation"),
+    );
+    for query in [
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+    ] {
+        assert!(
+            matches!(
+                read_automation_page(
+                    store,
+                    query,
+                    automation_id,
+                    AUTOMATION_PAGE_LIMIT,
+                    &foreign_generation_fence,
+                    None,
+                ),
+                Err(StoreError::FenceMismatch)
+            ),
+            "a read under a foreign generation fails with the owner's typed fence refusal"
+        );
+    }
+}
+
+fn assert_root_and_continued_cursor_identity(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    history_cursor: &str,
+    invocation_cursor: &str,
+) {
+    for (query, root_cursor, coverage_message, identity_message) in [
+        (
+            eliot_store_api::AUTOMATION_QUERY_HISTORY,
+            history_cursor,
+            "continued history page retains its further-row cursor",
+            "the continued history page has its own next-page identity",
+        ),
+        (
+            eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+            invocation_cursor,
+            "continued invocation page retains its further-row cursor",
+            "the continued invocation page has its own next-page identity",
+        ),
+    ] {
+        let continued_cursor = assert_automation_continuation_page_replay(
+            store,
+            query,
+            state_fence,
+            root_cursor,
+            coverage_message,
+        );
+        assert_ne!(root_cursor, continued_cursor.as_str(), "{identity_message}");
+    }
+}
+
+/// Test-only fault injection: corrupted retained root tails must be refused.
+fn assert_corrupted_root_cursor_replays_refused(
+    store: &MemoryStore,
+    state_fence: &StateFence,
+    page_cases: [(&str, &str, &[String]); 2],
+) {
+    for (query, cursor, expected_ids) in page_cases {
+        assert!(expected_ids.len() > 1, "fixture has a next logical row");
+        let reference = eliot_store_api::AutomationContinuationRef::parse_wire(cursor)
+            .expect("backend issued a canonical root continuation");
+        let retained_count = {
+            let mut state = store.lock_state().expect("memory state lock succeeds");
+            let retained_count = state.automation_continuations.len();
+            let Some(super::MemoryAutomationContinuationEntry::Active(record)) = state
+                .automation_continuations
+                .get_mut(reference.identifier())
+            else {
+                panic!("root cursor retains its original owner record");
+            };
+            assert_eq!(
+                record.exclusive_returned_tail.as_str(),
+                expected_ids[0].as_str(),
+                "root cursor retains the tail actually returned on its page"
+            );
+            record.exclusive_returned_tail = expected_ids[1].clone();
+            retained_count
+        };
+        assert!(
+            matches!(
+                read_automation_page(store, query, "auto-page-replay", 1, state_fence, None,),
+                Err(StoreError::AutomationContinuation(
+                    eliot_store_api::AutomationContinuationFailure::StaleSnapshot
+                ))
+            ),
+            "a root-page replay refuses a corrupted retained tail"
+        );
+        assert_retained_automation_cursor_count(
+            store,
+            retained_count,
+            "refusing a corrupted original cursor does not mint a replacement",
+        );
+    }
+}
+
+#[test]
+fn automation_page_replay_preserves_first_and_continued_cursor_identity() {
+    let store = MemoryStore::new();
+    let state_fence = fence();
+    let (history_ids, invocation_ids) = create_automation_replay_corpus(&store);
+
+    let (history_first, history_first_cursor) = assert_automation_root_page_replay(
+        &store,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        &state_fence,
+        1,
+        "replaying a root page retains one cursor identity",
+    );
+
+    let (invocations_first, invocations_first_cursor) = assert_automation_root_page_replay(
+        &store,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        &state_fence,
+        2,
+        "replaying both root pages does not add duplicate cursors",
+    );
+    let history_read_revision = history_first["completeness"]["read_revision"]
+        .as_str()
+        .expect("owner read revision exists")
+        .to_owned();
+    let invocations_read_revision = invocations_first["completeness"]["read_revision"]
+        .as_str()
+        .expect("owner read revision exists")
+        .to_owned();
+
+    assert_root_and_continued_cursor_identity(
+        &store,
+        &state_fence,
+        &history_first_cursor,
+        &invocations_first_cursor,
+    );
+    assert_retained_automation_cursor_count(
+        &store,
+        4,
+        "replaying continued pages reuses their linked successor cursors",
+    );
+    assert_automation_root_page_identity_unchanged(
+        &store,
+        eliot_store_api::AUTOMATION_QUERY_HISTORY,
+        &state_fence,
+        &history_first,
+        "continuing later pages does not change the root page identity",
+    );
+    assert_automation_root_page_identity_unchanged(
+        &store,
+        eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+        &state_fence,
+        &invocations_first,
+        "continuing later pages does not change the root page identity",
+    );
+    assert_retained_automation_cursor_count(
+        &store,
+        4,
+        "root replays still reuse the original cursor after child issuance",
+    );
+
+    assert_wrong_continuation_tail_refused(
+        &store,
+        eliot_store_api::AutomationContinuationQuery::History,
+        "auto-page-replay",
+        &history_read_revision,
+        &state_fence,
+        &history_first_cursor,
+    );
+    assert_wrong_continuation_tail_refused(
+        &store,
+        eliot_store_api::AutomationContinuationQuery::Invocations,
+        "auto-page-replay",
+        &invocations_read_revision,
+        &state_fence,
+        &invocations_first_cursor,
+    );
+    assert_corrupted_root_cursor_replays_refused(
+        &store,
+        &state_fence,
+        [
+            (
+                eliot_store_api::AUTOMATION_QUERY_HISTORY,
+                history_first_cursor.as_str(),
+                history_ids.as_slice(),
+            ),
+            (
+                eliot_store_api::AUTOMATION_QUERY_INVOCATIONS,
+                invocations_first_cursor.as_str(),
+                invocation_ids.as_slice(),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn automation_history_and_invocation_pages_obey_issue_2860_matrix() {
+    let store = MemoryStore::new();
+    let state_fence = fence();
+    let cases = create_issue_2860_matrix_cases(&store);
+    let (foreign_automation_id, foreign_revision_ids, foreign_occurrence_ids) =
+        create_foreign_probe_corpus(&store);
+
+    assert_issue_2860_matrix_walks(&store, &state_fence, &cases);
+    assert_foreign_probe_walks(
+        &store,
+        &state_fence,
+        &foreign_automation_id,
+        &foreign_revision_ids,
+        &foreign_occurrence_ids,
+    );
+
+    let (_, exact_automation_id, exact_revision_ids, exact_occurrence_ids) = cases
+        .iter()
+        .find(|(record_count, _, _, _)| *record_count == 130)
+        .expect("130-row exact-selector fixture exists");
+    assert_exact_issue_2860_selectors(
+        &store,
+        &state_fence,
+        exact_automation_id,
+        exact_revision_ids,
+        exact_occurrence_ids,
+    );
+    assert_foreign_generation_refusals(&store, &state_fence, exact_automation_id);
 }
 
 #[test]

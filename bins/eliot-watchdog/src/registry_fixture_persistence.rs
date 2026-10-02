@@ -28,7 +28,8 @@ use eliot_installation::{
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
-    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, InstallerRootPrimitiveSpec,
+    ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
+    InstallerRootCreateDisposition, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
     InstallerRootProfile, SERVICE_EXPECTED_GROUP_SID, SERVICE_EXPECTED_OWNER_SID, ServiceAccount,
     ServiceBootstrapArguments, ServiceRegistrationRequest, ServiceStartMode,
     WindowsInstallerRootPrimitive, host_service_security_descriptor_digest,
@@ -74,17 +75,50 @@ impl RegistryFixture {
             NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
         );
         let installation_key = sha256_hex(unique.as_bytes());
-        let fixture_root = std::env::temp_dir().join(format!(
+        let protected_fixture_parent_raw = std::env::temp_dir();
+        let protected_fixture_parent = protected_fixture_parent_raw
+            .parent()
+            .zip(protected_fixture_parent_raw.file_name())
+            .map_or_else(
+                || protected_fixture_parent_raw.clone(),
+                |(parent, name)| parent.join(name),
+            );
+        let fixture_root = protected_fixture_parent.join(format!(
             "eliot-watchdog-protected-root-{}-{}",
             std::process::id(),
             &installation_key[..16]
         ));
-        std::fs::create_dir_all(&fixture_root).unwrap_or_else(|error| {
-            panic!(
-                "failed to create disposable protected fixture root {}: {error}",
-                fixture_root.display()
-            )
-        });
+        let fixture_root_spec = InstallerRootPrimitiveSpec {
+            root: fixture_root.clone(),
+            installation_root: fixture_root.clone(),
+            profile_anchor: protected_fixture_parent,
+            profile: InstallerRootProfile::PortableDev,
+        };
+        let root_primitive = WindowsInstallerRootPrimitive::new();
+        let root_absence = match root_primitive.inspect(&fixture_root_spec) {
+            Ok(InstallerRootPrimitiveObservation::Absent(snapshot)) => snapshot,
+            Ok(InstallerRootPrimitiveObservation::Matching(_)) => {
+                panic!(
+                    "unique protected fixture root already exists: {}",
+                    fixture_root.display()
+                )
+            }
+            Ok(InstallerRootPrimitiveObservation::Mismatch) => {
+                panic!(
+                    "unique protected fixture root has a foreign object: {}",
+                    fixture_root.display()
+                )
+            }
+            Err(error) => panic!("failed to inspect protected fixture root: {error}"),
+        };
+        let root_created = root_primitive
+            .create(&fixture_root_spec, &root_absence)
+            .unwrap_or_else(|error| panic!("failed to create protected fixture root: {error}"));
+        assert_eq!(
+            root_created.disposition,
+            InstallerRootCreateDisposition::Created,
+            "unique protected fixture root was not newly created"
+        );
         let protected_root_override = test_support::override_protected_root(&fixture_root);
         let program_data = fixture_root;
         let installation_root = program_data
@@ -349,6 +383,29 @@ impl RegistryFixture {
         value
     }
 
+    /// Replaces or removes only the Host control grant in a fresh projection.
+    #[must_use]
+    pub fn substituted_host_service_control_grant(&self, replacement: Option<Value>) -> Value {
+        let mut value = self.active_only();
+        let approvals = value["service_registration_approvals"]
+            .as_array_mut()
+            .unwrap_or_else(|| unreachable!());
+        let approval = approvals
+            .iter_mut()
+            .find(|approval| approval["role"] == "HOST")
+            .unwrap_or_else(|| unreachable!());
+        match replacement {
+            Some(grant) => approval["service_control_grant"] = grant,
+            None => {
+                approval
+                    .as_object_mut()
+                    .unwrap_or_else(|| unreachable!())
+                    .remove("service_control_grant");
+            }
+        }
+        value
+    }
+
     /// Rewrites only the generation descriptor while retaining the original approval,
     /// producing a read-time projection drift that must fail closed.
     #[must_use]
@@ -522,7 +579,7 @@ impl RegistryFixture {
         )
         .unwrap_or_else(|error| panic!("invalid service approval request: {error}"));
         let service_control_grant = if host {
-            let principal_sid = "S-1-5-80-1-2-3-4-5";
+            let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
             let security_descriptor_digest = host_service_security_descriptor_digest(principal_sid)
                 .unwrap_or_else(|error| panic!("Host control-grant fixture: {error}"));
             json!({
@@ -534,7 +591,7 @@ impl RegistryFixture {
                 "security_descriptor_digest": security_descriptor_digest,
             })
         } else {
-            let principal_sid = "S-1-5-80-1-2-3-4-5";
+            let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
             let security_descriptor_digest =
                 watchdog_service_security_descriptor_digest(principal_sid)
                     .unwrap_or_else(|error| panic!("Watchdog control-grant fixture: {error}"));

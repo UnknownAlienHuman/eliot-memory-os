@@ -1,8 +1,10 @@
 //! Bounded projection batches with shared-fence gating and coverage.
 //!
 //! A [`MemoryProjectionBatch`] carries one [`MemoryScopeBinding`]: every
-//! record must name exactly the batch task, scope, and session, and every
-//! record fence must be compatible with the batch fence. The batch also
+//! record must declare exactly the batch binding — task, scope, session, and
+//! the binding's own state fence — and the fence each record was actually read
+//! under must be compatible with the batch fence. Those are two different
+//! questions, and [`MemoryProjectionBatch::validate`] asks both. The batch also
 //! carries the denominator context every consumer needs: how many canonical
 //! records the read side observed, what was truncated or omitted, and whether
 //! revalidation is required before use.
@@ -14,7 +16,10 @@
 //! the denominator. Completeness is therefore a property the batch proves
 //! about itself, not a claim a consumer has to take on trust; a remainder that
 //! nobody can name is refused at the boundary instead of surfacing later as a
-//! quietly short read.
+//! quietly short read. A read side that could not establish the denominator
+//! says so, and an unprovable denominator is an incomplete state with its own
+//! ceiling: it may never travel beside `revalidation_required: false`, and it
+//! is never repaired by restating the returned count as the total.
 
 use std::collections::BTreeSet;
 
@@ -50,7 +55,11 @@ fn text(value: &str, field: &'static str) -> Result<(), MemoryProjectionError> {
 /// `Known` is the normal case: the read side counted its observed records.
 /// `Unknown` preserves an explicit unknown (A0.4): the batch stays
 /// representable, but evaluation fails closed because applicability without a
-/// denominator is unprovable.
+/// denominator is unprovable. It is not a synonym for a smaller `Known`, and
+/// it carries its own mandatory ceiling: an unprovable denominator is an
+/// incomplete state, so a batch declaring one may never also declare that no
+/// revalidation is required. See
+/// [`MemoryProjectionBatch::validate`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", deny_unknown_fields)]
 pub enum DenominatorState {
@@ -118,6 +127,12 @@ pub struct ProjectionCoverage {
     /// omission, so one observed record can never be both returned and lost.
     pub omissions: Vec<CoverageOmission>,
     /// Whether the consumer must revalidate before use.
+    ///
+    /// This is the completeness bit a consumer actually reads, so it is not
+    /// optional on an incomplete batch. Truncation, any named omission, and an
+    /// unprovable ([`DenominatorState::Unknown`]) denominator all force it to
+    /// `true`; only a batch that accounts for every member of a known
+    /// population may carry `false`.
     pub revalidation_required: bool,
 }
 
@@ -169,7 +184,11 @@ impl MemoryProjectionBatch {
     /// records, the named omissions and the deferred resume frontier together
     /// account for exactly `total` distinct handles. `Unknown` stays
     /// representable — it claims no count, so nothing here can contradict it,
-    /// and the consumers that need a count fail closed on it instead.
+    /// and the consumers that need a count fail closed on it instead — but it
+    /// is an incomplete state rather than an absent one, so it must declare
+    /// `revalidation_required` like any other: the ceiling of an unprovable
+    /// denominator travels on the batch, and is never discharged by lowering
+    /// the denominator to the number of records actually returned.
     pub fn validate(&self) -> Result<(), MemoryProjectionError> {
         if self.contract_version != crate::CONTRACT_VERSION {
             return Err(MemoryProjectionError::VersionMismatch);
@@ -190,23 +209,7 @@ impl MemoryProjectionBatch {
                     value: record.handle.as_str().to_owned(),
                 });
             }
-            if record.binding.task_id != self.binding.task_id
-                || record.binding.scope_id != self.binding.scope_id
-                || record.binding.session_id != self.binding.session_id
-            {
-                return Err(MemoryProjectionError::ScopeMismatch {
-                    reason: "record binding must equal the batch binding",
-                });
-            }
-            if !record
-                .state_fence
-                .is_compatible_with(&self.binding.state_fence)
-            {
-                return Err(MemoryProjectionError::FenceMismatch {
-                    left: "record.state_fence",
-                    right: "batch.binding.state_fence",
-                });
-            }
+            self.validate_record_scope(record)?;
         }
         // Exact, disjoint member accounting. Every canonical record the read
         // side observed is projected, omitted, or deferred to the resume
@@ -228,7 +231,10 @@ impl MemoryProjectionBatch {
         // [readback] rule required a new candidate rather than an in-place
         // byte edit, so the r7 digest is superseded and every verdict bound to
         // it is invalidated. The rule below and the frozen note are one rule
-        // again, at the same revision boundary.
+        // again, at the same revision boundary. That note is still the current
+        // one: revision r12 carries the r8 wording verbatim rather than
+        // re-deriving it, so this comment names r8 for the correction's origin
+        // and not as the artifact a reader would find today.
         for omission in &self.coverage.omissions {
             if !seen.insert(omission.handle.as_str().to_owned()) {
                 return Err(MemoryProjectionError::Duplicate {
@@ -271,6 +277,93 @@ impl MemoryProjectionBatch {
         if must_revalidate && !self.coverage.revalidation_required {
             return Err(MemoryProjectionError::CoverageMismatch {
                 reason: "truncated or lossy coverage requires revalidation",
+            });
+        }
+        // An unprovable denominator is its own incomplete state, and it carries
+        // its own ceiling. The exact accounting above cannot run without a
+        // count, so `Unknown` leaves precisely the question the exact rule
+        // closes: whether an observed member was neither projected, nor named
+        // in `omissions`, nor deferred in the frontier. Nothing on the batch
+        // can answer it, and the only honest move is to require revalidation,
+        // not to substitute a count. Lowering the denominator to the returned
+        // record length is the same defect wearing a different hat: it would
+        // make the batch recheckable against itself and against nothing else.
+        //
+        // This is why the rule is a separate check rather than a fourth term in
+        // `must_revalidate`: the failure attribution differs. Truncation and
+        // omission are visible in the carried lists; an unknown denominator is
+        // a declared inability to count, and a consumer reading
+        // `revalidation_required: false` beside it is reading an unprovable
+        // batch as complete — exactly what the frozen `ProjectionCoverage`
+        // denominator_note forbids ("Unknown stays representable but no
+        // consumer may read it as completeness").
+        if matches!(self.coverage.denominator, DenominatorState::Unknown { .. })
+            && !self.coverage.revalidation_required
+        {
+            return Err(MemoryProjectionError::CoverageMismatch {
+                reason: "an unknown denominator requires revalidation",
+            });
+        }
+        Ok(())
+    }
+
+    /// Require one projected record to declare the batch's exact scope and to
+    /// have been read under a fence compatible with it.
+    ///
+    /// Two independent questions are asked, and conflating them is the defect
+    /// this gate closes.
+    ///
+    /// The record's **declared binding** is the scope it claims to belong to.
+    /// Task, scope, session, and the binding's own `state_fence` must all equal
+    /// the batch binding's. The fence field is compared by exact equality
+    /// rather than left to the compatibility relaxation below, because
+    /// compatibility is a relaxation and the declared scope is not one: a
+    /// record whose declared binding fence differs is asserting a different
+    /// scope. Checking only task/scope/session admitted exactly such a record
+    /// whenever its own projection fence happened to be compatible, which is the
+    /// wrong-scope-record-inside-a-valid-batch case this batch exists to refuse,
+    /// and it contradicted the frozen `MemoryProjectionBatch` `denominator_note`,
+    /// which requires the record binding to *equal* the batch binding.
+    ///
+    /// The record's **projection fence** is the fence it was actually read
+    /// under, and compatibility is correct for it: a record observed before
+    /// the batch's own fence is a legitimate read result, and requiring exact
+    /// equality there would reject it. Both checks therefore have their own
+    /// named `left`/`right` pair, so a refusal says which of the two failed.
+    ///
+    /// This is a gate over material the record already carries, not a new
+    /// field: no shape, version, or wire surface changes, so the byte-pinned
+    /// freeze and the generated serde boundary registry are untouched. The
+    /// existing typed errors are reused rather than new variants added, and the
+    /// distinction stays legible — an identity disagreement is
+    /// [`MemoryProjectionError::ScopeMismatch`] and every fence disagreement is
+    /// [`MemoryProjectionError::FenceMismatch`], so a consumer matching on the
+    /// variant still refuses.
+    fn validate_record_scope(
+        &self,
+        record: &MemoryProjectionRecord,
+    ) -> Result<(), MemoryProjectionError> {
+        if record.binding.task_id != self.binding.task_id
+            || record.binding.scope_id != self.binding.scope_id
+            || record.binding.session_id != self.binding.session_id
+        {
+            return Err(MemoryProjectionError::ScopeMismatch {
+                reason: "record binding must equal the batch binding",
+            });
+        }
+        if record.binding.state_fence != self.binding.state_fence {
+            return Err(MemoryProjectionError::FenceMismatch {
+                left: "record.binding.state_fence",
+                right: "batch.binding.state_fence",
+            });
+        }
+        if !record
+            .state_fence
+            .is_compatible_with(&self.binding.state_fence)
+        {
+            return Err(MemoryProjectionError::FenceMismatch {
+                left: "record.state_fence",
+                right: "batch.binding.state_fence",
             });
         }
         Ok(())

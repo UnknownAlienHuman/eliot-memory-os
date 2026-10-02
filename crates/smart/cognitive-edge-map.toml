@@ -72,6 +72,33 @@ contract = "eliot-dreamer-contracts::TypedCurationHandlerResult"
 consumer = "eliot-dreamer-curation"
 compile_link = "contract_only"
 
+# The three edges below are added by #261 r11 for the families that were frozen at
+# TYPE level only until that revision. Each names a consumer that was located with
+# git grep on the r11 base commit, not one chosen for plausibility.
+#
+# There is deliberately NO fourth edge for the memory-selection family.
+# selection.rs::select has zero callers outside its own crate, so there is no
+# producer-to-consumer pair to record, and naming one would be an invented edge.
+# That absence is carried in the freeze at [[disagreement]] DIS-SEL-NO-CALLER and
+# in [[coverage_accounting]] for that family, where owner_is_complete is false.
+[[edge]]
+producer = "eliot-observation (Governor journal owner, cited by handle)"
+contract = "eliot-observation-contracts::FailureObservation"
+consumer = "eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-observation (Governor journal owner, cited by handle)"
+contract = "eliot-observation-contracts::MemoryRevisionEvidence"
+consumer = "eliot-dreamer-memory-revision"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-epistemic"
+contract = "eliot-epistemic-contracts::ProviderContribution"
+consumer = "eliot-epistemic-context-provider, eliot-understanding-assessment"
+compile_link = "contract_only"
+
 [[forbidden_compile_edge]]
 from = "eliot-cue-index"
 to = "eliot-cue-normalizer"
@@ -457,3 +484,44 @@ owner = "A-19r"
 implementation_owner = "B-RCTX"
 consumer = "Host queue/service/transport"
 relation = "plan_to_delivery_boundary"
+
+# ---------------------------------------------------------------------------
+# #261 r12 edge rows for the four families that had NO field-contract row before
+# r12. Each names a consumer located with git grep on the r12 base commit, not
+# one chosen for plausibility.
+#
+# There is deliberately NO edge for the learning binding: its single measured
+# consumer constructs SourceDenominator inside eliot-learning-state-view and does
+# not consume the binding across a crate boundary, so naming an edge for it would
+# be an invented producer-to-consumer pair.
+# ---------------------------------------------------------------------------
+
+[[edge]]
+producer = "eliot-observation (Governor observation admission and classifier owner)"
+contract = "eliot_observation::ObservationAdmissionResult"
+consumer = "eliot-governor"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-observation (Governor observation admission and classifier owner)"
+contract = "eliot_observation::ObservationAdmissionReceipt"
+consumer = "eliot-cue-binding"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-self-query (brief projector over a validated source closure)"
+contract = "eliot_dreamer_contracts::self_query::AcceptedSourceProjection"
+consumer = "eliot-dreamer-self-query, eliot-understanding-assessment"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-admission (producer of the admitted set the view is validated against)"
+contract = "eliot_context_contracts::ActiveUnderstandingView"
+consumer = "eliotd, eliot-context-assembly"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-assembly (projection-only assembler; it performs no membership selection)"
+contract = "eliot_context_contracts::OmissionRecord"
+consumer = "eliot-context-assembly, eliotd"
+compile_link = "contract_only"

@@ -37,7 +37,12 @@
 //!   result exists only for lossless, fully accounted coverage; anything
 //!   else is `Inconclusive` with the exact evidence needed for recheck;
 //! - assessment order is deterministic input order; counter-metric rule
-//!   counts are sorted by rule name.
+//!   counts are sorted by rule name;
+//! - the package is bound to one exact freeze candidate and cannot read a
+//!   moved or edited one: the freeze bytes are embedded at compile time and
+//!   every request re-checks both the declared `freeze_id` and the sha256 of
+//!   those exact bytes against the recorded pins, so drift fails closed with
+//!   [`QualityError::VersionMismatch`] instead of being read as compatible.
 //!
 //! Failures are typed errors, never silent drops. [`MemoryEcologyAssessment`]
 //! serializes self-validating evidence: version, known denominator bound to
@@ -52,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_context_contracts::{
     CanonicalProjectionSet, ContextBinding, ContextError, OmissionRecord,
 };
-use eliot_contracts::{ArtifactId, ContractVersion, fences_match_exact};
+use eliot_contracts::{ArtifactId, ContractVersion, fences_match_exact, sha256_hex};
 use eliot_evidence::LifecycleState;
 use eliot_learning_contracts::identity::validate_digest as validate_learning_digest;
 use eliot_memory_projection_contracts::{
@@ -75,18 +80,15 @@ pub const QUALITY_CONTRACT_NAME: &str = "eliot.smart.memory-quality";
 /// Exact equality only: an assessment written against any other revision is
 /// rejected with [`QualityError::VersionMismatch`].
 pub const QUALITY_CONTRACT_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
-/// Freeze identity this consumer package builds against.
-///
-/// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r8";
+// Freeze identity this consumer package builds against, and the exact bytes it
+// is bound to, are declared in the freeze-binding block at the end of this
+// file: CONSUMED_FREEZE_ID, CONSUMED_FREEZE_DIGEST, FREEZE_BYTES and the
+// private guard `check_consumed_freeze` that reads them. That block sits after
+// the serde-carrying types so the generated protected-wire inventory
+// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+// keeps a small uniform line offset for those declarations; its accepted sync
+// belongs to the #929 owner, not to this crate.
 
-/// Fail closed unless this package builds against the delivered r8 freeze.
-fn check_consumed_freeze() -> Result<(), QualityError> {
-    if CONSUMED_FREEZE_ID != "cognitive-rev12-contract-schema-freeze-2026-09-22-r8" {
-        return Err(QualityError::VersionMismatch);
-    }
-    Ok(())
-}
 /// Hard ceiling on advisory receipt candidates carried by one request.
 pub const MAX_QUALITY_RECEIPTS: usize = 64;
 
@@ -184,22 +186,20 @@ impl QualityRequest {
     pub fn validate(&self) -> Result<(), QualityError> {
         check_consumed_freeze()?;
         self.batch.validate()?;
-        self.applicable.validate()?;
-        if self.applicable.binding != self.batch.binding {
-            return Err(QualityError::BindingMismatch {
-                left: "applicable.binding",
-                right: "batch.binding",
-            });
+        // The denominator is the batch owner's fact, so its absence is
+        // reported as the owner's typed refusal before the verdict is asked
+        // to carry a proof ceiling for it.
+        if !matches!(
+            self.batch.coverage.denominator,
+            DenominatorState::Known { .. }
+        ) {
+            return Err(QualityError::MissingDenominator);
         }
-        if self.applicable.denominator != self.batch.coverage.denominator
-            || self.applicable.truncated != self.batch.coverage.truncated
-            || self.applicable.revalidation_required != self.batch.coverage.revalidation_required
-        {
-            return Err(QualityError::BindingMismatch {
-                left: "applicable.denominator",
-                right: "batch.coverage",
-            });
-        }
+        // The owner's own join proves the verdict covers exactly this batch:
+        // its echoes match and its dispositions equal the projected handles.
+        // It replaces the separate echo comparison and handle-union walk that
+        // previously restated the same rule here.
+        self.applicable.validate_against_batch(&self.batch)?;
         self.projections.validate()?;
         let projection_binding = &self.projections.binding;
         if projection_binding.task_id != self.batch.binding.task_id
@@ -245,41 +245,7 @@ impl QualityRequest {
                 });
             }
         }
-        // The set verdict must cover exactly the batch records: neither a
-        // bare caller handle smuggled in nor a projected record left without
-        // a verdict is promoted to an accepted fact.
-        let batch_handles: BTreeSet<&str> = self
-            .batch
-            .records
-            .iter()
-            .map(|record| record.handle.as_str())
-            .collect();
-        let mut set_handles = BTreeSet::new();
-        for entry in self
-            .applicable
-            .applicable
-            .iter()
-            .map(|entry| entry.handle.as_str())
-            .chain(
-                self.applicable
-                    .excluded
-                    .iter()
-                    .map(|entry| entry.handle.as_str()),
-            )
-        {
-            if !set_handles.insert(entry) {
-                return Err(QualityError::HandleMismatch {
-                    field: "applicable",
-                    reason: "duplicate handle across the verdict lists",
-                });
-            }
-        }
-        if set_handles != batch_handles {
-            return Err(QualityError::HandleMismatch {
-                field: "applicable",
-                reason: "verdict handles must equal exactly the batch record handles",
-            });
-        }
+        // The verdict-must-cover-the-batch rule is enforced above, at its owner.
         Ok(())
     }
 }
@@ -503,9 +469,10 @@ const CLOSED_RULES: [&str; 12] = [
 ///
 /// Every count reconciles exactly: the denominator total equals assessed
 /// plus omitted plus unaccounted volume, applicable plus excluded equals
-/// assessed, and rule counts sum to excluded. No rate, ratio, or score is
-/// derived: cold-capture ratios and weak-claim rates stay proof fixtures
-/// with their own horizons, not assessment fields.
+/// assessed, rule counts sum to excluded, and `unaccounted_volume` equals the
+/// carried frontier remainder whose identities name it. No rate, ratio, or
+/// score is derived: cold-capture ratios and weak-claim rates stay proof
+/// fixtures with their own horizons, not assessment fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CounterMetrics {
@@ -515,7 +482,8 @@ pub struct CounterMetrics {
     pub records_assessed: usize,
     /// Named batch omissions carried alongside the records.
     pub omissions_carried: usize,
-    /// Declared volume with no carried record or omission: unaccounted.
+    /// Declared volume represented by no assessed record and no named
+    /// omission: exactly the carried resume-frontier remainder.
     pub unaccounted_volume: usize,
     /// Admitted projection omissions carried alongside the batch.
     pub projection_omissions: usize,
@@ -672,6 +640,7 @@ impl MemoryEcologyAssessment {
             }
         }
         self.validate_section_handles(&seen)?;
+        self.validate_recovery_partition(&seen)?;
         for observation in &self.receipts {
             observation.validate()?;
         }
@@ -700,6 +669,82 @@ impl MemoryEcologyAssessment {
                     reason: "maintenance notes must name assessed records",
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Validate that the carried recovery identities are unique, disjoint from
+    /// the assessed records, and account for exactly the known denominator.
+    ///
+    /// The batch owner proved this partition once, over the batch it produced;
+    /// this assessment is independently deserializable and persists its own
+    /// copy of the frontier and the named omissions, so it must be able to
+    /// recheck the partition against itself. Without this, a persisted
+    /// assessment could name a frontier handle that is also an assessed item,
+    /// or leave `unaccounted_volume` inconsistent with the identities that
+    /// account for it, while every carried count still reconciled.
+    fn validate_recovery_partition(&self, assessed: &BTreeSet<String>) -> Result<(), QualityError> {
+        let mut recovery = BTreeSet::new();
+        for handle in &self.frontier {
+            text(handle, "assessment.frontier")?;
+            if !recovery.insert(handle.clone()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.frontier",
+                    reason: "frontier handles must be unique",
+                });
+            }
+        }
+        for omission in &self.batch_omissions {
+            omission.validate()?;
+            if !recovery.insert(omission.handle.as_str().to_owned()) {
+                return Err(QualityError::HandleMismatch {
+                    field: "assessment.batch_omissions",
+                    reason: "batch omission handles must be unique and disjoint from the frontier",
+                });
+            }
+        }
+        if assessed.iter().any(|handle| recovery.contains(handle)) {
+            return Err(QualityError::HandleMismatch {
+                field: "assessment.coverage",
+                reason: "recovery identities cannot overlap assessed records",
+            });
+        }
+        let accounted = self
+            .items
+            .len()
+            .checked_add(self.batch_omissions.len())
+            .and_then(|volume| volume.checked_add(self.frontier.len()))
+            .ok_or(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "recovery-accounting volume overflows",
+            })?;
+        let DenominatorState::Known { total } = &self.denominator else {
+            return Err(QualityError::MissingDenominator);
+        };
+        if *total != accounted {
+            return Err(QualityError::InvalidField {
+                field: "assessment.coverage",
+                reason: "known denominator must exactly partition items, omissions, and frontier",
+            });
+        }
+        if self.truncated == self.frontier.is_empty() {
+            return Err(QualityError::InvalidField {
+                field: "assessment.truncated",
+                reason: "truncation must match frontier presence exactly",
+            });
+        }
+        let lossy_recovery = self.truncated || !self.batch_omissions.is_empty();
+        if lossy_recovery && !self.revalidation_required {
+            return Err(QualityError::InvalidField {
+                field: "assessment.revalidation_required",
+                reason: "lossy recovery requires revalidation",
+            });
+        }
+        if self.counter_metrics.unaccounted_volume != self.frontier.len() {
+            return Err(QualityError::InvalidField {
+                field: "counter_metrics.unaccounted_volume",
+                reason: "unaccounted volume must equal the carried frontier remainder",
+            });
         }
         Ok(())
     }
@@ -995,8 +1040,13 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
         verdicts.insert(entry.handle.as_str(), (Some(&entry.reason), entry.cue_hit));
     }
     let (items, gravity, maintenance, rules) = derive_sections(request, &verdicts)?;
-    let unaccounted_volume =
-        total.saturating_sub(request.batch.records.len() + request.batch.coverage.omissions.len());
+    // `MemoryProjectionBatch::validate` already proved the exact
+    // projected/omitted/deferred partition, so the residual this metric
+    // reports is precisely the deferred frontier remainder. Reading it as
+    // `total - records - omissions` would be the same number by that proof,
+    // but deriving it from the identities keeps the metric honest if the
+    // partition rule ever admits a fourth disposition.
+    let unaccounted_volume = request.batch.coverage.frontier.len();
     let lossy = request.batch.coverage.truncated
         || !request.batch.coverage.omissions.is_empty()
         || !request.projections.omissions.is_empty()
@@ -1052,4 +1102,188 @@ pub fn assess_quality(request: &QualityRequest) -> Result<MemoryEcologyAssessmen
     };
     assessment.validate()?;
     Ok(assessment)
+}
+
+// The freeze-binding block below sits after the serde-carrying types so the
+// generated protected-wire inventory in
+// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+// records a small uniform line offset for those declarations instead of one
+// larger than the whole block. Either way that inventory is a generated
+// snapshot whose accepted sync belongs to the #929 owner, not to this crate.
+
+/// Exact bytes of the contract-schema freeze this consumer is bound to, read
+/// at compile time from its owning path.
+///
+/// `include_bytes!` is the fail-closed choice for the same reason it is in
+/// `crates/smart/eliot-dreamer-memory-revision`: a missing, moved, or renamed
+/// freeze is a compile error in this crate, so no build of this consumer can
+/// ship against an absent freeze input. A runtime path lookup would instead
+/// depend on the process working directory and on the repository layout
+/// surviving packaging, which is a hidden failure source rather than a closed
+/// one. The accepted cost is that the freeze bytes are embedded in every
+/// consumer binary.
+pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-schema-freeze.toml");
+
+/// Freeze identity this consumer package builds against.
+///
+/// Repointed to the r12 candidate under `CC-W2-CONSUMER-REPIN`, which
+/// enumerates this exact constant together with "its self-comparison assertion"
+/// as a pin that must move in the same work unit as any freeze byte change.
+/// The string alone proves nothing about the bytes, so it is only ever read
+/// next to [`CONSUMED_FREEZE_DIGEST`]; the previous r8 pin and its
+/// identical-literal self-comparison were removed because a constant compared
+/// with itself can never detect the freeze moving under it.
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12";
+
+/// Lowercase sha256 over the exact [`FREEZE_BYTES`] this consumer is bound to.
+///
+/// Recorded out of band, never here, because a digest of a file's own bytes
+/// cannot live inside those bytes: this is the recorded readback digest and
+/// byte length in the `CC-W9-REV12-HANDOFF` row of
+/// `crates/smart/cognitive-contract-challenges.toml`, which
+/// `scripts/read_freeze_digest.py` re-reads against the freeze file. It is the
+/// same recorded value `crates/smart/eliot-dreamer-memory-revision/src/lib.rs`
+/// pins as `REQUIRED_FREEZE_DIGEST`, so the two consumers cannot disagree about
+/// which candidate is current. `CC-W2-CONSUMER-REPIN` lists "updating the
+/// string pins without the byte digest pin" as a forbidden workaround, which is
+/// why this constant exists next to [`CONSUMED_FREEZE_ID`].
+pub const CONSUMED_FREEZE_DIGEST: &str =
+    "eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596";
+
+/// Read the single column-0 `freeze_id` the freeze bytes declare.
+///
+/// The column-0 anchor is load-bearing: it is what keeps the freeze's own
+/// `supersedes_freeze_id` line from being read as the current identity. A
+/// document that declares no such line, or more than one, yields `None` rather
+/// than a best-effort value.
+fn declared_freeze_id(source: &str) -> Option<&str> {
+    const PREFIX: &str = "freeze_id = \"";
+    let mut declared: Option<&str> = None;
+    let mut lines = 0usize;
+    for line in source.lines() {
+        let Some(rest) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        lines += 1;
+        declared = rest.strip_suffix('"');
+    }
+    match (lines, declared) {
+        (1, Some(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// Fail closed unless these exact bytes are the freeze revision this package
+/// pins.
+///
+/// Takes the bytes as an argument so the comparison is over a document rather
+/// than over a constant compared with itself; [`check_consumed_freeze`] is the
+/// production entry and passes [`FREEZE_BYTES`]. Both sides are read from the
+/// given bytes: the declared `freeze_id` against [`CONSUMED_FREEZE_ID`], and the
+/// sha256 of the same bytes against [`CONSUMED_FREEZE_DIGEST`]. Divergence is
+/// the existing typed [`QualityError::VersionMismatch`] -- never a boolean --
+/// and never echoes the observed identity or digest, because this crate's
+/// error contract states that errors name only the failing field and the
+/// violated rule.
+fn verify_consumed_freeze(bytes: &[u8]) -> Result<(), QualityError> {
+    let source = std::str::from_utf8(bytes).map_err(|_| QualityError::VersionMismatch)?;
+    let observed_id = declared_freeze_id(source).ok_or(QualityError::VersionMismatch)?;
+    if observed_id != CONSUMED_FREEZE_ID || sha256_hex(bytes) != CONSUMED_FREEZE_DIGEST {
+        return Err(QualityError::VersionMismatch);
+    }
+    Ok(())
+}
+
+/// Fail closed unless this package builds against the delivered freeze bytes.
+///
+/// A freeze that is absent cannot reach this function: [`FREEZE_BYTES`] would
+/// not have compiled.
+fn check_consumed_freeze() -> Result<(), QualityError> {
+    verify_consumed_freeze(FREEZE_BYTES)
+}
+
+#[cfg(test)]
+mod freeze_binding {
+    //! The freeze pin is a byte binding, so both cases are measured against
+    //! real documents: the delivered bytes pass, and any other freeze identity
+    //! is refused with the existing typed error.
+
+    #![allow(clippy::expect_used)]
+
+    use super::{
+        CONSUMED_FREEZE_DIGEST, CONSUMED_FREEZE_ID, FREEZE_BYTES, QualityError,
+        check_consumed_freeze, declared_freeze_id, verify_consumed_freeze,
+    };
+    use eliot_contracts::sha256_hex;
+
+    #[test]
+    fn delivered_freeze_bytes_satisfy_both_recorded_pins() {
+        assert_eq!(check_consumed_freeze(), Ok(()));
+        assert_eq!(verify_consumed_freeze(FREEZE_BYTES), Ok(()));
+        // The identity is read out of the bytes, not asserted beside them.
+        assert_eq!(
+            declared_freeze_id(std::str::from_utf8(FREEZE_BYTES).expect("freeze is utf-8")),
+            Some(CONSUMED_FREEZE_ID)
+        );
+        assert_eq!(sha256_hex(FREEZE_BYTES), CONSUMED_FREEZE_DIGEST);
+    }
+
+    #[test]
+    fn a_moved_freeze_identity_is_refused() {
+        // Same document shape, a different published candidate: this is what a
+        // freeze that moved to another revision looks like at this guard.
+        let mut moved = String::from_utf8(FREEZE_BYTES.to_vec()).expect("freeze is utf-8");
+        let id_line = format!("freeze_id = \"{CONSUMED_FREEZE_ID}\"");
+        assert!(moved.contains(&id_line), "expected the declared id line");
+        moved = moved.replacen(
+            &id_line,
+            "freeze_id = \"cognitive-rev12-contract-schema-freeze-2026-09-22-r11\"",
+            1,
+        );
+        assert_eq!(
+            verify_consumed_freeze(moved.as_bytes()),
+            Err(QualityError::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn an_edited_freeze_under_an_unchanged_id_is_refused() {
+        // The id alone cannot detect the bytes moving, so this case holds the
+        // identity fixed and changes the digest's input. A line-ending rewrite
+        // would not do: it breaks the column-0 id read as well, so the refusal
+        // could not be attributed to the byte pin alone.
+        let source = std::str::from_utf8(FREEZE_BYTES).expect("freeze is utf-8");
+        let edited = source.replacen("revision = 12", "revision = 13", 1);
+        assert_ne!(edited, source, "the edited bytes must differ");
+        assert_eq!(
+            declared_freeze_id(&edited),
+            Some(CONSUMED_FREEZE_ID),
+            "the id is unchanged, so only the byte digest can refuse this"
+        );
+        assert_eq!(
+            verify_consumed_freeze(edited.as_bytes()),
+            Err(QualityError::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn bytes_with_no_single_declared_identity_are_refused() {
+        for source in [
+            "",
+            "[readback]\nrule = \"no identity here\"\n",
+            "freeze_id = \"a\"\nfreeze_id = \"b\"\n",
+            "supersedes_freeze_id = \"cognitive-rev12-contract-schema-freeze-2026-09-22-r11\"\n",
+        ] {
+            assert_eq!(
+                verify_consumed_freeze(source.as_bytes()),
+                Err(QualityError::VersionMismatch),
+                "expected a refusal for {source:?}"
+            );
+        }
+        assert_eq!(
+            verify_consumed_freeze(&[0xff, 0xfe]),
+            Err(QualityError::VersionMismatch),
+            "bytes that are not UTF-8 carry no readable identity"
+        );
+    }
 }

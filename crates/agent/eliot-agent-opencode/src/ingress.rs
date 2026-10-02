@@ -31,15 +31,54 @@
 //!   verifies it with its own copy of that credential; a foreign loopback
 //!   listener without the credential cannot manufacture a usable permit.
 //!
-//! First-contact note: plain loopback location is not server identity. The
-//! introduction pins the exact endpoint and server incarnation, and the
-//! handler refuses an introduction pinned to any other port than the
-//! serving listener; the listener is exclusively pre-bound (a bind conflict
-//! refuses the route instead of letting a squatter inherit it), and the
-//! credential is short-lived, single-generation, and process-bound. The
-//! User Broker owns the one-shot bootstrap authority behind the protected
-//! named-pipe channel (the introduction carries `bootstrap_channel` for
-//! it); the pipe transport with peer SID/process verification is not
+//! # First-contact server authentication
+//!
+//! Plain loopback location is not server identity, so the request credential
+//! is never the first protected byte on the connection. Before any bearer is
+//! disclosed, the client completes one **installation-pinned
+//! challenge/response identity proof** over this same endpoint and the same
+//! pre-bound loopback listener — the second accepted mechanism of issue #2898
+//! step 4 ("an owner-created, exclusively pre-bound listener/socket plus an
+//! installation-pinned challenge/response identity and one-use credential").
+//! No new port, no second credential scheme and no second identity store are
+//! introduced: the pinned value is the introduction's own
+//! [`OpenCodeBridgeIntroduction::server_identity`], the credential stays the
+//! introduction's existing [`SecretRef`], and the request stays the existing
+//! `POST /v1/host-events`.
+//!
+//! * **Probe.** `POST /v1/host-events` with the
+//!   `X-ELIOT-Bridge-Challenge` header, an empty body, and **no**
+//!   `Authorization` and **no** `Idempotency-Key` header. A request that mixes
+//!   the challenge header with either of those is refused, so a probe can never
+//!   carry a protected request and a protected request can never be a probe.
+//! * **Proof.** The answer is
+//!   [`BootstrapIdentityFields`]/[`bootstrap_identity_proof`]: an
+//!   HMAC-SHA256 (RFC 2104) over [`bootstrap_identity_message`] keyed by the
+//!   introduction's `server_identity`, covering the client's own fresh
+//!   challenge, the installation, the pinned endpoint, the introduction
+//!   digest and the bridge generation. The proof is one-use by construction —
+//!   it is bound to a challenge the client minted for this one contact and
+//!   never cached, so a recorded `(challenge, proof)` pair authenticates no
+//!   later contact.
+//! * **Refusals before disclosure.** The probe admits nothing: it performs no
+//!   durable admission, consults no `ActionGate`, resolves no credential, and
+//!   returns nothing but the proof. An unintroduced, expired, revoked,
+//!   wrong-port, or wrong-session composition is refused with the same typed
+//!   rejection the authenticated path uses.
+//! * **Disclosure only to a proved peer.** The client sends the existing
+//!   broker credential only after the proof verifies against its own copy of
+//!   the pinned identity, so at most one listener can ever hold it. A process
+//!   that merely guessed the pinned port holds a challenge and no secret.
+//!
+//! The listener itself stays owner-created and exclusively pre-bound
+//! ([`HostEventsListener::bind_loopback`], whose bind conflict refuses the
+//! route instead of letting a squatter inherit it), the credential stays
+//! short-lived, single-generation and process-bound, and the per-request
+//! [`join_introduction`] ownership check still requires the introduction's
+//! pinned port to equal the serving listener's own port. The User Broker's
+//! one-shot named-pipe bootstrap authority remains the *other* accepted
+//! mechanism: it is an alternative first contact, not a prerequisite of this
+//! one, and its peer SID/process/image/generation transport is still not
 //! implemented in this unit.
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -79,6 +118,20 @@ pub const MAX_HOST_EVENT_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_BEARER_BYTES: usize = 4096;
 /// Maximum `Idempotency-Key` bytes.
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
+/// Version of the first-contact server-identity proof (issue #2898, step 4).
+///
+/// The plugin mirrors this exact string and the exact
+/// [`bootstrap_identity_message`] array order when it verifies a probe answer.
+pub const HOST_EVENTS_IDENTITY_VERSION: &str = "eliot.opencode.bridge-identity.v1";
+/// Request header carrying the client's fresh first-contact challenge.
+///
+/// Its presence marks an identity probe: the request must then carry no
+/// `Authorization` and no `Idempotency-Key`, and its body must be empty, so a
+/// probe discloses nothing protected.
+pub const HOST_EVENTS_CHALLENGE_HEADER: &str = "x-eliot-bridge-challenge";
+/// Exact length, in characters, of a first-contact challenge: the lowercase
+/// hex encoding of 32 client-minted random bytes.
+pub const HOST_EVENTS_CHALLENGE_LENGTH: usize = 64;
 /// Maximum passive-observation top-level object keys.
 pub const MAX_PASSIVE_EVENT_FIELDS: usize = 64;
 /// Maximum event-id bytes accepted from any request.
@@ -212,16 +265,39 @@ impl HostEventReject {
 
 /// Validated `POST /v1/host-events` request head. Produced by
 /// [`parse_http_head`] before any body byte is allocated.
+///
+/// Exactly one of [`ParsedHostEventHead::bearer`] and
+/// [`ParsedHostEventHead::bootstrap_challenge`] is present. A protected
+/// request presents the credential; a first-contact identity probe
+/// ([`HOST_EVENTS_CHALLENGE_HEADER`]) presents a fresh challenge and no
+/// credential, so the credential is never the first protected byte sent to a
+/// listener that has not yet proved it holds the installation-pinned
+/// [`OpenCodeBridgeIntroduction::server_identity`].
 #[derive(Clone, Debug)]
 pub struct ParsedHostEventHead {
     /// Exact `Host` authority the request targeted.
     pub host: String,
-    /// Presented request credential. Never logged or echoed.
-    pub bearer: SecretString,
+    /// Presented request credential, absent on an identity probe. Never logged
+    /// or echoed.
+    pub bearer: Option<SecretString>,
+    /// Fresh client-minted first-contact challenge, present only on an
+    /// identity probe. Never logged or echoed.
+    pub bootstrap_challenge: Option<String>,
     /// Optional idempotency key; must equal the body `event_id` when present.
     pub idempotency_key: Option<String>,
     /// Declared body length, already bounded by [`MAX_HOST_EVENT_BODY_BYTES`].
     pub content_length: usize,
+}
+
+/// Returns whether one collected first-contact challenge is exactly the closed
+/// token shape the identity proof covers: [`HOST_EVENTS_CHALLENGE_LENGTH`]
+/// lowercase hex characters, nothing else. Any other shape is refused before
+/// a proof is computed, so a proof can never cover attacker-chosen bytes.
+fn is_bridge_challenge_token(value: &str) -> bool {
+    value.len() == HOST_EVENTS_CHALLENGE_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Rejects anything that is not exactly one `POST /v1/host-events` loopback
@@ -319,6 +395,7 @@ struct CollectedHead {
     content_length: Option<usize>,
     authorization: Option<String>,
     idempotency_key: Option<String>,
+    bootstrap_challenge: Option<String>,
 }
 
 fn collect_headers<'a>(
@@ -330,6 +407,7 @@ fn collect_headers<'a>(
         content_length: None,
         authorization: None,
         idempotency_key: None,
+        bootstrap_challenge: None,
     };
     let mut header_count = 0_usize;
     for line in lines {
@@ -450,6 +528,24 @@ fn apply_header_line(collected: &mut CollectedHead, line: &str) -> Result<(), Ho
             }
             collected.idempotency_key = Some(key);
         }
+        HOST_EVENTS_CHALLENGE_HEADER => {
+            if collected.bootstrap_challenge.is_some() {
+                return Err(HostEventReject::new(
+                    400,
+                    DISPOSITION_INVALID_REQUEST,
+                    REASON_INVALID_ARGUMENT,
+                ));
+            }
+            let challenge = value.trim().to_owned();
+            if !is_bridge_challenge_token(&challenge) {
+                return Err(HostEventReject::new(
+                    400,
+                    DISPOSITION_INVALID_REQUEST,
+                    REASON_INVALID_ARGUMENT,
+                ));
+            }
+            collected.bootstrap_challenge = Some(challenge);
+        }
         "transfer-encoding" | "expect" => {
             return Err(HostEventReject::new(
                 400,
@@ -503,6 +599,43 @@ fn validate_collected_head(
         DISPOSITION_INVALID_REQUEST,
         REASON_INVALID_ARGUMENT,
     ))?;
+    if let Some(challenge) = collected.bootstrap_challenge.as_deref() {
+        // First-contact identity probe. It must disclose nothing protected: no
+        // credential, no idempotency identity, and no body. Refusing the mixed
+        // shape here is what keeps "the bearer is never the first protected
+        // byte" structural rather than conventional.
+        if collected.authorization.is_some()
+            || collected.idempotency_key.is_some()
+            || content_length != 0
+        {
+            return Err(HostEventReject::new(
+                400,
+                DISPOSITION_INVALID_REQUEST,
+                REASON_INVALID_ARGUMENT,
+            ));
+        }
+        return Ok(ParsedHostEventHead {
+            host,
+            bearer: None,
+            bootstrap_challenge: Some(challenge.to_owned()),
+            idempotency_key: None,
+            content_length,
+        });
+    }
+    let bearer = presented_bearer(collected)?;
+    Ok(ParsedHostEventHead {
+        host,
+        bearer: Some(bearer),
+        bootstrap_challenge: None,
+        idempotency_key: collected.idempotency_key.clone(),
+        content_length,
+    })
+}
+
+/// Extracts and bounds the presented request credential of a protected
+/// request. Absent, malformed, over-limit or whitespace-bearing credentials
+/// are one typed refusal; the bytes are never logged or echoed.
+fn presented_bearer(collected: &CollectedHead) -> Result<SecretString, HostEventReject> {
     let authorization = collected.authorization.clone().ok_or(HostEventReject::new(
         401,
         DISPOSITION_DENIED,
@@ -527,12 +660,7 @@ fn validate_collected_head(
             REASON_AUTHENTICATION_REQUIRED,
         ));
     }
-    Ok(ParsedHostEventHead {
-        host,
-        bearer: SecretString::from(token.to_owned()),
-        idempotency_key: collected.idempotency_key.clone(),
-        content_length,
-    })
+    Ok(SecretString::from(token.to_owned()))
 }
 
 /// Current-introduction holder for the ingress join (issue #2898, step 7).
@@ -658,12 +786,18 @@ pub struct HostEventAdmissionReceipt {
     pub fence_id: String,
     /// Bridge generation bound from current owner state.
     pub bridge_generation: u64,
-    /// Stored effect decision when the route answered this operation identity
-    /// as an already-admitted replay (issue #2898, step 10). `Some` only when
-    /// the route's own ORS idempotency proved this exact operation identity
-    /// already holds a persisted decision; the returned value is that stored
-    /// record, which the handler compares by content against the decision this
-    /// request would produce.
+    /// Stored effect decision when this admission already committed one for
+    /// this exact operation identity (issue #2898, step 10).
+    ///
+    /// This is a process-local cache of what the owner already holds, not the
+    /// authority: it spares one durable round trip when the same process
+    /// serves a retry. The authority is always the owner's durable record,
+    /// which reconciles a retry that crossed a bridge restart through the
+    /// route's own idempotency answer on
+    /// [`HostEventAdmission::commit_decision`]. The returned record is what
+    /// the handler compares by content against the decision this request would
+    /// produce, so a changed effect, scope, fence, generation or policy
+    /// revision under one identity is a determined conflict.
     pub replayed_decision: Option<EffectDecisionRecord>,
 }
 
@@ -1232,6 +1366,125 @@ pub fn verify_response_commitment(
     )
 }
 
+/// First-contact server-identity proof fields (issue #2898, step 4).
+///
+/// The answer to a challenge probe. Every field is covered by
+/// [`bootstrap_identity_proof`], in fixed array order, and every value is
+/// owner-observed: the challenge is the client's own fresh token and the rest
+/// comes from the current installed introduction. No credential, no argument
+/// value, and no event identity appears here — a probe admits nothing.
+#[derive(Clone, Debug)]
+pub struct BootstrapIdentityFields {
+    /// Exact challenge the client presented.
+    pub challenge: String,
+    /// Installation bound from the current introduction.
+    pub installation_id: String,
+    /// Pinned loopback endpoint bound from the current introduction.
+    pub endpoint: String,
+    /// Installation-pinned server identity of this bridge incarnation.
+    pub server_identity: String,
+    /// Introduction digest this proof is bound to.
+    pub introduction_digest: String,
+    /// Bridge generation this proof is bound to.
+    pub bridge_generation: u64,
+}
+
+/// Builds the canonical first-contact identity message: one JSON array with
+/// every proof-covered field in fixed order.
+///
+/// Both sides (this module via `serde_json`, the plugin via `JSON.stringify`)
+/// encode the same array value to identical UTF-8: strings with ECMA-404
+/// escapes, plain integers, no whitespace. Encoder drift fails closed at
+/// verify.
+#[must_use]
+pub fn bootstrap_identity_message(fields: &BootstrapIdentityFields) -> Vec<u8> {
+    let canonical = serde_json::Value::Array(vec![
+        serde_json::Value::String(HOST_EVENTS_IDENTITY_VERSION.to_owned()),
+        serde_json::Value::String(fields.challenge.clone()),
+        serde_json::Value::String(fields.installation_id.clone()),
+        serde_json::Value::String(fields.endpoint.clone()),
+        serde_json::Value::String(fields.server_identity.clone()),
+        serde_json::Value::String(fields.introduction_digest.clone()),
+        serde_json::Value::Number(fields.bridge_generation.into()),
+    ]);
+    serde_json::to_vec(&canonical).unwrap_or_default()
+}
+
+/// Computes the first-contact server proof: HMAC-SHA256 (RFC 2104) over
+/// [`bootstrap_identity_message`] keyed by the installation-pinned
+/// [`OpenCodeBridgeIntroduction::server_identity`].
+///
+/// The plugin holds the same pinned value and recomputes this exact proof, so
+/// only the bridge incarnation the User Broker introduced into the approved
+/// `OpenCode` process can satisfy a probe. A process that merely bound the
+/// pinned loopback port has the challenge and nothing else: the pinned
+/// identity is never on the wire, so a squatter can neither read it nor mint a
+/// proof from it, and the client therefore never discloses the credential to
+/// it.
+#[must_use]
+pub fn bootstrap_identity_proof(fields: &BootstrapIdentityFields, server_identity: &str) -> String {
+    hmac_sha256_hex(
+        server_identity.as_bytes(),
+        &bootstrap_identity_message(fields),
+    )
+}
+
+/// Verifies one presented first-contact proof in constant time over its bytes.
+/// Length or byte mismatch fails closed; only the boolean is reported.
+#[must_use]
+pub fn verify_bootstrap_identity_proof(
+    fields: &BootstrapIdentityFields,
+    server_identity: &str,
+    proof: &str,
+) -> bool {
+    constant_time_equal(
+        bootstrap_identity_proof(fields, server_identity).as_bytes(),
+        proof.as_bytes(),
+    )
+}
+
+/// Encodes the first-contact identity answer, including its proof.
+#[must_use]
+pub fn encode_bootstrap_identity(
+    fields: &BootstrapIdentityFields,
+    server_identity: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::with_capacity(8);
+    body.insert(
+        "identity_version".to_owned(),
+        serde_json::Value::String(HOST_EVENTS_IDENTITY_VERSION.to_owned()),
+    );
+    body.insert(
+        "challenge".to_owned(),
+        serde_json::Value::String(fields.challenge.clone()),
+    );
+    body.insert(
+        "installation_id".to_owned(),
+        serde_json::Value::String(fields.installation_id.clone()),
+    );
+    body.insert(
+        "endpoint".to_owned(),
+        serde_json::Value::String(fields.endpoint.clone()),
+    );
+    body.insert(
+        "server_identity".to_owned(),
+        serde_json::Value::String(fields.server_identity.clone()),
+    );
+    body.insert(
+        "introduction_digest".to_owned(),
+        serde_json::Value::String(fields.introduction_digest.clone()),
+    );
+    body.insert(
+        "bridge_generation".to_owned(),
+        serde_json::Value::Number(fields.bridge_generation.into()),
+    );
+    body.insert(
+        "identity_proof".to_owned(),
+        serde_json::Value::String(bootstrap_identity_proof(fields, server_identity)),
+    );
+    serde_json::Value::Object(body)
+}
+
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1381,7 +1634,7 @@ struct JoinedIntroduction {
 }
 
 fn join_introduction<I, C>(
-    head: &ParsedHostEventHead,
+    bearer: &SecretString,
     bound_port: u16,
     introductions: &I,
     credentials: &C,
@@ -1449,7 +1702,7 @@ where
     };
     if !constant_time_equal(
         credential.expose_secret().as_bytes(),
-        head.bearer.expose_secret().as_bytes(),
+        bearer.expose_secret().as_bytes(),
     ) {
         return Err(HostEventReject::new(
             401,
@@ -1464,6 +1717,91 @@ where
     })
 }
 
+/// Answers one first-contact identity probe (issue #2898, step 4).
+///
+/// This is the whole of "authenticate the server before protected disclosure":
+/// the client has presented a fresh challenge and no credential, and this
+/// handler discloses exactly one thing — the proof that this listener holds
+/// the installation-pinned
+/// [`OpenCodeBridgeIntroduction::server_identity`] of the current
+/// introduction. It resolves no credential, admits no event, consults no
+/// `ActionGate`, and returns no receipt, decision or event identity, so a
+/// process that merely bound the pinned loopback port learns nothing from
+/// being probed and gains nothing to replay.
+///
+/// Every ownership refusal the authenticated path applies also applies here,
+/// before the proof exists: no current introduction, an introduction outside
+/// its issue/expiry window, a revoked introduction, an introduction pinned to
+/// any port other than this listener's own, and a live-session probe that no
+/// longer matches the bound `OpenCode` process. A foreign or stale listener
+/// therefore cannot pass the bootstrap identity check, and a composition with
+/// no live introduction can never mint a proof at all.
+fn handle_bootstrap_contact<I>(challenge: &str, bound_port: u16, introductions: &I) -> HttpOutcome
+where
+    I: IntroductionStore,
+{
+    let now_ms = introductions.now_ms();
+    let Some(introduction) = introductions.current_introduction() else {
+        return HttpOutcome::rejected(
+            HostEventReject::new(
+                503,
+                DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+                REASON_CAPABILITY_INTRODUCTION_REQUIRED,
+            ),
+            None,
+        );
+    };
+    if introduction.validate(now_ms).is_err() {
+        return HttpOutcome::rejected(
+            HostEventReject::new(
+                503,
+                DISPOSITION_UNAVAILABLE_OR_CAPACITY,
+                REASON_CAPABILITY_UNAVAILABLE,
+            ),
+            None,
+        );
+    }
+    if LoopbackEndpoint::parse(&introduction.endpoint)
+        .map(|endpoint| endpoint.port())
+        .ok()
+        != Some(bound_port)
+    {
+        // The introduction names a different bridge incarnation than this
+        // listener serves, so this listener must not prove that identity.
+        return HttpOutcome::rejected(
+            HostEventReject::new(404, DISPOSITION_INVALID_REQUEST, REASON_ROUTE_UNAVAILABLE),
+            None,
+        );
+    }
+    if introductions.is_revoked(&introduction.revocation_id) {
+        return HttpOutcome::rejected(
+            HostEventReject::new(403, DISPOSITION_DENIED, REASON_CAPABILITY_GRANT_REVOKED),
+            None,
+        );
+    }
+    if introduction
+        .probe_current_session(&introductions.session_facts())
+        .is_err()
+    {
+        return HttpOutcome::rejected(
+            HostEventReject::new(401, DISPOSITION_DENIED, REASON_AUTHENTICATION_REQUIRED),
+            None,
+        );
+    }
+    let fields = BootstrapIdentityFields {
+        challenge: challenge.to_owned(),
+        installation_id: introduction.installation_id.clone(),
+        endpoint: introduction.endpoint.clone(),
+        server_identity: introduction.server_identity.clone(),
+        introduction_digest: introduction.introduction_digest.clone(),
+        bridge_generation: introduction.bridge_generation.get(),
+    };
+    HttpOutcome::ok(encode_bootstrap_identity(
+        &fields,
+        &introduction.server_identity,
+    ))
+}
+
 /// Handles one bounded `POST /v1/host-events` request end to end.
 ///
 /// Pipeline: introduction join (current, valid window, endpoint pinned to
@@ -1475,6 +1813,13 @@ where
 /// listener's explicit port: an introduction pinned to any other endpoint is
 /// refused, so a foreign or stale listener cannot admit it. Every failure is
 /// a typed rejection; no failure path emits a permit.
+///
+/// A first-contact identity probe
+/// ([`HOST_EVENTS_CHALLENGE_HEADER`], no credential) never enters that
+/// pipeline: it is answered by [`handle_bootstrap_contact`] with the
+/// installation-pinned identity proof alone, so no protected request, event or
+/// decision exists on a connection whose peer has not yet proved it is the
+/// introduced bridge.
 pub fn handle_host_event<A, G, I, C>(
     head: &ParsedHostEventHead,
     body: &[u8],
@@ -1487,8 +1832,21 @@ where
     I: IntroductionStore,
     C: CredentialResolver,
 {
-    let joined = match join_introduction(head, bound_port, &ports.introductions, &ports.credentials)
-    {
+    if let Some(challenge) = head.bootstrap_challenge.as_deref() {
+        return handle_bootstrap_contact(challenge, bound_port, &ports.introductions);
+    }
+    let Some(presented_bearer) = head.bearer.as_ref() else {
+        return HttpOutcome::rejected(
+            HostEventReject::new(401, DISPOSITION_DENIED, REASON_AUTHENTICATION_REQUIRED),
+            None,
+        );
+    };
+    let joined = match join_introduction(
+        presented_bearer,
+        bound_port,
+        &ports.introductions,
+        &ports.credentials,
+    ) {
         Ok(joined) => joined,
         Err(reject) => return HttpOutcome::rejected(reject, None),
     };

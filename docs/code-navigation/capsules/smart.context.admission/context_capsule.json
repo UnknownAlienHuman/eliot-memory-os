@@ -25,10 +25,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 77879,
-    "test_stu": 42805,
+    "source_stu": 78100,
+    "test_stu": 61191,
     "selected_file_count": 8,
-    "physical_source_stu": 120684,
+    "physical_source_stu": 139291,
     "physical_file_count": 8,
     "inline_cfg_test_modules": 0,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -69,9 +69,9 @@
       },
       {
         "path": "crates/smart/eliot-context-admission/src/learning_gate.rs",
-        "bytes": 11952,
-        "sha256": "dbcd74e214c3d398114424597c604807627671e21d6097e995ab23018bdfc545",
-        "stu": 3984,
+        "bytes": 12615,
+        "sha256": "c324d2c3657783fd4613acf63e36da9737c00c9bf31648896a3e9e7705272d6e",
+        "stu": 4205,
         "inline_cfg_test": false
       },
       {
@@ -101,21 +101,22 @@
       },
       {
         "path": "crates/smart/eliot-context-admission/tests/learning_gate_1869.rs",
-        "bytes": 22404,
-        "sha256": "b18e498b7171ba1fcf71ae2a54c67d7190068ac6f739143a3dae720726d016ad",
-        "test_attributes": 6,
+        "bytes": 77562,
+        "sha256": "e920431ebfc97a89920852f8006dabf72d0f0f3f88d20ce8a9a6d376c5446a81",
+        "test_attributes": 16,
         "inline_cfg_test": false,
         "test_only_module": false,
         "classes": [
+          "edge_profile",
           "fault_restart_replay"
         ]
       }
     ],
-    "source_selection_digest": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
+    "source_selection_digest": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 8,
-    "physical_inventory_digest": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626",
+    "physical_inventory_digest": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5",
     "unselected_files": [],
     "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
@@ -146,7 +147,9 @@
     }
   ],
   "failure_fingerprints": [],
-  "edge_tests": [],
+  "edge_tests": [
+    "crates/smart/eliot-context-admission/tests/learning_gate_1869.rs"
+  ],
   "product_pulse": {
     "state": "DECLARED",
     "origin": "module.toml|product_pulse",
@@ -179,7 +182,7 @@
         },
         "package_manifest": {
           "path": "crates/smart/eliot-context-admission/Cargo.toml",
-          "sha256": "37f637348e701395583ad33219b9e0ce28e499314bedc2fdfd9a6b5747490843"
+          "sha256": "9d59fb92ef43fffcbf7e203e3ee4cff83904c10bee450c6cd6a83b775e04bc30"
         },
         "module_manifest": {
           "path": "crates/smart/eliot-context-admission/module.toml",
@@ -193,20 +196,20 @@
         },
         "physical_source_inventory": {
           "path_count": 8,
-          "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
+          "sha256": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5"
         },
         "selected_workset": {
           "allocation_scope": "PACKAGE_WIDE",
           "allocation_state": "EXPLICIT_PACKAGE_WIDE",
           "path_count": 8,
-          "sha256": "d7333d1ab4c6675208d0f333637980a77760be148b2929cb998543b287f4b626"
+          "sha256": "10399c9d5fd7f23c2c57c4434af988e775819979a0abc18d73519034e5bf8aa5"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "8ddcf4557e5f661248d539088f4d82cae46d2e1afc0d0e4ffd0903467ed3c59e",
+  "artifact_digest": "3c433644e6cd31d939a5ff4f115871a62d86e0b0f7cba9c45f848122dc9fac35",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "450462e44a43c833"

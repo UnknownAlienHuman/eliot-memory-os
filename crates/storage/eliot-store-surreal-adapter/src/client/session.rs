@@ -2,7 +2,10 @@
 use super::provider_owner::{
     ProviderOwner, require_listener_owner, require_unchanged_identity, validate_child_process,
 };
-use super::rpc_parse::{parse_response, provider_version_from_rpc, rpc_result};
+use super::rpc_parse::{
+    ResponseCeiling, parse_response, parse_response_bounded, provider_version_from_rpc,
+    response_ceiling_refusal, rpc_result,
+};
 use super::{RPC_PROTOCOL_VERSION, RpcRequest, RpcSocket, millis};
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
@@ -20,8 +23,14 @@ use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::{
-    MaybeTlsStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    MaybeTlsStream, connect_async_with_config,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        error::{CapacityError, Error as TransportError},
+        http::HeaderValue,
+        protocol::WebSocketConfig,
+    },
 };
 use uuid::Uuid;
 
@@ -63,6 +72,7 @@ impl RpcSession {
             owner.provider_process_id,
             &before,
             deadline,
+            ResponseCeiling::session_wide(),
         )
         .await?;
         drop(child);
@@ -118,6 +128,40 @@ impl RpcSession {
             .await
     }
 
+    /// Issues one request whose response is admitted under `ceiling`.
+    ///
+    /// This is the bounded-capture entry point of the accepted transport
+    /// (issue #951). It differs from [`RpcSession::request`] in exactly one way:
+    /// each frame the response arrives in is charged against `ceiling` before
+    /// the binary arm copies it and before any JSON `Value` is constructed. The
+    /// session's own socket was already constructed under the ELIOT-issued
+    /// transport bound (see [`response_bound_config`]), which is at or above
+    /// this one, so an oversize frame is refused there while it is still a
+    /// network frame. Everything else — the versioned request id, the deadline,
+    /// the owner-liveness check, the connection-peer proof — is unchanged, so a
+    /// bounded capture cannot acquire a different transport, a different
+    /// operation identity or a weaker time bound than any other named
+    /// operation.
+    pub(super) async fn request_bounded(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+        params: Value,
+        ceiling: ResponseCeiling,
+    ) -> Result<Value, AdapterError> {
+        let id = format!("{RPC_PROTOCOL_VERSION}:{operation}:{}", Uuid::new_v4());
+        let expected_id = Value::String(id.clone());
+        let payload = serde_json::to_string(&RpcRequest {
+            id,
+            method,
+            params: Some(params),
+        })
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+
+        self.request_payload(payload, expected_id, false, Some(ceiling))
+            .await
+    }
+
     async fn request_with_guard(
         &self,
         operation: &'static str,
@@ -134,7 +178,7 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id, prove_connection_owner)
+        self.request_payload(payload, expected_id, prove_connection_owner, None)
             .await
     }
 
@@ -152,20 +196,57 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id, true).await
+        self.request_payload(payload, expected_id, true, None).await
     }
 
+    /// Sends one payload and reads its response under the accepted transport's
+    /// time bound, plus an optional ELIOT-owned response byte ceiling.
+    ///
+    /// `ceiling` is `Some` exactly for the bounded capture path, and it is
+    /// charged **per received frame**, not per request: the loop below keeps
+    /// reading while the response id does not match, and each frame it reads is
+    /// charged against the same ceiling independently. The aggregate number of
+    /// frames one request may read is therefore bounded by the request deadline,
+    /// not by the ceiling. Nothing here is a per-request aggregate byte bound;
+    /// the capture's own admitted `max_bytes` is the aggregate bound, and it is
+    /// charged in `backup_snapshot::read_enumeration`.
+    ///
+    /// Two positions bound the response, and the order between them is the point:
+    ///
+    /// * the *transport* bound was fixed when this session's socket was
+    ///   constructed (see [`response_bound_config`]), from
+    ///   [`ResponseCeiling::session_wide`] and the owner-issued
+    ///   `MAX_SNAPSHOT_BYTES`. The provider library refuses a frame or message
+    ///   above it while the payload is still a network frame: its frame codec
+    ///   reads the declared length, compares it with `max_frame_size` and
+    ///   refuses before the payload is buffered at all, and it compares a
+    ///   complete message with `max_message_size` before a text payload is
+    ///   validated as UTF-8. An oversize response is therefore never
+    ///   materialised, for either arm, and that is what the ELIOT bound buys.
+    /// * this function then charges each frame it is handed against the
+    ///   *capture's own* ceiling, which is at or below the transport bound. That
+    ///   charge is what keeps the two positions in agreement and what refuses a
+    ///   frame the session-wide bound would admit but this capture's smaller
+    ///   admitted budget does not. It happens before the binary arm copies the
+    ///   frame and before any `Value` is built.
+    ///
+    /// Both positions, including the refusal the transport itself raises (see
+    /// [`transport_read_error`]), produce the same typed
+    /// `StoreError::PayloadTooLarge`. When `ceiling` is `None` the previous
+    /// unbounded read is unchanged: the ceiling is a property of an admitted
+    /// capture budget, and no other named operation has one.
     async fn request_payload(
         &self,
         payload: String,
         expected_id: Value,
         prove_connection_owner: bool,
+        ceiling: Option<ResponseCeiling>,
     ) -> Result<Value, AdapterError> {
         let owner = self
             .owner
             .upgrade()
             .ok_or(AdapterError::ProviderUnavailable)?;
-        timeout(self.request_timeout, async {
+        let read_response = async {
             let mut socket = self.socket.lock().await;
             if prove_connection_owner {
                 let (client_local_endpoint, peer_endpoint) =
@@ -184,18 +265,30 @@ impl RpcSession {
                     .next()
                     .await
                     .ok_or(AdapterError::ProviderUnavailable)?
-                    .map_err(|_| AdapterError::ProviderUnavailable)?;
+                    .map_err(|error| transport_read_error(&error))?;
                 match message {
                     Message::Text(text) => {
-                        let response = parse_response(text.as_str())?;
+                        let response = match ceiling {
+                            Some(ceiling) => {
+                                parse_response_bounded(text.as_str().as_bytes(), ceiling)?
+                            }
+                            None => parse_response(text.as_str())?,
+                        };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);
                         }
                     }
                     Message::Binary(bytes) => {
-                        let text = String::from_utf8(bytes.to_vec())
-                            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-                        let response = parse_response(&text)?;
+                        // The bounded arm reads the frame in place: the ceiling
+                        // is charged against the borrowed slice, so the second
+                        // copy the unbounded arm makes is never taken.
+                        let response = if let Some(ceiling) = ceiling {
+                            parse_response_bounded(&bytes, ceiling)?
+                        } else {
+                            let text = String::from_utf8(bytes.to_vec())
+                                .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+                            parse_response(&text)?
+                        };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);
                         }
@@ -208,9 +301,69 @@ impl RpcSession {
                     Message::Close(_) => return Err(AdapterError::ProviderUnavailable),
                 }
             }
-        })
-        .await
-        .map_err(|_| AdapterError::ProviderUnavailable)?
+        };
+        // The deadline maps only its own expiry onto a transport loss. A
+        // response-size refusal is an exact, typed outcome of the admitted
+        // budget and is returned unchanged: folding it into
+        // `ProviderUnavailable` would report an over-budget source as a lost
+        // provider and let a bounded refusal read as retryable.
+        timeout(self.request_timeout, read_response)
+            .await
+            .map_err(|_| AdapterError::ProviderUnavailable)?
+    }
+}
+
+/// Builds the transport response bound every socket this session owns is
+/// constructed with.
+///
+/// This is where the ELIOT-issued bound reaches the WebSocket layer, and it is
+/// deliberately not an `Option`: [`tokio_tungstenite::connect_async`] resolves a
+/// `None` configuration to the provider library's incidental defaults (16 MiB per
+/// frame, 64 MiB per message), and a socket built under those defaults refuses a
+/// single-frame response between them *inside the library* — before any ELIOT
+/// code runs — with a capacity error that would otherwise be indistinguishable
+/// from a lost provider.
+///
+/// The bound is derived from [`ResponseCeiling::session_wide`], which is itself
+/// derived from the owner-issued `MAX_SNAPSHOT_BYTES` every admitted capture
+/// budget is checked against, so the transport bound is never weaker than the
+/// bound the largest admissible capture needs and cannot refuse a capture its own
+/// admitted budget allows.
+///
+/// Every other configuration field is left at the library default, so this
+/// narrows the frame and message bounds and changes nothing else about the
+/// transport. `tungstenite` accepts this configuration once, at connect: it
+/// exposes no way to change a live socket's bounds, which is why the transport
+/// bound is the session-wide issue and the per-capture ceiling is charged per
+/// frame in [`RpcSession::request_payload`].
+fn response_bound_config(ceiling: ResponseCeiling) -> Result<WebSocketConfig, AdapterError> {
+    let bound = usize::try_from(ceiling.max_bytes()).map_err(|_| response_ceiling_refusal())?;
+    Ok(WebSocketConfig::default()
+        .max_frame_size(Some(bound))
+        .max_message_size(Some(bound)))
+}
+
+/// Maps one transport read failure onto the adapter's error model.
+///
+/// A capacity error means the provider answered with a frame or message the
+/// ELIOT-issued transport bound does not admit, so it becomes the *same* typed
+/// bounded refusal [`response_ceiling_refusal`] raises at the frame charge and
+/// in the bounded decoder. It is deliberately not
+/// [`AdapterError::ProviderUnavailable`]: the source answered, and
+/// `StoreError::Unavailable` is retryable, so folding this into a transport loss
+/// would let a bounded refusal masquerade as a lost provider and be resolved away
+/// as a transient read.
+///
+/// Every other read failure — a closed or reset connection, a protocol
+/// violation, an I/O error — stays a transport loss.
+fn transport_read_error(error: &TransportError) -> AdapterError {
+    if matches!(
+        *error,
+        TransportError::Capacity(CapacityError::MessageTooLong { .. })
+    ) {
+        response_ceiling_refusal()
+    } else {
+        AdapterError::ProviderUnavailable
     }
 }
 
@@ -287,6 +440,12 @@ pub(super) async fn authenticate_provider<T: ProviderAuthentication>(
     Ok(version)
 }
 
+/// Opens one authenticated-capable socket to the owned provider process.
+///
+/// `response_bound` is required, not optional: it is the ELIOT-issued transport
+/// bound the socket is constructed with (see [`response_bound_config`]), so a
+/// socket that reached the provider under the provider library's incidental
+/// defaults cannot be expressed at this seam.
 async fn connect_started_provider(
     config: &SurrealAdapterConfig,
     provider_process_lease: &RetainedProcessPathLease,
@@ -294,7 +453,11 @@ async fn connect_started_provider(
     provider_process_id: u32,
     identity_before_listener: &ProcessIdentity,
     deadline: Instant,
+    response_bound: ResponseCeiling,
 ) -> Result<(RpcSocket, ProcessIdentity), AdapterError> {
+    // Decided once, before the first attempt, so every socket this connect
+    // produces is built under the same ELIOT-issued response bound.
+    let response_config = response_bound_config(response_bound)?;
     loop {
         if child
             .try_wait()
@@ -319,7 +482,7 @@ async fn connect_started_provider(
             .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("json"));
         let attempt = timeout(
             remaining.min(Duration::from_millis(100)),
-            connect_async(request),
+            connect_async_with_config(request, Some(response_config), false),
         );
         if let Ok(Ok((socket, _))) = attempt.await {
             let endpoint = config
@@ -346,6 +509,148 @@ async fn connect_started_provider(
             return Ok((socket, identity_after_listener));
         }
         sleep(remaining.min(Duration::from_millis(25))).await;
+    }
+}
+
+/// The ELIOT-issued transport response bound, exercised against the real
+/// provider-library frame codec.
+///
+/// These cases need no provider process: `tungstenite`'s own
+/// `WebSocketContext` is the same codec the session socket runs, and
+/// [`response_bound_config`] is the exact configuration
+/// `connect_started_provider` hands to `connect_async_with_config`. So the
+/// transport refusal they observe is the one an oversize snapshot response would
+/// produce in production, and the mapping they then apply is the production
+/// [`transport_read_error`].
+#[cfg(test)]
+mod transport_response_bound_tests {
+    #![allow(clippy::expect_used)]
+
+    use eliot_store_api::{MAX_SNAPSHOT_BYTES, StoreError};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    use super::*;
+
+    /// The provider library's incidental defaults, restated so the "never
+    /// widened" property is an assertion about the library's own numbers and
+    /// not about whatever they happen to be today.
+    const INCIDENTAL_FRAME_BYTES: usize = 16 << 20;
+    const INCIDENTAL_MESSAGE_BYTES: usize = 64 << 20;
+
+    /// One unmasked server-to-client binary frame declaring `declared_len`
+    /// payload bytes, followed by `payload_len` of them.
+    ///
+    /// The header is written by hand so the declared length and the delivered
+    /// length can differ: the frame codec compares the declared length with
+    /// `max_frame_size` *before* it reads or reserves any payload, so a frame
+    /// one byte over the bound is refused without the payload ever existing.
+    /// This is exactly the "one oversized row forces the complete WebSocket
+    /// message" shape, and it is unreachable through a fake decoded value.
+    fn server_binary_frame(declared_len: u64, payload_len: usize) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(10 + payload_len);
+        // FIN + binary opcode, unmasked, 64-bit extended length.
+        frame.push(0x82);
+        frame.push(0x7F);
+        frame.extend_from_slice(&declared_len.to_be_bytes());
+        frame.resize(10 + payload_len, b'r');
+        frame
+    }
+
+    /// The session-wide ELIOT response bound, as a `usize`.
+    fn session_bound_bytes() -> usize {
+        usize::try_from(ResponseCeiling::session_wide().max_bytes())
+            .expect("the session response bound fits a usize")
+    }
+
+    /// The context the session socket's codec is configured with.
+    fn bounded_context() -> tokio_tungstenite::tungstenite::protocol::WebSocketContext {
+        let config = response_bound_config(ResponseCeiling::session_wide())
+            .expect("the session response bound fits a usize");
+        tokio_tungstenite::tungstenite::protocol::WebSocketContext::new(Role::Client, Some(config))
+    }
+
+    /// The ELIOT-issued bound reaches the transport, and it narrows the
+    /// library's incidental defaults rather than widening them.
+    ///
+    /// Both bounds are asserted, because the hole this repairs is a *frame* above
+    /// 16 MiB as much as a message above 64 MiB. Setting either field back to
+    /// `None`, or to the incidental default, fails here.
+    #[test]
+    fn the_transport_bound_narrows_the_incidental_provider_defaults() {
+        let config = response_bound_config(ResponseCeiling::session_wide())
+            .expect("the session response bound fits a usize");
+        let expected = session_bound_bytes();
+        assert_eq!(config.max_frame_size, Some(expected));
+        assert_eq!(config.max_message_size, Some(expected));
+        assert!(
+            expected < INCIDENTAL_FRAME_BYTES,
+            "the frame bound must narrow the provider library's incidental default"
+        );
+        assert!(
+            expected < INCIDENTAL_MESSAGE_BYTES,
+            "the message bound must narrow the provider library's incidental default"
+        );
+        // The transport can never refuse a capture the owner admits.
+        assert!(
+            expected >= usize::try_from(MAX_SNAPSHOT_BYTES).expect("owner ceiling fits a usize")
+        );
+    }
+
+    /// Refusal case at the transport: a single frame one byte over the
+    /// ELIOT-issued bound is refused *inside the provider library*, with no
+    /// payload delivered, and the production mapping turns that into the typed
+    /// bounded refusal rather than a lost provider.
+    ///
+    /// Dropping the bound from [`response_bound_config`] — the exact defect this
+    /// repairs — makes the frame decode, and retyping the capacity error as a
+    /// transport loss makes both assertions fail.
+    #[test]
+    fn an_oversize_single_frame_is_refused_by_the_transport_as_a_bounded_refusal() {
+        let bound = session_bound_bytes();
+        let declared = u64::try_from(bound + 1).expect("declared length fits a u64");
+        // Nothing of the oversize payload is on the wire at all.
+        let mut wire = std::io::Cursor::new(server_binary_frame(declared, 0));
+        let mut context = bounded_context();
+        let failure = context
+            .read(&mut wire)
+            .expect_err("a frame above the ELIOT bound is refused by the transport");
+        assert!(
+            matches!(
+                failure,
+                TransportError::Capacity(CapacityError::MessageTooLong { .. })
+            ),
+            "the provider library refuses an oversize frame with a capacity error: {failure:?}"
+        );
+        let refusal = transport_read_error(&failure);
+        assert_eq!(refusal, AdapterError::Store(StoreError::PayloadTooLarge));
+        assert_eq!(
+            refusal.into_store_error(),
+            StoreError::PayloadTooLarge,
+            "an oversize response reaches the store boundary as a bounded refusal, not as a retryable unavailable provider"
+        );
+        assert_ne!(
+            transport_read_error(&TransportError::ConnectionClosed),
+            AdapterError::Store(StoreError::PayloadTooLarge),
+            "a genuinely lost provider is a different outcome and must stay one"
+        );
+    }
+
+    /// Positive case at the transport: a frame exactly at the ELIOT-issued bound
+    /// is delivered whole, so the bound refuses oversize responses without
+    /// narrowing the ones an admissible capture needs.
+    #[test]
+    fn a_frame_at_the_transport_bound_is_delivered() {
+        let bound = session_bound_bytes();
+        let declared = u64::try_from(bound).expect("declared length fits a u64");
+        let mut wire = std::io::Cursor::new(server_binary_frame(declared, bound));
+        let mut context = bounded_context();
+        let message = context
+            .read(&mut wire)
+            .expect("a frame at the ELIOT bound is delivered");
+        assert!(
+            matches!(message, Message::Binary(bytes) if bytes.len() == bound),
+            "the whole in-bound frame arrives"
+        );
     }
 }
 

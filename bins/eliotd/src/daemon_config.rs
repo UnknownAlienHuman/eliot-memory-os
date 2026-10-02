@@ -17,7 +17,7 @@ use eliot_runtime_contracts::{
 };
 
 use super::canonical_config_precedence::{
-    PolicyDocument, ResolvedChain, resolve_effective_configuration,
+    ConfigLayer, PolicyDocument, ResolvedChain, resolve_effective_configuration,
 };
 use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES, SERVICE_NAME};
 
@@ -26,6 +26,13 @@ const INSTALLATION_CONFIG_RELATIVE: &str = r"Eliot\config\installation.toml";
 
 /// I3.9 System Owner policy file, relative to the protected `ProgramData` root.
 const SYSTEM_OWNER_POLICY_RELATIVE: &str = r"Eliot\config\policy.toml";
+
+/// Human model-preference store file name (issue #485, audit 5872395796).
+///
+/// The single `redb` file the settings owner (`eliot-host-state`) publishes
+/// under the daemon protected state root. The file itself is minted by the
+/// first committed publication; only the name is configured here, never bytes.
+pub(crate) const MODEL_PREFERENCE_STORE_FILE_NAME: &str = "model-preferences.redb";
 
 fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
     let expectation = current_process_named_pipe_expectation()
@@ -47,8 +54,14 @@ fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
 /// an unknown or duplicated layer, and a lower-layer expansion that no higher
 /// layer delegated all fail this function.
 fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
-    let mut retained: Vec<(&str, Vec<u8>)> = Vec::new();
-    for relative in [INSTALLATION_CONFIG_RELATIVE, SYSTEM_OWNER_POLICY_RELATIVE] {
+    let mut retained: Vec<(&str, ConfigLayer, Vec<u8>)> = Vec::new();
+    for (relative, expected_layer) in [
+        (
+            INSTALLATION_CONFIG_RELATIVE,
+            ConfigLayer::InstallationConfig,
+        ),
+        (SYSTEM_OWNER_POLICY_RELATIVE, ConfigLayer::SystemOwnerPolicy),
+    ] {
         let path = protected_program_data_path(relative)?;
         match path.try_exists() {
             Ok(false) => continue,
@@ -66,12 +79,17 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
                     .to_owned(),
             ));
         }
-        retained.push((relative, lease.read_bounded(MAX_CONFIG_BYTES)?));
+        retained.push((
+            relative,
+            expected_layer,
+            lease.read_bounded(MAX_CONFIG_BYTES)?,
+        ));
     }
     let documents: Vec<PolicyDocument<'_>> = retained
         .iter()
-        .map(|(file_name, bytes)| PolicyDocument {
+        .map(|(file_name, expected_layer, bytes)| PolicyDocument {
             file_name,
+            expected_layer: *expected_layer,
             bytes: bytes.as_slice(),
         })
         .collect();
@@ -345,6 +363,19 @@ impl DaemonConfig {
     #[must_use]
     pub fn state_root(&self) -> &Path {
         &self.state_root
+    }
+
+    /// Returns the absolute configured Human model-preference store path
+    /// (issue #485, audit 5872395796 step 2).
+    ///
+    /// Under the existing settings owner: the protected daemon state root this
+    /// boundary derived from the Host-approved launch config path. The path is
+    /// absolute whenever the state root is, and no second store, provider
+    /// state, or caller-supplied directory is involved: the daemon execution
+    /// intake hands exactly this path to the submit leg.
+    #[must_use]
+    pub fn model_preference_store_path(&self) -> PathBuf {
+        self.state_root.join(MODEL_PREFERENCE_STORE_FILE_NAME)
     }
 }
 

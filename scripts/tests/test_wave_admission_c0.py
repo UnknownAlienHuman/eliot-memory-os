@@ -41,6 +41,19 @@ Accepted owner evidence consumed (never re-authored here)
   snapshot. No test-authored string list grants authority anywhere in this file.
 * ``scripts/tests/test_cognitive_topology_contract.py`` (#816) — the owner of the
   cognitive wave/edge/decision/donor topology contract.
+* ``scripts/verify-dependency-policy.py`` — the accepted dependency owner. Case 27
+  reads its own observed-edge read of the real manifests
+  (``_collect_rust_dependency_graph``: source kind, path, features, workspace
+  membership) and its own findings, instead of reinterpreting the manifests here.
+  Case 26 reads its declared terminal status *and* its exit, and refuses a run
+  that reached one of its own non-evaluation statuses — reached for real by
+  re-running the same oracle with an empty PATH, so its configured scanner is
+  unresolvable.
+* ``scripts/verify.ps1`` — the one ordered gate-definition owner. Case 24 derives
+  the per-package Clippy invocation, and therefore the accepted warning policy,
+  from the argv that owner declares for ``cargo-clippy-workspace``, read through
+  the profile owner's existing PowerShell AST projection. The policy is never
+  written down in this file.
 
 Per-leaf evidence is kept in two separate, non-interchangeable phases:
 
@@ -96,8 +109,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -135,11 +150,14 @@ WORKSPACE_COMMANDS = (
     ("cargo", "check", "--locked", "--workspace", "--all-targets"),
     ("cargo", "test", "--locked", "--workspace", "--no-run"),
 )
+# The package-local commands that carry no warning policy of their own. The
+# package Clippy command is NOT listed here: it is derived in every case from the
+# accepted gate-definition owner's own declared argv (see ``member_selection``).
 PACKAGE_COMMANDS = (
     ("cargo", "test", "--locked", "-p"),
-    ("cargo", "clippy", "--locked", "-p"),
     ("cargo", "doc", "--locked", "--no-deps", "-p"),
 )
+CLIPPY_GATE = "cargo-clippy-workspace"
 
 
 # --------------------------------------------------------------------------- io
@@ -180,9 +198,10 @@ def git_bytes(*args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=False, timeout=180)
 
 
-def py_script(*args: str, timeout: int = 900) -> subprocess.CompletedProcess:
+def py_script(*args: str, timeout: int = 900,
+              env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, *args], cwd=str(ROOT),
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout, env=env)
 
 
 # ------------------------------------------------------------------ repository
@@ -480,6 +499,144 @@ def validate_workspace_command(command: tuple[str, ...], members: list[str],
     return errors
 
 
+# Statuses the accepted dependency oracle declares when it actually evaluated the
+# declared dependency policy, from ``_derive_overall_status`` in
+# ``scripts/verify-dependency-policy.py``. ``TOOL_UNAVAILABLE``, ``NOT_EXECUTED``,
+# ``STALE``, ``CONFLICTED`` and ``ADVISORY_SOURCE_UNAVAILABLE`` are the oracle's
+# own "I did not evaluate" states: a run that reaches one of them proves nothing
+# about any package, so it can never satisfy an acceptance case.
+DEPENDENCY_ORACLE_EVALUATED = ("PASS", "FINDINGS", "INCOMPLETE")
+
+
+def validate_dependency_oracle(terminal: str, returncode: int) -> list[str]:
+    """One dependency-oracle run, read from its own terminal line and exit.
+
+    A crashing or truncated oracle prints no terminal line at all and is refused
+    here. A run that reached a declared non-evaluation status is refused too: its
+    output names no package because it looked at none, which is precisely the
+    output omission the acceptance claim must not be able to hide behind.
+    """
+    errors: list[str] = []
+    if not terminal:
+        errors.append("dependency oracle printed no VERIFY_DEPENDENCY_POLICY terminal line")
+        return errors
+    fields = terminal.split(":", 2)
+    if len(fields) < 2:
+        errors.append(f"dependency oracle terminal line is malformed: {terminal}")
+        return errors
+    status = fields[1].split()[0] if fields[1].split() else ""
+    if status not in DEPENDENCY_ORACLE_EVALUATED + (
+            "TOOL_UNAVAILABLE", "NOT_EXECUTED", "STALE", "CONFLICTED",
+            "ADVISORY_SOURCE_UNAVAILABLE"):
+        errors.append(f"dependency oracle declared an unknown status: {status!r}")
+        return errors
+    if status not in DEPENDENCY_ORACLE_EVALUATED:
+        errors.append(f"dependency oracle did not evaluate the policy: {status}")
+    # The oracle's own contract: exit 0 only for a clean PASS, 1 otherwise.
+    if returncode != (0 if status == "PASS" else 1):
+        errors.append(f"dependency oracle exit {returncode} contradicts status {status}")
+    return errors
+
+
+def runtime_bin_packages(edges: list[dict]) -> dict[str, str]:
+    """The owner's own reading of which members are runtime binaries.
+
+    ``_collect_rust_dependency_graph`` in ``scripts/verify-dependency-policy.py``
+    records ``root_workspace_member`` per observed edge and the manifest path it
+    came from, so the runtime-binary set is derived from the accepted owner's
+    output over the real manifests rather than from a path prefix this file
+    hardcodes.
+    """
+    found: dict[str, str] = {}
+    for edge in edges:
+        manifest = edge["manifest"]
+        if not edge.get("root_workspace_member"):
+            continue
+        if not manifest.startswith("bins/"):
+            continue
+        found[edge["consumer"]] = manifest
+    return found
+
+
+def validate_no_runtime_edge(edges: list[dict], leaves: set[str]) -> list[str]:
+    """No admitted leaf may compile against a runtime binary.
+
+    Read from the accepted dependency owner's observed edges: a leaf whose
+    consumer row resolves onto a member the owner read as a runtime binary is a
+    runtime Edge created by admission, which this case refuses.
+    """
+    errors: list[str] = []
+    binaries = runtime_bin_packages(edges)
+    if not binaries:
+        errors.append("the dependency owner observed no runtime binary member")
+    for edge in edges:
+        if edge["consumer"] not in leaves:
+            continue
+        if edge["package"] in binaries:
+            errors.append(f"leaf {edge['consumer']} compiles against runtime binary "
+                          f"{edge['package']} ({binaries[edge['package']]})")
+    return errors
+
+
+def member_selection(command: tuple[str, ...], package: str) -> tuple[str, ...]:
+    """The owner's command narrowed from the workspace to one admitted member.
+
+    The accepted warning policy is not re-authored here: it is whatever the
+    gate-definition owner declared, and a package invocation is that same argv
+    with the workspace selection replaced by ``-p <package>``. Dropping
+    ``--workspace`` cannot drop the policy that follows it, because the policy
+    is carried over verbatim.
+    """
+    if "--workspace" not in command:
+        return command
+    narrowed: list[str] = []
+    for token in command:
+        if token == "--workspace":
+            narrowed += ["-p", package]
+        else:
+            narrowed.append(token)
+    return tuple(narrowed)
+
+
+def validate_clippy_policy(command: tuple[str, ...], accepted: tuple[str, ...],
+                           package: str) -> list[str]:
+    """A package Clippy invocation must carry the owner's warning policy.
+
+    ``accepted`` is the argv the accepted gate-definition owner declares for
+    ``cargo-clippy-workspace``. This validator is entered by the positive leg and
+    by every negative leg, so a per-package invocation that silently drops
+    ``-D warnings``, downgrades it, or substitutes a different package is refused
+    by exactly the reader that accepts the real one.
+    """
+    errors: list[str] = []
+    if command[:2] != ("cargo", "clippy"):
+        errors.append(f"not a clippy invocation: {list(command)}")
+    if "--locked" not in command:
+        errors.append(f"clippy is not locked: {list(command)}")
+    if "--all-targets" not in command:
+        errors.append(f"clippy does not select all targets: {list(command)}")
+    # The warning policy is the tail the owner declared after `--`.
+    policy = accepted[accepted.index("--") + 1:] if "--" in accepted else ()
+    carried = command[command.index("--") + 1:] if "--" in command else ()
+    if not policy:
+        errors.append("the accepted owner declares no clippy warning policy")
+    elif tuple(policy) != tuple(carried):
+        errors.append(f"clippy does not carry the accepted warning policy "
+                      f"{list(policy)}: {list(command)}")
+    if "-D" in command and "warnings" not in command:
+        errors.append(f"clippy denies a severity but never names warnings: {list(command)}")
+    if "-p" not in command:
+        errors.append(f"clippy selects no package: {list(command)}")
+    elif command[command.index("-p") + 1:command.index("-p") + 2] != (package,):
+        errors.append(f"clippy selects a different package than {package}: {list(command)}")
+    if "--workspace" in command:
+        errors.append(f"clippy is not narrowed to {package}: {list(command)}")
+    if command != member_selection(accepted, package):
+        errors.append(f"clippy {list(command)} is not the owner's policy narrowed to "
+                      f"{package}: {list(member_selection(accepted, package))}")
+    return errors
+
+
 def _entry(line: str) -> str:
     """The quoted path of a root members/exclude diff line.
 
@@ -715,6 +872,20 @@ class TestWaveAdmissionC0(unittest.TestCase):
         cls.code_nav = py_script("scripts/code_navigation.py", "check", "--root", ".")
         cls.dep_policy = py_script("scripts/verify-dependency-policy.py",
                                    "--root", ".", "--profile", "offline-source")
+        cls.dep_policy_scannerless = cls._run_dependency_oracle(scannerless=True)
+
+        # The accepted dependency owner's own observed-edge read of the real
+        # manifests. Case 27 reads this instead of interpreting the manifests
+        # itself; nothing in this file re-derives what the owner already read.
+        cls.dep_owner = cls._load_dependency_owner()
+        owner_findings, _, owner_edges = cls.dep_owner._collect_rust_dependency_graph(ROOT)
+        cls.dep_owner_findings = owner_findings
+        cls.dep_edges = owner_edges
+
+        # The accepted warning policy for package Clippy is the argv the
+        # gate-definition owner declares for ``cargo-clippy-workspace``. It is
+        # read from the owner's own script, never written down here.
+        cls.accepted_clippy = cls._accepted_clippy_argv()
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -729,6 +900,58 @@ class TestWaveAdmissionC0(unittest.TestCase):
                         "--snapshot", str(FIX / rel), "--format", "json")
         assert run.returncode in (0, 1), run.stderr
         return json.loads(run.stdout)
+
+    @classmethod
+    def _load_dependency_owner(cls):
+        """The accepted dependency owner, imported as a module (not re-derived)."""
+        path = ROOT / "scripts" / "verify-dependency-policy.py"
+        spec = importlib.util.spec_from_file_location("wave_c0_dependency_policy", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @classmethod
+    def _accepted_clippy_argv(cls) -> tuple[str, ...]:
+        """The argv the gate-definition owner declares for workspace Clippy.
+
+        ``scripts/verify.ps1`` is the one ordered gate-definition owner, so the
+        accepted warning policy is whatever its ``cargo-clippy-workspace`` step
+        says. The step is read through the owner's existing PowerShell AST
+        projection (``ps_profile_table``, the same reader the verification
+        profile owner uses), which yields each step's literal command text
+        without executing any gate. The policy is never re-authored in this file.
+        """
+        from scripts.tests.test_verification_profile import VERIFY_PS1, ps_profile_table
+
+        steps = {row["name"]: row["command"] for row in ps_profile_table(VERIFY_PS1)["steps"]}
+        assert CLIPPY_GATE in steps, f"{CLIPPY_GATE} is not declared in scripts/verify.ps1"
+        body = steps[CLIPPY_GATE].strip().lstrip("{").rstrip("}").strip()
+        argv = body.split("|", 1)[0].strip().split()
+        assert argv[:2] == ["cargo", "clippy"], argv
+        return tuple(argv)
+
+    @classmethod
+    def _run_dependency_oracle(cls, scannerless: bool) -> subprocess.CompletedProcess:
+        """Run the accepted dependency oracle, optionally without its scanner.
+
+        ``scannerless`` empties PATH so the owner's own
+        ``shutil.which(configured_executable)`` probe fails and the oracle reaches
+        its own ``TOOL_UNAVAILABLE`` state. This is the real oracle taking its
+        real degraded path - not a stub and not a hand-written status string - so
+        the negative leg proves the acceptance reader refuses a run that
+        evaluated nothing.
+        """
+        env = None
+        if scannerless:
+            empty = Path(tempfile.mkdtemp(prefix="wave-c0-empty-path-"))
+            if not hasattr(cls, "_temp"):
+                cls._temp = []
+            cls._temp.append(empty)
+            env = dict(os.environ, PATH=str(empty))
+        return py_script("scripts/verify-dependency-policy.py", "--root", ".",
+                         "--profile", "offline-source", env=env)
 
     @classmethod
     def _temp_root(cls, label: str) -> Path:
@@ -1722,10 +1945,11 @@ class TestWaveAdmissionC0(unittest.TestCase):
         """Ceiling: exact command identity and accepted lint/feature ownership.
 
         The per-package ``cargo test/clippy/doc`` results themselves are #829's
-        TEST-PHASE obligation (root acceptance). This case binds the exact
-        commands to the current member identities, to the accepted root lint
-        policy and to the #837 descriptor that governs them, and proves no member
-        escapes that policy.
+        TEST-PHASE obligation (root acceptance). What this case binds is the
+        command identity: the package Clippy invocation is derived from the argv
+        the gate-definition owner declares for ``cargo-clippy-workspace``, so the
+        accepted warning policy is the owner's, and the member is bound to the
+        current identities and to the #837 descriptor that governs it.
         """
         root_deps = root_workspace()["dependencies"]
         root_lints = root_workspace()["lints"]
@@ -1735,6 +1959,14 @@ class TestWaveAdmissionC0(unittest.TestCase):
             self.assertEqual(command[:2], ("cargo", command[1]))
             self.assertIn("--locked", command)
             self.assertEqual(command[-1], "-p", list(command))
+
+        # The accepted warning policy, read from the owner, not authored here.
+        accepted = self.accepted_clippy
+        self.assertIn("--workspace", accepted)
+        self.assertIn("--", accepted)
+        policy = accepted[accepted.index("--") + 1:]
+        self.assertEqual(policy, ("-D", "warnings"), list(accepted))
+        self.assertNotIn("--cap-lints", accepted)
         for item in self.six:
             cp, name = item["crate_path"], item["name"]
             manifest = load_toml(f"{cp}/Cargo.toml")
@@ -1772,7 +2004,33 @@ class TestWaveAdmissionC0(unittest.TestCase):
             self.assertEqual(descriptor.bounds.discovery_tests, block["matrix_cases"], name)
             self.assertEqual(descriptor.bounds.child_processes,
                              load_toml_bytes(raw)["bounds"]["child_processes"], name)
+            # The package Clippy invocation for this member, derived from the
+            # owner's declared argv, enters the same policy validator below.
+            self.assertEqual(validate_clippy_policy(
+                member_selection(accepted, name), accepted, name), [], name)
         self.assertEqual(len({i["name"] for i in self.six}), 6)
+
+        # Negative legs through that same policy validator: an invocation that
+        # drops the accepted warning policy, downgrades it, stays workspace-wide,
+        # or names a different member is refused by the reader that accepts the
+        # real per-package command above.
+        first, second = self.six_names[0], self.six_names[1]
+        real = member_selection(accepted, first)
+        self.assertEqual(validate_clippy_policy(real, accepted, first), [])
+        dropped = tuple(t for t in real if t not in ("--", "-D", "warnings"))
+        self.assertNotEqual(dropped, real)
+        self.assertTrue(any("warning policy" in e for e in
+                            validate_clippy_policy(dropped, accepted, first)))
+        self.assertTrue(any("warning policy" in e for e in validate_clippy_policy(
+            tuple("--cap-lints" if t == "-D" else t for t in real), accepted, first)))
+        self.assertTrue(any("not narrowed" in e for e in
+                            validate_clippy_policy(accepted, accepted, first)))
+        self.assertTrue(any("different package" in e for e in
+                            validate_clippy_policy(real, accepted, second)))
+        self.assertTrue(any("not locked" in e for e in validate_clippy_policy(
+            tuple(t for t in real if t != "--locked"), accepted, first)))
+        self.assertTrue(any("all targets" in e for e in validate_clippy_policy(
+            tuple(t for t in real if t != "--all-targets"), accepted, first)))
 
         # Negative leg through the same production path: another member's
         # descriptor and receipt cannot stand in for this member's commands, and
@@ -1863,11 +2121,16 @@ class TestWaveAdmissionC0(unittest.TestCase):
 
     # WORK_UNIT_CASE: 829/26
     def test_26_dependency_and_navigation_oracles_reach_a_declared_state(self) -> None:
-        """A crashed or failing oracle may never pass by output omission.
+        """A crashed, degraded or failing oracle may never pass by omission.
 
-        The exit status of both accepted oracles is asserted. A finding printed
-        by a failing oracle is not a pass, so neither oracle may exit nonzero
-        here, and no finding may name an admitted package or path.
+        Each oracle is read twice: its exit code and the result it declares on
+        its own terminal line. The dependency oracle must additionally have
+        *evaluated* the declared policy - a run that reaches one of the owner's
+        own non-evaluation statuses (``TOOL_UNAVAILABLE`` when its configured
+        scanner is absent from PATH, and its siblings) names no package because
+        it inspected none, so that state is refused here rather than tolerated.
+        No finding anywhere in an evaluated run may name an admitted package or
+        path.
         """
         # Both oracles must reach a declared terminal state: the navigation reader
         # emits its registry line, and the dependency oracle emits exactly one
@@ -1891,16 +2154,17 @@ class TestWaveAdmissionC0(unittest.TestCase):
                      if l.startswith("VERIFY_DEPENDENCY_POLICY:")]
         self.assertEqual(len(terminals), 1, combined[-2000:])
         terminal = terminals[0]
-        # The declared status is read from the oracle's own terminal line, and the
-        # exit must agree with it exactly as the oracle's contract defines: 0 only
-        # for PASS, 1 for every other declared status. A status the oracle never
-        # declares, or an exit that contradicts the printed status, fails here.
+        # The oracle's exit AND the result it declares are both asserted, and a
+        # declared state with no evaluation in it is refused.
+        self.assertEqual(validate_dependency_oracle(terminal, self.dep_policy.returncode),
+                         [], terminal)
         declared = terminal.split(":", 2)[1].split()[0]
-        self.assertIn(declared, ("PASS", "FINDINGS", "INCOMPLETE", "TOOL_UNAVAILABLE",
-                                 "ADVISORY_SOURCE_UNAVAILABLE", "STALE", "CONFLICTED",
-                                 "NOT_EXECUTED"), terminal)
-        self.assertEqual(self.dep_policy.returncode, 0 if declared == "PASS" else 1,
-                         terminal)
+        self.assertIn(declared, DEPENDENCY_ORACLE_EVALUATED, terminal)
+        # The oracle's own result is complete: the findings it declares are the
+        # findings it printed, so a truncated stream cannot read as a clean run.
+        finding_lines = [l for l in combined.splitlines() if "  [DEP-" in l]
+        self.assertEqual(int(re.search(r"findings=(\d+)", terminal).group(1)),
+                         len(finding_lines), terminal)
         # No finding anywhere in the run may name an admitted package or path,
         # whether the run is green or not.
         for name in self.six_names:
@@ -1912,6 +2176,39 @@ class TestWaveAdmissionC0(unittest.TestCase):
         for finding in [l for l in combined.splitlines() if "  [DEP-" in l]:
             for package in re.findall(r"package '([^']+)'", finding):
                 self.assertNotIn(package, self.six_names, finding)
+
+        # The same production oracle, run where its own configured scanner
+        # cannot be resolved, reaches a declared state with no evaluation in it.
+        # That observed result is refused by the same acceptance reader, so an
+        # absent tool can never stand in for a clean dependency verdict - and the
+        # positive leg above is not passing by output omission.
+        blind = self.dep_policy_scannerless
+        blind_text = blind.stdout + blind.stderr
+        blind_terminals = [l for l in blind_text.splitlines()
+                           if l.startswith("VERIFY_DEPENDENCY_POLICY:")]
+        self.assertEqual(len(blind_terminals), 1, blind_text[-2000:])
+        blind_declared = blind_terminals[0].split(":", 2)[1].split()[0]
+        self.assertEqual(blind_declared, "TOOL_UNAVAILABLE", blind_terminals[0])
+        self.assertEqual(blind.returncode, 1, blind_terminals[0])
+        self.assertTrue(
+            any("did not evaluate" in e for e in
+                validate_dependency_oracle(blind_terminals[0], blind.returncode)),
+            f"a non-evaluating oracle was accepted as a verdict: {blind_terminals[0]}")
+        # The refused run really is the same oracle, and it really did not look at
+        # the six: its only scanner finding is the missing tool itself.
+        self.assertTrue(any("DEP-001" in l for l in blind_text.splitlines()))
+        for name in self.six_names:
+            self.assertNotIn(f"[{name}]", blind_text)
+        # A terminal line the oracle never prints, and a run whose exit
+        # contradicts the status it printed, are refused by the same reader.
+        self.assertTrue(validate_dependency_oracle("", 1))
+        self.assertTrue(validate_dependency_oracle("", 0))
+        self.assertTrue(validate_dependency_oracle("VERIFY_DEPENDENCY_POLICY: PASS "
+                                                   "(profile=offline-source, findings=0)", 1))
+        self.assertTrue(validate_dependency_oracle("VERIFY_DEPENDENCY_POLICY: GREEN "
+                                                   "(profile=offline-source, findings=0)", 0))
+        self.assertEqual(validate_dependency_oracle(
+            "VERIFY_DEPENDENCY_POLICY: FINDINGS (profile=offline-source, findings=1)", 1), [])
 
         # The generated-index acceptance claim is withheld, not claimed: the
         # target-closure defect audited under #690 and the stale committed index
@@ -1933,11 +2230,15 @@ class TestWaveAdmissionC0(unittest.TestCase):
         A runtime binary consuming a contract leaf is legitimate: the leaf is a
         contract owner, the bin is the runtime provider. What must not happen is
         the reverse, and what must not happen either is a *runtime* claim created
-        by admission. Both directions are read from real manifests.
+        by admission.
+
+        Both directions are read from the accepted owners' own output, not from a
+        local interpretation of the manifests: the observed Cargo edges, their
+        source kind, features and workspace membership come from the accepted
+        dependency owner (``verify-dependency-policy.py``), and the compile
+        relation comes from the #816 topology owner.
         """
         ws = root_workspace()
-        runtime_bins = {rel for rel in ws["members"] if rel.startswith("bins/")}
-        self.assertTrue(runtime_bins)
 
         # Accepted owners decide the relation. #816 owns the cognitive wave/edge
         # topology and states that this wave's proof is metadata-only and that
@@ -1948,41 +2249,47 @@ class TestWaveAdmissionC0(unittest.TestCase):
         for edge in self.bundle816["edges"]["compile_edge"]:
             self.assertEqual(edge["relation"], "contract_only")
 
-        # Direction 1: a leaf never compiles against a runtime binary. Read from
-        # the real manifests through the shared dependency reader, with no
-        # hardcoded allow/deny path.
-        ws = root_workspace()
-        runtime_bins = {rel for rel in ws["members"] if rel.startswith("bins/")}
-        self.assertTrue(runtime_bins)
-        for item in self.six:
-            manifest = load_toml(f"{item['crate_path']}/Cargo.toml")
-            for dep, spec in manifest.get("dependencies", {}).items():
-                if isinstance(spec, dict) and "path" in spec:
-                    target = (ROOT / item["crate_path"] / spec["path"]).resolve()
-                    self.assertNotIn(target, [ROOT / b for b in runtime_bins],
-                                     f"{item['name']} compiles against a runtime bin: {dep}")
+        # The accepted dependency owner's own read of the real manifests: it found
+        # no structural defect, and it recorded the observed edges this case reads.
+        self.assertEqual([f"{f.code}:{f.path}:{f.detail}" for f in self.dep_owner_findings],
+                         [])
+        edges = self.dep_edges
+        self.assertTrue(edges)
+        leaf_names = set(self.six_names)
 
-        # Direction 2: consumer compile edges exist, and each one resolves to the
-        # admitted package's own in-tree manifest.
-        consumers: dict[str, set[str]] = {}
-        for member in sorted(ws["members"]):
-            if not (ROOT / member / "Cargo.toml").is_file() or member in self.six_paths:
-                continue
-            hits = declared_dependencies(load_toml(f"{member}/Cargo.toml")) & set(self.six_names)
-            if hits:
-                consumers[member] = hits
+        # Direction 1: no admitted leaf compiles against a runtime binary. The
+        # owner resolved each edge's source, so the runtime-binary set is the one
+        # the owner read - no path prefix is hardcoded here.
+        self.assertEqual(validate_no_runtime_edge(edges, leaf_names), [])
+        binaries = runtime_bin_packages(edges)
+        self.assertTrue(binaries)
+        for member in ws["members"]:
+            if member.startswith("bins/"):
+                self.assertIn(tomllib.loads(
+                    (ROOT / member / "Cargo.toml").read_text(encoding="utf-8")
+                )["package"]["name"], binaries, member)
+
+        # Direction 2: consumer compile edges exist, and the owner read every one
+        # of them as an in-tree path edge onto an admitted member.
+        consumers = [e for e in edges if e["package"] in leaf_names]
         self.assertTrue(consumers)
-        for member, hits in consumers.items():
-            for name in hits:
-                manifest = load_toml(f"{member}/Cargo.toml")
-                for table in ("dependencies", "dev-dependencies", "build-dependencies"):
-                    spec = manifest.get(table, {}).get(name)
-                    if isinstance(spec, dict) and "path" in spec:
-                        resolved = (ROOT / member / spec["path"]).resolve()
-                        self.assertEqual(
-                            resolved,
-                            (ROOT / self.by_name[name]["crate_path"]).resolve(),
-                            f"{member}->{name}")
+        external = {e["consumer"] for e in consumers} - leaf_names
+        self.assertTrue(external)
+        for edge in consumers:
+            self.assertEqual(edge["source_kind"], "path", f"{edge['consumer']}->{edge['package']}")
+            self.assertIs(edge["internal_workspace_package"], True,
+                          f"{edge['consumer']}->{edge['package']}")
+            self.assertIn(edge["package"], leaf_names)
+            self.assertIn(self.by_name[edge["package"]]["crate_path"], ws["members"],
+                          edge["package"])
+        # Completeness against an independent expected set: the root manifest's
+        # member count of runtime binaries is at least what the owner observed,
+        # and every admitted leaf is a consumer the owner actually read.
+        self.assertGreaterEqual(len(binaries),
+                                len([m for m in ws["members"] if m.startswith("bins/")]))
+        observed_consumers = {e["consumer"] for e in edges}
+        for name in self.six_names:
+            self.assertIn(name, observed_consumers, name)
 
         # #816 owns the compile relation: it is contract-only, acyclic and
         # declared by its own assignment rows, never by a local path allowlist.
@@ -2016,6 +2323,25 @@ class TestWaveAdmissionC0(unittest.TestCase):
         # The unmutated bundle the same reader accepts is genuinely different
         # from each mutant, so the negatives are not vacuous.
         self.assertEqual(self.topology816.topology_errors(self.bundle816), [])
+
+        # Negative leg for the runtime-edge direction through the same
+        # owner-derived validator: a leaf that gains an edge onto a member the
+        # owner read as a runtime binary is refused, so the positive leg is not
+        # satisfied by a validator that accepts everything.
+        real_bin = sorted(binaries)[0]
+        poisoned = copy.deepcopy(edges)
+        poisoned.append({"consumer": self.six_names[0], "package": real_bin,
+                         "manifest": f"{self.six_paths[0]}/Cargo.toml",
+                         "dependency_kind": "dependencies", "source_kind": "path",
+                         "source_spec": {}, "features": [], "optional": False,
+                         "default_features": True, "internal_workspace_package": True,
+                         "root_workspace_member": True, "resolver_workspace_root": None,
+                         "alias": real_bin, "version_requirement": None, "target": None})
+        self.assertTrue(validate_no_runtime_edge(poisoned, leaf_names), real_bin)
+        self.assertEqual(validate_no_runtime_edge(edges, leaf_names), [])
+        # And a non-member consumer is not mistaken for a runtime binary, so the
+        # refusal above is specific rather than a blanket rejection.
+        self.assertEqual(validate_no_runtime_edge(edges, {"eliot-not-a-member"}), [])
 
         # Admission itself creates no runtime state, effect or edge.
         for item in self.six:
