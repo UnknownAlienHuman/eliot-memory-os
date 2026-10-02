@@ -10,7 +10,26 @@ use serde_json::Value;
 
 use crate::error::AdapterError;
 
+/// The closed top-level response envelope (#937, #938, #940).
+///
+/// `surrealdb` `v3.1.4` (the pinned provider, and `v3.2.4` identically) builds
+/// every WebSocket response object from `DbResponse::into_value`
+/// (`surrealdb/core/src/rpc/response.rs`): a `result` or an `error`, plus `id`
+/// when the request carried one, plus `session` when — and only when — the
+/// *request* envelope carried a `session`. This crate's `RpcRequest`
+/// (`client.rs:203`) serializes only `id`, `method` and `params`, so `session`
+/// is never echoed and the admitted member set is exactly `id`/`result`/`error`.
+/// An unknown top-level member is refused instead of dropped silently.
+///
+/// Named boundary: this closure is the envelope only. `result` is a vendor
+/// document and `deny_unknown_fields` does not reach inside a `Value` field.
+/// `RpcErrorBody` is deliberately NOT closed: the real error object carries
+/// `kind` at the same level as `code`/`message` (and optionally `details` and
+/// `cause`) — `surrealdb/types/src/error.rs` — so closing it would refuse every
+/// genuine provider error frame. Its `data` member is never emitted by this
+/// provider; that under-specified shape is a separate, unowned schema question.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RpcResponse {
     pub(super) id: Option<Value>,
     result: Option<Value>,
