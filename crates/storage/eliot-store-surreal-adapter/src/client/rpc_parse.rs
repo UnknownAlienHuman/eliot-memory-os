@@ -7,8 +7,10 @@
 use std::cell::Cell;
 use std::fmt;
 
-use serde::de::{DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
+use serde::de::{
+    DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
 use serde_json::Value;
 
 use eliot_store_api::{MAX_SNAPSHOT_BYTES, StoreError};
@@ -409,12 +411,10 @@ impl<'de> Visitor<'de> for BoundedResponseVisitor<'_> {
                     self.id = Some(access.next_value()?);
                 }
                 "result" => {
-                    self.result = Some(
-                        access.next_value_seed(BoundedResultSeed {
-                            ceiling: self.ceiling,
-                            budget_exceeded: self.budget_exceeded,
-                        })?,
-                    );
+                    self.result = Some(access.next_value_seed(BoundedResultSeed {
+                        ceiling: self.ceiling,
+                        budget_exceeded: self.budget_exceeded,
+                    })?);
                 }
                 "error" => {
                     self.error = Some(access.next_value()?);
@@ -542,9 +542,9 @@ fn statement_charge_bytes(statement: &Value) -> u64 {
         return 0;
     };
     match result {
-        Value::Array(rows) => {
-            rows.iter().fold(0_u64, |total, row| total.saturating_add(encoded_len(row)))
-        }
+        Value::Array(rows) => rows
+            .iter()
+            .fold(0_u64, |total, row| total.saturating_add(encoded_len(row))),
         other => encoded_len(other),
     }
 }
@@ -575,8 +575,8 @@ mod bounded_response_tests {
 
     use super::*;
     use crate::backup_snapshot::{capture_point_statements, captured_member_tables};
-    use crate::client::{RPC_PROTOCOL_VERSION, snapshot_response_ceiling};
     use crate::client::backup_snapshot::SNAPSHOT_OPERATIONS;
+    use crate::client::{RPC_PROTOCOL_VERSION, snapshot_response_ceiling};
 
     /// The admitted budget these cases use. Chosen inside the closed
     /// [`eliot_store_api::SnapshotBounds`] range so it is a value the existing
@@ -702,7 +702,9 @@ mod bounded_response_tests {
         let statements = result.as_array().expect("statement list");
         assert_eq!(statements.len(), 1);
         assert_eq!(statements[0]["status"].as_str(), Some("OK"));
-        let rows = statements[0]["result"].as_array().expect("one whole-record row");
+        let rows = statements[0]["result"]
+            .as_array()
+            .expect("one whole-record row");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event_id"].as_str(), Some("one-row"));
     }
@@ -783,7 +785,9 @@ mod bounded_response_tests {
         let result = rpc_result(response).expect("no provider error");
         let statements = result.as_array().expect("statement list");
         assert_eq!(statements.len(), 1);
-        let body = statements[0]["result"][0]["body"].as_str().expect("row body");
+        let body = statements[0]["result"][0]["body"]
+            .as_str()
+            .expect("row body");
         assert_eq!(body.len(), admitted_body_bytes);
 
         // Content one row past the admitted budget, still inside the frame bound.
@@ -811,7 +815,10 @@ mod bounded_response_tests {
     fn the_derived_bound_is_exactly_the_admitted_budget_plus_one_envelope() {
         let ceiling = ceiling();
         assert_eq!(ceiling.admitted_bytes(), ADMITTED_MAX_BYTES);
-        assert_eq!(ceiling.max_bytes(), ADMITTED_MAX_BYTES + SNAPSHOT_PROTOCOL_ENVELOPE_BYTES);
+        assert_eq!(
+            ceiling.max_bytes(),
+            ADMITTED_MAX_BYTES + SNAPSHOT_PROTOCOL_ENVELOPE_BYTES
+        );
     }
 
     /// The envelope allowance is large enough for the framing the pinned member

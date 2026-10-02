@@ -3,8 +3,8 @@ use super::provider_owner::{
     ProviderOwner, require_listener_owner, require_unchanged_identity, validate_child_process,
 };
 use super::rpc_parse::{
-    ResponseCeiling, parse_response, parse_response_bounded, provider_version_from_rpc, rpc_result,
-    response_ceiling_refusal,
+    ResponseCeiling, parse_response, parse_response_bounded, provider_version_from_rpc,
+    response_ceiling_refusal, rpc_result,
 };
 use super::{RPC_PROTOCOL_VERSION, RpcRequest, RpcSocket, millis};
 use crate::config::SurrealAdapterConfig;
@@ -246,7 +246,7 @@ impl RpcSession {
             .owner
             .upgrade()
             .ok_or(AdapterError::ProviderUnavailable)?;
-        let read_response = async -> Result<Value, AdapterError> {
+        let read_response = async {
             let mut socket = self.socket.lock().await;
             if prove_connection_owner {
                 let (client_local_endpoint, peer_endpoint) =
@@ -265,11 +265,13 @@ impl RpcSession {
                     .next()
                     .await
                     .ok_or(AdapterError::ProviderUnavailable)?
-                    .map_err(transport_read_error)?;
+                    .map_err(|error| transport_read_error(&error))?;
                 match message {
                     Message::Text(text) => {
                         let response = match ceiling {
-                            Some(ceiling) => parse_response_bounded(text.as_str().as_bytes(), ceiling)?,
+                            Some(ceiling) => {
+                                parse_response_bounded(text.as_str().as_bytes(), ceiling)?
+                            }
                             None => parse_response(text.as_str())?,
                         };
                         if response.id.as_ref() == Some(&expected_id) {
@@ -354,8 +356,11 @@ fn response_bound_config(ceiling: ResponseCeiling) -> Result<WebSocketConfig, Ad
 ///
 /// Every other read failure — a closed or reset connection, a protocol
 /// violation, an I/O error — stays a transport loss.
-fn transport_read_error(error: TransportError) -> AdapterError {
-    if let TransportError::Capacity(CapacityError::MessageTooLong { .. }) = error {
+fn transport_read_error(error: &TransportError) -> AdapterError {
+    if matches!(
+        *error,
+        TransportError::Capacity(CapacityError::MessageTooLong { .. })
+    ) {
         response_ceiling_refusal()
     } else {
         AdapterError::ProviderUnavailable
@@ -616,7 +621,7 @@ mod transport_response_bound_tests {
             ),
             "the provider library refuses an oversize frame with a capacity error: {failure:?}"
         );
-        let refusal = transport_read_error(failure);
+        let refusal = transport_read_error(&failure);
         assert_eq!(refusal, AdapterError::Store(StoreError::PayloadTooLarge));
         assert_eq!(
             refusal.into_store_error(),
@@ -624,7 +629,7 @@ mod transport_response_bound_tests {
             "an oversize response reaches the store boundary as a bounded refusal, not as a retryable unavailable provider"
         );
         assert_ne!(
-            transport_read_error(TransportError::ConnectionClosed),
+            transport_read_error(&TransportError::ConnectionClosed),
             AdapterError::Store(StoreError::PayloadTooLarge),
             "a genuinely lost provider is a different outcome and must stay one"
         );
