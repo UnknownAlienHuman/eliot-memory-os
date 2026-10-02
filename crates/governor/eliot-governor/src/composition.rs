@@ -9522,8 +9522,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 // a self-consistent stale CurrentTaskSelection cannot authorize
                 // a direct call to this public Governor entrypoint.
                 let before_owner_read = current_unix_ms()?;
-                let owner_readback =
-                    self.cold_start_owner_readback_for_claim(claim, before_owner_read)?;
+                let owner_readback = self
+                    .cold_start_owner_readback_with_record_for_claim(claim, before_owner_read)?;
                 if &owner_readback != owner_readback_input {
                     return Err(CompositionError::Recovery(
                         "task-bound caller readback differs from the current durable owner terminal".to_owned(),
@@ -9580,7 +9580,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 // expiry or fence change. Re-read at a fresh time before
                 // entering the effect handoff.
                 let final_readback = self
-                    .cold_start_owner_readback_for_claim(claim, current_unix_ms()?)?;
+                    .cold_start_owner_readback_with_record_for_claim(claim, current_unix_ms()?)?;
                 let current_fence = self.snapshot.state_fence();
                 if final_readback != owner_readback
                     || owner_current.state_fence != current_fence
@@ -9614,7 +9614,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         identity,
                         envelope,
                         claim,
-                        owner_readback,
+                        &owner_readback,
                         &owner_selection,
                         &owner_current,
                     )
