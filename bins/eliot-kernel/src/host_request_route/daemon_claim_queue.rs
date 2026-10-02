@@ -333,6 +333,9 @@ impl KernelComposition {
                 {
                     continue;
                 }
+                if !self.application_session_live_for_claim(envelope)? {
+                    continue;
+                }
                 campaign_packet_admission(envelope, tool)?;
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
@@ -402,6 +405,9 @@ impl KernelComposition {
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if !self.application_session_live_for_claim(envelope)? {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
@@ -595,6 +601,9 @@ impl KernelComposition {
                     continue;
                 };
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
+                    continue;
+                }
+                if !self.application_session_live_for_claim(envelope)? {
                     continue;
                 }
                 finish_admission(envelope, tool)?;

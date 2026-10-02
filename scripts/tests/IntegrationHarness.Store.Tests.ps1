@@ -352,13 +352,20 @@ function Test-StoreCase7 {
     if (-not $script:ModulesAvailable) { return }
     $bindingA = Get-StoreTestBinding -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     $bindingB = Get-StoreTestBinding -RunId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    # A third run that shares its FIRST 8 hex chars with run A. runId-prefix-only
+    # naming makes these two runs indistinguishable, so this run exists to prove
+    # the namespace/database derivation does not stop there.
+    $bindingPrefixTwin = Get-StoreTestBinding -RunId 'aaaaaaaa123456781234567812345678'
     $planA = Invoke-StorePlan -Binding $bindingA -Requirement (Get-StoreTestRequirement)
     $planB = Invoke-StorePlan -Binding $bindingB -Requirement (Get-StoreTestRequirement)
+    $planPrefixTwin = Invoke-StorePlan -Binding $bindingPrefixTwin -Requirement (Get-StoreTestRequirement)
     $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     $reservationA = { param($ctx) return (New-StoreTestReservation -Port 18101) }
     $reservationB = { param($ctx) return (New-StoreTestReservation -Port 18102) }
+    $reservationPrefixTwin = { param($ctx) return (New-StoreTestReservation -Port 18103) }
     $allocA = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base -Entropy { return 'a1b2c3d4' } -PortReservation $reservationA
     $allocB = Invoke-StoreAllocate -Binding $bindingB -Plan $planB -BaseTemp $base -Entropy { return 'e5f60718' } -PortReservation $reservationB
+    $allocPrefixTwin = Invoke-StoreAllocate -Binding $bindingPrefixTwin -Plan $planPrefixTwin -BaseTemp $base -Entropy { return 'c3d4e5f6' } -PortReservation $reservationPrefixTwin
     Assert-StoreTrue $Failures ($allocA['runRoot'] -cne $allocB['runRoot']) '7-roots-unique'
     Assert-StoreTrue $Failures ($allocA['dataRoot'] -cne $allocB['dataRoot']) '7-data-unique'
     Assert-StoreTrue $Failures ($allocA['logRoot'] -cne $allocB['logRoot']) '7-log-unique'
@@ -370,6 +377,32 @@ function Test-StoreCase7 {
     Assert-StoreTrue $Failures ($allocA['endpoint'] -ceq '127.0.0.1:18101') '7-endpoint-shape'
     Assert-StoreTrue $Failures ($allocA['ownerMarker'] -ceq 'eliot-harness-owned-root-v1') '7-marker'
     Assert-StoreTrue $Failures ($allocA['reservationIdentity']['endpoint'] -ceq $allocA['endpoint']) '7-reservation-endpoint-bound'
+
+    # --- Names are per-allocation, not per-run-prefix. ------------------------
+    # The only case that decides this is a SECOND ALLOCATION OF THE SAME RUN: a
+    # different run proves nothing, because a runId-prefix derivation separates
+    # two runs trivially. These two allocations differ only in their allocation
+    # seed, which is exactly the per-allocation entropy the module already uses
+    # for the run root, and they must still not share either name.
+    $allocA1 = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base -Entropy { return 'a1b2c3d4' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port 18111) }
+    $allocA2 = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base -Entropy { return '5f6e7d8c' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port 18112) }
+    Assert-StoreTrue $Failures ([string]$allocA1['runId'] -ceq [string]$allocA2['runId']) '7-same-run-allocation-a'
+    Assert-StoreTrue $Failures ([string]$allocA1['runRoot'] -cne [string]$allocA2['runRoot']) '7-same-run-roots-unique'
+    Assert-StoreTrue $Failures ([string]$allocA1['namespace'] -cne [string]$allocA2['namespace']) ('7-same-run-ns-unique: ' + [string]$allocA1['namespace'] + ' vs ' + [string]$allocA2['namespace'])
+    Assert-StoreTrue $Failures ([string]$allocA1['database'] -cne [string]$allocA2['database']) ('7-same-run-db-unique: ' + [string]$allocA1['database'] + ' vs ' + [string]$allocA2['database'])
+    Assert-StoreTrue $Failures ([string]$allocA1['namespace'] -ceq 'eliot_ns_aaaaaaaa_a1b2c3d4') ('7-same-run-ns-shape: ' + [string]$allocA1['namespace'])
+    Assert-StoreTrue $Failures ([string]$allocA1['database'] -ceq 'eliot_db_aaaaaaaa_a1b2c3d4') ('7-same-run-db-shape: ' + [string]$allocA1['database'])
+    Assert-StoreTrue $Failures ([string]$allocA2['namespace'] -ceq 'eliot_ns_aaaaaaaa_5f6e7d8c') ('7-same-run-ns-shape-2: ' + [string]$allocA2['namespace'])
+    Assert-StoreTrue $Failures ([string]$allocA2['database'] -ceq 'eliot_db_aaaaaaaa_5f6e7d8c') ('7-same-run-db-shape-2: ' + [string]$allocA2['database'])
+    # Deterministic for a given (runId, seed): the same allocation re-derives the
+    # identical pair instead of minting a new name each time it is replayed.
+    $allocA1Replay = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base -Entropy { return 'a1b2c3d4' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port 18113) }
+    Assert-StoreTrue $Failures ([string]$allocA1Replay['namespace'] -ceq [string]$allocA1['namespace']) '7-ns-deterministic-for-seed'
+    Assert-StoreTrue $Failures ([string]$allocA1Replay['database'] -ceq [string]$allocA1['database']) '7-db-deterministic-for-seed'
+    # A DIFFERENT run that shares run A's first 8 hex chars must also not share
+    # the name: the run prefix alone is not an identity.
+    Assert-StoreTrue $Failures ([string]$allocA['namespace'] -cne [string]$allocPrefixTwin['namespace']) '7-ns-distinct-prefix-twin-run'
+    Assert-StoreTrue $Failures ([string]$allocA['database'] -cne [string]$allocPrefixTwin['database']) '7-db-distinct-prefix-twin-run'
 
     # --- Ownership is a per-allocation identity, not a name prediction. --------
     # The reserved endpoint is claimed by a registry identity built from this
@@ -408,22 +441,73 @@ function Test-StoreCase7 {
     }
     Assert-StoreTrue $Failures (-not [string]::IsNullOrWhiteSpace($refusal)) '7-live-reservation-refuses-second-bind'
 
-    # A second allocation that claims the SAME endpoint while A still holds it is
-    # refused. This is the race in its own shape: the loser never receives an
-    # allocation, so it has no record it could use to affect the winner.
-    $racerPlan = Invoke-StorePlan -Binding $bindingB -Requirement (Get-StoreTestRequirement)
-    $racer = $null
-    $racerRefusal = ''
-    try {
-        $racer = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
-            -Entropy { return '5a6b7c8d' } -PortReservation $reservationA
+    # --- A HOSTILE racer is refused on the endpoint, not on its identity. -----
+    # The arms below differ from the identity-equal cases above in exactly the
+    # ways a real racer differs: a DIFFERENT run, NO listener of its own, and A's
+    # endpoint while A still physically holds it. None of them matches A's
+    # runId/owner/generation/seed tuple, so a guard keyed on that tuple passes
+    # all three -- which is precisely why these arms exist.
+    $hostileRacers = @(
+        @{ name = 'foreign-run'; binding = $bindingB; generation = 1 },
+        @{ name = 'foreign-owner'; binding = (Get-StoreTestBinding -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' | ForEach-Object { $_.owner = 'someone-else'; $_ }); generation = 1 },
+        @{ name = 'foreign-generation'; binding = (Get-StoreTestBinding -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'); generation = 7 }
+    )
+    foreach ($racerCase in $hostileRacers) {
+        $racerBinding = $racerCase['binding']
+        $racerBinding['generation'] = $racerCase['generation']
+        $racerPlan = Invoke-StorePlan -Binding $racerBinding -Requirement (Get-StoreTestRequirement)
+        $hostileAllocation = $null
+        $hostileRefusal = ''
+        try {
+            # No listener: the racer owns nothing, it merely NAMES A's endpoint.
+            $hostileAllocation = Invoke-StoreAllocate -Binding $racerBinding -Plan $racerPlan -BaseTemp $base `
+                -Entropy { return '7d6e5f4c' } -PortReservation { param($ctx) return @{ port = [int]$allocA['port']; host = '127.0.0.1' } }
+        }
+        catch { $hostileRefusal = [string]$_.Exception.Message }
+        $label = [string]$racerCase['name']
+        Assert-StoreTrue $Failures ($null -eq $hostileAllocation) ("7-hostile-racer-refused-${label}: " + $hostileRefusal)
+        # A cross-run racer for a physically held endpoint is a genuine conflict,
+        # not this run's reused reservation; the refusal says so in its code.
+        Assert-StoreTrue $Failures ($hostileRefusal -match '^STORE-PORT-CONFLICT:') ("7-hostile-racer-typed-${label}: " + $hostileRefusal)
+        $afterHostile = [hashtable]$allocA['reservationIdentity']
+        Assert-StoreTrue $Failures ([string]$afterHostile['state'] -ceq 'Pending') "7-hostile-racer-left-winner-holding-$label"
+        Assert-StoreTrue $Failures ([string]$afterHostile['endpoint'] -ceq [string]$allocA['endpoint']) "7-hostile-racer-endpoint-intact-$label"
     }
-    catch { $racerRefusal = [string]$_.Exception.Message }
-    Assert-StoreTrue $Failures ($null -eq $racer) '7-claiming-racer-refused'
-    Assert-StoreTrue $Failures ($racerRefusal -match 'STORE-PORT-CONFLICT|STORE-RESERVATION-REUSED') '7-claiming-racer-typed'
-    $afterRacer = [hashtable]$allocA['reservationIdentity']
-    Assert-StoreTrue $Failures ([string]$afterRacer['state'] -ceq 'Pending') '7-winner-still-holding-after-racer'
-    Assert-StoreTrue $Failures ([string]$afterRacer['endpoint'] -ceq [string]$allocA['endpoint']) '7-winner-endpoint-intact-after-racer'
+
+    # Nothing the module can hand a racer authorizes a launch on an endpoint it
+    # did not prove: a racer that presents A's endpoint is refused at
+    # registration, and a racer whose only claim is a seam-asserted port cannot
+    # re-prove that port and is refused at the handoff. Neither reaches a child.
+    $hostileStart = $null
+    $hostileStartRefusal = ''
+    try {
+        $hostileStart = Invoke-StoreStart -Binding $bindingB -Allocation $allocB -Acquisition (Get-StoreTestAcquisition) `
+            -Launcher (New-StoreTestLauncher -ObservedPid 7301 -Nonce '2a2b3c3d') -Entropy { return 'e5f60718' }
+    }
+    catch { $hostileStartRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $hostileStart) ("7-hostile-launch-refused: " + $hostileStartRefusal)
+
+    # --- Ownership proof classes are not interchangeable at launch. -----------
+    # 'held-socket' is a bind this module re-reads and can re-prove; it reaches
+    # Start (A's own handoff below proves it). 'seam-asserted' is a seam's word
+    # with no handle behind it, so the handoff refuses it with a typed code
+    # instead of releasing a claim it cannot verify. The two records differ only
+    # because the proof differs.
+    $bindingUnproven = Get-StoreTestBinding -RunId 'cccccccccccccccccccccccccccccccc'
+    $seamAsserted = Invoke-StoreAllocate -Binding $bindingUnproven `
+        -Plan (Invoke-StorePlan -Binding $bindingUnproven -Requirement (Get-StoreTestRequirement)) `
+        -BaseTemp $base -Entropy { return 'c0ffee01' } -PortReservation { param($ctx) return @{ port = 18107; host = '127.0.0.1' } }
+    Assert-StoreTrue $Failures ([string]$seamAsserted['reservationIdentity']['reservationProof'] -ceq 'seam-asserted') '7-seam-asserted-classified'
+    $seamStart = $null
+    $seamStartRefusal = ''
+    try {
+        $seamStart = Invoke-StoreStart -Binding $bindingUnproven `
+            -Allocation $seamAsserted -Acquisition (Get-StoreTestAcquisition) `
+            -Launcher (New-StoreTestLauncher -ObservedPid 7302 -Nonce '3b3c4d3e') -Entropy { return 'c0ffee01' }
+    }
+    catch { $seamStartRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $seamStart) ('7-seam-asserted-start-refused: ' + $seamStartRefusal)
+    Assert-StoreTrue $Failures ($seamStartRefusal -match '^STORE-RESERVATION-UNPROVEN:') ('7-seam-asserted-start-typed: ' + $seamStartRefusal)
 
     # --- The registry, not just the OS, refuses to re-issue a live claim. -----
     # A seam that hands allocation A's OWN still-held endpoint back to a second
@@ -449,8 +533,9 @@ function Test-StoreCase7 {
     Assert-StoreTrue $Failures ([string]$afterSame['state'] -ceq 'Pending') '7-live-identity-left-winner-holding'
 
     # A different seed makes a DIFFERENT reservation identity for the very same
-    # run, owner, generation and endpoint, so the per-run endpoint guard must
-    # refuse it too rather than let one run hold the same endpoint twice.
+    # run, owner, generation and endpoint. This run already holds that endpoint,
+    # so it is the reused-reservation refusal -- the second identity is never
+    # issued, and the hold A still owns is untouched.
     $otherIdentity = $null
     $otherIdentityRefusal = ''
     try {
@@ -461,7 +546,7 @@ function Test-StoreCase7 {
     }
     catch { $otherIdentityRefusal = [string]$_.Exception.Message }
     Assert-StoreTrue $Failures ($null -eq $otherIdentity) '7-second-identity-same-endpoint-refused'
-    Assert-StoreTrue $Failures ($otherIdentityRefusal -match 'STORE-PORT-CONFLICT') ('7-second-identity-typed: ' + $otherIdentityRefusal)
+    Assert-StoreTrue $Failures ($otherIdentityRefusal -match '^STORE-RESERVATION-REUSED:') ('7-second-identity-typed: ' + $otherIdentityRefusal)
     $afterOther = [hashtable]$allocA['reservationIdentity']
     Assert-StoreTrue $Failures ([string]$afterOther['state'] -ceq 'Pending') '7-second-identity-left-winner-holding'
 
@@ -469,10 +554,11 @@ function Test-StoreCase7 {
     # genuine port conflict rather than adopted, so a name alone can never stand
     # in for the hold. This is the exact shape a losing racer would present: the
     # right endpoint string and no ownership of it.
+    $planB = Invoke-StorePlan -Binding $bindingB -Requirement (Get-StoreTestRequirement)
     $unowned = $null
     $unownedRefusal = ''
     try {
-        $unowned = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
+        $unowned = Invoke-StoreAllocate -Binding $bindingB -Plan $planB -BaseTemp $base `
             -Entropy { return '5a6b7c8d' } -PortReservation { param($ctx) return @{ port = 18105; host = '127.0.0.1' } }
     }
     catch { $unownedRefusal = [string]$_.Exception.Message }
@@ -548,7 +634,7 @@ function Test-StoreCase7 {
     $reused = $null
     $reusedRefusal = ''
     try {
-        $reused = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
+        $reused = Invoke-StoreAllocate -Binding $bindingB -Plan $planB -BaseTemp $base `
             -Entropy { return '5a6b7c8d' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port ([int]$allocA['port'])) }
     }
     catch { $reusedRefusal = [string]$_.Exception.Message }
@@ -558,6 +644,16 @@ function Test-StoreCase7 {
     $identityB2 = [hashtable]$allocB['reservationIdentity']
     Assert-StoreTrue $Failures ([string]$identityB2['state'] -ceq 'Pending') '7-competitor-unaffected'
     Assert-StoreTrue $Failures ([string]$identityB2['endpoint'] -ceq [string]$allocB['endpoint']) '7-competitor-endpoint-intact'
+
+    # B's own endpoint is a bind B really holds, so it is authorized -- this is the
+    # positive control for the proof classes above: the launch succeeds only
+    # because the ownership proof is re-verifiable, and only on B's own endpoint,
+    # which is not the endpoint A held a moment ago.
+    $startB = Invoke-StoreStart -Binding $bindingB -Allocation $allocB -Acquisition (Get-StoreTestAcquisition) `
+        -Launcher (New-StoreTestLauncher -ObservedPid 7401 -Nonce '4c4d5e5f') -Entropy { return 'e5f60718' }
+    Assert-StoreTrue $Failures ([string]$startB['startState'] -ceq 'StartRequested') '7-owned-holdsocket-launch-authorized'
+    Assert-StoreTrue $Failures ([string]$startB['invocation']['bindEndpoint'] -ceq [string]$allocB['endpoint']) '7-owned-holdsocket-binds-own-endpoint'
+    Assert-StoreTrue $Failures ([string]$startB['invocation']['bindEndpoint'] -cne [string]$allocA['endpoint']) '7-owned-holdsocket-not-winners-endpoint'
 
     # A handoff identity whose binding no longer matches its allocation cannot
     # authorize a launch: the reservation is proven against the allocation's own
