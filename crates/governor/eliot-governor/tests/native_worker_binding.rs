@@ -694,9 +694,7 @@ fn stale_task_revision_fails_publish() {
     let refused = result.expect_err("stale task revision must be refused at publish");
     assert_eq!(
         refused,
-        CompositionError::Recovery(
-            "native binding task revision is stale or foreign".to_owned()
-        ),
+        CompositionError::Recovery("native binding task revision is stale or foreign".to_owned()),
         "the refusal must name the stale task revision, not another publish guard"
     );
     // Proof that the facet/catalog gate is not what refuses this call: the same

@@ -1,5 +1,5 @@
-use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_freshness};
 use super::measurement::ul_token_estimate;
+use super::{ActivationEngine, CueIndexService, TouchedSetRegistry, capsule_freshness};
 use crate::{EngineError, WriterHandle};
 use eliot_store::CanonicalStore;
 use eliot_types::{

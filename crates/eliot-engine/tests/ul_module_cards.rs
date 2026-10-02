@@ -1,5 +1,5 @@
-use eliot_engine::ul::ul_token_estimate;
 use eliot_engine::ModuleCardService;
+use eliot_engine::ul::ul_token_estimate;
 use eliot_types::{CoChangeEdge, HotspotScore, ProjectId};
 use std::collections::BTreeMap;
 use std::fs;

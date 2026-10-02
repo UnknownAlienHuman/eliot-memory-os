@@ -317,7 +317,7 @@ pub fn refine_capsule_prose(
             inputs_hash,
             anchor_validation: anchor_refs,
             budget_limit: UL_REFINEMENT_OUTPUT_TOKEN_UNITS,
-            token_estimate: refined_output_units(&candidate)?,
+            token_estimate: refined_output_units(candidate)?,
             status: PyramidBuildStatus::Promoted,
             previous_build_id: Some(capsule.build_id.clone()),
         },

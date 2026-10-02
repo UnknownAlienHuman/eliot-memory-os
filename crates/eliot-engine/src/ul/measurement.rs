@@ -32,7 +32,6 @@ use eliot_context_measurement::stu_for_bytes;
 /// The input is measured as its exact UTF-8 byte length, which is what a
 /// `&str` already carries; no character count and no separate encoding step is
 /// involved, so a multi-byte character contributes the bytes it occupies.
-#[must_use]
 pub fn ul_token_estimate(text: &str) -> Result<u32, EngineError> {
     let bytes = u64::try_from(text.len()).map_err(|_| ContextError::Overflow)?;
     ul_token_estimate_for_bytes(bytes)
@@ -42,7 +41,6 @@ pub fn ul_token_estimate(text: &str) -> Result<u32, EngineError> {
 ///
 /// Used where a caller observes exact serialized bytes (a tool's measured
 /// input/output, a sum of ledger byte counters) rather than holding the text.
-#[must_use]
 pub fn ul_token_estimate_for_bytes(bytes: u64) -> Result<u32, EngineError> {
     let units = stu_for_bytes(bytes)?;
     Ok(u32::try_from(units).map_err(|_| ContextError::Overflow)?)
@@ -74,8 +72,16 @@ mod tests {
         let units = ul_token_estimate(&payload).expect("a 40-byte payload is measurable");
         assert_eq!(units, 14);
         assert_eq!(ul_token_estimate_for_bytes(40).expect("measurable"), 14);
-        assert_ne!(units, 40_u32.div_ceil(4), "the retired /4 ratio is still live");
-        assert_ne!(units, 20_u32.div_ceil(3), "a character count is not a byte length");
+        assert_ne!(
+            units,
+            40_u32.div_ceil(4),
+            "the retired /4 ratio is still live"
+        );
+        assert_ne!(
+            units,
+            20_u32.div_ceil(3),
+            "a character count is not a byte length"
+        );
     }
 
     /// The refusal discriminator for #783.

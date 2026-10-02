@@ -51,7 +51,10 @@ pub struct UlLedgerAccumulator {
 }
 
 impl UlLedgerAccumulator {
-    pub fn record(&mut self, measurement: &UlToolMeasurement) -> Result<UlLedgerDelta, EngineError> {
+    pub fn record(
+        &mut self,
+        measurement: &UlToolMeasurement,
+    ) -> Result<UlLedgerDelta, EngineError> {
         self.record_with_assignment(measurement, None)
     }
 
