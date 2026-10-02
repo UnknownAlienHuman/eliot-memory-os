@@ -1,5 +1,6 @@
 use eliot_engine::{CueIndexService, ObservedCue};
 use eliot_store::CanonicalStore;
+use eliot_store_surreal_adapter::ProviderKillOnCloseLease;
 use eliot_types::{
     CognitiveProjectionReadState, CredentialProviderKind, CueIndexRow, CueMatchMode, CueStrength,
     GovernorConfig, LegacyCueKindV1, MemoryRevision, ProjectId, cue_row_id, ul_token_estimate,
@@ -312,11 +313,27 @@ impl Drop for Harness {
     }
 }
 
-struct OwnedChild(Option<Child>);
+struct OwnedChild {
+    child: Option<Child>,
+    /// The retained kill-on-close Job Object handle for the provider
+    /// (#1888, K-STORE). It is held beside the child for the provider's whole
+    /// life, never read: dropping it closes the last handle to the Job and is
+    /// what ends the provider when this owner ends. `Drop` order runs
+    /// `OwnedChild::stop` first, so the child is killed and reaped explicitly
+    /// before that close.
+    kill_on_close: ProviderKillOnCloseLease,
+}
 
 impl OwnedChild {
+    fn new(child: Child, kill_on_close: ProviderKillOnCloseLease) -> Self {
+        Self {
+            child: Some(child),
+            kill_on_close,
+        }
+    }
+
     fn stop(&mut self) -> TestResult {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             if child.try_wait()?.is_none() {
                 child.kill()?;
             }
@@ -332,8 +349,16 @@ impl Drop for OwnedChild {
     }
 }
 
+/// Starts the fixture provider through the one job-owned launch path
+/// (#1888, K-STORE).
+///
+/// The spawned child is admitted into a kill-on-close Job Object immediately,
+/// before the provider is used, and the lease travels with it in `OwnedChild`,
+/// so an externally killed test process takes the server with it. A refused
+/// admission kills and reaps the child instead of continuing uncontained.
 fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .env("SURREAL_USER", "root")
         .env("SURREAL_PASS", "ul-t03-test-secret")
         .arg("start")
@@ -349,9 +374,13 @@ fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
         .arg("memory")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    Ok(OwnedChild(Some(child)))
+        .stderr(Stdio::inherit());
+    let (child, kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+        || command.spawn(),
+        |child: &Child| child.id(),
+        eliot_store_surreal_adapter::reap_refused_std_child,
+    )?;
+    Ok(OwnedChild::new(child, kill_on_close))
 }
 
 fn pinned_surreal_exe() -> TestResult<PathBuf> {

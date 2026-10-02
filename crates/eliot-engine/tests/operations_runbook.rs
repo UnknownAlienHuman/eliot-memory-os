@@ -3,6 +3,7 @@ use eliot_engine::{
     SurrealLogicalConfig, SurrealLogicalService, WriteAdmissionService, WriterActor, WriterConfig,
 };
 use eliot_store::{CanonicalStore, ControlWal};
+use eliot_store_surreal_adapter::ProviderKillOnCloseLease;
 use eliot_types::{
     AgentId, BackupKind, ClaimCardInput, ClaimId, ClaimProposeCommand, CommandContext,
     CredentialProviderKind, EpistemicStatus, GovernorConfig, LifecycleStatus, ProjectId,
@@ -378,15 +379,31 @@ async fn real_surreal_store_backup_restore_to_new_root() -> TestResult {
 
 struct IsolatedSurreal {
     child: Option<Child>,
+    /// The retained kill-on-close Job Object handle for the provider
+    /// (#1888, K-STORE). It is held beside the child for the provider's whole
+    /// life, never read: dropping it closes the last handle to the Job and is
+    /// what ends the provider when this owner ends. `Drop` order runs
+    /// `IsolatedSurreal::stop` first, so the child is killed and reaped
+    /// explicitly before that close.
+    kill_on_close: ProviderKillOnCloseLease,
 }
 
 impl IsolatedSurreal {
+    /// Starts the fixture provider through the one job-owned launch path
+    /// (#1888, K-STORE).
+    ///
+    /// The spawned child is admitted into a kill-on-close Job Object
+    /// immediately, before the provider is used, and the lease travels with it
+    /// in `IsolatedSurreal`, so an externally killed test process takes the
+    /// server with it. A refused admission kills and reaps the child instead of
+    /// continuing uncontained.
     fn start(executable: &Path, port: u16, storage: &Path, password: &str) -> TestResult<Self> {
         if let Some(parent) = storage.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let bind = format!("127.0.0.1:{port}");
-        let child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("start")
             .arg("--bind")
             .arg(&bind)
@@ -395,9 +412,16 @@ impl IsolatedSurreal {
             .env("SURREAL_USER", "root")
             .env("SURREAL_PASS", password)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut server = Self { child: Some(child) };
+            .stderr(Stdio::null());
+        let (child, kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+            || command.spawn(),
+            |child: &Child| child.id(),
+            eliot_store_surreal_adapter::reap_refused_std_child,
+        )?;
+        let mut server = Self {
+            child: Some(child),
+            kill_on_close,
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if TcpStream::connect(("127.0.0.1", port)).is_ok() {

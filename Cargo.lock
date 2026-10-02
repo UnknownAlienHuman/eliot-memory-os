@@ -1833,6 +1833,7 @@ dependencies = [
  "eliot-process",
  "eliot-skills",
  "eliot-store",
+ "eliot-store-surreal-adapter",
  "eliot-types",
  "eliot-verifier",
  "eliot-windows-ipc",

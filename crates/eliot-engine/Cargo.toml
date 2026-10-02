@@ -31,6 +31,21 @@ time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# Issue #1888 (K-STORE, consumer link): the engine `surreal.exe` SERVER
+# starters in `tests/` now launch through the one job-owned path the store
+# adapter already owns (`launch_fixture_provider` /
+# `reap_refused_std_child`, `crates/storage/eliot-store-surreal-adapter/src/
+# provider_job.rs`), so each fixture provider is admitted into a kill-on-close
+# Job Object immediately after `spawn()` and ends with its owner.
+#
+# scripts/audit-architecture-boundaries.py permits this edge: `eliot-engine` is
+# not a declared `[[runtime_root]]` package, so no `forbidden_exact` /
+# `forbidden_prefix` set binds it, and `[store_vendor] allowed_packages` gates
+# the `surrealdb` crate itself, not this adapter. This is the same test-only
+# shape bins/eliot-kernel declares in its `[dev-dependencies]`.
+eliot-store-surreal-adapter.workspace = true
+
 [target.'cfg(windows)'.dev-dependencies]
 eliot-windows-ipc = { workspace = true, features = ["test-support"] }
 
