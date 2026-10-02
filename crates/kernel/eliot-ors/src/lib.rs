@@ -19,6 +19,7 @@ mod effect_current_state;
 mod effect_operation_lease;
 mod execution_manifest;
 mod generation_lifecycle;
+mod generation_registry;
 mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
@@ -111,6 +112,14 @@ pub use execution_manifest::{
 pub use generation_lifecycle::{
     GENERATION_LIFECYCLE_SCHEMA_VERSION, GenerationDisposition, GenerationLifecycleRecord,
     ObservedGenerationLifecycle,
+};
+/// I1.9 Generation Registry: the Kernel/ORS-owned operational generation
+/// record set. This is the only owner of installed/running/candidate
+/// operational state, process handles, Authority Epoch, route state and
+/// drain/checkpoint/restart state.
+pub use generation_registry::{
+    GenerationDrainState, GenerationOperationalState, GenerationProcessHandles, GenerationRegistry,
+    GenerationRegistryRecord, GenerationRouteState,
 };
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,

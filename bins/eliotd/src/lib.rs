@@ -261,6 +261,11 @@ pub use dreamer_model_adapter::{
     DAEMON_GENERATION_PROJECTION_OPERATION, DreamerModelExecution, GovernedDreamerModelAdapter,
     KernelGenerationProjection, ModelInvokeInput, query_kernel_generation,
 };
+/// I1.9 Capability Registry: the Governor-owned composite capability
+/// projection, re-exported as the module so the exact registry name stays
+/// reachable without flattening it against the distinct canonical-evidence
+/// `CapabilityRegistry` that `eliot_governor` already exports at its root.
+pub use eliot_governor::capability_registry;
 pub use experience_runtime::{
     CommonGroundEventInputs, ExperienceCommitOutput, ExperienceDriverError,
     ExperienceJournalDriverInputs, ExperienceQualityEvent, ExperienceQualityEventOutput,
