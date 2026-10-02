@@ -708,6 +708,47 @@ fn expected_row_paths(doc: &TomlDoc, prefix: &str) -> Vec<String> {
     paths
 }
 
+/// Stale bare-name inventory rows for the retired V1 seam, read off the shipped
+/// inventory's own `id` lines.
+///
+/// A row id is the five-part `_stable_row_id` tuple
+/// `package:path:kind:type:enclosing-function`
+/// (`scripts/serde_boundary_inventory.py`, `_stable_row_id`), where the
+/// enclosing function is the literal `<root>` when empty and a collided id is
+/// widened by the `@mod:`/`@scope:`/`@span:` rungs. A stale row is therefore
+/// the pre-retirement spelling of the same declaration - the TYPE rung still
+/// carries the bare historical name - and it reads
+/// `eliot-types:crates/eliot-types/src/ul/cue.rs:<kind>:CueKind:<function-or-<root>>`,
+/// e.g. `...cue.rs:derive:CueKind:<root>`.
+///
+/// The kind rung is an open vocabulary read off the live inventory (`derive`,
+/// `manual-impl`, `decoder-callsite`, `<inferred>`), so this guard does not pin
+/// one: on a row for this path it takes the rung after the path as the kind,
+/// the next as the type, and requires that type rung to be exactly the bare
+/// historical name. The trailing colon is what makes it a token: `CueKind` is
+/// accepted and `LegacyCueKindV1`, `CueBinding` and `CueKindProvenance` are
+/// not. A degenerate row with an empty kind rung is caught too.
+///
+/// The three-part needle this replaces (`...cue.rs:CueKind"`) required the type
+/// name to start immediately after `cue.rs:`, i.e. an EMPTY kind rung.
+/// `_stable_row_id` never emits one, so no five-part row - stale or legitimate
+/// - could ever match it and the guard could only ever pass.
+fn stale_bare_cue_kind_rows(inventory: &str) -> Vec<&str> {
+    const PATH_PREFIX: &str = "id = \"eliot-types:crates/eliot-types/src/ul/cue.rs:";
+    inventory
+        .lines()
+        .filter(|line| {
+            let Some(tail) = line.strip_prefix(PATH_PREFIX) else {
+                return false;
+            };
+            let Some((_kind, after_kind)) = tail.split_once(':') else {
+                return false;
+            };
+            after_kind.starts_with("CueKind:")
+        })
+        .collect()
+}
+
 /// A stripped line uses the transitional alias outside its single frozen form.
 /// The frozen definition itself is the one inventoried hit; everything else is
 /// forbidden local alias use.
@@ -1371,13 +1412,67 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         1,
         "expected exactly one inventory row for the renamed V1 seam, saw: {legacy_id:?}"
     );
-    let bare_id = matched_lines(
-        &inventory,
-        "eliot-types:crates/eliot-types/src/ul/cue.rs:CueKind\"",
-    );
+    // The guard only means something if it can fail, so pin it on the real
+    // stale spelling before trusting it against the live inventory. The row is
+    // built at runtime so this oracle never prints a bare `CueKind` row id into
+    // the shipped inventory the assertion below reads.
+    let bare = "CueKind";
+    let seam_path = "eliot-types:crates/eliot-types/src/ul/cue.rs";
+    for (kind, function) in [
+        ("derive", "<root>"),
+        ("manual-impl", "<root>"),
+        ("derive", "as_str"),
+        ("manual-impl", "partial_cmp"),
+        ("decoder-callsite", "tests::cue_kind_roundtrip"),
+        ("derive", "<root>@mod:ul"),
+        ("<inferred>", "<root>@scope:prod"),
+    ] {
+        let stale = format!("id = \"{seam_path}:{kind}:{bare}:{function}\"");
+        assert_eq!(
+            stale_bare_cue_kind_rows(&stale).len(),
+            1,
+            "stale-row guard missed a real stale row: {stale}"
+        );
+    }
+    // The same rows with the retained explicit name are the legitimate current
+    // rows and must not be flagged, and neither may a longer type name that
+    // merely starts with the bare spelling.
+    for (kind, function, type_name) in [
+        ("derive", "<root>", "LegacyCueKindV1"),
+        ("manual-impl", "<root>", "LegacyCueKindV1"),
+        ("derive", "as_str", "CueBinding"),
+        ("derive", "<root>", "CueBindingPage"),
+        ("derive", "as_str", "CueMatchMode"),
+        ("derive", "cue_binding_page_set_hash", "CueIndexRow"),
+        ("derive", "as_str", "CueRecordSource"),
+        ("derive", "as_str", "CueStrength"),
+        ("derive", "<root>", "CueKindProvenance"),
+        ("decoder-callsite", "decode", "CueKindly"),
+        ("derive", "<root>", "LegacyCueKind"),
+    ] {
+        let current = format!("id = \"{seam_path}:{kind}:{type_name}:{function}\"");
+        assert!(
+            stale_bare_cue_kind_rows(&current).is_empty(),
+            "stale-row guard flagged a legitimate current row: {current}"
+        );
+    }
+    // A row on another path, and a path-shaped line that carries no type rung
+    // at all, are not this seam's problem either.
+    for unrelated in [
+        "id = \"eliot-cue-contracts:crates/smart/eliot-cue-contracts/src/normalization.rs:derive:CueKind:<root>\"",
+        "id = \"eliot-types:crates/eliot-types/src/ul/cue_index.rs:derive:CueKind:<root>\"",
+        "id = \"eliot-types:crates/eliot-types/src/ul/cue.rs\"",
+        "# the cue seam row id is eliot-types:crates/eliot-types/src/ul/cue.rs:derive:LegacyCueKindV1:<root>",
+    ] {
+        assert!(
+            stale_bare_cue_kind_rows(unrelated).is_empty(),
+            "stale-row guard flagged an unrelated line: {unrelated}"
+        );
+    }
+    let stale_rows = stale_bare_cue_kind_rows(&inventory);
     assert!(
-        bare_id.is_empty(),
-        "stale bare-name inventory row for the renamed V1 seam: {bare_id:?}"
+        stale_rows.is_empty(),
+        "stale bare-name inventory row for the renamed V1 seam: {stale_rows:?}"
     );
     Ok(())
 }

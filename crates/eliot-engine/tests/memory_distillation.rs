@@ -390,8 +390,14 @@ fn exact_distillation_reduces_the_covering_active_estimate_without_losing_curren
     // ten items of 64 units cover 10 * bytes_for_stu(64) == 1920, which is the
     // whole-multiple covering length and NOT the smallest covering length 190
     // per item, and never an observed byte count.
-    assert_eq!(plan.corpus_profile_before.estimated_covering_total_bytes, 1_920);
-    assert_eq!(plan.corpus_profile_before.estimated_covering_active_bytes, 1_920);
+    assert_eq!(
+        plan.corpus_profile_before.estimated_covering_total_bytes,
+        1_920
+    );
+    assert_eq!(
+        plan.corpus_profile_before.estimated_covering_active_bytes,
+        1_920
+    );
     assert_eq!(
         plan.expected_estimated_covering_active_bytes_delta,
         -9 * 192
