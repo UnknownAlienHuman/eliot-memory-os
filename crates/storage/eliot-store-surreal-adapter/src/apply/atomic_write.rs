@@ -152,6 +152,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "ordering_head_create_conflict",
     "finish_owner_cas_conflict",
     "finish_owner_create_conflict",
+    "agent_activation_owner_cas_conflict",
+    "agent_activation_owner_create_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "instrument_registry_fence_conflict",
@@ -978,6 +980,7 @@ fn build_apply_statements(
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_agent_activation_owner_statements(&mut sql, &mut bindings, transition)?;
 
     sql.push_str(schema::TX_CREATE_RECEIPT);
     bindings.insert(
@@ -1351,6 +1354,88 @@ fn recovery_owner_id(key: &eliot_store_api::RecoveryRecordKey) -> Result<String,
     let bytes = eliot_store_api::canonical_json_bytes(key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     Ok(eliot_store_api::sha256_hex(&bytes))
+}
+
+/// Appends the exact four Governor-produced agent activation owner rows to
+/// the canonical receipt transaction. The adapter validates the closed
+/// addresses, common fence, payload digest, and owner-supplied predecessor /
+/// successor revisions; it does not decode or derive any owner payload.
+fn append_agent_activation_owner_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    transition: &eliot_store_api::PreparedTransition,
+) -> Result<(), AdapterError> {
+    let mut matching = transition.named_operations.iter().filter(|command| {
+        command.operation == eliot_store_api::NamedMutationOperation::ApplyAgentActivationOwners
+    });
+    let Some(command) = matching.next() else {
+        return Ok(());
+    };
+    if matching.next().is_some() {
+        return Err(AdapterError::Store(StoreError::Duplicate {
+            field: "agent_activation_owner.named_operations",
+        }));
+    }
+    if transition.transition_class != eliot_store_api::TransitionClass::RecoverySchema {
+        return Err(AdapterError::Store(StoreError::TransitionClassExceeded));
+    }
+    let value = command
+        .parameters
+        .get("owner_records")
+        .cloned()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "missing required parameter",
+        }))?;
+    let owners: eliot_store_api::AgentActivationOwnerBundle = serde_json::from_value(value)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    owners
+        .validate_for_fence(&transition.state_fence)
+        .map_err(AdapterError::Store)?;
+
+    for (index, frame) in [
+        &owners.task,
+        &owners.session,
+        &owners.coordination,
+        &owners.work_scope,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let suffix = index.to_string();
+        let key = frame.record.record_key();
+        let owner_id = recovery_owner_id(&key)?;
+        sql.push_str(&schema::indexed(schema::TX_AGENT_ACTIVATION_OWNER, index));
+        bindings.insert(
+            format!("agent_activation_owner_table{suffix}"),
+            json!(schema::table::RECOVERY_OWNER),
+        );
+        bindings.insert(
+            format!("agent_activation_owner_id{suffix}"),
+            json!(owner_id),
+        );
+        bindings.insert(
+            format!("agent_activation_namespace{suffix}"),
+            json!(key.namespace),
+        );
+        bindings.insert(
+            format!("agent_activation_key{suffix}"),
+            json!(key.key),
+        );
+        bindings.insert(
+            format!("agent_activation_expected_state_fence{suffix}"),
+            json!(&transition.state_fence),
+        );
+        bindings.insert(
+            format!("agent_activation_expected_revision{suffix}"),
+            json!(frame.expected_revision),
+        );
+        bindings.insert(
+            format!("agent_activation_owner_record{suffix}"),
+            to_value(&frame.record)?,
+        );
+    }
+    Ok(())
 }
 
 /// Appends the admitted Governor capability-evidence row writes (issue #1773,
