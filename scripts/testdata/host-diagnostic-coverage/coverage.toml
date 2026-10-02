@@ -771,13 +771,13 @@ end = 251
 digest = "98c0f0d10c6311101cea76dbcc1836d3168819094dd7b841ebb915fc46e64b76"
 markers = ["sink_status", "EventLogUnavailable"]
 [[boundary.site]]
-start = 49
-end = 49
+start = 51
+end = 51
 digest = "7025a51f3237e71e9343e22c11aa71a30d401dea2f39ed16cbe69f53bc1d078f"
 markers = ["HOST_TERMINAL_CODE_DISPATCHER_FAILED", "dispatcher_failed"]
 [[boundary.site]]
-start = 53
-end = 53
+start = 55
+end = 55
 digest = "8272b0b3f9defca266812be5da475de5fdedc598d686071ce79a76ff947e5125"
 markers = ["HOST_TERMINAL_CODE_CONSOLE_FAILED", "console_failed"]
 [[boundary.caller]]
@@ -1396,7 +1396,7 @@ markers = ["BOUNDARY_LIFECYCLE_CONTEXT_TERMINAL", "boundary_by_event"]
 code = "host-lifecycle-context-failed"
 [[boundary.caller]]
 file = "bins/eliot-host/src/lib.rs"
-line = 8664
+line = 14029
 text = "lifecycle_context(&self.host, \"watchdog-start\")?,"
 
 [[boundary]]
