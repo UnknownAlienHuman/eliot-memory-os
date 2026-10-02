@@ -18,6 +18,8 @@ use eliot_dreamer_cycle::{
     CycleError, CyclePolicy, CycleStep, DreamerCycleState, ObservedOutcome, step_dreamer_cycle_at,
 };
 
+use crate::admitted_material::admission_of;
+use crate::admitted_stage_source::ControllerSnapshot;
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 
 /// Verifies that a flat semantic input names exactly the Kernel-admitted job.
@@ -54,18 +56,28 @@ pub(crate) fn verify_admitted_binding(
     Ok(())
 }
 
-/// Resolves the #806 inputs for one admitted job.
+/// Resolves the #806 inputs for one admitted job from the owner-published
+/// controller snapshot.
 ///
-/// Fails closed: any invalid/stale admission or identity mismatch refuses here
-/// with zero owner-transition calls. The Governor-issued controller snapshot
-/// (frozen state, observed outcomes, policy, bundle digest) arrives through a
-/// source-owner port in a later slice; until then resolution refuses rather
-/// than synthesizing state, because a locally built state would be self-issued
+/// Fails closed: the admitted binding is proved first, then any invalid/stale
+/// admission or identity mismatch refuses here with zero owner-transition calls.
+/// `snapshot` is the record a Governor/canonical owner published through
+/// [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource) for this
+/// exact claim; `None` is the measured absence of that record and leaves this
+/// gate refused, because a locally built controller state would be self-issued
 /// authority (I9.4: the denominator arrives with governed material; Dreamer
 /// never selects it).
+///
+/// A published snapshot is not trusted because it was published. Before it is
+/// handed to the owner transition this gate re-proves, against the admitted pair
+/// only, that the snapshot's own job is the admitted canonical job and that its
+/// policy carries the admitted fence. The owner entry then runs for real through
+/// [`step_admitted_cycle`] and may still refuse, so a lookalike state, a stale
+/// fence or a mismatched policy identity never reaches a transition.
 pub(crate) fn resolve_cycle_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
+    snapshot: Option<&ControllerSnapshot>,
 ) -> Result<
     (
         DreamerCycleState,
@@ -76,8 +88,25 @@ pub(crate) fn resolve_cycle_inputs(
     DreamerError,
 > {
     verify_admitted_binding(admission, job)?;
-    Err(DreamerError::InvalidAdmission(
-        "admitted controller inputs require Governor-resolved material",
+    let Some(snapshot) = snapshot else {
+        return Err(DreamerError::InvalidAdmission(
+            "admitted controller inputs require Governor-resolved material",
+        ));
+    };
+    let admitted = admission_of(admission, job)?;
+    if snapshot.state.job != admitted
+        || snapshot.state.job.state_fence != admission.state_fence
+        || snapshot.policy.state_fence != admission.state_fence
+    {
+        return Err(DreamerError::InvalidAdmission(
+            "controller snapshot binding",
+        ));
+    }
+    Ok((
+        snapshot.state.clone(),
+        snapshot.observed.clone(),
+        snapshot.policy.clone(),
+        snapshot.observation_time_ms,
     ))
 }
 
@@ -217,7 +246,7 @@ mod slice_2_controller_tests {
     fn stale_admission_fails_closed_before_any_step() {
         let admission = admission_with_deadline(1);
         let job = job_for(&admission);
-        let refused = resolve_cycle_inputs(&admission, &job);
+        let refused = resolve_cycle_inputs(&admission, &job, None);
         assert!(
             matches!(
                 refused,
@@ -234,7 +263,7 @@ mod slice_2_controller_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = resolve_cycle_inputs(&admission, &job);
+        let refused = resolve_cycle_inputs(&admission, &job, None);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -255,7 +284,7 @@ mod slice_2_controller_tests {
         )
         .expect("valid test epoch");
         job.state_fence = StateFence::new(other_epoch, ResourceGeneration::genesis());
-        let refused = resolve_cycle_inputs(&admission, &job);
+        let refused = resolve_cycle_inputs(&admission, &job, None);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -269,7 +298,7 @@ mod slice_2_controller_tests {
     fn valid_admission_waits_for_governed_material() {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_for(&admission);
-        let refused = resolve_cycle_inputs(&admission, &job);
+        let refused = resolve_cycle_inputs(&admission, &job, None);
         assert!(
             matches!(
                 refused,

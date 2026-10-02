@@ -31,7 +31,9 @@
 //!   built deterministically from task/scope/fence only, so admission, bundle,
 //!   and manifest agree by construction. The shell carries no references:
 //!   Dreamer never synthesizes a frozen universe locally; references arrive
-//!   Governor-resolved through a source-owner port in a later slice.
+//!   Governor-resolved over
+//!   [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource), and
+//!   the shell stays empty until an owner publishes them.
 //! * Bundle materials: evidence handles only. Memory, architecture,
 //!   implementation, and conformance handles are accounted as [`OmissionHandle`](eliot_dreamer_contracts::OmissionHandle)
 //!   entries (never silently dropped), so the bundle claims

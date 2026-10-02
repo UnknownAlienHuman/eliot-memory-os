@@ -4,8 +4,9 @@
 //! the binary plans the bounded frozen input bundle through the #593 owner
 //! ([`plan_bundle`](eliot_dreamer_bundle::plan_bundle)) exactly once per
 //! admitted job. This module performs no local fetch, ranking, compression,
-//! or model work: the [`AssemblyRequest`] arrives Governor-resolved (later
-//! slices), and the returned owner [`AssemblyPlan`](eliot_dreamer_bundle::AssemblyPlan)
+//! or model work: the [`AssemblyRequest`] arrives Governor-resolved over
+//! [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource), and the
+//! returned owner [`AssemblyPlan`](eliot_dreamer_bundle::AssemblyPlan)
 //! is surfaced unmodified so the frozen complete/partial/incomplete role
 //! denominator is preserved losslessly (I9.4: the denominator arrives with
 //! governed material; Dreamer never selects it).
@@ -13,25 +14,51 @@
 use eliot_dreamer_bundle::{AssemblyPlan, AssemblyRequest, plan_bundle};
 use eliot_dreamer_contracts::ContractViolation;
 
+use crate::admitted_material::admission_of;
 use crate::controller::verify_admitted_binding;
 use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 
-/// Resolves the A-04 request for one admitted job.
+/// Resolves the A-04 request for one admitted job from the owner-published
+/// recipe and manifest.
 ///
-/// Fails closed: any invalid/stale admission or identity mismatch refuses here
-/// with zero owner-plan calls. The Governor-issued recipe, manifest, supplied
-/// items, and measurement profile arrive through a source-owner port in a
-/// later slice; until then resolution refuses rather than synthesizing bundle
-/// inputs, because locally selected materials would be self-issued authority
-/// (I9.2: bundle construction runs via Governor handles).
+/// Fails closed: the admitted binding is proved first, then any invalid/stale
+/// admission or identity mismatch refuses here with zero owner-plan calls.
+/// `published` is the record a Governor/canonical owner published through
+/// [`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource) for this
+/// exact claim; `None` is the measured absence of that record and leaves this
+/// gate refused, because locally selected materials would be self-issued
+/// authority (I9.2: bundle construction runs via Governor handles).
+///
+/// A published request is not trusted because it was published. Before it is
+/// handed to the owner plan this gate re-proves, against the admitted pair only,
+/// that the request is the identity envelope of THIS admitted job — through the
+/// real owner binding
+/// [`DreamJobRecipe::bind_job`](eliot_dreamer_contracts::assembly::DreamJobRecipe::bind_job),
+/// which validates the whole recipe and then requires the embedded job to equal
+/// the derived one — and that the request's manifest is the frozen digest this
+/// admission derived. The owner entry then runs for real through
+/// [`plan_admitted_bundle`], so a foreign recipe, a stale manifest digest or a
+/// lookalike denominator never reaches assembly.
 pub(crate) fn resolve_bundle_request(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
+    published: Option<&AssemblyRequest>,
 ) -> Result<AssemblyRequest, DreamerError> {
     verify_admitted_binding(admission, job)?;
-    Err(DreamerError::InvalidAdmission(
-        "admitted bundle request requires Governor-resolved recipe and manifest",
-    ))
+    let Some(published) = published else {
+        return Err(DreamerError::InvalidAdmission(
+            "admitted bundle request requires Governor-resolved recipe and manifest",
+        ));
+    };
+    let admitted = admission_of(admission, job)?;
+    published
+        .recipe
+        .bind_job(&admitted)
+        .map_err(|error| bundle_denied(&error))?;
+    if published.manifest.digest != admitted.frozen_manifest_digest {
+        return Err(DreamerError::InvalidAdmission("bundle request binding"));
+    }
+    Ok(published.clone())
 }
 
 /// Plans the admitted A-04 bundle exactly once.
@@ -175,7 +202,7 @@ mod slice_2_bundle_tests {
     fn stale_admission_fails_closed_before_any_plan() {
         let admission = admission_with_deadline(1);
         let job = job_for(&admission);
-        let refused = resolve_bundle_request(&admission, &job);
+        let refused = resolve_bundle_request(&admission, &job, None);
         assert!(
             matches!(
                 refused,
@@ -192,7 +219,7 @@ mod slice_2_bundle_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.scope_id = "caller-switched-scope".to_owned();
-        let refused = resolve_bundle_request(&admission, &job);
+        let refused = resolve_bundle_request(&admission, &job, None);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -206,7 +233,7 @@ mod slice_2_bundle_tests {
     fn valid_admission_waits_for_governed_material() {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_for(&admission);
-        let refused = resolve_bundle_request(&admission, &job);
+        let refused = resolve_bundle_request(&admission, &job, None);
         assert!(
             matches!(
                 refused,

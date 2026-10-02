@@ -6,19 +6,21 @@
 //! wires it, and
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! consults it for admitted `JobClass::Orientation` jobs through the existing
-//! `resolve_orientation_supply` seam at lib.rs:791.
+//! `resolve_orientation_supply` seam in `submit`, past the two admitted-stage
+//! owner channels.
 //!
 //! # Reachability, measured rather than assumed
 //!
 //! `submit` is the only production caller of
-//! [`OrientationSupplySource::resolve_supply`], but on the current tree it
-//! never *reaches* that call. Two gates run first and both refuse
-//! unconditionally: `controller::resolve_cycle_inputs` (controller.rs:78-82)
-//! and `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) each end
-//! in a bare `Err`. So this implementation is presently reachable only from the
-//! crate's unit-level pipeline proofs, not from `main.rs`. That is a property of
-//! the tree, stated here so the next attempt measures it rather than assuming
-//! the seam is live.
+//! [`OrientationSupplySource::resolve_supply`], and it consults it for every
+//! admitted `JobClass::Orientation` job that clears the two admitted-stage
+//! gates ahead of it. Those gates are themselves owner channels
+//! ([`AdmittedStageMaterialSource`](crate::AdmittedStageMaterialSource), wired
+//! at `connect()` alongside this one), so this seam is now reached on every
+//! Orientation run rather than being unreachable code — and the production
+//! channel publishes no member, so the typed blocked disposition below is what a
+//! live run actually produces. That is a property of the tree, measured here, so
+//! the next attempt measures it rather than assuming the seam is live.
 //!
 //! # What this source reads
 //!

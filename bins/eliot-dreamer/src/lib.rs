@@ -17,6 +17,7 @@ use crate::dispatch_stage::CurationExecutionCarrier;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
 
 mod admitted_material;
+mod admitted_stage_source;
 mod bundle_stage;
 mod controller;
 mod curation_pulse;
@@ -35,6 +36,7 @@ mod validation_stage;
 #[cfg(test)]
 mod pipeline_e2e;
 
+pub use admitted_stage_source::{AdmittedStageMaterialSource, ControllerSnapshot};
 pub use curation_pulse::{
     CURATION_EDGE_PROOF_CEILING, CURATION_PACKAGE_PROOF_CEILING, CURATION_PULSE_ROUTE,
     CURATION_PULSE_SCHEMA_VERSION, CurationMemberFinding, CurationProductPulse,
@@ -227,16 +229,31 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// refuses at the carrier check); `Some` where the Governor wired one via
     /// [`AuthenticatedKernelJobPort::with_curation_source`].
     curation_source: Option<&'a dyn CurationCarrierSource>,
+    /// Owner channel for the two admitted-stage records the Orientation seam
+    /// sits behind: the #806 controller snapshot and the A-04 assembly request.
+    /// `Some` in production: `connect` wires
+    /// [`KernelStagedStageMaterialSource`](crate::admitted_stage_source::KernelStagedStageMaterialSource),
+    /// which re-proves the admitted binding and then reports the absence it
+    /// actually measures. On the current tree that is total absence, because no
+    /// in-binary producer of a `CyclePolicy`, a `PhasePolicyRule` or a
+    /// `DreamJobRecipe` exists — see that module's documentation — so the
+    /// production result is the same typed refusal the gates published before
+    /// this channel existed. What changed is that the gates are addressable:
+    /// `submit` now consults a real owner channel for both records, so the
+    /// downstream `resolve_orientation_supply` seam is reached on every admitted
+    /// non-Curation run instead of being unreachable code. The channel itself is
+    /// replaceable through
+    /// [`AuthenticatedKernelJobPort::with_admitted_stage_source`].
+    admitted_stage_source: Option<&'a dyn AdmittedStageMaterialSource>,
     /// Owner channel for the mandatory Orientation carrier. `Some` in
     /// production: `connect` wires
     /// [`KernelStagedOwnerRecordSource`](crate::orientation_supply_source::KernelStagedOwnerRecordSource),
     /// which reports the mandatory members the Kernel-staged owner record does
-    /// not publish. On the current tree that reports total absence, and it is
-    /// in any case reached only from the unit-level pipeline proofs: `submit`
-    /// consults it at lib.rs:791, after `resolve_cycle_inputs` and
-    /// `resolve_bundle_request`, both of which refuse unconditionally. The
-    /// carrier stays refused rather than synthesizing canonical state; the
-    /// channel itself is replaceable through
+    /// not publish. On the current tree that reports total absence. The seam is
+    /// reached from `submit` for every admitted `JobClass::Orientation` job
+    /// (past the two admitted-stage gates, which are themselves owner channels
+    /// now), and the carrier stays refused rather than synthesizing canonical
+    /// state. The channel itself is replaceable through
     /// [`AuthenticatedKernelJobPort::with_orientation_source`].
     orientation_source: Option<&'a dyn OrientationSupplySource>,
 }
@@ -286,6 +303,17 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport: Box::new(transport),
             curation_source: None,
+            // The two admitted-stage owner channels are wired here, at the one
+            // place the service is constructed, so `submit` never resolves the
+            // controller snapshot or the A-04 recipe without consulting a
+            // channel. Each reports the record it can actually read; the ones
+            // it cannot read stay absent and the typed refusal publishes, which
+            // is the same disposition the unaddressed gate produced but now
+            // reached through a real read rather than through a hardcoded
+            // refusal.
+            admitted_stage_source: Some(
+                &admitted_stage_source::KERNEL_STAGED_STAGE_MATERIAL_SOURCE,
+            ),
             // The production owner channel is wired here, at the one place the
             // service is constructed, so `submit` never runs the Orientation
             // composition with an unconsulted channel. It reports the owner
@@ -307,6 +335,24 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
     pub fn with_curation_source(self, source: &'a dyn CurationCarrierSource) -> Self {
         Self {
             curation_source: Some(source),
+            ..self
+        }
+    }
+
+    /// Replaces the two admitted-stage owner channels with another implementor.
+    ///
+    /// `connect` wires the production channel; this swaps in a different owner
+    /// of the same contract without a second code path. `submit` resolves the
+    /// #806 controller snapshot and the A-04 assembly request through this
+    /// source for every admitted non-Curation job. A source that publishes
+    /// neither record leaves both gates refused rather than filled.
+    #[must_use]
+    pub fn with_admitted_stage_source(
+        self,
+        source: &'a dyn AdmittedStageMaterialSource,
+    ) -> Self {
+        Self {
+            admitted_stage_source: Some(source),
             ..self
         }
     }
@@ -342,6 +388,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         admission: KernelJobAdmission,
         transport: Box<dyn ClaimTransport>,
         curation_source: Option<&'a dyn CurationCarrierSource>,
+        admitted_stage_source: Option<&'a dyn AdmittedStageMaterialSource>,
         orientation_source: Option<&'a dyn OrientationSupplySource>,
     ) -> Result<Self, DreamerError> {
         admission.validate()?;
@@ -363,6 +410,7 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
             handshake,
             transport,
             curation_source,
+            admitted_stage_source,
             orientation_source,
         })
     }
@@ -459,6 +507,46 @@ impl<'a> AuthenticatedKernelJobPort<'a> {
         match source {
             None => Ok(None),
             Some(source) => source.resolve_carrier(screen, admission, job).map(Some),
+        }
+    }
+
+    /// Resolves the owner-published #806 controller snapshot, if any.
+    ///
+    /// Copies the source reference out of `self` first (`Option<&dyn>` is
+    /// `Copy`, ending the borrow), then delegates. `None` — whether because no
+    /// source was wired or because the wired source measured that the owner
+    /// published no controller snapshot — leaves the controller gate refused,
+    /// because a locally built controller state would be self-issued authority.
+    /// The returned snapshot is owned, so it stays valid across the pipeline no
+    /// matter what the source's borrow does.
+    fn resolve_controller_snapshot(
+        &self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<Option<ControllerSnapshot>, DreamerError> {
+        let source = self.admitted_stage_source;
+        match source {
+            None => Ok(None),
+            Some(source) => source.resolve_controller_snapshot(admission, job),
+        }
+    }
+
+    /// Resolves the owner-published A-04 assembly request, if any.
+    ///
+    /// `None` — whether because no source was wired or because the wired source
+    /// measured that the owner published no recipe, manifest, supplied item or
+    /// measurement profile — leaves the bundle gate refused, because locally
+    /// selected materials would be self-issued authority. The returned request
+    /// is owned, so the owner plan consumes it after the borrow ends.
+    fn resolve_published_bundle_request(
+        &self,
+        admission: &KernelJobAdmission,
+        job: &DreamJobInput,
+    ) -> Result<Option<eliot_dreamer_bundle::AssemblyRequest>, DreamerError> {
+        let source = self.admitted_stage_source;
+        match source {
+            None => Ok(None),
+            Some(source) => source.resolve_bundle_request(admission, job),
         }
     }
 
@@ -792,11 +880,21 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
             let result = run_admitted_pipeline(admission, job, carrier, None)?;
             return self.finish_with_result(result);
         }
+        // Orientation reaches the #806 controller step and the A-04 bundle plan
+        // through the two admitted-stage owner channels. Each channel publishes
+        // the record its owner produced, or reports the measured absence; the
+        // gate re-proves the published record against this exact claim before the
+        // owner entry runs, and the owner entry itself still decides. Both
+        // resolved values are owned, so the borrow of the source ends here and
+        // the live view below is still reachable.
+        let snapshot = self.resolve_controller_snapshot(admission, job)?;
         let (state, observed, policy, observation_time_ms) =
-            controller::resolve_cycle_inputs(admission, job)?;
+            controller::resolve_cycle_inputs(admission, job, snapshot.as_ref())?;
         let _step =
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
-        let request = bundle_stage::resolve_bundle_request(admission, job)?;
+        let published_request = self.resolve_published_bundle_request(admission, job)?;
+        let request =
+            bundle_stage::resolve_bundle_request(admission, job, published_request.as_ref())?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
         let supply = if job.job_class == JobClass::Orientation {
             self.resolve_orientation_supply(admission, job)?
