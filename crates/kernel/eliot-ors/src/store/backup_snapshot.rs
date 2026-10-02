@@ -925,17 +925,9 @@ struct DispositionedTable {
 /// [`check_row_family_census`] is the only place a literal name appears at all —
 /// and there it comes from redb, not from this file.
 ///
-/// Every physical table the ORS store declares, each with its exact disposition
-/// (issue #953, A5).
-///
-/// The table is named by referencing `store.rs`'s own `const`, never by
-/// restating its string, so a renamed or replaced table changes its
-/// `TableDefinition` here too and the two cannot drift apart.
-///
-/// The live-name comparison in [`check_row_family_census`] is the only place a
-/// literal name appears at all, and there it comes from redb rather than from
-/// this file. Membership is not a review convention: it is checked against the
-/// crate's DECLARATIONS by [`check_declared_tables_are_censused`].
+/// Membership is not a review convention either: it is checked against the
+/// crate's DECLARATIONS by [`check_declared_tables_are_censused`], which is what
+/// a declared-but-unmaterialised table needs.
 ///
 /// Split into reviewable groups so no half can grow past the point where a
 /// reader stops checking it. The group sizes are NOT written down here —
@@ -964,7 +956,8 @@ fn dispositioned_tables() -> Vec<DispositionedTable> {
 /// up as a test failure rather than as a silently stale sentence.
 pub(super) fn census_counts() -> (usize, usize, usize) {
     let declared = super::declared_ors_tables().len()
-        + super::restore_journal::declared_restore_journal_tables().len();
+        + super::restore_journal::declared_restore_journal_tables()
+            .len();
     let census = dispositioned_tables();
     let exclusions = census
         .iter()
@@ -1643,14 +1636,20 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 /// store: the test names the guarantee, not a fixture.
 fn check_declared_tables_are_censused() -> Result<(), OrsError> {
     let census = dispositioned_tables();
+    // Both declaration lists are bound to locals before they are read, because
+    // `TableHandle::name` borrows from the `TableDefinition` it is called on:
+    // iterating a temporary `Vec` by value would leave `name` pointing at a
+    // binding that is already gone by the time it is reported.
+    let store_declarations = super::declared_ors_tables();
+    let journal_declarations = super::restore_journal::declared_restore_journal_tables();
     let mut uncensused: Vec<&str> = Vec::new();
-    for table in super::declared_ors_tables() {
+    for table in &store_declarations {
         let name = table.name();
         if !census.iter().any(|entry| entry.table.name() == name) {
             uncensused.push(name);
         }
     }
-    for table in super::restore_journal::declared_restore_journal_tables() {
+    for table in &journal_declarations {
         let name = table.name();
         if !census.iter().any(|entry| entry.table.name() == name) {
             uncensused.push(name);
@@ -4585,9 +4584,10 @@ mod census_tests {
     use crate::RedbRecoveryStore;
     use redb::TableHandle;
 
-    /// `declared_ors_tables` is private to `store`, so it is reached from here as
-    /// the parent this module already sits inside rather than by an absolute
-    /// path that a sibling module's privacy would reject.
+    // `declared_ors_tables` is private to `store`, and a private item is visible to
+    // its own descendants, so this nested module reaches it through the parent it
+    // already sits inside rather than through a path a sibling's privacy would
+    // reject.
     use super::super::{declared_ors_tables, restore_journal::declared_restore_journal_tables};
 
     /// Every declared table carries a disposition, checked against the
@@ -4602,13 +4602,13 @@ mod census_tests {
     /// one census entry and this fails.
     #[test]
     fn every_declared_table_carries_a_disposition() {
-    // `is_ok` rather than `unwrap`: the point is that the check FIRED, and
-    // `unwrap` would add a panic the crate's lints warn about.
-    assert!(
-        check_declared_tables_are_censused().is_ok(),
-        "a declared ORS table carries no backup row family disposition: {:?}",
-        check_declared_tables_are_censused().err()
-    );
+        // `is_ok` rather than `unwrap`: the point is that the check FIRED, and
+        // `unwrap` would add a panic the crate's lints warn about.
+        assert!(
+            check_declared_tables_are_censused().is_ok(),
+            "a declared ORS table carries no backup row family disposition: {:?}",
+            check_declared_tables_are_censused().err()
+        );
     }
 
     /// The census is a SET over the declarations: no name appears twice, and
@@ -4620,15 +4620,20 @@ mod census_tests {
     /// visible in a count, so both directions are compared as sets.
     #[test]
     fn census_is_a_set_over_the_declared_tables() {
-        let mut declared: Vec<&str> = declared_ors_tables()
+        // The declaration lists are bound to locals rather than iterated
+        // straight out of the call: `TableHandle::name` borrows from the
+        // `TableDefinition` it is called on, so collecting those names out of a
+        // temporary `Vec` would produce a `Vec<&str>` pointing into a value that
+        // has already been dropped.
+        let store_declarations = declared_ors_tables();
+        let journal_declarations = declared_restore_journal_tables();
+        let census_entries = dispositioned_tables();
+        let mut declared: Vec<&str> = store_declarations
             .iter()
             .map(TableHandle::name)
-            .chain(declared_restore_journal_tables().iter().map(TableHandle::name))
+            .chain(journal_declarations.iter().map(TableHandle::name))
             .collect();
-        let census: Vec<&str> = dispositioned_tables()
-            .iter()
-            .map(|entry| entry.table.name())
-            .collect();
+        let census: Vec<&str> = census_entries.iter().map(|entry| entry.table.name()).collect();
         assert_eq!(
             declared.len(),
             census.len(),

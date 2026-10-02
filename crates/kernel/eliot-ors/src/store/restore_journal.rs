@@ -70,8 +70,14 @@ pub(super) const RESTORE_JOURNAL_META: TableDefinition<'static, &'static str, &'
 /// materialisation-bounded check would have covered them by luck, while a table
 /// declared here and left out of the census would refuse every export of every
 /// store that had ever run a restore.
-pub(super) fn declared_restore_journal_tables()
--> Vec<TableDefinition<'static, &'static str, &'static str>> {
+/// One restore-journal physical table.
+///
+/// A name for the definition shape the three constants above share, so the
+/// declaration list below reads as a list of tables rather than as a
+/// transcription of a three-parameter generic. `&'static` in every slot matches
+/// [`TableDefinition`]: the journal tables are keyed and valued by static text.
+pub(super) type RestoreJournalTable = TableDefinition<'static, &'static str, &'static str>;
+pub(super) fn declared_restore_journal_tables() -> Vec<RestoreJournalTable> {
     vec![
         RESTORE_JOURNAL_INTENTS,
         RESTORE_JOURNAL_RESULTS,
