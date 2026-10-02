@@ -11,7 +11,7 @@ title = "Host diagnostic coverage: file/boundary/propagation/test/owner table"
 baseline_commit = "aed215f68f9e34eaff7276440471a33579f4015b"
 baseline_tree = "ead5b35a2d1eae8b43f116d490694155b98e22ba"
 baseline_count = 45
-current_count = 58
+current_count = 60
 ten_child_cases = 182
 
 [[deleted_file]]
@@ -62,6 +62,18 @@ path = "bins/eliot-host/src/host_startup_evidence.rs"
 created_in = "399a13e0"
 owner = 1967
 note = "Host startup evidence producer"
+
+[[added_file]]
+path = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+created_in = "38a76fca"
+owner = 1953
+note = "I14.16 exclusive-Kernel-ownership evidence for the Host-mediated cutover"
+
+[[added_file]]
+path = "bins/eliot-host/src/user_mode_launcher.rs"
+created_in = "3d9eb4de"
+owner = 1771
+note = "current-user launcher / Task Scheduler registration (UserMode ingress)"
 
 [[added_file]]
 path = "bins/eliot-host/src/introduction_readback.rs"
@@ -323,6 +335,26 @@ parent = "bins/eliot-host/src/lib.rs"
 parent_line = 16684
 parent_cfg = "#[cfg(test)]"
 exclusion = "test_only"
+
+[[file]]
+path = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+sha256 = "1274a21499690da4c933c64cbf41aa272df59e0ea7785133f6703be5fb4343d8"
+cfg = "windows"
+target = "lib"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 5340
+parent_cfg = "#[cfg(windows)]"
+owner = 1953
+
+[[file]]
+path = "bins/eliot-host/src/user_mode_launcher.rs"
+sha256 = "711c07eb58e5897ab84bd59af89fbe32242bfe2b7f3233b9929c361e5c71533b"
+cfg = "windows"
+target = "lib"
+parent = "bins/eliot-host/src/lib.rs"
+parent_line = 5658
+parent_cfg = "#[cfg(windows)]"
+owner = 1771
 
 [[file]]
 path = "bins/eliot-host/src/kernel_activation_driver.rs"
@@ -3142,6 +3174,52 @@ text = "match host.satisfy_claimed_wakes() {"
 file = "bins/eliot-host/src/main.rs"
 line = 3123
 text = "return match host.begin_idle_drain(self.last_census.observation_code()) {"
+
+[[boundary]]
+id = "B-user-mode-launcher"
+file = "bins/eliot-host/src/user_mode_launcher.rs"
+owner = 1771
+kind = "entrypoint"
+operation = "current-user launcher / Task Scheduler registration phase detail (UserMode ingress)"
+phase = "setup"
+scope = "wired"
+status = "incomplete"
+reason = "missing_test_binding"
+detail = "#1771 AUD4 ingress, landed in 3d9eb4de and previously absent from this table. Emits phase detail only through the #889 facade (user_mode_launcher_observe -> observe_entrypoint_with_detail, Startup); it owns no terminal: main.rs:930 treats its HostError as terminal for the supervisor. Real caller main.rs:930. NOT YET PROVEN: no test binding is claimed here and none has been executed against this contour; TEST-PHASE must bind one before this can be proven."
+ceiling_field_bytes = 256
+ceiling_detail_bytes = 1024
+[[boundary.site]]
+start = 85
+end = 92
+digest = "999002591888b4f29eca69964ffdde59d3fa121c62a0690a53cf363a02214568"
+markers = ["observe_entrypoint"]
+terminals = ["B-main-scm-receipts"]
+[[boundary.caller]]
+file = "bins/eliot-host/src/main.rs"
+line = 930
+text = "if let Err(error) = eliot_host::register_user_mode_launcher(&host) {"
+
+[[boundary]]
+id = "B-kernel-owner-exclusivity"
+file = "bins/eliot-host/src/kernel_owner_exclusivity.rs"
+owner = 1953
+kind = "propagated"
+operation = "I14.16 exclusive-Kernel-ownership release/hold evidence for the side-by-side cutover"
+phase = "activation"
+scope = "none"
+status = "incomplete"
+reason = "missing_callsite"
+detail = "#1953 I14.16 exclusive-owner evidence, landed in 38a76fca and previously absent from this table. Prove_candidate_owner_held is called by kernel_activation_driver.rs:873 and KernelHandoffReceipt::prove_released/recover_retained by the same driver (656/653); every failure is a typed HostError into that contour, which owns the terminal. The absence span below records that this module emits NO diagnostic of its own. NOT YET PROVEN: no test binding is claimed here; a missing-callsite boundary with no emission cannot be proven by structure alone."
+ceiling_field_bytes = 256
+ceiling_detail_bytes = 1024
+[[boundary.absence]]
+start = 1
+end = 173
+digest = "1274a21499690da4c933c64cbf41aa272df59e0ea7785133f6703be5fb4343d8"
+[[boundary.caller]]
+file = "bins/eliot-host/src/kernel_activation_driver.rs"
+line = 873
+text = "prove_candidate_owner_held(candidate)?;"
 
 [[matrix]]
 n = 1
