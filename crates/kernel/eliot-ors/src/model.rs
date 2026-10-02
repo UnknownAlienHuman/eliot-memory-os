@@ -4508,6 +4508,10 @@ pub enum OrsError {
     AlreadyTerminalWrite(AlreadyTerminalWrite),
     #[error("reservation was not found")]
     ReservationNotFound,
+    /// The I1.9 Generation Registry holds no record for the requested
+    /// `(module_id, generation)` key.
+    #[error("generation registry record was not found")]
+    GenerationRegistryRecordNotFound,
     #[error("reservation lifecycle transition is invalid")]
     InvalidTransition,
     #[error("writer epoch is stale or does not own the reservation")]
