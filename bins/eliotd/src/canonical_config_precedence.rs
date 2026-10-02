@@ -191,6 +191,15 @@ pub enum PrecedenceError {
     /// The document names a layer outside the seven canonical layers.
     #[error("unknown configuration layer: {0}")]
     UnknownLayer(String),
+    /// A document claimed a layer other than the one owned by its source.
+    #[error(
+        "policy document {file_name} declared layer {declared}, expected source layer {expected}"
+    )]
+    SourceLayerMismatch {
+        file_name: String,
+        expected: &'static str,
+        declared: &'static str,
+    },
     /// Two contributions name the same canonical layer. Layer authority
     /// must be unambiguous: the first contribution must not silently win
     /// over a conflicting same-layer document.
@@ -576,6 +585,10 @@ pub struct PolicyDocument<'a> {
     /// File name of the document. Its extension selects the typed decoder and
     /// refuses executable script extensions before any decoding runs.
     pub file_name: &'a str,
+    /// Layer assigned to this source by its owning boundary. The document's
+    /// `layer` field must match; payload text cannot claim another owner's
+    /// precedence position.
+    pub expected_layer: ConfigLayer,
     /// Exact document bytes as read through the protected config boundary.
     pub bytes: &'a [u8],
 }
@@ -594,12 +607,12 @@ pub struct PolicyDocument<'a> {
 /// [`resolve_canonical_chain`] merges the documents in canonical precedence
 /// order and refuses any lower-layer expansion that no higher layer delegated,
 /// so the returned chain is the effective configuration or the call fails
-/// closed. A document may not claim a layer outside the seven canonical
-/// layers, and two documents may not claim the same layer.
+/// closed. Each document must declare the layer assigned to its source by the
+/// caller, and two documents may not claim the same layer.
 ///
 /// # Errors
-/// Returns [`PrecedenceError`] for script, schema, unknown-layer,
-/// duplicate-layer, or undelegated-expansion input.
+/// Returns [`PrecedenceError`] for script, schema, unknown-layer, source-layer
+/// mismatch, duplicate-layer, or undelegated-expansion input.
 pub fn resolve_effective_configuration(
     documents: &[PolicyDocument<'_>],
 ) -> Result<ResolvedChain, PrecedenceError> {
@@ -616,7 +629,7 @@ pub fn resolve_effective_configuration(
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        inputs.push(match extension.as_str() {
+        let input = match extension.as_str() {
             "json" => parse_canonical_layer_json(document.bytes)?,
             "toml" => {
                 let text = std::str::from_utf8(document.bytes).map_err(|_| {
@@ -629,7 +642,15 @@ pub fn resolve_effective_configuration(
                     "unsupported policy file type for {file_name}"
                 )));
             }
-        });
+        };
+        if input.layer != document.expected_layer {
+            return Err(PrecedenceError::SourceLayerMismatch {
+                file_name: file_name.to_owned(),
+                expected: document.expected_layer.name(),
+                declared: input.layer.name(),
+            });
+        }
+        inputs.push(input);
     }
     resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
 }
@@ -642,8 +663,9 @@ pub fn resolve_effective_configuration(
 )]
 mod tests {
     use super::{
-        CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, canonical_layer_json_schema,
-        parse_canonical_layer_json, parse_canonical_layer_toml, resolve_canonical_chain,
+        CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PolicyDocument, PrecedenceError,
+        canonical_layer_json_schema, parse_canonical_layer_json, parse_canonical_layer_toml,
+        resolve_canonical_chain, resolve_effective_configuration,
     };
 
     fn narrowing_chain() -> Vec<LayerInput> {
@@ -1111,6 +1133,50 @@ mod tests {
                 .is_some_and(|item| item.delegated_expansion),
             "expansion must be marked delegated"
         );
+    }
+
+    #[test]
+    fn installation_document_resolves_when_its_source_layer_matches() {
+        let document = b"layer = \"installation_config\"\nkey = \"task.budget.per_job\"\nlimit = 48\n";
+        let resolved = resolve_effective_configuration(&[PolicyDocument {
+            file_name: "installation.toml",
+            expected_layer: ConfigLayer::InstallationConfig,
+            bytes: document,
+        }])
+        .expect("installation source must resolve its owned layer");
+
+        assert_eq!(resolved.winning_value(), 48);
+        assert_eq!(resolved.contributions().len(), 2);
+        assert_eq!(resolved.contributions()[1].layer, "installation_config");
+    }
+
+    #[test]
+    fn installation_document_cannot_claim_system_owner_or_human_approval() {
+        for declared in [
+            ConfigLayer::SystemOwnerPolicy,
+            ConfigLayer::ExactHumanApproval,
+        ] {
+            let document = format!(
+                "layer = \"{}\"\nkey = \"{}\"\nlimit = 80\n",
+                declared.name(),
+                CANONICAL_SETTING_KEY,
+            );
+            let error = resolve_effective_configuration(&[PolicyDocument {
+                file_name: "installation.toml",
+                expected_layer: ConfigLayer::InstallationConfig,
+                bytes: document.as_bytes(),
+            }])
+            .expect_err("installation payload must not impersonate another owner");
+
+            assert_eq!(
+                error,
+                PrecedenceError::SourceLayerMismatch {
+                    file_name: "installation.toml".to_owned(),
+                    expected: ConfigLayer::InstallationConfig.name(),
+                    declared: declared.name(),
+                }
+            );
+        }
     }
 
     #[test]
