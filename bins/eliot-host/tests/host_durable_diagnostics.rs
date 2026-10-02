@@ -5,8 +5,9 @@
 //!
 //! Through the #889 facade only (`host_diagnostics::observe_entrypoint`,
 //! `observe_entrypoint_with_detail`, `observe_terminal_error`); the Windows
-//! Event Log seam stays typed-Unavailable (`event_log_sink_status`), never
-//! implemented here (#984 still open).
+//! Event Log seam is the typed port that #984's landed safe port serves, so its
+//! disposition is platform-typed (`Ok` on Windows, typed-Unavailable off
+//! Windows) and is pinned per platform below, never assumed unavailable.
 //!
 //! Scope rule: production files are disjoint between writers. This file owns
 //! `credential_control.rs`, `store_recovery_persistence.rs`, and
@@ -28,6 +29,28 @@
 //! are evidence only: they never change control flow, state, errors,
 //! receipts, order, status, or cleanup, and stdout framing stays exactly
 //! one-JSON-per-line.
+//!
+//! NAMED CEILING for cases 1-26 (structural, not a matter of effort). No #980
+//! subordinate observer is reachable from an integration crate: the credential,
+//! Store-recovery, rollback and codec observers all live in private `mod`
+//! leaves behind private parents, their reasons are `pub(super)`, and
+//! `HostCredentialControl::new` is itself `pub(super)`, so this crate can
+//! construct no instance that would reach them
+//! (`src/credential_control.rs:15,41,383`, `src/credential_control/codec.rs`).
+//! Consequently, in every case below the `manifest_source` reads are
+//! SUPPLEMENTARY (source-bound: they turn red if a production label or frozen
+//! boundary is renamed or reverted), and the `capture_emit` records are the
+//! REAL PRODUCTION FORMATTER running over the facade vocabulary — they prove
+//! the facade renders a detail faithfully, never that a #980 callsite emitted
+//! it. Neither half is primary proof that a production callsite observed a
+//! contour; the executed per-callsite proof is each owner's own `#[cfg(test)]`
+//! case. The only production observers this target can drive end to end are the
+//! Event Log sink disposition (`note_event_log_sink_status`,
+//! `event_log_sink_status`, `report_event`, cases 24 and the codec contour case
+//! at the bottom), the real runtime-control wire types, and the diagnostic
+//! formatter every capture runs through. No #980 subordinate callsite is among
+//! them, and the codec case's reachability claim is bounded exactly as stated
+//! there.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -1298,8 +1321,8 @@ fn durable_t_b_canaries_absent_from_observations() {
     reason = "T-B keeps the unavailable-seam, result-identity, ordering, and stdout-framing proofs in one deterministic probe"
 )]
 fn durable_t_b_sink_failure_leaves_operation_identical() {
-    // T-B (noninterference half): every Writer-B boundary notes the
-    // unavailable Event Log seam; sink outcomes never alter the operation
+    // T-B (noninterference half): every Writer-B boundary carries the Event
+    // Log sink-disposition seam; sink outcomes never alter the operation
     // result, order, or stdout framing.
     for source in [
         credential_source(),
@@ -1308,26 +1331,52 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
     ] {
         assert!(
             source.contains("event_log_sink_status"),
-            "every Writer-B file must note the unavailable seam"
+            "every Writer-B file must carry the Event Log sink-disposition seam"
         );
     }
-    assert_eq!(
-        event_log_sink_status(),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
-    );
+    // The Event Log seam answer is platform-typed, and the two platforms have
+    // different typed answers: #984's safe port is live on Windows
+    // (`eliot-platform-windows/src/event_log.rs:484` is `cfg!(windows)`), so
+    // `event_log_sink_status` reports `Ok` there and stays typed-
+    // `EventLogUnavailable` off Windows. Pinning the off-Windows answer
+    // unconditionally would assert a platform seam state that is false on the
+    // platform this target is verified on; the on-Windows arm is the stricter
+    // of the two (it proves the port really is live). This is the same
+    // platform split the sibling `host_diagnostics_contract.rs` target pins.
+    if cfg!(windows) {
+        assert_eq!(
+            event_log_sink_status(),
+            Ok(()),
+            "the landed safe port must report the sink attemptable on Windows"
+        );
+    } else {
+        assert_eq!(
+            event_log_sink_status(),
+            Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable),
+            "off Windows the port stays typed-Unavailable"
+        );
+    }
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
         Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
     );
     assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
-    let record = eliot_host::windows_event_log::EventLogRecord::new(
-        AdmittedEvent::ServiceFailure,
-        "host-store-recovery-unknown",
-    );
-    assert_eq!(
-        report_event(&record),
-        Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
-    );
+    // The raw delivery attempt is driven only where the port is unavailable:
+    // on Windows it is a real OS insertion whose receipt depends on whether the
+    // fixed event source is registered on the running machine, so no
+    // deterministic typed answer exists there and an observation must not
+    // attempt the write at all (`windows_event_log.rs:388` — direct callers
+    // must not invoke it from Host control work).
+    if !cfg!(windows) {
+        let record = eliot_host::windows_event_log::EventLogRecord::new(
+            AdmittedEvent::ServiceFailure,
+            "host-store-recovery-unknown",
+        );
+        assert_eq!(
+            report_event(&record),
+            Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
+        );
+    }
     // Result identity: the same wire operation validates identically before
     // and after surrounding observations, with byte-identical digests.
     let before = store_request("893-24-stable", &"e4".repeat(32));
@@ -1543,25 +1592,50 @@ fn durable_26_actual_path_and_diff_guard() {
     );
 }
 
-// Executed case (audit 5909832545 required item 4): the codec contour split is
-// a real ten-way split, not a catch-all.
+// Executed case (audit 5909832545 required item 4, defect 3): the codec contour
+// split is a real ten-way split, not a catch-all.
 //
-// `credential_control/codec.rs` is a private `mod codec` inside the private
-// `credential_control` module, and `decode_marker` / `decode_envelope` are
-// `pub(super)` inside it (`src/credential_control.rs:15,40`). An
-// integration-test crate cannot name them, so this target cannot drive the
-// codec owner and does not claim to; the executed proof of each contour lives
-// in the owner's own `#[cfg(test)]` cases. What IS provable here is executed
-// against production on the reachable side: the only reachable production
-// diagnostic observer in this file's scope emits no codec contour and, above
-// all, no collapsed catch-all name, so a reachable reader can never be handed
-// the pre-fix "malformed" label that erased the MAC, protected-object,
-// wire-version, and shape causes. The ten frozen labels are then held to one
-// distinct name per contour, split into two disjoint five-member families.
+// REACHABILITY CEILING, STATED NOT HIDDEN. `credential_control/codec.rs` is a
+// private `mod codec` inside the private `credential_control` module;
+// `CodecRejectReason`, `decode_marker` and `decode_envelope` are `pub(super)`
+// inside that private leaf (`src/credential_control.rs:15,41`); every
+// `decode_marker` / `decode_envelope` call site
+// (`src/credential_control.rs:740,774,786,832,850,916,1011,1091`) is fed by
+// `WindowsInstallerRootPrimitive::read_local_service_protected_file` or by
+// `CredentialBackend` against a LocalService-protected installer root; and
+// `HostCredentialControl::new` is itself `pub(super)`
+// (`src/credential_control.rs:383`), so an integration crate can construct no
+// instance either. This target therefore cannot produce a codec contour record
+// at all and does not claim to; the executed per-contour proof lives in the
+// owner's own `#[cfg(test)]` cases (`codec.rs:669,731`).
+//
+// WHAT IS EXECUTED HERE. `host_diagnostics::note_event_log_sink_status` is the
+// canonical bounded observer that `credential_codec_observe` calls FIRST for
+// every single rejection (`codec.rs:166`), so it is the one production call of
+// the codec contour path that crosses this crate's public boundary. The probe
+// drives it for real inside a real `tracing` subscriber and asserts on the
+// text production actually emitted — never on a literal's presence in a source
+// file, never on a bare occurrence count, never on substring position. The
+// probe is liveness-controlled by a second real production record on the same
+// facade, so the closed denial can never be satisfied by an empty capture.
+//
+// The denial is therefore: across the whole reachable production observation
+// surface of this crate, no codec contour and, above all, no collapsed
+// catch-all name is ever emitted, so a reachable reader can never be handed the
+// pre-fix "malformed retained" label that erased the MAC, protected-object,
+// wire-version, and shape causes.
+//
+// Supplementary (source-bound, never primary): the owner's own emission sites.
+// The executed per-contour record is bound to the label the owner passes to
+// the facade, so if the owner collapsed all ten contours back onto
+// `marker malformed retained` / `envelope malformed retained`, the owner's
+// `codec.rs` cases 980/12 and 980/13 go red on
+// `assert_exactly_one_contour` and this target's supplementary emission
+// binding below goes red on the non-comment-line check.
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "the reachable-surface denial and the ten-label family inventory stay in one deterministic probe"
+    reason = "the reachable-surface denial, the production bound proof, the ten-label family inventory, and the supplementary emission binding stay in one deterministic probe"
 )]
 fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
     const MARKER: [&str; 5] = [
@@ -1583,10 +1657,25 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
     // live string LITERAL: a quoted occurrence would be an emittable label.
     const COLLAPSED: [&str; 2] = ["marker malformed retained", "envelope malformed retained"];
 
-    // Executed on production: what the reachable observer actually wrote is
-    // read back out of the real tracing subscriber, and neither a contour nor
-    // a collapsed name appears on the reachable surface.
-    let reachable = capture_emit(note_event_log_sink_status);
+    // PRIMARY (executed, real production seam): drive the codec path's one
+    // cross-boundary production call for real, plus one second real production
+    // record on the same facade as a liveness control, then read back exactly
+    // what production wrote.
+    //
+    // Why the control matters: `note_event_log_sink_status` returns early and
+    // writes nothing wherever the safe port is live (`host_diagnostics.rs:873`),
+    // so without a control record an empty capture would satisfy the denial
+    // below vacuously. The control record comes from the same real subscriber,
+    // so a non-zero capture is proven before any absence is claimed.
+    let reachable = capture_emit(|| {
+        note_event_log_sink_status();
+        observe_terminal_error("host-credential-unknown");
+    });
+    assert_eq!(
+        count_occurrences(&reachable, "host.terminal_error"),
+        1,
+        "the capture seam must carry real production output before any absence is claimed, got: {reachable}"
+    );
     for label in MARKER.iter().chain(ENVELOPE.iter()).chain(COLLAPSED.iter()) {
         assert!(
             !reachable.contains(label),
@@ -1597,6 +1686,32 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
         !reachable.contains("host.credential codec"),
         "no codec boundary leaked onto the reachable surface: {reachable}"
     );
+
+    // PRIMARY (executed, real production seam): the contour is only readable
+    // because production's own bounding keeps it whole. `bound_detail` is the
+    // exact production function `observe_entrypoint_with_detail` applies to
+    // every detail (`host_diagnostics.rs:588`), and it is what the codec's
+    // record passes through. If any contour record could lose its `reason=`
+    // tail to truncation, distinct causes would read as one cause again — the
+    // very collapse this split removed.
+    for boundary in [
+        "host.credential codec marker rejected",
+        "host.credential codec envelope rejected",
+    ] {
+        for contour in MARKER.iter().chain(ENVELOPE.iter()) {
+            let detail = format!("{boundary} reason={contour}");
+            let bounded = bound_detail(&detail);
+            assert!(
+                !bounded.truncated(),
+                "production would truncate the contour record {detail:?}"
+            );
+            assert_eq!(
+                bounded.text(),
+                detail,
+                "the emitted contour record must read back byte-for-byte"
+            );
+        }
+    }
 
     // Executed: one distinct label per contour member, so no two causes share a
     // name and the split cannot silently collapse back to a catch-all.
@@ -1625,9 +1740,11 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
         }
     }
 
-    // Supplementary emission binding: the ten contours are the owner's, emitted
-    // through its own closed `CodecRejectReason` discriminant behind the frozen
-    // boundary labels, with one observe call per branch.
+    // SUPPLEMENTARY (source-bound emission binding; the executed per-contour
+    // evidence is the owner's own cases 980/12 and 980/13, which no integration
+    // crate can reach). The ten contours are the owner's, emitted through its
+    // own closed `CodecRejectReason` discriminant behind the frozen boundary
+    // labels, with one observe call per branch.
     let codec = manifest_source("src/credential_control/codec.rs");
     for label in contours {
         assert!(
@@ -1640,6 +1757,21 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
             !codec.contains(&format!("\"{collapsed}\"")),
             "the collapsed catch-all {collapsed:?} must no longer be an emittable label"
         );
+        // Stronger than the quoted-literal check above: the collapsed name may
+        // survive as prose in the owner's change note, but it must appear on no
+        // EXECUTABLE line of the codec. A restored catch-all emits it from a
+        // live `credential_codec_observe` argument, never from a `//` line, so
+        // this is the assertion a revert of the split turns red.
+        for (number, line) in codec.lines().enumerate() {
+            let executable = line.trim_start().trim_start_matches('/').trim_start();
+            if !executable.starts_with('/') && !executable.starts_with('*') {
+                assert!(
+                    !line.contains(collapsed),
+                    "the collapsed catch-all {collapsed:?} is live on executable line {}: {line}",
+                    number + 1
+                );
+            }
+        }
     }
     for boundary in [
         "host.credential codec marker rejected",
