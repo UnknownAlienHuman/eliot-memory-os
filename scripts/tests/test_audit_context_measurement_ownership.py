@@ -2386,8 +2386,18 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
         row, same owner, same classification and status, is ``explicit-
         unresolved`` off the proven path and ``canonical-owner-consumer`` on it.
         An owner absent from the proof map entirely is likewise unproven, and the
-        owner of record is held to the same rule -- its reach is proved by its
-        definition site, so only rows AT a definition site may be canonical.
+        owner of record is held to the same rule -- its reach is proved at its
+        DECLARED scope, the exact ``source_paths`` the accepted frozen owner map
+        allocates to it, so only rows at a declared path may be canonical. A
+        declared path is not required to be a definition site: #704 declares four
+        exact files and defines the port in two of them, so a row at
+        ``receipt.rs`` or ``envelope.rs`` is inside its own scope with no
+        definition site at all. Its ``definition_paths`` still travels in the
+        record and is still the fact the single-definition-site finding is
+        derived from; it is simply not the scope the reach is asked at. A
+        ``canonical-port-owner`` record that names NO declared ``source_paths``
+        proves nothing at any path -- a proof lacking the scope must not fall
+        back to owner-scoping.
         """
         with _tree() as tree:
             tree.copy_producer()
@@ -2505,33 +2515,178 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
                 "another owner's proof must never satisfy this row's owner",
             )
 
-            # The owner of record has no closed dependency contract; its reach
-            # is proved by its definition SITE, which is at a path. It is held
-            # to exactly the same rule.
-            owner_proof = {
-                "#704": {
-                    "kind": "canonical-port-owner",
-                    "port_symbol": oracle.CANONICAL_MEASUREMENT_PORT,
-                    "definition_proved_by": "canonical-owner",
-                    "definition_paths": [proven_path],
-                }
-            }
-            owner_row = _row("704/1", owner="#704")
+            # The owner of record has no closed dependency contract and no
+            # self-dependency, so its canonical reach is proved at its DECLARED
+            # scope -- the exact ``source_paths`` the accepted frozen owner map
+            # allocates to it. It is held to exactly the same path-scoped rule.
+            #
+            # The record asserted against here is the MEASURED one, out of the
+            # real run's own ``result.dependency_proofs``, not a hand-built
+            # dict. :func:`evaluate` read the real owner map through the
+            # producer's accepted loader and bound that declared scope into the
+            # record; this test adds nothing to it and cannot widen it. Every
+            # path below is compared against the committed owner map loaded from
+            # the tree by that same accepted loader, so a path asserted canonical
+            # is a path the map really declares to #704.
+            producer_tree = oracle.load_producer(tree.root)
+            owner_proof = result.dependency_proofs["#704"]
             self.assertEqual(
-                oracle._derive_baseline_disposition(
-                    dict(owner_row, path=proven_path), owner_proof
-                ),
-                "canonical-owner-consumer",
-                "the owner's row at its own definition site is canonical",
+                owner_proof["kind"],
+                "canonical-port-owner",
+                "the owner of record's measured proof is a canonical-port-owner record",
+            )
+            owner_map, owner_map_state, _owner_map_digest = producer_tree.load_owner_map(
+                tree.root
+            )
+            self.assertEqual(
+                owner_map_state,
+                "SUPPLIED",
+                "the tree really supplied a frozen owner map to measure the scope from",
+            )
+            declared = set(owner_map["#704"]["source_paths"])
+            non_definition = sorted(declared - set(owner_proof["definition_paths"]))
+            self.assertEqual(
+                declared,
+                oracle._reach_scope(owner_proof),
+                "the measured reach scope IS the owner's declared owner-map allocation, "
+                "read out of the real map rather than restated by this test",
+            )
+            self.assertTrue(
+                non_definition,
+                "the settled semantics need a declared path with NO definition site of "
+                "its own, or the distinction being asserted does not exist: "
+                f"{sorted(declared)} vs {sorted(owner_proof['definition_paths'])}",
+            )
+            self.assertNotIn(
+                _SEAM_REL,
+                declared,
+                "the consumer seam fixture is not a path the owner map declares to #704",
+            )
+            owner_row = _row("704/1", owner="#704")
+
+            # (a) SETTLED BEHAVIOUR. A #704 row at a DECLARED path that carries
+            # NO definition site of its own IS canonical. Those spans
+            # (``envelope.rs`` / ``receipt.rs``) are not consumers of the
+            # measurement at all -- the dependency edge runs inbound from
+            # ``lib.rs`` -- but the issue says the formula is accepted "only in
+            # its OWNER", and the owner map's header forbids any glob or
+            # "anything under" scope, so the declared ``source_paths`` is the
+            # closed exact scope. Asserted against the measured record, so this
+            # is production behaviour and not a fixture's own invention.
+            for rel in non_definition:
+                self.assertEqual(
+                    oracle._derive_baseline_disposition(
+                        dict(owner_row, path=rel), result.dependency_proofs
+                    ),
+                    "canonical-owner-consumer",
+                    f"a #704 row at the declared, non-definition path {rel} IS inside "
+                    "the owner's scope and must reconcile as a canonical consumer",
+                )
+                self.assertTrue(
+                    oracle._canonical_reach_proven(
+                        "#704", rel, result.dependency_proofs
+                    )[0],
+                    f"the owner's measured reach is proved at its own declared path {rel}",
+                )
+            # The declaration is exact, not "anything under the owner's crate": a
+            # #704 row at a path the map allocates to a DIFFERENT owner is
+            # outside the owner's scope entirely.
+            declared_elsewhere = next(
+                rel
+                for other, paths in owner_map.items()
+                if other != "#704"
+                for rel in paths["source_paths"]
+            )
+            self.assertNotIn(
+                declared_elsewhere,
+                declared,
+                "the contrasting path belongs to another owner, not to #704",
             )
             self.assertEqual(
                 oracle._derive_baseline_disposition(
-                    dict(owner_row, path=unproven_path), owner_proof
+                    dict(owner_row, path=declared_elsewhere), result.dependency_proofs
                 ),
                 "explicit-unresolved",
-                "the owner of record is not proved by a definition site elsewhere in "
-                "its own crate",
+                f"a #704 row at {declared_elsewhere}, which the owner map declares to "
+                f"another owner, is outside the declared scope and stays unresolved",
             )
+            # And a path no owner declaration names at all is unresolved too.
+            self.assertEqual(
+                oracle._derive_baseline_disposition(
+                    dict(owner_row, path=unproven_path), result.dependency_proofs
+                ),
+                "explicit-unresolved",
+                "a #704 row at a path the owner map declares to nobody is outside the "
+                "declared scope and stays unresolved",
+            )
+
+            # (b) THE ORIGINAL DEFECT STAYS FIXED. The measured reach is asked at
+            # the row's OWN path, so a proof measured at one declared path is not
+            # inherited by a row at another path the owner does not declare.
+            for rel in sorted(declared):
+                trimmed = {"#704": dict(owner_proof, source_paths=[rel])}
+                self.assertEqual(
+                    oracle._derive_baseline_disposition(
+                        dict(owner_row, path=rel), trimmed
+                    ),
+                    "canonical-owner-consumer",
+                    f"narrowing the declared scope to {rel} must keep that path canonical",
+                )
+                self.assertEqual(
+                    oracle._derive_baseline_disposition(
+                        dict(owner_row, path=unproven_path), trimmed
+                    ),
+                    "explicit-unresolved",
+                    f"a proof declared at {rel} must not be inherited by a row at "
+                    f"{unproven_path}, which #704 does not declare",
+                )
+            # (c) FAIL CLOSED. A ``canonical-port-owner`` record carrying NO
+            # declared ``source_paths`` proves nothing at any path -- including at
+            # a definition site, and including at a declared one. The reader
+            # (:func:`_reach_scope`) is total over the kinds, so a record that
+            # omits the scope must not fall back to owner-scoping, and must not
+            # silently read the definition-site list as the scope either. This is
+            # the record shape the previous writer built by mistake, asserted
+            # now as the defect it is.
+            scopeless = {
+                "#704": {
+                    key: value
+                    for key, value in owner_proof.items()
+                    if key != "source_paths"
+                }
+            }
+            self.assertNotIn(
+                "source_paths",
+                scopeless["#704"],
+                "the scopeless record must genuinely carry no declared scope",
+            )
+            self.assertEqual(
+                oracle._reach_scope(scopeless["#704"]),
+                set(),
+                "a canonical-port-owner record with no declared source_paths has an "
+                "empty reach scope",
+            )
+            for rel in sorted(declared):
+                self.assertEqual(
+                    oracle._derive_baseline_disposition(
+                        dict(owner_row, path=rel), scopeless
+                    ),
+                    "explicit-unresolved",
+                    f"a scopeless owner proof must prove nothing even at the declared "
+                    f"path {rel}",
+                )
+                _scopeless_proven, scopeless_reason = oracle._canonical_reach_proven(
+                    "#704", rel, scopeless
+                )
+                self.assertFalse(
+                    _scopeless_proven,
+                    f"the scopeless proof must not be read as owner-scoped at {rel}",
+                )
+                self.assertIn(
+                    rel,
+                    scopeless_reason,
+                    "the unproven reason must name the row's own path",
+                )
             # And in the real run, every proof names at least one measured path,
             # and every row the real reconciliation called canonical sits at a
             # path its OWN owner's proof was measured at. That is the production
@@ -2543,7 +2698,6 @@ class ContextMeasurementOwnershipMatrix(unittest.TestCase):
                     f"proof for {owner} names no measured path, so it proves nothing "
                     "at any path",
                 )
-            producer_tree = oracle.load_producer(tree.root)
             live_rows = producer_tree._parse_toml(
                 tree.read_inventory_bytes(), source=_INVENTORY_REL
             )["rows"]
