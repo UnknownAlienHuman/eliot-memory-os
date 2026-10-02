@@ -627,6 +627,21 @@ mod pool_behavior_tests {
         adapter: Option<SurrealStoreAdapter>,
     }
 
+    /// One bootstrap provider paired with the kill-on-close Job Object lease
+    /// that must outlive it.
+    ///
+    /// This is the owner shape of
+    /// `tests/provider_kill_on_close_owner.rs::OwnerProvider`: the lease and the
+    /// child are one value, so the Job handle cannot leave scope while the
+    /// provider is still expected to be running - neither during the readiness
+    /// loop nor before the explicit stop. The Job still kills on close; holding
+    /// the lease is what defers that close past the stop.
+    struct BootstrapProvider {
+        #[expect(dead_code, reason = "the lease is held for its whole life, never read")]
+        lease: crate::provider_job::ProviderKillOnCloseLease,
+        child: Child,
+    }
+
     /// First genesis manifest entry: the same bootstrap the composition
     /// owner binds. Reproves `SurrealStoreAdapter::new_with_client_set`
     /// through the public constructor on every attempt.
@@ -707,24 +722,78 @@ mod pool_behavior_tests {
             // lease is held for this child's whole life, so an external kill of
             // the test process ends this provider too. A refused assignment
             // terminates and reaps the child; there is no unassigned fallback.
-            let (mut bootstrap, _kill_on_close) = crate::provider_job::launch_fixture_provider(
+            let (child, kill_on_close) = crate::provider_job::launch_fixture_provider(
+                // The child stays the async `tokio::process::Child` this
+                // fixture already drives: the readiness loop polls it and the
+                // explicit stop awaits it, and `configure_provider_command`
+                // arms the `Command`-level `kill_on_drop(true)` backstop on
+                // it. Spawning the `std` half instead would make `try_wait`
+                // blocking and would silently drop that backstop from the
+                // normal path of every test in this file.
                 || command.spawn(),
                 |child: &Child| child.id(),
-                |child: &mut Child| {
-                    let _kill_result = child.start_kill();
-                },
+                Self::refuse_bootstrap_child,
             )
             .expect("bootstrap child is admitted into its kill-on-close job");
+            // The lease is bound for the whole readiness window and for the
+            // explicit stop below, so the Job handle outlives the running
+            // child. Binding it to `_kill_on_close` would let it leave scope
+            // at the end of this block, and kill-on-close would then terminate
+            // the still-serving provider.
+            let mut bootstrap = BootstrapProvider {
+                lease: kill_on_close,
+                child,
+            };
+            Self::await_bootstrap_endpoint(&mut bootstrap, &config.provider_bind_address).await;
+            bootstrap.child.kill().await.expect("stop bootstrap");
+            bootstrap.child.wait().await.expect("reap bootstrap");
+            Self {
+                root,
+                config,
+                adapter: None,
+            }
+        }
+
+        /// The warm-up refusal step for `PoolHarness::provision`: terminates
+        /// AND waits, the property the shared `std` reaper gives the other
+        /// launch sites: `start_kill` alone leaves this handle unreaped.
+        /// `launch_fixture_provider` takes a synchronous `FnOnce(&mut Child)`,
+        /// so the wait cannot be `.await`ed - it is driven by the same
+        /// `try_wait` status this fixture already polls in the readiness loop,
+        /// bounded so a refused provider can never hang the test. The provider
+        /// itself still ends with its owner through the Job lease held beside
+        /// the child.
+        fn refuse_bootstrap_child(child: &mut Child) {
+            let _kill_result = child.start_kill();
+            let reap_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_exit_status)) => break,
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+
+        /// Bounded readiness wait for the warm-up provider: the staged binary
+        /// must stay alive and accept its endpoint before the bounded adapter
+        /// window begins. Takes the provider by mutable reference so its
+        /// kill-on-close lease keeps holding the Job handle for the whole wait
+        /// and for the explicit stop that follows it.
+        async fn await_bootstrap_endpoint(bootstrap: &mut BootstrapProvider, bind_address: &str) {
             let bootstrap_deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 assert!(
-                    bootstrap.try_wait().expect("bootstrap state").is_none(),
+                    bootstrap
+                        .child
+                        .try_wait()
+                        .expect("bootstrap state")
+                        .is_none(),
                     "staged provider exited during warm-up"
                 );
-                if TcpStream::connect(&config.provider_bind_address)
-                    .await
-                    .is_ok()
-                {
+                if TcpStream::connect(bind_address).await.is_ok() {
                     break;
                 }
                 assert!(
@@ -732,13 +801,6 @@ mod pool_behavior_tests {
                     "staged provider warm-up timed out"
                 );
                 sleep(Duration::from_millis(50)).await;
-            }
-            bootstrap.kill().await.expect("stop bootstrap");
-            bootstrap.wait().await.expect("reap bootstrap");
-            Self {
-                root,
-                config,
-                adapter: None,
             }
         }
 

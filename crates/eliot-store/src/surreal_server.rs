@@ -1435,9 +1435,49 @@ impl Drop for StartLock {
     }
 }
 
+/// Ends this value's server, whether or not the caller asked it to.
+///
+/// Releasing the client lease is the cooperative half and is all this drop can
+/// do on its own: a lease says "this runtime is done using the port", it does
+/// not end anything. The owned server is ended by TAKING the kill-on-close Job
+/// handle this value holds. Taking it, rather than leaving it to automatic field
+/// drop, is what makes the contract true by construction instead of by
+/// accident: closing the last handle to a `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+/// Job is the kernel's guarantee that every assigned process is terminated, so
+/// a `ReadySurrealServer` that is dropped - a failed assertion, an early `?`, a
+/// cancelled future, a fixture root going out of scope - cannot leave a
+/// `surreal.exe` holding the canonical data root and its bind port
+/// (issue #1888, package K-STORE; `I1.6`: "the process tree receives
+/// kill-on-close at its outer ownership boundary").
+///
+/// The take is `#[cfg(windows)]` because the handle only exists there; on
+/// other targets the lease release is the whole of this drop, exactly as
+/// before. Mirrors [`SpawnedServerFinalizer::drop`], which takes the same
+/// handle at the other end of the same launch.
+///
+/// A runtime that CONNECTED to a pre-existing server holds no Job here, so this
+/// drop leaves that server running. Ownership is the only thing that stops a
+/// process, and this drop acts on exactly the processes it owns.
+///
+/// This does not weaken - and does not replace - the existing explicit stop.
+/// [`Self::shutdown_if_spawned`] consumes `self`, stops the owned process on
+/// its own coordinated, drained path, and only THEN does this drop run. Closing
+/// a kill-on-close Job that no live process is assigned to ends nothing extra,
+/// so the two orderings agree: the coordinated stop is what a caller that asks
+/// for a stop gets, and the Job close underneath it is what guarantees the
+/// outcome - it also ends any descendant the coordinated stop did not reach.
+/// The case this drop newly covers is the one where nothing asked for a stop at
+/// all: a dropped server is ended by the Job whether or not its owner was ever
+/// going to call `shutdown_if_spawned`.
 impl Drop for ReadySurrealServer {
     fn drop(&mut self) {
         let _ = self.release_client_lease();
+        // The client lease must go FIRST. A lease still held by a runtime whose
+        // provider is already dead would make the next starter wait on a drain
+        // that can never complete, so the order here is part of the contract and
+        // not incidental.
+        #[cfg(windows)]
+        self.kill_on_close_job.take();
     }
 }
 

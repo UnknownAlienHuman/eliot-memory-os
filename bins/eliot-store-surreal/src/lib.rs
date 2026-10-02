@@ -222,7 +222,13 @@ fn map_adapter_error(error: AdapterError) -> StoreCompositionError {
         // contention, required migrations and unknown migration outcomes
         // share `Unavailable` here. Live migration paths keep their exact
         // outcome via `map_schema_bootstrap_error`.
-        AdapterError::ProviderUnavailable
+        //
+        // A refused kill-on-close Job assignment is the same class: the provider
+        // was never admitted to a kill domain, so the composition cannot
+        // proceed, and it must refuse rather than fall back to an uncontained
+        // launch.
+        AdapterError::LaunchJobAssignmentFailed { .. }
+        | AdapterError::ProviderUnavailable
         | AdapterError::AllocationContention { .. }
         | AdapterError::MigrationRequired
         | AdapterError::UnknownMigrationOutcome { .. } => {

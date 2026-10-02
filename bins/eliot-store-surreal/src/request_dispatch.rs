@@ -1437,13 +1437,12 @@ mod dreamer_dispatch_tests {
         // cannot outlive this fixture even when the test process is killed from
         // the outside and no `Drop` runs. A refused admission terminates and
         // reaps the child instead of continuing uncontained.
-        let (mut child, _kill_on_close) =
-            eliot_store_surreal_adapter::launch_fixture_provider(
-                || command.spawn(),
-                |child: &std::process::Child| Some(child.id()),
-                eliot_store_surreal_adapter::reap_refused_std_child,
-            )
-            .expect("preparation provider is admitted into its kill-on-close job");
+        let (mut child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+            || command.spawn(),
+            |child: &std::process::Child| Some(child.id()),
+            eliot_store_surreal_adapter::reap_refused_std_child,
+        )
+        .expect("preparation provider is admitted into its kill-on-close job");
         let deadline = std::time::Instant::now() + Duration::from_mins(1);
         loop {
             if std::net::TcpStream::connect(bind).is_ok() {

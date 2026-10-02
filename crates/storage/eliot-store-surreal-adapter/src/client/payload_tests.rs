@@ -32,6 +32,21 @@ struct Harness {
     adapter: Option<SurrealStoreAdapter>,
 }
 
+/// One bootstrap provider paired with the kill-on-close Job Object lease that
+/// must outlive it.
+///
+/// This is the owner shape of
+/// `tests/provider_kill_on_close_owner.rs::OwnerProvider`: the lease and the
+/// child are one value, so the Job handle cannot leave scope while the provider
+/// is still expected to be running - neither during the readiness loop nor
+/// before the explicit stop. The Job still kills on close; holding the lease is
+/// what defers that close past the stop.
+struct BootstrapProvider {
+    #[expect(dead_code, reason = "the lease is held for its whole life, never read")]
+    lease: crate::provider_job::ProviderKillOnCloseLease,
+    child: Child,
+}
+
 impl Harness {
     async fn start() -> Self {
         let port = TcpListener::bind("127.0.0.1:0")
@@ -101,7 +116,7 @@ impl Harness {
         // is held for this child's whole life, so an external kill of the test
         // process ends this provider too. A refused assignment terminates and
         // reaps the child; there is no unassigned fallback.
-        let (mut child, _kill_on_close) = crate::provider_job::launch_fixture_provider(
+        let (child, kill_on_close) = crate::provider_job::launch_fixture_provider(
             || command.spawn(),
             |child: &Child| child.id(),
             |child: &mut Child| {
@@ -109,10 +124,19 @@ impl Harness {
             },
         )
         .expect("bootstrap provider is admitted into its kill-on-close job");
+        // The lease is bound for the whole readiness window and for the
+        // explicit stop below, so the Job handle outlives the running child.
+        // Binding it to `_kill_on_close` would let it leave scope at the end of
+        // this block, and kill-on-close would then terminate the still-serving
+        // provider.
+        let mut provider = BootstrapProvider {
+            lease: kill_on_close,
+            child,
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
-                child.try_wait().expect("child status").is_none(),
+                provider.child.try_wait().expect("child status").is_none(),
                 "bootstrap exited"
             );
             if TcpStream::connect(&harness.config.provider_bind_address)
@@ -124,8 +148,8 @@ impl Harness {
             assert!(Instant::now() < deadline, "bootstrap bind timeout");
             sleep(Duration::from_millis(50)).await;
         }
-        child.kill().await.expect("stop bootstrap");
-        child.wait().await.expect("reap bootstrap");
+        provider.child.kill().await.expect("stop bootstrap");
+        provider.child.wait().await.expect("reap bootstrap");
         harness.open().await;
         println!(
             "ISSUE-10 provider={} sha256={} root={}",

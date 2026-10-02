@@ -125,11 +125,15 @@ pub struct ProviderKillOnCloseLease {
 /// Installs the single launch path: spawn, then admit, with no unassigned
 /// fallback, and return the retained lease.
 ///
-/// The Job is created before `spawn()` so a Job refusal costs nothing, and the
-/// child is assigned immediately after `spawn()` and before the provider is
-/// used, so there is no window in which a running provider is uncontained.
-/// `spawn` supplies the platform-specific `spawn()`/`id()` pair so one path
-/// serves both the Tokio-backed adapter and the `std`-backed test fixtures.
+/// [`ProviderKillDomain::admit_spawned`] runs AFTER `spawn()`, and it owns Job
+/// creation and assignment as one step, so the child is admitted as soon as it
+/// exists and before the provider is ever used. The cost of that ordering is
+/// that the interval between `spawn()` and admission is the one moment a
+/// provider runs uncontained; a refusal inside that interval terminates the
+/// child through `refuse` instead of returning it, so no unassigned launch
+/// survives either way. `spawn` supplies the platform-specific `spawn()`/`id()`
+/// pair so one path serves both the Tokio-backed adapter and the `std`-backed
+/// test fixtures.
 ///
 /// # Errors
 ///

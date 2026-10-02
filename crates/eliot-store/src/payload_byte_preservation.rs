@@ -71,6 +71,8 @@ use crate::canonical_store::envelope_with_text_fragments;
 use crate::surreal_server::assign_owned_server_to_kill_on_close_job;
 #[cfg(all(test, feature = "live-edge"))]
 use crate::{CanonicalClaimCard, CanonicalStore, CanonicalToolObservation, DbClientSet};
+#[cfg(all(test, feature = "live-edge"))]
+use eliot_platform_windows::JobObject;
 use eliot_types::{
     AgentId, ClaimCardInput, ClaimId, EpistemicStatus, EvidenceAtomInput, EvidenceId,
     FailureFingerprintInput, IdempotencyOptions, LifecycleStatus, LifecycleWriteOptions,
@@ -78,8 +80,6 @@ use eliot_types::{
     TaintClass, TaskContractInput, TaskContractStatus, TaskId, ToolObservationInput,
     VerificationId, VerificationResult, VerificationRunInput, Visibility, WriteId,
 };
-#[cfg(all(test, feature = "live-edge"))]
-use eliot_platform_windows::JobObject;
 #[cfg(all(test, feature = "live-edge"))]
 use eliot_types::{FetchAtomsL2Request, GovernorConfig, ProjectSequence, ReadConsistencyMode};
 #[cfg(all(test, feature = "live-edge"))]

@@ -40,22 +40,24 @@ pub(crate) struct ProviderOwner {
     /// outside and no `Drop` runs.
     ///
     /// It is held in a `Mutex` for a type reason, not for concurrency: the
-    /// owning crate declares `JobObject` `Send` but deliberately NOT `Sync`
-    /// (`crates/kernel/eliot-platform-windows/src/process_job.rs:326-328`,
-    /// "a Job Object handle is process-global and uniquely owned here"). This
-    /// owner must be `Sync` because `Arc<ProviderOwner>` reaches the adapter's
-    /// port bounds, so the lease is wrapped exactly as `provider_child: Mutex<Child>`
-    /// is - the same treatment the same owner already gives its other
-    /// process-owned handle.
+    /// owning crate gives `JobObject` an `unsafe impl Send` and deliberately no
+    /// `unsafe impl Sync`, on the stated grounds that "a Job Object handle is
+    /// process-global and uniquely owned here". This owner must be `Sync`
+    /// because `Arc<ProviderOwner>` reaches the adapter's port bounds, so the
+    /// lease is wrapped exactly as `provider_child: Mutex<Child>` is - the same
+    /// treatment the same owner already gives its other process-owned handle.
     ///
-    /// The lease is never READ; it is held for its `Drop`, and that `Drop` is
-    /// the whole mechanism - closing the last handle to a kill-on-close Job
-    /// terminates every process assigned to it. Taking it away or forgetting it
-    /// would defeat the guarantee, so it is stored unconditionally for the
-    /// owner's whole life.
+    /// The lease is never READ; it is held so its Job handle outlives the
+    /// child. The mechanism is NOT this `Drop`: closing the last handle to a
+    /// kill-on-close Job terminates every process assigned to it, and Windows
+    /// closes that handle when the owning process ends for any reason,
+    /// including an external kill that runs no destructor. That kernel-side
+    /// close is what ends the provider with this owner, which is why taking the
+    /// lease away or forgetting it would defeat the guarantee, and why it is
+    /// stored unconditionally for the owner's whole life.
     #[expect(
         dead_code,
-        reason = "held for Drop: closing the kill-on-close Job ends the provider with its owner"
+        reason = "never read: the retained Job handle is what ends the provider with its owner"
     )]
     pub(crate) kill_on_close_job: Mutex<ProviderKillOnCloseLease>,
     data_root_lease: StoreDataRootLease,

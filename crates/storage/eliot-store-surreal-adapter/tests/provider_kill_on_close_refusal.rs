@@ -41,8 +41,6 @@ use eliot_store_surreal_adapter::{
     spawn_provider_kill_on_close,
 };
 
-type RefusalResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-
 /// Interval at which liveness is re-read from the operating system.
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -157,7 +155,7 @@ fn poll_until_absent(process_id: u32) -> bool {
 /// The documented pid-0 `assign_process` refusal surfaces as the typed launch
 /// refusal, and admission never yields a usable kill domain.
 #[test]
-fn assign_process_refuses_pid_zero_with_typed_launch_refusal() -> RefusalResult {
+fn assign_process_refuses_pid_zero_with_typed_launch_refusal() {
     // `expect_err` would require `ProviderKillDomain: Debug`, and it
     // deliberately implements none - a live Job handle must not be printable.
     // The success value is therefore discarded explicitly and the refusal is
@@ -189,13 +187,12 @@ fn assign_process_refuses_pid_zero_with_typed_launch_refusal() -> RefusalResult 
         admitted.is_err(),
         "admit(0) must never produce a kill domain"
     );
-    Ok(())
 }
 
 /// A refused launch returns a typed error and leaves no provider running: the
 /// launch path reaps the provider it already spawned.
 #[test]
-fn refused_launch_reaps_provider_and_returns_typed_refusal() -> RefusalResult {
+fn refused_launch_reaps_provider_and_returns_typed_refusal() {
     let sandbox = Sandbox::new("launch-refusal");
     let image = provider_image(sandbox.path());
     let mut command = Command::new(&image);
@@ -264,5 +261,4 @@ fn refused_launch_reaps_provider_and_returns_typed_refusal() -> RefusalResult {
         poll_until_absent(refused_pid),
         "the refused launch must leave no provider running (pid {refused_pid})"
     );
-    Ok(())
 }

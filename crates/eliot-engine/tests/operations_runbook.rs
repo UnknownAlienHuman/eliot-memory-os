@@ -385,6 +385,10 @@ struct IsolatedSurreal {
     /// what ends the provider when this owner ends. `Drop` order runs
     /// `IsolatedSurreal::stop` first, so the child is killed and reaped
     /// explicitly before that close.
+    #[expect(
+        dead_code,
+        reason = "the lease is held for the provider's whole life, never read: dropping it is what ends the provider"
+    )]
     kill_on_close: ProviderKillOnCloseLease,
 }
 

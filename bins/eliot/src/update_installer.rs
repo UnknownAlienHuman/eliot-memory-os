@@ -3,7 +3,8 @@
 //! Update packages are installed into new versioned directories; the installer
 //! never overwrites a running binary. Whether the update target is running is
 //! observed from a live process snapshot before any filesystem effect, not
-//! asserted by the operator. The only declared channels are `stable`,
+//! asserted by the operator, and an observed running target refuses the whole
+//! install. The only declared channels are `stable`,
 //! `preview`, and `local-dev`. Kernel/Host updates are release-level
 //! operations requiring the release approval path, while optional module
 //! updates are normal hot-generation operations carrying explicit
@@ -213,9 +214,9 @@ pub struct InstallUpdateRequest<'a> {
     /// [`running_binary_would_be_overwritten`] reads this path, and the live
     /// snapshot search behind [`UpdateRecord::running_target`] additionally
     /// covers its basename when it differs from the staged executable name.
-    /// The two mechanisms stay independent: nothing branches on
-    /// `running_target`, and activation — where the observation would have to
-    /// be enforced — is owned outside this module.
+    /// The two mechanisms stay independent, and neither depends on this field:
+    /// `install_update` gates on the observed `running_target` itself, so
+    /// omitting this declaration never removes the running-binary refusal.
     pub running_executable: Option<&'a Path>,
     /// Package metadata for the update.
     pub package: &'a PackageMetadata,
@@ -375,15 +376,22 @@ pub fn observe_running_executable(
 /// [`UpdateInstallerError::RunningObservationFailed`]. `NotRunning` still
 /// proves only that no live process carries a searched basename, and
 /// `request.previous_version_dir` (where the running copy usually lives) is
-/// not consulted. The observation is recorded, not enforced: nothing here
-/// branches on it, and activation — the point at which it would have to
-/// gate — is owned outside this module.
+/// not consulted.
+///
+/// The observation **gates** the install: an observed
+/// [`RunningTargetObservation::Running`] refuses the whole install with
+/// [`UpdateInstallerError::RunningBinaryWouldBeOverwritten`] naming the staged
+/// executable path, whether or not `request.running_executable` is set.
+/// Declaring a running path is never required for the refusal, and no
+/// declaration can override it: the snapshot is fail-closed, so `NotRunning` is
+/// never synthesized without a completed process snapshot. That refusal
+/// precedes every filesystem effect, including the versioned-directory fence.
 ///
 /// Separately and independently, when `request.running_executable` resolves to
 /// the staged executable path or its parent versioned directory, installation
-/// fails closed with
-/// [`UpdateInstallerError::RunningBinaryWouldBeOverwritten`]. Kernel/Host
-/// packages fail closed without `release_approved`.
+/// also fails closed with
+/// [`UpdateInstallerError::RunningBinaryWouldBeOverwritten`] naming the
+/// declared path. Kernel/Host packages fail closed without `release_approved`.
 ///
 /// # Errors
 ///
@@ -431,6 +439,19 @@ pub fn install_update(
         if matches!(declared, RunningTargetObservation::Running { .. }) {
             running_target = declared;
         }
+    }
+    // Enforce the observation, not just the declaration: a live process
+    // carrying the staged executable's basename — or a declared different
+    // basename that a completed snapshot also found live — refuses the whole
+    // install. The snapshot is fail-closed, so an `Ok` observation always rests
+    // on a completed process snapshot; there is no caller-supplied override,
+    // and the refusal lands before `versioned_dir` staging and before the
+    // versioned-directory fence below, so it is distinguishable from the
+    // structural refusal.
+    if matches!(running_target, RunningTargetObservation::Running { .. }) {
+        return Err(UpdateInstallerError::RunningBinaryWouldBeOverwritten {
+            path: executable_path.display().to_string(),
+        });
     }
     if let Some(running) = request.running_executable
         && running_binary_would_be_overwritten(running, &executable_path)
@@ -611,27 +632,72 @@ mod tests {
 
     #[test]
     fn reinstall_over_running_binary_fails_closed() {
+        // The staged versioned directory is deliberately absent, so the
+        // structural `VersionedDirExists` fence cannot be what refuses here:
+        // the only refusal this scenario can reach is the running-binary one.
+        // A live process carrying `example-module.exe` stands in for the
+        // running copy, which is what a declaration-only guard misses.
+        assert!(
+            matches!(
+                observe_running_executable(Path::new("example-module.exe")),
+                Ok(RunningTargetObservation::Running { .. })
+            ),
+            "the proof process must be observed as running for this scenario to cover anything"
+        );
+
         let root = unique_root("guard");
         let running_dir = versioned_dir(&root, "example-module", "2.0.0");
-        std::fs::create_dir_all(&running_dir).expect("create running version dir");
         let running_exe = running_dir.join(staged_executable_name("example-module"));
-        std::fs::write(&running_exe, b"running").expect("write running exe");
-
         let package = test_package("example-module", "2.0.0", UpdateChannel::Preview);
-        let request = InstallUpdateRequest {
+
+        // Declaring no running executable must not remove the refusal: the
+        // observed snapshot alone has to gate the install.
+        let undeclared = InstallUpdateRequest {
             install_root: &root,
-            running_executable: Some(&running_exe),
+            running_executable: None,
             package: &package,
             payload: b"overwrite-attempt",
             previous_version_dir: None,
             release_approved: false,
         };
-        let error = install_update(&request).expect_err("must refuse overwrite");
-        assert!(matches!(
+        let observed = install_update(&undeclared).expect_err("must refuse overwrite");
+        assert!(
+            matches!(
+                observed,
+                UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. }
+            ),
+            "an observed running target must refuse with \
+             RunningBinaryWouldBeOverwritten, got: {observed:?}"
+        );
+        assert_eq!(
+            observed,
+            UpdateInstallerError::RunningBinaryWouldBeOverwritten {
+                path: versioned_dir(&root, "example-module", "2.0.0")
+                    .join(staged_executable_name("example-module"))
+                    .display()
+                    .to_string(),
+            }
+        );
+        assert!(
+            !root.exists(),
+            "the refusal must precede every filesystem effect"
+        );
+
+        // A declaration naming the same parent versioned directory takes the
+        // path-identity refusal instead; it stays the structural case.
+        std::fs::create_dir_all(&running_dir).expect("create running version dir");
+        std::fs::write(&running_exe, b"running").expect("write running exe");
+        let declared = InstallUpdateRequest {
+            running_executable: Some(&running_exe),
+            ..undeclared
+        };
+        let error = install_update(&declared).expect_err("must refuse overwrite");
+        assert_eq!(
             error,
-            UpdateInstallerError::RunningBinaryWouldBeOverwritten { .. }
-                | UpdateInstallerError::VersionedDirExists { .. }
-        ));
+            UpdateInstallerError::RunningBinaryWouldBeOverwritten {
+                path: running_exe.display().to_string(),
+            }
+        );
         assert_eq!(
             std::fs::read(&running_exe).expect("read"),
             b"running".as_slice()

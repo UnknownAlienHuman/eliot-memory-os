@@ -20,6 +20,21 @@
 //! returns [`PortError::Unavailable`]: unknown authority is never manufactured
 //! as ready.
 //!
+//! ## Required outer kill domain (I1.6, issue #1888 / AUD5)
+//!
+//! Launching from this port is a Kernel-child launch, so the child must enter
+//! the Host-owned Kernel outer Job Object exactly as every other production
+//! Kernel-child caller does. An admitted [`ProcessRequest`] carries no Job
+//! Object binding, so the request alone can never prove that membership: the
+//! same owner that stages the admitted request stages the exact Host-issued
+//! outer Job Object binding through
+//! [`WasmP03ProcessAdapter::stage_kernel_outer_job_binding`], and `start`
+//! reaches [`WindowsProcessExecutor::start_with_kernel_outer_job_binding`] —
+//! the one required-binding production entry point — with it. The binding is
+//! never derived, opened, or named here: when the slot is empty the launch
+//! surfaces [`PortError::Unavailable`] before any child exists, which is the
+//! fail-closed outcome for a caller that has no Host-issued binding to give.
+//!
 //! The adapter keeps no operation registry, no job table, and spawns no child
 //! directly: `start`, `cancel`, and `reconcile` delegate verbatim to the
 //! injected executor, which remains the sole owner of process state. The async
@@ -72,6 +87,9 @@ const RECONCILE_OBSERVE_POLL: Duration = Duration::from_millis(25);
 
 use crate::WindowsProcessExecutor;
 
+#[cfg(windows)]
+use eliot_platform_windows::RecoverableJobBinding;
+
 /// Owner-blessed A-12 P-03 adapter fronting the real process executor.
 ///
 /// Construct with the production [`WindowsProcessExecutor`] (wired to the
@@ -85,6 +103,15 @@ pub struct WasmP03ProcessAdapter {
     executor: Arc<WindowsProcessExecutor>,
     sink: Arc<dyn ProcessEvidenceSink>,
     staged: Mutex<Option<ProcessRequest>>,
+    /// The exact Host-issued outer Job Object binding for the next launch.
+    ///
+    /// It is staged beside the admitted request by the same owner, because
+    /// the admitted request alone proves nothing about outer kill-domain
+    /// membership (issue #1888 / I1.6). One slot serves one launch and is
+    /// consumed by it, exactly like the admission slot: a binding can never
+    /// serve a second invocation.
+    #[cfg(windows)]
+    outer_binding: Mutex<Option<RecoverableJobBinding>>,
 }
 
 impl WasmP03ProcessAdapter {
@@ -94,6 +121,8 @@ impl WasmP03ProcessAdapter {
             executor,
             sink,
             staged: Mutex::new(None),
+            #[cfg(windows)]
+            outer_binding: Mutex::new(None),
         }
     }
 
@@ -130,6 +159,62 @@ impl WasmP03ProcessAdapter {
         let mut staged = self.staged.lock().map_err(|_| PortError::UnknownOutcome)?;
         staged.take().ok_or(PortError::Unavailable)
     }
+
+    /// Stages the exact Host-issued outer Job Object binding for the next
+    /// launch.
+    ///
+    /// This is the outer half of the launch tuple the Kernel lane already
+    /// assembles for its own gateway launches: the admitted request proves the
+    /// intent, the permit and the one-shot nonce, while only this binding
+    /// proves which outer kill domain the child enters. The adapter never
+    /// opens, derives, or names a Job Object on its own — it forwards exactly
+    /// what its owner retained, and the platform revalidates that exact
+    /// binding (and the actual suspended child's membership in it) before
+    /// resume.
+    ///
+    /// Staging follows the admission slot's rule: a second stage without an
+    /// intervening `start` is rejected, so one Host-issued binding can serve
+    /// exactly one child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContractError`] when the slot is already occupied or the
+    /// slot lock is poisoned. No child material is consumed by the refusal.
+    #[cfg(windows)]
+    pub fn stage_kernel_outer_job_binding(
+        &self,
+        outer_binding: RecoverableJobBinding,
+    ) -> Result<(), ContractError> {
+        let mut staged = self
+            .outer_binding
+            .lock()
+            .map_err(|_| ContractError::InvalidValue {
+                field: "wasm_p03_outer_binding_slot",
+                reason: "outer binding slot lock poisoned",
+            })?;
+        if staged.is_some() {
+            return Err(ContractError::DuplicateValue {
+                field: "wasm_p03_outer_binding_slot",
+            });
+        }
+        *staged = Some(outer_binding);
+        Ok(())
+    }
+
+    /// Takes the staged outer Job Object binding for one launch.
+    ///
+    /// An unstaged slot is [`PortError::Unavailable`], never a defaulted or
+    /// synthesised binding: with no Host-issued binding in hand there is no
+    /// proven outer kill domain for this child, so the launch is unavailable
+    /// rather than permitted outside the Kernel Job Object.
+    #[cfg(windows)]
+    fn take_outer_binding(&self) -> Result<RecoverableJobBinding, PortError> {
+        let mut staged = self
+            .outer_binding
+            .lock()
+            .map_err(|_| PortError::UnknownOutcome)?;
+        staged.take().ok_or(PortError::Unavailable)
+    }
 }
 
 impl P03ProcessPort for WasmP03ProcessAdapter {
@@ -142,9 +227,32 @@ impl P03ProcessPort for WasmP03ProcessAdapter {
         Ok(staged)
     }
 
+    /// Starts the admitted child inside the Host-owned Kernel outer Job.
+    ///
+    /// This reaches [`WindowsProcessExecutor::start_with_kernel_outer_job_binding`],
+    /// the same required-binding production API every other Kernel-child
+    /// caller uses, so the child lands in the Host-owned Kernel Job Object
+    /// plus its fresh per-attempt nested Job — never in a binding-free
+    /// per-attempt Job alone.
     fn start(&mut self, request: ProcessRequest) -> Result<ProcessStartReceipt, PortError> {
         let sink = Arc::clone(&self.sink);
-        drive_blocking(self.executor.start(request, sink)).map_err(|error| map_start_error(&error))
+        #[cfg(windows)]
+        {
+            let outer_binding = self.take_outer_binding()?;
+            self.executor
+                .start_with_kernel_outer_job_binding(request, sink, outer_binding, None)
+                .map_err(|error| map_start_error(&error))
+        }
+        #[cfg(not(windows))]
+        {
+            // Off Windows there is no Job Object and so no outer kill domain to
+            // prove. The admission cannot substitute for one, and no other
+            // launch shape exists on this target, so this port is unavailable
+            // rather than uncontained.
+            let _ = (request, sink);
+            Err(PortError::Unavailable)
+        }
+        .map_err(|error| map_start_error(&error))
     }
 
     fn cancel(&mut self, binding: &ProcessBinding) -> Result<CancellationReceipt, PortError> {

@@ -248,11 +248,11 @@ pub(crate) use process_identity::{
 #[cfg(windows)]
 pub use process_job::OuterKillDomain;
 pub use process_job::{
-    ExistingJobMemberObservation, JobObject, JobObjectIdentity, JobObjectLimits, JobObservationGap,
-    JobProcessHistory, PinnedRuntimeFile, ProcessObservation, RecoverableJobBinding,
-    RecoverableJobObject, RunningExistingJobChild, RunningJobChild, RunningJobObservation,
-    SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild, SuspendedJobChild,
-    SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
+    ExecutionIdentityMode, ExistingJobMemberObservation, JobObject, JobObjectIdentity,
+    JobObjectLimits, JobObservationGap, JobProcessHistory, PinnedRuntimeFile, ProcessObservation,
+    RecoverableJobBinding, RecoverableJobObject, RunningExistingJobChild, RunningJobChild,
+    RunningJobObservation, SUSPENDED_LAUNCH_STDIN_LIMIT, SuspendedExistingJobChild,
+    SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence, SuspendedValidationError,
     TerminatedExistingJobChild, TerminatedJobChild, ValidatedSuspendedExistingJobChild,
     ValidatedSuspendedJobChild, cancel_capture_thread_io,
 };
