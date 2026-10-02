@@ -214,14 +214,18 @@ enum RollbackIdentity<'a> {
 /// at this call site, or `RollbackIdentity::Unavailable` while it holds none:
 /// no digest is recomputed, re-derived, or fabricated here, and no slot makes
 /// this a second authority owner — it decides nothing and runs no probe.
-struct RollbackOperationIdentity<'a> {
+///
+/// Each slot owns the digest TEXT the owner already computed once at this call
+/// site, exactly as `PhaseBAuthorityIdentity` does, so the record outlives the
+/// owner local it was bound from and no borrow keeps a handle in place.
+struct RollbackOperationIdentity {
     /// Digest of the retained rollback sidecar bytes read for this operation.
-    backup: Option<&'a str>,
+    backup: Option<String>,
     /// Digest of the live destination content observed for this operation.
-    current: Option<&'a str>,
+    current: Option<String>,
 }
 
-impl<'a> RollbackOperationIdentity<'a> {
+impl RollbackOperationIdentity {
     /// The identity group of a contour that runs before its owner computed any
     /// digest. Both slots then render the explicit missing-evidence
     /// disposition.
@@ -235,27 +239,27 @@ impl<'a> RollbackOperationIdentity<'a> {
     /// Binds the exact `PlatformHandle` digest of the sidecar bytes the owner
     /// already read and recorded, so two rollbacks of the same profile over
     /// different material produce different records.
-    fn bind_backup_digest(&mut self, digest: &'a PlatformHandle) {
-        self.backup = Some(digest.as_str());
+    fn bind_backup_digest(&mut self, digest: &PlatformHandle) {
+        self.backup = Some(digest.as_str().to_owned());
     }
 
     /// Binds the exact `PlatformHandle` digest of the destination content the
     /// owner already read and recorded.
-    fn bind_current_digest(&mut self, digest: &'a PlatformHandle) {
-        self.current = Some(digest.as_str());
+    fn bind_current_digest(&mut self, digest: &PlatformHandle) {
+        self.current = Some(digest.as_str().to_owned());
     }
 
     /// The frozen rollback key set, projected 1:1.
-    fn slots(&self) -> [(&'static str, RollbackIdentity<'a>); 2] {
+    fn slots(&self) -> [(&'static str, RollbackIdentity<'_>); 2] {
         [
-            ("backup", Self::slot(self.backup)),
-            ("current", Self::slot(self.current)),
+            ("backup", Self::slot(self.backup.as_deref())),
+            ("current", Self::slot(self.current.as_deref())),
         ]
     }
 
     /// Projects one slot as the exact bound value or the explicit
     /// missing-evidence disposition; never a fabricated literal.
-    fn slot(value: Option<&'a str>) -> RollbackIdentity<'a> {
+    fn slot(value: Option<&str>) -> RollbackIdentity<'_> {
         if let Some(text) = value {
             RollbackIdentity::Bound(text)
         } else {
@@ -286,7 +290,7 @@ const fn rollback_profile_label(profile: Option<&InstallationProfile>) -> &'stat
 fn rollback_backup_observe_bound(
     contour: RollbackContour,
     profile: Option<&InstallationProfile>,
-    identity: &RollbackOperationIdentity<'_>,
+    identity: &RollbackOperationIdentity,
 ) {
     rollback_backup_note_event_log_unavailable();
     let mut detail = String::from(contour.label());
