@@ -9546,6 +9546,10 @@ pub(crate) fn bridge_hook_from_payload(
         .get("event_envelope")
         .cloned()
         .ok_or(TransportError::SessionFenced)?;
+    let presented_event_digest = payload
+        .get("envelope_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
     let event: EventEnvelope =
         serde_json::from_value(event_value).map_err(|_| TransportError::SessionFenced)?;
     event
@@ -9554,6 +9558,44 @@ pub(crate) fn bridge_hook_from_payload(
     event
         .require_known_payload_type()
         .map_err(|_| TransportError::SessionFenced)?;
+    let event_bytes = eliot_contracts::canonical_json_bytes(&event)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let event_digest = eliot_contracts::sha256_hex(&event_bytes);
+    let normalized = hook_value
+        .get("normalized")
+        .ok_or(TransportError::SessionFenced)?;
+    let producer_id = normalized
+        .get("producer_adapter_identity")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let normalized_event_id = normalized
+        .get("event_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    let normalized_sequence = normalized
+        .get("sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(TransportError::SessionFenced)?;
+    let lineage = normalized
+        .get("lineage")
+        .ok_or(TransportError::SessionFenced)?;
+    let native = lineage
+        .get("SessionObservation")
+        .and_then(|observation| observation.get("native"))
+        .or_else(|| {
+            lineage
+                .get("ExecutionUnitObservation")
+                .and_then(|observation| observation.get("binding"))
+                .and_then(|binding| binding.get("native_session"))
+        })
+        .ok_or(TransportError::SessionFenced)?;
+    let stream_id = native
+        .get("Native")
+        .and_then(|locator| locator.get("locator"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
     let source = match &event.payload_or_blob_ref {
         eliot_protocol::EventPayload::Inline(payload) => match payload.as_ref() {
             ProtocolPayload::Json(value) => value,
@@ -9563,7 +9605,13 @@ pub(crate) fn bridge_hook_from_payload(
             return Err(TransportError::SessionFenced);
         }
     };
-    if source != &hook_value
+    if presented_event_digest != event_digest
+        || event.payload_type != eliot_protocol::NORMALIZED_HOST_EVENT_PAYLOAD_TYPE
+        || event.producer_id != producer_id
+        || event.stream_id != stream_id
+        || normalized_event_id != event_id
+        || normalized_sequence != sequence
+        || source != &hook_value
         || event.event_id != event_id
         || event.sequence != sequence
         || event.delivery_class != DeliveryClass::DurableObservation
