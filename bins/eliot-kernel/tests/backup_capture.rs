@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput,
     CanonicalRecord, EventRange, ExportFence, HostStateAuditFence, OrsSnapshotFence,
-    PublicationError, WatchdogSpoolFence,
+    PublicationError, SchemaGenerationObservation, SourceObservation, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
@@ -284,6 +284,13 @@ fn valid_full_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-full".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: fixture.schema_generation.clone(),
+                observation: SourceObservation {
+                    observed_by: fixture.source_adapter.clone(),
+                    observed_at: fence.clone(),
+                },
+            }),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: None,
@@ -325,6 +332,13 @@ fn degraded_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-degraded".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: fixture.schema_generation.clone(),
+                observation: SourceObservation {
+                    observed_by: fixture.source_adapter.clone(),
+                    observed_at: fence.clone(),
+                },
+            }),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: None,
@@ -363,6 +377,13 @@ fn scope_input() -> BackupInput {
         schema_generation: fixture.schema_generation.clone(),
         export_fence: ExportFence {
             export_id: "export-959-scope".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: fixture.schema_generation.clone(),
+                observation: SourceObservation {
+                    observed_by: fixture.source_adapter.clone(),
+                    observed_at: fence.clone(),
+                },
+            }),
             store_generation: fixture.store_generation.clone(),
             state_fence: fence.clone(),
             scope_id: Some(

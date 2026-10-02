@@ -32,7 +32,7 @@ fn path_str(path: &Path) -> TestResult<&str> {
 fn write_degraded_bundle(path: &Path) -> TestResult {
     use eliot_backup::{
         BackupArtifact, BackupBundle, BackupClass, BackupInput, EventRange, ExportFence,
-        WatchdogSpoolFence,
+        SchemaGenerationObservation, SourceObservation, WatchdogSpoolFence,
     };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
     use std::num::NonZeroU64;
@@ -61,6 +61,13 @@ fn write_degraded_bundle(path: &Path) -> TestResult {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-cli".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "schema-1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter".to_owned(),
+                    observed_at: source_fence.clone(),
+                },
+            }),
             store_generation: "store-cli".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,
@@ -225,7 +232,7 @@ fn backup_restore_preview_derives_bindings_from_bundle_file() -> TestResult {
 fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
     use eliot_backup::{
         BackupArtifact, BackupClass, BackupInput, CanonicalRecord, EventRange, ExportFence,
-        OrsSnapshotFence, WatchdogSpoolFence,
+        OrsSnapshotFence, SchemaGenerationObservation, SourceObservation, WatchdogSpoolFence,
     };
     use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
     use eliot_security_contracts::{PurgeLedgerEntry, PurgeLocation, PurgeState};
@@ -315,6 +322,13 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
         };
         ExportFence {
             export_id: "export-cli".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "schema-1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter".to_owned(),
+                    observed_at: fence(),
+                },
+            }),
             store_generation: "store-cli".to_owned(),
             state_fence: fence(),
             scope_id: None,

@@ -11,7 +11,9 @@
 use std::error::Error;
 use std::num::NonZeroU64;
 
-use eliot_backup::{BackupError, EventRange, ExportFence};
+use eliot_backup::{
+    BackupError, EventRange, ExportFence, SchemaGenerationObservation, SourceObservation,
+};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use serde::Deserialize;
 
@@ -55,6 +57,13 @@ fn fence() -> StateFence {
 fn consumer_fence(range: EventRange) -> ExportFence {
     ExportFence {
         export_id: "export-862".to_owned(),
+        schema_generation: Some(SchemaGenerationObservation {
+            generation: "schema-1".to_owned(),
+            observation: SourceObservation {
+                observed_by: "test-adapter".to_owned(),
+                observed_at: fence(),
+            },
+        }),
         store_generation: "store-862".to_owned(),
         state_fence: fence(),
         scope_id: None,

@@ -12,7 +12,8 @@ use std::num::NonZeroU64;
 use eliot_backup::{
     BackupArtifact, BackupBundle, BackupClass, BackupCreateArgs, BackupError, BackupInput,
     EventRange, ExportFence, OrsSnapshotFence, RestoreContext, RestoreEvidenceLevel,
-    WatchdogSpoolFence, parse_backup_class, preview_backup_create, preview_restore,
+    SchemaGenerationObservation, SourceObservation, WatchdogSpoolFence, parse_backup_class,
+    preview_backup_create, preview_restore,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 
@@ -50,6 +51,13 @@ fn full_input() -> BackupInput {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-1873c".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "schema-1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter".to_owned(),
+                    observed_at: source_fence.clone(),
+                },
+            }),
             store_generation: "store-1873c".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,

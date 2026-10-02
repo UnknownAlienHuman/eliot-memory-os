@@ -27,8 +27,8 @@ use eliot_backup::{
     RestoreEvidence, RestoreEvidenceLevel, RestoreIntent, RestoreJournalPort, RestoreJournalRecord,
     RestoreJournalState, RestoreObligationState, RestoreObligations, RestoreOwnerEpoch,
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreProvenance, RestoreReceipt,
-    RestoreReconciliation, RestoreTarget, RestoredFence, WatchdogSpoolFence,
-    suspended_recovery_entries,
+    RestoreReconciliation, RestoreTarget, RestoredFence, SchemaGenerationObservation,
+    SourceObservation, WatchdogSpoolFence, suspended_recovery_entries,
 };
 use eliot_blob_api::{
     BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor, ObjectResidencyKey,
@@ -302,6 +302,13 @@ fn bundle_input(class: BackupClass, with_ors: bool, scoped: bool) -> BackupInput
         schema_generation: manifest_string(&manifest, "schema_generation"),
         export_fence: ExportFence {
             export_id: manifest_string(&manifest, "export_id"),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: manifest_string(&manifest, "schema_generation"),
+                observation: SourceObservation {
+                    observed_by: manifest_string(&manifest, "source_adapter"),
+                    observed_at: source_fence(),
+                },
+            }),
             store_generation: manifest_string(&manifest, "store_generation"),
             state_fence: source_fence(),
             scope_id: if scoped {

@@ -15,7 +15,8 @@ use eliot_backup::{
     BackupBundle, BackupClass, BackupError, BackupInput, CutoverAuthorization, EventRange,
     ExportFence, ObservedLineageLimit, OwnerTrustBinding, RestoreContext, RestoreEvidenceLevel,
     RestoreJournalAdmission, RestoreJournalPort, RestoreJournalRecord, RestoreObligationState,
-    RestoreStep, WrappedKeyEntry, WrappedKeyManifest,
+    RestoreStep, SchemaGenerationObservation, SourceObservation, WrappedKeyEntry,
+    WrappedKeyManifest,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
@@ -45,6 +46,13 @@ fn test_bundle(target: &str) -> BackupBundle {
         schema_generation: "1".to_owned(),
         export_fence: ExportFence {
             export_id: format!("export-960-{target}"),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter-960".to_owned(),
+                    observed_at: source_fence.clone(),
+                },
+            }),
             store_generation: "store-960".to_owned(),
             state_fence: source_fence,
             scope_id: None,

@@ -1152,41 +1152,42 @@ fn ecxf_error(error: eliot_ecxf::EcxfError) -> BackupError {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel-fence projection (issue #2569 item 2)
+// Kernel-fence projection (issue #2569, package BK)
 //
 // `eliot_ecxf::ExportFence` (`crates/storage/eliot-ecxf/src/lib.rs:217-243`) and
-// this crate's own `ExportFence` (`crates/storage/eliot-backup/src/lib.rs:189`)
-// are two fences that share a name and are not the same object. Eight members
-// have identical types on both sides (`export_id`, `store_generation`,
-// `state_fence`, `scope_id`, `revision_heads`, `ordering_heads`, `event_range`
-// -- which is the very same `eliot_ecxf::EventRange`, re-exported at
-// `lib.rs:184` -- and `consistent`), so those carry the source value verbatim.
-// The two fences differ in exactly two places, and both differences are
-// refusals below rather than conversions:
+// this crate's own `ExportFence` (`crates/storage/eliot-backup/src/lib.rs:206`)
+// are two fences that share a name and are not the same object. Nine members
+// have identical types on both sides (`export_id`, `schema_generation` -- the
+// very same `eliot_ecxf::SchemaGenerationObservation`, re-exported at
+// `lib.rs:201` -- `store_generation`, `state_fence`, `scope_id`,
+// `revision_heads`, `ordering_heads`, `event_range`, which is the very same
+// `eliot_ecxf::EventRange` re-exported at `lib.rs:189`, and `consistent`), so
+// those carry the source value verbatim. Nothing is flattened on the way: the
+// source's schema generation crosses as the owner's own observation, naming the
+// adapter that read it and the state fence it read it at, so a kernel fence
+// states the same checkable provenance the interchange fence states rather than a
+// bare generation string or a digest of one.
 //
-// * the interchange fence carries `schema_generation` and the kernel fence has
-//   no member for it, so there is nothing to carry it into. The kernel fence is
-//   pinned (`shipped_serde_boundaries.toml:68661`, `ExportFence:187`,
-//   `span_start = 187`, `span_end = 200`), so adding a member is not this
-//   crate's to do either. If kernel semantics later require the generation, its
-//   own owner adds the member;
+// The two fences now differ in exactly one place, and that difference is the
+// refusal below rather than a conversion:
+//
 // * the interchange fence's `blob_reachability_manifest` is an OBSERVATION whose
 //   declared set holds RESIDENCY-key digests (`eliot-ecxf/src/lib.rs:198-215`
 //   and `:231-241`: issue #1871 D1 -- reachability is keyed on residency and
 //   not on content, because I05-13 forbids merging records whose content
 //   digests match). The kernel fence's member is a `Vec<BlobHash>` that its
 //   consumers read as a bijection over CONTENT digests:
-//   `lib.rs:732` requires every `blob.locator.hash` to be in that set,
-//   `lib.rs:738` requires its length to equal the carried blob count, and
-//   `bins/eliot-kernel/src/backup_capture.rs:1660-1662` states that explicitly
-//   ("the fence bijection is still over CONTENT digests"). Re-parsing a
-//   residency key through `BlobHash::new` would type-check and would still
-//   assert a content identity that no owner ever proved, so it refuses.
+//   `lib.rs:796` requires every `blob.locator.hash` to be in that set,
+//   `lib.rs:802` requires its length to equal the carried blob count, and
+//   `bins/eliot-kernel/src/backup_capture.rs:1818` states that explicitly ("the
+//   fence bijection is still over CONTENT digests"). Re-parsing a residency key
+//   through `BlobHash::new` would type-check and would still assert a content
+//   identity that no owner ever proved, so it refuses.
 //
-// Issue #1871, A2 additionally made both differing members observations, so an
-// absent observation is a state this projection can see. It refuses that state
-// by name instead of reading it as an empty member: an empty kernel member would
-// be indistinguishable from an owner-issued bijection over zero blobs, which is
+// Issue #1871, A2 made both fenced source values observations, so an absent
+// observation is a state this projection can see. It refuses that state by name
+// instead of reading it as an empty member: an empty kernel member would be
+// indistinguishable from an owner-issued bijection over zero blobs, which is
 // precisely the fabrication this projection exists to prevent. An observed but
 // EMPTY live set remains a store statement about zero blobs and is carried as
 // the empty list it is.
@@ -1207,11 +1208,11 @@ use eliot_blob_api::BlobHash;
 pub enum FenceBridgeRefusal {
     /// The source member carries no source-store observation at all.
     ///
-    /// Issue #1871, A2: `blob_reachability_manifest` is an observation rather
-    /// than a bare list, so an absent observation is representable and is never
-    /// the same record as an observed empty one. Reading it as an empty member
-    /// here would fabricate exactly the silence this projection exists to
-    /// refuse, so it is refused by name instead.
+    /// Issue #1871, A2: `schema_generation` and `blob_reachability_manifest`
+    /// are observations rather than bare values, so an absent observation is
+    /// representable and is never the same record as an observed empty one.
+    /// Reading it as an empty member here would fabricate exactly the silence
+    /// this projection exists to refuse, so it is refused by name instead.
     #[error("ecxf export fence {member:?} carries no source-store observation")]
     SourceMemberAbsent {
         /// The static name of the source member that carries no observation.
@@ -1226,14 +1227,6 @@ pub enum FenceBridgeRefusal {
         entry: String,
         /// The owning constructor's own reason for refusing it.
         reason: String,
-    },
-    /// The source carries a member the kernel fence has no member for.
-    #[error(
-        "ecxf export fence carries {member:?} and the kernel ExportFence has no member to carry it into"
-    )]
-    NoTargetMember {
-        /// The static name of the source member with no counterpart.
-        member: &'static str,
     },
     /// The source member holds residency identities where the kernel member is
     /// read as a content-digest bijection.
@@ -1258,7 +1251,20 @@ impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
     /// own [`ExportFence::validate`](super::ExportFence::validate). No digest is
     /// recomputed here and no stored digest is replaced by a fresh one.
     fn try_from(source: &eliot_ecxf::ExportFence) -> Result<Self, Self::Error> {
-        // Issue #1871, A2: `blob_reachability_manifest` is an observation now, so
+        // Issue #1871, A2: `schema_generation` is an observation now, so "nobody
+        // read a generation" is a state distinct from "the owner read an empty
+        // one". An absent observation is refused by name here rather than read as
+        // an empty generation, because an empty generation reads exactly like an
+        // observed value that names nothing. An owner-issued fence always carries
+        // one -- `eliot_ecxf::ExportFence::validate` refuses a fence that
+        // carries none -- so this refusal is reachable only for a fence the
+        // interchange owner would itself refuse.
+        if source.schema_generation.is_none() {
+            return Err(FenceBridgeRefusal::SourceMemberAbsent {
+                member: "schema_generation",
+            });
+        }
+        // Issue #1871, A2: `blob_reachability_manifest` is an observation too, so
         // "nobody declared a live set" is a state distinct from "the owner
         // declared an empty one". An absent observation is refused by name here
         // rather than read as an empty member, because an empty kernel member is
@@ -1289,23 +1295,15 @@ impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
         if !blob_reachability_manifest.is_empty() {
             return Err(FenceBridgeRefusal::ResidencyKeyIsNotContentIdentity);
         }
-        // The source fence carries `schema_generation`; the kernel fence has no
-        // member to carry it into and this crate may not add one (pinned row
-        // above). Discarding an owner-issued generation would silently drop an
-        // owner value, so a source that observed one is refused rather than
-        // downgraded. An owner-issued fence always observes one, because
-        // `eliot_ecxf::ExportFence::validate` refuses a fence that carries no
-        // generation observation at all; the conversion is therefore
-        // total-refusing in practice and says so rather than returning a value
-        // that looks convertible and is not. This bridge never supplies a
-        // generation of its own in either state.
-        if source.schema_generation.is_some() {
-            return Err(FenceBridgeRefusal::NoTargetMember {
-                member: "schema_generation",
-            });
-        }
+        // The source fence carries `schema_generation` as the source store's own
+        // observation and the kernel fence has a member for exactly that value,
+        // so it crosses verbatim below: the generation string, the adapter that
+        // read it and the state fence it was read at. This bridge never supplies
+        // a generation of its own in either state and never flattens the
+        // observation into a bare string or a digest of one.
         let fence = Self {
             export_id: source.export_id.clone(),
+            schema_generation: source.schema_generation.clone(),
             store_generation: source.store_generation.clone(),
             state_fence: source.state_fence.clone(),
             scope_id: source.scope_id.clone(),

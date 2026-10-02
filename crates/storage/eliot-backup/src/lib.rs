@@ -188,11 +188,33 @@ impl BackupClass {
 /// compiling against the single owner with identical wire bytes.
 pub use eliot_ecxf::EventRange;
 
+/// The source store's own observation of its schema generation, and the shared
+/// provenance record both fenced observations carry (issue #1871, A2).
+///
+/// Both types are owned solely by `eliot-ecxf` for the same reason
+/// [`EventRange`] is: I05-10 puts the fence's "schema/store generation" inside
+/// the fence and requires it to be *checkable against the source Store*, which is
+/// a statement about an observer and a boundary rather than about a string. The
+/// reexports let [`ExportFence`] carry the owner's own observation type with
+/// identical wire bytes and keep this crate from stating a second
+/// generation-observation schema next to it.
+pub use eliot_ecxf::{SchemaGenerationObservation, SourceObservation};
+
 /// The coherent logical boundary of an ECXF export.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportFence {
     pub export_id: String,
+    /// Schema generation observed at this boundary, with the source that observed
+    /// it, carried verbatim from [`eliot_ecxf::ExportFence::schema_generation`].
+    ///
+    /// The observation itself is carried rather than a bare generation string or
+    /// a digest of one, because I05-10 makes the generation checkable against the
+    /// source Store and only the observation names which source read it and at
+    /// which state fence. `None` means no source observed one; that is a
+    /// distinct record from an observed empty value and is refused by name in
+    /// [`Self::validate`] rather than read as an empty generation.
+    pub schema_generation: Option<SchemaGenerationObservation>,
     pub store_generation: String,
     pub state_fence: StateFence,
     pub scope_id: Option<ScopeId>,
@@ -211,6 +233,43 @@ impl ExportFence {
         self.state_fence
             .validate()
             .map_err(|error| BackupError::Foundation(error.to_string()))?;
+        // I05-10 puts the fence's "schema/store generation" inside the fence and
+        // requires it to be checkable against the source Store, so this fence
+        // carries the source store's own observation of it (issue #1871, A2)
+        // rather than a bare string. An absent observation is a record no source
+        // ever produced and is refused by name here; it is never read as an empty
+        // generation, and an observed value is never re-derived from one.
+        //
+        // The carried observation is checked against the ORIGINAL recorded values
+        // with the existing validators of its own parts — `text` for the two
+        // recorded strings, the owner's `StateFence::validate` for the boundary —
+        // and its `observed_at` is compared with this fence's own `state_fence`,
+        // which is the same two-recorded-positions comparison
+        // `eliot_ecxf::ExportFence::validate` makes against its own fence. No
+        // digest, MAC or generation string is recomputed from it.
+        let Some(observed) = self.schema_generation.as_ref() else {
+            return Err(BackupError::UnobservedSourceMember {
+                member: "schema_generation",
+            });
+        };
+        text(
+            &observed.generation,
+            "export_fence.schema_generation.generation",
+        )?;
+        text(
+            &observed.observation.observed_by,
+            "export_fence.schema_generation.observed_by",
+        )?;
+        observed
+            .observation
+            .observed_at
+            .validate()
+            .map_err(|error| BackupError::Foundation(error.to_string()))?;
+        if observed.observation.observed_at != self.state_fence {
+            return Err(BackupError::FenceMismatch {
+                subject: "schema_generation observation".to_owned(),
+            });
+        }
         if !self.consistent {
             return Err(BackupError::InconsistentBoundary);
         }
@@ -3109,6 +3168,19 @@ mod restore_tests {
         .expect("valid test epoch")
     }
 
+    /// The source store's own observation of its schema generation, read at `at`.
+    /// I05-10 makes the fence's generation checkable against the source Store,
+    /// so the fixture carries the observation rather than a bare string.
+    fn observed_generation(at: StateFence) -> SchemaGenerationObservation {
+        SchemaGenerationObservation {
+            generation: "1".to_owned(),
+            observation: SourceObservation {
+                observed_by: "test".to_owned(),
+                observed_at: at,
+            },
+        }
+    }
+
     fn test_owner(owner_id: &str) -> OwnerTrustBinding {
         OwnerTrustBinding {
             owner_id: owner_id.to_owned(),
@@ -3419,6 +3491,7 @@ mod restore_tests {
             schema_generation: "1".to_owned(),
             export_fence: ExportFence {
                 export_id: "export".to_owned(),
+                schema_generation: Some(observed_generation(source_fence.clone())),
                 store_generation: "store".to_owned(),
                 state_fence: source_fence,
                 scope_id: None,
@@ -3465,6 +3538,7 @@ mod restore_tests {
             schema_generation: "1".to_owned(),
             export_fence: ExportFence {
                 export_id: "export".to_owned(),
+                schema_generation: Some(observed_generation(source_fence.clone())),
                 store_generation: "store".to_owned(),
                 state_fence: source_fence,
                 scope_id: None,
@@ -4013,9 +4087,24 @@ mod backup_verify_tests_948 {
         }
     }
 
+    /// The source store's own observation of its schema generation, read at
+    /// `at` by the test adapter. I05-10 makes the fence's generation checkable
+    /// against the source Store, so the fixture carries the observation rather
+    /// than a bare string.
+    fn observed_generation(at: StateFence) -> SchemaGenerationObservation {
+        SchemaGenerationObservation {
+            generation: "schema-1".to_owned(),
+            observation: SourceObservation {
+                observed_by: "test-adapter".to_owned(),
+                observed_at: at,
+            },
+        }
+    }
+
     fn export_fence(scope: bool) -> ExportFence {
         ExportFence {
             export_id: "export-948".to_owned(),
+            schema_generation: Some(observed_generation(fence())),
             store_generation: "store-948".to_owned(),
             state_fence: fence(),
             scope_id: if scope {
