@@ -590,6 +590,241 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
     );
 }
 
+fn result_body_with_local_read_execution_evidence(
+    envelope: &HostRequestEnvelope,
+    attempt: LocalReadAttempt,
+    session: &Session,
+    receipt: &eliot_protocol::HostRequestAdmissionReceipt,
+) -> HostRequestResultBody {
+    let mut body = result_body_for(envelope, Some(attempt));
+    body.evidence = Some(eliot_protocol::LocalReadExecutionEvidence {
+        wire_id: eliot_protocol::LOCAL_READ_EXECUTION_EVIDENCE_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::LocalReadExecutionEvidence::CONTRACT_VERSION,
+        operation_id: eliot_protocol::host_request_operation_id(envelope),
+        invoked_operation: Some("local_read".to_owned()),
+        actual_route: Some(receipt.receipt_sha256.clone()),
+        adapter_identity: Some(session.connection_id.clone()),
+        executor_identity: None,
+        input_handle: Some(envelope.envelope_sha256.clone()),
+        output_handle: Some(body.result_digest.clone()),
+        side_effects: Some(eliot_protocol::LOCAL_READ_EXECUTION_NO_SIDE_EFFECTS.to_owned()),
+    });
+    body.validate()
+        .expect("result body with execution evidence must validate");
+    body
+}
+
+fn complete_trace_local_read(
+    kernel: &KernelComposition,
+    fence: &StateFence,
+    session: &Session,
+    request_id: &str,
+) -> (
+    HostRequestEnvelope,
+    HostRequestResultBody,
+    eliot_protocol::HostRequestAdmissionReceipt,
+    eliot_ors::HostRequestRecord,
+    LocalReadAttempt,
+) {
+    let tool = query_tool();
+    let envelope = query_envelope(
+        fence,
+        unix_ms().saturating_add(60_000),
+        request_id,
+        &tool_digest(&tool),
+    );
+    assert!(matches!(
+        host_request_route::check_local_read_admission(&envelope, &tool)
+            .expect("query admission must validate"),
+        host_request_route::LocalReadAdmission::Query(_)
+    ));
+    stage_admitted(kernel, &envelope);
+    enqueue_query_pair(kernel, &envelope, &tool);
+    let (_, _, attempt) = claim_query_pair(kernel, session);
+    let receipt =
+        eliot_protocol::HostRequestAdmissionReceipt::issue(&envelope).expect("receipt must issue");
+    let body = result_body_with_local_read_execution_evidence(
+        &envelope,
+        attempt.clone(),
+        session,
+        &receipt,
+    );
+    let persisted = match kernel
+        .submit_local_read_result(session, &body)
+        .expect("execution result must submit")
+    {
+        LocalReadSubmitDisposition::Persisted(record) => record,
+        LocalReadSubmitDisposition::StaleAttempt(observation) => {
+            panic!("current local-read attempt must persist, got stale: {observation:?}")
+        }
+    };
+    assert_eq!(persisted.state, HostRequestState::ResultReceived);
+    let stored = waiter_record(kernel, &envelope);
+    assert_eq!(
+        stored.result_digest.as_deref(),
+        Some(body.result_digest.as_str())
+    );
+    (envelope, body, receipt, stored, attempt)
+}
+
+/// Acceptance (#1838): the real local-read result path seals and replays the
+/// request, fence, session, attempt, requested/actual route and result handles.
+/// The execution evidence is derived only from the admitted envelope, receipt,
+/// claimed daemon session and result digest; this fixture does not claim to be
+/// a live installed daemon.
+#[test]
+fn local_read_trace_manifest_replay_preserves_admitted_execution_evidence() {
+    let root =
+        std::env::temp_dir().join(format!("eliot-kernel-trace-replay-{}", std::process::id()));
+    std::fs::create_dir(&root).expect("test work root must be exclusively owned");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+    let daemon_session = daemon_session_for(&policy);
+    let (envelope, body, receipt, stored, attempt) =
+        complete_trace_local_read(&kernel, &fence, &daemon_session, "host-request-1");
+
+    let manifest = kernel
+        .local_read_replay_manifest(&receipt, &stored, &envelope)
+        .expect("persisted local-read replay must succeed")
+        .expect("resulted request must have a sealed manifest");
+    assert_eq!(
+        manifest.operation_id,
+        eliot_protocol::host_request_operation_id(&envelope)
+    );
+    assert_eq!(
+        manifest.format_version,
+        crate::trace_manifest::TRACE_MANIFEST_FORMAT_VERSION
+    );
+    assert_eq!(
+        manifest.capability.as_deref(),
+        Some(envelope.identity.capability.as_str())
+    );
+    assert_eq!(
+        manifest.payload_digest.as_deref(),
+        Some(envelope.identity.payload_sha256.as_str())
+    );
+    assert_eq!(manifest.state_fence.as_ref(), Some(&envelope.state_fence));
+    assert_eq!(
+        stored.connection_ref.as_str(),
+        envelope.connection_id.as_str()
+    );
+    assert_eq!(
+        manifest.connection_id.as_deref(),
+        Some(stored.connection_ref.as_str())
+    );
+    assert_eq!(
+        manifest.session_id.as_deref(),
+        envelope.identity.session_id.as_deref()
+    );
+    assert_eq!(
+        manifest.lease_attempt_id.as_deref(),
+        Some(attempt.attempt_id.as_str())
+    );
+    assert_eq!(
+        manifest.fencing_generation,
+        Some(attempt.fencing_generation)
+    );
+    assert_eq!(
+        manifest.requested_route.as_deref(),
+        Some(envelope.identity.capability.as_str())
+    );
+    assert_eq!(
+        manifest.actual_route.as_deref(),
+        Some(receipt.receipt_sha256.as_str())
+    );
+    assert_eq!(manifest.invoked_operation.as_deref(), Some("local_read"));
+    assert_eq!(
+        manifest.input_handle.as_deref(),
+        Some(envelope.envelope_sha256.as_str())
+    );
+    assert_eq!(
+        manifest.output_handle.as_deref(),
+        Some(body.result_digest.as_str())
+    );
+    assert_eq!(
+        manifest.adapter_identity.as_deref(),
+        Some(daemon_session.connection_id.as_str())
+    );
+    assert_eq!(
+        manifest.result_digest.as_deref(),
+        Some(body.result_digest.as_str())
+    );
+    assert_eq!(manifest.finish.as_str(), "DEGRADED_NO_PROOF");
+
+    let mut substituted_request = envelope.clone();
+    substituted_request.identity.request_id =
+        eliot_contracts::RequestId::new("host-request-governed-1")
+            .expect("substituted request ID must be valid");
+    assert!(
+        matches!(
+            kernel.local_read_replay_manifest(&receipt, &stored, &substituted_request),
+            Err(TransportError::SessionFenced)
+        ),
+        "a substituted request must not read another request's sealed trace"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Acceptance (#1838): the ordinary query has no verifier result or packet
+/// manifest, so the persisted readback lists the withheld verifier and cannot
+/// report an unqualified completion.
+#[test]
+fn local_read_trace_manifest_missing_verifier_is_explicitly_degraded() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-trace-verifier-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).expect("test work root must be exclusively owned");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+    let daemon_session = daemon_session_for(&policy);
+    let (envelope, _body, receipt, stored, _attempt) =
+        complete_trace_local_read(&kernel, &fence, &daemon_session, "host-request-1");
+
+    let manifest = kernel
+        .local_read_replay_manifest(&receipt, &stored, &envelope)
+        .expect("persisted local-read replay must succeed")
+        .expect("resulted request must have a sealed manifest");
+    assert!(
+        manifest.verifier_result.is_none(),
+        "the query has no verifier result"
+    );
+    assert!(
+        manifest.active_view_packet_manifest.is_none(),
+        "the query has no active-view packet manifest"
+    );
+    assert!(
+        manifest
+            .missing_parts
+            .iter()
+            .any(|part| part == "verifier_result"),
+        "the persisted manifest must explicitly name the missing verifier result"
+    );
+    assert!(
+        manifest
+            .missing_parts
+            .iter()
+            .any(|part| part == "active_view_packet_manifest"),
+        "the persisted manifest must explicitly name the absent packet manifest"
+    );
+    assert_eq!(manifest.finish.as_str(), "DEGRADED_NO_PROOF");
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// Acceptance (#1808): exactly one completion per current fencing generation.
 /// A superseded attempt quarantines as stale and leaves the waiter clean,
 /// then the current attempt completes; a revoked attempt quarantines as
