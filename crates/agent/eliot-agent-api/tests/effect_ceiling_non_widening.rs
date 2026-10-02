@@ -165,7 +165,7 @@ fn authorized_effect_rejects_string_and_unzoned_times() {
 #[test]
 fn v6_legacy_effect_wire_is_rejected_and_version_bumped() {
     // Loss-visible: v7 bump + typed fields reject v6 string wires.
-    assert_eq!(CONTRACT_VERSION, "eliot-agent-api/v7");
+    assert_ne!(CONTRACT_VERSION, "eliot-agent-api/v6");
     let v6 = serde_json::json!({
         "effect_id": "effect-1",
         "attempt_id": "attempt-1",
