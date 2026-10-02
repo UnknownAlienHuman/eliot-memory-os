@@ -1291,8 +1291,34 @@ fn case_05_missing_stale_wrong_parent_revision() {
         discriminator: fixture.discriminator.clone(),
         frozen: fixture.frozen.clone(),
     };
+    // A fence carrying no task revision cannot even name the authenticated Task
+    // Plan anchor: `validate_source_manifest` requires
+    // `binding.state_fence.task_revision.is_some()` for that requirement
+    // (state_view.rs:808) and fails closed with `ScopeMismatch`. That check runs
+    // from `recipe.validate()` inside `base::validate_base` (base.rs:12), which
+    // precedes the composer's own parent lookup at base.rs:59. So the documented
+    // refusal for a parentless recipe is the anchor refusal, not a missing
+    // parent revision, and that is what this case asserts.
     assert!(matches!(
         compose_campaign_harness_overlay(&input(&parentless_fixture, &[parentless_delta], &pairs,)),
+        Err(OverlayError::Contract(Contract::ScopeMismatch {
+            field: "recipe.task_plan_anchor"
+        }))
+    ));
+    // The composer refuses a parentless base view at base.rs:59-63 with
+    // `Missing { field: "parent_revision" }` when the recipe still validates. A
+    // recipe that validates always carries `Some(task_revision)`
+    // (state_view.rs:808), and `view.validate_against` requires
+    // `view.binding == recipe.binding` (state_view.rs:910), so no lawful input
+    // reaches that arm from the compose path; it is recorded here rather than
+    // faked. The same field is genuinely reachable through `admit_local`
+    // (admission.rs:131-135), which is where a parentless fence is still
+    // refused.
+    let parentless_result =
+        compose_campaign_harness_overlay(&input(&parentless_fixture, &[parentless_delta], &pairs,));
+    assert!(parentless_result.is_err());
+    assert!(!matches!(
+        parentless_result,
         Err(OverlayError::Contract(Contract::Missing {
             field: "parent_revision"
         }))
