@@ -1,14 +1,18 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
 use std::future::Future;
 use std::io::{self, Write};
+#[cfg(test)]
 use std::task::{Context, Poll, Waker};
+
+#[cfg(test)]
+use eliot_testd::drive_validated_dispatch_material;
 
 use eliot_process::ProcessExecutor;
 use eliot_testd::{
     ADMITTED_WORKER_LEASE_MS, PROTOCOL_VERSION, SERVICE_NAME, TestReceipt, TestdComposition,
-    ValidatedDispatchDriveOutcome, drive_validated_dispatch_material,
-    drive_validated_dispatch_material_with_terminal_publisher,
+    ValidatedDispatchDriveOutcome, drive_validated_dispatch_material_with_terminal_publisher,
     kernel_client::{KernelTestdIpcClient, PresentedAdmission},
     run_admitted_one_shot,
     testd_material::{ValidatedTestdMaterial, read_testd_material},
@@ -141,17 +145,24 @@ fn drive_material_probe_with_terminal_publisher(
     let Some(source_root) = generation_root_cwd() else {
         return EXIT_ADMITTED_DRIVE_FAILED;
     };
-    match block_on_drive(drive_validated_dispatch_material_with_terminal_publisher(
+    match drive_validated_dispatch_material_with_terminal_publisher(
         material,
         &source_root,
         now_ms(),
         client,
-    )) {
+    ) {
         Ok(ValidatedDispatchDriveOutcome::Completed { .. }) => EXIT_ADMITTED_COMPLETED,
         Ok(ValidatedDispatchDriveOutcome::Failed { .. }) => EXIT_ADMITTED_DRIVE_FAILED,
         Ok(ValidatedDispatchDriveOutcome::Cancelled { .. }) => EXIT_ADMITTED_CANCELLED,
         Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
             EXIT_ADMITTED_RECONCILE_REQUIRED
+        }
+        Ok(ValidatedDispatchDriveOutcome::ProviderRefused { disposition, .. }) => {
+            let _ = writeln!(
+                io::stderr(),
+                "Testd provider dispatch refused: {disposition:?}"
+            );
+            EXIT_ADMITTED_DRIVE_FAILED
         }
         Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
     }
@@ -170,6 +181,7 @@ fn generation_root_cwd() -> Option<String> {
 
 /// Worker-only projection retained for non-production unit fixtures. The
 /// executable path above always uses the authenticated terminal publisher.
+#[cfg(test)]
 fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
     let Some(source_root) = generation_root_cwd() else {
         return EXIT_ADMITTED_DRIVE_FAILED;
@@ -185,6 +197,13 @@ fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
         Ok(ValidatedDispatchDriveOutcome::ReconcileRequired { .. }) => {
             EXIT_ADMITTED_RECONCILE_REQUIRED
         }
+        Ok(ValidatedDispatchDriveOutcome::ProviderRefused { disposition, .. }) => {
+            let _ = writeln!(
+                io::stderr(),
+                "Testd provider dispatch refused: {disposition:?}"
+            );
+            EXIT_ADMITTED_DRIVE_FAILED
+        }
         Err(_) => EXIT_ADMITTED_DRIVE_FAILED,
     }
 }
@@ -192,6 +211,7 @@ fn drive_material_probe(material: &ValidatedTestdMaterial) -> i32 {
 /// Minimal std-only driver for the single executor future, mirroring
 /// `worker::block_on_one_shot`: resolves futures that progress without an
 /// external reactor. This binary takes no async runtime dependency.
+#[cfg(test)]
 fn block_on_drive<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);

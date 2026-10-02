@@ -1090,7 +1090,41 @@ impl ProviderRegistry {
             cargo_entry(fingerprints, generation)?,
             rustc_entry(fingerprints, generation)?,
             rustfmt_entry(fingerprints, generation)?,
-            nextest_entry(fingerprints, generation)?,
+            nextest_entry(
+                fingerprints,
+                generation,
+                "cargo",
+                "rust-toolchain plus nextest binary; exact command mirrors NextestCommand::run (cargo nextest run --profile <profile>)",
+            )?,
+            scip_entry(fingerprints, generation)?,
+            dotnet_entry(fingerprints, generation)?,
+        ];
+        let registry = Self::build(entries, generation, normative_pair_digest)?;
+        registry.verify_profile_identities()?;
+        crate::package_disposition::verify_disposition_coverage(&registry)?;
+        crate::testd_profile_dispatch::verify_testd_dispatch(&registry)?;
+        Ok(registry)
+    }
+
+    /// Assembles the same six accepted entries for Testd's closed native
+    /// productive factory. Only the nextest entry's executable is supplied by
+    /// the existing Testd core binding; all duplicated identity slots are
+    /// constructed alongside their source fields.
+    pub(crate) fn ready_testd(
+        generation: u64,
+        normative_pair_digest: String,
+        fingerprints: &InvalidationSet,
+    ) -> Result<Self, RegistryError> {
+        let entries = vec![
+            cargo_entry(fingerprints, generation)?,
+            rustc_entry(fingerprints, generation)?,
+            rustfmt_entry(fingerprints, generation)?,
+            nextest_entry(
+                fingerprints,
+                generation,
+                eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM,
+                "Testd core productive profile binding resolves the native cargo-nextest executable through the platform tool locator",
+            )?,
             scip_entry(fingerprints, generation)?,
             dotnet_entry(fingerprints, generation)?,
         ];
@@ -1516,13 +1550,18 @@ fn rustfmt_entry(
 
 /// Nextest entry: test only.
 ///
-/// Kind follows the `NextestAdapter::launch` gate; the executable records the
-/// exact `cargo nextest run --profile <profile>` projection built by
-/// `NextestCommand::run`. The parser and evaluator follow the in-adapter
-/// `parse_jsonl` projection and `NextestReport::outcome` algebra.
+/// Kind follows the `NextestAdapter::launch` gate. The selected registry
+/// factory supplies the executable and acquisition rule: static `ready`
+/// records the cargo wrapper used by `NextestCommand::run`, while Testd's
+/// accepted dataset records its native core-bound `cargo-nextest` program.
+/// Profile identity slots are built from these same parameters. The parser
+/// and evaluator follow the in-adapter `parse_jsonl` projection and
+/// `NextestReport::outcome` algebra.
 fn nextest_entry(
     fingerprints: &InvalidationSet,
     generation: u64,
+    executable: &str,
+    acquisition_rule: &str,
 ) -> Result<RegistryEntry, ContractError> {
     let instrument = contract_id(NEXTEST_INSTRUMENT)?;
     let resource_contract = format!(
@@ -1536,10 +1575,7 @@ fn nextest_entry(
         kinds: vec![InstrumentKind::Test],
         adapter: NEXTEST_INSTRUMENT.to_owned(),
         adapter_version: ContractVersion::new(1, 0, 0),
-        executable: ExecutableIdentity::process(
-            "cargo",
-            "rust-toolchain plus nextest binary; exact command mirrors NextestCommand::run (cargo nextest run --profile <profile>)",
-        ),
+        executable: ExecutableIdentity::process(executable, acquisition_rule),
         toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
@@ -1554,7 +1590,7 @@ fn nextest_entry(
             source: fingerprints.source.clone(),
             lock: fingerprints.lock.clone(),
             toolchain: "cargo (rust toolchain)".to_owned(),
-            executable: "cargo".to_owned(),
+            executable: executable.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
             artifact: "nextest test binaries under the admitted target layout; the run report is raw evidence".to_owned(),
