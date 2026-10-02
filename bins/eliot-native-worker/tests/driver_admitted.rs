@@ -10,11 +10,11 @@
 //! `ProcessRequest`, and no direct `std::process::Command`.
 //!
 //! Proves one real admitted contour reaches `Ready` and serves a bounded
-//! frame, lost start/restart reconciles without a second process, invalid
-//! admission invokes no factory/start, and the `KernelReplayPort` thin
-//! transport (no worker-local journal, M3) carries the five replay ops with
-//! claim/replay binding and echo checks. T9-05 coordinator verification is
-//! not consumed by this contour.
+//! frame, a failed response writer leaves the exact request replayable, lost
+//! start/restart reconciles without a second process, invalid admission invokes
+//! no factory/start, and the `KernelReplayPort` thin transport (no worker-local
+//! journal, M3) carries the five replay ops with claim/replay binding and echo
+//! checks. T9-05 coordinator verification is not consumed by this contour.
 
 #![cfg(windows)]
 
@@ -33,7 +33,7 @@ use eliot_contracts::{
 };
 use eliot_native_worker::{
     AdmittedLifecycle, KernelReplayPort, KernelReplayTransport, NativeWorker, NativeWorkerError,
-    ReconcileRetainedReceipt, ReconcileSubmission, WorkerResponse, drive_admitted_claimed,
+    ReconcileRetainedReceipt, ReconcileSubmission, drive_admitted_claimed,
 };
 use eliot_native_worker_core::{
     AdmissionLivenessFacts, AdmissionLivenessOutcome, AttemptId, AuthorityEnvelope, BudgetEnvelope,
@@ -872,14 +872,27 @@ fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
         .expect("valid EBP frame encodes")
 }
 
-fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
+struct DecodedWorkerResponse {
+    connection_id: String,
+    request_id: RequestId,
+    trace_context: BTreeMap<String, String>,
+    response: eliot_native_worker::WorkerResponse,
+}
+
+fn decode_response(bytes: &[u8]) -> DecodedWorkerResponse {
     let frame: Frame = JsonCodec::new().decode(bytes).expect("valid EBP response");
     assert_eq!(frame.kind, FrameKind::Response);
     assert_eq!(frame.message_type, MessageType::Result);
+    let request_id = frame.request_id.expect("response keeps request identity");
     let ProtocolPayload::Json(payload) = frame.payload else {
         panic!("native worker response uses the shared JSON result payload");
     };
-    serde_json::from_value(payload).expect("typed worker response")
+    DecodedWorkerResponse {
+        connection_id: frame.connection_id,
+        request_id,
+        trace_context: frame.trace_context,
+        response: serde_json::from_value(payload).expect("typed worker response"),
+    }
 }
 
 type DriverWorker = NativeWorker<
@@ -1019,15 +1032,150 @@ fn admitted_drive_reaches_ready_and_serves_bounded_frame() {
         .unwrap_or_else(|error| panic!("bounded frame must serve, got {error:?}"));
     assert!(!shutdown);
     let response = decode_response(&writer);
-    assert!(!response.events.is_empty());
+    assert_eq!(response.connection_id, "connection-claim-1");
+    assert_eq!(response.request_id.as_str(), "health-1");
+    assert_eq!(response.trace_context["trace_id"], "trace-health-1");
+    assert!(!response.response.events.is_empty());
     assert!(
         response
+            .response
             .events
             .iter()
             .all(|event| event.stream_id == "claim-1/gen-1")
     );
 
     remove_bat("drive-ready");
+}
+
+#[test]
+fn response_writer_failure_keeps_claimed_request_replayable() {
+    struct BrokenPipeWriter {
+        attempted_writes: usize,
+        output: Vec<u8>,
+    }
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.attempted_writes += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "response channel closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (
+        mut worker,
+        _,
+        registration,
+        claim_value,
+        hello_value,
+        process,
+        evidence,
+        admissions,
+        bat,
+    ) = build_driver(
+        "drive-output-refusal",
+        "operation-output-refusal-1",
+        "tree-output-refusal-1",
+        "nonce-output-refusal-1",
+    );
+    let operation_id = claim_value.operation_id.as_str().to_owned();
+    assert_eq!(process.operation_id().as_str(), operation_id.as_str());
+    let admission = claim_request(&registration, &claim_value);
+    let reconcile = reconcile_for(&claim_value);
+    let readiness = readiness_for(&claim_value);
+    let mut lifecycle = FakeLifecycle::new();
+
+    let ready = block_on(drive_admitted_claimed(
+        &mut lifecycle,
+        &mut worker,
+        &registration,
+        &admission,
+        hello_value,
+        process,
+        &reconcile,
+        &readiness,
+    ))
+    .unwrap_or_else(|error| panic!("output-refusal worker must reach Ready, got {error:?}"));
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(ready.stream_id, "claim-1/gen-1");
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str())
+    );
+
+    let frame = stdio_frame("output-refusal-request-1", WorkerFrameBody::Health);
+    let mut failing_reader = Cursor::new(encode_frame(&frame));
+    let mut failing_writer = BrokenPipeWriter {
+        attempted_writes: 0,
+        output: Vec::new(),
+    };
+    let refused = block_on(worker.serve_one_frame(&mut failing_reader, &mut failing_writer));
+    assert!(
+        matches!(
+            &refused,
+            Err(NativeWorkerError::Io(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ),
+        "a closed response channel must return the typed I/O refusal, got {refused:?}"
+    );
+    assert_eq!(failing_writer.attempted_writes, 1);
+    assert!(failing_writer.output.is_empty());
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str()),
+        "response refusal must leave the admitted operation bound to its original claim"
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    // The same request identity reads the committed result through the normal
+    // replay port after the output refusal; a repeated read returns that same
+    // event identity instead of starting another operation.
+    let mut replay_reader = Cursor::new(encode_frame(&frame));
+    let mut replay_output = Vec::new();
+    let shutdown = block_on(worker.serve_one_frame(&mut replay_reader, &mut replay_output))
+        .unwrap_or_else(|error| panic!("refused response must remain replayable, got {error:?}"));
+    assert!(!shutdown);
+    let replay = decode_response(&replay_output);
+    assert_eq!(replay.request_id.as_str(), frame.request_id.as_str());
+    assert_eq!(replay.connection_id, frame.connection_id);
+    assert_eq!(replay.trace_context, frame.trace_context);
+    assert!(!replay.response.events.is_empty());
+    assert!(replay.response.events.iter().all(|event| {
+        event.request_id.as_str() == frame.request_id.as_str()
+            && event.stream_id == ready.stream_id
+    }));
+
+    let replay_events = serde_json::to_value(&replay.response.events).expect("replay events");
+    let mut repeated_reader = Cursor::new(encode_frame(&frame));
+    let mut repeated_output = Vec::new();
+    let shutdown = block_on(worker.serve_one_frame(&mut repeated_reader, &mut repeated_output))
+        .unwrap_or_else(|error| panic!("repeated request must replay, got {error:?}"));
+    assert!(!shutdown);
+    let repeated = decode_response(&repeated_output);
+    assert_eq!(
+        serde_json::to_value(&repeated.response.events).expect("repeated events"),
+        replay_events,
+        "the original request must keep its committed replay event identity"
+    );
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str())
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    remove_bat("drive-output-refusal");
 }
 
 #[test]
@@ -1350,9 +1498,6 @@ fn retained_record_restart_reconciles_with_receipt_without_second_process() {
 /// the same test binary re-runs this test with piped stdio and serves.
 const STDIO_STARVATION_CHILD_ENV: &str = "ELIOT_T9_06_STDIO_STARVATION_CHILD";
 const STDIO_STARVATION_TEST_NAME: &str = "cancel_heartbeat_served_through_stdio_while_running";
-/// Sync marker printed by the child before serving: everything before this
-/// line on the child stdout is libtest harness output, never frame bytes.
-const STDIO_BEGIN_MARKER: &str = "ELIOT-T9-06-STDIO-BEGIN";
 
 /// Frame envelope mirroring `health_frame` (same grant binding), with the
 /// caller choosing the body and a unique idempotency identity.
@@ -1406,10 +1551,10 @@ fn stdio_heartbeat_frame() -> WorkerFrame {
 }
 
 /// Child role: drive one real admitted contour to `Ready` with the real
-/// `WindowsProcessExecutor`, print the sync marker, then serve the REAL
-/// `serve_stdio` loop (dedicated reader thread plus bounded `sync_channel(64)`)
-/// until the parent closes stdin (EOF). Every served response is a
-/// length-delimited frame on stdout after the marker line.
+/// `WindowsProcessExecutor`, then serve the production stdio input loop
+/// (dedicated reader thread plus bounded `sync_channel(64)`) until the parent
+/// closes stdin (EOF). Responses use stderr's dedicated pipe because libtest
+/// owns stdout and writes status text there.
 fn stdio_starvation_child() {
     let (mut worker, _, registration, claim_value, hello_value, process, _, _, _) = build_driver(
         "serve-stdio",
@@ -1433,53 +1578,34 @@ fn stdio_starvation_child() {
     ))
     .unwrap_or_else(|error| panic!("stdio child must reach Ready, got {error:?}"));
     assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
-    println!("{STDIO_BEGIN_MARKER}");
-    std::io::stdout().flush().expect("flush stdio begin marker");
-    block_on(worker.serve_stdio())
+    let mut protocol_output = std::io::stderr().lock();
+    block_on(worker.serve_stdio_with_output(&mut protocol_output))
         .unwrap_or_else(|error| panic!("stdio child must serve until EOF, got {error:?}"));
     remove_bat("serve-stdio");
 }
 
-fn fill_stdio(stdout: &mut impl Read, buffered: &mut Vec<u8>) -> Result<bool, String> {
+fn fill_stdio(protocol: &mut impl Read, buffered: &mut Vec<u8>) -> Result<bool, String> {
     let mut chunk = [0_u8; 1024];
-    let read = stdout
+    let read = protocol
         .read(&mut chunk)
-        .map_err(|error| format!("stdio child read failed: {error}"))?;
+        .map_err(|error| format!("stdio protocol pipe read failed: {error}"))?;
     buffered.extend_from_slice(&chunk[..read]);
     Ok(read > 0)
 }
 
-/// Reads exactly `expected` length-delimited [`WorkerResponse`] frames from
-/// the child stdout, discarding the harness preamble through the marker line.
+/// Reads exactly `expected` length-delimited EBP response frames from the
+/// dedicated child protocol pipe.
 fn read_stdio_responses(
-    stdout: &mut impl Read,
+    protocol: &mut impl Read,
     expected: usize,
-) -> Result<Vec<WorkerResponse>, String> {
+) -> Result<Vec<DecodedWorkerResponse>, String> {
     let mut buffered = Vec::new();
-    loop {
-        if let Some(position) = buffered
-            .windows(STDIO_BEGIN_MARKER.len())
-            .position(|window| window == STDIO_BEGIN_MARKER.as_bytes())
-        {
-            let after = position + STDIO_BEGIN_MARKER.len();
-            let line_end = buffered[after..]
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map(|offset| after + offset + 1)
-                .unwrap_or(buffered.len());
-            buffered = buffered[line_end..].to_vec();
-            break;
-        }
-        if !fill_stdio(stdout, &mut buffered)? {
-            return Err("child stdout ended before the stdio begin marker".to_owned());
-        }
-    }
     let mut out = Vec::with_capacity(expected);
     while out.len() < expected {
         while buffered.len() < 4 {
-            if !fill_stdio(stdout, &mut buffered)? {
+            if !fill_stdio(protocol, &mut buffered)? {
                 return Err(format!(
-                    "child stdout ended after {} of {expected} responses",
+                    "child protocol pipe ended after {} of {expected} responses",
                     out.len()
                 ));
             }
@@ -1493,9 +1619,9 @@ fn read_stdio_responses(
             return Err(format!("stdio frame length out of bounds: {length}"));
         }
         while buffered.len() < 4 + length {
-            if !fill_stdio(stdout, &mut buffered)? {
+            if !fill_stdio(protocol, &mut buffered)? {
                 return Err(format!(
-                    "child stdout ended after {} of {expected} responses",
+                    "child protocol pipe ended after {} of {expected} responses",
                     out.len()
                 ));
             }
@@ -1506,7 +1632,8 @@ fn read_stdio_responses(
     Ok(out)
 }
 
-/// Parent role: pipes Execute, Cancel, and Heartbeat frames into the child,
+/// Parent role: pipes Execute, Cancel, and Heartbeat frames into the child's
+/// stdin and reads responses from its dedicated stderr protocol pipe,
 /// then asserts every frame is served within a bounded wait. Execute moves the
 /// worker to `Running`; Cancel and Heartbeat must still be served after it,
 /// proving the `serve_stdio` reader-thread split keeps cancellation and
@@ -1521,27 +1648,18 @@ fn stdio_starvation_parent() {
         .arg("--nocapture")
         .env(STDIO_STARVATION_CHILD_ENV, "1")
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn stdio child");
     let mut stdin = child.stdin.take().expect("child stdin");
-    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut protocol = child.stderr.take().expect("child protocol stderr");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(read_stdio_responses(&mut stdout, 3));
-        // Keep the only stdout read end open until the child exits: dropping
-        // it right after the third frame would break the child harness
-        // summary pipe (BrokenPipe) and fail an otherwise clean child.
-        // EOF arrives when the child exits; a killed child ends this too.
-        loop {
-            let mut chunk = [0_u8; 4096];
-            match stdout.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        let _ = sender.send(read_stdio_responses(&mut protocol, 3));
+        // Keep the dedicated protocol pipe open until child exit. This avoids
+        // breaking a still-running response write after the third frame.
+        let _ = std::io::copy(&mut protocol, &mut std::io::sink());
     });
     for frame in [
         stdio_execute_frame(),
@@ -1562,10 +1680,21 @@ fn stdio_starvation_parent() {
     let responses =
         responses.unwrap_or_else(|error| panic!("stdio child responses unreadable: {error}"));
     assert_eq!(responses.len(), 3);
-    for response in &responses {
-        assert!(!response.events.is_empty());
+    for (response, expected_id) in
+        responses
+            .iter()
+            .zip(["stdio-exec-1", "stdio-cancel-1", "stdio-heartbeat-1"])
+    {
+        assert_eq!(response.connection_id, "connection-claim-1");
+        assert_eq!(response.request_id.as_str(), expected_id);
+        assert_eq!(
+            response.trace_context["trace_id"],
+            format!("trace-{expected_id}")
+        );
+        assert!(!response.response.events.is_empty());
         assert!(
             response
+                .response
                 .events
                 .iter()
                 .all(|event| event.stream_id == "claim-1/gen-1")
@@ -1573,7 +1702,7 @@ fn stdio_starvation_parent() {
     }
     let kinds: Vec<&str> = responses
         .iter()
-        .map(|response| match &response.events[0].payload {
+        .map(|response| match &response.response.events[0].payload {
             WorkerEventPayload::Accepted { .. } => "accepted",
             WorkerEventPayload::Cancellation { .. } => "cancellation",
             WorkerEventPayload::Heartbeat => "heartbeat",
