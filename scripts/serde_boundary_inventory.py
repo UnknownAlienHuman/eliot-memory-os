@@ -553,8 +553,28 @@ def _tracked_rust_files(root: Path) -> list[str]:
     return sorted(found)
 
 
+# Masking patterns are compiled once and applied with an explicit start
+# offset against the original buffer. `re.match(pattern, source[i:])` used to
+# allocate a fresh copy of the whole remaining tail of the buffer at every
+# quote/raw-string/char position, which is quadratic in the file size; matching
+# at an offset over `source` itself is exactly equivalent (the patterns carry
+# no lookbehind and no `\A` anchor, so `match(source, i)` sees the same
+# character stream as `match(source[i:])`) and allocates nothing per position.
+# scripts/tests/test_serde_boundary_inventory.py case 8 proves byte equality of
+# the produced mask against the previous implementation over a real corpus.
+_MASK_BYTE_CHAR_RE = re.compile(r"b'(?:\\.|[^'\\])'")
+_MASK_CHAR_RE = re.compile(r"'(?:\\.|[^'\\\n])'")
+_MASK_RAW_STRING_RE = re.compile(r'r(#*)"')
+_MASK_RAW_BYTE_STRING_RE = re.compile(r'br(#*)"')
+
+
 def _mask_rust(source: str) -> str:
     """Blank strings/comments with spaces, preserving newlines and spans.
+
+    Work is linear in len(source): every regex runs against `source` at an
+    offset and every blanked region is emitted by indexing the original
+    buffer, so no per-position substring copy is allocated. The emitted mask
+    is byte-identical to the previous slice-per-character implementation.
 
     Raises InventoryError MALFORMED_RUST_SOURCE on unclosed block comments,
     string/char literals or raw strings instead of silently mis-scanning.
@@ -625,10 +645,10 @@ def _mask_rust(source: str) -> str:
                 raise InventoryError("MALFORMED_RUST_SOURCE", "unclosed byte-string literal")
             continue
         if ch == "b" and nxt == "'":
-            m = re.match(r"b'(?:\\.|[^'\\])'", source[i:])
+            m = _MASK_BYTE_CHAR_RE.match(source, i)
             if not m:
                 raise InventoryError("MALFORMED_RUST_SOURCE", "unclosed byte-char literal")
-            out.extend([" "] * len(m.group(0)))
+            out.append(" " * len(m.group(0)))
             i += len(m.group(0))
             continue
         if ch == '"':
@@ -654,10 +674,10 @@ def _mask_rust(source: str) -> str:
                 raise InventoryError("MALFORMED_RUST_SOURCE", "unclosed string literal")
             continue
         if ch == "'":
-            m = re.match(r"'(?:\\.|[^'\\\n])'", source[i:])
+            m = _MASK_CHAR_RE.match(source, i)
             if m:
                 # Genuine char literal: blank it.
-                out.extend([" "] * len(m.group(0)))
+                out.append(" " * len(m.group(0)))
                 i += len(m.group(0))
             else:
                 # Lifetime tick (e.g. <'de>) or stray quote: keep it so the
@@ -666,7 +686,7 @@ def _mask_rust(source: str) -> str:
                 i += 1
             continue
         if ch == "r":
-            m = re.match(r'r(#*)"', source[i:])
+            m = _MASK_RAW_STRING_RE.match(source, i)
             if m:
                 hashes = m.group(1)
                 closer = '"' + hashes
@@ -674,11 +694,11 @@ def _mask_rust(source: str) -> str:
                 end = source.find(closer, start)
                 if end < 0:
                     raise InventoryError("MALFORMED_RUST_SOURCE", "unclosed raw string literal")
-                segment = source[i:end + len(closer)]
-                out.extend("\n" if c == "\n" else " " for c in segment)
-                i = end + len(closer)
+                stop = end + len(closer)
+                out.extend("\n" if source[k] == "\n" else " " for k in range(i, stop))
+                i = stop
                 continue
-            m2 = re.match(r'br(#*)"', source[i:])
+            m2 = _MASK_RAW_BYTE_STRING_RE.match(source, i)
             if m2:
                 hashes = m2.group(1)
                 closer = '"' + hashes
@@ -686,9 +706,9 @@ def _mask_rust(source: str) -> str:
                 end = source.find(closer, start)
                 if end < 0:
                     raise InventoryError("MALFORMED_RUST_SOURCE", "unclosed raw byte string")
-                segment = source[i:end + len(closer)]
-                out.extend("\n" if c == "\n" else " " for c in segment)
-                i = end + len(closer)
+                stop = end + len(closer)
+                out.extend("\n" if source[k] == "\n" else " " for k in range(i, stop))
+                i = stop
                 continue
             out.append(ch)
             i += 1

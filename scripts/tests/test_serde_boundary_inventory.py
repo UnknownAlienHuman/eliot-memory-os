@@ -10,11 +10,15 @@ Branch: work/929-serde-boundary-inventory
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
+import inspect
 import json
+import re
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -112,6 +116,267 @@ def _validate_text(tmp: Path, text: str) -> None:
     doc = tool.load_artifact_toml(tmp)
     fresh = tool.build_inventory(tmp)
     tool.validate_against_artifact(tmp, fresh, doc)
+
+
+# ---------------------------------------------------------------------------
+# `_mask_rust` equivalence oracle (consumed by WORK_UNIT_CASE 929/8).
+#
+# The mask is load-bearing proof surface, not a convenience: every row's
+# span_digest is computed over the MASKED text, and the closure oracle proves
+# closure from the MASKED body of the schema-version refusal helper. Its
+# allocation was quadratic in file size, because `re.match(pat, source[i:])`
+# copied the whole remaining tail of the buffer at every quote / raw-string /
+# char position. The refactor is admissible only if the produced mask is
+# byte-identical, so `_reference_mask_rust` below is the previous
+# slice-per-character algorithm, transcribed verbatim, and is the oracle the
+# differential assertion runs against. It is deliberately left quadratic: it
+# is a test oracle, never a second production path.
+# ---------------------------------------------------------------------------
+def _reference_mask_rust(source: str) -> str:
+    """Verbatim transcription of the pre-refactor `_mask_rust` (quadratic)."""
+    out: list[str] = []
+    i = 0
+    n = len(source)
+    line_comment = False
+    block_depth = 0
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+                out.append("\n")
+            else:
+                out.append(" ")
+            i += 1
+            continue
+        if block_depth > 0:
+            if ch == "/" and nxt == "*":
+                block_depth += 1
+                out.extend([" ", " "])
+                i += 2
+            elif ch == "*" and nxt == "/":
+                block_depth -= 1
+                out.extend([" ", " "])
+                i += 2
+            elif ch == "\n":
+                out.append("\n")
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            line_comment = True
+            out.extend([" ", " "])
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            block_depth = 1
+            out.extend([" ", " "])
+            i += 2
+            continue
+        if ch == "b" and nxt == '"':
+            closed = False
+            out.extend([" ", " "])
+            i += 2
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    out.extend([" ", " "])
+                    i += 2
+                    continue
+                if c == '"':
+                    out.append(" ")
+                    i += 1
+                    closed = True
+                    break
+                if c == "\n":
+                    break
+                out.append(" ")
+                i += 1
+            if not closed:
+                raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed byte-string literal")
+            continue
+        if ch == "b" and nxt == "'":
+            m = re.match(r"b'(?:\\.|[^'\\])'", source[i:])
+            if not m:
+                raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed byte-char literal")
+            out.extend([" "] * len(m.group(0)))
+            i += len(m.group(0))
+            continue
+        if ch == '"':
+            out.append(" ")
+            i += 1
+            closed = False
+            while i < n:
+                c = source[i]
+                if c == "\\":
+                    out.extend([" ", " "])
+                    i += 2
+                    continue
+                if c == '"':
+                    out.append(" ")
+                    i += 1
+                    closed = True
+                    break
+                if c == "\n":
+                    break
+                out.append(" " if c != "\n" else "\n")
+                i += 1
+            if not closed:
+                raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed string literal")
+            continue
+        if ch == "'":
+            m = re.match(r"'(?:\\.|[^'\\\n])'", source[i:])
+            if m:
+                out.extend([" "] * len(m.group(0)))
+                i += len(m.group(0))
+            else:
+                out.append(ch)
+                i += 1
+            continue
+        if ch == "r":
+            m = re.match(r'r(#*)"', source[i:])
+            if m:
+                hashes = m.group(1)
+                closer = '"' + hashes
+                start = i + len(m.group(0))
+                end = source.find(closer, start)
+                if end < 0:
+                    raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed raw string literal")
+                segment = source[i:end + len(closer)]
+                out.extend("\n" if c == "\n" else " " for c in segment)
+                i = end + len(closer)
+                continue
+            m2 = re.match(r'br(#*)"', source[i:])
+            if m2:
+                hashes = m2.group(1)
+                closer = '"' + hashes
+                start = i + len(m2.group(0))
+                end = source.find(closer, start)
+                if end < 0:
+                    raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed raw byte string")
+                segment = source[i:end + len(closer)]
+                out.extend("\n" if c == "\n" else " " for c in segment)
+                i = end + len(closer)
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    if block_depth > 0:
+        raise tool.InventoryError("MALFORMED_RUST_SOURCE", "unclosed block comment")
+    return "".join(out)
+
+
+def _mask_outcome(fn, text: str) -> tuple:
+    """Outcome of one mask implementation: the mask, or the refusal code."""
+    try:
+        return ("mask", fn(text))
+    except tool.InventoryError as exc:
+        return ("error", exc.code, exc.detail)
+
+
+# Targeted shapes for every branch of the masker, including the malformed
+# inputs it must refuse rather than mis-scan.
+_MASK_EDGE_CASES: tuple[tuple[str, str], ...] = (
+    ("empty", ""),
+    ("plain-code", "struct A;\nimpl A { fn f(&self) -> u8 { 7 } }\n"),
+    ("line-comment-derive", 'let s = "x"; // #[derive(Deserialize)]\nstruct A;\n'),
+    ("block-comment-derive", "/*\n#[derive(Deserialize)]\n*/\nstruct A;\n"),
+    ("nested-block-comment", "/* a /* b */ #[derive(Deserialize)] */\nstruct A;\n"),
+    ("doc-comment", "//! doc\n/// doc\nstruct A;\n"),
+    ("nested-quotes-in-string", 'let s = "\\"#[derive(Deserialize)]\\"";\nstruct A;\n'),
+    ("escaped-backslash-quote", 'let s = "a\\\\"; let t = "b";\nstruct A;\n'),
+    ("raw-string", 'let s = r#" raw #[derive(Deserialize)] "#;\nstruct A;\n'),
+    ("raw-string-plain", 'let s = r"raw";\nstruct A;\n'),
+    ("raw-string-multiline", 'let s = r#"\n#[derive(Deserialize)]\n"#;\nstruct A;\n'),
+    ("raw-string-hash-run", 'let s = r####"x"###y"####;\nstruct A;\n'),
+    ("byte-string", 'let s = b"bytes";\nstruct A;\n'),
+    ("byte-string-escape", 'let s = b"a\\"b";\nstruct A;\n'),
+    ("byte-raw-string", 'let s = br#"raw"#;\nstruct A;\n'),
+    ("byte-raw-string-multi-hash", 'let s = br##"raw"#"##;\nstruct A;\n'),
+    ("char-literal", "let c = 'x';\nlet d = '\\n';\nlet e = '\\u{1F600}';\nstruct A;\n"),
+    ("byte-char-literal", "let c = b'x';\nlet d = b'\\n';\nstruct A;\n"),
+    ("lifetime", "fn f<'a>(s: &'a str) -> &'a str { s }\nstruct A;\n"),
+    ("stray-quote", "let s = a' + b';\nstruct A;\n"),
+    ("quote-in-ident", "fn r(x: char) -> char { r }\nlet z = 'r';\nstruct A;\n"),
+    ("cstring-literal", 'let s = c"cstr";\nstruct A;\n'),
+    ("attribute-adjacent", '#[serde(rename = "r", alias = "r#")]\nstruct A;\n'),
+    ("crlf", 'let s = "x";\r\n// comment\r\nstruct A;\r\n'),
+    ("unicode", 'let s = "\u00e9\u2028\u2029"; // \u0442\u0435\u0441\u0442\nstruct A;\n'),
+    ("derive-after-noise", (
+        "//! \u043c\u043e\u0434\u0443\u043b\u044c\n"
+        "/* \u0431\u043b\u043e\u043a */\n"
+        "pub struct Real { a: String }\n"
+    )),
+    ("malformed-block-comment", "/* unclosed\nstruct A;\n"),
+    ("malformed-block-comment-nested", "/* a /* b */\nstruct A;\n"),
+    ("malformed-string", 'let s = "unclosed;\nstruct A;\n'),
+    ("malformed-byte-string", 'let s = b"unclosed;\nstruct A;\n'),
+    ("malformed-raw-string", 'let s = r#"unclosed;\nstruct A;\n'),
+    ("malformed-raw-byte-string", 'let s = br#"unclosed;\nstruct A;\n'),
+    ("malformed-byte-char", "let c = b';\nstruct A;\n"),
+)
+
+# Corpus budget for the differential assertion. The oracle is quadratic by
+# construction, so the tracked-source sample is byte-bounded; it still covers
+# ~85 real crate files plus a prefix of the largest one, which is far past the
+# size at which the previous implementation stopped being practical.
+_MASK_CORPUS_BUDGET = 4 * 1024 * 1024
+_MASK_CORPUS_LARGEST_PREFIX = 256 * 1024
+
+
+def _mask_corpus() -> list[tuple[str, str]]:
+    """Deterministic (label, source) corpus for the mask equivalence proof."""
+    cases: list[tuple[str, str]] = list(_MASK_EDGE_CASES)
+    for name in FIXTURE_RS:
+        cases.append(("fixture:%s" % name, (FIXTURE_DIR / name).read_text(encoding="utf-8")))
+    sizes: list[tuple[int, str]] = []
+    for rel in tool._tracked_rust_files(ROOT):
+        try:
+            sizes.append(((ROOT / rel).stat().st_size, rel))
+        except OSError:
+            continue
+    budget = 0
+    for size, rel in sorted(sizes, key=lambda item: item[1]):
+        if budget + size > _MASK_CORPUS_BUDGET:
+            continue
+        budget += size
+        cases.append(("tracked:%s" % rel, (ROOT / rel).read_text(encoding="utf-8")))
+    if sizes:
+        largest = sorted(sizes, reverse=True)[0][1]
+        cases.append((
+            "largest-prefix:%s" % largest,
+            (ROOT / largest).read_text(encoding="utf-8")[:_MASK_CORPUS_LARGEST_PREFIX],
+        ))
+    return cases
+
+
+def _mask_input_slices(fn) -> list[ast.Subscript]:
+    """Every `source[a:b]` slice expression inside `fn`'s own body."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Slice)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "source"
+    ]
+
+
+def _uncompiled_regex_calls(fn) -> list[ast.Call]:
+    """Every `re.*(...)` call inside `fn` (each one used to need a fresh slice)."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "re"
+    ]
 
 
 class SerdeBoundaryInventoryTests(unittest.TestCase):
@@ -265,6 +530,66 @@ class SerdeBoundaryInventoryTests(unittest.TestCase):
             self.assertTrue(row["test_scope"])
             self.assertEqual(row["disposition"], "exact-internal")
             self.assertNotEqual(row["disposition"], "current-closed")
+
+        # The mask is the proof surface this case is about: doc comments and
+        # string literals must not stand in for real code, and the row spans
+        # and the closure oracle's schema-version refusal proof are both taken
+        # from the MASKED text. A mask that changed would not fail loudly, it
+        # would silently change every row's span_digest and make the shipped
+        # artifact wrong instead of detectably stale. So the refactored linear
+        # masker is compared byte for byte against the verbatim previous
+        # implementation over a real corpus, refusals included.
+        corpus = _mask_corpus()
+        self.assertGreaterEqual(len(corpus), 80)
+        self.assertTrue(any(label.startswith("tracked:") for label, _ in corpus))
+        self.assertTrue(any(label.startswith("largest-prefix:") for label, _ in corpus))
+        differing: list[str] = []
+        for label, text in corpus:
+            actual = _mask_outcome(tool._mask_rust, text)
+            expected = _mask_outcome(_reference_mask_rust, text)
+            if actual != expected:
+                differing.append(label)
+        self.assertEqual(differing, [], "mask output diverged from the previous implementation")
+        # Equality above is only meaningful if the corpus really exercises the
+        # mask: both implementations must blank noise, refuse the malformed
+        # inputs with the same code, and keep exactly one character per input
+        # character (the span-preserving contract the row spans rely on).
+        for label, text in corpus:
+            actual = _mask_outcome(tool._mask_rust, text)
+            self.assertEqual(actual[0], _mask_outcome(_reference_mask_rust, text)[0])
+            if actual[0] == "mask":
+                self.assertEqual(len(actual[1]), len(text), label)
+        blanked = tool._mask_rust('let s = "x"; // #[derive(Deserialize)]\nstruct A;')
+        self.assertNotIn("Deserialize", blanked)
+        self.assertIn("struct A;", blanked)
+        with self.assertRaises(tool.InventoryError) as ctx:
+            tool._mask_rust("/* unclosed")
+        self.assertEqual(ctx.exception.code, "MALFORMED_RUST_SOURCE")
+        with self.assertRaises(tool.InventoryError) as ctx:
+            tool._mask_rust('let s = "unclosed;')
+        self.assertEqual(ctx.exception.code, "MALFORMED_RUST_SOURCE")
+
+        # The allocation cause, asserted structurally rather than as a timing
+        # number: the quadratic term was a fresh copy of the remaining tail of
+        # the buffer at every quote / raw-string / char position. The mask body
+        # must therefore contain no slice expression over its input and no
+        # uncompiled `re.*` call (which is what forced that slice); it matches
+        # precompiled patterns at an offset over the original buffer.
+        self.assertEqual(_mask_input_slices(tool._mask_rust), [])
+        self.assertEqual(_uncompiled_regex_calls(tool._mask_rust), [])
+        for name in (
+            "_MASK_BYTE_CHAR_RE", "_MASK_CHAR_RE",
+            "_MASK_RAW_STRING_RE", "_MASK_RAW_BYTE_STRING_RE",
+        ):
+            self.assertIsInstance(getattr(tool, name), re.Pattern, name)
+        # Linear work at a size the previous implementation could not scan
+        # without copying gigabytes: output identical to the oracle.
+        unit = "pub fn f<'a>(s: &'a str) -> &'a str { let c = 'x'; let r = r\"raw\"; s }\n"
+        stress = unit * 3000
+        self.assertEqual(
+            _mask_outcome(tool._mask_rust, stress),
+            _mask_outcome(_reference_mask_rust, stress),
+        )
 
     # WORK_UNIT_CASE: 929/9
     def test_09_unsupported_syntax_macro_read_failure_never_empty_success(self) -> None:
