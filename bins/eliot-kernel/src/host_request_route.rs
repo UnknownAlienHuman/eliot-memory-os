@@ -395,6 +395,11 @@ pub(crate) struct HostRequestOperationRef {
     /// the State claim gate refuses a query/Skill form, so neither attempt can
     /// be completed by the other's result.
     pub(crate) local_read_pair_kind: Option<LocalReadPairKind>,
+    /// Original authenticated host OS user identity for the retained state
+    /// request. This value is captured at admission from the presenting
+    /// Kernel Session and mechanically returned to the daemon claim; it is
+    /// never parsed from the MCP payload or reconstructed from daemon facts.
+    pub(crate) local_read_authenticated_owner_ref: Option<String>,
     /// Queued observe pair for the daemon observe poller (issue #2565). Set
     /// only for admitted `eliot.observe` invocations whose tool bytes proved
     /// linkage: the exact envelope plus the exact retained tool bytes the
@@ -563,6 +568,11 @@ pub(crate) struct RetainedBoundedRead {
     pub(crate) tool: serde_json::Value,
     /// The Kernel-minted fenced attempt capability for this generation.
     pub(crate) attempt: eliot_protocol::LocalReadAttempt,
+    /// Exact authenticated host owner identity captured when the original
+    /// request entered through the Kernel frame route. Present for state
+    /// requests admitted through that route; direct test/legacy queue callers
+    /// retain `None` and cannot claim HumanOwner source authority.
+    pub(crate) authenticated_owner_ref: Option<String>,
 }
 
 /// Which bounded-read carrier admission accepted one linked pair (issue
@@ -1673,6 +1683,39 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        self.invoke_read_host_request_inner(envelope, tool, None)
+    }
+
+    /// Admits one invoke-read request from the authenticated host frame and
+    /// carries its actual OS peer identity with any queued State pair. The
+    /// identity is captured before queue retention; it is not inferred from
+    /// caller JSON, daemon Session facts, or the later state claim.
+    fn invoke_read_host_request_from_session(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        let owner_ref = match &session.peer {
+            PeerIdentity::Authenticated { user_identity, .. }
+                if !user_identity.trim().is_empty()
+                    && !user_identity.chars().any(char::is_control) =>
+            {
+                Some(user_identity.clone())
+            }
+            PeerIdentity::Authenticated { .. } | PeerIdentity::Unavailable { .. } => {
+                return Err(TransportError::PeerIdentityUnavailable);
+            }
+        };
+        self.invoke_read_host_request_inner(envelope, tool, Some(owner_ref))
+    }
+
+    fn invoke_read_host_request_inner(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        authenticated_owner_ref: Option<String>,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         if envelope.kind != HostRequestKind::Invocation {
             return Err(TransportError::SessionFenced);
         }
@@ -1715,7 +1758,12 @@ impl KernelComposition {
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
-            self.route_and_retain_invoke_read_lane(envelope, tool, &receipt)?;
+            self.route_and_retain_invoke_read_lane(
+                envelope,
+                tool,
+                &receipt,
+                authenticated_owner_ref.as_deref(),
+            )?;
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -1756,6 +1804,7 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         receipt: &HostRequestAdmissionReceipt,
+        authenticated_owner_ref: Option<&str>,
     ) -> Result<(), TransportError> {
         let mut mismatch_reason: Option<&'static str> = None;
         // A carrier gate failure is a real refusal that must keep its durable
@@ -1775,7 +1824,7 @@ impl KernelComposition {
                 // checked, not assumed: a carrier that answered with the
                 // state form did not retain THIS query, and saying so is a
                 // refusal rather than a silent reclassification.
-                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query)? {
+                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query, None)? {
                     Some("query")
                 } else {
                     mismatch_reason = Some("query_carrier_refused");
@@ -1783,7 +1832,7 @@ impl KernelComposition {
                 }
             }
             Ok(LocalReadAdmission::Skill) => {
-                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query)? {
+                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query, None)? {
                     Some("skill")
                 } else {
                     mismatch_reason = Some("query_carrier_refused");
@@ -1836,7 +1885,10 @@ impl KernelComposition {
                     // retains exactly the State form or returns its own
                     // typed gate error. There is no form mismatch to record,
                     // so `state_carrier_refused` is not invented here.
-                    match self.retain_bounded_state_pair(envelope, tool) {
+                    let Some(owner_ref) = authenticated_owner_ref else {
+                        return Err(TransportError::PeerIdentityUnavailable);
+                    };
+                    match self.retain_bounded_state_pair(envelope, tool, Some(owner_ref)) {
                         Ok(true) => Some("state"),
                         Ok(false) => {
                             mismatch_reason = Some("state_carrier_refused");
@@ -3180,6 +3232,7 @@ impl KernelComposition {
                 local_read_held_bytes: 0,
                 local_read_attempt: LocalReadAttemptState::default(),
                 local_read_pair_kind: None,
+                local_read_authenticated_owner_ref: None,
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: None,
@@ -3231,7 +3284,7 @@ impl KernelComposition {
         tool: &serde_json::Value,
     ) -> Result<LocalReadPairKind, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
-        self.enqueue_local_read_pair_under_transition(envelope, tool)
+        self.enqueue_local_read_pair_under_transition(envelope, tool, None)
     }
 }
 
@@ -3393,8 +3446,14 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
+        authenticated_owner_ref: Option<&str>,
     ) -> Result<bool, TransportError> {
-        self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::State)
+        self.retain_bounded_read_as(
+            envelope,
+            tool,
+            LocalReadPairKind::State,
+            authenticated_owner_ref,
+        )
     }
 
     /// Retains one bounded read on the carrier ONLY if the carrier admits it as
@@ -3412,8 +3471,13 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         form: LocalReadPairKind,
+        authenticated_owner_ref: Option<&str>,
     ) -> Result<bool, TransportError> {
-        Ok(self.enqueue_local_read_pair_under_transition(envelope, tool)? == form)
+        Ok(self.enqueue_local_read_pair_under_transition(
+            envelope,
+            tool,
+            authenticated_owner_ref,
+        )? == form)
     }
 
     /// Retains one bounded-read pair on the shared local-read carrier,
@@ -3444,6 +3508,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
+        authenticated_owner_ref: Option<&str>,
     ) -> Result<LocalReadPairKind, TransportError> {
         let Some(admission) = self.bounded_read_carrier_admission(envelope, tool) else {
             return Err(TransportError::SessionFenced);
@@ -3466,7 +3531,22 @@ impl KernelComposition {
             LocalReadReplay::ConflictingConnection => {
                 return Err(TransportError::IdentityConflict);
             }
-            LocalReadReplay::AlreadyStaged => return Ok(kind),
+            LocalReadReplay::AlreadyStaged => {
+                if kind == LocalReadPairKind::State
+                    && index
+                        .get(&envelope.connection_id)
+                        .into_iter()
+                        .flatten()
+                        .find(|candidate| candidate.operation_id == operation_id)
+                        .and_then(|candidate| {
+                            candidate.local_read_authenticated_owner_ref.as_deref()
+                        })
+                        != authenticated_owner_ref
+                {
+                    return Err(TransportError::IdentityConflict);
+                }
+                return Ok(kind);
+            }
             LocalReadReplay::Fresh => {}
         }
         // I7.24 step 5: refuse materially repeated calls with no new
@@ -3516,6 +3596,8 @@ impl KernelComposition {
                 kind,
                 local_read_attempt,
             );
+            candidate.local_read_authenticated_owner_ref =
+                authenticated_owner_ref.map(str::to_owned);
         } else {
             refs.push(HostRequestOperationRef {
                 operation_id,
@@ -3525,6 +3607,7 @@ impl KernelComposition {
                 local_read_held_bytes: request_bytes,
                 local_read_attempt,
                 local_read_pair_kind: Some(kind),
+                local_read_authenticated_owner_ref: authenticated_owner_ref.map(str::to_owned),
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: None,
@@ -3905,6 +3988,9 @@ impl KernelComposition {
                     envelope: envelope.clone(),
                     tool: tool.clone(),
                     attempt,
+                    authenticated_owner_ref: candidate
+                        .local_read_authenticated_owner_ref
+                        .clone(),
                 }));
             }
         }
@@ -5342,6 +5428,7 @@ impl KernelComposition {
                 local_read_held_bytes: 0,
                 local_read_attempt: LocalReadAttemptState::default(),
                 local_read_pair_kind: None,
+                local_read_authenticated_owner_ref: None,
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: Some(token),
@@ -6896,7 +6983,8 @@ impl KernelComposition {
                 }
                 AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                     let tool = host_request_tool_from_payload(payload)?;
-                    let (receipt, record) = self.invoke_read_host_request(envelope, &tool)?;
+                    let (receipt, record) =
+                        self.invoke_read_host_request_from_session(session, envelope, &tool)?;
                     // The durable record carries the result pair when the
                     // operation already received its bounded answer, so the
                     // admitted shape is the result-bearing response: no second
@@ -10979,6 +11067,7 @@ mod invoke_read_tool_tests {
             // `local_read_envelope`, and a tagged-but-empty row is not a shape
             // the enqueue gate can produce.
             local_read_pair_kind: None,
+            local_read_authenticated_owner_ref: None,
             observe_envelope: None,
             observe_tool: None,
             observe_reservation: None,

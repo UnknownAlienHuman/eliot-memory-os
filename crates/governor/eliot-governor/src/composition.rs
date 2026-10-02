@@ -239,6 +239,28 @@ pub trait KernelTransitionPort: Send + Sync {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt>;
 
+    /// Applies a task-bound prepared transition after the Governor has
+    /// rechecked the original cold-start terminal and selection against the
+    /// live task owner. Implementations must fail closed unless they can bind
+    /// this evidence to the exact prepared task/scope/fence.
+    fn apply_prepared_with_task_selection<'a>(
+        &'a self,
+        _identity: &RequestIdentity,
+        _transition: PreparedTransition,
+        _expected_revision_heads: Vec<RevisionHeadExpectation>,
+        _expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        _claim: &'a ColdStartReadinessClaim,
+        _owner_readback: &'a ColdStartOwnerReadback,
+        _selection: &'a TaskSelectionEvidence,
+        _current: &'a CurrentTaskSelection,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        Box::pin(async {
+            Err(KernelPortError::NotAdmitted(
+                "task-bound prepared transition handoff is not admitted".to_owned(),
+            ))
+        })
+    }
+
     /// Reconciles one operation by its exact canonical identity.
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>>;
 
@@ -3797,6 +3819,70 @@ impl CanonicalAdmissionOwner {
                 transition,
                 expected_revision_heads,
                 expected_ordering_heads,
+            )
+            .await?)
+    }
+
+    /// Sends the same Canonical-produced transition through the task-bound
+    /// handoff only after the original owner terminal and current selection
+    /// agree with its immutable task, scope, and fence. No transition or
+    /// request digest is rewritten on this path.
+    pub(crate) async fn commit_with_task_selection<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        claim: &ColdStartReadinessClaim,
+        owner_readback: &ColdStartOwnerReadback,
+        selection: &TaskSelectionEvidence,
+        current: &CurrentTaskSelection,
+    ) -> Result<WriteReceipt, CompositionError> {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        if envelope.request != identity.request.metadata
+            || envelope.idempotency_key != identity.idempotency_key
+        {
+            return Err(CompositionError::Provider(
+                "admitted request binding does not match the Canonical task-bound envelope".to_owned(),
+            ));
+        }
+        if owner_readback.record.claim != *claim {
+            return Err(CompositionError::Recovery(
+                "task-bound handoff claim differs from the exact owner readback".to_owned(),
+            ));
+        }
+        selection
+            .recheck_against_current(current, &identity.request.metadata.state_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if selection.is_contaminated() {
+            return Err(CompositionError::Recovery(
+                "contaminated task selection cannot authorize a canonical write".to_owned(),
+            ));
+        }
+        let expected_revision_heads = envelope.expected_revision_heads.clone();
+        let expected_ordering_heads = envelope.expected_ordering_heads.clone();
+        let transition = self.prepare(&envelope)?;
+        if transition.identity.idempotency_key != identity.idempotency_key
+            || transition.state_fence != identity.request.metadata.state_fence
+            || transition.task_id.as_deref() != Some(selection.task_ref.as_str())
+            || transition.scope_id.as_str() != selection.work_scope_ref.as_str()
+            || current.state_fence != transition.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "prepared transition does not match the owner-rechecked task selection".to_owned(),
+            ));
+        }
+        Ok(port
+            .apply_prepared_with_task_selection(
+                identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                claim,
+                owner_readback,
+                selection,
+                current,
             )
             .await?)
     }
@@ -9386,6 +9472,63 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 directive,
                 missing_inputs,
             }),
+        }
+    }
+
+    /// Task-bound canonical write handoff. This keeps the ordinary material
+    /// and retained-WorkScope gates, then carries the original readiness owner
+    /// readback and rechecked task selection to the neutral Kernel port.
+    pub async fn commit_canonical_with_readiness_for_task_bound(
+        &mut self,
+        identity: &RequestIdentity,
+        envelope: CanonicalWriteEnvelope,
+        readiness: &MaterialReadinessInputs<'_>,
+        observed: &ScopeBinding,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        claim: &ColdStartReadinessClaim,
+        owner_readback: &ColdStartOwnerReadback,
+        selection: &TaskSelectionEvidence,
+        current: &CurrentTaskSelection,
+    ) -> Result<WriteReceipt, CompositionError> {
+        match self.check_material_readiness_for_write(readiness, observed, sources, privacy)? {
+            MaterialAdmission::Denied {
+                receipt_ref,
+                effect,
+                directive,
+                missing_inputs,
+            } => Err(CompositionError::MaterialReadinessDenied {
+                receipt_ref,
+                effect,
+                directive,
+                missing_inputs,
+            }),
+            MaterialAdmission::Admitted { .. } => {
+                let scope = require_fresh_matched_binding(
+                    self.owners.work_scope.as_ref(),
+                    &envelope.request.state_fence,
+                    "task-bound canonical write work scope is not freshly matched",
+                )?;
+                if scope.binding.scope.scope_ref != envelope.scope_id.as_str()
+                    || scope.binding.scope.scope_ref.as_str() != selection.work_scope_ref.as_str()
+                {
+                    return Err(CompositionError::Recovery(
+                        "task-bound canonical write differs from the retained WorkScope".to_owned(),
+                    ));
+                }
+                self.owners
+                    .canonical
+                    .commit_with_task_selection(
+                        self.kernel.as_ref(),
+                        identity,
+                        envelope,
+                        claim,
+                        owner_readback,
+                        selection,
+                        current,
+                    )
+                    .await
+            }
         }
     }
 

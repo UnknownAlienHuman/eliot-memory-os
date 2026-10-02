@@ -293,6 +293,54 @@ impl KernelTransitionPort for DaemonKernelClient {
         )
     }
 
+    fn apply_prepared_with_task_selection<'a>(
+        &'a self,
+        identity: &RequestIdentity,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        claim: &'a eliot_ors::ColdStartReadinessClaim,
+        owner_readback: &'a eliot_governor::ColdStartOwnerReadback,
+        selection: &'a eliot_observation::TaskSelectionEvidence,
+        current: &'a eliot_observation::CurrentTaskSelection,
+    ) -> KernelPortFuture<'a, WriteReceipt> {
+        let identity = identity.clone();
+        let claim = claim.clone();
+        let owner_readback = owner_readback.clone();
+        let selection = selection.clone();
+        let current = current.clone();
+        Box::pin(async move {
+            owner_readback
+                .record
+                .validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if owner_readback.record.claim != claim {
+                return Err(KernelPortError::NotAdmitted(
+                    "task-bound handoff claim differs from its durable owner readback".to_owned(),
+                ));
+            }
+            selection
+                .recheck_against_current(&current, &identity.request.metadata.state_fence)
+                .map_err(|error| KernelPortError::NotAdmitted(error.to_string()))?;
+            if selection.is_contaminated()
+                || transition.task_id.as_deref() != Some(selection.task_ref.as_str())
+                || transition.scope_id.as_str() != selection.work_scope_ref.as_str()
+                || transition.state_fence != current.state_fence
+            {
+                return Err(KernelPortError::NotAdmitted(
+                    "prepared transition differs from the owner-rechecked task selection".to_owned(),
+                ));
+            }
+            self.apply_prepared(
+                &identity,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+            )
+            .await
+        })
+    }
+
     fn receipt(&self, operation_id: OperationId) -> KernelPortFuture<'_, Option<WriteReceipt>> {
         let state_fence = self.kernel_binding.state_fence.clone();
         // #740: receipt-boundary span over the owning read path

@@ -999,6 +999,83 @@ pub fn parse_local_read_claimed_pair(
     }
 }
 
+/// Authenticated `eliot.state` pair claimed from the bounded Kernel carrier.
+/// The human owner identity is captured at the original authenticated host
+/// frame and returned by the Kernel queue verbatim; it is required to build
+/// any HumanOwner source admission and never falls back to the daemon peer.
+pub struct LocalStateClaimedPair {
+    /// Exact admitted host request envelope.
+    pub envelope: HostRequestEnvelope,
+    /// Exact canonical state tool bytes retained at admission.
+    pub tool: serde_json::Value,
+    /// Kernel-minted fenced attempt capability.
+    pub attempt: LocalReadAttempt,
+    /// Original authenticated OS peer identity captured at admission.
+    pub authenticated_owner_ref: String,
+}
+
+/// Decodes the state-only claim form, including the actual original host
+/// owner identity captured by Kernel admission. No request field supplies it.
+pub fn parse_local_state_claimed_pair(
+    value: &serde_json::Value,
+) -> Result<Option<LocalStateClaimedPair>, String> {
+    let pair = value
+        .get("pair")
+        .ok_or_else(|| "Kernel local_state_claim answer omits the pair".to_owned())?;
+    match pair {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(object) => {
+            if object.len() != 5
+                || object.get("form").and_then(serde_json::Value::as_str) != Some("state")
+            {
+                return Err("Kernel local_state_claim pair has an invalid closed shape".to_owned());
+            }
+            let envelope: HostRequestEnvelope = serde_json::from_value(
+                object
+                    .get("envelope")
+                    .cloned()
+                    .ok_or_else(|| "Kernel local_state_claim pair omits envelope".to_owned())?,
+            )
+            .map_err(|error| format!("Kernel local_state_claim envelope does not decode: {error}"))?;
+            envelope
+                .validate()
+                .map_err(|error| format!("Kernel local_state_claim envelope is invalid: {error}"))?;
+            let tool = object
+                .get("tool")
+                .cloned()
+                .ok_or_else(|| "Kernel local_state_claim pair omits tool".to_owned())?;
+            let attempt: LocalReadAttempt = serde_json::from_value(
+                object
+                    .get("attempt")
+                    .cloned()
+                    .ok_or_else(|| "Kernel local_state_claim pair omits attempt".to_owned())?,
+            )
+            .map_err(|error| format!("Kernel local_state_claim attempt does not decode: {error}"))?;
+            attempt
+                .validate()
+                .map_err(|error| format!("Kernel local_state_claim attempt is invalid: {error}"))?;
+            if attempt.operation_id != host_request_operation_id(&envelope) {
+                return Err("Kernel local_state_claim attempt does not bind the envelope".to_owned());
+            }
+            let authenticated_owner_ref = object
+                .get("authenticated_owner_ref")
+                .and_then(serde_json::Value::as_str)
+                .filter(|owner| !owner.trim().is_empty() && !owner.chars().any(char::is_control))
+                .ok_or_else(|| {
+                    "Kernel local_state_claim pair lacks authenticated host owner identity".to_owned()
+                })?
+                .to_owned();
+            Ok(Some(LocalStateClaimedPair {
+                envelope,
+                tool,
+                attempt,
+                authenticated_owner_ref,
+            }))
+        }
+        _ => Err("Kernel local_state_claim pair is neither object nor null".to_owned()),
+    }
+}
+
 /// Parses one unwrapped `local_read_result` answer value into the typed
 /// submit outcome.
 ///
@@ -2804,10 +2881,7 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_local_state_pair_async(
         &self,
-    ) -> Result<
-        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
-        super::DaemonError,
-    > {
+    ) -> Result<Option<LocalStateClaimedPair>, super::DaemonError> {
         let value = self
             .transact_async(
                 "local_state_claim",
@@ -2815,10 +2889,11 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
-        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
-            envelope.identity.capability != "eliot.state"
-                || tool.get("name").and_then(serde_json::Value::as_str) != Some("eliot.state")
+        let pair = parse_local_state_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|pair| {
+            pair.envelope.identity.capability != "eliot.state"
+                || pair.tool.get("name").and_then(serde_json::Value::as_str)
+                    != Some("eliot.state")
         }) {
             let _ = crate::diagnostics::RejectionRecord::of(
                 crate::diagnostics::RejectionReason::RouteMismatch,
@@ -2830,10 +2905,10 @@ impl DaemonKernelClient {
                 "Kernel local_state_claim returned a pair outside the state tool".to_owned(),
             ));
         }
-        if let Some((envelope, _, attempt)) = pair.as_ref() {
+        if let Some(pair) = pair.as_ref() {
             let _ = crate::diagnostics::RequestReceipt::of(
-                envelope.identity.request_id.as_str(),
-                &attempt.operation_id,
+                pair.envelope.identity.request_id.as_str(),
+                &pair.attempt.operation_id,
             )
             .emit();
         }

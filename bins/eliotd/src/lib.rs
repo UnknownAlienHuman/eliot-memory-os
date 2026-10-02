@@ -1113,6 +1113,7 @@ impl DaemonComposition {
         identity: &eliot_protocol::RequestIdentity,
         envelope: eliot_governor::CanonicalWriteEnvelope,
         readiness: &eliot_workscope::MaterialReadinessInputs<'_>,
+        owner_dispatch: Option<&task_binding_admission::OwnerBoundDispatch>,
         observed_work_scope: &eliot_governor::ScopeBinding,
         source_closure: Option<(
             &eliot_governor::GoverningSourceSet,
@@ -1162,8 +1163,13 @@ impl DaemonComposition {
         // the caller-presented readiness fence (I4.2.1: "`MATCHED` is required
         // again after any generation change that can alter the real target of
         // the task").
-        let live_fence = self.governor.kernel_snapshot().state_fence();
-        let admission = if crate::task_binding_admission::envelope_is_task_relative(&envelope) {
+        let mut live_fence = self.governor.kernel_snapshot().state_fence();
+        let task_relative = crate::task_binding_admission::envelope_is_task_relative(&envelope);
+        let mut owner_current_selection = None;
+        let mut owner_task_evidence = None;
+        let mut owner_readback_for_effect = None;
+        let mut owner_claim_for_effect = None;
+        let admission = if task_relative {
             // Issue #1746 (W4/A2): a task-relative write is admitted only
             // against the live Governor-resolved activation, never on the
             // caller-presented receipt alone. The lease key terms come from
@@ -1183,23 +1189,161 @@ impl DaemonComposition {
             // Captures and non-task-relative writes stay on the receipt-only
             // leg below so permitted raw capture remains cold (issue #1746,
             // A3) without a retained terminal.
-            let (activation, _) = self.governor.current_task_selection(
-                readiness.now,
-                readiness.lease.lineage_candidate_ref.as_str(),
-                readiness.lease.workspace_instance_candidate_ref.as_str(),
-                readiness.lease.privacy_class,
-                readiness.lease.governing_source_generation,
-            )?;
-            crate::task_binding_admission::admit_canonical_write_with_activation(
+            let dispatch = owner_dispatch.ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-relative canonical write has no owner-bound dispatch carrier",
+                ))
+            })?;
+            if dispatch.envelope() != &envelope
+                || dispatch.bootstrap().operation_id() != envelope.operation_id.as_str()
+                || dispatch.bootstrap().attach().state_fence != readiness.fence.clone()
+                || dispatch.bootstrap().attach().lease != *readiness.lease
+            {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "canonical payload or readiness tuple differs from its original owner-bound dispatch",
+                    ),
+                ));
+            }
+            let claim = &dispatch.bootstrap().attach().readiness_claim;
+            let now = unix_ms();
+            let owner_bootstrap = self
+                .governor
+                .cold_start_owner_readback_with_delta_for_claim(claim, None, now)
+                .map_err(DaemonError::Composition)?;
+            if owner_bootstrap.readback.record != *dispatch.bootstrap().owner_record()
+                || owner_bootstrap.readback.lease != dispatch.bootstrap().attach().lease
+                || owner_bootstrap.readback.surface
+                    != dispatch.bootstrap().attach().expected_surface
+                || &owner_bootstrap.readback.receipt != readiness.receipt
+            {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "current owner terminal differs from the original dispatch receipt, lease, or surface",
+                    ),
+                ));
+            }
+            let (activation, owner_receipt) = self
+                .governor
+                .current_task_selection_for_claim(unix_ms(), claim)
+                .map_err(DaemonError::Composition)?;
+            if owner_receipt != owner_bootstrap.readback.receipt {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "current task selection returned a different owner terminal",
+                    ),
+                ));
+            }
+            let evidence = match task_binding_admission::resolve_task_selection(&owner_receipt)
+                .map_err(DaemonError::TaskBinding)?
+            {
+                task_binding_admission::TaskSelectionDisposition::Current(evidence) => evidence,
+                _ => {
+                    return Err(DaemonError::TaskBinding(
+                        task_binding_admission::TaskBindingError::selection_required(
+                            "task-relative canonical write has no current owner task selection",
+                        ),
+                    ));
+                }
+            };
+            let current_selection = self
+                .governor
+                .recheck_task_selection_for_claim(unix_ms(), claim, &evidence)
+                .await
+                .map_err(DaemonError::Composition)?;
+            owner_task_evidence = Some(evidence.clone());
+            if activation.as_ref().is_none_or(|activation| {
+                activation.task_id.as_str() != current_selection.task_ref
+                    || activation.task_revision != current_selection.task_revision
+                    || activation.work_scope_id != current_selection.work_scope_ref
+                    || activation.state_fence != current_selection.state_fence
+            }) {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "live acceptance-set selection differs from the activation snapshot",
+                    ),
+                ));
+            }
+            owner_current_selection = Some(current_selection);
+            live_fence = self.governor.kernel_snapshot().state_fence();
+            let final_readback = self
+                .governor
+                .cold_start_owner_readback_with_delta_for_claim(claim, None, unix_ms())
+                .map_err(DaemonError::Composition)?;
+            if final_readback.readback.record != owner_bootstrap.readback.record
+                || final_readback.readback.receipt != owner_bootstrap.readback.receipt
+                || final_readback.readback.lease != owner_bootstrap.readback.lease
+                || final_readback.readback.surface != owner_bootstrap.readback.surface
+                || final_readback.readback.surface.lease_deadline < unix_ms()
+                || final_readback.readback.surface.state_fence != live_fence
+            {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "owner readiness terminal expired or moved before canonical admission",
+                    ),
+                ));
+            }
+            owner_readback_for_effect = Some(final_readback.readback.clone());
+            owner_claim_for_effect = Some(claim.clone());
+            let current_governance_profile = self
+                .governor_authority_mut()
+                .map_err(|error| match error {
+                    DaemonError::Composition(error) => DaemonError::Composition(error),
+                    other => DaemonError::Composition(CompositionError::Recovery(
+                        other.to_string(),
+                    )),
+                })?
+                .current_profile()
+                .cloned();
+            let revalidation_now = unix_ms();
+            let effect_owner_input = task_binding_admission::OwnerBoundBootstrapInput {
+                attach: dispatch.bootstrap().attach(),
+                owner_readback: &final_readback.readback,
+                // This process has no retained verified IntegrationCoverageProfile
+                // owner. Keep the axis unknown; a prior profile reference is not
+                // evidence that the same profile is current.
+                coverage: None,
+                governance: current_governance_profile.as_ref(),
+                activation: activation.as_ref(),
+                current_selection: owner_current_selection.as_ref(),
+                operation_id: envelope.operation_id.as_str(),
+                now: revalidation_now,
+                live_fence: &live_fence,
+            };
+            task_binding_admission::revalidate_owner_bound_dispatch(
+                dispatch,
+                &effect_owner_input,
+            )
+            .map_err(DaemonError::TaskBinding)?;
+            let admission = crate::task_binding_admission::admit_canonical_write_with_activation(
                 envelope.operation_id.as_str().to_owned(),
                 &identity.request.metadata,
                 &envelope,
-                readiness.receipt,
+                &owner_receipt,
                 readiness.fence,
                 &live_fence,
                 activation.as_ref(),
-            )?
+            )?;
+            if !matches!(
+                &admission,
+                task_binding_admission::TaskBindingAdmission::TaskBound(binding)
+                    if binding == dispatch.binding()
+            ) {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "admitted task binding differs from the original sealed dispatch",
+                    ),
+                ));
+            }
+            admission
         } else {
+            if owner_dispatch.is_some() {
+                return Err(DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(
+                        "non-task-relative canonical write cannot consume a task-bound dispatch carrier",
+                    ),
+                ));
+            }
             crate::task_binding_admission::admit_canonical_write(
                 envelope.operation_id.as_str().to_owned(),
                 &identity.request.metadata,
@@ -1252,6 +1396,17 @@ impl DaemonComposition {
         // through untouched.
         if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) = &admission
         {
+            let current = owner_current_selection.as_ref().ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-bound write lost its owner selection before the effect gate",
+                ))
+            })?;
+            binding
+                .evidence
+                .recheck_against_current(current, &live_fence)
+                .map_err(|error| DaemonError::TaskBinding(
+                    task_binding_admission::TaskBindingError::scope_incompatible(error.to_string()),
+                ))?;
             crate::task_binding_admission::revalidate_task_bound_for_effect(
                 &binding.evidence,
                 Some(binding.admitted_task_ref.as_str()),
@@ -1277,18 +1432,55 @@ impl DaemonComposition {
                 "canonical write has no governing-source closure".to_owned(),
             ))
         })?;
-        let receipt = self
-            .governor
-            .commit_canonical_with_readiness(
-                identity,
-                envelope,
-                readiness,
-                observed_work_scope,
-                sources,
-                privacy,
-            )
-            .await
-            .map_err(DaemonError::Composition)?;
+        let receipt = if task_relative {
+            let claim = owner_claim_for_effect.as_ref().ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-bound effect lost its original cold-start claim",
+                ))
+            })?;
+            let owner_readback = owner_readback_for_effect.as_ref().ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-bound effect lost its exact owner readback",
+                ))
+            })?;
+            let evidence = owner_task_evidence.as_ref().ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-bound effect lost its original selection evidence",
+                ))
+            })?;
+            let current = owner_current_selection.as_ref().ok_or_else(|| {
+                DaemonError::TaskBinding(task_binding_admission::TaskBindingError::selection_required(
+                    "task-bound effect lost its current owner selection",
+                ))
+            })?;
+            self.governor
+                .commit_canonical_with_readiness_for_task_bound(
+                    identity,
+                    envelope,
+                    readiness,
+                    observed_work_scope,
+                    sources,
+                    privacy,
+                    claim,
+                    owner_readback,
+                    evidence,
+                    current,
+                )
+                .await
+                .map_err(DaemonError::Composition)?
+        } else {
+            self.governor
+                .commit_canonical_with_readiness(
+                    identity,
+                    envelope,
+                    readiness,
+                    observed_work_scope,
+                    sources,
+                    privacy,
+                )
+                .await
+                .map_err(DaemonError::Composition)?
+        };
         if self.governor.refresh_from_kernel().is_err() {
             self.view_stale = true;
         }
