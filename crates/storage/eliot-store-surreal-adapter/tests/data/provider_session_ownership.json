@@ -55,7 +55,7 @@
       "symbol": "connect_started_provider",
       "from": "src/client.rs",
       "to": "src/client/session.rs",
-      "old_body_sha256": "321920f05781ca81184da357ab8383791d66f2f5f6a3006e9477378e51eca13d"
+      "old_body_sha256": "4fd9cbad8677b2c33571e47f928fb39832a7cdf82a24cdae742f274f7eb69cb8"
     }
   ],
   "callers": [
