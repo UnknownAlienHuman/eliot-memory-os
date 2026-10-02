@@ -348,7 +348,9 @@ impl SkillContextMeasurementProjection {
                 );
                 seal_skill_context_number(&mut hasher, "tokens", tokenizer.tokens);
             }
-            None => hasher.update(&[0_u8]),
+            None => {
+                hasher.update(&[0_u8]);
+            }
         }
         hasher.finalize().to_hex().to_string()
     }
