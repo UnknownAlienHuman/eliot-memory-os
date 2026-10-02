@@ -34,7 +34,21 @@ where
     Ok(version)
 }
 
-/// Implementation grouping names used to account for every I9.5 semantic field.
+/// Implementation grouping for the packet's section accounting.
+///
+/// These names are a grouping, not a field list: nothing binds this enum to an
+/// external I9.5 field inventory, so this crate cannot check that the grouping
+/// accounts for every field. `known` is derived for four sections -
+/// `EvidenceCoverage` and `Positions` from the presence of
+/// `coverage_denominator`, `RelationCandidates` and `SafeExternalHandoff` from
+/// `known_empty_sections` membership - and is asserted by construction for the
+/// remaining seven (`IdentityTaskFrame`, `Constraints`,
+/// `InterpretationsRivalsDissent`, `UnknownsGaps`, `InertProbes`,
+/// `OmissionsExpansionFrontierInvalidation`, `Preservation`), whose items come
+/// from inputs this crate admits unconditionally and which the denominator does
+/// not account for. `Preservation`'s flag is rewritten from the projection
+/// verdicts in `rebuild_preservation_section`, and every one of those verdicts
+/// carries a literal `known: true`, so that rewrite is asserted too.
 #[derive(
     Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
 )]
@@ -121,13 +135,52 @@ pub struct OrientationInterpretation {
     pub invalidation_conditions: Vec<String>,
 }
 
+/// The I9.5 residue classes this crate emits on its production path.
+///
+/// The declared variant set matches the construction sites on that path -
+/// `build_semantics`, `make_packet`, and
+/// `preserves_rivals_counterevidence_and_temporal_status`, which is a
+/// production predicate called from `projection_preservation` and not a test
+/// helper - and the deserializer refuses any spelling outside this declared
+/// set. That refusal is the whole of what is enforced here. This enum is `pub`
+/// and unsealed, so authoring closure is NOT established: adding a variant is
+/// an ordinary additive change to this declaration, and no mechanism in this
+/// crate prevents one. The `#[cfg(test)]` match over every variant below and
+/// the orientation proof that pins each declared variant to an observed
+/// producer both fail when a variant is added, but both are edited in the same
+/// change as the variant, so neither is a seal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationResidueKind {
+    /// Model-supplied counterevidence carried as a rival residue.
+    Counterevidence,
+    /// An admitted omission handle whose material is not available.
+    Unavailable,
+    /// A class outside this basic Orientation owner's boundary.
+    Unsupported,
+    /// A class the coverage denominator proves empty.
+    KnownEmpty,
+    /// Retained A03 usage with no admitted route or price provenance.
+    BudgetProvenanceUnavailable,
+}
+
 /// Explicit unsupported residue, never upgraded to an algorithmic relation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OrientationResidue {
-    pub kind: String,
+    pub kind: OrientationResidueKind,
     pub text: String,
     pub source: String,
+}
+
+/// Closed I9.5 probe classes produced by this crate. An inert model
+/// recommendation is the only measured probe status; the deserializer refuses
+/// any spelling outside this set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InertProbeStatus {
+    /// A model recommendation carried without execution authority.
+    ModelRecommendationInert,
 }
 
 /// A model recommendation remains inert and cannot become a typed plan.
@@ -135,7 +188,7 @@ pub struct OrientationResidue {
 #[serde(deny_unknown_fields)]
 pub struct InertProbe {
     pub text: String,
-    pub status: String,
+    pub status: InertProbeStatus,
     pub result_space: Option<String>,
 }
 
@@ -165,6 +218,11 @@ pub struct OrientationProvenance {
 pub struct OrientationPacketCandidate {
     #[serde(deserialize_with = "deserialize_orientation_packet_schema")]
     pub schema_version: u32,
+    /// A self-hash of this packet: the canonical bytes of the packet with
+    /// `packet_id` and `output_digest` cleared, hashed in `finalize_packet`.
+    /// It is recomputed in `validate`, which proves the packet is internally
+    /// consistent and nothing about its inputs; `input_digest` is the member
+    /// that binds the five admitted inputs.
     pub packet_id: String,
     pub job_id: String,
     pub operation_id: String,
@@ -180,21 +238,41 @@ pub struct OrientationPacketCandidate {
     pub anchored_evidence_by_status: Vec<AnchoredEvidence>,
     pub synthesized_interpretations: Vec<OrientationInterpretation>,
     pub rival_models_and_dissent: Vec<OrientationResidue>,
+    /// Empty when the coverage denominator proves `relation_candidates`
+    /// known-empty, otherwise one hardcoded `Unsupported` marker. This crate
+    /// has no relation input, so no residue here is derived from source
+    /// material; the member records that typed relation projection is outside
+    /// this owner's boundary and nothing more.
     pub hidden_relation_candidates: Vec<OrientationResidue>,
     pub unknowns_and_gaps: Vec<OrientationResidue>,
     pub recommended_probes_or_next_actions: Vec<InertProbe>,
+    /// A literal in both branches: `KnownEmpty` when the coverage denominator
+    /// lists `architecture_implications` among `known_empty_sections`, otherwise
+    /// the `Unsupported` marker. Only the branch is input-driven; the kind and
+    /// the text are fixed, and no architecture input is read.
     pub architecture_implications: OrientationResidue,
+    /// `kind` is the unconditional constant `BudgetProvenanceUnavailable`;
+    /// only `text` interpolates A03 usage. No route or price provenance exists
+    /// in this crate, so nothing here measures a route or a cost.
     pub model_routes_and_cost: OrientationResidue,
     pub budget_usage: BudgetUsage,
     pub invalidation_conditions: Vec<String>,
     pub provenance: OrientationProvenance,
     pub sections: Vec<OrientationSection>,
     pub preservation: RelationPreservation,
+    /// A clone of the admitted candidate's upstream `PreservationReport`. The
+    /// packet's own `preservation` is computed independently by
+    /// `projection_preservation`, and nothing cross-checks the two against each
+    /// other; this member carries the upstream claim, not a corroboration of
+    /// it.
     pub upstream_preservation: eliot_dreamer_contracts::PreservationReport,
     pub model_draft: eliot_dreamer_contracts::ModelDraft,
     pub grounded_draft: eliot_dreamer_contracts::GroundedDreamDraft,
     pub disposition: crate::result::OrientationDisposition,
     pub input_digest: String,
+    /// A self-hash of this packet with `output_digest` cleared, computed in
+    /// `finalize_packet` and recomputed in `validate`. It binds the packet to
+    /// its own bytes and nothing else.
     pub output_digest: String,
 }
 
@@ -417,7 +495,7 @@ fn build_semantics(
             .counterevidence
             .iter()
             .map(|text| OrientationResidue {
-                kind: "counterevidence".to_owned(),
+                kind: OrientationResidueKind::Counterevidence,
                 text: text.clone(),
                 source: "model_draft".to_owned(),
             })
@@ -427,7 +505,7 @@ fn build_semantics(
             .omissions
             .iter()
             .map(|o| OrientationResidue {
-                kind: "unavailable".to_owned(),
+                kind: OrientationResidueKind::Unavailable,
                 text: o.reason.clone(),
                 source: o.handle.clone(),
             })
@@ -438,7 +516,7 @@ fn build_semantics(
             .iter()
             .map(|text| InertProbe {
                 text: text.clone(),
-                status: "model_recommendation_inert".to_owned(),
+                status: InertProbeStatus::ModelRecommendationInert,
                 result_space: None,
             })
             .collect(),
@@ -1086,7 +1164,7 @@ fn make_packet(
     data: ProjectionData,
 ) -> Result<OrientationPacketCandidate, OrientationError> {
     let advanced = |kind: &str| OrientationResidue {
-        kind: "unsupported".to_owned(),
+        kind: OrientationResidueKind::Unsupported,
         text: format!("{kind} is outside the basic Orientation owner"),
         source: "orientation_contract".to_owned(),
     };
@@ -1097,7 +1175,7 @@ fn make_packet(
     });
     let architecture = if architecture_known {
         OrientationResidue {
-            kind: "known_empty".to_owned(),
+            kind: OrientationResidueKind::KnownEmpty,
             text: "no architecture implications admitted".to_owned(),
             source: "coverage_denominator".to_owned(),
         }
@@ -1155,7 +1233,7 @@ fn make_packet(
         recommended_probes_or_next_actions: data.probes,
         architecture_implications: architecture,
         model_routes_and_cost: OrientationResidue {
-            kind: "budget_provenance_unavailable".to_owned(),
+            kind: OrientationResidueKind::BudgetProvenanceUnavailable,
             text: format!(
                 "A03 usage retained: input_bytes={} output_bytes={} stu_used={}",
                 candidate.usage.input_bytes, candidate.usage.output_bytes, candidate.usage.stu_used
@@ -1427,7 +1505,7 @@ fn preserves_rivals_counterevidence_and_temporal_status(
         .counterevidence
         .iter()
         .map(|text| OrientationResidue {
-            kind: "counterevidence".to_owned(),
+            kind: OrientationResidueKind::Counterevidence,
             text: text.clone(),
             source: "model_draft".to_owned(),
         })
@@ -1519,9 +1597,9 @@ fn preserves_source_authority(
 }
 
 fn preserves_candidate_effect_ceiling(data: &ProjectionData) -> bool {
-    data.probes
-        .iter()
-        .all(|probe| probe.status == "model_recommendation_inert" && probe.result_space.is_none())
+    data.probes.iter().all(|probe| {
+        probe.status == InertProbeStatus::ModelRecommendationInert && probe.result_space.is_none()
+    })
 }
 
 fn preserves_dependency_closure(candidate: &ValidatedCandidate, data: &ProjectionData) -> bool {
@@ -1537,4 +1615,91 @@ fn preserves_dependency_closure(candidate: &ValidatedCandidate, data: &Projectio
         && data.omissions == candidate.bundle.omissions
         && denominator_retained
         && data.denominator.is_some() == candidate.bundle.authoritative_denominator.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{InertProbeStatus, OrientationResidueKind};
+
+    /// Every declared residue kind, named through an exhaustive match.
+    ///
+    /// This is the closure check the residue-kind doc points at. Declaring a
+    /// sixth variant makes this match non-exhaustive, so the crate no longer
+    /// compiles until the new variant is named here - a class with no producer
+    /// cannot be added without this file failing first. It is a check over the
+    /// declaration, not a seal: the same change can add a variant and this
+    /// arm together, and nothing here judges which classes are legitimate.
+    fn declared_residue_kind_spelling(kind: OrientationResidueKind) -> &'static str {
+        match kind {
+            OrientationResidueKind::Counterevidence => "counterevidence",
+            OrientationResidueKind::Unavailable => "unavailable",
+            OrientationResidueKind::Unsupported => "unsupported",
+            OrientationResidueKind::KnownEmpty => "known_empty",
+            OrientationResidueKind::BudgetProvenanceUnavailable => "budget_provenance_unavailable",
+        }
+    }
+
+    /// The declared set as data, for the assertions below.
+    fn declared_residue_kinds() -> [OrientationResidueKind; 5] {
+        [
+            OrientationResidueKind::Counterevidence,
+            OrientationResidueKind::Unavailable,
+            OrientationResidueKind::Unsupported,
+            OrientationResidueKind::KnownEmpty,
+            OrientationResidueKind::BudgetProvenanceUnavailable,
+        ]
+    }
+
+    #[test]
+    fn declared_residue_kinds_are_distinct_and_match_their_wire_spelling() {
+        let kinds = declared_residue_kinds();
+        let spellings: BTreeSet<&str> = kinds
+            .iter()
+            .copied()
+            .map(declared_residue_kind_spelling)
+            .collect();
+        assert_eq!(
+            spellings.len(),
+            kinds.len(),
+            "two declared residue kinds share one spelling"
+        );
+        // Pins the declared set against the wire spelling the integration
+        // proof observes on the production path. Together with that proof,
+        // observed == declared, which a literal-only comparison in the
+        // integration test cannot establish on its own.
+        assert_eq!(
+            spellings,
+            BTreeSet::from([
+                "budget_provenance_unavailable",
+                "counterevidence",
+                "known_empty",
+                "unavailable",
+                "unsupported",
+            ])
+        );
+        for kind in kinds {
+            let spelling = declared_residue_kind_spelling(kind);
+            assert_eq!(
+                serde_json::to_value(kind).ok().as_ref(),
+                Some(&serde_json::json!(spelling)),
+                "declared spelling must be the emitted wire spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_probe_status_is_the_single_inert_class() {
+        // The same declaration check for the probe discriminant.
+        let spelling = match InertProbeStatus::ModelRecommendationInert {
+            InertProbeStatus::ModelRecommendationInert => "model_recommendation_inert",
+        };
+        assert_eq!(
+            serde_json::to_value(InertProbeStatus::ModelRecommendationInert)
+                .ok()
+                .as_ref(),
+            Some(&serde_json::json!(spelling))
+        );
+    }
 }

@@ -6,7 +6,7 @@
 //! wires it, and
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! consults it for admitted `JobClass::Orientation` jobs through the existing
-//! `resolve_orientation_supply` seam at lib.rs:791.
+//! `resolve_orientation_supply` seam at lib.rs:820.
 //!
 //! # Reachability, measured rather than assumed
 //!

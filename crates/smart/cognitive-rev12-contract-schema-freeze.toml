@@ -1,8 +1,8 @@
 schema_version = 1
-freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
-revision = 12
-supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r11"
-supersedes_freeze_digest = "sha256:e3705b0c310ab2a633a67d7ba27c540eb4064124f446a8bfbccc2c1560e3872c"
+freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13"
+revision = 13
+supersedes_freeze_id = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
+supersedes_freeze_digest = "sha256:eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596"
 status = "FROZEN_STATIC_SCHEMA"
 base_commit = "12eae28aa4154fd4f8deed21cde8b3c9c0e5094a"
 normative_pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
@@ -15,6 +15,26 @@ integration_owner = "cognitive-wave-integrator"
 [readback]
 rule = "Reproducible digest is sha256 over these exact file bytes. Any byte change creates a new freeze candidate; verdicts bound to the prior digest are invalidated, not edited."
 rejects = ["generic JSON treated as a projection contract", "prose-invented request/contribution types", "MCP surface DTOs treated as owner-neutral contracts"]
+
+# r13 exists for exactly one reason, and it is a reconciliation rather than a
+# new claim. A mechanical comparison of all 76 [[frozen_type]].fields lists
+# against the declaration in each row's own declaring crate resolved MATCH 65,
+# DRIFT 4, AGGREGATE_ROW 6, NO_DECL 1. r12's own revision note and its
+# DIS-CTX-VIEW-EXECUTION-POLICY row both asserted that EXACTLY TWO lists no
+# longer matched; FOUR do, so that claim was never true on the commit that made
+# it. In every one of the four the Rust is the intended shape and only the
+# recorded summary is behind it, so r13 changes no type, field, enum, denominator
+# id, bound or cell binding -- it corrects four recorded field lists, one
+# superseded denominator_note, and two prose counts, and it says so in the rows
+# that recorded the disagreement rather than absorbing them silently. Every
+# verdict bound to the r12 digest is invalidated by this revision rather than
+# edited, per the [readback] rule below.
+[revision_note_r13]
+revision = 13
+supersedes = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12"
+changed = "four [[frozen_type]].fields lists (eliot_memory_projection_contracts::ExclusionReason gains INFLUENCE_INELIGIBLE, eleven to twelve; eliot_memory_projection_provider::ProjectionRequest gains continuity, workflow_view and workflow_continuity, four to seven, plus its denominator_note restated as the two-count single-read rule the owner code already enforces; eliot_context_contracts::ActiveUnderstandingView gains execution and policy_sha256, nine to eleven; eliot_learning_contracts::HarnessActivationReceiptCandidate goes fifteen to thirty-three), the DIS-LEA-ACTIVATION-SURFACE prose counts thirty-two and seventeen to thirty-three and eighteen, and the SemanticRole count thirteen to fourteen in the two rows that measured it"
+reason = "the four drifted field lists are FREEZE-SIDE documentation drift with rust_change_needed = false, measured against the declaring crates at this base commit; the SemanticRole count was wrong over a member list that already named all fourteen, so only the prose number was corrected"
+unchanged = "all enums, all denominator ids, all [[bound]] rows, all [[field_contract]] type and field rows, all denominator notes other than the one named above, all cell bindings, proof_ceiling, implementation_support, and evidence_execution_status"
 
 # r8 exists for exactly one reason, and it is a reconciliation rather than a
 # new claim. The r7 `ProjectionCoverage` denominator_note stated a LOWER BOUND
@@ -343,7 +363,7 @@ denominator_note = "Denominator, truncation, and revalidation echo the evaluated
 [[frozen_type]]
 crate = "eliot-memory-projection-contracts"
 rust_path = "eliot_memory_projection_contracts::ExclusionReason"
-fields = ["STALE", "CONFLICTED", "REJECTED", "EPISTEMICALLY_UNKNOWN", "PROTECTED", "NEGATIVE_MEMORY", "PRECONDITION_FAILED{id}", "PRECONDITION_UNASSESSED{id}", "LIFECYCLE_INACTIVE", "FENCE_MISMATCH", "SCOPE_MISMATCH"]
+fields = ["STALE", "CONFLICTED", "REJECTED", "EPISTEMICALLY_UNKNOWN", "PROTECTED", "INFLUENCE_INELIGIBLE", "NEGATIVE_MEMORY", "PRECONDITION_FAILED{id}", "PRECONDITION_UNASSESSED{id}", "LIFECYCLE_INACTIVE", "FENCE_MISMATCH", "SCOPE_MISMATCH"]
 denominator_note = "No cue-hit variant exists: cue activation is advisory evidence, never an applicability rule."
 
 [[frozen_type]]
@@ -394,8 +414,8 @@ role = "Governor-owned bounded projection of admitted observations into one batc
 [[frozen_type]]
 crate = "eliot-memory-projection-provider"
 rust_path = "eliot_memory_projection_provider::ProjectionRequest"
-fields = ["binding", "projection_revision", "denominator_total", "observations"]
-denominator_note = "Single-read contract: denominator_total must equal the supplied observation count; intake is bounded by MAX_INTAKE_OBSERVATIONS."
+fields = ["binding", "projection_revision", "denominator_total", "observations", "continuity", "workflow_view", "workflow_continuity"]
+denominator_note = "Single-read contract: denominator_total must equal the supplied observation count PLUS the supplied continuity observation count; intake is bounded by MAX_INTAKE_OBSERVATIONS. workflow_view and workflow_continuity are OPTIONAL attestations about the same workflow position and are accounted exactly like the view, never added to denominator_total; workflow_continuity may never travel alone, because admit_workflow_continuity_for_projection refuses a record with no attested view."
 
 [[frozen_type]]
 crate = "eliot-memory-projection-provider"
@@ -457,7 +477,7 @@ denominator_note = "Each projection carries schema_version 1 and its own Context
 [[frozen_type]]
 crate = "eliot-context-contracts"
 rust_path = "eliot_context_contracts::ActiveUnderstandingView"
-fields = ["binding", "admitted_ids", "rendered", "selection", "quality", "measurement", "output_digest", "recipe_digest", "fence_digest"]
+fields = ["binding", "admitted_ids", "rendered", "selection", "quality", "measurement", "execution", "output_digest", "recipe_digest", "policy_sha256", "fence_digest"]
 scope_fence_fields = ["binding"]
 denominator_note = "Immutable assembled view consumed read-only by understanding assessment. No second compilation, no second admission pass, no mutable UnderstandingState."
 
@@ -500,7 +520,7 @@ role = "Provider-neutral, candidate-only contracts for bounded online learning. 
 [[frozen_type]]
 crate = "eliot-learning-contracts"
 rust_path = "eliot_learning_contracts::HarnessActivationReceiptCandidate"
-fields = ["binding", "activation_id", "target", "view_digest", "delta_id", "overlay_id", "admission_receipt", "activation_request_receipt", "stages", "member_denominator", "metrics", "attrition", "confounders", "independent_evaluator_receipt", "canonical_digest"]
+fields = ["binding", "activation_id", "target", "view_digest", "delta_id", "overlay_id", "admission_receipt", "activation_request_receipt", "stages", "member_denominator", "metrics", "attrition", "confounders", "independent_evaluator_receipt", "compiled_view_ref", "context_compiler_revision", "render_profile_revision", "stable_harness_refs", "task_family_harness_refs", "skill_refs", "memory_refs", "procedure_refs", "preserved_success_ref", "eligibility_and_retrieval_reason", "retrieval", "delivery", "activation", "adherence", "conflicts_suppression_or_compaction_loss", "downstream_decision_action_artifact_and_verifier_refs", "receipt_completeness_and_missing_fields", "invalidation_expiry_and_missingness", "canonical_digest"]
 scope_fence_fields = ["binding"]
 denominator_note = "Member/stage denominator (SourceDenominator{declared, observed}) is retained separately from observed counts; observed coverage can never exceed declaration."
 
@@ -4111,8 +4131,8 @@ name = "rev12 closed seven-class provider enum"
 challenge = "CC-PROVIDER-CONTRIBUTION-SCHEMA"
 reason = "Current ProviderRole is a provider/semantic-role slot struct; the exact rev12 closed seven-class set is not closed in source."
 r11_disposition = "MISSING_CONTRACT_DECISION"
-r11_measured = "crates/smart/eliot-context-contracts/src/identity.rs:58 declares SemanticRole as a SCREAMING_SNAKE_CASE enum with THIRTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole at identity.rs:78 is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere: git grep over crates/smart/eliot-context-contracts/src for an enum declaration returns none of that shape, and git log --all -S seven returns no commit defining one."
-r11_why_not_created = "Thirteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Choosing seven of the thirteen because a planning sentence said seven would silently redefine the vocabulary that eliot-context-admission, eliot-context-assembly and crates/meta/eliot-improvement already consume. The #196 C1 card forbids exactly this: 'No old names added to ProviderRole for matching words.'"
+r11_measured = "crates/smart/eliot-context-contracts/src/identity.rs:58 declares SemanticRole as a SCREAMING_SNAKE_CASE enum with FOURTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole at identity.rs:78 is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere: git grep over crates/smart/eliot-context-contracts/src for an enum declaration returns none of that shape, and git log --all -S seven returns no commit defining one. r13 corrects the prose count only: the recorded member LIST was and remains the fourteen the enum declares, so r11 and r12 asserted THIRTEEN over a list of fourteen."
+r11_why_not_created = "Fourteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Choosing seven of the fourteen because a planning sentence said seven would silently redefine the vocabulary that eliot-context-admission, eliot-context-assembly and crates/meta/eliot-improvement already consume. The #196 C1 card forbids exactly this: 'No old names added to ProviderRole for matching words.'"
 r11_owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cue-contracts/module.toml, over the crate whose module.toml names agent_order = 15 for eliot-context-contracts"
 r11_blocks_completion_of = "nothing in this file. This row contributes ZERO to every coverage count."
 r11_contributes_to_coverage = false
@@ -4234,8 +4254,8 @@ family = "F6-rev12-closed-seven-class-provider-enum"
 card_text = "\"the closed seven-class provider enum\""
 scoped_owners = ["crates/smart/eliot-context-contracts/src/identity.rs"]
 disposition = "MISSING_CONTRACT_DECISION"
-measured_fact = "crates/smart/eliot-context-contracts/src/identity.rs declares SemanticRole as a SCREAMING_SNAKE_CASE enum with THIRTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere in the tree: `git grep -n 'enum' crates/smart/eliot-context-contracts/src` returns no provider-class enum, and `git log --all -S 'seven'` returns no commit defining one."
-why_not_invented = "Thirteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Picking seven of the thirteen because a planning sentence said seven would silently redefine the vocabulary the delivered admission, assembly and improvement crates already consume, and the C1 card forbids exactly that: 'No old names added to ProviderRole for matching words.'"
+measured_fact = "crates/smart/eliot-context-contracts/src/identity.rs declares SemanticRole as a SCREAMING_SNAKE_CASE enum with FOURTEEN members: Authority, Goal, Scope, Acceptance, Source, Verifier, MaterialUnknown, Negative, Security, Evidence, Instruction, Optional, Conflict, Constraint. ProviderRole is a two-field struct {provider: ProviderId, role: SemanticRole}, not an enum. There is no seven-member provider enum anywhere in the tree: `git grep -n 'enum' crates/smart/eliot-context-contracts/src` returns no provider-class enum, and `git log --all -S 'seven'` returns no commit defining one. r13 corrects the prose count only; the recorded member list was already the fourteen the enum declares."
+why_not_invented = "Fourteen is not seven, and SemanticRole is a SEMANTIC role axis while ProviderRole is a PROVIDER slot. Picking seven of the fourteen because a planning sentence said seven would silently redefine the vocabulary the delivered admission, assembly and improvement crates already consume, and the C1 card forbids exactly that: 'No old names added to ProviderRole for matching words.'"
 blocker = "The closed seven-class set has no referent in current source. It must be either reissued by the eliot-context-contracts owner as a real enum with its own members, or retired explicitly. This row is NOT_FROZEN and contributes zero to any coverage count."
 owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/eliot-cue-contracts/module.toml, over the crate whose module.toml names agent_order = 15 for eliot-context-contracts"
 rust_change_needed = false
@@ -8059,30 +8079,30 @@ evidence_required = "NOT_EXECUTED; static field contract only"
 [[disagreement]]
 id = "DIS-CTX-VIEW-EXECUTION-POLICY"
 crate = "eliot-context-contracts"
-recorded_reference = "the [[frozen_type]] row for eliot_context_contracts::ActiveUnderstandingView in this file, which lists NINE fields: binding, admitted_ids, rendered, selection, quality, measurement, output_digest, recipe_digest, fence_digest. That list has been carried unchanged since r6."
+recorded_reference = "the [[frozen_type]] row for eliot_context_contracts::ActiveUnderstandingView in this file, which listed NINE fields at r12 (carried unchanged since r6) and lists all ELEVEN at r13: binding, admitted_ids, rendered, selection, quality, measurement, execution, output_digest, recipe_digest, policy_sha256, fence_digest."
 actual_source_reference = "crates/smart/eliot-context-contracts/src/view.rs::ActiveUnderstandingView, which declares ELEVEN fields: the same nine plus execution: ContextExecutionIdentity and policy_sha256: String."
 exact_fields_in_dispute = ["execution", "policy_sha256"]
-measured_fact = "Found by a mechanical comparison of every [[frozen_type]].fields list against the current struct declaration. Exactly two lists in the whole file no longer match, and this is one of them. Both missing fields were added by #1724, whose work is c81af0746 merged to main as 64cb7daad, and that same change added the validate_against cross-record comparisons on recipe_digest and policy_sha256 that make both fields load-bearing rather than decorative."
-proposed_repair = "UPDATE THE RECORDED LIST, and only the recorded list: add execution and policy_sha256 to the [[frozen_type]].fields array for this type, bringing it to eleven. This is a FREEZE-SIDE documentation repair and needs no Rust change, because the code is already correct and already enforces both fields. It is NOT performed in this candidate because a byte change to that row is exactly the kind of silent reconciliation W5 forbids: doing it here would leave no record that the r6 list and the current code ever disagreed, and the r6 list is the thing a reader of an older verdict was bound to."
+measured_fact = "Found by a mechanical comparison of every [[frozen_type]].fields list against the current struct declaration. r12 asserted that EXACTLY TWO lists in the whole file no longer match; the same comparison over all 76 [[frozen_type]].fields lists at r13 resolved MATCH 65, DRIFT 4, AGGREGATE_ROW 6, NO_DECL 1, so FOUR lists drifted, not two, and the exactly-two claim was never true on the commit that made it. This is one of the four; the two this row did not name are eliot_memory_projection_contracts::ExclusionReason (missing INFLUENCE_INELIGIBLE) and eliot_memory_projection_provider::ProjectionRequest (missing continuity, workflow_view, workflow_continuity, whose denominator_note also still stated the superseded single-read rule). Both missing fields here were added by #1724, whose work is c81af0746 merged to main as 64cb7daad, and that same change added the validate_against cross-record comparisons on recipe_digest and policy_sha256 that make both fields load-bearing rather than decorative."
+proposed_repair = "DONE at r13: the [[frozen_type]].fields array for this type now lists all eleven, in declaration order, measured against the struct at r13. This was a FREEZE-SIDE documentation repair and needed no Rust change, because the code is already correct and already enforces both fields. It is recorded here rather than absorbed silently, and it was carried out as part of the ordered repin recorded in CC-W2-FREEZE-REPIN so the recorded digest attests to the bytes that carry the repair; every verdict bound to the r12 digest is invalidated rather than edited, per this file's own [readback].rule."
 owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner, over the freeze file itself; the context side needs no owner because nothing in crates/smart/eliot-context-contracts is wrong"
 rust_change_needed = false
 why_no_rust_change = "The Rust struct and its validation are correct and were changed together with the documentation elsewhere; only this file's summary list is stale."
-status = "OPEN_OWNED"
-note = "The r12 field contract rows for this type DO state all eleven current fields, with execution and policy_sha256 carrying their own rows and their own requiredness, bound, binding and typed error. So a downstream implementer reading the field contract is not misled; the defect is confined to the older summary array, which is why this row is reported rather than treated as blocking."
+status = "RESOLVED_IN_R13"
+note = "The r12 field contract rows for this type DO state all eleven current fields, with execution and policy_sha256 carrying their own rows and their own requiredness, bound, binding and typed error. So a downstream implementer reading the field contract is not misled; the defect was confined to the older [[frozen_type]].fields summary array, which r13 corrected to the same eleven, which is why this row is reported rather than treated as blocking."
 
 [[disagreement]]
 id = "DIS-LEA-ACTIVATION-SURFACE"
 crate = "eliot-learning-contracts"
-recorded_reference = "the [[frozen_type]] row for eliot_learning_contracts::HarnessActivationReceiptCandidate in this file, which lists FIFTEEN fields: binding, activation_id, target, view_digest, delta_id, overlay_id, admission_receipt, activation_request_receipt, stages, member_denominator, metrics, attrition, confounders, independent_evaluator_receipt, canonical_digest."
-actual_source_reference = "crates/smart/eliot-learning-contracts/src/activation.rs::HarnessActivationReceiptCandidate, which declares THIRTY-TWO fields: the same fifteen plus seventeen more."
+recorded_reference = "the [[frozen_type]] row for eliot_learning_contracts::HarnessActivationReceiptCandidate in this file, which listed FIFTEEN fields at r12 and lists all THIRTY-THREE at r13: binding, activation_id, target, view_digest, delta_id, overlay_id, admission_receipt, activation_request_receipt, stages, member_denominator, metrics, attrition, confounders, independent_evaluator_receipt, compiled_view_ref, context_compiler_revision, render_profile_revision, stable_harness_refs, task_family_harness_refs, skill_refs, memory_refs, procedure_refs, preserved_success_ref, eligibility_and_retrieval_reason, retrieval, delivery, activation, adherence, conflicts_suppression_or_compaction_loss, downstream_decision_action_artifact_and_verifier_refs, receipt_completeness_and_missing_fields, invalidation_expiry_and_missingness, canonical_digest."
+actual_source_reference = "crates/smart/eliot-learning-contracts/src/activation.rs::HarnessActivationReceiptCandidate, which declares THIRTY-THREE fields: the same fifteen plus EIGHTEEN more. r13 corrects this row's prose counts; the eighteen names in exact_fields_in_dispute were correct at r12, so fifteen plus eighteen is thirty-three and BOTH the thirty-two and the seventeen this row asserted understated the gap by one."
 exact_fields_in_dispute = ["compiled_view_ref", "context_compiler_revision", "render_profile_revision", "stable_harness_refs", "task_family_harness_refs", "skill_refs", "memory_refs", "procedure_refs", "preserved_success_ref", "eligibility_and_retrieval_reason", "retrieval", "delivery", "activation", "adherence", "conflicts_suppression_or_compaction_loss", "downstream_decision_action_artifact_and_verifier_refs", "receipt_completeness_and_missing_fields", "invalidation_expiry_and_missingness"]
-measured_fact = "Found by the same mechanical comparison and this is the second and larger of the two drifted lists. The recorded list is not merely stale by a field or two: it omits SEVENTEEN of thirty-two fields, including the four orthogonal section records retrieval, delivery, activation and adherence that the crate's own module invariant names as orthogonal, and including receipt_completeness_and_missing_fields and invalidation_expiry_and_missingness, which are precisely the two fields a completeness reading would look to. A reader relying on the recorded fifteen would conclude the receipt has no per-section breakdown and no missingness accounting, which is the opposite of what the code says."
-proposed_repair = "UPDATE THE RECORDED LIST to the current thirty-two fields, and treat this as a PRIORITY over DIS-CTX-VIEW-EXECUTION-POLICY because the gap is large enough to invert a reader's conclusion about the type rather than merely leave it incomplete. Still a FREEZE-SIDE documentation repair with no Rust change. NOT performed here for the same W5 reason: the disagreement must stay visible as a recorded disagreement with an owner rather than being absorbed into a byte edit."
+measured_fact = "Found by the same mechanical comparison and this is the second and larger of the two drifted lists. The recorded list was not merely stale by a field or two: it omitted EIGHTEEN of thirty-three fields, including the four orthogonal section records retrieval, delivery, activation and adherence that the crate's own module invariant names as orthogonal, and including receipt_completeness_and_missing_fields and invalidation_expiry_and_missingness, which are precisely the two fields a completeness reading would look to. A reader relying on the recorded fifteen would conclude the receipt has no per-section breakdown and no missingness accounting, which is the opposite of what the code says."
+proposed_repair = "DONE at r13: the [[frozen_type]] row now lists all thirty-three fields, in declaration order, measured against the struct at r13. Still a FREEZE-SIDE documentation repair with no Rust change, carried out as part of the ordered repin recorded in CC-W2-FREEZE-REPIN rather than as a partial byte edit, so the recorded digest attests to the bytes that carry the repair."
 owning_task = "the cognitive-wave integrator named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml::integration_owner, over the freeze file itself"
 rust_change_needed = false
 why_no_rust_change = "The Rust struct is the intended shape; the recorded summary is what fell behind it."
-status = "OPEN_OWNED"
-note = "This row is the concrete reason the issue's A6 condition -- known contract gaps have exact owners and prevent completion of those rows -- is satisfied rather than asserted: this is a real, measured, named gap with a named owner, and it is explicitly NOT counted as coverage anywhere in this file. The r12 field contract does NOT freeze this type; the learning family rows at r12 cover ContractBinding and SourceDenominator only, and [[coverage_accounting]] for that family names this type among the rows it does not freeze. A downstream implementer must therefore read the source rather than the stale list, and this row is what tells them so."
+status = "RESOLVED_IN_R13"
+note = "This row is the concrete reason the issue's A6 condition -- known contract gaps have exact owners and prevent completion of those rows -- is satisfied rather than asserted: this is a real, measured, named gap with a named owner, and it is explicitly NOT counted as coverage anywhere in this file. The r12 field contract does NOT freeze this type; the learning family rows at r12 cover ContractBinding and SourceDenominator only, and [[coverage_accounting]] for that family names this type among the rows it does not freeze. A downstream implementer must therefore read the source rather than the stale list, and this row is what tells them so. r13 corrected the recorded list itself, so that instruction now names a list that agrees with the source."
 
 # ===========================================================================
 # r12 ASSIGNMENT BINDINGS (W4). One per r12 family, stating the concrete input

@@ -7,6 +7,14 @@
 
 pub mod initial_snapshot;
 pub mod legacy_capability_import;
+pub mod retention_policy;
+
+pub use retention_policy::{
+    COMPILED_SAFE_DEFAULT_RETENTION_POLICY_REFS, MAX_DECLARED_RETENTION_POLICY_REFS,
+    RETENTION_POLICY_SETTING_KEY, compiled_default_retention_policy_refs,
+    declared_retention_policy_ref, declared_retention_policy_refs, narrow_retention_policy_refs,
+    retention_policy_setting_key,
+};
 
 use eliot_contracts::{PolicyRevision, StateFence};
 use eliot_security_contracts::PolicyFence;
@@ -54,9 +62,17 @@ pub enum ConfigError {
     ForgedRollbackLineage,
     #[error("invalid snapshot: {0}")]
     InvalidSnapshot(&'static str),
+    #[error("retention policy ref {policy_ref} is outside the declared vocabulary")]
+    UndeclaredRetentionPolicy { policy_ref: String },
+    #[error("a declared retention policy set must name at least one ref")]
+    EmptyRetentionPolicySet,
+    #[error("declared retention policy set exceeds the bound of {max} refs")]
+    TooManyRetentionPolicyRefs { max: usize },
+    #[error("retention policy ref {policy_ref} is declared more than once")]
+    DuplicateRetentionPolicy { policy_ref: String },
 }
 
-fn non_blank(value: &str, field: &'static str) -> Result<(), ConfigError> {
+pub(crate) fn non_blank(value: &str, field: &'static str) -> Result<(), ConfigError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ConfigError::Blank { field });
     }
@@ -237,6 +253,15 @@ pub enum ChangeImpact {
     PresentationOnly,
     OperationalReversible,
     ModelCostRoute,
+    /// Retention of stored experience, feedback, and observation material.
+    ///
+    /// I3.10:39 names `data_retention` as a `ConfigurationChangeIntent` impact.
+    /// I3.10:62 puts destructive retention changes in the class that "require
+    /// the role that owns that boundary", so it is routed for Human-owned
+    /// policy approval below exactly like the other authority boundaries, and
+    /// it is deliberately not `OperationalReversible`: deleting retained
+    /// material is not undone by reverting a setting.
+    DataRetention,
     PrivacySecurityAuthority,
     StorageMigration,
 }
@@ -266,6 +291,11 @@ impl ConfigurationChangeIntent {
     /// Checks that a proposed change is based on the active snapshot and has
     /// the required Human-owned policy approval.
     ///
+    /// The approval gate covers every impact that I3.10:62 reserves to "the role
+    /// that owns that boundary": model/provider cost, data retention, privacy,
+    /// secrets, authority, and storage. Only `PresentationOnly` and a
+    /// pre-authorized reversible operational change may publish without one.
+    ///
     /// # Errors
     /// Returns `ConfigError` for stale, ambiguous, unknown, or unauthorized
     /// changes.
@@ -286,6 +316,7 @@ impl ConfigurationChangeIntent {
         if matches!(
             self.impact,
             ChangeImpact::ModelCostRoute
+                | ChangeImpact::DataRetention
                 | ChangeImpact::PrivacySecurityAuthority
                 | ChangeImpact::StorageMigration
         ) && !self.approval.as_ref().is_some_and(|approval| {
@@ -449,6 +480,51 @@ mod tests {
             Err(ConfigError::UnauthorizedPolicy)
         );
     }
+    /// I3.10:62: a destructive retention change is not a presentation change, so
+    /// it must carry the Human-owned approval naming the candidate's own owner,
+    /// snapshot, and policy fence, and it must refuse without one.
+    #[test]
+    fn data_retention_change_requires_human_owned_policy_approval() {
+        let active = snapshot("machine-1", "scope-1", 1);
+        let candidate = snapshot("machine-1", "scope-1", 2);
+        let unapproved = ConfigurationChangeIntent {
+            intent_id: "i-retention".into(),
+            requester_ref: "r".into(),
+            trigger: RequestTrigger::Dreamer,
+            current_snapshot_id: active.snapshot_id.clone(),
+            candidate: candidate.clone(),
+            impact: ChangeImpact::DataRetention,
+            approval: None,
+            declared_disposition: None,
+        };
+        assert_eq!(
+            unapproved.validate(&active, &context()),
+            Err(ConfigError::UnauthorizedPolicy),
+            "a retention change without the owning role's approval must fail closed"
+        );
+
+        let mut approved = unapproved;
+        approved.approval = Some(PolicyApproval {
+            owner_ref: candidate.policy_owner.owner_ref.clone(),
+            snapshot_id: candidate.snapshot_id.clone(),
+            policy_fence: candidate.policy_fence.clone(),
+        });
+        assert_eq!(
+            approved.validate(&active, &context()),
+            Ok(()),
+            "the owning role's exact approval admits the retention change"
+        );
+
+        // The same impact under a different Human trigger is still gated: the
+        // gate is on the boundary the change crosses, not on who asked.
+        approved.approval = None;
+        approved.trigger = RequestTrigger::Human;
+        assert_eq!(
+            approved.validate(&active, &context()),
+            Err(ConfigError::UnauthorizedPolicy)
+        );
+    }
+
     #[test]
     fn forged_rollback_lineage_is_rejected() {
         let active = snapshot("machine-1", "scope-1", 1);

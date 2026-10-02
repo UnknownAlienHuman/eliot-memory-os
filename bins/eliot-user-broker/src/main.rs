@@ -15,14 +15,21 @@ use eliot_user_broker::{
 // crate that also validates it; a second literal here would mint endpoints
 // naming a pipe nobody serves.
 use eliot_user_broker_core::{
-    CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OPERATOR_PIPE_NAME, OperatorEndpoint,
-    OperatorHandoffRequest, OperatorNativeResourceSelectionInput,
+    CutoverReceipt, LaunchRequest, OPENCODE_BOOTSTRAP_PIPE_NAME, OPENCODE_BOOTSTRAP_TTL_MS,
+    OPERATOR_HANDOFF_TTL_MS, OPERATOR_PIPE_NAME, OpenCodeBootstrapTicket, OpenCodeProcessBinding,
+    OperatorEndpoint, OperatorHandoffRequest, OperatorNativeResourceSelectionInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PROVIDER_REJECTED_EXIT: i32 = 69;
 const OPERATOR_PIPE_PREFACE: &str = "ELIOT-BROKER-1\n";
+// The `OpenCode` bootstrap pipe is a different channel with a different owner
+// obligation, so it carries its own preface and frame bound rather than sharing
+// the Operator ones: nothing may reach this pipe that is not an `OpenCode`
+// bootstrap request, and the frame is bounded at the smaller bootstrap budget.
+const OPENCODE_BOOTSTRAP_PIPE_PREFACE: &str = "ELIOT-OPENCODE-BOOTSTRAP-1\n";
+const MAX_OPENCODE_BOOTSTRAP_LINE_BYTES: usize = 8 * 1024;
 const MAX_OPERATOR_PIPE_LINE_BYTES: usize = eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
 // The authenticated registration lease is refreshed while the broker is
 // idle.  This interval is deliberately short and bounded; a failed refresh
@@ -243,6 +250,59 @@ enum BrokerInput {
         response: tokio::sync::oneshot::Sender<OperatorPipeMessage>,
     },
     OperatorPipeFailure(String),
+    /// One `OpenCode` bootstrap redemption request from the protected
+    /// [`OPENCODE_BOOTSTRAP_PIPE_NAME`] channel. It is separate from the
+    /// Operator channel because it has a different owner obligation and a
+    /// different refusal set: the peer must be the exact approved `OpenCode`
+    /// child, and a refusal there discloses nothing.
+    OpenCodeBootstrapPipe {
+        ticket: Box<OpenCodeBootstrapTicket>,
+        peer: Box<eliot_platform_windows::NamedPipePeerEvidence>,
+        response: tokio::sync::oneshot::Sender<OpenCodeBootstrapPipeMessage>,
+    },
+    OpenCodeBootstrapPipeFailure(String),
+}
+
+/// The only request the `OpenCode` bootstrap pipe accepts (issue #2898, step 4).
+///
+/// It carries the broker-issued one-shot ticket and nothing else: no endpoint,
+/// no channel, no nonce, no generation and no session may be named by the
+/// caller, so a peer cannot choose the authenticator or pre-claim an expiry.
+/// The pipe peer itself is never a request field — it is the sealed OS
+/// observation the broker composes at the transport edge.
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg(windows)]
+enum OpenCodeBootstrapPipeRequest {
+    RedeemOpenCodeBootstrap { ticket: OpenCodeBootstrapTicket },
+}
+
+/// The closed one-use client introduction released to an authenticated peer.
+///
+/// This is the *only* place the route credential reaches the wire, and it is
+/// reached only after the broker proved the peer SID, logon session, process
+/// identity, running image and broker generation. Every field is the broker's
+/// own owner value; nothing is echoed from the request.
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCodeBootstrapIntroductionWire {
+    introduction_digest: String,
+    endpoint: String,
+    server_identity: String,
+    process_binding: OpenCodeProcessBinding,
+    credential: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum OpenCodeBootstrapPipeMessage {
+    Introduced {
+        introduction: OpenCodeBootstrapIntroductionWire,
+    },
+    Error {
+        code: &'static str,
+        detail: String,
+    },
 }
 
 // One loop owns heartbeat timing, request dispatch, and fail-closed shutdown accounting.
@@ -320,6 +380,18 @@ fn main() {
             error,
         );
     }
+    // The protected `OpenCode` one-shot bootstrap channel (issue #2898, step
+    // 4). It is bound unconditionally, like the Operator channel, and admits
+    // nothing until an approved `OpenCode` launch has installed a route: a
+    // connection before that, or after a rotation that retired the previous
+    // one, is refused by the composition owner with its own stable code.
+    if let Err(error) = start_opencode_bootstrap_pipe_server(sender.clone()) {
+        exit(
+            PROVIDER_REJECTED_EXIT,
+            "BROKER_OPENCODE_BOOTSTRAP_PIPE_REJECTED",
+            error,
+        );
+    }
     if !write_message(&Message::Ready { readiness }) {
         return;
     }
@@ -382,6 +454,23 @@ fn main() {
             BrokerInput::OperatorPipeFailure(error) => exit(
                 PROVIDER_REJECTED_EXIT,
                 "BROKER_OPERATOR_PIPE_FAILURE",
+                error,
+            ),
+            BrokerInput::OpenCodeBootstrapPipe {
+                ticket,
+                peer,
+                response,
+            } => {
+                let _ = response.send(dispatch_opencode_bootstrap_pipe(
+                    &mut composition,
+                    &ticket,
+                    &peer,
+                ));
+                continue;
+            }
+            BrokerInput::OpenCodeBootstrapPipeFailure(error) => exit(
+                PROVIDER_REJECTED_EXIT,
+                "BROKER_OPENCODE_BOOTSTRAP_PIPE_FAILURE",
                 error,
             ),
         };
@@ -660,6 +749,47 @@ fn dispatch_operator_pipe(
     }
 }
 
+/// Dispatches one `OpenCode` bootstrap redemption to the composition owner.
+///
+/// The projection is explicit rather than a blanket `Serialize` on the owner
+/// type: the credential is the only secret this broker ever puts on a local
+/// channel, and naming its fields here keeps that a single auditable site
+/// instead of a derive on a struct that holds a secret.
+fn dispatch_opencode_bootstrap_pipe(
+    composition: &mut BrokerComposition,
+    ticket: &OpenCodeBootstrapTicket,
+    peer: &eliot_platform_windows::NamedPipePeerEvidence,
+) -> OpenCodeBootstrapPipeMessage {
+    match composition.redeem_opencode_bootstrap(ticket, peer) {
+        Err(error) => opencode_bootstrap_pipe_rejection(&error),
+        Ok(introduction) => OpenCodeBootstrapPipeMessage::Introduced {
+            introduction: OpenCodeBootstrapIntroductionWire {
+                introduction_digest: introduction.introduction_digest,
+                endpoint: introduction.endpoint,
+                server_identity: introduction.server_identity,
+                process_binding: introduction.process_binding,
+                credential: introduction.credential.into_string(),
+            },
+        },
+    }
+}
+
+/// Projects one bootstrap refusal onto the wire without collapsing the broker's
+/// own admission refusals into the generic composition code: each refusal keeps
+/// its exact stable cause, and no credential, digest, or peer path is echoed.
+fn opencode_bootstrap_pipe_rejection(error: &CompositionError) -> OpenCodeBootstrapPipeMessage {
+    match error {
+        CompositionError::Admission { refusal, .. } => OpenCodeBootstrapPipeMessage::Error {
+            code: refusal.code(),
+            detail: error.to_string(),
+        },
+        other => OpenCodeBootstrapPipeMessage::Error {
+            code: "BROKER_COMPOSITION_REJECTED",
+            detail: other.to_string(),
+        },
+    }
+}
+
 /// Admits one state-changing request and returns the authenticated Human
 /// principal it was admitted for.
 ///
@@ -856,6 +986,236 @@ fn start_operator_pipe_server(sender: mpsc::Sender<BrokerInput>) -> Result<(), S
 #[cfg(not(windows))]
 fn start_operator_pipe_server(_sender: mpsc::Sender<BrokerInput>) -> Result<(), String> {
     Err("the authenticated Operator pipe is available only on Windows".to_owned())
+}
+
+#[cfg(windows)]
+fn start_opencode_bootstrap_pipe_server(sender: mpsc::Sender<BrokerInput>) -> Result<(), String> {
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .map_err(|error| error.to_string())?;
+    let allowed_sid = expectation.expected_sid().to_owned();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let failure_sender = sender.clone();
+    std::thread::Builder::new()
+        .name("eliot-user-broker-opencode-bootstrap-pipe".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let detail =
+                        format!("OpenCode bootstrap pipe runtime initialization failed: {error}");
+                    let _ = ready_sender.send(Err(detail.clone()));
+                    let _ = failure_sender.send(BrokerInput::OpenCodeBootstrapPipeFailure(detail));
+                    return;
+                }
+            };
+            let result = runtime.block_on(opencode_bootstrap_pipe_server_loop(
+                sender,
+                allowed_sid,
+                expectation,
+                Some(ready_sender),
+            ));
+            if let Err(error) = result {
+                let _ = failure_sender.send(BrokerInput::OpenCodeBootstrapPipeFailure(error));
+            }
+        })
+        .map_err(|error| format!("could not start OpenCode bootstrap pipe thread: {error}"))?;
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!(
+            "OpenCode bootstrap pipe startup ended before bind: {error}"
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+fn start_opencode_bootstrap_pipe_server(_sender: mpsc::Sender<BrokerInput>) -> Result<(), String> {
+    Err("the protected OpenCode bootstrap pipe is available only on Windows".to_owned())
+}
+
+/// Serves the protected one-shot bootstrap channel (issue #2898, step 4).
+///
+/// The loop is deliberately identical in shape to the Operator pipe loop and
+/// for the same reason: the first instance is retained while the successor is
+/// created, so there is never a moment with no broker-owned instance of this
+/// name that another same-user process could pre-create. Each connection is
+/// authenticated before a single request byte is read.
+#[cfg(windows)]
+async fn opencode_bootstrap_pipe_server_loop(
+    sender: mpsc::Sender<BrokerInput>,
+    allowed_sid: String,
+    expectation: eliot_platform_windows::NamedPipePeerExpectation,
+    mut ready_sender: Option<mpsc::SyncSender<Result<(), String>>>,
+) -> Result<(), String> {
+    use std::os::windows::io::AsHandle;
+    use tokio::io::AsyncReadExt;
+
+    let mut server = eliot_windows_ipc::create_current_user_server(
+        OPENCODE_BOOTSTRAP_PIPE_NAME,
+        &allowed_sid,
+        true,
+    )
+    .map_err(|error| format!("could not bind the protected OpenCode bootstrap pipe: {error}"))?;
+    if let Some(ready_sender) = ready_sender.take() {
+        let _ = ready_sender.send(Ok(()));
+    }
+    loop {
+        server
+            .connect()
+            .await
+            .map_err(|error| format!("OpenCode bootstrap pipe connection failed: {error}"))?;
+        let next_server = eliot_windows_ipc::create_current_user_server(
+            OPENCODE_BOOTSTRAP_PIPE_NAME,
+            &allowed_sid,
+            false,
+        )
+        .map_err(|error| format!("could not retain OpenCode bootstrap pipe ownership: {error}"))?;
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(OPENCODE_BOOTSTRAP_TTL_MS);
+        let mut preface = vec![0_u8; OPENCODE_BOOTSTRAP_PIPE_PREFACE.len()];
+        let preface_read = tokio::time::timeout_at(deadline, server.read_exact(&mut preface)).await;
+        if !matches!(preface_read, Ok(Ok(_)))
+            || preface.as_slice() != OPENCODE_BOOTSTRAP_PIPE_PREFACE.as_bytes()
+        {
+            server = next_server;
+            continue;
+        }
+        let Ok(peer) = eliot_platform_windows::authenticate_named_pipe_client(
+            server.as_handle(),
+            &expectation,
+        ) else {
+            server = next_server;
+            continue;
+        };
+        let _ = tokio::time::timeout_at(
+            deadline,
+            serve_opencode_bootstrap_pipe_connection(server, peer, &sender),
+        )
+        .await;
+        server = next_server;
+    }
+}
+
+#[cfg(windows)]
+async fn serve_opencode_bootstrap_pipe_connection(
+    server: tokio::net::windows::named_pipe::NamedPipeServer,
+    peer: eliot_platform_windows::NamedPipePeerEvidence,
+    sender: &mpsc::Sender<BrokerInput>,
+) -> io::Result<()> {
+    use tokio::io::BufReader;
+
+    let (reader, mut writer) = tokio::io::split(server);
+    let mut reader = BufReader::with_capacity(4096, reader);
+    let Some(line) = read_opencode_bootstrap_pipe_line(&mut reader).await? else {
+        return Ok(());
+    };
+    let request = match serde_json::from_str::<OpenCodeBootstrapPipeRequest>(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_opencode_bootstrap_pipe_message(
+                &mut writer,
+                &OpenCodeBootstrapPipeMessage::Error {
+                    code: "REQUEST_INVALID",
+                    detail: error.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+    let OpenCodeBootstrapPipeRequest::RedeemOpenCodeBootstrap { ticket } = request;
+    let message = dispatch_opencode_bootstrap_pipe_to_owner(sender, ticket, &peer).await;
+    write_opencode_bootstrap_pipe_message(&mut writer, &message).await
+}
+
+#[cfg(windows)]
+async fn dispatch_opencode_bootstrap_pipe_to_owner(
+    sender: &mpsc::Sender<BrokerInput>,
+    ticket: OpenCodeBootstrapTicket,
+    peer: &eliot_platform_windows::NamedPipePeerEvidence,
+) -> OpenCodeBootstrapPipeMessage {
+    let (response, receiver) = tokio::sync::oneshot::channel();
+    if sender
+        .send(BrokerInput::OpenCodeBootstrapPipe {
+            ticket: Box::new(ticket),
+            peer: Box::new(peer.clone()),
+            response,
+        })
+        .is_err()
+    {
+        return OpenCodeBootstrapPipeMessage::Error {
+            code: "BROKER_OWNER_UNAVAILABLE",
+            detail: "the broker composition owner is no longer available".to_owned(),
+        };
+    }
+    receiver
+        .await
+        .unwrap_or_else(|_| OpenCodeBootstrapPipeMessage::Error {
+            code: "BROKER_OWNER_UNAVAILABLE",
+            detail: "the broker composition owner ended without a response".to_owned(),
+        })
+}
+
+#[cfg(windows)]
+async fn read_opencode_bootstrap_pipe_line<R>(reader: &mut R) -> io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "OpenCode bootstrap pipe closed before line terminator",
+            ));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(count) > MAX_OPENCODE_BOOTSTRAP_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OpenCode bootstrap pipe line exceeds the configured frame limit",
+            ));
+        }
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            break;
+        }
+    }
+    line.pop();
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(windows)]
+async fn write_opencode_bootstrap_pipe_message<W>(
+    writer: &mut W,
+    message: &OpenCodeBootstrapPipeMessage,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let bytes = serde_json::to_vec(message)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await
 }
 
 #[cfg(windows)]

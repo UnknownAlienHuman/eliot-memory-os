@@ -5873,25 +5873,41 @@ fn read_back_served_result(
 ) -> ServedResultReadback {
     // An absent record, and one that could not be read or is oversize, all
     // answer the same typed state: this identity has no usable retained
-    // result. `MaterialError::Malformed` is NOT that state and is not folded
-    // into it here. The reader already proved a record file EXISTS at this
-    // path; malformed therefore never means absence, it means the bytes there
-    // contradict a record this host itself defines — a `ServedResultRecord`
-    // that is not valid JSON, that cannot name an identity, that carries
-    // zero or both result payloads, whose `stream_digest` is not a hex
-    // digest, or whose `terminal_sequence` names an event it never stored.
-    // Each is a self-contradicting record and is reported as the conflict it
-    // is, with the distinction made here on this side of the reader rather
-    // than by editing it. Genuinely unreadable and oversize records keep
-    // their own error variants and stay `Unavailable`, so no check is
-    // weakened and no absent record is ever reported as a conflict.
+    // result. `MaterialError::Malformed` and `MaterialError::InvalidRecord`
+    // are NOT that state and neither is folded into it here. The reader
+    // already proved a record file EXISTS at this path, so neither of those
+    // two can mean absence: they mean the bytes there contradict a record
+    // this host itself defines — a `ServedResultRecord` that is not valid
+    // JSON, that cannot name an identity, that carries zero or both result
+    // payloads, that names an event its `terminal_sequence` never stored
+    // (`Malformed`), or one whose `grant_digest` or `stream_digest` is not
+    // the lowercase hex digest this owner writes (`InvalidRecord`, the
+    // variant `hex_digest` produces). Each is a self-contradicting record
+    // and is reported as the conflict it is, with the distinction made here
+    // on this side of the reader rather than by editing it. Genuinely
+    // unreadable and oversize records keep their own error variants and stay
+    // `Unavailable`, so no check is weakened and no absent record is ever
+    // reported as a conflict.
     let record = match crate::dispatch_material::read_served_result(directory) {
         Ok(Some(record)) => record,
-        Ok(None) => return ServedResultReadback::Unavailable,
-        Err(crate::dispatch_material::MaterialError::Malformed) => {
+        // One arm, because both states answer the same question the same way:
+        // this identity has no usable retained result on disk right now.
+        Ok(None)
+        | Err(
+            crate::dispatch_material::MaterialError::Unreadable(_)
+            | crate::dispatch_material::MaterialError::TooLarge,
+        ) => return ServedResultReadback::Unavailable,
+        Err(
+            crate::dispatch_material::MaterialError::Malformed
+            | crate::dispatch_material::MaterialError::InvalidRecord { .. },
+        ) => {
             return ServedResultReadback::Conflict;
         }
-        Err(_unreadable_or_oversize) => return ServedResultReadback::Unavailable,
+        // A state this reader does not produce today. It answers absence only
+        // as `Ok(None)`, after proving the record file is gone, so an
+        // unrecognized failure here is never an absence: it fails closed as
+        // the contradiction it is rather than being reported as one.
+        Err(_unreached_state) => return ServedResultReadback::Conflict,
     };
     if !record.names(identity) {
         return ServedResultReadback::Conflict;

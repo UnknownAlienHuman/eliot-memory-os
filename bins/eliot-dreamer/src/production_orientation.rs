@@ -12,15 +12,15 @@
 //!
 //! | Responsibility | Actual runtime owner | Status |
 //! |---|---|---|
-//! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired |
-//! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired |
-//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
-//! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
-//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
+//! | Construct/admit `ModelRouteRequest` | `model_stage::model_route_request` over the admitted pair | wired in source; NOT REACHABLE IN PRODUCTION: its ONLY call site is `dispatch_stage::dispatch_orientation` at `dispatch_stage.rs:559` — it is NOT reached from `run_admitted_pipeline`, and that function is entered only past `require_validated_binding` (`dispatch_stage.rs:511`), so it is downstream of the A-14b -> A-05 handoff this table also proves unreachable. The two routes are unchanged by that relocation: the non-Curation branch refuses at controller.rs:78-82 / bundle_stage.rs:31-35 before `run_admitted_pipeline` is entered, and the Curation branch leaves at lib.rs:714 into `dispatch_curation`, which never calls it |
+//! | Execute the admitted provider route, return `ModelRouteOutcome` | `model_stage::model_route_outcome` over the measured local call | wired in source; NOT REACHABLE IN PRODUCTION: the same barrier as the request — its ONLY call site is `dispatch_stage::dispatch_orientation` at `dispatch_stage.rs:563`, past `require_validated_binding` (`dispatch_stage.rs:511`) and therefore downstream of the unreachable A-14b -> A-05 handoff; non-Curation refuses at controller.rs:78-82 / bundle_stage.rs:31-35 before `run_admitted_pipeline` is entered, and Curation leaves at lib.rs:714 into `dispatch_curation`, which never calls it |
+//! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired in source; NOT REACHABLE IN PRODUCTION: the non-Curation branch refuses first (`controller::resolve_cycle_inputs`, controller.rs:78-82, and `bundle_stage::resolve_bundle_request`, bundle_stage.rs:31-35); the Curation branch does reach `run_admitted_pipeline` at lib.rs:810 without either gate, but returns at lib.rs:694-715 through `dispatch_curation` before the model, grounding and validation rows |
+//! | Ground the admitted draft and bind the A-05 carrier | `validation_stage::ground_and_bind_validation_carrier` -> `eliot_dreamer_claim_grounding::ground_for_validation` (the owner's single construction site) | wired in source; NOT REACHABLE IN PRODUCTION: the non-Curation branch refuses first (`controller::resolve_cycle_inputs`, controller.rs:78-82, and `bundle_stage::resolve_bundle_request`, bundle_stage.rs:31-35), and the Curation branch returns at lib.rs:694-715 before it; so the handoff executes only from this crate's own proofs |
+//! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired in source; NOT REACHABLE IN PRODUCTION: it runs after the handoff in the same `run_admitted_pipeline` — the Curation branch returns at lib.rs:694-715 before the handoff, and the non-Curation branch is already refused at controller.rs:78-82 / bundle_stage.rs:31-35 |
 //! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | NOT REACHABLE IN PRODUCTION: the producer has no production caller, and the supply seam itself sits behind two upstream gates that refuse unconditionally |
 //! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | NOT REACHABLE IN PRODUCTION: no owner publishes these records to this binary, and the seam that would read them is unreachable |
-//! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
-//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
+//! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired in source; NOT REACHABLE IN PRODUCTION: it needs a complete carrier, and the non-Curation branch is refused at controller.rs:78-82 / bundle_stage.rs:31-35 before `run_admitted_pipeline` reaches dispatch, the Curation branch returns at lib.rs:694-715, and even past both `resolve_production_inputs` refuses without the owner supply channel (`production_orientation.rs:469-478`) |
+//! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired in source; NOT REACHABLE IN PRODUCTION: it is strictly downstream of the composer above and therefore of the same three refusals — controller.rs:78-82 / bundle_stage.rs:31-35 for the non-Curation branch, the lib.rs:714 Curation return, and the absent owner supply channel at `production_orientation.rs:469-478` |
 //!
 //! The two records the admitted pipeline itself produces — the grounding
 //! request and the structured A-05 validated grounding candidate — are NOT owner
@@ -30,6 +30,25 @@
 //! hypothesis pair enters beside them as explicit parameters, because
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
+//!
+//! Carrying the grounding request into the carrier as a record is not the same
+//! as grounding again, and the difference is deliberate. The A-14b -> A-05
+//! handoff grounds the admitted draft once, inside the one owner call, and this
+//! module joins that already-grounded result — with one explicit exception this
+//! file does not hide: when the owner collapses a grounding refusal onto its
+//! single `"contract"` static, `validation_stage::handoff_denied` grounds the
+//! retained request ONE MORE TIME through the composition's own
+//! [`crate::grounding_stage::ground_admitted_draft_with`] seam so the precise
+//! refusal class can be recovered; that second grounding is a refusal-recovery
+//! run, not a re-derivation of the grounded leg this module joins, and it is
+//! disclosed where it is written (`grounding_stage.rs`, `validation_stage.rs`).
+//! The Orientation pulse does re-run the same pure grounding over the same
+//! retained request, but only to compute its own stage commitment digest
+//! (`pulse::run_grounding_stage`, called from
+//! `collect_ref_stages` below), and only when an owner channel is admitted —
+//! which the refusal below (`production_orientation.rs:469-478`) and the
+//! `Ok(None)` from the only production supply source
+//! (`orientation_supply_source.rs:151`) currently prevent.
 //!
 //! The last two owner-channel rows are measured, not aspirational, and the
 //! measurement is stronger than "the owner published nothing". Three separate
@@ -48,14 +67,36 @@
 //! **2. The supply seam is unreachable from the production `submit` path.**
 //! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
 //! calls [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort::resolve_orientation_supply)
-//! at lib.rs:791, but only after two gates that refuse unconditionally:
+//! at lib.rs:820, but only after two gates that refuse unconditionally:
 //! `controller::resolve_cycle_inputs` (controller.rs:78-82) and
 //! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) both end in a
 //! bare `Err`. An `Ok(None)` from the owner channel is therefore not merely the
 //! current answer — on today's tree `resolve_supply` is never called at all on
-//! any production path. The crate's own
+//! any production path.
+//!
+//! The same two gates sit ahead of every other row the admitted chain executes,
+//! not just this one, but not by one route, and naming only one of the two would
+//! be false. The grounding request, the A-14b -> A-05 handoff, and the A-05 gate
+//! all run inside `run_admitted_pipeline`, while the model-route pair runs one
+//! step later still, inside `dispatch_stage::dispatch_orientation` at
+//! `dispatch_stage.rs:559` and `dispatch_stage.rs:563` — `run_admitted_pipeline`
+//! reaches that function only through `dispatch_admitted` (lib.rs:743). The
+//! Curation branch does reach `run_admitted_pipeline` with NEITHER gate in front
+//! of it: `submit` branches on the class at lib.rs:799-812 and enters
+//! `run_admitted_pipeline` at lib.rs:810. What keeps those rows unreachable for
+//! Curation is the earlier return at lib.rs:694-715 — `dispatch_curation` is
+//! called at lib.rs:714, before the model stage at lib.rs:716 and therefore
+//! before grounding, validation, and the dispatch that owns the model-route
+//! pair. For every non-Curation class the two refusals do stand in front of
+//! `run_admitted_pipeline` outright
+//! (`controller::resolve_cycle_inputs`, controller.rs:78-82;
+//! `bundle_stage::resolve_bundle_request`, bundle_stage.rs:31-35). The composer
+//! and the publish are downstream of both routes again, and behind them the
+//! carrier resolution itself still refuses without the owner supply channel
+//! (`production_orientation.rs:469-478`). The
+//! crate's own
 //! `submit_orientation_stops_at_controller_gate` proof
-//! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
+//! (`pipeline_e2e.rs:1373`) asserts exactly this: an Orientation `submit` stops at
 //! the controller gate. The blocked disposition published downstream is reached
 //! today only from the unit-level pipeline proofs, not from `main.rs`.
 //!
@@ -69,9 +110,12 @@
 //! than recomputing them. But `owner_record` is an [`OpaqueContentRef`] — a
 //! digest, a byte length and an artifact handle. It carries no member, and this
 //! binary holds no capability that could resolve one: there is no blob/artifact
-//! read anywhere under `bins/eliot-dreamer/src` (`git grep -i blob` over that
-//! tree returns nothing). So even a fully published record could not fill the
-//! carrier here without a new content-retrieval capability.
+//! read anywhere under `bins/eliot-dreamer/src`. `git grep -i blob` over that
+//! tree is run and read, not assumed: its only hits are this sentence's own two
+//! occurrences and the same claim restated in the supply source
+//! (`orientation_supply_source.rs:42`). None of them is a read, so the claim
+//! stands. Even a fully published record could not fill the carrier here without
+//! a new content-retrieval capability.
 //!
 //! [`resolve_production_inputs`] therefore keeps returning the
 //! [`OrientationDisposition::Blocked`] result from [`supply_missing_blocked`]
@@ -189,8 +233,12 @@ pub type MeasureFn = fn(&[u8]) -> Result<SerializedContextMeasurement, ContextEr
 /// JSON-round-tripped and no missing member is defaulted. The assembler
 /// declares the shared operation/task/scope/fence identity explicitly, and
 /// [`compose_production_result`] re-proves every member against it before any
-/// stage runs. Budget travels on the admitted job; deadline and cancellation
-/// travel as scalars observed before composition.
+/// stage runs. Budget travels on the admitted job, and `deadline_unix_ms` is
+/// copied off the admission. `cancelled` is NOT an observation: the `false`
+/// this composition issues is an ASSERTED negative — the same assertion
+/// `admitted_material::validation_attachment_for` makes for the frozen
+/// `cancellation_requested` — and the `KernelJobAdmission::cancellation_id`
+/// this root holds is never consulted to reach it.
 pub(crate) struct ProductionOrientationInputs<'a> {
     /// Exact schema version; must be 1.
     pub schema_version: u32,
@@ -238,7 +286,10 @@ pub(crate) struct ProductionOrientationInputs<'a> {
     pub state_fence: StateFence,
     /// Wall-clock deadline in Unix milliseconds.
     pub deadline_unix_ms: u64,
-    /// True when cancellation was observed before composition.
+    /// Composition-asserted negative, never an observation: `false` is the only
+    /// value [`resolve_production_inputs`] issues here, so the
+    /// `compose_production_result` gate on it is unreachable on this path (see
+    /// `pulse::PulseError::Cancelled`).
     pub cancelled: bool,
 }
 

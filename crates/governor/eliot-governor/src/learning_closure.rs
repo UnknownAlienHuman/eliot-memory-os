@@ -63,6 +63,21 @@
 //! promotion *verdict* runs on every committed record here, while the
 //! boundary-content validation behind [`PromotionBoundaryInput::Published`] has
 //! no production caller until an owner publishes a boundary.
+//!
+//! Use attribution: the closure also derives the candidate-only use attribution
+//! for every committed record through [`crate::learning_attribution`], so the
+//! inner-loop attribution step of A14.5 is produced by this production path
+//! rather than by tests alone. The closure really holds only two of the five
+//! attribution owner slots — the executing process identity and the deciding
+//! plan route, which together name the attributor's failure domain — so it
+//! composes the [`AttributorIdentity`] from those and passes every other owner
+//! record as absent. Each absent seam is recorded as its own typed
+//! [`AttributionRefusal`](crate::learning_attribution::AttributionRefusal) on the
+//! receipt, and the independent observation is recorded as
+//! [`IndependenceOutcome::NotObserved`]. That is the A5.5 outcome "otherwise,
+//! finish remains honestly degraded": the attributor is never allowed to certify
+//! its own independence, and no attribution is manufactured to satisfy schema
+//! presence.
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard};
@@ -85,6 +100,10 @@ use thiserror::Error;
 
 use crate::composition::{
     CanonicalVerifierExecutionFact, GovernorComposition, KernelGenerationPort,
+};
+use crate::learning_attribution::{
+    AttributionOutcome, AttributorIdentity, FailureDomain, IndependenceOutcome,
+    attribute_committed_attempt,
 };
 use crate::learning_delta_integration::{StoredDeltaIdentity, delta_delivery_refusal};
 use crate::learning_promotion::{LearningPromotionOutcome, PromotionBoundaryInput};
@@ -343,6 +362,21 @@ pub struct LearningClosureReceipt {
     /// at this seam yet, and an absent boundary is recorded as absent rather
     /// than treated as admissible.
     pub promotion: LearningPromotionOutcome,
+    /// Independent-observation verdict for the record this closure committed.
+    ///
+    /// `Observed` carries the sealed receipt an owner outside the attributor's
+    /// failure domain minted for the decided action. `NotObserved` carries the
+    /// exact typed reason no such route published at this seam, which is the
+    /// honest A5.5 degradation and never an implied pass.
+    pub independence: IndependenceOutcome,
+    /// Use-attribution derivation for the record this closure committed.
+    ///
+    /// `Attributed` carries the sealed candidate-only attribution whose nine
+    /// load-bearing fields each came from their named owner. `Unattributed`
+    /// carries the exact typed reason the first failing owner seam did not
+    /// publish, so an absent owner and an invalid owner record never collapse
+    /// into one answer.
+    pub attribution: AttributionOutcome,
 }
 
 /// Typed outcome of one learning-closure attempt.
@@ -516,6 +550,28 @@ impl LearningClosureService {
         )?;
         let delivery_refusal = delta_delivery_refusal(receipt, &record);
         let promotion_outcome = promotion.evaluate(&record, receipt);
+        // Use attribution (A14.5 inner loop; I12.24 line 179 keeps the
+        // interpretation fields owner-supplied and candidate-only). The closure
+        // composes only the attributor identity it really holds — the executing
+        // process identity and the deciding plan route — and passes every other
+        // attribution owner record as absent, because no such owner publishes
+        // one at the finish seam. Each absent seam is named by its own typed
+        // refusal on the receipt instead of being filled in, and the
+        // independent observation is refused rather than self-certified (A5.5).
+        let attributor = attributor_for(&identity)?;
+        let (independence, attribution) = attribute_committed_attempt(
+            &attributor,
+            &record.delta_artifact,
+            &record.delta_digest,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let version = commit_closure(&self.store, record.clone())?;
         Ok(LearningClosureOutcome::Committed(Box::new(
             LearningClosureReceipt {
@@ -543,9 +599,32 @@ impl LearningClosureService {
                     LearningClosureError::Canonical(format!("ordering head: {error}"))
                 })?,
                 promotion: promotion_outcome,
+                independence,
+                attribution,
             },
         )))
     }
+}
+
+/// Compose the attributing actor identity the closure really holds.
+///
+/// The durable process identity bound to the attempt and the canonical plan
+/// identity that selected it are the two owner values recorded for every
+/// attempt, and together they name the failure domain the attributor operates
+/// in. Nothing else about that domain is assumed, and no independent observing
+/// route is inferred from it.
+fn attributor_for(
+    identity: &StoredDeltaIdentity,
+) -> Result<AttributorIdentity, LearningClosureError> {
+    let failure_domain =
+        FailureDomain::seal(&[identity.actor_id.as_str(), identity.route_id.as_str()]).map_err(
+            |error| LearningClosureError::Canonical(format!("attributing failure domain: {error}")),
+        )?;
+    Ok(AttributorIdentity {
+        actor_id: identity.actor_id.clone(),
+        route_id: identity.route_id.clone(),
+        failure_domain,
+    })
 }
 
 /// Builds a foundation artifact identity or fails closed with the field name.

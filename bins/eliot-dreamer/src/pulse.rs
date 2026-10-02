@@ -489,7 +489,12 @@ pub(crate) enum PulseError {
     /// Context-candidate mapper refused.
     #[error("pulse context candidates refused")]
     Candidates,
-    /// The production carrier observed cancellation before composition.
+    /// The production carrier's cancellation gate fired.
+    ///
+    /// Unreachable on the production path as the carrier is composed today:
+    /// `ProductionOrientationInputs::cancelled` is a composition-asserted
+    /// negative that `resolve_production_inputs` issues as the literal `false`,
+    /// so this variant is reachable only from a caller-built carrier.
     #[error("pulse cancelled")]
     Cancelled,
     /// The production carrier deadline passed before composition.

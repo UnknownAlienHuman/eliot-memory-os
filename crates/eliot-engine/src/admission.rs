@@ -8,9 +8,10 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_types::{
     ClaimCardInput, CommandContext, CompletionStatus, EpistemicStatus, EvidenceAtomInput,
     FailureFingerprintInput, FailureRecordCommand, IdempotencyOptions, LifecycleWriteOptions,
-    MemoryWriteEnvelope, OperationId, RelationInput, RelationType, SemanticCommand,
-    SourceSnapshotInput, TaskContractInput, TaskContractStatus, ToolObservationInput, UlArtifact,
-    VerificationResult, VerificationRunInput, WriteRejectReason, WriteStatus, normalize_bindings,
+    MemoryWriteEnvelope, OperationId, RecallCandidatePayload, RecallPayloadViolation,
+    RelationInput, RelationType, SemanticCommand, SourceSnapshotInput, TaskContractInput,
+    TaskContractStatus, ToolObservationInput, UlArtifact, VerificationResult, VerificationRunInput,
+    WriteRejectReason, WriteStatus, normalize_bindings,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ impl WriteAdmissionService {
         let input_hash = stable_input_hash(command)?;
         let context = command.context().clone();
         validate_context(&context.scope, &context.authority)?;
+        admit_recall_payloads(command)?;
         let admitted = admit_command(command)?;
 
         Ok(MemoryWriteEnvelope {
@@ -648,6 +650,104 @@ where
 
 fn reject<T>(reason: &str) -> Result<T, EngineError> {
     Err(EngineError::WriteRejected(reason.to_owned()))
+}
+
+/// The one gate every one of the six `recall_candidate.payload` arms passes
+/// through at the write boundary (issue #262, D-1).
+///
+/// `payload` is permitted inert evidence content; the retrieval projection's
+/// control-envelope members are not. A declared control member present with the
+/// wrong JSON type is refused here, as the existing typed
+/// [`WriteRejectReason::InvalidEnvelope`] surfaced as [`EngineError::WriteRejected`]
+/// — never as a silently dropped cue that reads back as "this record states no
+/// path".
+///
+/// `MissingRequiredField` is reserved for the one arm whose payload is not a
+/// JSON object at all: the shared column contract has no value to project.
+fn admit_recall_payload(
+    payload: &Value,
+    record_type: &str,
+) -> Result<RecallCandidatePayload, EngineError> {
+    RecallCandidatePayload::from_wire(payload).map_err(|violation| match violation {
+        RecallPayloadViolation::NotAnObject => EngineError::WriteRejected(format!(
+            "{:?}: {record_type} recall_candidate.payload must be a JSON object",
+            WriteRejectReason::MissingRequiredField
+        )),
+        RecallPayloadViolation::FieldWrongType { field, expected } => EngineError::WriteRejected(
+            format!(
+                "{:?}: {record_type} recall_candidate.payload control field {field:?} is not {expected}",
+                WriteRejectReason::InvalidEnvelope
+            ),
+        ),
+    })
+}
+
+/// The UL artifact arm's payload is the `receipt_body` the store's artifact
+/// branch projects, not the tool observation's own `payload`. Both are gated:
+/// the observation payload carries `receipt_kind` and the inert evidence, and the
+/// nested `receipt_body` carries the shared column contract.
+fn admit_recall_receipt_body(payload: &Value) -> Result<(), EngineError> {
+    if let Some(receipt_body) = payload.get("receipt_body") {
+        if !receipt_body.is_null() {
+            let receipt_kind = payload
+                .get("receipt_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("canonical_record");
+            admit_recall_payload(receipt_body, receipt_kind)?;
+        }
+    }
+    Ok(())
+}
+
+/// Applies [`admit_recall_payload`] to every admitted record body of one
+/// command, so no arm can reach the store untyped.
+fn admit_recall_payloads(command: &SemanticCommand) -> Result<(), EngineError> {
+    match command {
+        SemanticCommand::EvidenceIngest(body) => {
+            admit_recall_payload(&body.evidence.payload, "evidence_atom")?;
+        }
+        SemanticCommand::ToolObservationRecord(body) => {
+            admit_recall_payload(&body.payload, "tool_observation")?;
+            admit_recall_receipt_body(&body.payload)?;
+        }
+        SemanticCommand::ClaimPropose(body) => {
+            admit_recall_payload(&body.claim.payload, "claim_card")?;
+        }
+        SemanticCommand::ClaimVerify(body) => {
+            admit_recall_payload(&body.verification.payload, "verification_run")?;
+            admit_recall_payload(&body.payload, "claim_verify_support")?;
+        }
+        SemanticCommand::ClaimSupport(body) => {
+            admit_recall_payload(&body.payload, "claim_support")?;
+        }
+        SemanticCommand::FailureRecord(body) => {
+            admit_recall_payload(&body.payload, "failure_fingerprint")?;
+        }
+        SemanticCommand::VerificationRecord(body) => {
+            admit_recall_payload(&body.verification.payload, "verification_run")?;
+        }
+        SemanticCommand::TaskContractWrite(body) => {
+            if let Some(observation) = &body.observation {
+                admit_recall_payload(&observation.payload, "tool_observation")?;
+                admit_recall_receipt_body(&observation.payload)?;
+            }
+            if let Some(verification) = &body.verification {
+                admit_recall_payload(&verification.payload, "verification_run")?;
+            }
+        }
+        SemanticCommand::UlArtifactBatchRecord(body) => {
+            for artifact in &body.artifacts {
+                let receipt_body = ul_artifact_body(artifact)?;
+                admit_recall_payload(&receipt_body, artifact.receipt_kind())?;
+            }
+        }
+        SemanticCommand::AgentResultRecord(_)
+        | SemanticCommand::DiagnosticBatchRecord(_)
+        | SemanticCommand::ActiveDecisionTransition(_)
+        | SemanticCommand::ProbeRecord(_)
+        | SemanticCommand::CompletionProofSubmit(_) => {}
+    }
+    Ok(())
 }
 
 /// Canonical-import outcome for one published candidate-only bootstrap draft

@@ -33,14 +33,14 @@ use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_assembly::{
-    ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyError, AssemblyPolicy,
-    QualityScorecard, SerializedContextMeasurement, assemble_active_view,
+    ActiveUnderstandingView, ActiveUnderstandingViewResult, AdmittedContextSet, AssemblyError,
+    AssemblyPolicy, QualityScorecard, SerializedContextMeasurement, assemble_active_view,
     assemble_active_view_with_learning,
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, StateFence, TaskId,
-    TaskRevision, sha256_hex,
+    ArtifactId, DecisionId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration,
+    StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_governor::{
@@ -51,7 +51,7 @@ use eliot_improvement::candidate_bounds::{
     BoundedBacklog, CrossTaskCarryover, GovernedOverlay, OverlayState,
 };
 use eliot_improvement::{PresentedLearning, datetime_from_unix};
-use eliot_receipts::{ProofCeiling, WorkScopeId};
+use eliot_receipts::{ProofCeiling, ProtectedReserves, WorkScopeId};
 
 const LINEAGE_1864: &str = "550e8400-e29b-41d4-a716-446655440001";
 const CAMPAIGN_1864: &str = "campaign-1864-a";
@@ -158,11 +158,12 @@ fn candidate(context: &ContextBinding, atom: &str) -> ContextCandidate {
 /// Admitted set with one ordinary atom plus one intrinsically marked
 /// learning atom citing `permit_digest`. The mark expiry is caller-chosen so
 /// refusal can be attributed to the overlay revision alone.
-fn admitted_with_learning(permit_digest: &str, mark_expires: Option<u64>) -> AdmittedContextSet {
-    let context = binding();
-    let first = candidate(&context, "atom-1864");
-    let mut second = candidate(&context, "learning-1864");
-    second.learning = Some(LearningProvenance {
+/// The learning provenance this file's overlay revision admits: an owner-issued
+/// campaign/overlay pair with no draft, closure or owner claim, and the caller's
+/// chosen expiry and permit digest. Extracted so the admitted-set fixture stays
+/// readable; every field is the same literal the fixture always carried.
+fn learning_provenance_1864(mark_expires: Option<u64>, permit_digest: &str) -> LearningProvenance {
+    LearningProvenance {
         campaign_id: CAMPAIGN_1864.to_string(),
         overlay_id: Some(OVERLAY_1864.to_string()),
         candidate_id: None,
@@ -171,7 +172,14 @@ fn admitted_with_learning(permit_digest: &str, mark_expires: Option<u64>) -> Adm
         draft: false,
         expires_at_unix_secs: mark_expires,
         permit_digest: permit_digest.to_string(),
-    });
+    }
+}
+
+fn admitted_with_learning(permit_digest: &str, mark_expires: Option<u64>) -> AdmittedContextSet {
+    let context = binding();
+    let first = candidate(&context, "atom-1864");
+    let mut second = candidate(&context, "learning-1864");
+    second.learning = Some(learning_provenance_1864(mark_expires, permit_digest));
     let atom_id = first.atom_id.clone();
     let provider = first.provider_role.clone();
     let floor = DecisionSafetyFloor {
@@ -383,6 +391,62 @@ fn policy_for(context: &ContextBinding, max_serialized_bytes: u64) -> AssemblyPo
     }
 }
 
+/// The card a delivered packet accepts: it records the exact output it graded
+/// (the instance digest, the fence, the admitted set's own canonical payload
+/// digest, the ordered rendered payload digest and the source revisions the
+/// bytes were read from), so `require_graded_output` compares a real grade
+/// against a real packet. The intrinsic [`quality`] card above is for the
+/// packets the carriage gate refuses BEFORE the grade is read; a packet that is
+/// delivered is graded, and a placeholder card is not the grade of anything.
+fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("fixture fence digest");
+    card.output.recipe_digest.clone_from(&recipe.recipe_sha256);
+    card.output.fence_digest.clone_from(&fence_digest);
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("fixture admitted digest");
+    card.output.rendered_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered_for(admitted),
+    )
+    .expect("fixture rendered digest");
+    card.output
+        .omission_handles
+        .clone_from(&admitted.economy.displaced);
+    card.output.evidence_revisions = admitted
+        .records
+        .iter()
+        .map(|record| record.candidate.source.snapshot_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    card
+}
+
+/// The rendered order this fixture's approved revision declares: declared role
+/// position, then provider, then atom identity. The positions
+/// [`approved_policy`] assigns are `SemanticRole` ordinals, so this projection
+/// and the approved revision's `layout.role_positions` state one order.
+fn rendered_for(admitted: &AdmittedContextSet) -> Vec<RenderedAtom> {
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    rendered
+}
+
 fn recipe(context: &ContextBinding) -> ContextRecipe {
     let provider = role();
     let mut recipe = ContextRecipe {
@@ -391,9 +455,11 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
         decision: DecisionRevision {
             decision_id: context.decision_id.clone(),
             recipe_revision: TaskRevision::new(1).expect("recipe revision"),
-            policy_sha256: digest(),
+            // Sealed by `seal_recipe`: the approved revision this instance is
+            // issued under, not a placeholder. See that function.
+            policy_sha256: String::new(),
         },
-        recipe_sha256: digest(),
+        recipe_sha256: String::new(),
         denominator: ProviderRoleDenominator {
             requested: vec![provider.clone()],
             dispositions: vec![ProviderDisposition {
@@ -418,8 +484,177 @@ fn recipe(context: &ContextBinding) -> ContextRecipe {
         predecessor: None,
         invalidation: None,
     };
-    recipe.recipe_sha256 = recipe.canonical_policy_digest().expect("recipe digest");
+    seal_recipe(&mut recipe);
     recipe
+}
+
+/// Re-seal one instance against the approved revision it is now issued under.
+///
+/// #1724 made the approved revision part of the instance's own identity: the
+/// assembly joins the instance's recorded `decision.policy_sha256`, the approved
+/// revision's own digest and the admitted receipt's on one value
+/// (`ContextRecipePolicy::binds_recipe`, `require_recipe_policy_binding`, and
+/// `ActiveUnderstandingView::validate_against` on the way out). A placeholder
+/// digest cannot satisfy that join, so the instance records the digest of the
+/// revision [`approved_recipe`] actually builds for it.
+fn seal_recipe(recipe: &mut ContextRecipe) {
+    recipe.decision.policy_sha256 =
+        approved_policy(&recipe.mandatory_roles, &recipe.role_policies).policy_sha256;
+    recipe.recipe_sha256 = recipe.canonical_policy_digest().expect("recipe digest");
+}
+
+/// The approved recipe revision this fixture's compilation is issued under.
+///
+/// #1724 W4/W5. The delivery entrypoint renders under an APPROVED revision and
+/// joins it to the instance and to the admitted receipt by digest, so a
+/// placeholder cannot stand in for one: this builds a real
+/// `ContextRecipePolicy` and seals its own `canonical_policy_digest`, and
+/// [`seal_recipe`] records that digest on the instance.
+///
+/// It is derived FROM the instance's own role declarations instead of being one
+/// shared fixture, because the approved content must declare what this instance
+/// declares: `ContextRecipePolicy::binds_recipe` refuses a budgeted role the
+/// instance governs no `RoleLossRule` for, and `render::render` refuses a
+/// rendered role the revision does not position. Layout positions are assigned
+/// in `SemanticRole` ordinal order, which is the order [`rendered_for`] above
+/// projects.
+fn approved_policy(
+    mandatory_roles: &[SemanticRole],
+    role_policies: &[RoleLossRule],
+) -> ContextRecipePolicy {
+    let features: Vec<SemanticRole> = mandatory_roles
+        .iter()
+        .chain(role_policies.iter().map(|rule| &rule.role))
+        .copied()
+        .collect::<std::collections::BTreeSet<SemanticRole>>()
+        .into_iter()
+        .collect();
+    let mut policy = ContextRecipePolicy {
+        policy_schema_version: CONTEXT_RECIPE_POLICY_SCHEMA_VERSION,
+        policy_id: id("fixture-recipe-policy"),
+        policy_revision: PolicyRevision::new(1).expect("fixture policy revision"),
+        policy_sha256: String::new(),
+        applicability: RecipeApplicability {
+            task_profiles: vec!["fixture-task-profile".to_owned()],
+            route_profiles: vec!["fixture-route-profile".to_owned()],
+            impact_profiles: vec!["fixture-impact-profile".to_owned()],
+            governance_profiles: vec!["fixture-governance-profile".to_owned()],
+        },
+        stages: vec![RecipeStage {
+            stage_id: id(EXECUTED_CONTEXT_STAGE),
+            semantic_role: *features
+                .first()
+                .expect("fixture instance configures at least one role"),
+            predecessors: Vec::new(),
+        }],
+        candidate_features: features.clone(),
+        admission: RecipeAdmissionPolicy {
+            admission_rule: id("admission-rule"),
+            safety_floor: id("safety-floor"),
+            // A mandatory role may never also be suppressible, and this
+            // revision suppresses nothing.
+            suppressible_roles: Vec::new(),
+        },
+        section_budgets: role_policies
+            .iter()
+            .map(|rule| ContextSectionBudget {
+                semantic_role: rule.role,
+                unit_boundary_kind: BoundaryUnitKind::Unit,
+                minimum_required_whole_units: 1,
+                required_exact_references: vec![id("fixture-section-unit")],
+                protected_floor_refs: Vec::new(),
+                planning_maximum_whole_units: 64,
+                planning_route_profile: "fixture-route-profile".to_owned(),
+                // The instance's OWN per-role loss rule, which is what
+                // `binds_recipe` compares against this member.
+                omission_or_handle_policy: rule.loss_policy,
+                degradation_behavior: EXECUTED_SECTION_DEGRADATION,
+                disable_feature_when_floor_cannot_be_preserved: false,
+            })
+            .collect(),
+        protected_reserve: ProtectedReservePolicy {
+            reserves: ProtectedReserves {
+                reasoning_reserve: 1,
+                review_reserve: 1,
+                evidence_reserve: 1,
+                owner_ref: "fixture-protected-reserve".to_owned(),
+            },
+            margin_reserve: 1,
+        },
+        layout: RecipeLayoutPolicy {
+            role_positions: features
+                .iter()
+                .enumerate()
+                .map(|(position, semantic_role)| RecipeRolePosition {
+                    semantic_role: *semantic_role,
+                    position: u32::try_from(position).expect("fixture layout position"),
+                })
+                .collect(),
+            repetition: EXECUTED_REPETITION_POLICY,
+        },
+        omission: RecipeOmissionPolicy {
+            permitted_reasons: vec![OmissionReason::Capacity],
+            non_recoverable_reasons: Vec::new(),
+        },
+        blocking_dimensions: vec![QualityDimension::FreshnessStateFenceCoherence],
+        execution: RecipeExecutionContour {
+            contour: id("fixture-compiler-contour"),
+            generation: 1,
+            transform: BoundaryTransformerRevision {
+                transformer_id: "fixture-transform".to_owned(),
+                revision: eliot_contracts::ContractVersion::new(1, 0, 0),
+                configuration_sha256: digest(),
+            },
+        },
+        qualification: RecipeQualification {
+            qualification: id("fixture-qualification"),
+            state: RecipeQualificationState::Qualified,
+            counter_metrics: Vec::new(),
+        },
+        supersession: RecipeSupersession {
+            activation: id("fixture-recipe-activation"),
+        },
+    };
+    policy.policy_sha256 = policy
+        .canonical_policy_digest()
+        .expect("approved recipe policy digest");
+    policy
+}
+
+/// The approved revision pinned for one exact instance, taken BY VALUE.
+///
+/// Every call site owns the exact instance value it passes as the delivery
+/// entrypoint's `recipe` argument, so the approved revision is derived from that
+/// owned value rather than from a re-borrow of a name that could mean something
+/// else by the time it is read. What IS validated here is the approved revision
+/// this helper built, so a fixture that cannot construct one fails loudly
+/// instead of passing a revision the assembly would refuse.
+fn approved_recipe(recipe: ContextRecipe) -> ResolvedContextRecipe {
+    let ContextRecipe {
+        mandatory_roles,
+        role_policies,
+        ..
+    } = recipe;
+    let policy = approved_policy(&mandatory_roles, &role_policies);
+    let mut resolution = ResolvedContextRecipe {
+        identity: RecipePolicyIdentity {
+            policy_id: policy.policy_id.clone(),
+            policy_revision: policy.policy_revision,
+            policy_sha256: policy.policy_sha256.clone(),
+        },
+        approval: policy.supersession.activation.clone(),
+        applicability: policy.applicability.clone(),
+        execution: policy.execution.clone(),
+        policy,
+        resolution_sha256: "0".repeat(64),
+    };
+    resolution.resolution_sha256 = resolution
+        .canonical_resolution_digest()
+        .expect("fixture approved recipe revision digest");
+    resolution
+        .validate()
+        .expect("fixture approved recipe revision resolves");
+    resolution
 }
 
 fn owner_permit(
@@ -504,7 +739,8 @@ fn assemble_marked_1864(
     assemble_active_view_with_learning(
         value,
         &recipe(&context),
-        quality(&context),
+        &approved_recipe(recipe(&context)),
+        quality_for(value, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1864(
@@ -571,7 +807,8 @@ fn expired_overlay_revision_refuses_later_delivery_and_plain_projection_survives
     let view = assemble_active_view(
         &plain,
         &recipe(&context),
-        quality(&context),
+        &approved_recipe(recipe(&context)),
+        quality_for(&plain, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )

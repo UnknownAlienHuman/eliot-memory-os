@@ -63,7 +63,7 @@ pub use handoff_rebuild::{
 pub use handoff_resume::{HandoffResumeOutcome, resume_handoff};
 #[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::assemble_active_view_with_learning;
-pub use measurement::assemble_active_view_with_measurement;
+pub use measurement::{assemble_active_view_with_measurement, compile_context_render_codec};
 pub use readback::{ReopenedSource, gate_citation};
 
 pub use eliot_context_contracts::{

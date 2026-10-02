@@ -194,10 +194,7 @@ pub fn ground_draft_with_controls(
                 "curation screen binding is absent or differs from the input screen".into(),
             );
             evidence::recompute_record_assertability(&mut record);
-            evidence::cap_record_assertability(
-                &mut record,
-                eliot_dreamer_contracts::grounding::canonical::PositionAssertability::HypothesisCandidate,
-            );
+            evidence::cap_record_assertability(&mut record, evidence::CANDIDATE_ONLY_CEILING);
         }
         aggregate_parent_record(
             &grounded.input,
@@ -617,7 +614,7 @@ fn aggregate_parent_record(
             child_assignments.push(grade.clone());
         }
         child_assertability = Some(match child_assertability {
-            Some(current) => weaker_assertability(current, child.assertability_ceiling),
+            Some(current) => evidence::weaker(current, child.assertability_ceiling),
             None => child.assertability_ceiling,
         });
         child_coverage.extend(child.coverage_denominator_ids.iter().cloned());
@@ -657,12 +654,24 @@ fn aggregate_parent_record(
                 }
             })?,
         );
-        record.grade_ceiling = record
-            .grade
-            .as_ref()
-            .and_then(GradeAssignment::known_grade)
-            .unwrap_or(record.grade_ceiling);
     }
+    // Grade-axis finalize, mirroring the assertability cap at the end of this
+    // function: once the parent's grade is known, `grade_ceiling` is re-pinned to
+    // exactly that grade, UNCONDITIONALLY. A ceiling below the grade the record
+    // itself certifies is self-certification on the grade axis, and the fold
+    // above can produce one whenever no child contributes a grade assignment: a
+    // supportless child's ceiling is `Orienting`, so the parent's own accepted
+    // support would survive at `Grounded` under an `Orienting` ceiling. Gating
+    // this re-pin on `!child_assignments.is_empty()` left that record class
+    // inconsistent, and `validation_bridge::refuse_self_certified_grounding`
+    // rightly refused it. An absent or unknown grade certifies nothing, so the
+    // fallback leaves the weakened child ceiling in place and such a record
+    // still claims no rigour.
+    record.grade_ceiling = record
+        .grade
+        .as_ref()
+        .and_then(GradeAssignment::known_grade)
+        .unwrap_or(record.grade_ceiling);
     if let Some(child_assertability) = child_assertability {
         evidence::cap_record_assertability(record, child_assertability);
     }
@@ -696,32 +705,8 @@ fn aggregate_parent_record(
             .insert("typed precision payload is incomplete for grounding".into());
     }
     evidence::recompute_record_assertability(record);
-    evidence::cap_record_assertability(
-        record,
-        eliot_dreamer_contracts::grounding::canonical::PositionAssertability::HypothesisCandidate,
-    );
+    evidence::cap_record_assertability(record, evidence::CANDIDATE_ONLY_CEILING);
     Ok(())
-}
-
-fn weaker_assertability(
-    left: eliot_dreamer_contracts::grounding::canonical::PositionAssertability,
-    right: eliot_dreamer_contracts::grounding::canonical::PositionAssertability,
-) -> eliot_dreamer_contracts::grounding::canonical::PositionAssertability {
-    use eliot_dreamer_contracts::grounding::canonical::PositionAssertability;
-    let rank = |value| match value {
-        PositionAssertability::UnknownWithheldQuarantined => 0,
-        PositionAssertability::PlanningOnly => 1,
-        PositionAssertability::HypothesisCandidate => 2,
-        PositionAssertability::ConflictQualificationRequired => 3,
-        PositionAssertability::QualifiedInference => 4,
-        PositionAssertability::ObservedFact => 5,
-        PositionAssertability::MaterialEffect => 6,
-    };
-    if rank(left) <= rank(right) {
-        left
-    } else {
-        right
-    }
 }
 
 fn postorder<'a>(

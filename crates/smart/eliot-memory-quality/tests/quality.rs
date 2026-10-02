@@ -665,6 +665,72 @@ fn projection_omissions_block_completeness() {
     assert_eq!(assessment.counter_metrics.projection_omissions, 1);
 }
 
+// WORK_UNIT_CASE: 196/W3-1
+#[test]
+fn a_persisted_complete_assessment_without_a_recheckable_denominator_is_refused() {
+    // The assessment is independently deserializable and self-validating, so
+    // it carries the completeness claim and the denominator independently.
+    // A persisted artifact that reads `CoverageStatus::Complete` while its
+    // denominator is `Unknown` is the "looks complete, cannot be rechecked"
+    // shape: nothing is truncated, nothing is omitted, the frontier is empty,
+    // and `unaccounted_volume` is zero, so every *visible* coverage signal says
+    // complete. The refusal is the assessment owner's own typed
+    // `QualityError::MissingDenominator` — the same variant `assess_quality`
+    // raises — not a boolean and not a formatted string.
+    //
+    // This is the consumer half of the item and it is not the batch half:
+    // `unknown_denominator_fails_closed` above drives `assess_quality` (the
+    // request path), and the batch owner's own refusal
+    // (`MemoryProjectionError::CoverageMismatch`) is a different typed error
+    // raised by a different validator. Neither of them re-validates a
+    // persisted `Complete` artifact.
+    let batch_value = batch(vec![record("mem-1")]);
+    let candidate = request(batch_value, &[], &[], vec![]);
+    let mut assessment = assess_quality(&candidate).expect("quality assessment");
+
+    // Control: the identical artifact with its exact denominator validates as
+    // Complete, so the refusal below is attributable to the denominator alone.
+    assert_eq!(assessment.status, CoverageStatus::Complete);
+    assert!(matches!(
+        assessment.denominator,
+        DenominatorState::Known { total: 1 }
+    ));
+    assessment
+        .validate()
+        .expect("the recheckable Complete assessment");
+
+    // Exactly one field changes: the denominator stops being recheckable while
+    // the completeness claim and every coverage signal stay put.
+    assessment.denominator = DenominatorState::Unknown {
+        reason: "read-side recount pending".to_owned(),
+    };
+    assert_eq!(assessment.status, CoverageStatus::Complete);
+    assert!(!assessment.truncated);
+    assert!(assessment.frontier.is_empty());
+    assert!(assessment.batch_omissions.is_empty());
+    assert_eq!(assessment.counter_metrics.unaccounted_volume, 0);
+    assert_eq!(
+        assessment.validate(),
+        Err(QualityError::MissingDenominator),
+        "a Complete assessment with no recheckable denominator must be refused by name"
+    );
+
+    // A caller that cannot restate the count cannot reach Complete at all: the
+    // request path refuses the same fact with the same typed error, so no
+    // route produces the artifact above and the persisted recheck is the only
+    // thing standing behind a deserialized copy.
+    let mut request_batch = batch(vec![record("mem-1")]);
+    request_batch.coverage.denominator = DenominatorState::Unknown {
+        reason: "read-side recount pending".to_owned(),
+    };
+    request_batch.coverage.revalidation_required = true;
+    let request_candidate = request(request_batch, &[], &[], vec![]);
+    assert_eq!(
+        assess_quality(&request_candidate),
+        Err(QualityError::MissingDenominator)
+    );
+}
+
 #[test]
 fn verdict_missing_a_batch_record_is_rejected() {
     let batch_value = batch(vec![record("mem-1"), record("mem-2")]);

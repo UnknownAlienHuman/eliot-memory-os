@@ -848,6 +848,517 @@ pub struct FailureFingerprintInput {
     pub payload: Value,
 }
 
+// ---------------------------------------------------------------------------
+// The shared `recall_candidate.payload` column contract (issue #262, D-1).
+//
+// Measured owner of the seven store-projection keys. `payload` is NOT a failure
+// vocabulary: it is the single shared `recall_candidate.payload` column that all
+// six record-type arms of `crates/eliot-store/src/canonical_store.rs`
+// (`projection_rows`) read through `joined_search_fields`, and that
+// `crates/eliot-store/src/surql/load_recall_candidates.surql` projects in its
+// six `$kind` branches. No document named these keys; the shape below is taken
+// from that store contract, which is the only place they exist.
+//
+// #937 line, made explicit and enforced here. `payload: Value` is PERMITTED
+// INERT EVIDENCE CONTENT. Everything the retrieval projection actually reads is
+// an Eliot CONTROL-ENVELOPE field and is one of the closed members below. The
+// inert remainder is never interpreted by this contract: it is carried as
+// [`RecallCandidatePayload::evidence`] and round-trips byte-identically, so no
+// existing producer of inert evidence (`cue_bindings`, `lineage`, bootstrap
+// draft material, cognitive child receipts, UL `receipt_body`) is disturbed.
+// ---------------------------------------------------------------------------
+
+/// Cue fields of the shared `recall_candidate.payload` column contract.
+///
+/// Closed: `deny_unknown_fields`, no `flatten`, no tagging. Closedness here is
+/// over the SET of members, not over their presence: an absent member is "this
+/// record states no such cue", which is exactly what the store's
+/// `searchable_field` already produced for an absent key. A member stated with
+/// the wrong type is refused by [`RecallCandidatePayload::from_wire`], never
+/// coerced and never dropped.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecallCueFields {
+    pub path: Option<String>,
+    pub symbol: Option<String>,
+    pub error: Option<String>,
+    pub task_class: Option<String>,
+}
+
+impl RecallCueFields {
+    /// The declared cue member names, in the store's projection order.
+    pub const CUE_FIELD_NAMES: [&'static str; 4] = ["path", "symbol", "error", "task_class"];
+
+    /// The store's `cue_text`: present members joined by one space, absent or
+    /// empty members dropped. Byte-identical to the store's
+    /// `joined_search_fields` over the same four declared keys.
+    #[must_use]
+    pub fn joined_text(&self) -> String {
+        join_present(&[
+            self.path.as_deref(),
+            self.symbol.as_deref(),
+            self.error.as_deref(),
+            self.task_class.as_deref(),
+        ])
+    }
+}
+
+/// Concept fields of the shared `recall_candidate.payload` column contract.
+///
+/// Closed: `deny_unknown_fields`, no `flatten`, no tagging. Same presence
+/// semantics as [`RecallCueFields`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecallConceptFields {
+    pub concept_id: Option<String>,
+    pub concept_refs: Option<Vec<String>>,
+    pub subsystem: Option<String>,
+    pub subsystem_concept_refs: Option<Vec<String>>,
+}
+
+impl RecallConceptFields {
+    /// The store's `concept_text` for the four-arm projection
+    /// (`concept_id`, `concept_refs`).
+    #[must_use]
+    pub fn joined_text(&self) -> String {
+        let refs = joined_refs(self.concept_refs.as_deref());
+        join_present(&[self.concept_id.as_deref(), Some(refs.as_str())])
+    }
+
+    /// The store's `concept_text` for the claim arm, which also reads
+    /// `subsystem`.
+    #[must_use]
+    pub fn claim_joined_text(&self) -> String {
+        let refs = joined_refs(self.concept_refs.as_deref());
+        join_present(&[
+            self.concept_id.as_deref(),
+            Some(refs.as_str()),
+            self.subsystem.as_deref(),
+        ])
+    }
+
+    /// The store's `concept_text` for the UL artifact arm, which also reads
+    /// `subsystem_concept_refs`.
+    #[must_use]
+    pub fn artifact_joined_text(&self) -> String {
+        let refs = joined_refs(self.concept_refs.as_deref());
+        let subsystem_refs = joined_refs(self.subsystem_concept_refs.as_deref());
+        join_present(&[
+            self.concept_id.as_deref(),
+            Some(refs.as_str()),
+            Some(subsystem_refs.as_str()),
+        ])
+    }
+}
+
+/// Ranking fields of the shared `recall_candidate.payload` column contract.
+///
+/// Closed: `deny_unknown_fields`, no `flatten`, no tagging. These four signal
+/// families plus [`Self::beneficial_use_count`] are the ONLY payload members the
+/// retrieval ranking reads; everything else in `payload` is inert. Same presence
+/// semantics as [`RecallCueFields`].
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecallRankingFields {
+    pub changed_outcome: Option<bool>,
+    pub beneficial_use_count: Option<u32>,
+    pub harmful: Option<bool>,
+    pub repeated: Option<bool>,
+    pub distraction: Option<bool>,
+}
+
+/// Why a wire `payload` object is not a valid shared-column-contract value.
+///
+/// Non-content-bearing: it names the offending member and the type the contract
+/// requires. It never carries the rejected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecallPayloadViolation {
+    /// The payload is not a JSON object at all.
+    NotAnObject,
+    /// A declared control-envelope member is present with the wrong JSON type.
+    FieldWrongType {
+        /// The declared control-envelope member name.
+        field: &'static str,
+        /// The JSON type the shared column contract requires for it.
+        expected: &'static str,
+    },
+}
+
+impl RecallPayloadViolation {
+    /// Stable, bounded, content-free reason string.
+    ///
+    /// Not `const`: the arm discriminates on `&str`, and matching a `str` in a
+    /// constant function is not yet stable. Nothing here is evaluated in a
+    /// constant context, so the qualifier bought nothing.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAnObject => "recall payload is not a JSON object",
+            Self::FieldWrongType { expected, .. } => match expected {
+                "string" => "recall payload control field is not a string",
+                "array" => "recall payload control field is not an array of strings",
+                "boolean" => "recall payload control field is not a boolean",
+                "integer" => "recall payload control field is not a non-negative integer",
+                _ => "recall payload control field has the wrong type",
+            },
+        }
+    }
+}
+
+/// Typed projection of one shared `recall_candidate.payload` value.
+///
+/// `cues`, `concepts` and `ranking` are the closed control-envelope contract;
+/// `evidence` is the permitted inert remainder and is never interpreted here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecallCandidatePayload {
+    pub cues: RecallCueFields,
+    pub concepts: RecallConceptFields,
+    pub ranking: RecallRankingFields,
+    pub evidence: Value,
+}
+
+impl RecallCandidatePayload {
+    /// Every control-envelope member name this contract claims, in a stable
+    /// order. A wire member in this list is typed and refused on a wrong type;
+    /// a wire member outside it is inert evidence.
+    pub const CONTROL_FIELD_NAMES: [&'static str; 13] = [
+        "path",
+        "symbol",
+        "error",
+        "task_class",
+        "concept_id",
+        "concept_refs",
+        "subsystem",
+        "subsystem_concept_refs",
+        "changed_outcome",
+        "beneficial_use_count",
+        "harmful",
+        "repeated",
+        "distraction",
+    ];
+
+    /// Decodes the shared column contract out of an untyped wire `payload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecallPayloadViolation::NotAnObject`] for a payload that is
+    /// neither a JSON object nor JSON `null`, and
+    /// [`RecallPayloadViolation::FieldWrongType`] for any declared
+    /// control-envelope member present with the wrong JSON type. An ABSENT
+    /// member is `None`; it is never defaulted to an empty value.
+    ///
+    /// JSON `null` is the encoding of "no members stated" and decodes to the
+    /// empty contract. That is what `joined_search_fields` already produced for
+    /// a null payload, so the store's existing byte-preservation oracle over
+    /// `FailureFingerprintInput { payload: Value::Null }`
+    /// (`crates/eliot-store/src/payload_byte_preservation.rs`) is unchanged.
+    pub fn from_wire(payload: &Value) -> Result<Self, RecallPayloadViolation> {
+        if payload.is_null() {
+            return Ok(Self::empty());
+        }
+        let object = payload
+            .as_object()
+            .ok_or(RecallPayloadViolation::NotAnObject)?;
+        Ok(Self {
+            cues: RecallCueFields {
+                path: wire_string(object, "path")?,
+                symbol: wire_string(object, "symbol")?,
+                error: wire_string(object, "error")?,
+                task_class: wire_string(object, "task_class")?,
+            },
+            concepts: RecallConceptFields {
+                concept_id: wire_string(object, "concept_id")?,
+                concept_refs: wire_refs(object, "concept_refs")?,
+                subsystem: wire_string(object, "subsystem")?,
+                subsystem_concept_refs: wire_refs(object, "subsystem_concept_refs")?,
+            },
+            ranking: RecallRankingFields {
+                changed_outcome: wire_bool(object, "changed_outcome")?,
+                beneficial_use_count: wire_count(object, "beneficial_use_count")?,
+                harmful: wire_bool(object, "harmful")?,
+                repeated: wire_bool(object, "repeated")?,
+                distraction: wire_bool(object, "distraction")?,
+            },
+            evidence: Self::inert_remainder(object),
+        })
+    }
+
+    /// The empty contract: no member stated on either side.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            cues: RecallCueFields::default(),
+            concepts: RecallConceptFields::default(),
+            ranking: RecallRankingFields::default(),
+            evidence: Value::Null,
+        }
+    }
+
+    /// Re-emits the exact wire object this projection was decoded from:
+    /// declared control members at the top level, inert remainder alongside
+    /// them. Round-trip is byte-identical for every accepted payload.
+    #[must_use]
+    pub fn to_wire(&self) -> Value {
+        let mut object = match &self.evidence {
+            Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        put_string(&mut object, "path", self.cues.path.as_deref());
+        put_string(&mut object, "symbol", self.cues.symbol.as_deref());
+        put_string(&mut object, "error", self.cues.error.as_deref());
+        put_string(&mut object, "task_class", self.cues.task_class.as_deref());
+        put_string(
+            &mut object,
+            "concept_id",
+            self.concepts.concept_id.as_deref(),
+        );
+        put_refs(
+            &mut object,
+            "concept_refs",
+            self.concepts.concept_refs.as_deref(),
+        );
+        put_string(&mut object, "subsystem", self.concepts.subsystem.as_deref());
+        put_refs(
+            &mut object,
+            "subsystem_concept_refs",
+            self.concepts.subsystem_concept_refs.as_deref(),
+        );
+        put_bool(&mut object, "changed_outcome", self.ranking.changed_outcome);
+        put_count(
+            &mut object,
+            "beneficial_use_count",
+            self.ranking.beneficial_use_count,
+        );
+        put_bool(&mut object, "harmful", self.ranking.harmful);
+        put_bool(&mut object, "repeated", self.ranking.repeated);
+        put_bool(&mut object, "distraction", self.ranking.distraction);
+        Value::Object(object)
+    }
+
+    /// The store's `cue_text` for this payload.
+    #[must_use]
+    pub fn cue_text(&self) -> String {
+        self.cues.joined_text()
+    }
+
+    /// The store's `concept_text` for the four-arm projection.
+    #[must_use]
+    pub fn concept_text(&self) -> String {
+        self.concepts.joined_text()
+    }
+
+    /// The store's `concept_text` for the claim arm, which also reads
+    /// `subsystem`.
+    #[must_use]
+    pub fn claim_concept_text(&self) -> String {
+        self.concepts.claim_joined_text()
+    }
+
+    /// The store's `concept_text` for the UL artifact arm, which also reads
+    /// `subsystem_concept_refs`.
+    #[must_use]
+    pub fn artifact_concept_text(&self) -> String {
+        self.concepts.artifact_joined_text()
+    }
+
+    /// The store's `known_decision_delta` contribution.
+    #[must_use]
+    pub fn known_decision_delta(&self) -> i32 {
+        i32::from(self.ranking.changed_outcome == Some(true))
+    }
+
+    /// The store's `prior_beneficial_use` contribution. Absent means zero, which
+    /// is the store's own `payload_i32` default and is NOT a wire default.
+    #[must_use]
+    pub fn prior_beneficial_use(&self) -> i32 {
+        self.ranking
+            .beneficial_use_count
+            // A declared count wider than `i32` saturates rather than wraps:
+            // the ranking signal is monotone, so clamping preserves its
+            // direction where a two's-complement cast would invert it.
+            .map_or(0, |count| i32::try_from(count).unwrap_or(i32::MAX))
+    }
+
+    /// The store's `harm_signal`.
+    #[must_use]
+    pub fn harm_signal(&self) -> bool {
+        self.ranking.harmful == Some(true)
+    }
+
+    /// The store's `repetition_signal`.
+    #[must_use]
+    pub fn repetition_signal(&self) -> bool {
+        self.ranking.repeated == Some(true)
+    }
+
+    /// The store's `distraction_signal`.
+    #[must_use]
+    pub fn distraction_signal(&self) -> bool {
+        self.ranking.distraction == Some(true)
+    }
+
+    /// The store's `searchable_value` rendering of the whole payload: control
+    /// members and inert evidence alike, in one string.
+    #[must_use]
+    pub fn searchable_text(&self) -> String {
+        searchable_payload_value(&self.to_wire())
+    }
+
+    fn inert_remainder(object: &serde_json::Map<String, Value>) -> Value {
+        let mut map = serde_json::Map::new();
+        for (key, value) in object {
+            if Self::CONTROL_FIELD_NAMES.contains(&key.as_str()) {
+                continue;
+            }
+            map.insert(key.clone(), value.clone());
+        }
+        Value::Object(map)
+    }
+}
+
+fn join_present(parts: &[Option<&str>]) -> String {
+    // `iter().copied()` yields `Option<&str>` by value, so `flatten` yields
+    // `&str`. Iterating the slice by reference instead would yield `&&str`,
+    // which `join` cannot take.
+    parts
+        .iter()
+        .copied()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Renders a declared reference array exactly as the store's
+/// `searchable_value` renders the same JSON array, so the migrated arms produce
+/// byte-identical `cue_text` / `concept_text`.
+fn joined_refs(refs: Option<&[String]>) -> String {
+    let Some(refs) = refs else {
+        return String::new();
+    };
+    searchable_payload_value(&Value::Array(
+        refs.iter()
+            .map(|value| Value::String(value.clone()))
+            .collect(),
+    ))
+}
+
+fn wire_string(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, RecallPayloadViolation> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(RecallPayloadViolation::FieldWrongType {
+            field,
+            expected: "string",
+        }),
+    }
+}
+
+fn wire_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<bool>, RecallPayloadViolation> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(RecallPayloadViolation::FieldWrongType {
+            field,
+            expected: "boolean",
+        }),
+    }
+}
+
+fn wire_refs(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, RecallPayloadViolation> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(values)) => {
+            let mut refs = Vec::with_capacity(values.len());
+            for value in values {
+                let Value::String(text) = value else {
+                    return Err(RecallPayloadViolation::FieldWrongType {
+                        field,
+                        expected: "array",
+                    });
+                };
+                refs.push(text.clone());
+            }
+            Ok(Some(refs))
+        }
+        Some(_) => Err(RecallPayloadViolation::FieldWrongType {
+            field,
+            expected: "array",
+        }),
+    }
+}
+
+fn wire_count(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<u32>, RecallPayloadViolation> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => {
+            match number.as_u64().and_then(|raw| u32::try_from(raw).ok()) {
+                Some(count) => Ok(Some(count)),
+                None => Err(RecallPayloadViolation::FieldWrongType {
+                    field,
+                    expected: "integer",
+                }),
+            }
+        }
+        Some(_) => Err(RecallPayloadViolation::FieldWrongType {
+            field,
+            expected: "integer",
+        }),
+    }
+}
+
+fn put_string(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
+}
+
+fn put_bool(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), Value::Bool(value));
+    }
+}
+
+fn put_count(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<u32>) {
+    if let Some(value) = value {
+        object.insert(key.to_owned(), Value::from(value));
+    }
+}
+
+fn put_refs(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<&[String]>) {
+    if let Some(value) = value {
+        object.insert(
+            key.to_owned(),
+            Value::Array(
+                value
+                    .iter()
+                    .map(|ref_| Value::String(ref_.clone()))
+                    .collect(),
+            ),
+        );
+    }
+}
+
+fn searchable_payload_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
 /// Decoder: derived, no `flatten`, no tagging. Unknown member keys are refused by `deny_unknown_fields`; repeated keys are refused while reading the raw map.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

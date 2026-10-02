@@ -221,6 +221,56 @@ fn record_scope_mismatch_fails_closed() {
     ));
 }
 
+// WORK_UNIT_CASE: 196/W3-2
+#[test]
+fn a_record_declaring_another_work_scope_is_refused_by_the_scope_comparison() {
+    // The wrong-scope record, on the `scope_id` axis specifically. Task,
+    // session, the declared binding fence and the record's own projection fence
+    // are all left exactly equal to the batch's, so every other comparison in
+    // `MemoryProjectionBatch::validate` passes and only the scope identity
+    // differs. A batch digest computed over this record would then cover
+    // material from a scope the batch never claimed.
+    //
+    // The `scope_id` term is the one arm of the scope comparison with no
+    // fixture anywhere in this crate: `record_scope_mismatch_fails_closed`
+    // varies `task_id`, and the two fence fixtures vary `state_fence`. Nothing
+    // here is weakened to make the case pass: the two control batches below
+    // are the ordinary admitted shapes, and only the one field differs.
+    let mut candidate = batch();
+    candidate.records[0].binding.scope_id = WorkScopeId::new("scope-other-cc008").expect("other scope");
+    let error = candidate
+        .validate()
+        .expect_err("a record from another work scope must fail closed");
+    assert_eq!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::ScopeMismatch {
+            reason: "record binding must equal the batch binding",
+        },
+        "the refusal must be the typed scope comparison, not a fence relaxation"
+    );
+
+    // Control: the identical batch with the scope restored is admitted, so the
+    // refusal above is attributable to the scope identity alone.
+    let mut admitted = batch();
+    admitted.records[0].binding.scope_id = scope();
+    admitted.validate().expect("the in-scope record is ordinary evidence");
+
+    // Control: the mismatch is refused even when the batch is otherwise
+    // perfect coverage — the scope comparison is not conditioned on coverage.
+    let mut lossy = batch();
+    lossy.coverage.denominator = DenominatorState::Known { total: 3 };
+    lossy.coverage.omissions = vec![CoverageOmission {
+        handle: aid("mem-3"),
+        reason: "fence-mismatch".to_owned(),
+    }];
+    lossy.coverage.revalidation_required = true;
+    lossy.records[0].binding.scope_id = WorkScopeId::new("scope-other-cc008").expect("other scope");
+    assert!(matches!(
+        lossy.validate(),
+        Err(eliot_memory_projection_contracts::MemoryProjectionError::ScopeMismatch { .. })
+    ));
+}
+
 #[test]
 fn duplicate_handles_are_rejected() {
     let mut candidate = batch();

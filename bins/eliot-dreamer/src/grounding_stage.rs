@@ -2,16 +2,52 @@
 //!
 //! After the A-04 bundle stage, the binary grounds the structured draft
 //! against the frozen evidence universe through the #602 owner
-//! ([`ground_draft_with_controls`](eliot_dreamer_claim_grounding::ground_draft_with_controls))
-//! exactly once per admitted job. This module performs no local retrieval,
-//! ranking, or truth promotion: the structured draft arrives from the model
+//! ([`ground_draft_with_controls`](eliot_dreamer_claim_grounding::ground_draft_with_controls)).
+//! The A-14b -> A-05 handoff performs that grounding exactly once per admitted
+//! job (see below); the Orientation pulse separately re-runs the same pure
+//! function for its own commitment digest. This module performs no local
+//! retrieval, ranking, or truth promotion: the structured draft arrives from
+//! the model
 //! stage, the frozen manifest and bundle are derived from the admitted pair
 //! through [`admitted_material`], and the returned owner [`GroundedDreamDraft`](eliot_dreamer_contracts::grounding::GroundedDreamDraft)
 //! is surfaced unmodified so the frozen claim denominator is preserved
 //! losslessly (the denominator arrives with governed material; Dreamer never
 //! selects it, and never synthesizes a frozen universe locally).
+//!
+//! The production chain reaches that owner through
+//! [`ground_and_bind_validation_carrier`](crate::validation_stage::ground_and_bind_validation_carrier):
+//! grounding and the A-05 carrier binding are one call into the owning crate
+//! ([`ground_for_validation`](eliot_dreamer_claim_grounding::ground_for_validation)),
+//! which also owns the carrier's single construction site. That handoff grounds
+//! the admitted draft exactly once per admitted job, inside that one owner
+//! call, and this module adds no second grounding entry to the ADMITTED path.
+//! The one other entry is the refusal-recovery run, and it is named here
+//! because it is disclosed where it is written: the production refusal path
+//! ([`handoff_denied`](crate::validation_stage::handoff_denied)) passes a real
+//! grounding over the request it retains, through the injectable seam
+//! [`ground_admitted_draft_with`] below, purely to recover a refusal class the
+//! owning crate collapsed. That is a second grounding of the retained request,
+//! not a second admitted grounding, and it lives in this file and in
+//! `validation_stage.rs`.
+//!
+//! "Exactly once per admitted job" is scoped to that handoff, not to the whole
+//! process. The Orientation Product Pulse re-runs the same pure grounding over
+//! the same retained request for its own stage commitment digest
+//! (`pulse::run_grounding_stage`, reached from
+//! `production_orientation::collect_ref_stages` -> `compose_production_result`
+//! -> `dispatch_stage::dispatch_admitted`), and it does so only when an owner
+//! channel is admitted. On this tree that cannot happen: the only production
+//! supply source returns `None`
+//! (`orientation_supply_source.rs:151`) and the carrier resolution refuses
+//! first when the supply is absent (`production_orientation.rs:469-478`), so
+//! the re-run is masked rather than absent. The seam kept here is the
+//! injectable one, [`ground_admitted_draft_with`]: the slice tests use it to
+//! prove the once-per-admission call shape against the real owner function,
+//! and the production refusal path uses it so that this module's exhaustive
+//! owner-refusal table is the mapping a collapsed owner refusal is reported
+//! through rather than the owner's single static.
 
-use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
+use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ContractViolation;
 use eliot_dreamer_contracts::grounding::{GroundedDreamDraft, StructuredModelDraft};
 
@@ -46,34 +82,22 @@ pub(crate) fn resolve_grounding_inputs(
     ))
 }
 
-/// Grounds the admitted structured draft exactly once.
+/// Grounds the admitted structured draft exactly once, and maps its refusal.
 ///
 /// `ground_once` is `FnOnce`: the owner grounding cannot run twice for one
-/// admission through this seam. Production passes
-/// [`ground_draft_with_controls`](eliot_dreamer_claim_grounding::ground_draft_with_controls);
-/// deterministic tests pass a counting wrapper around the real function to
-/// prove the once-per-admission call shape. The resulting grounded draft is
-/// returned unmodified: no claim is dropped, re-graded, or re-selected here.
+/// admission through this seam. The production refusal path
+/// ([`handoff_denied`](crate::validation_stage::handoff_denied)) passes the real
+/// [`ground_draft_with_controls`](eliot_dreamer_claim_grounding::ground_draft_with_controls)
+/// on the request it retains, so a refusal the owner collapsed is still
+/// reported through this module's exhaustive table; the slice tests pass a
+/// counting wrapper around the same real function to prove the
+/// once-per-admission call shape. The resulting grounded draft is returned
+/// unmodified: no claim is dropped, re-graded, or re-selected here.
 pub(crate) fn ground_admitted_draft_with(
     request: GroundingRequest,
     ground_once: impl FnOnce(GroundingRequest) -> Result<GroundedDreamDraft, ContractViolation>,
 ) -> Result<GroundedDreamDraft, DreamerError> {
     ground_once(request).map_err(|error| grounding_denied(&error))
-}
-
-/// Production entry: the real A-14b grounding, once per admission.
-///
-/// Unwired until the pipeline threads the model draft through; `submit`
-/// cannot supply a [`StructuredModelDraft`] yet, so the entry is exercised by the slice
-/// tests below. Remove the allowance once the pipeline calls this entry.
-#[allow(
-    dead_code,
-    reason = "wired once the pipeline threads the model draft; tests cover it until then"
-)]
-pub(crate) fn ground_admitted_draft(
-    request: GroundingRequest,
-) -> Result<GroundedDreamDraft, DreamerError> {
-    ground_admitted_draft_with(request, ground_draft_with_controls)
 }
 
 /// Maps an owner grounding refusal to a typed fail-closed refusal.
@@ -82,7 +106,17 @@ pub(crate) fn ground_admitted_draft(
 /// never the Kernel-admission code: the admission itself was valid, the
 /// grounding inputs were not. Dynamic payloads (digests, reasons, values) are
 /// dropped in favor of bounded static field names; nothing secret flows.
-fn grounding_denied(error: &ContractViolation) -> DreamerError {
+///
+/// This table is the production refusal mapping for the A-14b -> A-05 handoff
+/// as well as for the seam above: the owning crate reduces a
+/// `ContractViolation` through its own `summarize_contract`, which collapses
+/// six classes onto one static, and
+/// [`handoff_denied`](crate::validation_stage::handoff_denied) routes a
+/// collapsed refusal back through the seam and therefore through this table, so
+/// those six stay distinguishable. Exhaustive with no wildcard arm: extending
+/// the closed owner taxonomy breaks compilation here until the new refusal is
+/// assigned a mapping.
+pub(crate) fn grounding_denied(error: &ContractViolation) -> DreamerError {
     match error {
         ContractViolation::UnknownVariant { field, .. }
         | ContractViolation::OutOfBounds { field, .. }
@@ -357,7 +391,7 @@ mod slice_5_grounding_tests {
             request.bundle.materials[0].handle, "evidence-slice-5",
             "the carried material must keep the admitted handle verbatim"
         );
-        let Ok(grounded) = ground_admitted_draft(request) else {
+        let Ok(grounded) = ground_admitted_draft_with(request, ground_draft_with_controls) else {
             panic!("governed material must ground through the real owner");
         };
         let Ok(admitted) = governed::admission_of(&admission, &job) else {
@@ -555,22 +589,6 @@ mod slice_5_grounding_tests {
         assert!(
             !matches!(error, DreamerError::KernelAdmissionRequired(_)),
             "grounding refusal must not borrow the Kernel-admission code"
-        );
-    }
-
-    /// Every owner grounding refusal shape maps to the request-rejected code,
-    /// never to the Kernel-admission code.
-    #[test]
-    fn production_entry_refuses_through_the_real_owner() {
-        let refused = ground_admitted_draft(corrupted_request());
-        let code = match &refused {
-            Err(error) => error.code(),
-            Ok(_) => "UNEXPECTED_OK",
-        };
-        assert_eq!(code, "DREAMER_REQUEST_REJECTED");
-        assert!(
-            !matches!(refused, Err(DreamerError::KernelAdmissionRequired(_))),
-            "production refusal must not borrow the Kernel-admission code"
         );
     }
 

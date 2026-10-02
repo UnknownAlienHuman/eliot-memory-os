@@ -55,6 +55,7 @@ mod kernel_authority_port;
 mod native_resource_resolver;
 mod notify_fallback_ensure;
 pub mod notify_launch_callin;
+mod opencode_bootstrap;
 mod operation_identity;
 #[cfg(windows)]
 mod own_generation_job;
@@ -1308,6 +1309,15 @@ pub struct BrokerComposition {
     /// launchable only from here; see
     /// [`BrokerComposition::launch_notify`].
     notify_launch: BrokerNotifyLaunchAuthority,
+    /// The current one-shot `OpenCode` bootstrap route, installed when an
+    /// admitted launch of the approved `OpenCode` child carried the broker's own
+    /// introduction projection and every owner-record comparison succeeded (see
+    /// [`opencode_bootstrap`]). `None` means this generation introduces no
+    /// route, and every redemption is refused; installing a new rotation
+    /// replaces it, which is what retires the previous credential with its
+    /// generation. Process memory only: a broker restart installs nothing, so a
+    /// restarted broker cannot inherit a route whose child died with it.
+    opencode_bootstrap: Option<eliot_user_broker_core::OpenCodeBootstrapRoute>,
 }
 
 impl BrokerComposition {
@@ -1534,6 +1544,11 @@ impl BrokerComposition {
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
             }),
+            // No route is introduced until an approved `OpenCode` launch
+            // installs one, so a recovered broker never inherits the
+            // introduction, credential, or one-shot ticket of the generation
+            // that died with its child.
+            opencode_bootstrap: None,
         })
     }
 
@@ -1813,12 +1828,29 @@ impl BrokerComposition {
     }
 
     /// Heartbeats the protected registration before an admitted launch.
+    ///
+    /// A launch the Kernel admitted with an `OpenCode` bridge owner grant also
+    /// materializes this broker's own session-scoped endpoint and credential
+    /// introduction onto that launch, and installs the one-shot bootstrap route
+    /// for the child this call just started, from this broker's own owner
+    /// records (issue #2898, steps 1, 2 and 4). The materialization runs
+    /// **before** the dispatch, so the bytes the child receives are broker-minted
+    /// on the launch the Kernel admitted, and the install is best-effort and
+    /// never fails an admitted launch: it reads the projection out of the very
+    /// request that was dispatched and the child's OS-observed identity out of
+    /// the start receipt the dispatch returned.
     pub fn launch(
         &mut self,
-        request: LaunchRequest,
+        mut request: LaunchRequest,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
-        self.broker.launch(request).map_err(Self::classify)
+        self.materialize_opencode_bridge_projection(&mut request)?;
+        let projection = opencode_bootstrap::launch_names_opencode_projection(&request);
+        let receipt = self.broker.launch(request).map_err(Self::classify)?;
+        if let Some(projection) = projection {
+            self.install_opencode_bootstrap_route(&projection, &receipt);
+        }
+        Ok(receipt)
     }
 
     /// Authenticated generic Human launch with an explicit selected native

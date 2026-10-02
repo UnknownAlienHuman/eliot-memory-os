@@ -168,10 +168,7 @@ pub(crate) fn evaluate_claim(
     };
     // Grounding is a candidate-only transformation. It may carry upstream
     // ceilings downward, but it cannot mint an observed fact or material effect.
-    record.assertability_ceiling = weaker(
-        record.assertability_ceiling,
-        PositionAssertability::HypothesisCandidate,
-    );
+    record.assertability_ceiling = weaker(record.assertability_ceiling, CANDIDATE_ONLY_CEILING);
     Ok(record)
 }
 
@@ -925,6 +922,28 @@ pub(crate) fn recompute_record_assertability(record: &mut ClaimGroundingRecord) 
     record.assertability_ceiling = weaker(base, record.assertability_ceiling);
 }
 
+/// The strongest epistemic position this cell may ever leave on a grounded
+/// record: a hypothesis held as a candidate, never a fact.
+///
+/// This is the one owner of that policy value in this crate. Grounding is a
+/// candidate-only transformation, and this cell's declared invariant is
+/// "grounding does not promote epistemic status", so every site that caps a
+/// record's `assertability_ceiling` reads this symbol instead of restating the
+/// literal:
+///
+/// - [`evaluate_claim`], the unconditional producer cap on every record;
+/// - `grounding::ground_draft_with_controls`, the curation-screen cap;
+/// - `grounding::aggregate_parent_record`, the aggregation finalize cap;
+/// - `validation_bridge::refuse_self_certified_grounding`, which refuses a
+///   retained record that claims a position above this ceiling.
+///
+/// Relaxing or tightening the ceiling is therefore one edit here, and it moves
+/// every producer and every refusal with it. The comparison itself belongs to
+/// [`weaker`], the crate's evidence-side ordering over
+/// [`PositionAssertability`].
+pub(crate) const CANDIDATE_ONLY_CEILING: PositionAssertability =
+    PositionAssertability::HypothesisCandidate;
+
 pub(crate) fn cap_record_assertability(
     record: &mut ClaimGroundingRecord,
     cap: PositionAssertability,
@@ -960,7 +979,44 @@ fn assertability(result: &EvaluatedClaim) -> PositionAssertability {
     result.caps.iter().copied().fold(base, weaker)
 }
 
-fn weaker(left: PositionAssertability, right: PositionAssertability) -> PositionAssertability {
+/// The crate's single ordering over [`PositionAssertability`]: returns the
+/// weaker of two positions.
+///
+/// This is the only rank table in this crate's PRODUCTION code. The test
+/// module's `ladder` array in `weaker_pins_the_frozen_assertability_ladder`
+/// restates the same ladder, but as a fixture the test asserts against rather
+/// than as a second ordering, so it cannot compete with the closure below at
+/// runtime. It owns both the comparison the
+/// ceiling cap uses ([`cap_record_assertability`], and therefore
+/// [`CANDIDATE_ONLY_CEILING`] at all four producer and refusal sites) and the
+/// comparison `grounding::aggregate_parent_record` uses when it folds a
+/// parent's ceiling down to its weakest child, so a cap and a comparison cannot
+/// disagree about which position is weaker.
+///
+/// `grounding.rs` previously carried `weaker_assertability`, a byte-for-byte
+/// duplicate of the table below; that duplicate was deleted rather than kept in
+/// sync. `weaker_pins_the_frozen_assertability_ladder` pins the ladder this one
+/// declaration implements; a table reintroduced anywhere else in the crate would
+/// be caught by review of this declaration, not by that test.
+///
+/// Open Contract Challenge, issue #262 (recorded, not repaired here): the
+/// `rank` closure below is a crate-local copy of the upstream ladder
+/// `PositionAssertability::strength` /
+/// `PositionAssertability::strength_rank`
+/// (`crates/smart/eliot-epistemic-contracts/src/assertability.rs`), where
+/// `strength` carries NO visibility modifier and is therefore module-private to
+/// the upstream `assertability` module, while only `strength_rank` is
+/// `pub(crate)`. Neither is reachable from here, and the test module's `ladder`
+/// array is a third restatement of the same table. The copy
+/// will drift silently if upstream changes. The owner is
+/// `eliot_epistemic_contracts::PositionAssertability`; the conformance test that
+/// would catch the drift is one that runs `weaker` against
+/// `strength_rank` over every variant pair, which requires a visibility change in
+/// ANOTHER crate and is not this cell's to make.
+pub(crate) fn weaker(
+    left: PositionAssertability,
+    right: PositionAssertability,
+) -> PositionAssertability {
     let rank = |value| match value {
         PositionAssertability::UnknownWithheldQuarantined => 0,
         PositionAssertability::PlanningOnly => 1,
@@ -974,5 +1030,393 @@ fn weaker(left: PositionAssertability, right: PositionAssertability) -> Position
         left
     } else {
         right
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::num::NonZeroU64;
+
+    use super::{
+        CANDIDATE_ONLY_CEILING, EvaluatedClaim, assertability, cap_record_assertability,
+        evaluate_claim, weaker,
+    };
+    use eliot_dreamer_contracts::grounding::canonical::{
+        ArtifactId, DisclosureClass, EpochId, EpochLineageId, EvidenceAuthority, EvidenceFreshness,
+        EvidenceGrade, GradeAssignment, PositionAssertability, PrivacyHandling, PropositionId,
+        ResourceGeneration, SourceId, SourceLineage, SourceRevisionId, StateFence, SupportRecord,
+        SupportResult, TaskId, ValidityBounds,
+    };
+    use eliot_dreamer_contracts::grounding::{
+        AllowedReferenceManifest, AuthorizedReference, ClaimKind, GroundingPolicy, MaterialClaim,
+        PrecisionPayload, TypedEvidenceAssertion,
+    };
+
+    const FIXTURE_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// Unwraps a fixture construction result or fails the test loudly.
+    ///
+    /// Every call site builds a bounded literal from this module, so a failure is
+    /// a broken fixture, never an expected outcome. This is the crate's existing
+    /// in-src test idiom (`validation_bridge.rs`): a `panic!` in a `match` keeps
+    /// the test free of `expect`/`unwrap` without an allowance.
+    fn required<T, E: std::fmt::Debug>(result: Result<T, E>, label: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("the {label} fixture is a bounded literal: {error:?}"),
+        }
+    }
+
+    fn artifact(value: &str) -> ArtifactId {
+        required(ArtifactId::new(value), "artifact")
+    }
+
+    fn fence() -> StateFence {
+        let lineage = required(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000"),
+            "lineage",
+        );
+        let epoch = required(EpochId::new(lineage, NonZeroU64::MIN), "epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn task() -> TaskId {
+        required(TaskId::new("ceiling-task"), "task")
+    }
+
+    fn precision() -> PrecisionPayload {
+        PrecisionPayload::NumericQuantified {
+            value: "42".into(),
+            unit: "items".into(),
+            denominator: Some("100".into()),
+            interval: None,
+            rounding: None,
+            uncertainty: Some("exact".into()),
+        }
+    }
+
+    /// A `Supported` typed support relation whose grade is known, so the claim it
+    /// matches grounds legitimately rather than through an absent handle.
+    fn supported_support() -> SupportRecord {
+        SupportRecord {
+            proposition: required(PropositionId::new("proposition-ceiling"), "proposition"),
+            result: SupportResult::Supported,
+            handles: BTreeSet::from([artifact("evidence-1")]),
+            validity: ValidityBounds {
+                scope: "ceiling-scope".into(),
+                window_start_ms: None,
+                window_end_ms: None,
+                version: "revision-ceiling".into(),
+                precision: "file".into(),
+            },
+            grade: GradeAssignment::known(EvidenceGrade::Grounded),
+            task_id: task(),
+            fence: fence(),
+            temporal: None,
+            assurance: None,
+            reopen_reason: None,
+            proof_digest: FIXTURE_DIGEST.into(),
+        }
+    }
+
+    fn production_claim() -> MaterialClaim {
+        let proposition = required(PropositionId::new("proposition-ceiling"), "proposition");
+        let kind = ClaimKind::NumericQuantified;
+        let payload = precision();
+        let mut material_claim = MaterialClaim {
+            claim_id: "claim-ceiling".into(),
+            proposition: proposition.clone(),
+            proposition_digest: required(
+                eliot_dreamer_contracts::grounding::proposition_content_digest(&kind, &payload),
+                "proposition digest",
+            ),
+            kind,
+            payload,
+            subclaim_ids: BTreeSet::new(),
+            proposed_support: BTreeSet::from([artifact("evidence-1")]),
+            proposed_counterevidence: BTreeSet::new(),
+            component_digests: BTreeMap::from([(
+                "value".to_owned(),
+                required(
+                    eliot_dreamer_contracts::grounding::component_content_digest(
+                        &proposition,
+                        "value",
+                    ),
+                    "component digest",
+                ),
+            )]),
+            screen_target: None,
+            source_preimage_digest: String::new(),
+        };
+        material_claim.source_preimage_digest =
+            required(material_claim.computed_digest(), "claim preimage digest");
+        material_claim
+    }
+
+    fn production_manifest() -> AllowedReferenceManifest {
+        let proposition = required(PropositionId::new("proposition-ceiling"), "proposition");
+        let kind = ClaimKind::NumericQuantified;
+        let payload = precision();
+        let lineage = required(
+            SourceLineage::new(
+                required(SourceId::new("ceiling-source"), "source"),
+                required(SourceRevisionId::new("revision-ceiling"), "source revision"),
+                FIXTURE_DIGEST,
+                None,
+                BTreeSet::new(),
+                None,
+            ),
+            "source lineage",
+        );
+        let assertion = TypedEvidenceAssertion {
+            assertion_id: "assertion-ceiling".into(),
+            proposition: proposition.clone(),
+            proposition_digest: required(
+                eliot_dreamer_contracts::grounding::proposition_content_digest(&kind, &payload),
+                "assertion proposition digest",
+            ),
+            component: "value".into(),
+            precision: payload,
+            source_span_digest: FIXTURE_DIGEST.into(),
+            support: Some(Box::new(supported_support())),
+        };
+        let mut manifest = AllowedReferenceManifest {
+            schema_version: 2,
+            manifest_id: "manifest-ceiling".into(),
+            run_id: "run-ceiling".into(),
+            task_id: task(),
+            scope_id: "ceiling-scope".into(),
+            state_fence: fence(),
+            source_snapshot: "snapshot-ceiling".into(),
+            source_revision: "revision-ceiling".into(),
+            references: BTreeMap::from([(
+                artifact("evidence-1"),
+                AuthorizedReference {
+                    handle: artifact("evidence-1"),
+                    source_lineage: Some(lineage),
+                    support: None,
+                    provenance: None,
+                    content_digest: FIXTURE_DIGEST.into(),
+                    source_revision: "revision-ceiling".into(),
+                    authority_digest: FIXTURE_DIGEST.into(),
+                    authority: EvidenceAuthority::SourceIdentity,
+                    freshness: EvidenceFreshness::ExactCommit,
+                    source_assurance: None,
+                    grade_ceiling: EvidenceGrade::Grounded,
+                    assertability_ceiling: PositionAssertability::ObservedFact,
+                    privacy: PrivacyHandling::Unrestricted,
+                    disclosure: DisclosureClass::Open,
+                    origin: "fixture".into(),
+                    invalidated: false,
+                    revocation_reason: None,
+                    assertions: vec![assertion],
+                    stale: false,
+                },
+            )]),
+            coverage_denominators: BTreeMap::new(),
+            coverage_receipts: BTreeMap::new(),
+            dependence_groups: BTreeSet::new(),
+            digest: String::new(),
+        };
+        manifest.digest = required(manifest.computed_digest(), "manifest digest");
+        manifest
+    }
+
+    fn production_policy() -> GroundingPolicy {
+        let mut policy = GroundingPolicy {
+            schema_version: 2,
+            policy_id: "ceiling-policy".into(),
+            revision: "policy-revision".into(),
+            permitted_kinds: BTreeSet::from([ClaimKind::NumericQuantified]),
+            permitted_nonmaterial_classes: BTreeSet::from(["unresolved".into()]),
+            max_claims: 64,
+            max_subclaims_per_claim: 16,
+            max_support_handles_per_claim: 8,
+            max_output_bytes: 1_048_576,
+            digest: String::new(),
+        };
+        policy.digest = required(policy.computed_digest(), "policy digest");
+        policy
+    }
+
+    /// A record produced by this crate's own production evaluation path, resealed
+    /// exactly as `grounding::finalize_record` seals one before retention.
+    fn production_supported_record() -> eliot_dreamer_contracts::grounding::ClaimGroundingRecord {
+        let mut record = required(
+            evaluate_claim(
+                &production_claim(),
+                &production_manifest(),
+                &production_policy(),
+            ),
+            "production claim evaluation",
+        );
+        record.record_digest = required(record.computed_digest(), "record digest");
+        record
+    }
+
+    /// A `Supported` evaluated claim whose grade is known, with no extra caps.
+    fn supported_with_known_grade() -> EvaluatedClaim {
+        EvaluatedClaim {
+            disposition: SupportResult::Supported,
+            grade: Some(GradeAssignment::known(EvidenceGrade::Corroborated)),
+            ..EvaluatedClaim::default()
+        }
+    }
+
+    /// The single ceiling is exactly the weakest position grounding leaves on a
+    /// `Supported` record with a known grade.
+    ///
+    /// Measured on the current code: [`assertability`] derives `MaterialEffect`
+    /// for that disposition/grade pair (rank 6 under [`weaker`]), and the
+    /// mandatory producer cap in `evaluate_claim` then reduces it to
+    /// `HypothesisCandidate` (rank 2), which is [`CANDIDATE_ONLY_CEILING`]. The
+    /// cap is therefore load-bearing, not redundant, and the constant equals
+    /// the weakest assertability this record class can carry.
+    ///
+    /// The constant is a ceiling, not a floor: an upstream cap may still weaken
+    /// a record below it (`grounding.rs` caps a parent by its weakest child,
+    /// and a non-`Supported` child carries `UnknownWithheldQuarantined`). This
+    /// test pins the ceiling the cap guarantees, not a claim that no weaker
+    /// value is reachable.
+    #[test]
+    fn candidate_only_ceiling_is_the_weakest_supported_known_grade_position() {
+        let base = assertability(&supported_with_known_grade());
+        assert_eq!(
+            base,
+            PositionAssertability::MaterialEffect,
+            "measured: a Supported record with a known grade derives MaterialEffect"
+        );
+        assert_eq!(
+            weaker(base, CANDIDATE_ONLY_CEILING),
+            CANDIDATE_ONLY_CEILING,
+            "measured: the mandatory producer cap reduces MaterialEffect to the ceiling"
+        );
+    }
+
+    /// The same ceiling, measured on a record this crate's own production path
+    /// emits rather than on one hand-built here.
+    ///
+    /// The predecessor of this case built a `ClaimGroundingRecord` literal that
+    /// no production path produces, left `record_digest` unsealed, and then
+    /// asserted that capping it returns the constant it had just passed in. That
+    /// proved only that `cap_record_assertability` delegates to `weaker`, and it
+    /// could not fail on any producer regression. The sibling case above was not
+    /// a substitute: it calls [`assertability`] on a hand-built
+    /// [`EvaluatedClaim`], so it never reaches `evaluate_claim` either. This
+    /// case therefore builds its input through production [`evaluate_claim`] and
+    /// reseals the record digest the way `grounding::finalize_record` does.
+    ///
+    /// What it now pins, on the producer path:
+    ///
+    /// - a legitimately `Supported` claim carrying a known grade is emitted
+    ///   exactly at the candidate-only ceiling and never above it;
+    /// - the pre-cap derivation for this record is `ObservedFact` (rank 5 under
+    ///   [`weaker`]), not the `MaterialEffect` rank 6 that the case above
+    ///   measures: the `Supported` disposition with a known grade derives
+    ///   `MaterialEffect`, but `production_manifest` sets the reference's
+    ///   `assertability_ceiling` to `ObservedFact` and `collect_metadata` folds
+    ///   that reference ceiling into `caps`, so it outranks the base and the
+    ///   remaining caps (all `MaterialEffect`) on this fixture. Rank 5 sits
+    ///   strictly ABOVE the candidate-only ceiling's rank 2, so the mandatory cap
+    ///   is load-bearing on this record class rather than redundant with an
+    ///   upstream ceiling;
+    /// - the record-level cap that `grounding.rs` and `validation_bridge.rs` both
+    ///   call brings that above-ceiling record down to the same constant, and is
+    ///   idempotent on the already-capped production record;
+    /// - capping a position never rewrites provenance: `record_digest` is
+    ///   untouched across the call.
+    #[test]
+    fn candidate_only_ceiling_bounds_a_production_record_through_the_shared_cap() {
+        let production = production_supported_record();
+        assert_eq!(
+            production.disposition,
+            SupportResult::Supported,
+            "measured: production evaluate_claim emits this claim as Supported"
+        );
+        assert_eq!(
+            production.grade,
+            Some(GradeAssignment::known(EvidenceGrade::Grounded)),
+            "measured: production evaluate_claim emits a known grade for this claim"
+        );
+        assert_eq!(
+            production.assertability_ceiling, CANDIDATE_ONLY_CEILING,
+            "measured: production output lands exactly on the candidate-only ceiling"
+        );
+
+        let mut above = production.clone();
+        above.assertability_ceiling = PositionAssertability::MaterialEffect;
+        cap_record_assertability(&mut above, CANDIDATE_ONLY_CEILING);
+        assert_eq!(
+            above.assertability_ceiling, CANDIDATE_ONLY_CEILING,
+            "a record above the ceiling is capped down to it"
+        );
+
+        let mut idempotent = production.clone();
+        cap_record_assertability(&mut idempotent, CANDIDATE_ONLY_CEILING);
+        assert_eq!(
+            idempotent.assertability_ceiling, CANDIDATE_ONLY_CEILING,
+            "the ceiling is idempotent under the crate's own ordering"
+        );
+        assert_eq!(
+            idempotent.record_digest, production.record_digest,
+            "measured: capping a position never rewrites the sealed record digest"
+        );
+    }
+
+    /// The crate's one ordering, pinned on the full frozen ladder.
+    ///
+    /// This case pins the LADDER `weaker` implements, not the claim that `weaker`
+    /// is the crate's only ordering. It exercises `weaker` alone, so it cannot
+    /// observe a second rank table introduced elsewhere in the crate: no pair of
+    /// `PositionAssertability` variants discriminates between two tables that
+    /// agree variant for variant, which is exactly the shape the deleted
+    /// `grounding.rs::weaker_assertability` duplicate had. A duplicate table is
+    /// therefore caught by review of this declaration, not by this test; what
+    /// this test does catch is any reordering, re-adding, or removal inside this
+    /// one table.
+    ///
+    /// The two ranks most likely to drift are the interior ones the naive
+    /// "observation beats inference" reading gets wrong —
+    /// `ConflictQualificationRequired` (3) sits *below* both `QualifiedInference`
+    /// (4) and `ObservedFact` (5) — so the ladder is asserted on every adjacent
+    /// pair, which catches any single reordering, and the two extremes are
+    /// asserted explicitly because they are the endpoints any second table must
+    /// also agree on.
+    #[test]
+    fn weaker_pins_the_frozen_assertability_ladder() {
+        let ladder = [
+            PositionAssertability::UnknownWithheldQuarantined,
+            PositionAssertability::PlanningOnly,
+            PositionAssertability::HypothesisCandidate,
+            PositionAssertability::ConflictQualificationRequired,
+            PositionAssertability::QualifiedInference,
+            PositionAssertability::ObservedFact,
+            PositionAssertability::MaterialEffect,
+        ];
+        for pair in ladder.windows(2) {
+            let weaker_rank = pair[0];
+            let stronger_rank = pair[1];
+            assert_eq!(
+                weaker(weaker_rank, stronger_rank),
+                weaker_rank,
+                "measured: the ladder is total and strictly increasing, so this pair has one weaker side"
+            );
+            assert_eq!(
+                weaker(stronger_rank, weaker_rank),
+                weaker_rank,
+                "measured: the ladder is independent of argument order"
+            );
+        }
+        assert_eq!(
+            weaker(ladder[0], ladder[ladder.len() - 1]),
+            ladder[0],
+            "measured: the extremes are the endpoints of the same ordering"
+        );
+        assert_eq!(
+            weaker(ladder[ladder.len() - 1], ladder[0]),
+            ladder[0],
+            "measured: the extremes are the endpoints of the same ordering"
+        );
     }
 }
