@@ -2274,6 +2274,130 @@ mod tests {
     }
 
     #[test]
+    fn expiry_condition_guard_over_refuses_a_temporary_fixture_whose_removal_date_is_already_reached()
+     {
+        // Refusal arm three: the `expiry_date <= revision` branch, written at
+        // `expiry_condition_guard_over` in
+        // crates/eliot-app/src/disposition.rs:1619. This is the arm that
+        // refuses a dated row that outlived its own recorded deadline.
+        //
+        // The dates below are taken from `INVENTORY_REVISION` itself (parsed,
+        // never re-typed), so the test proves the comparison the guard claims
+        // and invents no expiry policy of its own.
+        let revision_digits = first_iso_date_digits(INVENTORY_REVISION)
+            .unwrap_or_else(|| panic!("INVENTORY_REVISION carries no YYYY-MM-DD token"));
+
+        // Exactly at the inventory revision: `<=` makes this a refusal, so a
+        // fixture whose deadline is the revision day has already outlived it.
+        let on_revision = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2026-09-25, when the retained legacy entry point is deleted",
+        );
+        assert_eq!(
+            first_iso_date_digits(on_revision.expiry),
+            Some(revision_digits),
+            "this refusal case must sit exactly on the inventory revision"
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&on_revision)),
+            Err(ExpiryRefusal::ExpiredFixture {
+                proof: REFUSAL_PROOF,
+                expired_on: revision_digits,
+            }),
+            "a fixture dated exactly at the inventory revision must be refused as \
+             ExpiredFixture: the comparison is <=, not <"
+        );
+
+        // One day before the revision, and one full year before it: both are
+        // already-reached deadlines and must be refused with their own date.
+        for (expiry, expected) in [
+            (
+                "remove by 2026-09-24, when the release bundle stops staging the binary",
+                [2u8, 0, 2, 6, 0, 9, 2, 4],
+            ),
+            (
+                "remove by 2025-09-25, when the plugin subtree is removed under #1719",
+                [2u8, 0, 2, 5, 0, 9, 2, 5],
+            ),
+        ] {
+            let expired = refused_fixture(Disposition::TemporaryFixture, expiry);
+            assert_eq!(
+                first_iso_date_digits(expired.expiry),
+                Some(expected),
+                "this refusal case must carry the date it claims"
+            );
+            assert_eq!(
+                expiry_condition_guard_over(std::slice::from_ref(&expired)),
+                Err(ExpiryRefusal::ExpiredFixture {
+                    proof: REFUSAL_PROOF,
+                    expired_on: expected,
+                }),
+                "a fixture whose deadline {expiry:?} is already reached must be refused as \
+                 ExpiredFixture"
+            );
+        }
+
+        // The comparison is digitwise on YYYYMMDD, so a smaller month in a
+        // later year is NOT already reached and must not be refused. This is
+        // what makes the refusals above refusals of THIS threshold.
+        let later_year_earlier_month = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2027-01-01, when the retained shim is deleted",
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&later_year_earlier_month)),
+            Ok(()),
+            "2027-01-01 is after the inventory revision {INVENTORY_REVISION} and must not \
+             be refused as expired"
+        );
+    }
+
+    #[test]
+    fn expiry_condition_guard_over_accepts_only_a_dated_fixture_strictly_after_the_revision() {
+        // The accept side of the same rule, so the refusals above are shown to be
+        // refusals of THIS threshold rather than of every fixture. One day after
+        // the inventory revision is the nearest date the guard accepts; the
+        // shipped fixture deadline, 2026-12-31, is accepted too.
+        let one_day_after = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2026-09-26, when the legacy route is deleted",
+        );
+        assert_eq!(
+            first_iso_date_digits(one_day_after.expiry),
+            Some([2, 0, 2, 6, 0, 9, 2, 6]),
+            "this case must sit one day after the inventory revision"
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&one_day_after)),
+            Ok(()),
+            "a fixture dated one day after the inventory revision must be accepted"
+        );
+
+        let shipped_deadline = refused_fixture(
+            Disposition::TemporaryFixture,
+            "remove by 2026-12-31, when the retained legacy entry points are deleted under #18",
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&shipped_deadline)),
+            Ok(()),
+            "the deadline the shipped inventory uses must be accepted by the same rule"
+        );
+
+        // The shipped inventory still passes the production entry gate, and it
+        // passes through the same rule that produced every refusal above.
+        assert_eq!(
+            expiry_condition_guard(),
+            Ok(()),
+            "the shipped inventory must still pass the entry-gate form of the rule"
+        );
+        assert_eq!(
+            expiry_condition_guard_over(current_consumer_inventory()),
+            Ok(()),
+            "the shipped inventory must still pass the typed form of the rule"
+        );
+    }
+
+    #[test]
     fn assert_inventory_entries_are_live_backs_every_row_with_its_own_baked_proof() {
         // Production guard under test, reached from
         // `run_facade_disposition_guards`.
