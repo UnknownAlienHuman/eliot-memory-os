@@ -561,6 +561,18 @@ pub fn dispatch_lifecycle_cancel(
 ///   [`observe_lifecycle_deadline`], and is applied through
 ///   [`eliot_protocol::ModuleLifecycle::apply`] only while that contract is
 ///   `Pending`.
+///
+/// A message with no request form and no control flow of its own — `Ready`,
+/// `Result`, `EventAck` and the native-worker messages — is refused by the same
+/// gate rather than interpreted as a generic command.
+///
+/// # Errors
+///
+/// Returns the typed protocol failure for invalid frames and for messages that
+/// are not lifecycle control flows, [`TransportError::UnknownRequest`] for an
+/// unregistered cancellation identity, and the owner's typed protocol failure
+/// for illegal phase moves, missing checkpoints, uncorrelated restarts and
+/// idempotency identity conflicts.
 pub fn dispatch_lifecycle_message(
     frame: &Frame,
     observed_unix_ms: u64,
@@ -3332,8 +3344,8 @@ mod windows_transport {
 mod tests {
     use super::*;
     use eliot_contracts::{
-        ClockReading, ContractError, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-        SourceId, StateFence,
+        ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
+        StateFence,
     };
     use eliot_protocol::{
         AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_ID, AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
@@ -4393,8 +4405,7 @@ mod tests {
 
         // A lifecycle Event goes through the durable envelope, never the
         // lifecycle control owner.
-        let mut event_frame = event_frame()?;
-        event_frame.message_type = MessageType::Event;
+        let event_frame = event_frame()?;
         assert!(matches!(
             dispatch_lifecycle_message(
                 &event_frame,
@@ -4417,9 +4428,7 @@ mod tests {
         ));
 
         // Fatal is the explicit terminal control flow.
-        let mut fatal = lifecycle_frame_with_deadline("cancel-2", 900, MessageType::Fatal)?;
-        fatal.request_id = None;
-        fatal.request_identity = None;
+        let fatal = lifecycle_frame_with_deadline("cancel-2", 900, MessageType::Fatal)?;
         assert_eq!(
             dispatch_lifecycle_message(
                 &fatal,
@@ -4472,18 +4481,13 @@ mod tests {
         Ok(frame)
     }
 
-    /// Projects a foundation contract error into the test's error type.
-    fn contract_error(error: ContractError) -> Box<dyn std::error::Error> {
-        Box::new(error)
-    }
-
     /// Builds a validated request-bearing lifecycle frame carrying a deadline
     /// and cancellation identity, without reading any clock.
     fn lifecycle_frame_with_deadline(
         cancellation_id: &str,
         deadline_unix_ms: u64,
         message_type: MessageType,
-    ) -> Result<Frame, TransportError> {
+    ) -> Result<Frame, Box<dyn std::error::Error>> {
         let request_id = RequestId::new("request-1")?;
         let state_fence = StateFence::new(test_epoch(1), ResourceGeneration::genesis());
         let identity = RequestIdentity {
@@ -4492,8 +4496,8 @@ mod tests {
                     request_id: request_id.clone(),
                     session_id: None,
                     task_id: None,
-                    product_id: ProductId::new("product-1").map_err(contract_error)?,
-                    source_id: SourceId::new("source-1").map_err(contract_error)?,
+                    product_id: ProductId::new("product-1")?,
+                    source_id: SourceId::new("source-1")?,
                     state_fence: state_fence.clone(),
                     clock: ClockReading::default(),
                 },
@@ -4503,24 +4507,26 @@ mod tests {
             deadline_unix_ms,
             cancellation_id: cancellation_id.to_owned(),
         };
+        // `Fatal` has no request form: its canonical frame kind is `Control`
+        // and it carries no request identity at all.
+        let control = message_type == MessageType::Fatal;
         let frame = Frame {
             protocol_version: ProtocolVersion::CURRENT,
             encoding_profile: EncodingProfile::JsonV1,
             connection_id: "connection-1".into(),
-            request_id: Some(request_id),
+            request_id: (!control).then(|| request_id.clone()),
             kind: match message_type {
                 MessageType::Cancel => FrameKind::Cancel,
                 MessageType::Health => FrameKind::Heartbeat,
+                MessageType::Fatal => FrameKind::Control,
                 _ => FrameKind::Request,
             },
             message_type,
-            request_identity: Some(identity),
+            request_identity: (!control).then_some(identity),
             payload: ProtocolPayload::Json(serde_json::json!({"command": "health"})),
             trace_context: BTreeMap::new(),
         };
-        frame
-            .validate()
-            .map_err(TransportError::Protocol)?;
+        frame.validate()?;
         Ok(frame)
     }
 
