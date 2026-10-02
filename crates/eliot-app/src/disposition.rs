@@ -1919,11 +1919,23 @@ fn command_variant_name(line: &'static str) -> Option<&'static str> {
 /// The facade must stay out of the default build; absence of the section
 /// also fails closed.
 pub fn default_members_guard() -> Result<(), String> {
+    default_members_section_refuses_facade(WORKSPACE_MANIFEST)
+}
+
+/// The default-members detector, over the text of a workspace manifest.
+///
+/// [`default_members_guard`] supplies the baked-in root `Cargo.toml`. This
+/// function is the whole decision: locate the `default-members` list and
+/// refuse when the facade appears in it, failing closed at each parse step.
+/// Taking the manifest as an argument lets a test drive every refusal arm
+/// with a fixture without changing which bytes the production guard reads
+/// (it still passes only [`WORKSPACE_MANIFEST`]).
+fn default_members_section_refuses_facade(manifest: &str) -> Result<(), String> {
     let marker = "default-members";
-    let start = WORKSPACE_MANIFEST
+    let start = manifest
         .find(marker)
         .ok_or_else(|| "root Cargo.toml has no default-members section".to_owned())?;
-    let rest = &WORKSPACE_MANIFEST[start + marker.len()..];
+    let rest = &manifest[start + marker.len()..];
     let open = rest
         .find('[')
         .ok_or_else(|| "root Cargo.toml default-members section is malformed".to_owned())?;
@@ -1952,4 +1964,25 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
     facade_surface_guard()?;
     crate::cell_declaration_registry::cell_declaration_guard()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod default_members_guard_tests {
+    use super::{WORKSPACE_MANIFEST, default_members_guard, default_members_section_refuses_facade};
+
+    /// Positive: the real baked-in root `Cargo.toml` satisfies the guard, and
+    /// the real guard returns `Ok` on the current repository state.
+    #[test]
+    fn real_root_manifest_keeps_the_facade_out_of_default_members() {
+        // The real guard, over the real baked manifest.
+        assert_eq!(default_members_guard(), Ok(()));
+        // Same decision through the parameterised detector, over the same
+        // bytes, so the positive arm is proven on the live data and not only
+        // on a fixture.
+        assert_eq!(default_members_section_refuses_facade(WORKSPACE_MANIFEST), Ok(()));
+        // The baked manifest really does carry a default-members list; the
+        // positive is a real parse, not a fail-closed "no section" fallthrough.
+        assert!(WORKSPACE_MANIFEST.contains("default-members"));
+        assert!(WORKSPACE_MANIFEST.contains("default-members = ["));
+    }
 }
