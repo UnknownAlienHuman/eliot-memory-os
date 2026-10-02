@@ -85,17 +85,22 @@ pub use doctor::*;
 pub use effect_operation_lease::{
     ActiveEffectOperationLease, EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectAuthorizationView,
     EffectDispatchAuthority, EffectOperationLease, EffectOperationLeaseAdmission,
-    EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics, authorize_effect_replay,
+    EffectOperationLeaseGenerationDisposition, EffectOperationLeaseReplayQuery,
+    EffectReplayDecision, EffectReplayRequest, ShadowEffectDiagnostics,
+    authorize_effect_operation_lease_replay, authorize_effect_replay,
     deny_effect_replay_without_manifest, deny_unleased_effect_replay,
 };
 pub use execution_manifest::{
     AdmittedModuleGeneration, BoundKernelExecutionManifest, CatalogPolicyView,
-    EffectDeliveryAcknowledgement, KERNEL_EXECUTION_MANIFEST_SCHEMA_VERSION,
-    KernelExecutionManifest, KernelExecutionProjection, KernelExecutionRestartRequest,
-    KernelLaunchBinding, KernelReconciliationItem, KernelReconciliationKind, KernelRestartDecision,
-    KernelRestartEvidence, KernelServiceAdmission, ManifestDependencyEntry, ManifestEffectCeiling,
+    EffectDeliveryAcknowledgement, GOVERNOR_GENERATION_ADMISSION_SEAL_VERSION,
+    GovernorGenerationAdmissionSeal, GovernorGenerationAdmissionSealParts,
+    KERNEL_EXECUTION_MANIFEST_SCHEMA_VERSION, KernelExactEffectReplayDecision,
+    KernelExactEffectReplayRequest, KernelExecutionManifest, KernelExecutionProjection,
+    KernelExecutionRestartRequest, KernelLaunchBinding, KernelReconciliationItem,
+    KernelReconciliationKind, KernelRestartDecision, KernelRestartEvidence, KernelServiceAdmission,
+    LifecycleAdmissionDisposition, ManifestDependencyEntry, ManifestEffectCeiling,
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
-    RevocationAcknowledgement, verify_kernel_execution_restart,
+    RevocationAcknowledgement, verify_exact_effect_replay, verify_kernel_execution_restart,
 };
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,

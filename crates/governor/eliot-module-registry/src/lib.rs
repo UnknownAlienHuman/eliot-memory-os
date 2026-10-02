@@ -21,7 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{
-    ContractVersion, OperationId, RequestMetadata, StateFence, canonical_json_bytes, sha256_hex,
+    ContractVersion, OperationId, RequestMetadata, ResourceGeneration, StateFence,
+    canonical_json_bytes, sha256_hex,
 };
 use eliot_runtime_contracts::{
     RestartDependencyKind, RestartGroupStrategy, RestartInvalidationTrigger,
@@ -907,6 +908,165 @@ impl GenerationAdmission {
             return Err(ModuleError::IdentityConflict);
         }
         Ok(())
+    }
+}
+
+/// Seals one verified [`GenerationAdmission`] into the single canonical sealed
+/// projection a Kernel Generation Registry copy is made from:
+/// [`eliot_ors::GovernorGenerationAdmissionSeal`].
+///
+/// This is the only adapter from this owner contract to that projection, so
+/// there is exactly one spelling of the field-by-field mapping and one seal
+/// version it is recorded under. The projection itself is owned by the Kernel
+/// side; nothing here restates or redeclares it.
+///
+/// The change must be the accepted-generation change itself, the row must be the
+/// row that accepted it at the expected revision and State Fence, and the
+/// operation identity, module, catalog revision, policy revision, accepted
+/// manifest digest, State Fence snapshot and lifecycle disposition are copied
+/// from those owner values. A mismatch is refused rather than resolved: a stale
+/// revision, a different fence, a row that does not carry this exact admission,
+/// a module or generation that differs from the row, a withheld restart policy,
+/// or an admitting fence with no policy revision all name the gap instead of
+/// producing a seal with a substituted field.
+pub fn seal_generation_admission(
+    change: &ModuleCatalogChange,
+    entry: &ModuleCatalogEntry,
+    expected_catalog_revision: u64,
+    expected_state_fence: &StateFence,
+) -> Result<eliot_ors::GovernorGenerationAdmissionSeal, ModuleError> {
+    change.validate()?;
+    entry.validate()?;
+    let CatalogMutation::AcceptGeneration { admission } = &change.mutation else {
+        return Err(ModuleError::InvalidField {
+            field: "mutation",
+            reason: "a seal is issued only for an accepted-generation change",
+        });
+    };
+    admission.validate()?;
+    if entry.module_id != change.module_id {
+        return Err(ModuleError::IdentityConflict);
+    }
+    // The seal is issued for the revision this admission was accepted at. A
+    // catalog that has since moved on has no current admission to seal, so a
+    // later revision is refused rather than sealed under a revision the
+    // admission never named.
+    if expected_catalog_revision == 0 || expected_catalog_revision != admission.catalog_revision {
+        return Err(ModuleError::RevisionConflict);
+    }
+    expected_state_fence
+        .validate()
+        .map_err(|error| ModuleError::Contract(error.to_string()))?;
+    if admission.state_fence != *expected_state_fence || entry.state_fence != *expected_state_fence
+    {
+        return Err(ModuleError::FenceMismatch);
+    }
+    // The owner row must carry this exact admission, so a replaced or unrelated
+    // candidate cannot be sealed under a receipt that names another one.
+    if entry.accepted_generation.as_ref() != Some(admission) {
+        return Err(ModuleError::AdmissionReceiptUnverified);
+    }
+    if admission.candidate.module_id != entry.module_id
+        || admission.execution.module_id != entry.module_id
+        || admission.execution.generation_id != admission.candidate.candidate_id
+    {
+        return Err(ModuleError::IdentityConflict);
+    }
+    // The policy revision is the fence's own value. A fence that carries none
+    // has no policy revision to seal, and one is never derived from the restart
+    // policy digest or from any other field.
+    let Some(policy_revision) = admission.state_fence.policy_revision else {
+        return Err(ModuleError::InvalidField {
+            field: "seal.policy_revision",
+            reason: "the admitting state fence carries no policy revision",
+        });
+    };
+    // Only an admitted restart policy can be sealed, and it must be the exact
+    // digest the accepted execution projection is already bound to. A withheld
+    // disposition admits no policy to bind, so it is refused here rather than
+    // sealed as an automatic restart authority.
+    let Some(admitted_policy_digest) = entry.restart_policy_disposition.policy_digest() else {
+        return Err(ModuleError::InvalidField {
+            field: "seal.lifecycle_admission",
+            reason: "the catalog withheld this generation's restart policy",
+        });
+    };
+    if admitted_policy_digest != admission.execution.restart_policy_digest {
+        return Err(ModuleError::IdentityConflict);
+    }
+    let operation_id = eliot_ors::OperationIdentity::new(change.operation_id.as_str())
+        .map_err(sealed_projection_refusal)?;
+    // The sealed projection records the admitting fence as a canonical snapshot
+    // of that exact fence value, observed under the fence's own epoch sequence.
+    // The snapshot is a capture of the recorded fence, not a re-statement of it.
+    let state_fence = eliot_ors::StateFenceSnapshot::capture(
+        &admission.state_fence,
+        admission.state_fence.authority_epoch.sequence.get(),
+    )
+    .map_err(sealed_projection_refusal)?;
+    let generation = sealed_generation_counter(&admission.execution.generation_id)?;
+    let mut parts = eliot_ors::GovernorGenerationAdmissionSealParts {
+        operation_id,
+        idempotency_key: change.idempotency_key.clone(),
+        module_id: admission.execution.module_id.as_str().to_owned(),
+        generation,
+        catalog_revision: admission.catalog_revision,
+        policy_revision: policy_revision.value(),
+        accepted_manifest_sha256: admission.execution.manifest_digest.clone(),
+        state_fence,
+        lifecycle_disposition: eliot_ors::LifecycleAdmissionDisposition::Admitted,
+        // The canonical owner digest is computed over the other fields by the
+        // sealed projection's own digest function, which recomputes it on every
+        // validation; it is never a digest this owner invents.
+        owner_canonical_sha256: String::new(),
+    };
+    parts.owner_canonical_sha256 =
+        eliot_ors::GovernorGenerationAdmissionSeal::canonical_sha256(&parts)
+            .map_err(sealed_projection_refusal)?;
+    eliot_ors::GovernorGenerationAdmissionSeal::seal(parts).map_err(sealed_projection_refusal)
+}
+
+/// The generation counter the sealed projection records for this admission.
+///
+/// This catalog states the admitted generation as owner text ([`GenerationId`])
+/// while the sealed projection states it as the numeric generation counter of the
+/// Generation Registry. No field of the candidate, of the accepted execution
+/// projection, of the accepting change or of the admitting State Fence relates
+/// the two: the fence's own `resource_generation` is a different counter that no
+/// join binds to this generation. The bridge is therefore refused here rather
+/// than parsing one vocabulary into the other or substituting the fence's
+/// counter, because either would manufacture a generation binding the Governor
+/// never issued.
+///
+/// The refusal is raised before any sealed projection is constructed, so a
+/// caller cannot reach the Kernel side with an unbound generation.
+fn sealed_generation_counter(
+    _admitted_generation: &GenerationId,
+) -> Result<ResourceGeneration, ModuleError> {
+    Err(ModuleError::InvalidField {
+        field: "seal.generation",
+        reason: "the admitted generation identity has no owner-declared numeric counter",
+    })
+}
+
+/// Maps one sealed-projection refusal onto this owner's typed refusal.
+///
+/// The arms preserve the refusal each foreign variant states: a fence that does
+/// not match stays a fence mismatch, a malformed sealed field stays an invalid
+/// field, and a recorded field set whose canonical owner digest does not bind it
+/// stays an identity conflict, which is the refusal this crate already records
+/// when one of its own digests does not bind its recorded fields. Any other
+/// foreign refusal is recorded as the contract failure it is, with the foreign
+/// cause retained rather than dropped.
+fn sealed_projection_refusal(error: eliot_ors::OrsError) -> ModuleError {
+    match error {
+        eliot_ors::OrsError::FenceMismatch => ModuleError::FenceMismatch,
+        eliot_ors::OrsError::InvalidField { .. } => ModuleError::InvalidField {
+            field: "seal",
+            reason: "the sealed admission projection refused one of its own typed fields",
+        },
+        eliot_ors::OrsError::IntegrityProblem { .. } => ModuleError::IdentityConflict,
+        other => ModuleError::Contract(other.to_string()),
     }
 }
 

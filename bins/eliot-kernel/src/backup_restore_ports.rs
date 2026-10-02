@@ -2344,6 +2344,17 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
                 subject: "restore journal supervision lease".to_owned(),
             }
         }
+        // Issue #1884: ORS refused to issue an effect operation lease for the
+        // affected generation, or the issuance input's manifest binding
+        // disagreed with the bound manifest. A restore must not present either
+        // as an available lease.
+        OrsError::EffectOperationLeaseGenerationDegraded { .. }
+        | OrsError::EffectOperationLeaseGenerationUnrecorded { .. }
+        | OrsError::EffectOperationLeaseManifestBindingMismatch { .. } => {
+            BackupError::FenceMismatch {
+                subject: "restore journal effect operation lease".to_owned(),
+            }
+        }
         OrsError::SupervisionLeaseBindingMismatch
         | OrsError::SupervisionLeaseTicketNotStaged
         | OrsError::SupervisionLeaseTicketResolved

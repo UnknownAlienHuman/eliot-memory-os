@@ -80,6 +80,110 @@ fn daemon_recovery_terminal_code(error: &KernelBuildError) -> &'static str {
     }
 }
 
+/// The manifest-bound outcome of one automatic `eliotd` restart attempt
+/// (issue #1884; I1.9).
+///
+/// `Admitted` carries the sealed
+/// [`eliot_ors::BoundKernelExecutionManifest`] the ORS verifier issued for this
+/// exact module and generation, so the artifact/config identity and the bounded
+/// restart budget this attempt is decided under are read out of the immutable
+/// manifest rather than out of contemporaneous configuration. It is the only
+/// value a launch may take its recorded identity from: the type has no public
+/// constructor, so this file cannot assemble one. `Refused` carries the daemon's
+/// own typed restart refusal, mapped from the ORS reconciliation cause so that
+/// cause survives the layer boundary instead of being flattened into one
+/// refusal.
+#[cfg(windows)]
+enum DaemonRestartManifestAdmission {
+    /// The verifier admitted a restart under the sealed immutable manifest.
+    ///
+    /// Boxed because the sealed binding is far larger than the refusal beside it,
+    /// and this enum crosses the restart path by value.
+    Admitted(Box<eliot_ors::BoundKernelExecutionManifest>),
+    /// A typed refusal withholds the replacement.
+    Refused(DaemonRestartRefusal),
+}
+
+/// Projects one recorded ORS restart cause onto the daemon's own typed restart
+/// refusal.
+///
+/// The recorded budget exhaustion keeps the existing
+/// [`DaemonRestartRefusal::RestartBudgetExhausted`], which is exactly what it
+/// is. Every other manifest-side cause keeps its own bounded reason code, so an
+/// absent, receipt-less, stale, incompatible, revoked or identity-mismatched
+/// manifest is never reported as a spent budget, and a refusal that IS a spent
+/// budget is never reported as one of those. The codes are a fixed vocabulary
+/// derived only from the ORS cause, so no recorded payload can reach an
+/// observation.
+///
+/// The effect-lease family of causes belongs to the effect-replay verifier and
+/// cannot be produced by the restart verifier, so those variants share one
+/// bounded code rather than each claiming a restart-specific meaning.
+#[cfg(windows)]
+const fn daemon_restart_refusal_for_manifest_cause(
+    kind: eliot_ors::KernelReconciliationKind,
+) -> DaemonRestartRefusal {
+    use eliot_ors::KernelReconciliationKind as Cause;
+    match kind {
+        Cause::ManifestRestartBudgetExhausted => DaemonRestartRefusal::RestartBudgetExhausted,
+        Cause::ManifestAbsent => DaemonRestartRefusal::ClassWithholds("restart_manifest_absent"),
+        Cause::ManifestIdentityMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_identity_mismatch")
+        }
+        Cause::ManifestCandidateBindingMismatch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_candidate_binding_mismatch")
+        }
+        Cause::ManifestIncompatible => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_incompatible")
+        }
+        Cause::ManifestRevoked => DaemonRestartRefusal::ClassWithholds("restart_manifest_revoked"),
+        Cause::ManifestReceiptless => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_receiptless")
+        }
+        Cause::ManifestForeignEpoch => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_foreign_epoch")
+        }
+        Cause::ManifestInvalid => DaemonRestartRefusal::ClassWithholds("restart_manifest_invalid"),
+        Cause::ManifestCatalogPolicyStale => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_catalog_policy_stale")
+        }
+        Cause::ManifestRevocationUnacknowledged => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_revocation_unacknowledged")
+        }
+        Cause::ManifestDeliveryGapOpen => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_delivery_gap_open")
+        }
+        Cause::ManifestNotEffectCapable => {
+            DaemonRestartRefusal::ClassWithholds("restart_manifest_not_effect_capable")
+        }
+        // A sealed Governor admission defect is the manifest's own structural
+        // refusal, so it keeps its own code rather than being reported as the
+        // undifferentiated "not admitted" reading.
+        Cause::GovernorAdmissionSealAbsent => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_absent")
+        }
+        Cause::GovernorAdmissionSealWithheld => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_withheld")
+        }
+        Cause::GovernorAdmissionSealMalformed => {
+            DaemonRestartRefusal::ClassWithholds("restart_governor_admission_seal_malformed")
+        }
+        Cause::GovernorAdmissionSealIdentityMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_identity_mismatch",
+        ),
+        Cause::GovernorAdmissionSealRevisionMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_revision_mismatch",
+        ),
+        Cause::GovernorAdmissionSealStateFenceAbsent => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_state_fence_absent",
+        ),
+        Cause::GovernorAdmissionSealOwnerDigestMismatch => DaemonRestartRefusal::ClassWithholds(
+            "restart_governor_admission_seal_owner_digest_mismatch",
+        ),
+        _ => DaemonRestartRefusal::ClassWithholds("restart_manifest_not_admitted"),
+    }
+}
+
 #[cfg(windows)]
 fn record_daemon_recovery_operation_context(
     context: &tracing::Span,
@@ -583,8 +687,9 @@ impl KernelComposition {
     }
 
     /// Decides one automatic restart attempt against the owner's DURABLE
-    /// restart record and returns the refusal that withholds it, or `None`
-    /// when the attempt is admitted.
+    /// restart record and the immutable execution manifest bound to the
+    /// admitted generation, and returns either the sealed manifest-bound
+    /// authority the replacement may run under or the refusal that withholds it.
     ///
     /// `attempt` is the Kernel's restart ordinal for this process lifetime and
     /// is NOT the budget: it names the replacement generation and is compared
@@ -594,8 +699,7 @@ impl KernelComposition {
     /// supervised child's stable identity (`ACTIVE_DAEMON_CALLER`) and to the
     /// admitted generation being replaced.
     ///
-    /// Two refusals can arise here, and both are absences rather than
-    /// defaults:
+    /// The refusals that can arise here are absences rather than defaults:
     ///
     /// * no admitted restart policy means this child has no declared restart
     ///   budget at all, so its replacement is refused as
@@ -604,25 +708,33 @@ impl KernelComposition {
     ///   must never destroy a child it cannot replace.
     /// * a durable record that already exists under this child's identity and
     ///   admitted generation means the restart disposition for this lineage was
-    ///   already decided durably, so the attempt is refused as
-    ///   `DaemonRestartRefusal::RestartBudgetExhausted` and no fresh window is
-    ///   opened. That record is what a recreated supervisor reads back.
+    ///   already decided durably, so the attempt is refused and no fresh window
+    ///   is opened. That record is what a recreated supervisor reads back, and
+    ///   it is read back as the decision it is: the recorded cause is projected
+    ///   through [`daemon_restart_refusal_for_manifest_cause`], so a recorded
+    ///   manifest defect keeps its own reason instead of being reported as a
+    ///   spent budget. This boundary never rewrites a row it did not read as
+    ///   absent: an existing durable disposition is never treated as permission
+    ///   and never replaced by a locally recomputed one.
     ///
-    /// The third outcome is an unreadable or invalid durable record, which is
-    /// returned as a mechanical failure: an unreadable record is never read as
-    /// an absent one and never as permission.
+    /// The remaining outcomes are an unreadable or invalid durable record and
+    /// an unreadable manifest row, both of which are returned as mechanical
+    /// failures: an unreadable record is never read as an absent one and never
+    /// as permission.
     #[cfg(windows)]
     fn admit_daemon_restart_attempt(
         &self,
         launch: &EliotdLaunchDescriptor,
         attempt: u64,
         previous_receipt: Option<&ProcessStartReceipt>,
-    ) -> Result<Option<DaemonRestartRefusal>, KernelBuildError> {
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
         let admitted_generation = launch.generation;
         let admitted_state_fence =
             eliot_contracts::StateFence::new(launch.authority_epoch.clone(), admitted_generation);
         let Some(admitted) = self.daemon_restart_policy.as_ref() else {
-            return Ok(Some(DaemonRestartRefusal::PolicyNotAdmitted));
+            return Ok(DaemonRestartManifestAdmission::Refused(
+                DaemonRestartRefusal::PolicyNotAdmitted,
+            ));
         };
         // The threshold is read only while the retained binding still proves
         // the exact admitted generation and fence the caller observed. A
@@ -632,7 +744,7 @@ impl KernelComposition {
         let Ok(declared_threshold) =
             admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence)
         else {
-            return Ok(Some(
+            return Ok(DaemonRestartManifestAdmission::Refused(
                 DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
             ));
         };
@@ -644,17 +756,42 @@ impl KernelComposition {
                     "eliotd durable restart record is unreadable: {error}"
                 ))
             })?;
-        // ANY durable row under this child's identity and generation means the
-        // restart disposition for this lineage was already decided and
-        // committed. It is therefore read back as the decision it is, and this
-        // boundary never rewrites a row it did not read as absent: an existing
-        // durable disposition is never treated as permission and never
-        // replaced by a locally recomputed one.
-        if recorded.is_some() {
-            return Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted));
+        // A durable row under this child's identity and generation is the
+        // decision it was committed as, read back unchanged and never replaced
+        // by a locally recomputed one. Its recorded CAUSE is projected through
+        // the shared mapping, so a recorded manifest defect keeps its own
+        // reason instead of every cause collapsing into one budget refusal.
+        if let Some(recorded) = recorded {
+            return Ok(DaemonRestartManifestAdmission::Refused(
+                daemon_restart_refusal_for_manifest_cause(recorded.kind),
+            ));
         }
+        // Issue #1884 (I1.9): the restart disposition is decided against the
+        // immutable `KernelExecutionManifest` recorded for this exact module
+        // and generation, and never against contemporaneous configuration.
+        // `load_and_verify_kernel_execution_restart` loads that manifest by the
+        // request's own identity, re-verifies its recorded bound digest on
+        // readback, and then runs the pure verifier over the exact candidate,
+        // Authority Epoch, I1.12 evidence, recorded restart budget and recorded
+        // launch binding. A missing, receipt-less, stale, incompatible, revoked
+        // or identity-mismatched manifest therefore refuses the restart instead
+        // of admitting it, and the ORS owner persists that refusal's
+        // reconciliation item before returning, so the affected generation stays
+        // visibly degraded.
+        //
+        // `restarts_spent` is the durably recorded spend, which is exactly zero
+        // on this arm: the durable record above is the spend record and it was
+        // read back as absent. The process-local `attempt` ordinal is NOT spent
+        // and is never substituted for it; the recorded budget ceiling is read
+        // from the immutable manifest inside the verifier.
+        let bound = match self.admit_daemon_restart_under_manifest(launch, 0)? {
+            DaemonRestartManifestAdmission::Admitted(bound) => bound,
+            DaemonRestartManifestAdmission::Refused(refusal) => {
+                return Ok(DaemonRestartManifestAdmission::Refused(refusal));
+            }
+        };
         if attempt < u64::from(declared_threshold) {
-            return Ok(None);
+            return Ok(DaemonRestartManifestAdmission::Admitted(bound));
         }
         let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
         store
@@ -662,8 +799,8 @@ impl KernelComposition {
                 kind: eliot_ors::KernelReconciliationKind::ManifestRestartBudgetExhausted,
                 module_id: ACTIVE_DAEMON_CALLER.to_owned(),
                 generation: admitted_generation,
-                bound_manifest_sha256: None,
-                recorded_manifest_sha256: None,
+                bound_manifest_sha256: Some(bound.manifest_sha256().to_owned()),
+                recorded_manifest_sha256: Some(bound.manifest_sha256().to_owned()),
                 lease_id: None,
                 operation_id: None,
                 observed_at_ms,
@@ -682,7 +819,231 @@ impl KernelComposition {
             "eliotd bounded restart budget is spent for this child identity",
             self.current_state_fence().as_ref(),
         ));
-        Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted))
+        Ok(DaemonRestartManifestAdmission::Refused(
+            DaemonRestartRefusal::RestartBudgetExhausted,
+        ))
+    }
+
+    /// Reads the immutable execution manifest recorded for this exact module and
+    /// generation and asks its owner in ORS to verify this restart against it
+    /// (issue #1884; I1.9, W1.5).
+    ///
+    /// `restarts_spent` is the durably recorded restart spend this attempt is
+    /// decided under; the recorded budget CEILING is never supplied here, it is
+    /// read from the immutable manifest by the verifier itself.
+    ///
+    /// Every other request field is stated from a durable record or from an
+    /// explicit fail-closed reading, and nothing here rebuilds, defaults or
+    /// reconstructs a manifest:
+    ///
+    /// * the module identity is this supervised child's stable identity, the
+    ///   same identity an admitted restart policy's `subject_id` must name, and
+    ///   the generation is the admitted generation being replaced;
+    /// * the bound manifest digest and the candidate launch binding are the ones
+    ///   the immutable manifest records for exactly this module and generation,
+    ///   read back from the Generation Registry row. Naming the recorded
+    ///   candidate here does not make the recorded hashes self-confirming: the
+    ///   descriptor this owner would actually launch from is an INDEPENDENT
+    ///   record, and `recover_eliotd_inner` refuses the replacement unless its
+    ///   artifact and config digests equal this binding's. A substituted
+    ///   descriptor is therefore refused after this call, not before it;
+    /// * `current_authority_epoch` is this child's own retained launch epoch read
+    ///   as the Kernel authority epoch counter, exactly as this owner's process
+    ///   execution gate reads it for an exact effect replay
+    ///   (`require_effect_replay_authority`);
+    /// * `current_catalog_revision` and `current_policy_revision` are the
+    ///   recorded admission's accepted revisions, and `catalog_view` is
+    ///   [`eliot_ors::CatalogPolicyView::Unavailable`] because this owner holds
+    ///   no Module Catalog/Policy view at all. An unavailable view is the
+    ///   fail-closed reading, so an effect-capable manifest is capped at shadow
+    ///   diagnostics and is refused below rather than opened as normal-effect
+    ///   service;
+    /// * `revocation` is
+    ///   [`eliot_ors::RevocationAcknowledgement::Unacknowledged`] and `delivery`
+    ///   is [`eliot_ors::EffectDeliveryAcknowledgement::GapOpen`] because this
+    ///   owner has no revocation-event or delivery-state readback. Those are the
+    ///   same non-fabricated readings ORS itself states for its exact-effect
+    ///   replay gate (`authorize_effect_replay_for_operation`): an unobservable
+    ///   clearance is not a clearance;
+    /// * `compatibility` is the I1.12 verdict recorded for this exact module and
+    ///   generation, read back from the durable versioned-artifact registry. A
+    ///   generation with no recorded verdict is refused and never given a
+    ///   synthesised one.
+    #[cfg(windows)]
+    fn admit_daemon_restart_under_manifest(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        restarts_spent: u32,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        let store = self.generation_gateway.ors.as_ref();
+        let observed_at_ms = i64::try_from(super::unix_ms()).unwrap_or(i64::MAX);
+        let generation = launch.generation;
+        let manifest = store
+            .load_kernel_execution_manifest(ACTIVE_DAEMON_CALLER, generation.value())
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd immutable execution manifest is unreadable: {error}"
+                ))
+            })?;
+        // A generation with no recorded manifest can name no bound manifest
+        // digest, so no request can be stated for it at all. The absence is
+        // recorded durably under ORS's own typed kind and refused, so the
+        // affected generation stays visibly degraded instead of restarting.
+        let Some(manifest) = manifest else {
+            return self.refuse_daemon_restart_under_manifest(
+                eliot_ors::KernelReconciliationKind::ManifestAbsent,
+                generation,
+                None,
+                None,
+                observed_at_ms,
+            );
+        };
+        // A receipt-less manifest records no accepted Catalog/Policy revision,
+        // so this owner can state no current one and cannot construct the request
+        // at all. It is refused under ORS's own receipt-less kind rather than
+        // being given a synthesised revision.
+        if !manifest.has_governor_admission() {
+            return self.refuse_daemon_restart_under_manifest(
+                eliot_ors::KernelReconciliationKind::ManifestReceiptless,
+                generation,
+                None,
+                Some(manifest.manifest_sha256.as_str()),
+                observed_at_ms,
+            );
+        }
+        let compatibility = store
+            .load_versioned_artifact_registry(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd recorded I1.12 verdicts are unreadable: {error}"
+                ))
+            })?
+            .compatibility(ACTIVE_DAEMON_CALLER, generation.value())
+            .cloned();
+        let Some(compatibility) = compatibility else {
+            // No recorded I1.12 verdict means this owner can state no
+            // compatibility evidence, so no request can be built for this
+            // generation. It is refused under ORS's own incompatible kind, which
+            // is the cause its verifier produces for a candidate that fails
+            // I1.12 evidence, and the refusal is recorded durably so the
+            // affected generation stays visibly degraded instead of restarting.
+            return self.refuse_daemon_restart_under_manifest(
+                eliot_ors::KernelReconciliationKind::ManifestIncompatible,
+                generation,
+                None,
+                Some(manifest.manifest_sha256.as_str()),
+                observed_at_ms,
+            );
+        };
+        let current_authority_epoch = eliot_contracts::AuthorityEpoch::new(
+            launch.authority_epoch.sequence.get(),
+        )
+        .map_err(|error| {
+            KernelBuildError::Service(format!(
+                "eliotd retained epoch is not a Kernel authority epoch: {error}"
+            ))
+        })?;
+        let request = eliot_ors::KernelExecutionRestartRequest {
+            module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+            generation,
+            bound_manifest_sha256: manifest.manifest_sha256.clone(),
+            candidate: manifest.launch_binding(),
+            current_authority_epoch,
+            current_catalog_revision: manifest.admission.catalog_revision,
+            current_policy_revision: manifest.admission.policy_revision,
+            catalog_view: eliot_ors::CatalogPolicyView::Unavailable,
+            revocation: eliot_ors::RevocationAcknowledgement::Unacknowledged,
+            delivery: eliot_ors::EffectDeliveryAcknowledgement::GapOpen,
+            compatibility,
+            restarts_spent,
+            observed_at_ms,
+        };
+        let decision = store
+            .load_and_verify_kernel_execution_restart(&request)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd manifest-bound restart verification failed: {error}"
+                ))
+            })?;
+        match &decision.admission {
+            // Only a normal-service admission carries restart authority, and it
+            // carries the sealed manifest the replacement must be bound to.
+            eliot_ors::KernelServiceAdmission::ReadRebuildService(bound)
+            | eliot_ors::KernelServiceAdmission::EffectService(bound) => Ok(
+                DaemonRestartManifestAdmission::Admitted(Box::new(bound.clone())),
+            ),
+            // `None` starts nothing, and shadow diagnostics carry no external
+            // effect and no canonical write admission, so neither is a normal
+            // restart. Both are refused with the decision's own recorded cause,
+            // which the ORS owner has already persisted.
+            eliot_ors::KernelServiceAdmission::ShadowDiagnosticsOnly(_)
+            | eliot_ors::KernelServiceAdmission::None => {
+                Ok(DaemonRestartManifestAdmission::Refused(
+                    Self::daemon_manifest_restart_cause(&decision),
+                ))
+            }
+        }
+    }
+
+    /// The typed refusal one refused manifest-bound decision carries.
+    ///
+    /// The decision's own first durable reconciliation item is the cause, so the
+    /// ORS refusal survives the layer boundary instead of being reported as an
+    /// unrelated budget or class verdict. The admission-derived codes below are
+    /// only reached if a decision ever refused without recording a cause.
+    #[cfg(windows)]
+    fn daemon_manifest_restart_cause(
+        decision: &eliot_ors::KernelRestartDecision,
+    ) -> DaemonRestartRefusal {
+        if let Some(item) = decision.reconciliation.first() {
+            return daemon_restart_refusal_for_manifest_cause(item.kind);
+        }
+        match decision.admission {
+            eliot_ors::KernelServiceAdmission::ShadowDiagnosticsOnly(_) => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_shadow_diagnostics_only")
+            }
+            eliot_ors::KernelServiceAdmission::None => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_declined")
+            }
+            eliot_ors::KernelServiceAdmission::ReadRebuildService(_)
+            | eliot_ors::KernelServiceAdmission::EffectService(_) => {
+                DaemonRestartRefusal::ClassWithholds("restart_manifest_cause_unrecorded")
+            }
+        }
+    }
+
+    /// Records one manifest-bound restart refusal durably and returns it as this
+    /// file's typed refusal carrying the ORS kind's own bounded reason code.
+    #[cfg(windows)]
+    fn refuse_daemon_restart_under_manifest(
+        &self,
+        kind: eliot_ors::KernelReconciliationKind,
+        generation: eliot_contracts::ResourceGeneration,
+        bound_manifest_sha256: Option<&str>,
+        recorded_manifest_sha256: Option<&str>,
+        observed_at_ms: i64,
+    ) -> Result<DaemonRestartManifestAdmission, KernelBuildError> {
+        self.generation_gateway
+            .ors
+            .as_ref()
+            .persist_kernel_restart_reconciliation(&eliot_ors::KernelReconciliationItem {
+                kind,
+                module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+                generation,
+                bound_manifest_sha256: bound_manifest_sha256.map(str::to_owned),
+                recorded_manifest_sha256: recorded_manifest_sha256.map(str::to_owned),
+                lease_id: None,
+                operation_id: None,
+                observed_at_ms,
+            })
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd manifest-bound restart refusal could not be persisted: {error}"
+                ))
+            })?;
+        Ok(DaemonRestartManifestAdmission::Refused(
+            daemon_restart_refusal_for_manifest_cause(kind),
+        ))
     }
 
     /// Performs one Kernel-owned bounded recovery of a failed daemon
@@ -828,21 +1189,32 @@ impl KernelComposition {
         // refusal is returned. A daemon restart therefore cannot hand out a
         // fresh window: the record IS the window.
         //
-        // Absence stays absence. `Ok(None)` means this child's declared budget
-        // was never recorded as spent, and it is never widened into an
-        // unlimited budget; an unreadable or invalid record is a mechanical
-        // failure, not a permission. The declared THRESHOLD is read only from
-        // an admitted policy, and a child with no admitted policy has no
-        // declared budget at all, so its replacement is refused as
-        // `PolicyNotAdmitted` rather than being given a synthesised default.
+        // Absence stays absence. An admitted disposition means this child's
+        // declared budget was never recorded as spent and that the immutable
+        // manifest bound to the admitted generation admitted the replacement;
+        // neither is ever widened into an unlimited budget, and an unreadable
+        // or invalid record is a mechanical failure, not a permission. The
+        // declared THRESHOLD is read only from an admitted policy, and a child
+        // with no admitted policy has no declared budget at all, so its
+        // replacement is refused as `PolicyNotAdmitted` rather than being given
+        // a synthesised default.
+        //
+        // Issue #1884 (I1.9): the admitted disposition carries the sealed
+        // `BoundKernelExecutionManifest` the ORS verifier issued, and that is
+        // the only value the replacement below may take launch identity from.
+        let mut bound_restart_manifest = None;
         if previous_receipt.is_some() {
-            let refused =
-                self.admit_daemon_restart_attempt(&launch, attempt, previous_receipt.as_ref())?;
-            if let Some(refusal) = refused {
-                let reason = daemon_restart_refusal_reason(&refusal);
-                observe_daemon_runtime("kernel.daemon.restart_refused", reason);
-                return Err(self
-                    .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
+            match self.admit_daemon_restart_attempt(&launch, attempt, previous_receipt.as_ref())? {
+                DaemonRestartManifestAdmission::Admitted(bound) => {
+                    bound_restart_manifest = Some(bound);
+                }
+                DaemonRestartManifestAdmission::Refused(refusal) => {
+                    let reason = daemon_restart_refusal_reason(&refusal);
+                    observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                    return Err(self.daemon_failure_error(format!(
+                        "eliotd automatic restart refused: {reason}"
+                    )));
+                }
             }
         }
         // The two refusals that no declared restart class may bypass (I14.10)
@@ -907,6 +1279,29 @@ impl KernelComposition {
             return Err(self.daemon_failure_error(reason));
         }
         let next_launch = fresh_eliotd_launch_descriptor(&launch, attempt + 1)?;
+        // Issue #1884 (I1.9): a replacement of a supervised child is launched
+        // only under the exact launch identity the sealed manifest records. The
+        // immutable bytes and the exact daemon configuration this replacement
+        // would start are compared against the bound launch binding, never
+        // against the retained descriptor alone, so a descriptor whose recorded
+        // digests no longer stand for the admitted manifest is refused instead
+        // of being launched. The binding is absent on a first launch that has no
+        // previous generation to replace; that path is not a restart and is not
+        // decided here.
+        if let Some(bound) = bound_restart_manifest.as_ref() {
+            let binding = bound.launch_binding();
+            if next_launch.executable_sha256 != binding.artifact_sha256
+                || next_launch.config_descriptor_sha256 != binding.config_sha256
+            {
+                let refusal = DaemonRestartRefusal::ClassWithholds(
+                    "restart_launch_identity_not_the_recorded_manifest",
+                );
+                let reason = daemon_restart_refusal_reason(&refusal);
+                observe_daemon_runtime_in_context("kernel.daemon.restart_refused", reason, context);
+                return Err(self
+                    .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
+            }
+        }
         {
             let mut policy = self.front_door_policy.lock().map_err(|_| {
                 KernelBuildError::Service("front-door policy lock poisoned".to_owned())
