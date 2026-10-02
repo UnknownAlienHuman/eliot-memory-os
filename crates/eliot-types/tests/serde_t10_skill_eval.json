@@ -30,5 +30,93 @@
     "requested_route": "runtime artifact/effect observation",
     "acceptance_relation": "required criterion matches a measurement result",
     "oracle_owner": "eliot_engine::eval::EvalMeasurementService"
+  },
+  "case_result_nested_known_accept": {
+    "result_id": "eval-case-result-01920000-0000-7000-8000-000000000002",
+    "eval_case_id": "01920000-0000-7000-8000-000000000003",
+    "family": "understand",
+    "status": "passed",
+    "measurements": [],
+    "produced_refs": [],
+    "errors": [],
+    "duration_ms": 0,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+  "case_result_nested_unknown_refuse": {
+    "result_id": "eval-case-result-01920000-0000-7000-8000-000000000002",
+    "eval_case_id": "01920000-0000-7000-8000-000000000003",
+    "family": "understand",
+    "status": "passed",
+    "measurements": [],
+    "produced_refs": [],
+    "errors": [],
+    "duration_ms": 0,
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001",
+      "evaluator_tier": "gold"
+    }
+  },
+  "baseline_nested_known_accept": {
+    "baseline_id": "eval-baseline-01920000-0000-7000-8000-000000000004",
+    "suite_id": "eval-suite-01920000-0000-7000-8000-000000000005",
+    "eval_run_id": "eval-run-01920000-0000-7000-8000-000000000006",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "manifest_ref": "file://crates/eliot-types/tests/serde_t10_skill_eval.json",
+    "family_scores": [],
+    "overall_status": "pass",
+    "approved_at": "2026-09-29T22:50:16Z",
+    "approved_by": "issue-939-audit-5900564590",
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+    }
+  },
+  "baseline_nested_unknown_refuse": {
+    "baseline_id": "eval-baseline-01920000-0000-7000-8000-000000000004",
+    "suite_id": "eval-suite-01920000-0000-7000-8000-000000000005",
+    "eval_run_id": "eval-run-01920000-0000-7000-8000-000000000006",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "manifest_ref": "file://crates/eliot-types/tests/serde_t10_skill_eval.json",
+    "family_scores": [],
+    "overall_status": "pass",
+    "approved_at": "2026-09-29T22:50:16Z",
+    "approved_by": "issue-939-audit-5900564590",
+    "integrity_fingerprints": {
+      "harness_fingerprint": "eliot-engine-eval-case-schema",
+      "evaluator_fingerprint": "eliot_engine::eval::EvalMeasurementService",
+      "environment_fingerprint": "not-captured:structural-evaluator-process",
+      "actual_route": "eliot_engine::eval::evaluate_case",
+      "requested_route": "runtime artifact/effect observation",
+      "acceptance_relation": "required criterion matches a measurement result",
+      "oracle_owner": "eliot_engine::eval::EvalMeasurementService",
+      "oracle_version": "0.1.0",
+      "product_identity": "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001",
+      "evaluator_tier": "gold"
+    }
   }
 }
