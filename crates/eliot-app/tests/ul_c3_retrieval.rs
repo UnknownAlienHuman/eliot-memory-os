@@ -217,7 +217,33 @@ fn c3_unified_projection_pages_beyond_512_and_preserves_filters_and_dedup() -> T
         prepared.apply_memory_envelope(&archived)?.status,
         WriteStatus::Committed
     );
-    let harness = prepared.launch()?;
+    // CONTRACT UPDATE (lane W4, branch fix/ul-credential-retirement-W4).
+    //
+    // Classification: RETIRED FRONT DOOR, but NOT a lost guarantee.
+    //
+    // This test was mis-reported as "credential-gated child test failed with
+    // exit code: 101". The measured cause is the unconditional front-door
+    // refusal emitted by `crates/eliot-app/src/front_door_cutover.rs:129`
+    // ("legacy eliot-governor daemon is retired: no legacy route remains"),
+    // which `docs/release/WINDOWS_X64_RELEASE.md:15` ("Claude Code front door",
+    // issue #1719) mandates for every non-stdio entrypoint: `daemon run`
+    // "unconditionally refuse[s] with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus
+    // the canonical-route receipt". It is NOT credential-gated: SurrealDB 3.1.4
+    // is present and reachable at C:\Tools\SurrealDB\surreal.exe, and the
+    // isolated credential fixture provisions fine.
+    //
+    // Every assertion below is a `CanonicalStore::recall_l0` guarantee (rank
+    // trace feature scores, bounded candidate contract, filter preservation,
+    // semantic-dedup collapse, scope suppression, lifecycle-audit visibility,
+    // penalty application). None of them is served by the legacy route: the
+    // retired `daemon run` child was only ever incidental here, acting as a
+    // projection publisher. That role belongs to `eliot_engine`'s public
+    // `CognitiveProjectionCoordinator`, so the harness now runs it in-process
+    // (see `PreparedHarness::launch_store_only`) and this test keeps asserting
+    // the real retrieval contract instead of a refusal.
+    //
+    // No assertion was removed, relaxed, or made vacuous.
+    let harness = prepared.launch_store_only()?;
 
     let mut paged = request(
         project_id,

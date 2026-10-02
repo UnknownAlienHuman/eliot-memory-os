@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use eliot_engine::{
-    UlArtifactWriteReport, UlArtifactWriterService, WriteAdmissionService, WriterActor,
-    WriterConfig, WriterHandle,
+    CognitiveProjectionCoordinator, CognitiveProjectionCoordinatorConfig,
+    CognitiveProjectionShutdownHandle, CueIndexService, UlArtifactWriteReport,
+    UlArtifactWriterService, UlDependencyService, WriteAdmissionService, WriterActor, WriterConfig,
+    WriterHandle,
 };
 use eliot_store::{
     CanonicalStore, CognitiveProjectionFamily, CognitiveProjectionFamilyState,
@@ -75,6 +77,24 @@ pub struct PreparedHarness {
     bootstrap_heads: BTreeMap<ProjectId, MemoryRevision>,
     surreal: OwnedChild,
     runtime: OwnedRuntime,
+    projection_worker: Option<ProjectionWorker>,
+}
+
+/// Owns the in-process cognitive-projection coordinator so store-level UL
+/// guarantees stay provable after the legacy `daemon run` route is retired.
+/// See [`PreparedHarness::launch_store_only`] for the retirement citation.
+pub struct ProjectionWorker {
+    shutdown: Option<CognitiveProjectionShutdownHandle>,
+    actor: tokio::task::JoinHandle<Result<(), eliot_engine::EngineError>>,
+}
+
+impl Drop for ProjectionWorker {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.shutdown();
+        }
+        self.actor.abort();
+    }
 }
 
 impl Harness {
@@ -387,7 +407,65 @@ impl PreparedHarness {
             store,
             store_runtime,
             bootstrap_heads: BTreeMap::new(),
+            projection_worker: None,
         })
+    }
+
+    /// Launches a harness that never spawns the retired `eliot-governor daemon
+    /// run` child, for UL guarantees that are proven entirely against
+    /// `CanonicalStore` and `eliot_engine` APIs.
+    ///
+    /// Why this exists. `docs/release/WINDOWS_X64_RELEASE.md` ("Claude Code front
+    /// door", issue #1719) mandates that every non-stdio entrypoint —
+    /// `daemon run` included — "unconditionally refuse with
+    /// `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the canonical-route receipt".
+    /// `crates/eliot-app/src/front_door_cutover.rs` implements that refusal, so
+    /// the retired daemon can no longer publish cognitive projections. But the
+    /// projections themselves are owned by `eliot_engine`'s
+    /// `CognitiveProjectionCoordinator`, which is public and needs no legacy
+    /// route. Starting it in-process preserves the store-level guarantee
+    /// (recall ranking, filter/dedup preservation, lifecycle-audit visibility)
+    /// instead of restating it as a refusal.
+    pub fn launch_store_only(self) -> TestResult<StoreHarness> {
+        let Self {
+            runtime,
+            port,
+            config_path,
+            surreal,
+            bootstrap_writer,
+            bootstrap_actor,
+            store,
+            store_runtime,
+            bootstrap_heads,
+            projection_worker: _,
+        } = self;
+        drop(bootstrap_writer);
+        store_runtime.block_on(bootstrap_actor)?;
+
+        let (notifier, coordinator, shutdown) = CognitiveProjectionCoordinator::channel(
+            store.clone(),
+            std::sync::Arc::new(CueIndexService::new(store.clone())),
+            std::sync::Arc::new(UlDependencyService::new(store.clone())),
+            CognitiveProjectionCoordinatorConfig::default(),
+        );
+        store_runtime.block_on(notifier.recover())?;
+        let projection_actor = store_runtime.spawn(coordinator.run());
+
+        let harness = StoreHarness {
+            runtime,
+            port,
+            config_path,
+            surreal,
+            store,
+            store_runtime,
+            bootstrap_heads,
+            projection_worker: Some(ProjectionWorker {
+                shutdown: Some(shutdown),
+                actor: projection_actor,
+            }),
+        };
+        harness.wait_for_bootstrap_projections(&harness.bootstrap_heads, Duration::from_secs(60))?;
+        Ok(harness)
     }
 
     pub fn launch(self) -> TestResult<Harness> {
@@ -401,6 +479,7 @@ impl PreparedHarness {
             store,
             store_runtime,
             bootstrap_heads,
+            projection_worker: _,
         } = self;
         drop(bootstrap_writer);
         store_runtime.block_on(bootstrap_actor)?;
@@ -508,6 +587,85 @@ impl PreparedHarness {
                 .and_modify(|head| *head = (*head).max(memory_revision))
                 .or_insert(memory_revision);
         }
+    }
+}
+
+/// A `Harness` with no `eliot-governor` child of any kind: no retired
+/// `daemon run`, and no legacy `mcp stdio`. It exposes only the store-level
+/// read/write surface, so a UL guarantee that never depended on the legacy
+/// route keeps asserting the real thing.
+pub struct StoreHarness {
+    runtime: OwnedRuntime,
+    port: u16,
+    config_path: PathBuf,
+    surreal: OwnedChild,
+    store: CanonicalStore,
+    store_runtime: tokio::runtime::Runtime,
+    bootstrap_heads: BTreeMap<ProjectId, MemoryRevision>,
+    projection_worker: Option<ProjectionWorker>,
+}
+
+impl StoreHarness {
+    pub fn recall_l0(&self, request: &RecallL0Request) -> TestResult<RecallL0Response> {
+        Ok(self.store_runtime.block_on(self.store.recall_l0(request))?)
+    }
+
+    pub fn current_revision(&self, project_id: ProjectId) -> TestResult<MemoryRevision> {
+        current_revision(&self.store_runtime, &self.store, project_id)
+    }
+
+    pub fn cue_rows(&self, project_id: ProjectId) -> TestResult<Vec<eliot_types::CueIndexRow>> {
+        Ok(self
+            .store_runtime
+            .block_on(self.store.load_cue_rows(project_id))?)
+    }
+
+    fn wait_for_bootstrap_projections(
+        &self,
+        bootstrap_heads: &BTreeMap<ProjectId, MemoryRevision>,
+        timeout: Duration,
+    ) -> TestResult {
+        for (&project_id, &bootstrap_head) in bootstrap_heads {
+            let deadline = Instant::now() + timeout;
+            let mut last_observed = "projection state was not read".to_owned();
+            let mut ready = false;
+            while Instant::now() < deadline {
+                let states = self
+                    .store_runtime
+                    .block_on(self.store.cognitive_projection_family_states(project_id))?;
+                if states.iter().any(|state| {
+                    (state.family == CognitiveProjectionFamily::Search
+                        || state.family == CognitiveProjectionFamily::Cue)
+                        && state.status == CognitiveProjectionPublicationStatus::Published
+                        && state
+                            .applied_revision
+                            .is_some_and(|revision| revision >= bootstrap_head)
+                }) {
+                    ready = true;
+                    break;
+                }
+                last_observed = format!("states={states:#?}");
+                thread::sleep(Duration::from_millis(25));
+            }
+            if !ready {
+                return Err(format!(
+                    "in-process projection coordinator did not publish project {project_id} at revision {}: {last_observed}",
+                    bootstrap_head.value()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StoreHarness {
+    fn drop(&mut self) {
+        self.projection_worker.take();
+        let _ = self.surreal.stop();
+        let _ = wait_for_tcp_closed(self.port, Duration::from_secs(5));
+        let _ = fs::remove_file(&self.config_path);
+        let _ = self.runtime.cleanup();
     }
 }
 
