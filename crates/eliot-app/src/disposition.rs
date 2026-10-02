@@ -2026,10 +2026,10 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSUMER_SURFACES, ConsumerEntry, Disposition, INVENTORY_REVISION,
+        CONSUMER_SURFACES, ConsumerEntry, Disposition, ExpiryRefusal, INVENTORY_REVISION,
         assert_inventory_entries_are_live, baked_surface, consumer_disposition_guard,
-        current_consumer_inventory, expiry_condition_guard, first_iso_date_digits,
-        inventory_entries_for, iso_date_text,
+        current_consumer_inventory, expiry_condition_guard, expiry_condition_guard_over,
+        first_iso_date_digits, inventory_entries_for, iso_date_text,
     };
 
     /// Digits of the first `YYYY-MM-DD` token in `text`, decoded to integers.
@@ -2037,6 +2037,27 @@ mod tests {
         let digits = first_iso_date_digits(text)
             .unwrap_or_else(|| panic!("expiry text carries no YYYY-MM-DD token: {text}"));
         digits.map(u32::from)
+    }
+
+    /// A one-row inventory built in the test, not read out of
+    /// [`current_consumer_inventory`].
+    ///
+    /// The production inventory is a compile-time literal table, so a test that
+    /// wants to see a refusal has to hand the rule a value the guard is meant to
+    /// refuse. Every refusal case in this module is built here; no production
+    /// inventory row, `CONSUMER_SURFACES` path or `MIGRATED_CONSUMER_EDGES` row
+    /// is edited to make a case fail.
+    const REFUSAL_PROOF: &str = "tests/refused-by-the-expiry-guard/proof.json";
+
+    /// One refusal-case row carrying `expiry` verbatim as its condition.
+    const fn refused_fixture(disposition: Disposition, expiry: &'static str) -> ConsumerEntry {
+        ConsumerEntry {
+            consumer: "refusal-case consumer named only for the expiry guard rule",
+            proof: REFUSAL_PROOF,
+            live_reference: REFUSAL_PROOF,
+            disposition,
+            expiry,
+        }
     }
 
     #[test]
@@ -2150,6 +2171,48 @@ mod tests {
             Ok(()),
             "with six undated ExtractToCurrentOwner rows present, expiry_condition_guard \
              still answers Ok: an undated row passes unchecked"
+        );
+    }
+
+    #[test]
+    fn expiry_condition_guard_over_refuses_a_temporary_fixture_whose_condition_never_says_remove() {
+        // Refusal arm one: the `!expiry.contains("remove")` branch, written at
+        // `expiry_condition_guard_over` in
+        // crates/eliot-app/src/disposition.rs:1606. The fixture is built here
+        // because no production row should ever fail this arm.
+        let fixture = refused_fixture(
+            Disposition::TemporaryFixture,
+            "retained until the current owner for this surface exists under #13",
+        );
+
+        // The fixture is not refused because of its date: it carries no date at
+        // all, and the guard must still refuse it for the missing removal word
+        // rather than falling through to the undated-date arm.
+        assert_eq!(
+            first_iso_date_digits(fixture.expiry),
+            None,
+            "this refusal case must fail the removal-word arm, not the undated-date arm"
+        );
+
+        // Typed assertion on the production rule: the guard returns the
+        // no-removal-condition cause, naming the proof of the offending row.
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&fixture)),
+            Err(ExpiryRefusal::NoRemovalCondition {
+                proof: REFUSAL_PROOF
+            }),
+            "a temporary fixture whose condition never says remove must be refused as \
+             NoRemovalCondition"
+        );
+
+        // Same rule, no date, on a bare empty condition: still the same arm.
+        let blank = refused_fixture(Disposition::TemporaryFixture, "");
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&blank)),
+            Err(ExpiryRefusal::NoRemovalCondition {
+                proof: REFUSAL_PROOF
+            }),
+            "an empty removal condition must be refused as NoRemovalCondition"
         );
     }
 
