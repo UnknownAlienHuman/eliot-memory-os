@@ -1957,8 +1957,8 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Disposition, INVENTORY_REVISION, current_consumer_inventory, expiry_condition_guard,
-        first_iso_date_digits, iso_date_text,
+        Disposition, INVENTORY_REVISION, assert_inventory_entries_are_live, baked_surface,
+        current_consumer_inventory, expiry_condition_guard, first_iso_date_digits, iso_date_text,
     };
 
     /// Digits of the first `YYYY-MM-DD` token in `text`, decoded to integers.
@@ -2080,5 +2080,52 @@ mod tests {
             "with six undated ExtractToCurrentOwner rows present, expiry_condition_guard \
              still answers Ok: an undated row passes unchecked"
         );
+    }
+
+    #[test]
+    fn assert_inventory_entries_are_live_backs_every_row_with_its_own_baked_proof() {
+        // Production guard under test, reached from
+        // `run_facade_disposition_guards`.
+        assert_eq!(
+            assert_inventory_entries_are_live(),
+            Ok(()),
+            "the shipped inventory must pass the liveness assertion at the entry gate"
+        );
+
+        let inventory = current_consumer_inventory();
+        assert!(
+            !inventory.is_empty(),
+            "the liveness assertion is blind with an empty inventory"
+        );
+
+        for entry in inventory {
+            // The three field checks the guard makes before it opens any proof.
+            assert!(
+                !entry.consumer.is_empty() && !entry.proof.is_empty() && !entry.expiry.is_empty(),
+                "facade inventory entry is missing consumer, proof, or expiry: {entry:?}"
+            );
+            assert!(
+                !entry.live_reference.is_empty(),
+                "facade inventory entry {} records no live reference",
+                entry.proof
+            );
+
+            // The live side is read out of the real baked file, not out of the
+            // table being checked, so this is the guard's own liveness test.
+            let Some(surface) = baked_surface(entry.proof) else {
+                panic!("baked_surface({}) returned None", entry.proof);
+            };
+            let live = surface.body.contains(entry.live_reference);
+            assert_eq!(
+                live,
+                entry.disposition != Disposition::Remove,
+                "recorded {} for {} is not backed by its proof: {:?} is {} in {}",
+                entry.disposition.label(),
+                entry.proof,
+                entry.live_reference,
+                if live { "present" } else { "absent" },
+                surface.path
+            );
+        }
     }
 }
