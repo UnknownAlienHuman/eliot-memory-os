@@ -963,10 +963,6 @@ fn durable_18_recovery_lifecycle_stays_distinct() {
 
 // WORK_UNIT_CASE: 893/19
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-A keeps the replay/readback inventory, no-commit proof, and readback labelling in one deterministic probe"
-)]
 fn durable_t_a_replay_is_readback_not_second_commit() {
     // T-A (replay half): exact replay is a readback, never a duplicate
     // commit. Every replay-labelled record pinned by the fixture exists in
@@ -1146,10 +1142,6 @@ fn durable_21_timeout_keeps_possible_effect_unknown() {
 
 // WORK_UNIT_CASE: 893/22
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-A keeps the terminal inventory, guard proof, and disjoint-ownership proof in one deterministic probe"
-)]
 fn durable_t_a_single_terminal_per_failed_operation() {
     // T-A (terminal half): one terminal error per underlying operation across
     // nested propagation. Each Writer-B terminal code is emitted from exactly
@@ -1253,10 +1245,6 @@ fn durable_t_a_single_terminal_per_failed_operation() {
 
 // WORK_UNIT_CASE: 893/23
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-B keeps the canary sweep, literal proof, and bound honesty in one deterministic probe"
-)]
 fn durable_t_b_canaries_absent_from_observations() {
     // T-B (redaction half): credential/DB/env/source/user canaries are
     // absent from every frozen diagnostic string line; captures never carry
@@ -1314,16 +1302,7 @@ fn durable_t_b_canaries_absent_from_observations() {
     );
 }
 
-// WORK_UNIT_CASE: 893/24
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "T-B keeps the unavailable-seam, result-identity, ordering, and stdout-framing proofs in one deterministic probe"
-)]
-fn durable_t_b_sink_failure_leaves_operation_identical() {
-    // T-B (noninterference half): every Writer-B boundary carries the Event
-    // Log sink-disposition seam; sink outcomes never alter the operation
-    // result, order, or stdout framing.
+fn assert_every_writer_b_file_carries_the_event_log_sink_disposition_seam() {
     for source in [
         credential_source(),
         store_persist_source(),
@@ -1334,6 +1313,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
             "every Writer-B file must carry the Event Log sink-disposition seam"
         );
     }
+}
+
+fn assert_the_event_log_port_disposition_is_pinned_per_platform() {
     // The Event Log seam answer is platform-typed, and the two platforms have
     // different typed answers: #984's safe port is live on Windows
     // (`eliot-platform-windows/src/event_log.rs:484` is `cfg!(windows)`), so
@@ -1356,11 +1338,17 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
             "off Windows the port stays typed-Unavailable"
         );
     }
+}
+
+fn assert_the_facade_sink_dispositions_stay_distinct() {
     assert_eq!(
         sink_status(DiagnosticSink::WindowsEventLog),
         Err(eliot_host::host_diagnostics::HostDiagnosticsError::EventLogUnavailable)
     );
     assert_eq!(sink_status(DiagnosticSink::TracingStderr), Ok(()));
+}
+
+fn assert_the_raw_event_log_insertion_is_driven_only_where_the_port_is_unavailable() {
     // The raw delivery attempt is driven only where the port is unavailable:
     // on Windows it is a real OS insertion whose receipt depends on whether the
     // fixed event source is registered on the running machine, so no
@@ -1377,6 +1365,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
             Err(eliot_host::windows_event_log::WindowsEventLogError::EventLogUnavailable)
         );
     }
+}
+
+fn assert_observations_do_not_perturb_operation_identity() {
     // Result identity: the same wire operation validates identically before
     // and after surrounding observations, with byte-identical digests.
     let before = store_request("893-24-stable", &"e4".repeat(32));
@@ -1399,6 +1390,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
         digest_before,
         "observations must not perturb identity"
     );
+}
+
+fn assert_observation_order_is_preserved_in_the_capture() {
     // Order identity: staged observations keep emission order in the capture.
     let ordered = capture_emit(|| {
         observe_entrypoint_with_detail(
@@ -1420,6 +1414,9 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
         first < second,
         "observation order must be preserved, got: {ordered}"
     );
+}
+
+fn assert_stdout_framing_stays_exactly_one_json_per_line() {
     // Stdout framing: tracing writes to the capture (stderr model), never to
     // stdout; the console protocol stays exactly one-JSON-per-line.
     let mut buffer = Vec::new();
@@ -1445,6 +1442,21 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
         fixture["stdout_protocol_contamination"].as_bool(),
         Some(false)
     );
+}
+
+// WORK_UNIT_CASE: 893/24
+#[test]
+fn durable_t_b_sink_failure_leaves_operation_identical() {
+    // T-B (noninterference half): every Writer-B boundary carries the Event
+    // Log sink-disposition seam; sink outcomes never alter the operation
+    // result, order, or stdout framing.
+    assert_every_writer_b_file_carries_the_event_log_sink_disposition_seam();
+    assert_the_event_log_port_disposition_is_pinned_per_platform();
+    assert_the_facade_sink_dispositions_stay_distinct();
+    assert_the_raw_event_log_insertion_is_driven_only_where_the_port_is_unavailable();
+    assert_observations_do_not_perturb_operation_identity();
+    assert_observation_order_is_preserved_in_the_capture();
+    assert_stdout_framing_stays_exactly_one_json_per_line();
 }
 
 // WORK_UNIT_CASE: 893/25
@@ -1632,31 +1644,9 @@ fn durable_26_actual_path_and_diff_guard() {
 // `codec.rs` cases 980/12 and 980/13 go red on
 // `assert_exactly_one_contour` and this target's supplementary emission
 // binding below goes red on the non-comment-line check.
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the reachable-surface denial, the production bound proof, the ten-label family inventory, and the supplementary emission binding stay in one deterministic probe"
-)]
-fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
-    const MARKER: [&str; 5] = [
-        "marker-record-shape",
-        "marker-expected-mac",
-        "marker-mac-mismatch",
-        "marker-protected-object-mismatch",
-        "marker-wire-version-mismatch",
-    ];
-    const ENVELOPE: [&str; 5] = [
-        "envelope-record-shape",
-        "envelope-expected-mac",
-        "envelope-mac-mismatch",
-        "envelope-protected-object-mismatch",
-        "envelope-wire-version-mismatch",
-    ];
-    // The two names the pre-fix codec collapsed every cause into. They survive
-    // only as prose in the owner's change note, so what must be gone is the
-    // live string LITERAL: a quoted occurrence would be an emittable label.
-    const COLLAPSED: [&str; 2] = ["marker malformed retained", "envelope malformed retained"];
-
+fn assert_no_codec_contour_is_reachable_on_the_executed_production_surface<'a>(
+    denied: impl Iterator<Item = &'a str>,
+) {
     // PRIMARY (executed, real production seam): drive the codec path's one
     // cross-boundary production call for real, plus one second real production
     // record on the same facade as a liveness control, then read back exactly
@@ -1676,7 +1666,7 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
         1,
         "the capture seam must carry real production output before any absence is claimed, got: {reachable}"
     );
-    for label in MARKER.iter().chain(ENVELOPE.iter()).chain(COLLAPSED.iter()) {
+    for label in denied {
         assert!(
             !reachable.contains(label),
             "the reachable surface produced the codec contour {label:?}: {reachable}"
@@ -1686,7 +1676,13 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
         !reachable.contains("host.credential codec"),
         "no codec boundary leaked onto the reachable surface: {reachable}"
     );
+}
 
+fn assert_production_bound_detail_keeps_each_contour_record_whole(
+    boundaries: [&str; 2],
+    markers: [&str; 5],
+    envelopes: [&str; 5],
+) {
     // PRIMARY (executed, real production seam): the contour is only readable
     // because production's own bounding keeps it whole. `bound_detail` is the
     // exact production function `observe_entrypoint_with_detail` applies to
@@ -1694,11 +1690,8 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
     // record passes through. If any contour record could lose its `reason=`
     // tail to truncation, distinct causes would read as one cause again — the
     // very collapse this split removed.
-    for boundary in [
-        "host.credential codec marker rejected",
-        "host.credential codec envelope rejected",
-    ] {
-        for contour in MARKER.iter().chain(ENVELOPE.iter()) {
+    for boundary in boundaries {
+        for contour in markers.iter().chain(envelopes.iter()) {
             let detail = format!("{boundary} reason={contour}");
             let bounded = bound_detail(&detail);
             assert!(
@@ -1712,14 +1705,15 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
             );
         }
     }
+}
 
+fn assert_the_codec_owns_ten_distinct_contours_in_two_disjoint_families(
+    contours: &[&str],
+    markers: [&str; 5],
+    envelopes: [&str; 5],
+) {
     // Executed: one distinct label per contour member, so no two causes share a
     // name and the split cannot silently collapse back to a catch-all.
-    let contours: Vec<&str> = MARKER
-        .iter()
-        .chain(ENVELOPE.iter())
-        .copied()
-        .collect();
     assert_eq!(contours.len(), 10, "the codec owns exactly ten contours");
     for (index, left) in contours.iter().enumerate() {
         for right in &contours[index + 1..] {
@@ -1731,15 +1725,21 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
     }
     // Two disjoint five-member families: a marker cause is never named by an
     // envelope contour, so a marker rejection cannot read as an envelope one.
-    for marker in MARKER {
-        for envelope in ENVELOPE {
+    for marker in markers {
+        for envelope in envelopes {
             assert!(
                 !envelope.contains(marker) && !marker.contains(envelope),
                 "the marker contour {marker:?} and the envelope contour {envelope:?} name each other"
             );
         }
     }
+}
 
+fn assert_the_codec_owner_source_names_every_contour_and_no_collapsed_catch_all(
+    contours: &[&str],
+    collapsed: [&str; 2],
+    boundaries: [&str; 2],
+) {
     // SUPPLEMENTARY (source-bound emission binding; the executed per-contour
     // evidence is the owner's own cases 980/12 and 980/13, which no integration
     // crate can reach). The ten contours are the owner's, emitted through its
@@ -1752,7 +1752,7 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
             "the codec owner must name contour {label:?}"
         );
     }
-    for collapsed in COLLAPSED {
+    for collapsed in collapsed {
         assert!(
             !codec.contains(&format!("\"{collapsed}\"")),
             "the collapsed catch-all {collapsed:?} must no longer be an emittable label"
@@ -1773,13 +1773,66 @@ fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
             }
         }
     }
-    for boundary in [
-        "host.credential codec marker rejected",
-        "host.credential codec envelope rejected",
-    ] {
+    for boundary in boundaries {
         assert!(
             codec.contains(&format!("\"{boundary}\"")),
             "the codec owner must name boundary {boundary:?}"
         );
     }
+}
+
+#[test]
+fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
+    const MARKER: [&str; 5] = [
+        "marker-record-shape",
+        "marker-expected-mac",
+        "marker-mac-mismatch",
+        "marker-protected-object-mismatch",
+        "marker-wire-version-mismatch",
+    ];
+    const ENVELOPE: [&str; 5] = [
+        "envelope-record-shape",
+        "envelope-expected-mac",
+        "envelope-mac-mismatch",
+        "envelope-protected-object-mismatch",
+        "envelope-wire-version-mismatch",
+    ];
+    // The two names the pre-fix codec collapsed every cause into. They survive
+    // only as prose in the owner's change note, so what must be gone is the
+    // live string LITERAL: a quoted occurrence would be an emittable label.
+    const COLLAPSED: [&str; 2] = ["marker malformed retained", "envelope malformed retained"];
+
+    assert_no_codec_contour_is_reachable_on_the_executed_production_surface(
+        MARKER
+            .iter()
+            .chain(ENVELOPE.iter())
+            .chain(COLLAPSED.iter())
+            .copied(),
+    );
+    assert_production_bound_detail_keeps_each_contour_record_whole(
+        [
+            "host.credential codec marker rejected",
+            "host.credential codec envelope rejected",
+        ],
+        MARKER,
+        ENVELOPE,
+    );
+    let contours: Vec<&str> = MARKER
+        .iter()
+        .chain(ENVELOPE.iter())
+        .copied()
+        .collect();
+    assert_the_codec_owns_ten_distinct_contours_in_two_disjoint_families(
+        &contours,
+        MARKER,
+        ENVELOPE,
+    );
+    assert_the_codec_owner_source_names_every_contour_and_no_collapsed_catch_all(
+        &contours,
+        COLLAPSED,
+        [
+            "host.credential codec marker rejected",
+            "host.credential codec envelope rejected",
+        ],
+    );
 }
