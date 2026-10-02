@@ -100,6 +100,14 @@ impl LiveGovernorAuthority {
         }
     }
 
+    /// Returns the exact current Governor-derived profile, if one has been
+    /// issued. The reference is borrowed from the single retained derivation
+    /// owner; this does not rebuild a profile from its transport projection.
+    #[must_use]
+    pub fn current_profile(&self) -> Option<&eliot_integration_coverage::GovernanceProfile> {
+        self.derivation.current()
+    }
+
     /// Derives the current profile from runtime coverage, Watchdog evidence,
     /// and trace freshness, and projects its exact revision, fingerprint,
     /// and authorization axes for the authenticated boundary.

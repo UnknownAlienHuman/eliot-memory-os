@@ -94,7 +94,9 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{
+    CurrentTaskSelection, ObservationJournal, ObservationJournalEntry, TaskSelectionEvidence,
+};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -1348,6 +1350,10 @@ pub enum CompositionError {
     /// The semantic owner read was fenced or no longer current.
     #[error("activation owner fence is stale")]
     ActivationStaleFence,
+    /// Request-supplied task-selection evidence did not match the live
+    /// Governor-selected TaskContract, WorkScope, or admission fence.
+    #[error("task selection revalidation: {0}")]
+    TaskSelection(#[from] eliot_observation::GovernorObservationError),
     /// Canonical admission rejected the envelope.
     #[error("canonical admission: {0}")]
     Canonical(#[from] CanonicalError),
@@ -5314,6 +5320,23 @@ pub struct ColdStartSurfaceView {
     pub projection_generation: u64,
 }
 
+/// Exact cold-start owner row and its decoded projections for one claim.
+///
+/// `record.terminal.receipt_bytes` and `receipt_digest` are returned from the
+/// durable owner unchanged so dispatch can carry the original receipt without
+/// reserializing or rehashing it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdStartOwnerReadback {
+    /// Exact validated ORS record as read from the durable owner.
+    pub record: ColdStartReadinessOrsRecord,
+    /// Lease decoded from the record's original claim bytes.
+    pub lease: OnboardingLease,
+    /// Readiness receipt decoded from the original terminal bytes.
+    pub receipt: eliot_workscope::OnboardingReadinessReceipt,
+    /// Surface projected from that same exact lease/receipt pair.
+    pub surface: ColdStartSurfaceView,
+}
+
 /// Ephemeral capability held only by the composition invocation that won the
 /// durable ORS claim. Restart recovery uses ORS readback and never restores
 /// this process-local compile capability from serialized data.
@@ -7560,6 +7583,94 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
+    /// Rechecks request-held selection evidence against the exact durable
+    /// readiness terminal and the live `TaskContract` owner at the current
+    /// Governor fence (issue #1746, W4).
+    ///
+    /// The terminal supplies the original selection source/evidence and the
+    /// task/scope/revision named at bootstrap. The Kernel `TaskContract`
+    /// owner supplies the current acceptance digest at the live fence. A
+    /// caller's `TaskSelectionEvidence` is admitted only when those owner
+    /// values still match it; no receipt field is copied into the current
+    /// selection projection and compared back to itself.
+    pub async fn recheck_task_selection_for_claim(
+        &self,
+        now: u64,
+        claim: &ColdStartReadinessClaim,
+        selection: &TaskSelectionEvidence,
+    ) -> Result<CurrentTaskSelection, CompositionError> {
+        let (activation, receipt) = self.current_task_selection_for_claim(now, claim)?;
+        let activation = activation.ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        let (
+            receipt_task_ref,
+            receipt_task_revision,
+            receipt_acceptance_digest,
+            receipt_selection_source_ref,
+            receipt_evidence_ref,
+        ) = match &receipt.task_binding {
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            } => (
+                task_ref.as_str(),
+                *task_revision,
+                acceptance_digest.as_str(),
+                selection_source_ref.as_str(),
+                evidence_ref.as_str(),
+            ),
+            TaskBindingState::None_
+            | TaskBindingState::Exploratory { .. }
+            | TaskBindingState::Stale { .. }
+            | TaskBindingState::Ambiguous { .. } => {
+                return Err(CompositionError::ActivationTaskSelectionRequired);
+            }
+        };
+        if selection.acceptance_digest != receipt_acceptance_digest {
+            return Err(eliot_observation::GovernorObservationError::StaleTaskSelection.into());
+        }
+        if selection.selection_source_ref != receipt_selection_source_ref
+            || selection.evidence_ref != receipt_evidence_ref
+        {
+            return Err(eliot_observation::GovernorObservationError::TaskScopeIncompatible.into());
+        }
+
+        let live_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&activation.state_fence, &live_fence)
+            || activation.task_id.as_str() != receipt_task_ref
+            || activation.task_revision != receipt_task_revision
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let owner_set = self
+            .kernel
+            .task_contract_acceptance_set(&activation.task_id, activation.task_revision, &live_fence)
+            .await?;
+        owner_set
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if owner_set.task_id != activation.task_id {
+            return Err(eliot_observation::GovernorObservationError::TaskScopeIncompatible.into());
+        }
+        if owner_set.task_revision != activation.task_revision {
+            return Err(eliot_observation::GovernorObservationError::StaleTaskSelection.into());
+        }
+        if !fences_match_exact(&owner_set.read_state_fence, &live_fence) {
+            return Err(eliot_observation::GovernorObservationError::FenceMismatch.into());
+        }
+        let current = CurrentTaskSelection {
+            task_ref: owner_set.task_id.as_str().to_owned(),
+            task_revision: owner_set.task_revision,
+            acceptance_digest: owner_set.acceptance_digest,
+            work_scope_ref: activation.work_scope_id,
+            state_fence: owner_set.read_state_fence,
+        };
+        selection.recheck_against_current(&current, &live_fence)?;
+        Ok(current)
+    }
+
     /// Admits one scope-sensitive canonical write whose observed binding and
     /// source closure the caller already holds (issue #1787).
     pub fn check_canonical_write_work_scope(
@@ -8435,16 +8546,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         claim: &ColdStartReadinessClaim,
         now: u64,
     ) -> Result<(OnboardingLease, ColdStartSurfaceView), CompositionError> {
-        let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
-        let surface = Self::cold_start_surface_view(&lease, &receipt)?;
-        Ok((lease, surface))
+        let readback = self.cold_start_owner_readback_with_record_for_claim(claim, now)?;
+        Ok((readback.lease, readback.surface))
     }
 
-    pub(crate) fn cold_start_readiness_terminal_for_claim(
+    /// Reads one exact readiness row and returns the raw owner record beside
+    /// the decoded receipt/surface used by dispatch.
+    pub fn cold_start_owner_readback_with_record_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,
-    ) -> Result<(OnboardingLease, eliot_workscope::OnboardingReadinessReceipt), CompositionError>
+    ) -> Result<ColdStartOwnerReadback, CompositionError>
     {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -8478,9 +8590,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         record
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if record.claim.key != claim.key
-            || record.claim.binding_digest != claim.binding_digest
-            || now > record.claim.lease_deadline
+        if record.claim != *claim || now > record.claim.lease_deadline
         {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -8533,7 +8643,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         } else if receipt.readiness == ReadinessLifecycle::ReadyMaterial {
             return Err(CompositionError::ActivationScopeSelectionRequired);
         }
-        Ok((lease, receipt))
+        let surface = Self::cold_start_surface_view(&lease, &receipt)?;
+        Ok(ColdStartOwnerReadback {
+            record,
+            lease,
+            receipt,
+            surface,
+        })
+    }
+
+    pub(crate) fn cold_start_readiness_terminal_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<(OnboardingLease, eliot_workscope::OnboardingReadinessReceipt), CompositionError>
+    {
+        let readback = self.cold_start_owner_readback_with_record_for_claim(claim, now)?;
+        Ok((readback.lease, readback.receipt))
     }
 
     fn cold_start_surface_view(
@@ -11107,6 +11233,22 @@ fn classify_activation_error(
         }
         CompositionError::ActivationStaleFence => GovernorActivationOutcome::StaleFence {
             recovery_handle: "governor.stale-fence:recovery".to_owned(),
+            observed_state_fence: None,
+        },
+        CompositionError::TaskSelection(
+            eliot_observation::GovernorObservationError::TaskScopeIncompatible,
+        ) => GovernorActivationOutcome::ScopeSelectionRequired {
+            selection: GovernorSelectionDirective::new(
+                Vec::new(),
+                GovernorCandidateCoverage::Unknown,
+                "governor.task-scope-incompatible:recovery",
+            ),
+        },
+        CompositionError::TaskSelection(
+            eliot_observation::GovernorObservationError::StaleTaskSelection
+            | eliot_observation::GovernorObservationError::FenceMismatch,
+        ) => GovernorActivationOutcome::StaleFence {
+            recovery_handle: "governor.task-selection-stale:recovery".to_owned(),
             observed_state_fence: None,
         },
         _ => GovernorActivationOutcome::FailedInternal {
