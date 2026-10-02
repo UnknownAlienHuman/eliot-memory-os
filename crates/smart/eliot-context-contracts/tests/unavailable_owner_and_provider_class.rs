@@ -8,28 +8,32 @@
 //! ## What the closed provider-class set is, measured
 //!
 //! The rev12 "closed seven-class provider set" has **no referent in current
-//! source**. `crates/smart/cognitive-rev12-contract-schema-freeze.toml:4109`
+//! source**. `crates/smart/cognitive-rev12-contract-schema-freeze.toml:4129`
 //! records it as `[[not_frozen]]` with
-//! `r11_disposition = "MISSING_CONTRACT_DECISION"`, and `:4114` measures that
-//! `SemanticRole` (`crates/smart/eliot-context-contracts/src/identity.rs:58`)
-//! has thirteen members and `ProviderRole` is a two-field slot struct, not an
-//! enum. So these fixtures deliberately do **not** assert membership against a
+//! `r11_disposition = "MISSING_CONTRACT_DECISION"`, and `:4134` measures that
+//! `SemanticRole` (`crates/smart/eliot-context-contracts/src/identity.rs`)
+//! has FOURTEEN members and `ProviderRole` is a two-field slot struct, not an
+//! enum. The file the issue body cites for the seven,
+//! `cognitive-rev12-coverage.toml`, has never existed in this repository. So
+//! these fixtures deliberately do **not** assert membership against a
 //! seven-member vocabulary, and do not invent one. What they do assert is the
 //! property that is decidable in source today and that the frozen item asks
 //! for: an **extra or unknown class is refused by an existing typed error**,
 //! never admitted by a permissive default.
 //!
-//! **The membership question is not closed here.** Which classes the final set
-//! contains is owned by the cognitive-wave integrator named at
-//! `crates/smart/cognitive-rev12-contract-schema-freeze.toml:4116`; these
-//! fixtures only prove that a value outside whatever the owner declares cannot
-//! slip through admission.
+//! **Membership is decided separately, and these assertions do not change.**
+//! The `eliot-context-contracts` owner has since closed the membership
+//! question: the provider axis IS the existing `SemanticRole` axis, the closed
+//! set is its fourteen declared members, and the deciding document sentences
+//! are recorded on the enum itself
+//! (`crates/smart/eliot-context-contracts/src/identity.rs`, "Semantic role of a
+//! whole Context unit — and, by decision, the CLOSED PROVIDER CLASS SET").
+//! The per-class positive and negative cases are in
+//! `tests/provider_class_membership.rs`. Nothing here is relaxed by that
+//! decision: an extra or unknown class still cannot slip through admission,
+//! and the seven names the issue body claimed are refused there individually.
 
-#![allow(
-    clippy::expect_used,
-    clippy::too_many_lines,
-    clippy::unwrap_used
-)]
+#![allow(clippy::expect_used, clippy::too_many_lines, clippy::unwrap_used)]
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_contracts::{
@@ -189,7 +193,9 @@ fn an_extra_provider_class_is_refused_rather_than_admitted() {
     // attributable to the provider class and not to a defective fixture.
     let admitted = base_recipe(&context);
     admitted.validate().expect("one declared class validates");
-    candidate(&context).validate().expect("control candidate validates");
+    candidate(&context)
+        .validate()
+        .expect("control candidate validates");
 
     // The closed set is the owner's to declare, so this fixture does not claim
     // which classes belong in it. It claims the decidable half: a class added
@@ -315,7 +321,11 @@ fn an_unavailable_outcome_without_a_named_missing_owner_is_refused() {
         vec![QualityApplicabilityInput::ActiveDirective],
         "an unavailable input with a named owner stays blocked, never resolved"
     );
-    assert!(!partition.resolved.contains(&QualityApplicabilityInput::ActiveDirective));
+    assert!(
+        !partition
+            .resolved
+            .contains(&QualityApplicabilityInput::ActiveDirective)
+    );
     assert!(QualityOperation::DependentAction.blocks_on_unresolved_applicability());
 
     // Now the same outcome with the name removed. Blank and whitespace-only are
@@ -355,16 +365,15 @@ fn an_unavailable_outcome_without_a_named_missing_owner_is_refused() {
     // an unavailable outcome. This is what stops "no named owner" from being
     // reachable by deserialization rather than only by construction.
     assert!(
-        serde_json::from_str::<QualityApplicabilityResolution>(
-            r#"{"status":"UNKNOWN"}"#
-        )
-        .is_err(),
+        serde_json::from_str::<QualityApplicabilityResolution>(r#"{"status":"UNKNOWN"}"#).is_err(),
         "an UNKNOWN payload without missing_owner must fail to decode"
     );
-    assert!(serde_json::from_str::<QualityApplicabilityResolution>(
-        r#"{"status":"UNKNOWN","missing_owner":"governor"}"#
-    )
-    .is_ok());
+    assert!(
+        serde_json::from_str::<QualityApplicabilityResolution>(
+            r#"{"status":"UNKNOWN","missing_owner":"governor"}"#
+        )
+        .is_ok()
+    );
     assert!(
         serde_json::from_str::<QualityApplicabilityResolution>(r#"{"status":"MAYBE"}"#).is_err(),
         "an unrecognised resolution status must fail closed, not default"
