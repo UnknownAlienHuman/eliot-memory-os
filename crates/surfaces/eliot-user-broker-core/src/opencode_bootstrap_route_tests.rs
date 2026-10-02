@@ -21,8 +21,9 @@ use super::{
     BrokerError, EpochId, EpochLineageId, Generation, MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES,
     OPENCODE_BOOTSTRAP_PIPE_NAME, OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE,
     OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT, OpenCodeApprovedProcess, OpenCodeBootstrapPeer,
-    OpenCodeBootstrapRoute, OpenCodeBridgeIntroduction, OpenCodeBrokerProcessBinding,
-    OpenCodeIntroductionParams, OpenCodeProcessBinding, SecretRef,
+    OpenCodeBootstrapRoute, OpenCodeBridgeIntroduction, OpenCodeBridgeOwnerGrant,
+    OpenCodeBridgeOwnerGrantParams, OpenCodeBridgeProcessProjection, OpenCodeBrokerProcessBinding,
+    OpenCodeIntroductionParams, OpenCodeProcessBinding, OpenCodeProcessProjectionParams, SecretRef,
 };
 
 const INSTALLATION_ID: &str = "installation-2898-bootstrap";
@@ -134,6 +135,150 @@ fn installed_route() -> OpenCodeBootstrapRoute {
         ISSUED_AT,
     )
     .expect("the broker installs one current one-shot route")
+}
+
+/// The Kernel-owned authorization record for this exact bridge launch. It is
+/// the only source of the activation generation, the activation fence nonce
+/// and the authorized endpoint, and it names the admitted bridge artifact that
+/// authorizes that endpoint.
+fn owner_grant() -> OpenCodeBridgeOwnerGrant {
+    OpenCodeBridgeOwnerGrant::mint(OpenCodeBridgeOwnerGrantParams {
+        installation_id: INSTALLATION_ID.to_owned(),
+        windows_sid: WINDOWS_SID.to_owned(),
+        interactive_session_id: INTERACTIVE_SESSION_ID.to_owned(),
+        authority_epoch: epoch(),
+        activation_generation: generation(BRIDGE_GENERATION),
+        activation_fence_nonce: format!("fence-{BRIDGE_GENERATION}"),
+        registration_fence_id: format!("user-broker-fence-{BROKER_GENERATION}"),
+        authorized_endpoint: "http://127.0.0.1:39411".to_owned(),
+        bridge_artifact_digest: EXECUTABLE_DIGEST.to_owned(),
+        issued_at: ISSUED_AT,
+        expires_at: EXPIRES_AT,
+    })
+    .expect("the Kernel mints this owner grant")
+}
+
+/// The broker-observed half only. The activation generation, the activation
+/// fence nonce and the endpoint are structurally absent: they are read from
+/// [`owner_grant`], so no caller scalar can stand in for them.
+fn broker_observed_params() -> OpenCodeProcessProjectionParams {
+    OpenCodeProcessProjectionParams {
+        installation_id: INSTALLATION_ID.to_owned(),
+        windows_sid: WINDOWS_SID.to_owned(),
+        interactive_session_id: INTERACTIVE_SESSION_ID.to_owned(),
+        authority_epoch: epoch(),
+        registration_fence_id: format!("user-broker-fence-{BROKER_GENERATION}"),
+        broker_generation: generation(BROKER_GENERATION),
+        server_identity: FOREIGN_IMAGE_DIGEST.to_owned(),
+        bootstrap_channel: Some(OPENCODE_BOOTSTRAP_PIPE_NAME.to_owned()),
+        credential: SecretRef::new("opencode-route", REVOCATION_ID)
+            .expect("typed opaque credential handle"),
+        credential_expires_at: CREDENTIAL_EXPIRES_AT,
+        allowed_capabilities: vec![
+            OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT.to_owned(),
+            OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE.to_owned(),
+        ],
+        issued_at: ISSUED_AT,
+        expires_at: EXPIRES_AT,
+        revocation_id: REVOCATION_ID.to_owned(),
+        process_binding: OpenCodeProcessBinding {
+            executable_digest: EXECUTABLE_DIGEST.to_owned(),
+            launch_nonce: LAUNCH_NONCE.to_owned(),
+            parent_broker_process_id: BROKER_PROCESS_ID.to_string(),
+        },
+    }
+}
+
+/// Positive case for the launch-time producer: a projection composed from a
+/// current Kernel owner grant carries exactly the grant's activation
+/// generation, activation fence nonce and authorized endpoint, and re-reads
+/// through its own closed validator. This is what makes
+/// `ingress.rs:2689` reachable: the introduction's `bridge_generation` is the
+/// generation the bridge's own live attach fence will carry, so the serving
+/// loop no longer returns `Rotated` before the first byte.
+#[test]
+fn a_current_owner_grant_produces_the_serving_introduction() {
+    let owner = owner_grant();
+    owner
+        .validate(ISSUED_AT)
+        .expect("a freshly minted owner grant is current");
+    let projection = OpenCodeBridgeProcessProjection::compose(&owner, broker_observed_params())
+        .expect("the broker composes the child projection from its own owner grant");
+
+    assert_eq!(
+        projection.introduction.bridge_generation.get(),
+        owner.activation_generation.get(),
+        "the introduction's bridge generation IS the granted activation generation"
+    );
+    assert_eq!(
+        projection.introduction.fence_id, owner.activation_fence_nonce,
+        "the introduction's fence IS the nonce the activation exchange installs"
+    );
+    assert_eq!(
+        projection.introduction.endpoint, owner.authorized_endpoint,
+        "the endpoint is the owner-authorized one, never a bare port"
+    );
+    assert!(
+        owner.authorizes_endpoint_for(INSTALLATION_ID, EXECUTABLE_DIGEST),
+        "the endpoint is authorized by the admitted bridge artifact identity"
+    );
+    projection
+        .facts(ISSUED_AT)
+        .expect("the composed projection re-reads through its own validator");
+}
+
+/// Refusal cases for the same seam. Each is an owner-record mismatch or an
+/// owner-record tamper, and each is answered with the *existing* typed
+/// [`BrokerError`] set rather than a string verdict or a boolean:
+///
+/// * a grant issued under a superseded registration fence is
+///   [`BrokerError::StaleRegistrationIdentity`];
+/// * a grant whose activation generation no longer binds its own digest tuple
+///   is [`BrokerError::GrantBindingMismatch`];
+/// * a grant presented outside its own issue/expiry window is
+///   [`BrokerError::LeaseExpired`];
+/// * a grant that authorizes a *different* bridge artifact refuses to
+///   authorize this launch's endpoint, which is what makes a port insufficient
+///   owner data on its own.
+#[test]
+fn a_mismatched_owner_grant_is_refused_with_a_typed_error() {
+    let owner = owner_grant();
+
+    // A grant minted under another live registration fence never composes.
+    let mut superseded = broker_observed_params();
+    superseded.registration_fence_id = "user-broker-fence-99".to_owned();
+    assert_eq!(
+        OpenCodeBridgeProcessProjection::compose(&owner, superseded).err(),
+        Some(BrokerError::StaleRegistrationIdentity),
+        "a grant from another registration is refused, not minted from"
+    );
+
+    // A tampered activation generation no longer binds the grant digest.
+    let mut rotated = owner.clone();
+    rotated.activation_generation = generation(BROKER_GENERATION);
+    assert_eq!(
+        rotated.validate(ISSUED_AT).err(),
+        Some(BrokerError::GrantBindingMismatch),
+        "an activation generation that does not bind the grant is refused"
+    );
+
+    // A port is not owner data: the same grant authorizes no endpoint for a
+    // foreign artifact, and no endpoint at all for another installation.
+    assert!(
+        !owner.authorizes_endpoint_for(INSTALLATION_ID, FOREIGN_IMAGE_DIGEST),
+        "a foreign artifact never inherits an authorized endpoint"
+    );
+    assert!(
+        !owner.authorizes_endpoint_for("installation-other", EXECUTABLE_DIGEST),
+        "an endpoint is authorized inside one installation only"
+    );
+
+    // A grant outside its own window is refused as a stale lease.
+    assert_eq!(
+        owner.validate(EXPIRES_AT).err(),
+        Some(BrokerError::LeaseExpired),
+        "an expired owner grant composes nothing"
+    );
 }
 
 #[test]

@@ -1829,17 +1829,22 @@ impl BrokerComposition {
 
     /// Heartbeats the protected registration before an admitted launch.
     ///
-    /// A launch that carries the broker's own `OpenCode` introduction projection
-    /// also installs the one-shot bootstrap route for the child this call just
-    /// started, from this broker's own owner records (issue #2898, step 4). The
-    /// install is best-effort and never fails an admitted launch; it reads the
-    /// projection before the request is dispatched and the child's
-    /// OS-observed identity out of the start receipt the dispatch returned.
+    /// A launch the Kernel admitted with an `OpenCode` bridge owner grant also
+    /// materializes this broker's own session-scoped endpoint and credential
+    /// introduction onto that launch, and installs the one-shot bootstrap route
+    /// for the child this call just started, from this broker's own owner
+    /// records (issue #2898, steps 1, 2 and 4). The materialization runs
+    /// **before** the dispatch, so the bytes the child receives are broker-minted
+    /// on the launch the Kernel admitted, and the install is best-effort and
+    /// never fails an admitted launch: it reads the projection out of the very
+    /// request that was dispatched and the child's OS-observed identity out of
+    /// the start receipt the dispatch returned.
     pub fn launch(
         &mut self,
-        request: LaunchRequest,
+        mut request: LaunchRequest,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         let _ = self.heartbeat()?;
+        self.materialize_opencode_bridge_projection(&mut request)?;
         let projection = opencode_bootstrap::launch_names_opencode_projection(&request);
         let receipt = self.broker.launch(request).map_err(Self::classify)?;
         if let Some(projection) = projection {

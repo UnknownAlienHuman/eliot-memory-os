@@ -30,18 +30,35 @@
 //! reusable bearer to an arbitrary port."
 //!
 //! What this module deliberately does **not** do: it does not mint the
-//! introduction's `endpoint` or `server_identity`. Both are facts of the bridge
-//! incarnation this broker never observes, no owner record for either exists in
-//! this tree, and nothing here fabricates one from a port, a path, a pid, or an
-//! environment value.
+//! introduction's `endpoint` or `server_identity` from a port, a path, a pid,
+//! or an environment value. Both are now owner data:
+//!
+//! * the **authorized endpoint** is read from the Kernel's own
+//!   [`OpenCodeBridgeOwnerGrant`], published on the admitted launch under
+//!   [`OPENCODE_BRIDGE_ENV_OWNER_GRANT`]. That grant carries the endpoint
+//!   together with the admitted bridge artifact digest, the installation, the
+//!   activation generation and the activation fence nonce, because
+//!   `crates/kernel/AGENTS.md` states "Process ownership requires immutable
+//!   artifact/config/protocol identity, installation/generation lineage and OS
+//!   evidence. PID/name/path/port alone are insufficient" and `bins/AGENTS.md`
+//!   states "Do not infer process ownership from PID, name, path, port,
+//!   current directory, environment variables, or a successful exit". A bare
+//!   port is therefore never owner data.
+//! * the **server identity** is minted by this broker inside its own secret
+//!   boundary, so a foreign process that merely bound the pinned port can hold
+//!   a challenge but never this value, and therefore can neither mint the
+//!   first-contact identity proof nor receive the request credential.
 
 use std::path::Path;
 
 use eliot_platform_windows::{NamedPipePeerEvidence, ProcessIdentity};
+use eliot_process::{EnvironmentProjection, Generation, SecretRef};
 use eliot_user_broker_core::{
-    BrokerError, LaunchReceipt, LaunchRequest, OpenCodeApprovedProcess, OpenCodeBootstrapPeer,
-    OpenCodeBootstrapRoute, OpenCodeBootstrapTicket, OpenCodeBridgeProcessProjection,
-    OpenCodeBrokerProcessBinding, OpenCodeOneUseIntroduction,
+    BrokerError, LaunchReceipt, LaunchRequest, OPENCODE_BRIDGE_CAPABILITIES,
+    OPENCODE_BRIDGE_ENV_INTRODUCTION, OPENCODE_BRIDGE_ENV_OWNER_GRANT, OpenCodeApprovedProcess,
+    OpenCodeBootstrapPeer, OpenCodeBootstrapRoute, OpenCodeBootstrapTicket,
+    OpenCodeBridgeOwnerGrant, OpenCodeBridgeProcessProjection, OpenCodeBrokerProcessBinding,
+    OpenCodeOneUseIntroduction, OpenCodeProcessBinding, OpenCodeProcessProjectionParams,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -105,23 +122,212 @@ pub(crate) fn launch_names_opencode_projection(request: &LaunchRequest) -> Optio
         .approved
         .environment
         .non_secret()
-        .get(eliot_user_broker_core::OPENCODE_BRIDGE_ENV_INTRODUCTION)
+        .get(OPENCODE_BRIDGE_ENV_INTRODUCTION)
         .cloned()
 }
 
+/// Returns the Kernel-owned `OpenCode` bridge owner grant the launch
+/// composition seam published on this admitted launch, if any.
+///
+/// A launch that carries no owner grant is not an `OpenCode` bridge launch: the
+/// broker then mints nothing, so no introduction can exist without the Kernel's
+/// own authorization for the endpoint, the activation generation and the
+/// activation fence nonce.
+pub(crate) fn launch_opencode_owner_grant(
+    request: &LaunchRequest,
+) -> Result<Option<OpenCodeBridgeOwnerGrant>, CompositionError> {
+    let Some(raw) = request
+        .approved
+        .environment
+        .non_secret()
+        .get(OPENCODE_BRIDGE_ENV_OWNER_GRANT)
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(raw).map(Some).map_err(|error| {
+        BrokerAdmissionRefusal::OperatorHandoffNotAdmitted.with_platform(format!(
+            "launch owner grant is not the owner's closed record: {error}"
+        ))
+    })
+}
+
+/// Mints the broker-owned server identity for one `OpenCode` bridge launch.
+///
+/// It is 64 lowercase hex characters, exactly the introduction's own
+/// `server_identity` shape, and it is **minted** rather than derived from the
+/// endpoint: a process that merely bound the pinned port therefore holds a
+/// challenge, never this value, so it can neither recompute the first-contact
+/// identity proof nor receive the request credential that follows it. The value
+/// is disclosed only to the exact approved children, alongside the route
+/// credential, through the same broker-owned secret boundary.
+fn mint_server_identity() -> String {
+    let material = format!(
+        "eliot.opencode.bridge-server-identity.v1:{}",
+        Uuid::new_v4().simple()
+    );
+    format!("{:x}", Sha256::digest(material.as_bytes()))
+}
+
+/// Broker-minted per-launch nonce and the revocation id derived from it.
+///
+/// The launch nonce binds this introduction to exactly one admitted launch
+/// identity, and the revocation id is the key a later rotation or revocation
+/// retires, so a superseded introduction fails closed even while it is still
+/// installed and inside its window.
+fn mint_launch_binding(request: &LaunchRequest) -> (String, String) {
+    let nonce = format!("opencode-bridge-launch-{}", Uuid::new_v4().simple());
+    let revocation_id = format!("opencode-bridge-revoke-{}", request.approved.request_id);
+    (nonce, revocation_id)
+}
+
+/// Replaces the Kernel's authorization entry on this admitted launch with the
+/// broker-minted child projection of it.
+///
+/// The owner grant is the Kernel's authorization to *this broker*; the child
+/// receives the broker-minted projection of that authorization instead, so
+/// exactly one introduction identity is ever present in the child environment
+/// and a stale authorization is not carried forward. The projection is
+/// re-admitted through [`EnvironmentProjection::new`], so a value the
+/// secret-safe environment contract refuses is never written.
+fn project_introduction_onto_child(
+    request: &mut LaunchRequest,
+    projection_bytes: String,
+) -> Result<(), CompositionError> {
+    let mut environment = request.approved.environment.non_secret().clone();
+    environment.remove(OPENCODE_BRIDGE_ENV_OWNER_GRANT);
+    environment.insert(
+        OPENCODE_BRIDGE_ENV_INTRODUCTION.to_owned(),
+        projection_bytes,
+    );
+    request.approved.environment = EnvironmentProjection::new(
+        environment,
+        request.approved.environment.secret_refs().to_vec(),
+        request.approved.environment.inheritance(),
+    )
+    .map_err(|error| {
+        BrokerAdmissionRefusal::OperatorHandoffNotAdmitted.with_platform(format!(
+            "the minted child projection is not admissible: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 impl BrokerComposition {
+    /// Materializes the `OpenCode` bridge introduction and its child projection
+    /// onto one admitted launch, from the Kernel's own owner grant (issue
+    /// #2898, steps 1 and 2).
+    ///
+    /// This is the **production caller** of
+    /// [`OpenCodeBridgeProcessProjection::compose`], and therefore of
+    /// [`eliot_user_broker_core::OpenCodeBridgeIntroduction::mint`]. It runs
+    /// before the launch is dispatched, so the bytes the child receives are
+    /// broker-minted on the launch the Kernel admitted rather than read back
+    /// from whatever the caller supplied.
+    ///
+    /// Everything unownable is taken from owner records: the activation
+    /// generation, the activation fence nonce and the authorized loopback
+    /// endpoint come from the [`OpenCodeBridgeOwnerGrant`] the Kernel
+    /// published, and the server identity is minted here inside this broker's
+    /// own secret boundary. The grant is additionally joined against this
+    /// broker's live registration and against the approved artifact digest of
+    /// this very launch, so a grant minted for another installation, session or
+    /// image is refused instead of minted from.
+    ///
+    /// Installation is fail-closed: a projection that fails any check is simply
+    /// absent, the launch still runs without a route, and
+    /// [`Self::install_opencode_bootstrap_route`] then refuses every redemption
+    /// because no introduction was carried.
+    pub(crate) fn materialize_opencode_bridge_projection(
+        &mut self,
+        request: &mut LaunchRequest,
+    ) -> Result<(), CompositionError> {
+        let Some(owner) = launch_opencode_owner_grant(request)? else {
+            return Ok(());
+        };
+        self.verify_launch_lease()?;
+        let live = self.live_registration()?;
+        let now = now_unix_ms()?;
+        owner.validate(now).map_err(classify)?;
+        if !owner.authorizes_endpoint_for(
+            live.installation_id.as_str(),
+            request.approved.artifact_digest.as_str(),
+        ) {
+            return Err(
+                BrokerAdmissionRefusal::OperatorClientProcessForeign.with_platform(
+                    "the launch owner grant does not authorize this bridge artifact and endpoint",
+                ),
+            );
+        }
+        // A grant may never outlive the registration it was minted under, and an
+        // introduction may never outlive its own authorization.
+        let expires_at = live
+            .expires_at
+            .min(owner.expires_at)
+            .min(request.lease_expires_at);
+        if expires_at <= now {
+            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
+                .with_platform("the OpenCode bridge owner grant is not presently live"));
+        }
+        let (launch_nonce, revocation_id) = mint_launch_binding(request);
+        let broker_process = Self::opencode_broker_process_binding()?;
+        let generation = Generation::new(live.user_broker_epoch).map_err(|_| {
+            BrokerAdmissionRefusal::OperatorSessionTokenStale
+                .with_platform("the live broker epoch is not an admitted generation")
+        })?;
+        let projection = OpenCodeBridgeProcessProjection::compose(
+            &owner,
+            OpenCodeProcessProjectionParams {
+                installation_id: live.installation_id.clone(),
+                windows_sid: live.windows_sid.clone(),
+                interactive_session_id: live.interactive_session_id.clone(),
+                authority_epoch: live.authority_epoch.clone(),
+                registration_fence_id: live.fence_id.clone(),
+                broker_generation: generation,
+                server_identity: mint_server_identity(),
+                bootstrap_channel: None,
+                credential: SecretRef::new(
+                    "opencode-route",
+                    format!("opencode-route-{revocation_id}"),
+                )
+                .map_err(|error| {
+                    BrokerAdmissionRefusal::OperatorHandoffNotAdmitted
+                        .with_platform(format!("route credential handle refused: {error}"))
+                })?,
+                credential_expires_at: expires_at,
+                allowed_capabilities: OPENCODE_BRIDGE_CAPABILITIES
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect(),
+                issued_at: now,
+                expires_at,
+                revocation_id,
+                process_binding: OpenCodeProcessBinding {
+                    executable_digest: request.approved.artifact_digest.clone(),
+                    launch_nonce,
+                    parent_broker_process_id: broker_process.process_id.to_string(),
+                },
+            },
+        )
+        .map_err(classify)?;
+        let bytes = serde_json::to_string(&projection).map_err(CompositionError::Encoding)?;
+        project_introduction_onto_child(request, bytes)
+    }
+
     /// Installs the one-shot bootstrap route for the `OpenCode` child this
     /// broker just launched, from this broker's own owner records.
     ///
     /// `projection_bytes` is the broker-minted
-    /// [`OpenCodeBridgeProcessProjection`] the admitted launch carried as its own
-    /// child projection. It is *verified*, never trusted: the introduction is
-    /// revalidated against its own digest and window and joined with the session
-    /// facts it was minted under, and then every identity value this broker owns
-    /// is compared with this broker's own protected declaration and live
-    /// registration — installation, Windows SID, interactive session, the live
-    /// attach fence, the introducing broker process id, and the SHA-256 of the
-    /// exact image bytes the OS reported for the launched child.
+    /// [`OpenCodeBridgeProcessProjection`] that
+    /// [`Self::materialize_opencode_bridge_projection`] wrote onto the admitted
+    /// launch as its own child projection, and that
+    /// [`launch_names_opencode_projection`] reads back out of it. It is
+    /// *verified*, never trusted: the introduction is revalidated against its
+    /// own digest and window and joined with the session facts it was minted
+    /// under, and then every identity value this broker owns is compared with
+    /// this broker's own protected declaration and live registration —
+    /// installation, Windows SID, interactive session, the introducing broker
+    /// process id, the Kernel owner grant's authorized endpoint, and the
+    /// SHA-256 of the exact image bytes the OS reported for the launched child.
     ///
     /// Installation is best-effort by design and never fails an admitted launch:
     /// a projection that fails any check leaves no route, so every redemption is
@@ -170,10 +376,24 @@ impl BrokerComposition {
                 ),
             );
         }
-        if introduction.fence_id != self.live_registration()?.fence_id {
+        // The introduction's `fence_id` is now the **activation** fence nonce
+        // the Kernel minted for the bridge incarnation, not this broker's
+        // registration fence: the serving bridge re-proves it against its own
+        // live attach `FencingToken` nonce, so requiring the registration fence
+        // here would refuse every correct introduction. What this broker can and
+        // does re-prove is that the minted introduction was issued under the
+        // **same live Kernel authority** it still holds, and that it names a
+        // non-empty Kernel-granted activation fence and generation.
+        let live = self.live_registration()?;
+        if !introduction
+            .authority_epoch
+            .is_same_authority(&live.authority_epoch)
+            || introduction.fence_id.is_empty()
+            || introduction.bridge_generation.get() == 0
+        {
             return Err(
                 BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
-                    "bootstrap introduction is not bound to the live Kernel registration fence",
+                    "bootstrap introduction is not bound to the live Kernel authority fence",
                 ),
             );
         }

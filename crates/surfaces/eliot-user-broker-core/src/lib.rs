@@ -5113,6 +5113,285 @@ impl OpenCodeProcessBinding {
     }
 }
 
+/// Version of the Kernel-owned `OpenCode` bridge owner grant (issue #2898).
+pub const OPENCODE_BRIDGE_OWNER_GRANT_VERSION: &str = "eliot.opencode.bridge-owner-grant.v1";
+/// Exact child environment name carrying the Kernel-owned `OpenCode` bridge
+/// owner grant for one admitted launch (issue #2898, steps 1 and 2).
+///
+/// This is the *authorization* half of the launch composition seam: the Kernel
+/// publishes the activation generation, the activation fence nonce, the
+/// authorized loopback endpoint and the admitted bridge artifact identity that
+/// authorize that endpoint. The User Broker reads it from the launch it is
+/// admitting, mints the [`OpenCodeBridgeIntroduction`] from it, and replaces
+/// this very entry with the minted [`OpenCodeBridgeProcessProjection`] for the
+/// child. A launch that carries no owner grant is not an `OpenCode` bridge
+/// launch and mints nothing.
+pub const OPENCODE_BRIDGE_ENV_OWNER_GRANT: &str = "ELIOT_OPENCODE_BRIDGE_OWNER_GRANT";
+
+/// Kernel-owned authorization record for one `OpenCode` bridge route (issue
+/// #2898, steps 1 and 2).
+///
+/// This is the owner record that makes the introduction's endpoint and bridge
+/// identity **authorized** rather than inferred, and it is the only source of
+/// the three fields a launch-time producer cannot observe for itself:
+///
+/// * [`Self::activation_generation`] is the generation the Kernel grants to
+///   this bridge incarnation. The serving loop compares it against the
+///   bridge's own live attach-fence generation before one byte is served
+///   (`HostEventsListener::serve_until`), so an introduction minted under any
+///   other generation is retired rather than served.
+/// * [`Self::activation_fence_nonce`] is the per-activation fence nonce the
+///   Kernel mints for exactly that activation. The bridge's own admission join
+///   re-proves `introduction.fence_id` against its live attach
+///   `FencingToken` nonce, so the published nonce and the installed one must be
+///   one value; a second independently minted nonce would make rotation
+///   undetectable.
+/// * [`Self::authorized_endpoint`] together with
+///   [`Self::bridge_artifact_digest`] is the authorization for the loopback
+///   endpoint. `bins/AGENTS.md`: "Do not infer process ownership from PID,
+///   name, path, port, current directory, environment variables, or a
+///   successful exit", and `crates/kernel/AGENTS.md`: "Process ownership
+///   requires immutable artifact/config/protocol identity,
+///   installation/generation lineage and OS evidence. PID/name/path/port alone
+///   are insufficient." A bare port therefore never qualifies as owner data:
+///   the endpoint is authorized only together with the admitted immutable
+///   bridge artifact digest, the installation, and the activation generation
+///   that constitutes its lineage.
+///
+/// [`Self::registration_fence_id`] additionally binds the grant to the live
+/// Kernel registration fence the launch is admitted under, so a grant presented
+/// under a superseded registration is refused rather than minted from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBridgeOwnerGrant {
+    pub version: String,
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub authority_epoch: EpochId,
+    /// Activation generation granted by the Kernel to this bridge incarnation.
+    pub activation_generation: Generation,
+    /// Per-activation fence nonce minted by the Kernel for that activation.
+    pub activation_fence_nonce: String,
+    /// Live Kernel registration fence this launch is admitted under.
+    pub registration_fence_id: String,
+    /// Canonical pinned loopback endpoint the admitted bridge artifact is
+    /// authorized to bind (`http://127.0.0.1:<port>` or `http://[::1]:<port>`).
+    pub authorized_endpoint: String,
+    /// Lowercase SHA-256 hex of the admitted bridge artifact that is
+    /// authorized to bind [`Self::authorized_endpoint`].
+    pub bridge_artifact_digest: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    /// Lowercase SHA-256 hex over the canonical grant tuple, recomputed by
+    /// [`OpenCodeBridgeOwnerGrant::validate`].
+    pub grant_digest: String,
+}
+
+/// Mint parameters for [`OpenCodeBridgeOwnerGrant`]. Every field is Kernel
+/// state; nothing here is broker, caller, or `OpenCode` input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeBridgeOwnerGrantParams {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub authority_epoch: EpochId,
+    pub activation_generation: Generation,
+    pub activation_fence_nonce: String,
+    pub registration_fence_id: String,
+    pub authorized_endpoint: String,
+    pub bridge_artifact_digest: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Serialize)]
+struct OpenCodeBridgeOwnerGrantDigest<'a> {
+    version: &'a str,
+    installation_id: &'a str,
+    windows_sid: &'a str,
+    interactive_session_id: &'a str,
+    authority_epoch: &'a EpochId,
+    activation_generation: u64,
+    activation_fence_nonce: &'a str,
+    registration_fence_id: &'a str,
+    authorized_endpoint: &'a str,
+    bridge_artifact_digest: &'a str,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+impl OpenCodeBridgeOwnerGrant {
+    fn mint_digest(params: &OpenCodeBridgeOwnerGrantParams) -> Result<String, BrokerError> {
+        digest(&OpenCodeBridgeOwnerGrantDigest {
+            version: OPENCODE_BRIDGE_OWNER_GRANT_VERSION,
+            installation_id: params.installation_id.as_str(),
+            windows_sid: params.windows_sid.as_str(),
+            interactive_session_id: params.interactive_session_id.as_str(),
+            authority_epoch: &params.authority_epoch,
+            activation_generation: params.activation_generation.get(),
+            activation_fence_nonce: params.activation_fence_nonce.as_str(),
+            registration_fence_id: params.registration_fence_id.as_str(),
+            authorized_endpoint: params.authorized_endpoint.as_str(),
+            bridge_artifact_digest: params.bridge_artifact_digest.as_str(),
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+        })
+    }
+
+    /// Mints one owner grant from Kernel state.
+    pub fn mint(params: OpenCodeBridgeOwnerGrantParams) -> Result<Self, BrokerError> {
+        text(&params.installation_id, "owner_grant.installation_id")?;
+        text(&params.windows_sid, "owner_grant.windows_sid")?;
+        text(
+            &params.interactive_session_id,
+            "owner_grant.interactive_session_id",
+        )?;
+        if params.activation_generation.get() == 0 {
+            return Err(BrokerError::InvalidField(
+                "owner_grant.activation_generation",
+            ));
+        }
+        text(
+            &params.activation_fence_nonce,
+            "owner_grant.activation_fence_nonce",
+        )?;
+        text(
+            &params.registration_fence_id,
+            "owner_grant.registration_fence_id",
+        )?;
+        validate_opencode_endpoint(&params.authorized_endpoint)?;
+        hex_digest(
+            &params.bridge_artifact_digest,
+            "owner_grant.bridge_artifact_digest",
+        )?;
+        if params.issued_at == 0 || params.expires_at <= params.issued_at {
+            return Err(BrokerError::InvalidField("owner_grant.expires_at"));
+        }
+        let grant_digest = Self::mint_digest(&params)?;
+        Ok(Self {
+            version: OPENCODE_BRIDGE_OWNER_GRANT_VERSION.to_owned(),
+            installation_id: params.installation_id,
+            windows_sid: params.windows_sid,
+            interactive_session_id: params.interactive_session_id,
+            authority_epoch: params.authority_epoch,
+            activation_generation: params.activation_generation,
+            activation_fence_nonce: params.activation_fence_nonce,
+            registration_fence_id: params.registration_fence_id,
+            authorized_endpoint: params.authorized_endpoint,
+            bridge_artifact_digest: params.bridge_artifact_digest,
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+            grant_digest,
+        })
+    }
+
+    /// Validates version, shape, digest binding, and the issue/expiry window.
+    ///
+    /// The typed refusals are the existing [`BrokerError`] set: an invalid
+    /// field, a digest that no longer binds the tuple, or a window that does
+    /// not contain `now_ms`. No verdict is flattened into a boolean.
+    pub fn validate(&self, now_ms: u64) -> Result<(), BrokerError> {
+        if self.version != OPENCODE_BRIDGE_OWNER_GRANT_VERSION {
+            return Err(BrokerError::InvalidField("owner_grant.version"));
+        }
+        text(&self.installation_id, "owner_grant.installation_id")?;
+        text(&self.windows_sid, "owner_grant.windows_sid")?;
+        text(
+            &self.interactive_session_id,
+            "owner_grant.interactive_session_id",
+        )?;
+        if self.activation_generation.get() == 0 {
+            return Err(BrokerError::InvalidField(
+                "owner_grant.activation_generation",
+            ));
+        }
+        text(
+            &self.activation_fence_nonce,
+            "owner_grant.activation_fence_nonce",
+        )?;
+        text(
+            &self.registration_fence_id,
+            "owner_grant.registration_fence_id",
+        )?;
+        validate_opencode_endpoint(&self.authorized_endpoint)?;
+        hex_digest(
+            &self.bridge_artifact_digest,
+            "owner_grant.bridge_artifact_digest",
+        )?;
+        if self.issued_at == 0 || self.expires_at <= self.issued_at {
+            return Err(BrokerError::InvalidField("owner_grant.expires_at"));
+        }
+        hex_digest(&self.grant_digest, "owner_grant.grant_digest")?;
+        let params = OpenCodeBridgeOwnerGrantParams {
+            installation_id: self.installation_id.clone(),
+            windows_sid: self.windows_sid.clone(),
+            interactive_session_id: self.interactive_session_id.clone(),
+            authority_epoch: self.authority_epoch.clone(),
+            activation_generation: self.activation_generation,
+            activation_fence_nonce: self.activation_fence_nonce.clone(),
+            registration_fence_id: self.registration_fence_id.clone(),
+            authorized_endpoint: self.authorized_endpoint.clone(),
+            bridge_artifact_digest: self.bridge_artifact_digest.clone(),
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        };
+        if Self::mint_digest(&params)? != self.grant_digest {
+            return Err(BrokerError::GrantBindingMismatch);
+        }
+        if now_ms < self.issued_at || now_ms >= self.expires_at {
+            return Err(BrokerError::LeaseExpired);
+        }
+        Ok(())
+    }
+
+    /// Returns whether this grant authorizes exactly one artifact at exactly
+    /// one loopback endpoint inside one installation. The endpoint is never
+    /// accepted on its own: `bins/AGENTS.md` forbids inferring process
+    /// ownership from a port, so the endpoint is only ever read as a property
+    /// of the admitted artifact digest below.
+    #[must_use]
+    pub fn authorizes_endpoint_for(
+        &self,
+        installation_id: &str,
+        bridge_artifact_digest: &str,
+    ) -> bool {
+        self.installation_id == installation_id
+            && self.bridge_artifact_digest == bridge_artifact_digest
+    }
+}
+
+/// Mint inputs for [`OpenCodeBridgeProcessProjection::compose`]: exactly the
+/// values the **broker** observes about itself and about the child it is about
+/// to start. The activation generation, the activation fence nonce and the
+/// authorized endpoint are deliberately absent: they are read from the
+/// [`OpenCodeBridgeOwnerGrant`], so no caller scalar can stand in for them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeProcessProjectionParams {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub authority_epoch: EpochId,
+    /// The live Kernel registration fence this launch is admitted under.
+    pub registration_fence_id: String,
+    pub broker_generation: Generation,
+    /// Broker-minted server identity (lowercase SHA-256 hex) held in the
+    /// broker's own secret table. It is minted, never derived from the
+    /// endpoint, so a process that merely bound the pinned port cannot mint
+    /// the first-contact identity proof.
+    pub server_identity: String,
+    /// Protected bootstrap channel (named-pipe name), or `None` to select the
+    /// exclusively pre-bound listener path.
+    pub bootstrap_channel: Option<String>,
+    pub credential: SecretRef,
+    pub credential_expires_at: u64,
+    pub allowed_capabilities: Vec<String>,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revocation_id: String,
+    pub process_binding: OpenCodeProcessBinding,
+}
+
 /// Mint parameters for [`OpenCodeBridgeIntroduction`]. Every field is
 /// broker-observed owner state; nothing is copied from `OpenCode` input.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5282,6 +5561,80 @@ impl OpenCodeBridgeProcessProjection {
         let facts = self.session_facts.facts()?;
         self.introduction.probe_current_session(&facts)?;
         Ok(facts)
+    }
+
+    /// Mints the one child projection of one admitted `OpenCode` bridge
+    /// launch (issue #2898, steps 1 and 2).
+    ///
+    /// This is the **only** producer of [`OpenCodeBridgeIntroduction`]. It
+    /// reads the three fields a launch-time producer cannot observe for itself
+    /// — the activation generation, the activation fence nonce and the
+    /// authorized loopback endpoint — from `owner`, the Kernel's own grant, and
+    /// takes everything else from `params`, the broker-observed facts. The
+    /// introduction is therefore never minted from a caller scalar, and the
+    /// endpoint is never a bare port: `owner` also names the admitted bridge
+    /// artifact digest that authorizes it.
+    ///
+    /// The grant is verified, never trusted: version, shape, digest binding and
+    /// window, then an exact join against the broker's own installation, SID,
+    /// logon session, authority epoch and live registration fence. A grant
+    /// minted for another registration or another session is refused here with
+    /// the existing typed [`BrokerError`] set rather than producing a
+    /// projection that no bridge could admit.
+    pub fn compose(
+        owner: &OpenCodeBridgeOwnerGrant,
+        params: OpenCodeProcessProjectionParams,
+    ) -> Result<Self, BrokerError> {
+        owner.validate(params.issued_at)?;
+        if owner.installation_id != params.installation_id
+            || owner.windows_sid != params.windows_sid
+            || owner.interactive_session_id != params.interactive_session_id
+            || owner.registration_fence_id != params.registration_fence_id
+            || !owner
+                .authority_epoch
+                .is_same_authority(&params.authority_epoch)
+        {
+            return Err(BrokerError::StaleRegistrationIdentity);
+        }
+        let introduction = OpenCodeBridgeIntroduction::mint(OpenCodeIntroductionParams {
+            installation_id: params.installation_id,
+            windows_sid: params.windows_sid,
+            interactive_session_id: params.interactive_session_id,
+            broker_generation: params.broker_generation,
+            bridge_generation: owner.activation_generation,
+            endpoint: owner.authorized_endpoint.clone(),
+            server_identity: params.server_identity,
+            bootstrap_channel: params.bootstrap_channel,
+            credential: params.credential,
+            credential_expires_at: params.credential_expires_at,
+            allowed_capabilities: params.allowed_capabilities,
+            authority_epoch: owner.authority_epoch.clone(),
+            fence_id: owner.activation_fence_nonce.clone(),
+            issued_at: params.issued_at,
+            expires_at: params.expires_at,
+            revocation_id: params.revocation_id,
+            process_binding: params.process_binding,
+        })?;
+        // The broker-observed facts are projected from the minted introduction
+        // itself, so a projection can never pair one introduction with another
+        // launch's facts: there is one value, not two stores.
+        let session_facts = OpenCodeSessionFactsProjection {
+            installation_id: introduction.installation_id.clone(),
+            windows_sid: introduction.windows_sid.clone(),
+            interactive_session_id: introduction.interactive_session_id.clone(),
+            broker_generation: introduction.broker_generation.get(),
+            bridge_generation: introduction.bridge_generation.get(),
+            launch_nonce: introduction.process_binding.launch_nonce.clone(),
+            executable_digest: introduction.process_binding.executable_digest.clone(),
+        };
+        let projection = Self {
+            introduction,
+            session_facts,
+        };
+        // Re-read the composed projection through its own closed validator, so a
+        // composed value that no serving process could admit is never returned.
+        projection.facts(params.issued_at)?;
+        Ok(projection)
     }
 }
 

@@ -402,7 +402,17 @@ impl<'runner> BridgeHostEventAdmission<'runner> {
                 HostEventAdmissionFailure::StaleEpoch,
             ));
         }
-        if fence.nonce() != introduction.fence_id {
+        // The introduction's `fence_id` and `bridge_generation` are the
+        // activation generation and per-activation fence nonce the Kernel
+        // published on the admitted launch and then installed on this very
+        // activation. Both halves are compared here, in the same join and under
+        // the same typed refusal as the nonce, so a forged or stale introduction
+        // is refused before durable admission instead of only at the serving
+        // loop's first iteration. This strengthens the existing comparison; it
+        // is not a second mechanism.
+        if fence.nonce() != introduction.fence_id
+            || fence.generation().get() != introduction.bridge_generation.get()
+        {
             return Err(HostEventAdmissionError::of(
                 HostEventAdmissionFailure::Fenced,
             ));
