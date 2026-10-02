@@ -391,7 +391,19 @@ fn fixture() -> Fixture {
             owner: OwnerId::from_artifact(aid("owner-add")),
             source_role: CampaignSourceRole::ArtifactProjection,
             target: targets[0].clone(),
-            requirement: SlotRequirement::Optional,
+            // This slot's projection is `KnownEmpty` with owner evidence and no
+            // declared members. Under `Optional`, `derive_slot_completeness`
+            // routes the slot through `classify_optional_disposition`, which has
+            // no evidenced-empty carve-out and derives `Partial`. The view then
+            // declares `CompleteForDeclaredRecipe`, and `validate_against`
+            // refuses the mismatch as `IncompleteCoverage`
+            // (state_view.rs `validate_against`). `Required` routes the same
+            // evidenced-empty shape through `classify_required_disposition_contract`,
+            // which treats an owner-evidenced empty declaration as complete, so
+            // the declared completeness is derivable. The composer's `Add` path
+            // requires exactly this `KnownEmpty` projection, so `Required` is
+            // also the only declaration under which an `Add` is lawful.
+            requirement: SlotRequirement::Required,
             declared_members: vec![],
             accepted_type: "verification/v1".to_owned(),
             schema_digest: digest("schema-add"),
@@ -901,6 +913,31 @@ fn resealed_view(
 ) -> CampaignLearningStateView {
     let mut next = view.clone();
     mutate(&mut next);
+    next.seal_content_addressed().expect("view reseal");
+    next
+}
+
+/// Record the `Optional` `target-replace` slot as an explicit owner omission, so
+/// the view genuinely declares less than the recipe's full coverage instead of
+/// merely relabelling a complete view.
+fn omitted_replace_slot(view: &CampaignLearningStateView) -> CampaignLearningStateView {
+    let mut next = view.clone();
+    let replaced = next.slots.remove(1);
+    next.omissions.push(replaced.slot_id);
+    next.denominator.observed = 2;
+    next.seal_content_addressed().expect("view reseal");
+    next
+}
+
+/// A view whose declared `Partial` completeness is genuinely derivable: the
+/// `Optional` `target-replace` slot is unprojected and carried in the frontier,
+/// which `derive_slot_completeness` classifies as open (partial) coverage.
+fn genuinely_partial_view(view: &CampaignLearningStateView) -> CampaignLearningStateView {
+    let mut next = view.clone();
+    let replaced = next.slots.remove(1);
+    next.frontier.push(replaced.slot_id);
+    next.denominator.observed = 2;
+    next.completeness = Completeness::Partial;
     next.seal_content_addressed().expect("view reseal");
     next
 }
@@ -2050,9 +2087,7 @@ fn case_22_missing_wrong_revision_cycle_partial_dependency_closure() {
             field: "delta.dependencies"
         })
     ));
-    let partial = resealed_view(&fixture.view, |view| {
-        view.completeness = Completeness::Partial;
-    });
+    let partial = genuinely_partial_view(&fixture.view);
     let (add, add_inverse) = operation_add(&fixture.targets[0], "partial");
     let partial_delta = delta(&partial, "partial", add, add_inverse);
     let pairs = admitted(std::slice::from_ref(&partial_delta));
@@ -2464,9 +2499,7 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
     let fixture = fixture();
     let (_, complete) = full_candidate(&fixture);
     assert_eq!(complete.changes.len(), 3);
-    let partial = resealed_view(&fixture.view, |view| {
-        view.completeness = Completeness::Partial;
-    });
+    let partial = genuinely_partial_view(&fixture.view);
     let (add, add_inverse) = operation_add(&fixture.targets[0], "partial-denominator");
     let partial_delta = delta(&partial, "partial-denominator", add, add_inverse);
     let pairs = admitted(std::slice::from_ref(&partial_delta));
@@ -2500,11 +2533,10 @@ fn case_34_complete_and_partial_delta_surface_dependency_denominators() {
         compose_campaign_harness_overlay(&input(&miscounted_fixture, &[miscounted_delta], &pairs,)),
         Err(OverlayError::Contract(Contract::IncompleteCoverage))
     ));
-    let omitted = resealed_view(&fixture.view, |view| {
-        let removed = view.slots.remove(0);
-        view.omissions.push(removed.slot_id);
-        view.denominator.observed = 2;
-    });
+    // `SlotRequirement::Optional` for `target-replace`, so its omission is a legal
+    // partition and the derived completeness stays `CompleteForDeclaredRecipe`;
+    // the composer's own `view.omissions` refusal is what is under test.
+    let omitted = omitted_replace_slot(&fixture.view);
     let (add, add_inverse) = operation_add(&fixture.targets[0], "omitted");
     let omitted_delta = delta(&omitted, "omitted", add, add_inverse);
     let pairs = admitted(std::slice::from_ref(&omitted_delta));
@@ -2612,11 +2644,9 @@ fn case_35_every_independent_item_output_work_bound_and_frontier() {
             field: "view.invalidation_reason"
         })
     ));
-    let unexplored = resealed_view(&fixture.view, |view| {
-        let removed = view.slots.remove(0);
-        view.frontier.push(removed.slot_id);
-        view.denominator.observed = 2;
-    });
+    // A frontiered slot is open coverage, so the declared `Partial` completeness
+    // here is genuinely derivable rather than a relabelled complete view.
+    let unexplored = genuinely_partial_view(&fixture.view);
     let (add, add_inverse) = operation_add(&fixture.targets[0], "unexplored");
     let unexplored_delta = delta(&unexplored, "unexplored", add, add_inverse);
     let pairs = admitted(std::slice::from_ref(&unexplored_delta));

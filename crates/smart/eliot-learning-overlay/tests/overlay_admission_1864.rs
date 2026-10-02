@@ -358,6 +358,26 @@ fn bind_slot_source_contract(
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
+                digest: digest.clone(),
+            });
+        // The declared source binding for this role is `ExactReference`, and
+        // `matches_current_source_reference` admits a `Current` resolution only
+        // when `requirement.expected_reference == Some(reference)`. Binding the
+        // projected slot payload into the requirement alone therefore publishes
+        // a reference the requirement does not declare, and
+        // `validate_slot_projections` reads the same digest from the resolved
+        // reference. Both sides must carry the identical entry.
+        provenance
+            .source_resolutions
+            .iter_mut()
+            .find(|resolution| resolution.role == spec.source_role)
+            .expect("slot source role is resolved")
+            .reference
+            .as_mut()
+            .expect("slot source has an exact current reference")
+            .slot_projection_digests
+            .push(CampaignSlotProjectionDigest {
+                slot_id: projection.slot_id.clone(),
                 digest,
             });
     }
@@ -372,7 +392,14 @@ fn fixture() -> Fixture {
         owner: OwnerId::from_artifact(aid("owner-1864")),
         source_role: CampaignSourceRole::ArtifactProjection,
         target: target.clone(),
-        requirement: SlotRequirement::Optional,
+        // The composer admits only `CompleteForDeclaredRecipe` views, and this
+        // projection is `KnownEmpty` with owner evidence and no declared
+        // members. Under `Optional`, `classify_optional_disposition` derives
+        // `Completeness::Partial` for that shape, so the fixture's declared
+        // completeness would be underivable. `Required` routes the same shape
+        // through `classify_required_disposition_contract`, which treats an
+        // evidenced empty declaration as complete.
+        requirement: SlotRequirement::Required,
         declared_members: vec![],
         accepted_type: "verification/v1".to_owned(),
         schema_digest: digest("schema-1864"),
