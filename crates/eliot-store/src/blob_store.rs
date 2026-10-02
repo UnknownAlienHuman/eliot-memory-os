@@ -5,8 +5,8 @@
 use crate::StoreError;
 use crate::blob_validation::{expected_blob_relative_path, validate_blob_ref};
 use crate::error::{
-    StorageCleanup, StorageExhausted, StorageExhaustedEffect, StorageExhaustedRetry,
-    StorageExhaustedStage, StorageIoCause,
+    StorageCleanup, StorageCleanupFailed, StorageExhausted, StorageExhaustedEffect,
+    StorageExhaustedRetry, StorageExhaustedStage, StorageIoCause,
 };
 use eliot_types::secret_boundary::MAX_SECRET_BOUNDARY_BYTES;
 use eliot_types::{
@@ -320,20 +320,12 @@ impl BlobStore {
     }
 
     fn handle_put_failure(&self, failure: PutFailure<'_>) -> Result<BlobRef, StoreError> {
+        // One cleanup observation per failed attempt, whatever the primary
+        // classification is. A failed removal of a staging artifact this
+        // attempt created is additional evidence: it cannot be made harmless
+        // by a different original error kind, and it must never be discarded.
+        let cleanup = cleanup_owned_temp(failure.temp_path, failure.temp_owned);
         if is_storage_capacity(&failure.error) {
-            let cleanup = if failure.temp_owned {
-                match std::fs::remove_file(failure.temp_path) {
-                    Ok(()) => StorageCleanup::Removed,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        StorageCleanup::Absent
-                    }
-                    Err(error) => {
-                        StorageCleanup::Failed(StorageIoCause::new(error, native_namespace()))
-                    }
-                }
-            } else {
-                StorageCleanup::NotAttempted
-            };
             return Err(storage_exhausted(
                 StorageExhaustedDetails {
                     operation: "blob.put_bytes",
@@ -347,8 +339,26 @@ impl BlobStore {
                 failure.error,
             ));
         }
-        if failure.temp_owned {
-            let _ = std::fs::remove_file(failure.temp_path);
+        if let StorageCleanup::Failed(cleanup_cause) = cleanup {
+            // Non-capacity primary failure plus a failed owned cleanup. The
+            // readback may still record that this exact content is available
+            // at the destination, but content availability is not proof that
+            // this attempt's staging cleanup succeeded, so neither cause nor
+            // publication uncertainty may be erased by the success branch.
+            let destination_available =
+                failure.path.exists() && self.read_verified(failure.blob).is_ok();
+            return Err(StorageCleanupFailed {
+                operation: "blob.put_bytes",
+                stage: failure.stage,
+                storage_identity: storage_identity(&self.root),
+                local_attempt_id: Some(failure.attempt_id.to_owned()),
+                attempted_bytes: failure.attempted_bytes,
+                effect: legacy_stage_effect(failure.stage),
+                cleanup: cleanup_cause,
+                destination_available,
+                cause: StorageIoCause::new(failure.error, native_namespace()),
+            }
+            .into());
         }
         if failure.path.exists() {
             self.read_verified(failure.blob)?;
@@ -721,6 +731,25 @@ fn native_namespace() -> &'static str {
     std::env::consts::OS
 }
 
+/// Removes the per-attempt staging artifact and reports what was observed.
+///
+/// Executed at most once per failed attempt, independent of the primary error
+/// classification, so a cleanup result can never be lost by a non-capacity
+/// branch. Ownership decides whether the path may be touched at all: a path
+/// this attempt did not create stays `NotAttempted`, and an already-absent
+/// owned path is `Absent`, never a failure. Every other native outcome is a
+/// `Failed` cause with the same redaction as the primary capacity evidence.
+fn cleanup_owned_temp(temp_path: &Path, owned: bool) -> StorageCleanup {
+    if !owned {
+        return StorageCleanup::NotAttempted;
+    }
+    match std::fs::remove_file(temp_path) {
+        Ok(()) => StorageCleanup::Removed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => StorageCleanup::Absent,
+        Err(error) => StorageCleanup::Failed(StorageIoCause::new(error, native_namespace())),
+    }
+}
+
 /// POSIX capacity errno observed through the legacy local write path.
 /// Numeric precedent (read-only): `crates/storage/eliot-blob/src/lib.rs`
 /// pins the same value for the current provider; the legacy donor keeps its
@@ -1003,7 +1032,10 @@ pub(crate) fn verify_canonical_memory_child_set(
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStore, CanonicalMemoryStagedRecord, verify_canonical_memory_child_set};
+    use super::{
+        BlobStore, CanonicalMemoryStagedRecord, cleanup_owned_temp, native_namespace,
+        verify_canonical_memory_child_set,
+    };
     use crate::StoreError;
     use crate::error::{
         StorageCleanup, StorageExhaustedEffect, StorageExhaustedRetry, StorageExhaustedStage,
@@ -1196,6 +1228,247 @@ mod tests {
         // Release the root lease before removing the scratch root: the live
         // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
         // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    /// Creates a staging path that `remove_file` provably cannot remove on
+    /// this platform, so a real native cleanup failure is produced without
+    /// filling a volume. A directory is never deleted by `cleanup_owned_temp`.
+    fn undeletable_staging_path(path: &std::path::Path) -> std::io::Result<std::io::ErrorKind> {
+        std::fs::create_dir(path)?;
+        let kind = std::fs::remove_file(path)
+            .err()
+            .map_or(std::io::ErrorKind::NotFound, |error| error.kind());
+        Ok(kind)
+    }
+
+    #[test]
+    fn cleanup_owned_temp_reports_removal_absent_and_unowned_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-cleanup-owned-temp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        let owned = temp_dir.join("blob-stage-owned");
+        std::fs::write(&owned, b"staged bytes")?;
+        // POSITIVE: an owned staging artifact is removed and reported as such.
+        assert!(matches!(
+            cleanup_owned_temp(&owned, true),
+            StorageCleanup::Removed
+        ));
+        assert!(!owned.exists());
+
+        // POSITIVE: an already-absent owned path is `Absent`, never a failure.
+        assert!(matches!(
+            cleanup_owned_temp(&owned, true),
+            StorageCleanup::Absent
+        ));
+
+        // REFUSAL: a predictable staging name is not ownership. The
+        // unowned path must not be touched at all.
+        let unowned = temp_dir.join("blob-stage-unowned");
+        std::fs::write(&unowned, b"preexisting bytes")?;
+        assert!(matches!(
+            cleanup_owned_temp(&unowned, false),
+            StorageCleanup::NotAttempted
+        ));
+        assert_eq!(std::fs::read(&unowned)?, b"preexisting bytes");
+
+        // REFUSAL: a real removal failure is retained as typed evidence.
+        let blocked = temp_dir.join("blob-stage-blocked");
+        let blocked_kind = undeletable_staging_path(&blocked)?;
+        let StorageCleanup::Failed(cause) = cleanup_owned_temp(&blocked, true) else {
+            return Err("a failed owned cleanup was reported as a success".into());
+        };
+        assert_eq!(cause.kind(), blocked_kind);
+        assert_eq!(cause.namespace(), native_namespace());
+        assert!(blocked.is_dir());
+
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn noncapacity_failure_with_failed_cleanup_keeps_both_causes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-cleanup-compound-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = BlobStore::open(&BlobStoreConfig {
+            root: temp_dir.display().to_string(),
+        })?;
+        let blob = store.put_bytes(b"cleanup compound")?;
+        let destination = store.blob_path(&blob);
+
+        // The audit counterexample: a non-capacity rename failure whose owned
+        // staging cleanup then also fails, with a verifying destination. The
+        // outcome must be a non-success retaining both causes.
+        let blocked = destination.with_extension("blob-stage-blocked-present");
+        let blocked_kind = undeletable_staging_path(&blocked)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &blocked,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-5",
+            temp_owned: true,
+            stage: StorageExhaustedStage::Rename,
+            attempted_bytes: Some(blob.size_bytes),
+            error: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private native rename detail",
+            ),
+        });
+        let Err(StoreError::StorageCleanupFailed(error)) = result else {
+            return Err(
+                "a failed staging cleanup was erased by the matching-destination success".into(),
+            );
+        };
+        // The primary failure keeps its own kind: cleanup running out of space
+        // never relabels the rename error as capacity exhaustion.
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.cleanup.kind(), blocked_kind);
+        assert_eq!(error.stage, StorageExhaustedStage::Rename);
+        assert_eq!(error.effect, StorageExhaustedEffect::PossiblePublication);
+        assert_eq!(error.operation, "blob.put_bytes");
+        assert_eq!(error.local_attempt_id.as_deref(), Some("local-attempt-5"));
+        assert_eq!(error.attempted_bytes, Some(blob.size_bytes));
+        assert_eq!(error.cause.namespace(), native_namespace());
+        assert_eq!(error.cleanup.namespace(), native_namespace());
+        assert!(std::error::Error::source(&error.cleanup).is_none());
+        assert!(error.destination_available, "verified content availability is still recorded");
+        // Diagnostics reveal no configured root and no native message.
+        let debug = format!("{error:?}");
+        assert!(!debug.contains(&temp_dir.display().to_string()));
+        assert!(!debug.contains("private native rename detail"));
+        assert!(debug.contains(&error.storage_identity));
+        // The destination is never deleted and never republished.
+        assert!(destination.exists());
+        assert_eq!(std::fs::read(&destination)?, b"cleanup compound");
+        assert!(blocked.is_dir());
+        std::fs::remove_dir_all(&blocked)?;
+
+        // REFUSAL: with the destination absent the compound still refuses
+        // success and still carries both causes plus publication uncertainty.
+        std::fs::remove_file(&destination)?;
+        let blocked = destination.with_extension("blob-stage-blocked-absent");
+        let blocked_kind = undeletable_staging_path(&blocked)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &blocked,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-6",
+            temp_owned: true,
+            stage: StorageExhaustedStage::PayloadWrite,
+            attempted_bytes: Some(blob.size_bytes),
+            error: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private native write detail",
+            ),
+        });
+        let Err(StoreError::StorageCleanupFailed(error)) = result else {
+            return Err("an absent destination turned a failed cleanup into a success".into());
+        };
+        assert!(!error.destination_available);
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.cleanup.kind(), blocked_kind);
+        assert_eq!(error.stage, StorageExhaustedStage::PayloadWrite);
+        assert_eq!(error.effect, StorageExhaustedEffect::StagedUnknown);
+        assert_eq!(error.local_attempt_id.as_deref(), Some("local-attempt-6"));
+        std::fs::remove_dir_all(&blocked)?;
+
+        // Release the root lease before removing the scratch root: the live
+        // `.eliot-root.lock` handle (#19) cannot be deleted on Windows while
+        // the store holds it (ERROR_SHARING_VIOLATION, OS code 32).
+        drop(store);
+        std::fs::remove_dir_all(temp_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn noncapacity_failure_with_removed_staging_keeps_legacy_variants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "eliot-cleanup-legacy-variant-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = BlobStore::open(&BlobStoreConfig {
+            root: temp_dir.display().to_string(),
+        })?;
+        let blob = store.put_bytes(b"legacy variant")?;
+        let destination = store.blob_path(&blob);
+
+        // POSITIVE: a successful owned cleanup plus a verifying destination
+        // keeps the legacy matching-destination success, unchanged.
+        let staged = destination.with_extension("blob-stage-removed");
+        std::fs::write(&staged, b"staged bytes")?;
+        let recovered = store.handle_put_failure(super::PutFailure {
+            temp_path: &staged,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-7",
+            temp_owned: true,
+            stage: StorageExhaustedStage::Rename,
+            attempted_bytes: Some(blob.size_bytes),
+            error: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private native rename detail",
+            ),
+        })?;
+        assert_eq!(recovered, blob);
+        assert!(!staged.exists());
+
+        // REFUSAL: without a destination, a non-capacity primary with no
+        // cleanup work stays the plain legacy `StoreError::Io` family.
+        std::fs::remove_file(&destination)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &destination.with_extension("blob-stage-absent"),
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-8",
+            temp_owned: false,
+            stage: StorageExhaustedStage::TempCreate,
+            attempted_bytes: None,
+            error: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private native create detail",
+            ),
+        });
+        let Err(StoreError::Io(error)) = result else {
+            return Err("an ordinary non-capacity failure changed its legacy family".into());
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // REFUSAL: a primary capacity failure with a failed owned cleanup
+        // still returns the typed capacity error with the original cause.
+        let blocked = destination.with_extension("blob-stage-capacity");
+        undeletable_staging_path(&blocked)?;
+        let result = store.handle_put_failure(super::PutFailure {
+            temp_path: &blocked,
+            path: &destination,
+            blob: &blob,
+            attempt_id: "local-attempt-9",
+            temp_owned: true,
+            stage: StorageExhaustedStage::Rename,
+            attempted_bytes: Some(blob.size_bytes),
+            error: std::io::Error::new(std::io::ErrorKind::StorageFull, "primary capacity"),
+        });
+        let Err(StoreError::StorageExhausted(error)) = result else {
+            return Err("a capacity primary failure lost its typed result".into());
+        };
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::StorageFull);
+        assert!(matches!(&error.cleanup, StorageCleanup::Failed(_)));
+        assert_eq!(
+            error.effect,
+            StorageExhaustedEffect::PossiblePublication,
+            "publication uncertainty is retained"
+        );
+        std::fs::remove_dir_all(&blocked)?;
+
         drop(store);
         std::fs::remove_dir_all(temp_dir)?;
         Ok(())

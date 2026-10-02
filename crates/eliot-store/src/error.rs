@@ -178,6 +178,82 @@ impl From<StorageExhausted> for StoreError {
     }
 }
 
+/// Compound legacy write failure: the primary non-capacity durable-write
+/// failure together with a separately observed failure of the staging-path
+/// cleanup that the very same attempt owned.
+///
+/// The primary `cause` keeps its own kind and stage. A cleanup failure is
+/// additional evidence and never relabels the original permission/rename
+/// error as capacity exhaustion (I2.6 causal chain, known/unknown effect
+/// status). `effect` is the same publication status the primary failure
+/// would carry, and `destination_available` records that the
+/// existing-destination readback proved this exact content is already
+/// stored there. Debug and Display stay bounded and never include a
+/// configured path, a payload, or a native message.
+pub struct StorageCleanupFailed {
+    /// Local operation name, such as `blob.put_bytes`.
+    pub operation: &'static str,
+    /// Filesystem stage of the primary write failure.
+    pub stage: StorageExhaustedStage,
+    /// Redacted hash of the configured storage-root identity.
+    pub storage_identity: String,
+    /// Per-attempt staging token when one exists.
+    pub local_attempt_id: Option<String>,
+    /// Buffer bytes offered to the write call, not committed bytes.
+    pub attempted_bytes: Option<u64>,
+    /// Known/unknown publication status of the primary failure.
+    pub effect: StorageExhaustedEffect,
+    /// Redacted native cause of the failed staging cleanup, kept separate
+    /// from the primary `cause`.
+    pub cleanup: StorageIoCause,
+    /// Whether the readback proved the canonical destination already held
+    /// this exact content.
+    pub destination_available: bool,
+    /// Redacted native cause of the primary write failure.
+    pub cause: StorageIoCause,
+}
+
+impl fmt::Debug for StorageCleanupFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageCleanupFailed")
+            .field("operation", &self.operation)
+            .field("stage", &self.stage)
+            .field("storage_identity", &self.storage_identity)
+            .field("local_attempt_id", &self.local_attempt_id)
+            .field("attempted_bytes", &self.attempted_bytes)
+            .field("effect", &self.effect)
+            .field("cleanup", &self.cleanup)
+            .field("destination_available", &self.destination_available)
+            .field("cause", &self.cause)
+            .finish()
+    }
+}
+
+impl fmt::Display for StorageCleanupFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "legacy storage write failed during {} at {:?} ({:?}); owned staging cleanup failed",
+            self.operation, self.stage, self.effect
+        )
+    }
+}
+
+impl std::error::Error for StorageCleanupFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The primary cause is the causal-chain head; the cleanup cause stays
+        // reachable through the bounded `cleanup` field.
+        Some(&self.cause)
+    }
+}
+
+impl From<StorageCleanupFailed> for StoreError {
+    fn from(error: StorageCleanupFailed) -> Self {
+        Self::StorageCleanupFailed(Box::new(error))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -189,6 +265,11 @@ pub enum StoreError {
     /// A legacy local blob operation observed native storage exhaustion.
     #[error(transparent)]
     StorageExhausted(#[from] Box<StorageExhausted>),
+
+    /// A legacy local blob write failed for a non-capacity reason and the
+    /// staging-path cleanup owned by that same attempt failed as well.
+    #[error(transparent)]
+    StorageCleanupFailed(#[from] Box<StorageCleanupFailed>),
 
     #[error(transparent)]
     RedbCommit(#[from] redb::CommitError),
@@ -283,9 +364,74 @@ impl StoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        StorageCleanup, StorageExhausted, StorageExhaustedEffect, StorageExhaustedRetry,
-        StorageExhaustedStage, StorageIoCause, StoreError,
+        StorageCleanup, StorageCleanupFailed, StorageExhausted, StorageExhaustedEffect,
+        StorageExhaustedRetry, StorageExhaustedStage, StorageIoCause, StoreError,
     };
+
+    fn cleanup_failed_fixture() -> StorageCleanupFailed {
+        StorageCleanupFailed {
+            operation: "blob.put_bytes",
+            stage: StorageExhaustedStage::Rename,
+            storage_identity: "root-blake3:fixture-identity".to_owned(),
+            local_attempt_id: Some("local-attempt-9".to_owned()),
+            attempted_bytes: Some(11),
+            effect: StorageExhaustedEffect::PossiblePublication,
+            cleanup: StorageIoCause::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "native cleanup detail with C:\\configured\\root must stay private",
+                ),
+                std::env::consts::OS,
+            ),
+            destination_available: true,
+            cause: StorageIoCause::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "native rename detail must stay private",
+                ),
+                std::env::consts::OS,
+            ),
+        }
+    }
+
+    #[test]
+    fn cleanup_compound_keeps_the_primary_and_cleanup_causes_separate() {
+        let fixture = cleanup_failed_fixture();
+        let StoreError::StorageCleanupFailed(error) = StoreError::from(fixture) else {
+            panic!("the compound cleanup failure changed family");
+        };
+        // A cleanup that ran out of space must not relabel the primary
+        // permission/rename error as storage exhaustion.
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.cleanup.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(error.stage, StorageExhaustedStage::Rename);
+        assert_eq!(error.effect, StorageExhaustedEffect::PossiblePublication);
+        assert_eq!(error.local_attempt_id.as_deref(), Some("local-attempt-9"));
+        assert_eq!(error.attempted_bytes, Some(11));
+        assert!(error.destination_available);
+    }
+
+    #[test]
+    fn cleanup_compound_rendering_exposes_no_native_detail() {
+        let error = cleanup_failed_fixture();
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        assert!(display.contains("blob.put_bytes"));
+        assert!(!display.contains("native rename detail"));
+        assert!(!display.contains("native cleanup detail"));
+        assert!(!debug.contains("native rename detail"));
+        assert!(!debug.contains("native cleanup detail"));
+        assert!(!debug.contains("C:\\configured\\root"));
+        assert!(debug.contains("root-blake3:fixture-identity"));
+        let Some(source) = std::error::Error::source(&error) else {
+            panic!("compound failure lost its primary cause");
+        };
+        assert_eq!(
+            source.to_string(),
+            format!("{}", error.cause),
+            "the causal-chain head is the primary cause, not the cleanup cause"
+        );
+    }
 
     fn exhausted_fixture() -> StorageExhausted {
         StorageExhausted {
