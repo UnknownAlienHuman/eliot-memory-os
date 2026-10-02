@@ -832,9 +832,13 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // and the count of readiness evidence references it carried. The
         // activation nonce digest and the evidence reference handles
         // themselves stay with the journal record.
+        // The record identity is bound to a named local first, so the slots it
+        // projects below borrow that binding for the whole statement instead of
+        // a temporary that would be dropped at the end of this `let`. The slots
+        // and their order are otherwise exactly what the record already binds.
+        let identity = ActivationRecordIdentity::new(&self.current);
         let evidence_fields = [
-            ActivationRecordIdentity::new(&self.current)
-                .with_journal_and_candidate(&active_receipt),
+            identity.with_journal_and_candidate(&active_receipt),
             vec![
                 (
                     "permit_operation",
