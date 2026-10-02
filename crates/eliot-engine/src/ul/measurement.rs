@@ -57,23 +57,25 @@ mod tests {
 
     /// The positive discriminator for #783.
     ///
-    /// The payload is 20 three-byte UTF-8 characters, so its UTF-8 byte length
-    /// is 60 while its character count is 20. Measuring bytes is what widens
-    /// the gap against the retired local `ceil(bytes / 4)`: the canonical
-    /// value is 20 and the retired expression would have returned 15, so this
-    /// assertion cannot pass against the old implementation. A character-count
-    /// estimator would instead return 5, so it cannot pass either.
+    /// The payload is 20 two-byte UTF-8 characters (U+00E9 LATIN SMALL LETTER
+    /// E WITH ACUTE, `C3 A9`), so its UTF-8 byte length is 40 while its
+    /// character count is 20. Measuring bytes is what separates the canonical
+    /// value from the retired local `ceil(bytes / 4)`: the canonical value is
+    /// `ceil(40 / 3)` = 14 and the retired expression would have returned
+    /// `ceil(40 / 4)` = 10, so this assertion cannot pass against the old
+    /// implementation. A character-count estimator would instead return
+    /// `ceil(20 / 3)` = 7, so it cannot pass either.
     #[test]
     fn multi_byte_payload_measures_the_canonical_thirds_not_quarters() {
         let payload = "\u{00e9}".repeat(20);
         assert_eq!(payload.chars().count(), 20);
-        assert_eq!(payload.len(), 60);
+        assert_eq!(payload.len(), 40);
 
-        let units = ul_token_estimate(&payload).expect("a 60-byte payload is measurable");
-        assert_eq!(units, 20);
-        assert_eq!(ul_token_estimate_for_bytes(60).expect("measurable"), 20);
-        assert_ne!(units, 60_u32.div_ceil(4), "the retired /4 ratio is still live");
-        assert_ne!(units, 20_u32.div_ceil(4), "a character count is not a byte length");
+        let units = ul_token_estimate(&payload).expect("a 40-byte payload is measurable");
+        assert_eq!(units, 14);
+        assert_eq!(ul_token_estimate_for_bytes(40).expect("measurable"), 14);
+        assert_ne!(units, 40_u32.div_ceil(4), "the retired /4 ratio is still live");
+        assert_ne!(units, 20_u32.div_ceil(3), "a character count is not a byte length");
     }
 
     /// The refusal discriminator for #783.
