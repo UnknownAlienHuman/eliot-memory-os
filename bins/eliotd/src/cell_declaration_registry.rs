@@ -662,6 +662,30 @@ mod tests {
     }
 
     #[test]
+    fn a_contract_cell_the_manifest_does_not_declare_is_undeclared_contract_cell() {
+        // Arm: the real generated contract block projects a ninth cell that the
+        // real manifest never declares. Every manifest cell is still projected
+        // with the same owner, so the forward pass succeeds; the reverse pass
+        // is the only thing that catches a projection with no declaration
+        // behind it, and it must refuse and name the invented cell.
+        let contract = add_contract_cell(
+            "governor.daemon.fabricated",
+            "eliotd::FabricatedMutableStateOwner",
+        );
+
+        let Err(error) = compiled_table_drift_over(MANIFEST_TEXT, &contract) else {
+            panic!("a contract projection with no manifest declaration must not pass");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::UndeclaredContractCell {
+                cell: "governor.daemon.fabricated".to_owned(),
+            },
+            "the typed refusal must name the projected cell the manifest omits"
+        );
+    }
+
+    #[test]
     fn a_declared_cell_the_contract_does_not_project_is_missing_contract_cell() {
         // Arm: the real manifest declares a tenth cell that the real generated
         // contract block does not project. Refs and owner rows still agree and
