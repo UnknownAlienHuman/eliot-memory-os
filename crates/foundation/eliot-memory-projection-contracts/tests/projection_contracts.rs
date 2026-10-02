@@ -252,9 +252,41 @@ fn unknown_denominator_stays_representable() {
     candidate.coverage.denominator = DenominatorState::Unknown {
         reason: "read side could not count".to_owned(),
     };
+    // The positive half of the unknown-denominator rule, and the reason the
+    // rule is a ceiling rather than a refusal: the state remains expressible.
+    // What it may not do is travel beside a closed revalidation claim, because
+    // that is the one combination that reads as a complete read nobody can
+    // prove is complete.
+    candidate.coverage.revalidation_required = true;
     candidate
         .validate()
         .expect("unknown denominator is explicit, not invalid");
+}
+
+#[test]
+fn an_unknown_denominator_may_not_close_revalidation() {
+    // The same batch as `unknown_denominator_stays_representable` with the
+    // revalidation flag dropped. Nothing is truncated and nothing is omitted,
+    // so the previous rule had no term to fire on, and the batch passed while
+    // asserting both that it could not count its observed population and that
+    // the consumer therefore had nothing to revalidate. That is the frozen
+    // `ProjectionCoverage` note read backwards: "Unknown stays representable
+    // but no consumer may read it as completeness." Substituting the returned
+    // record count for the missing denominator would be the same claim with a
+    // number attached, which is why the fix requires the ceiling instead.
+    let mut candidate = batch();
+    candidate.coverage.denominator = DenominatorState::Unknown {
+        reason: "read side could not count".to_owned(),
+    };
+    let error = candidate
+        .validate()
+        .expect_err("an unprovable denominator cannot claim no revalidation");
+    assert!(matches!(
+        error,
+        eliot_memory_projection_contracts::MemoryProjectionError::CoverageMismatch {
+            reason: "an unknown denominator requires revalidation",
+        }
+    ));
 }
 
 #[test]

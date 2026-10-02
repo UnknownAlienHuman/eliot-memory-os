@@ -464,6 +464,11 @@ fn unknown_denominator_fails_closed() {
     batch_value.coverage.denominator = DenominatorState::Unknown {
         reason: "read-side recount pending".to_owned(),
     };
+    // The batch owner requires an unprovable denominator to carry its
+    // revalidation ceiling, so the fixture is honest. The refusal under test is
+    // still the assessment owner's: it reports the absent denominator as its
+    // own typed error rather than admitting the batch's projected count.
+    batch_value.coverage.revalidation_required = true;
     let applicable = set_for(&batch_value, &[], &[], None);
     let candidate = QualityRequest {
         batch: batch_value,

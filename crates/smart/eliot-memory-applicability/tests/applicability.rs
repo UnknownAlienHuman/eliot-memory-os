@@ -266,6 +266,10 @@ fn missing_denominator_fails_closed() {
     candidate.batch.coverage.denominator = DenominatorState::Unknown {
         reason: "read side could not count".to_owned(),
     };
+    // The batch owner requires the incomplete state to carry its own ceiling,
+    // so the fixture is an honest one. The refusal under test is still the
+    // evaluator's: it never manufactures a denominator of its own.
+    candidate.batch.coverage.revalidation_required = true;
     let error = evaluate_applicability(&candidate).expect_err("unknown denominator");
     assert!(matches!(
         error,
@@ -335,12 +339,11 @@ fn duplicate_and_overlapping_recovery_identities_are_refused() {
     let mut overlapping = request(vec![record("mem-1")]);
     overlapping.batch.coverage.denominator = DenominatorState::Known { total: 2 };
     overlapping.batch.coverage.revalidation_required = true;
-    overlapping.batch.coverage.omissions = vec![
-        eliot_memory_projection_contracts::CoverageOmission {
+    overlapping.batch.coverage.omissions =
+        vec![eliot_memory_projection_contracts::CoverageOmission {
             handle: aid("mem-1"),
             reason: "fence-mismatch".to_owned(),
-        },
-    ];
+        }];
     assert!(matches!(
         evaluate_applicability(&overlapping),
         Err(eliot_memory_applicability::ApplicabilityError::Projection(
@@ -390,7 +393,8 @@ fn a_standalone_verdict_cannot_claim_a_short_closed_denominator() {
     // The set is independently deserializable, so this proves the ceiling is
     // checked on the verdict itself, not only while the evaluator runs.
     let set = evaluate(vec![record("mem-1")]);
-    set.validate().expect("the exact verdict is closed and complete");
+    set.validate()
+        .expect("the exact verdict is closed and complete");
     let mut wire = serde_json::to_value(&set).expect("serialize set");
     wire["denominator"] = serde_json::json!({ "state": "KNOWN", "total": 2 });
     let decoded: ApplicableMemorySet =
