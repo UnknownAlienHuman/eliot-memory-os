@@ -770,7 +770,11 @@ mod codec_reject_contour_tests {
         let version = capture(|| {
             assert!(decode_envelope(&request, &key, &epoch, &identity, &wrong_version).is_err());
         });
-        assert_exactly_one_contour(&version, "envelope-wire-version-mismatch", ENVELOPE_BOUNDARY);
+        assert_exactly_one_contour(
+            &version,
+            "envelope-wire-version-mismatch",
+            ENVELOPE_BOUNDARY,
+        );
 
         // 5. The admitted case emits NO reject contour at all.
         let admitted = capture(|| {

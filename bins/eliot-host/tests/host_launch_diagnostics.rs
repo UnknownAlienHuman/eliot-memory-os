@@ -943,7 +943,10 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
                 .with_operation(AdmittedEvent::ServiceStart),
         );
     });
-    assert!(unknown.contains("host.request"), "no projection record: {unknown}");
+    assert!(
+        unknown.contains("host.request"),
+        "no projection record: {unknown}"
+    );
     assert!(unknown.contains("evidence=unknown"), "got: {unknown}");
     assert!(unknown.contains("reason_missing=true"), "got: {unknown}");
     assert_eq!(
@@ -959,14 +962,20 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
                 .with_operation(AdmittedEvent::ServiceStart),
         );
     });
-    assert!(started.contains("evidence=process_started"), "got: {started}");
+    assert!(
+        started.contains("evidence=process_started"),
+        "got: {started}"
+    );
     assert!(started.contains("process=4242"), "got: {started}");
     assert!(started.contains("process_missing=false"), "got: {started}");
     assert!(
         started.contains("host.event_log_admission"),
         "proven start must be admitted: {started}"
     );
-    assert!(started.contains("operation=service_start"), "got: {started}");
+    assert!(
+        started.contains("operation=service_start"),
+        "got: {started}"
+    );
     // A verified durable effect (the disposition a rollback restoration may
     // reach once its readback proved it) stays distinguishable from the
     // unproven pair, and a proven no-effect stop admits nothing.
@@ -976,8 +985,14 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
                 .with_operation(AdmittedEvent::ServiceStop),
         );
     });
-    assert!(committed.contains("evidence=durable_committed"), "got: {committed}");
-    assert!(committed.contains("operation=service_stop"), "got: {committed}");
+    assert!(
+        committed.contains("evidence=durable_committed"),
+        "got: {committed}"
+    );
+    assert!(
+        committed.contains("operation=service_stop"),
+        "got: {committed}"
+    );
     let cancelled = capture_emit(|| {
         observe_host_request(
             &HostRequestProjection::cancelled(EntrypointStage::Startup)
@@ -1004,7 +1019,10 @@ fn launch_15_rollback_positive_requires_owner_evidence() {
     assert!(failed.contains("evidence=failed"), "got: {failed}");
     assert!(failed.contains("reason=recovery_required"), "got: {failed}");
     assert!(failed.contains("reason_missing=false"), "got: {failed}");
-    assert!(failed.contains("operation=service_failure"), "got: {failed}");
+    assert!(
+        failed.contains("operation=service_failure"),
+        "got: {failed}"
+    );
     assert!(
         !failed.contains("unread-back"),
         "the error payload must not cross the record: {failed}"

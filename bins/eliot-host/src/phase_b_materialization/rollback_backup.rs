@@ -226,7 +226,10 @@ impl<'a> RollbackOperationIdentity<'a> {
     /// digest. Both slots then render the explicit missing-evidence
     /// disposition.
     const fn empty() -> Self {
-        Self { backup: None, current: None }
+        Self {
+            backup: None,
+            current: None,
+        }
     }
 
     /// Binds the exact `PlatformHandle` digest of the sidecar bytes the owner
@@ -244,7 +247,10 @@ impl<'a> RollbackOperationIdentity<'a> {
 
     /// The frozen rollback key set, projected 1:1.
     fn slots(&self) -> [(&'static str, RollbackIdentity<'a>); 2] {
-        [("backup", Self::slot(self.backup)), ("current", Self::slot(self.current))]
+        [
+            ("backup", Self::slot(self.backup)),
+            ("current", Self::slot(self.current)),
+        ]
     }
 
     /// Projects one slot as the exact bound value or the explicit
@@ -555,7 +561,10 @@ pub fn phase_b_restore_or_remove(
         // nothing uncommitted to remove. Recorded with the same explicit
         // not-required disposition as the template-preserved no-op below, so a
         // silent no-op can never be confused with an unproven removal.
-        rollback_backup_observe(RollbackContour::UncommittedRemovalNotRequired, Some(&profile));
+        rollback_backup_observe(
+            RollbackContour::UncommittedRemovalNotRequired,
+            Some(&profile),
+        );
     }
     Ok(())
 }
@@ -770,10 +779,8 @@ mod rollback_contour_tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "eliot-host-rollback-contour-{}",
-                Uuid::new_v4()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("eliot-host-rollback-contour-{}", Uuid::new_v4()));
             let portable = root.join("portable");
             std::fs::create_dir_all(&portable)
                 .unwrap_or_else(|error| panic!("create fixture root: {error}"));
@@ -1036,7 +1043,10 @@ mod rollback_contour_tests {
                 "Store config",
                 Some(&template_digest),
             );
-            assert!(outcome.is_ok(), "a template-preserved rollback must succeed");
+            assert!(
+                outcome.is_ok(),
+                "a template-preserved rollback must succeed"
+            );
         });
         assert!(
             emitted(&record, RollbackContour::UncommittedRemovalNotRequired),

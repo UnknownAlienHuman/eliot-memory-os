@@ -2158,17 +2158,42 @@ mod host_lifecycle_boundary_table_tests {
         ];
         assert_eq!(
             bounds.iter().map(|bound| bound.name).collect::<Vec<_>>(),
-            ["open.requested", "open.admitted", "start.requested", "start.started"]
+            [
+                "open.requested",
+                "open.admitted",
+                "start.requested",
+                "start.started"
+            ]
         );
         let ready_event = row(super::BOUNDARY_READINESS_PROOF_READY).event;
         for bound in bounds {
-            assert_eq!(bound.test, "891/case-2", "{} must name this case", bound.name);
-            assert_ne!(bound.event, ready_event, "{} must never claim ready", bound.name);
+            assert_eq!(
+                bound.test, "891/case-2",
+                "{} must name this case",
+                bound.name
+            );
+            assert_ne!(
+                bound.event, ready_event,
+                "{} must never claim ready",
+                bound.name
+            );
         }
-        assert_ne!(bounds[0].event, bounds[1].event, "a request is not an admission");
-        assert_ne!(bounds[2].event, bounds[3].event, "a request is not a started result");
-        assert_ne!(bounds[0].owner_state, bounds[1].owner_state, "a request owns no evidence");
-        assert_ne!(bounds[2].owner_state, bounds[3].owner_state, "a request owns no contour");
+        assert_ne!(
+            bounds[0].event, bounds[1].event,
+            "a request is not an admission"
+        );
+        assert_ne!(
+            bounds[2].event, bounds[3].event,
+            "a request is not a started result"
+        );
+        assert_ne!(
+            bounds[0].owner_state, bounds[1].owner_state,
+            "a request owns no evidence"
+        );
+        assert_ne!(
+            bounds[2].owner_state, bounds[3].owner_state,
+            "a request owns no contour"
+        );
 
         // The real open owner: `HostComposition::open` records the request
         // before any admission work, and an open that never reaches durable
@@ -2187,16 +2212,44 @@ mod host_lifecycle_boundary_table_tests {
                 registration_nonce: None,
             }));
         });
-        let refused = opened_result.expect("the real open must have returned").err();
+        let refused = opened_result
+            .expect("the real open must have returned")
+            .err();
         let _ = std::fs::remove_dir_all(&root);
-        assert!(refused.is_some(), "an empty approved registry admits nothing");
-        assert_eq!(detail_order(&opened).first(), Some(&bounds[0].event), "request leads");
-        assert_eq!(occurrences(&opened, bounds[0].event), 1, "one request record");
-        assert!(!opened.contains(bounds[1].event), "no evidence, no admitted");
-        assert!(!opened.contains(bounds[2].event), "a refused open starts nothing");
-        assert!(!opened.contains(bounds[3].event), "a refused open starts nothing");
-        assert!(!opened.contains(ready_event), "a refused open is never ready");
-        assert!(!opened.contains("semantically_ready"), "no ready evidence claim");
+        assert!(
+            refused.is_some(),
+            "an empty approved registry admits nothing"
+        );
+        assert_eq!(
+            detail_order(&opened).first(),
+            Some(&bounds[0].event),
+            "request leads"
+        );
+        assert_eq!(
+            occurrences(&opened, bounds[0].event),
+            1,
+            "one request record"
+        );
+        assert!(
+            !opened.contains(bounds[1].event),
+            "no evidence, no admitted"
+        );
+        assert!(
+            !opened.contains(bounds[2].event),
+            "a refused open starts nothing"
+        );
+        assert!(
+            !opened.contains(bounds[3].event),
+            "a refused open starts nothing"
+        );
+        assert!(
+            !opened.contains(ready_event),
+            "a refused open is never ready"
+        );
+        assert!(
+            !opened.contains("semantically_ready"),
+            "no ready evidence claim"
+        );
         assert!(!opened.contains("process_started"), "no ownership claim");
 
         // The real start owner: the Store-before-Kernel sequence records the
@@ -2217,14 +2270,35 @@ mod host_lifecycle_boundary_table_tests {
                     Ok(())
                 },
             );
-            assert!(matches!(outcome, Err(super::StoreKernelLaunchError::Kernel { .. })));
+            assert!(matches!(
+                outcome,
+                Err(super::StoreKernelLaunchError::Kernel { .. })
+            ));
         });
-        assert!(kernel_launches == 1 && store_cleaned, "the real launch ran and cleaned up");
-        assert!(launched.contains("host.kernel-launch requested"), "the request is recorded");
-        assert!(!launched.contains("kernel-ready observed"), "a failed launch has no result");
-        assert!(!launched.contains(bounds[2].event), "the sequence owns no start request");
-        assert!(!launched.contains(bounds[3].event), "the sequence owns no started result");
-        assert!(!launched.contains("semantically_ready"), "started is not ready");
+        assert!(
+            kernel_launches == 1 && store_cleaned,
+            "the real launch ran and cleaned up"
+        );
+        assert!(
+            launched.contains("host.kernel-launch requested"),
+            "the request is recorded"
+        );
+        assert!(
+            !launched.contains("kernel-ready observed"),
+            "a failed launch has no result"
+        );
+        assert!(
+            !launched.contains(bounds[2].event),
+            "the sequence owns no start request"
+        );
+        assert!(
+            !launched.contains(bounds[3].event),
+            "the sequence owns no started result"
+        );
+        assert!(
+            !launched.contains("semantically_ready"),
+            "started is not ready"
+        );
         assert!(!launched.contains("process_started"), "no ownership claim");
 
         // The service-start result belongs to an observed process start: at
@@ -2238,7 +2312,11 @@ mod host_lifecycle_boundary_table_tests {
             HostRequestEvidence::Unknown,
         ] {
             let claimed = AdmittedEvent::ServiceStart.is_admitted_by(evidence);
-            assert!(!claimed, "request-side evidence {} claims no start", evidence.as_str());
+            assert!(
+                !claimed,
+                "request-side evidence {} claims no start",
+                evidence.as_str()
+            );
         }
         let observed = HostRequestEvidence::ProcessStarted;
         assert!(
@@ -2250,8 +2328,15 @@ mod host_lifecycle_boundary_table_tests {
         let request_only = capture_records(|| {
             super::host_lifecycle_observe_requested(super::BOUNDARY_START_REQUESTED);
         });
-        assert_eq!(detail_order(&request_only), vec![bounds[2].event], "request detail only");
-        assert!(!request_only.contains(bounds[3].event), "a request renders no result");
+        assert_eq!(
+            detail_order(&request_only),
+            vec![bounds[2].event],
+            "request detail only"
+        );
+        assert!(
+            !request_only.contains(bounds[3].event),
+            "a request renders no result"
+        );
     }
 
     #[cfg(windows)]
@@ -3423,11 +3508,8 @@ mod host_lifecycle_boundary_table_tests {
         )
         .unwrap();
         for record in [starting, control_ready.clone(), active.clone()] {
-            super::journal_append::append_reconciled(
-                &journal,
-                HostStateRecord::Activation(record),
-            )
-            .unwrap();
+            super::journal_append::append_reconciled(&journal, HostStateRecord::Activation(record))
+                .unwrap();
         }
         let drain_generation = active.fence.activation_generation.clone();
         for (label, state) in [
@@ -3508,8 +3590,13 @@ mod host_lifecycle_boundary_table_tests {
             "a cancelled drain must never reach the durable linearization point"
         );
         assert!(
-            super::clean_marker_record(&cancelled_snapshot, &host, &activation_id, &activation_generation)
-                .is_err(),
+            super::clean_marker_record(
+                &cancelled_snapshot,
+                &host,
+                &activation_id,
+                &activation_generation
+            )
+            .is_err(),
             "a cancelled drain must never produce the clean stopped marker"
         );
 
@@ -3518,8 +3605,7 @@ mod host_lifecycle_boundary_table_tests {
         use super::host_diagnostics::HostRequestEvidence;
         use super::windows_event_log::AdmittedEvent;
         assert!(
-            !AdmittedEvent::ServiceStop
-                .is_admitted_by(HostRequestEvidence::Cancelled),
+            !AdmittedEvent::ServiceStop.is_admitted_by(HostRequestEvidence::Cancelled),
             "a cancelled request must never be recorded as a completed stop"
         );
         assert!(
@@ -3607,10 +3693,7 @@ mod host_lifecycle_boundary_table_tests {
             super::runtime_control_unknown_ref("kernel-restart-pending", &request),
         );
         assert!(
-            matches!(
-                unknown,
-                super::HostRuntimeControlResponse::Unknown { .. }
-            ),
+            matches!(unknown, super::HostRuntimeControlResponse::Unknown { .. }),
             "a pending intent answers typed Unknown, never a completion"
         );
         assert!(
@@ -3657,7 +3740,10 @@ mod host_lifecycle_boundary_table_tests {
                 Err(super::HostError::Stopped)
             },
         );
-        assert_eq!(probes, 0, "a possible state change must not re-probe as a retry");
+        assert_eq!(
+            probes, 0,
+            "a possible state change must not re-probe as a retry"
+        );
         assert_eq!(
             disposition,
             super::HostBranchDisposition::ReadinessDegraded,
@@ -3671,9 +3757,7 @@ mod host_lifecycle_boundary_table_tests {
 
         // The emitted vocabulary stays on the unknown side of the boundary.
         let emitted = capture_records(|| {
-            super::host_lifecycle_observe_scm(
-                super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED,
-            );
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED);
             super::host_lifecycle_observe_scm(pending);
             {
                 let _guard = super::HostTerminalGuard::armed(
@@ -3693,7 +3777,9 @@ mod host_lifecycle_boundary_table_tests {
         );
         assert!(
             !emitted.contains(super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION.event)
-                && !emitted.contains(super::BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event),
+                && !emitted.contains(
+                    super::BOUNDARY_KERNEL_RESTART_RECONCILE_RECEIPT_READBACK_REPLAY.event
+                ),
             "a pending intent never records a completion or a readback replay, got: {emitted}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3787,7 +3873,10 @@ mod host_lifecycle_boundary_table_tests {
             "the single terminal must carry the outer operation's frozen code, got: {emitted}"
         );
         assert_eq!(
-            occurrences(&emitted, super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED.event),
+            occurrences(
+                &emitted,
+                super::BOUNDARY_KERNEL_RESTART_RECONCILE_REQUESTED.event
+            ),
             1,
             "the inner phase observation stays non-terminal and correlates once"
         );
@@ -3800,8 +3889,9 @@ mod host_lifecycle_boundary_table_tests {
                     super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
             }
             {
-                let _guard =
-                    super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL);
+                let _guard = super::HostTerminalGuard::armed(
+                    super::BOUNDARY_KERNEL_RESTART_RECONCILE_TERMINAL,
+                );
             }
         });
         assert_eq!(
@@ -3820,9 +3910,7 @@ mod host_lifecycle_boundary_table_tests {
             let mut guard =
                 super::HostTerminalGuard::armed(super::BOUNDARY_KERNEL_RESTART_TERMINAL);
             guard.disarm();
-            super::host_lifecycle_observe_scm(
-                super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION,
-            );
+            super::host_lifecycle_observe_scm(super::BOUNDARY_KERNEL_RESTART_RECEIPT_COMPLETION);
         });
         assert_eq!(
             occurrences(&succeeded, "host.terminal_error"),
@@ -3846,7 +3934,10 @@ mod host_lifecycle_boundary_table_tests {
         assert_eq!(context_requested.name, "lifecycle-context.requested");
         assert_eq!(context_admitted.name, "lifecycle-context.admitted");
         assert_ne!(context_requested.event, context_admitted.event);
-        assert_ne!(context_requested.event, row(super::BOUNDARY_RECONCILE_REQUESTED).event);
+        assert_ne!(
+            context_requested.event,
+            row(super::BOUNDARY_RECONCILE_REQUESTED).event
+        );
         assert_eq!(
             context_admitted.owner_state, "RequestMetadata",
             "the admitted row must record the owner's own metadata carrier"
@@ -3894,8 +3985,7 @@ mod host_lifecycle_boundary_table_tests {
             None,
         )
         .unwrap();
-        let other_context =
-            super::lifecycle_context(&other, "891-case-15-start-manifest").unwrap();
+        let other_context = super::lifecycle_context(&other, "891-case-15-start-manifest").unwrap();
         assert_ne!(
             other_context.request_id.as_str(),
             request_id,
@@ -4158,9 +4248,7 @@ mod host_lifecycle_boundary_table_tests {
                 &super::host_diagnostics::HostRequestProjection::admitted(
                     super::host_diagnostics::EntrypointStage::Startup,
                     &super::HostLaunchOptions {
-                        config_descriptor_path: std::path::PathBuf::from(
-                            "891-case-17-config.json",
-                        ),
+                        config_descriptor_path: std::path::PathBuf::from("891-case-17-config.json"),
                         config_descriptor_digest: PlatformHandle::new("a".repeat(64)).unwrap(),
                         installation: host.installation.clone(),
                         transaction_plan_generation: 3,
@@ -4171,7 +4259,8 @@ mod host_lifecycle_boundary_table_tests {
             );
         });
         assert!(
-            dropped.contains("evidence=\"admitted\"") && !dropped.contains("evidence=\"process_started\""),
+            dropped.contains("evidence=\"admitted\"")
+                && !dropped.contains("evidence=\"process_started\""),
             "the suppressed contour must render its admitted evidence only, got: {dropped}"
         );
         assert!(
@@ -4334,9 +4423,7 @@ mod host_lifecycle_boundary_table_tests {
                 admission,
                 super::windows_event_log::EventLogAdmission::RejectedNotStarted { .. }
                     | super::windows_event_log::EventLogAdmission::RejectedShutdown { .. }
-                    | super::windows_event_log::EventLogAdmission::RejectedWorkerUnavailable {
-                        ..
-                    }
+                    | super::windows_event_log::EventLogAdmission::RejectedWorkerUnavailable { .. }
                     | super::windows_event_log::EventLogAdmission::DroppedQueueFull { .. }
                     | super::windows_event_log::EventLogAdmission::DroppedProducerBusy { .. }
                     | super::windows_event_log::EventLogAdmission::DroppedFormattingPanic { .. }
@@ -4554,8 +4641,7 @@ mod host_lifecycle_boundary_table_tests {
         .unwrap();
         request.validate().unwrap();
         let pending_ref = super::runtime_control_unknown_ref("kernel-restart", &request);
-        let refusal =
-            super::HostRuntimeControlResponse::unknown_for(&request, pending_ref.clone());
+        let refusal = super::HostRuntimeControlResponse::unknown_for(&request, pending_ref.clone());
         assert!(
             eliot_host_service::runtime_control::response_matches_request(&request, &refusal),
             "the typed refusal must answer its own SCM request"

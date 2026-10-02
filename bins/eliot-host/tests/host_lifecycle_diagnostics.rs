@@ -161,12 +161,10 @@ fn frozen_event(value: &str) -> String {
     let inner = inner
         .split_once(')')
         .map_or(inner, |(arguments, _)| arguments);
-    inner
-        .split(',')
-        .fold(String::new(), |mut joined, part| {
-            joined.push_str(&quoted(part.trim()));
-            joined
-        })
+    inner.split(',').fold(String::new(), |mut joined, part| {
+        joined.push_str(&quoted(part.trim()));
+        joined
+    })
 }
 
 /// Parses the frozen production boundary table out of `src/lib.rs`.
@@ -453,7 +451,10 @@ fn scm_receipt_and_unknown_preserve_identity_single_terminal() {
     // production sites; the sites now name the frozen boundary row rather than
     // the code literal, so the count is taken on the emission sites themselves.
     assert_eq!(
-        count_occurrences(&lib, "host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL)"),
+        count_occurrences(
+            &lib,
+            "host_lifecycle_observe_terminal(BOUNDARY_KERNEL_RESTART_TERMINAL)"
+        ),
         2,
         "handle must own exactly its request + unknown terminals, got handle sites"
     );
@@ -687,9 +688,7 @@ fn case_matrix_denominator_is_exactly_1_to_22() {
     for (case, _) in &markers {
         let marker_line = lib
             .lines()
-            .position(|line| {
-                line.trim() == format!("// WORK_UNIT_CASE: 891/{case}")
-            })
+            .position(|line| line.trim() == format!("// WORK_UNIT_CASE: 891/{case}"))
             .expect("marker line must be locatable");
         let window = lib
             .lines()
@@ -759,9 +758,7 @@ fn boundary_fixture_binds_production_table() {
     }
     // Same rows in the same order: order drift is drift too.
     assert_eq!(
-        rows.iter()
-            .map(|row| row.name.as_str())
-            .collect::<Vec<_>>(),
+        rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
         fixture_names,
         "fixture names must equal the production table in source order"
     );

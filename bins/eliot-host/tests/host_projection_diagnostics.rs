@@ -210,14 +210,34 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
         "semantically_ready",
     ];
     let unknown = emit(|| {
-        observe_host_request(&HostRequestProjection::unknown(EntrypointStage::ScmDispatch));
+        observe_host_request(&HostRequestProjection::unknown(
+            EntrypointStage::ScmDispatch,
+        ));
     });
-    assert!(unknown.contains("host.request"), "no projection record: {unknown}");
-    assert!(unknown.contains("evidence=unknown"), "evidence must be unknown: {unknown}");
-    assert!(unknown.contains("reason_missing=true"), "no reason may be invented: {unknown}");
-    assert!(unknown.contains("running_missing=true"), "running must stay missing: {unknown}");
-    assert!(unknown.contains("process_missing=true"), "process must stay missing: {unknown}");
-    assert!(unknown.contains("generation_missing=true"), "generation must stay missing: {unknown}");
+    assert!(
+        unknown.contains("host.request"),
+        "no projection record: {unknown}"
+    );
+    assert!(
+        unknown.contains("evidence=unknown"),
+        "evidence must be unknown: {unknown}"
+    );
+    assert!(
+        unknown.contains("reason_missing=true"),
+        "no reason may be invented: {unknown}"
+    );
+    assert!(
+        unknown.contains("running_missing=true"),
+        "running must stay missing: {unknown}"
+    );
+    assert!(
+        unknown.contains("process_missing=true"),
+        "process must stay missing: {unknown}"
+    );
+    assert!(
+        unknown.contains("generation_missing=true"),
+        "generation must stay missing: {unknown}"
+    );
     assert!(
         !unknown.contains("host.terminal_error"),
         "a projection is never a terminal: {unknown}"
@@ -235,8 +255,14 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             EntrypointStage::ScmDispatch,
         ));
     });
-    assert!(unattributed.contains("evidence=failed"), "got: {unattributed}");
-    assert!(unattributed.contains("reason_missing=true"), "got: {unattributed}");
+    assert!(
+        unattributed.contains("evidence=failed"),
+        "got: {unattributed}"
+    );
+    assert!(
+        unattributed.contains("reason_missing=true"),
+        "got: {unattributed}"
+    );
     for positive in positives {
         assert!(
             !unattributed.contains(positive),
@@ -250,8 +276,14 @@ fn projection_05_unknown_rollback_disposition_emits_no_positive_claim() {
             EntrypointStage::ShutdownDrain,
         ));
     });
-    assert!(committed.contains("evidence=durable_committed"), "got: {committed}");
-    assert!(committed.contains("stage=shutdown_drain"), "got: {committed}");
+    assert!(
+        committed.contains("evidence=durable_committed"),
+        "got: {committed}"
+    );
+    assert!(
+        committed.contains("stage=shutdown_drain"),
+        "got: {committed}"
+    );
 }
 
 // Executed case: bounded static detail is honoured by the real formatter, so
@@ -265,12 +297,18 @@ fn projection_06_detail_is_truncated_with_honest_byte_accounting() {
     let t = emit(|| {
         observe_entrypoint_with_detail(EntrypointStage::ScmDispatch, &oversized);
     });
-    assert!(t.contains("host.entrypoint_stage"), "no entrypoint record: {t}");
+    assert!(
+        t.contains("host.entrypoint_stage"),
+        "no entrypoint record: {t}"
+    );
     assert!(
         t.contains(&format!("detail_bytes={}", oversized.len())),
         "original byte count must be reported: {t}"
     );
-    assert!(t.contains("detail_truncated=true"), "truncation must be reported: {t}");
+    assert!(
+        t.contains("detail_truncated=true"),
+        "truncation must be reported: {t}"
+    );
     let retained = MAX_DIAGNOSTIC_DETAIL_BYTES.min(oversized.len());
     assert!(
         t.contains(&oversized[..retained]),
