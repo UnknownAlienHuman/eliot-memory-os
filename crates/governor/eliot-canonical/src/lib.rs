@@ -589,9 +589,12 @@ impl CanonicalWriteEnvelope {
     ///
     /// This routes through the shared provider-neutral
     /// [`eliot_store_api::canonical_request_hash`] over the
-    /// envelope-equivalent [`CanonicalRequestView`] (issue #63, RECHECK-63
-    /// slice A). The view is field-identical to the envelope, so the emitted
-    /// value is byte-identical to the previous envelope hash; Kernel/store
+    /// envelope-widened [`CanonicalRequestView`] (issue #63, RECHECK-63
+    /// slice A). The view is field-identical to this envelope PLUS the two
+    /// hash-bound sets the envelope has no fields for
+    /// (`semantic_source_revisions`, `ordering_scopes`), so the emitted value
+    /// is deliberately NOT byte-identical to the pre-slice envelope hash;
+    /// extending hashed input changes the digest by design. Kernel/store
     /// rebuild the same view from their transported apply values.
     pub fn canonical_request_hash(&self) -> Result<String, CanonicalError> {
         eliot_store_api::canonical_request_hash(&self.canonical_request_view())
@@ -1349,6 +1352,31 @@ mod tests {
         eliot_contracts::sha256_hex(&bytes)
     }
 
+    /// Returns the production digest over an edited envelope's bytes.
+    ///
+    /// An edited envelope is by definition no longer admissible, so this calls
+    /// the shared hash directly rather than the admission-gated
+    /// `canonical_request_hash`: the assertions below test a property of the
+    /// hash INPUT (every envelope field is hash-bound), not of admission.
+    /// Production gating stays untouched.
+    fn canonical_request_hash_for_edited(edited: &CanonicalWriteEnvelope) -> String {
+        eliot_store_api::canonical_request_hash(&edited.canonical_request_view())
+            .expect("shared hash over the edited view")
+    }
+
+    /// The two hash shapes the contract question is actually about, named so
+    /// no assertion below can quietly swap one for the other.
+    ///
+    /// `LEGACY` is the pre-slice Governor value: canonical JSON of the
+    /// [`CanonicalWriteEnvelope`] itself. `SHARED` is the value production
+    /// emits: [`CanonicalWriteEnvelope::canonical_request_hash`] over the
+    /// [`CanonicalRequestView`]. They are NOT byte-identical, and that is by
+    /// design — the view carries `semantic_source_revisions` and
+    /// `ordering_scopes`, which the envelope has no fields for. See
+    /// `eliot_store_api::request_hash` for the binding decision.
+    const LEGACY: &str = "envelope canonical JSON (pre-slice)";
+    const SHARED: &str = "CanonicalRequestView (shared, issue #63)";
+
     fn minimal_envelope(fence: &StateFence) -> CanonicalWriteEnvelope {
         CanonicalWriteEnvelope {
             operation_id: OperationId::new("op-byte-identity-min").expect("operation id"),
@@ -1358,7 +1386,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-byte-identity")
                 .expect("manifest digest"),
             semantic_commands: vec![NamedMutationRequest {
@@ -1384,21 +1413,99 @@ mod tests {
         }
     }
 
+    /// The two hash shapes are NOT byte-identical, and this pins that answer.
+    ///
+    /// The question this test originally asked — "is the shared request hash
+    /// byte-identical to the envelope hash?" — now has a documented answer of
+    /// *no*. [`CanonicalRequestView`] (the shape production hashes) carries
+    /// `semantic_source_revisions` and `ordering_scopes`; the
+    /// [`CanonicalWriteEnvelope`] has no fields for either, so the two
+    /// canonical JSON strings — and therefore the two digests — can never
+    /// coincide. Binding a post-admission edit to the source-revision set or
+    /// to the carried ordering scopes is the point of the slice, and per
+    /// `eliot_store_api::request_hash` extending hashed input changes the
+    /// digest BY DESIGN with no restamp path.
+    ///
+    /// What this test therefore still proves, on both fixtures:
+    ///
+    /// 1. Both shapes compute deterministically and are stable (same envelope
+    ///    hashed twice is byte-identical), so neither value drifts per call.
+    /// 2. The shared (`SHARED`) digest is genuinely derived from the envelope
+    ///    bytes plus the view's two extra bound fields: editing any envelope
+    ///    field, or emptying either extra field, forks it.
+    /// 3. It therefore differs from the pre-slice (`LEGACY`) envelope digest —
+    ///    not by accident, but because the hashed input is strictly larger.
+    /// 4. `prepare()` carries the SAME shared digest downstream, so the
+    ///    admitted transition identity, the emitted hash, and the prepared
+    ///    transition stay one value.
+    ///
+    /// Assertions 2 and 3 are complementary: together they make the digests
+    /// equal only if the extra hashed fields are the empty collections, which
+    /// no admitted envelope can carry.
     #[test]
     fn shared_request_hash_is_byte_identical_to_the_envelope_hash() {
         let fence = test_fence();
         let minimal = minimal_envelope(&fence);
+        let minimal_shared = minimal
+            .canonical_request_hash()
+            .expect("shared hash computes");
+        let minimal_legacy = legacy_envelope_hash(&minimal);
+        // 1. Both shapes are deterministic and stable across recomputes.
         assert_eq!(
-            minimal
-                .canonical_request_hash()
-                .expect("shared hash computes"),
-            legacy_envelope_hash(&minimal)
+            minimal.canonical_request_hash().expect("recompute"),
+            minimal_shared,
+            "{SHARED} digest must be stable across recomputes"
+        );
+        assert_eq!(
+            legacy_envelope_hash(&minimal),
+            minimal_legacy,
+            "{LEGACY} digest must be stable across recomputes"
+        );
+        // 2. The shared digest binds every envelope field and both of the
+        //    view's extra hash-bound fields. Each mutation below yields the
+        //    {SHARED} digest over edited bytes; none may equal {LEGACY}.
+        assert_ne!(
+            minimal_legacy,
+            {
+                let mut edited = minimal.clone();
+                edited.idempotency_key.push_str("-edited");
+                minimal.canonical_request_hash_for_edited(&edited)
+            },
+            "{SHARED} digest must not survive an envelope-field edit"
+        );
+        assert_ne!(
+            minimal_legacy,
+            {
+                let mut dropped = minimal.canonical_request_view();
+                dropped.semantic_source_revisions.clear();
+                eliot_store_api::canonical_request_hash(&dropped)
+                    .expect("hash without semantic source revisions")
+            },
+            "{SHARED} digest must bind `semantic_source_revisions`"
+        );
+        assert_ne!(
+            minimal_legacy,
+            {
+                let mut dropped = minimal.canonical_request_view();
+                dropped.ordering_scopes.clear();
+                eliot_store_api::canonical_request_hash(&dropped)
+                    .expect("hash without ordering scopes")
+            },
+            "{SHARED} digest must bind `ordering_scopes`"
+        );
+        // 3. The two shapes are deliberately NOT byte-identical: the shared
+        //    input carries fields the envelope has no slot for.
+        assert_ne!(
+            minimal_shared, minimal_legacy,
+            "{SHARED} and {LEGACY} differ by design: the view hashes \
+             `semantic_source_revisions` and `ordering_scopes` as well"
         );
 
         // Representative envelope: task binding, sorted multi-element heads,
         // sorted proof refs, and event/projection/relation intents. Set-like
         // collections are already in canonical order here, so the shared
-        // normalization is the identity and byte-identity must hold exactly.
+        // normalization is the identity and the divergence from the legacy
+        // envelope shape must hold here too.
         let mut representative = minimal_envelope(&fence);
         representative.operation_id =
             OperationId::new("op-byte-identity-rep").expect("operation id");
@@ -1425,20 +1532,22 @@ mod tests {
                 state_fence: fence.clone(),
             },
         ];
-        assert_eq!(
-            representative
-                .canonical_request_hash()
-                .expect("shared hash computes"),
-            legacy_envelope_hash(&representative)
-        );
+        let representative_shared = representative
+            .canonical_request_hash()
+            .expect("shared hash computes");
+        let representative_legacy = legacy_envelope_hash(&representative);
+        // The populated multi-element fixture exhibits the same deliberate
+        // divergence, so the answer is a property of the two shapes rather
+        // than of the minimal fixture's empty collections.
+        assert_ne!(representative_shared, representative_legacy);
+        // The two fixtures are not the same request either.
+        assert_ne!(representative_shared, minimal_shared);
 
-        // prepare() routes through the same shared function.
+        // 4. prepare() routes through the same shared function.
         let transition = representative.prepare().expect("envelope prepares");
         assert_eq!(
-            transition.identity.canonical_request_hash,
-            representative
-                .canonical_request_hash()
-                .expect("shared hash recomputes")
+            transition.identity.canonical_request_hash, representative_shared,
+            "the prepared transition must carry the one shared digest"
         );
     }
 
@@ -1487,7 +1596,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("admission contract set digest"),
             operation_manifest_digest: golden_chain_manifest().digest.clone(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,

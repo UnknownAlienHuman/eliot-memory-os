@@ -1139,7 +1139,8 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            admission_contract_set_digest: crate::supported_admission_contract_set_digest()
+                .expect("admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1796")
                 .expect("manifest"),
             semantic_commands: vec![NamedMutationRequest {
