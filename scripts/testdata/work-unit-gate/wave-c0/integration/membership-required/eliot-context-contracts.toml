@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-584"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 584}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-context-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-context-contracts/src"}, {value = "crates/smart/eliot-context-contracts/tests"}]
+matrix_cases = 90
+proof_ceiling = {value = "workspace-integration"}
+revision = 1
+body_sha256 = "c10b80229e5f2151bce52bfea8e34a4ebc437116026da21eed46f35d6922e35f"
+matrix_sha256 = "ba5bad82db27c84b0e66344838aa39e8620132b6961d9c9f655522abab0185da"
+require_workspace_member = true
+package = {name = "eliot-context-contracts"}
+module = {value = "smart.context.contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 90, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 90, child_processes = 64}

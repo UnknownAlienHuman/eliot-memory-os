@@ -96,7 +96,7 @@ use eliot_context_contracts::{
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
-    StateFence, sha256_hex,
+    StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
@@ -2063,8 +2063,10 @@ impl KernelContextReadClient {
     /// - required roles (`task_frame`, `negative_memory`, `affordances`) with an
     ///   authoritative `KnownEmpty` acquisition compile to empty-member
     ///   projections bound to the compilation binding, the observed scope-head
-    ///   revision, and the digest of the authoritative empty payload;
-    /// - a required role without readable source fails as
+    ///   revision, and the content digest of the authoritative empty envelope
+    ///   the owner actually retained — never a constant stand-in digest;
+    /// - a required role without readable source, or one whose authoritative
+    ///   empty result retained no payload to digest, fails as
     ///   [`PacketCompositionError::RoleUnavailable`] — a missing required input
     ///   never becomes a complete empty view;
     /// - a `Complete`, `Partial`, or `Stale` role fails as
@@ -2867,12 +2869,33 @@ fn optional_role<T>(
 /// Builds one required opaque projection from an authoritatively empty role.
 ///
 /// Only `KnownEmpty` converts: the projection carries zero members under the
-/// compilation binding with the candidate-stage envelope version, the
-/// observed scope-head revision, and the digest of the authoritative empty
-/// payload (`b"null"`, the canonical bytes of the acquired null). A required
-/// role without readable source fails as `RoleUnavailable`; a readable role
-/// fails as `RoleConversionMissing`, because member content and ceilings
-/// belong to the named owner.
+/// compilation binding with the candidate-stage envelope version and the
+/// observed scope-head revision.
+///
+/// [`ProjectionSchema::snapshot_digest`] is the content digest of the complete
+/// source snapshot, so it is computed from the owner payload this role actually
+/// retained. #2563 measured the previous constant `sha256_hex(b"null")`: that
+/// literal is the canonical bytes of JSON `null`, which is NOT the authoritative
+/// empty payload of any of these three roles. `GetTaskState`,
+/// `GetUnderstandingProjectionInputs` and `GetCapabilityEvidenceState` each
+/// answer with a versioned envelope (`{version, <selector>, scope_id, records,
+/// provenance}`) whose `records` array is empty; only the optional epistemic
+/// role can read back as JSON `null`, and that role never reaches this
+/// function. The constant therefore described no snapshot at all and was the
+/// same value for every scope, selector, fence and revision, so it could not
+/// distinguish two authoritative empty results. It is exactly the "field filled
+/// with a stand-in in place of owner data" this lane forbids.
+///
+/// The digest is taken over the retained owner's own bytes through the
+/// repository's existing canonical codec ([`eliot_contracts::canonical_json_bytes`]
+/// plus [`sha256_hex`]), the same pair the Context render owner publishes
+/// through `canonical_render_serializer`. A `KnownEmpty` role that retained no
+/// payload cannot name its snapshot at all, so it is refused as
+/// `RoleUnavailable` rather than given a digest of bytes nobody produced.
+///
+/// A required role without readable source fails as `RoleUnavailable`; a
+/// readable role fails as `RoleConversionMissing`, because member content and
+/// ceilings belong to the named owner.
 fn required_projection(
     role: &eliot_governor::RoleAcquisition,
     label: &'static str,
@@ -2882,21 +2905,33 @@ fn required_projection(
     scope_revision: &str,
 ) -> Result<OpaqueProjection, PacketCompositionError> {
     match &role.state {
-        CandidateProjectionState::KnownEmpty => Ok(OpaqueProjection {
-            schema: ProjectionSchema {
-                owner: ProviderId::new(provider)
-                    .map_err(|_| PacketCompositionError::BindingMismatch)?,
-                schema_version: CANDIDATE_SCHEMA_VERSION,
-                source_revision: scope_revision.to_owned(),
-                snapshot_digest: sha256_hex(b"null"),
-            },
-            task_id: request.binding.task_id.clone(),
-            scope_id: request.binding.scope_id.clone(),
-            state_fence: request.binding.state_fence.clone(),
-            state: CandidateProjectionState::KnownEmpty,
-            members: Vec::new(),
-            frontier: Vec::new(),
-        }),
+        CandidateProjectionState::KnownEmpty => {
+            // The authoritative empty result is the owner's retained envelope,
+            // so its canonical bytes ARE the snapshot this projection describes.
+            let owner_payload = role
+                .payload
+                .as_ref()
+                .ok_or(PacketCompositionError::RoleUnavailable { role: label })?;
+            let snapshot_digest = sha256_hex(
+                &canonical_json_bytes(owner_payload)
+                    .map_err(|_| PacketCompositionError::RoleUnavailable { role: label })?,
+            );
+            Ok(OpaqueProjection {
+                schema: ProjectionSchema {
+                    owner: ProviderId::new(provider)
+                        .map_err(|_| PacketCompositionError::BindingMismatch)?,
+                    schema_version: CANDIDATE_SCHEMA_VERSION,
+                    source_revision: scope_revision.to_owned(),
+                    snapshot_digest,
+                },
+                task_id: request.binding.task_id.clone(),
+                scope_id: request.binding.scope_id.clone(),
+                state_fence: request.binding.state_fence.clone(),
+                state: CandidateProjectionState::KnownEmpty,
+                members: Vec::new(),
+                frontier: Vec::new(),
+            })
+        }
         CandidateProjectionState::Complete
         | CandidateProjectionState::Partial { .. }
         | CandidateProjectionState::Stale { .. } => {
@@ -3494,6 +3529,155 @@ mod tests {
         assert!(matches!(
             composition.check_role_response(NamedReadOperation::GetMailbox, &exact),
             Err(StoreError::UnknownOperation)
+        ));
+        Ok(())
+    }
+
+    /// The exact empty `GetTaskState` envelope the Store owner handler returns
+    /// for a task with no matching authority record: a versioned object whose
+    /// `records` array is empty, never JSON `null`.
+    fn authoritative_empty_task_state() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "task_id": "task-one",
+            "scope_id": "governor",
+            "records": [],
+            "current": null,
+            "provenance": {
+                "matched_total": 0,
+                "returned": 0,
+                "max_records": 8,
+                "truncated": false,
+            },
+        })
+    }
+
+    fn known_empty_role(payload: Option<serde_json::Value>) -> eliot_governor::RoleAcquisition {
+        eliot_governor::RoleAcquisition {
+            operation: NamedReadOperation::GetTaskState,
+            state: CandidateProjectionState::KnownEmpty,
+            payload,
+            revision_heads: Vec::new(),
+            identity: None,
+        }
+    }
+
+    /// The compilation binding every required projection is stamped with. Only
+    /// the three binding fields `required_projection` reads are needed here.
+    fn test_candidate_request(
+        fence: &StateFence,
+    ) -> Result<CandidateRequest, Box<dyn std::error::Error>> {
+        Ok(CandidateRequest {
+            binding: ContextBinding {
+                task_id: eliot_contracts::TaskId::new("task-one")?,
+                attempt_id: eliot_agent_contracts::AgentAttemptId::new("attempt-one")?,
+                scope_id: eliot_receipts::WorkScopeId::new("governor")?,
+                state_fence: fence.clone(),
+                decision_id: eliot_contracts::DecisionId::new("decision-one")?,
+                operation_id: None,
+            },
+            request_id: RequestId::new("request-one")?,
+            idempotency_key: "idem-one".to_owned(),
+        })
+    }
+
+    #[test]
+    fn required_projection_digests_the_owner_empty_envelope_not_a_stand_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let request = test_candidate_request(&fence)?;
+        let empty = authoritative_empty_task_state();
+        let role = known_empty_role(Some(empty.clone()));
+
+        let projection = required_projection(
+            &role,
+            ROLE_TASK_FRAME,
+            PROVIDER_TASK_FRAME,
+            "governor-task-frame",
+            &request,
+            "r1",
+        )?;
+
+        // The digest is the content digest of the exact owner bytes, so it is
+        // reproducible from them and is NOT the old constant digest of `null`.
+        assert_eq!(
+            projection.schema.snapshot_digest,
+            sha256_hex(&canonical_json_bytes(&empty)?)
+        );
+        assert_ne!(projection.schema.snapshot_digest, sha256_hex(b"null"));
+        // An authoritative empty result still binds the real compilation
+        // binding and the observed scope head, and fabricates no members.
+        assert_eq!(projection.task_id, request.binding.task_id);
+        assert_eq!(projection.scope_id, request.binding.scope_id);
+        assert_eq!(projection.state_fence, request.binding.state_fence);
+        assert_eq!(projection.schema.source_revision, "r1");
+        assert_eq!(projection.state, CandidateProjectionState::KnownEmpty);
+        assert!(projection.members.is_empty());
+        assert!(projection.frontier.is_empty());
+        projection.validate()?;
+
+        // Two authoritative empty results over different owner content get
+        // different digests, so the field can tell them apart.
+        let mut second = authoritative_empty_task_state();
+        second["task_id"] = json!("task-two");
+        let second_projection = required_projection(
+            &known_empty_role(Some(second)),
+            ROLE_TASK_FRAME,
+            PROVIDER_TASK_FRAME,
+            "governor-task-frame",
+            &request,
+            "r1",
+        )?;
+        assert_ne!(
+            projection.schema.snapshot_digest,
+            second_projection.schema.snapshot_digest
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_projection_refuses_a_known_empty_role_with_no_owner_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = test_fence(1)?;
+        let request = test_candidate_request(&fence)?;
+        // `KnownEmpty` with nothing retained names no snapshot, so the role is
+        // refused instead of being given a digest of bytes nobody produced.
+        assert!(matches!(
+            required_projection(
+                &known_empty_role(None),
+                ROLE_TASK_FRAME,
+                PROVIDER_TASK_FRAME,
+                "governor-task-frame",
+                &request,
+                "r1",
+            ),
+            Err(PacketCompositionError::RoleUnavailable {
+                role: ROLE_TASK_FRAME
+            })
+        ));
+
+        // A readable role is still refused as a missing owner conversion: no
+        // conversion here may promote a Complete verdict without one.
+        let complete = eliot_governor::RoleAcquisition {
+            operation: NamedReadOperation::GetTaskState,
+            state: CandidateProjectionState::Complete,
+            payload: Some(authoritative_empty_task_state()),
+            revision_heads: Vec::new(),
+            identity: None,
+        };
+        assert!(matches!(
+            required_projection(
+                &complete,
+                ROLE_TASK_FRAME,
+                PROVIDER_TASK_FRAME,
+                "governor-task-frame",
+                &request,
+                "r1",
+            ),
+            Err(PacketCompositionError::RoleConversionMissing {
+                role: ROLE_TASK_FRAME,
+                owner: "governor-task-frame"
+            })
         ));
         Ok(())
     }
