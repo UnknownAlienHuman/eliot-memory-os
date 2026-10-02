@@ -87,12 +87,12 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    ContextExecutionIdentity, HeadroomAllocationLedger, HeadroomDimension,
-    MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId, QualityRefusal,
-    QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding, canonical_render_serializer,
+    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError,
+    ContextExecutionIdentity, ContextOutcome, ContextRecipe, DecisionContextIncomplete,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger,
+    HeadroomDimension, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
+    QualityRefusal, QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,

@@ -318,8 +318,7 @@ pub(crate) use kernel_authority_client::KernelAuthorityClient;
 // owner delivery record, so it belongs to the context read client rather than to
 // the caller that happens to hold the record.
 pub use kernel_context_read_client::{
-    KernelContextReadClient, ReconstructionReadComposition,
-    require_delivered_context_render_codec,
+    KernelContextReadClient, ReconstructionReadComposition, require_delivered_context_render_codec,
 };
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
