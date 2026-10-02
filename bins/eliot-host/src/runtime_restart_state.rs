@@ -535,6 +535,54 @@ fn sync_runtime_restart_store_dir(dir: &Path) -> Result<(), HostError> {
     sync_dir(dir)
 }
 
+/// Reads and validates the retained durable receipt of one runtime restart.
+///
+/// The ORIGINAL recorded bytes are decoded and validated with the existing
+/// `HostKernelRestartReceipt::validate`; no digest is recomputed and no
+/// receipt is minted here. `Ok(None)` means this mutation has no receipt on
+/// disk, which is distinct from a malformed, invalid or foreign record: those
+/// fail closed and leave every retained byte untouched.
+#[cfg(windows)]
+pub(super) fn read_runtime_restart_receipt(
+    host_state_root: &Path,
+    mutation_digest: &str,
+) -> Result<Option<HostKernelRestartReceipt>, HostError> {
+    if !valid_sha256_text(mutation_digest) {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart receipt path is not a lowercase sha256 mutation".to_owned(),
+        ));
+    }
+    let path = runtime_restart_receipt_path(host_state_root, mutation_digest);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(HostError::RecoveryRequired(format!(
+                "runtime restart receipt cannot be inspected: {error}"
+            )));
+        }
+    };
+    if !metadata.is_file() || metadata.len() > 16 * 1024 {
+        host_restart_observe("host.restart receipt malformed observed");
+        return Err(HostError::RecoveryRequired(
+            "runtime restart receipt is malformed or too large".to_owned(),
+        ));
+    }
+    let bytes = read_bounded_runtime_restart_file(&path, 16 * 1024, "runtime restart receipt")?;
+    let receipt = serde_json::from_slice::<HostKernelRestartReceipt>(&bytes).map_err(|error| {
+        HostError::RecoveryRequired(format!(
+            "existing runtime restart receipt is malformed: {error}"
+        ))
+    })?;
+    receipt.validate().map_err(HostError::RecoveryRequired)?;
+    if receipt.mutation_digest.as_str() != mutation_digest {
+        return Err(HostError::RecoveryRequired(
+            "runtime restart receipt is bound to another mutation".to_owned(),
+        ));
+    }
+    Ok(Some(receipt))
+}
+
 #[cfg(windows)]
 fn remove_receipt_confirmed_runtime_restart_pending(
     host_state_root: &Path,
@@ -717,26 +765,9 @@ pub(super) fn persist_runtime_restart_receipt(
     let dir = runtime_restart_store_dir(host_state_root);
     std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
     let path = runtime_restart_receipt_path(host_state_root, receipt.mutation_digest.as_str());
-    if let Some(existing_bytes) = (|| -> Result<Option<Vec<u8>>, HostError> {
-        match std::fs::metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(HostError::RecoveryRequired(format!(
-                    "runtime restart receipt cannot be inspected: {error}"
-                )));
-            }
-        }
-        let bytes = read_bounded_runtime_restart_file(&path, 16 * 1024, "runtime restart receipt")?;
-        Ok(Some(bytes))
-    })()? {
-        let existing = serde_json::from_slice::<HostKernelRestartReceipt>(&existing_bytes)
-            .map_err(|error| {
-                HostError::RecoveryRequired(format!(
-                    "existing runtime restart receipt is malformed: {error}"
-                ))
-            })?;
-        existing.validate().map_err(HostError::RecoveryRequired)?;
+    if let Some(existing) =
+        read_runtime_restart_receipt(host_state_root, receipt.mutation_digest.as_str())?
+    {
         if existing == *receipt {
             // An earlier publication may have stranded its pending cleanup
             // (failed removal or interruption after the receipt commit).
@@ -778,16 +809,14 @@ pub(super) fn persist_runtime_restart_receipt(
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let bytes =
-                    read_bounded_runtime_restart_file(&path, 16 * 1024, "runtime restart receipt")?;
-                let existing = serde_json::from_slice::<HostKernelRestartReceipt>(&bytes).map_err(
-                    |error| {
-                        HostError::RecoveryRequired(format!(
-                            "existing runtime restart receipt is malformed: {error}"
-                        ))
-                    },
-                )?;
-                existing.validate().map_err(HostError::RecoveryRequired)?;
+                let Some(existing) =
+                    read_runtime_restart_receipt(host_state_root, receipt.mutation_digest.as_str())?
+                else {
+                    return Err(HostError::RecoveryRequired(
+                        "existing runtime restart receipt disappeared during publication"
+                            .to_owned(),
+                    ));
+                };
                 if existing == *receipt {
                     // An earlier attempt may have linked this record and then failed its
                     // directory sync; confirm the entry is durable before treating it as published.
@@ -851,6 +880,77 @@ pub(super) fn has_runtime_restart_pending(
         .is_some_and(|identity| identity.mutation_digest() == digest))
 }
 
+/// Retained-evidence disposition of one `RestartKernel` mutation, resolved in
+/// the order the restart receipt contract requires.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RuntimeRestartReplay {
+    /// The exact durable receipt of this mutation is retained. Its committed
+    /// directory entry was re-confirmed and this operation's receipt-confirmed
+    /// pending cleanup was retried, so the retained receipt is the replay
+    /// answer. A completed restart is never re-run and no receipt is rewritten.
+    Receipt(HostKernelRestartReceipt),
+    /// A pending intent is retained with no durable receipt for it: the outcome
+    /// of that operation is unknown, no cleanup is authorized, and the caller
+    /// must refuse rather than rerun or erase the evidence.
+    OutcomeUnknown,
+    /// Nothing is retained for this mutation: a fresh restart is admissible.
+    Fresh,
+}
+
+/// Resolves the retained runtime-restart evidence for `mutation_digest`.
+///
+/// The durable receipt is the only evidence that the operation's effect
+/// committed, while a retained pending record is that same operation's
+/// unfinished cleanup. The retained receipt is therefore resolved — and its
+/// receipt-confirmed pending cleanup retried through the one receipt publisher
+/// — BEFORE the unknown-outcome refusal, and the refusal stands only when no
+/// receipt exists for the mutation at all (I1.2: Host owns start/stop/restart
+/// Kernel and the `HostStateJournal`; A13.6: "operations are reconciled by
+/// receipt before replay" and "blind retry is prohibited"; audit 5884445860
+/// repair: "route both new publication and exact replay through it", acceptance
+/// "exact replay actually retries cleanup").
+///
+/// `retained` is the receipt this Host already admitted in memory for the same
+/// mutation. It is used only where no durable record is retained, where no
+/// cleanup is claimed, because cleanup requires a confirmed publication.
+#[cfg(windows)]
+pub(super) fn resolve_runtime_restart_replay(
+    host_state_root: &Path,
+    retained: Option<&HostKernelRestartReceipt>,
+    mutation_digest: &str,
+) -> Result<RuntimeRestartReplay, HostError> {
+    if let Some(receipt) = read_runtime_restart_receipt(host_state_root, mutation_digest)? {
+        if let Some(admitted) = retained
+            && admitted != &receipt
+        {
+            return Err(HostError::RecoveryRequired(
+                "admitted runtime restart receipt conflicts with the durable receipt".to_owned(),
+            ));
+        }
+        // Exact replay of the one receipt publisher: it re-confirms the
+        // committed receipt entry and retries the receipt-confirmed pending
+        // removal instead of reporting success with pending still on disk.
+        persist_runtime_restart_receipt(host_state_root, &receipt)?;
+        host_restart_observe("host.restart receipt replay confirmed observed");
+        return Ok(RuntimeRestartReplay::Receipt(receipt));
+    }
+    if let Some(receipt) = retained {
+        // Validate the ORIGINAL recorded value; never recompute its digest.
+        receipt.validate().map_err(HostError::RecoveryRequired)?;
+        if receipt.mutation_digest.as_str() != mutation_digest {
+            return Err(HostError::RecoveryRequired(
+                "admitted runtime restart receipt is bound to another mutation".to_owned(),
+            ));
+        }
+        return Ok(RuntimeRestartReplay::Receipt(receipt.clone()));
+    }
+    if has_runtime_restart_pending(host_state_root, mutation_digest)? {
+        return Ok(RuntimeRestartReplay::OutcomeUnknown);
+    }
+    Ok(RuntimeRestartReplay::Fresh)
+}
+
 #[cfg(windows)]
 pub(super) fn rebind_runtime_restart_receipt(
     receipt: &HostKernelRestartReceipt,
@@ -895,6 +995,19 @@ mod durability_repair_tests {
         ));
         std::fs::create_dir_all(&root)?;
         Ok(root)
+    }
+
+    /// Holds `path` open with a Windows share mode that permits reads but
+    /// denies delete, so a production `remove_file` of that pending record
+    /// fails with a sharing violation. This is the real access fault the
+    /// receipt-confirmed cleanup must survive; no process-global flag is used.
+    fn deny_delete_handle(path: &Path) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(path)?)
     }
 
     fn make_receipt(
@@ -1307,6 +1420,169 @@ mod durability_repair_tests {
         // After durable receipt, pending should be gone
         assert!(!runtime_restart_pending_path(&root, &digest).exists());
         assert!(runtime_restart_receipt_path(&root, &digest).exists());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_receipt_replay_stays_non_success_while_pending_cleanup_fails()
+    -> TestResult {
+        // Audit 5884445860 / AUD1 focused acceptance, runtime side: fail after
+        // receipt publication but before pending deletion. The exact replay
+        // must then stay non-success while the removal or its directory commit
+        // fails, and must preserve the receipt bytes and identity.
+        //
+        // Production path: `lib.rs::HostComposition::execute_kernel_restart`
+        // resolves this mutation through the same
+        // `runtime_restart_state.rs::resolve_runtime_restart_replay`.
+        assert!(
+            include_str!("lib.rs").contains("resolve_runtime_restart_replay("),
+            "the replay gate under test must be the one the production restart path calls"
+        );
+        let root = temp_root("rr-replay-stranded")?;
+        let host = test_host()?;
+        let digest = "b1".repeat(32);
+        let request = fresh_request("rr-replay-stranded", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let receipt = make_receipt_for_request(&request)?;
+        let pending_path = runtime_restart_pending_path(&root, &digest);
+        let receipt_path = runtime_restart_receipt_path(&root, &digest);
+        // The pending record is held open for delete, so the receipt publishes
+        // and its own pending cleanup is the failing step.
+        let held = deny_delete_handle(&pending_path)?;
+        let first = persist_runtime_restart_receipt(&root, &receipt);
+        assert!(first.is_err(), "a failed pending removal is not success");
+        assert!(
+            receipt_path.exists(),
+            "the receipt is durable before pending removal is attempted"
+        );
+        assert!(pending_path.exists(), "the pending record is retained");
+        let receipt_bytes = std::fs::read(&receipt_path)?;
+        drop(held);
+        // With the access fault cleared but the cleanup directory commit
+        // failing, the replay is still not success.
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        ordering::clear();
+        let commit_failure = resolve_runtime_restart_replay(&root, None, &digest);
+        assert!(
+            commit_failure.is_err(),
+            "a failed cleanup directory commit is not success: {commit_failure:?}"
+        );
+        let log = ordering::take_log();
+        assert!(
+            log.contains(&"dir_sync_fault_injected".to_owned()),
+            "the cleanup directory commit failure must be the observed cause: {log:?}"
+        );
+        assert!(
+            pending_path.exists(),
+            "pending evidence is retained while the cleanup commit fails"
+        );
+        assert_eq!(
+            std::fs::read(&receipt_path)?,
+            receipt_bytes,
+            "the published receipt bytes must be preserved"
+        );
+        assert_eq!(
+            read_runtime_restart_receipt(&root, &digest)?,
+            Some(receipt.clone()),
+            "the recorded receipt identity must survive the failed cleanup"
+        );
+        test_fault::clear_sync_fault();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_replay_resolves_stranded_pending_and_retries_cleanup() -> TestResult {
+        // Positive case of the same production gate: a stranded pending record
+        // is confirmed against the exact durable receipt, the exact-replay
+        // cleanup actually runs, and the receipt identity and bytes are the
+        // retained ones.
+        let root = temp_root("rr-replay-resume")?;
+        let host = test_host()?;
+        let digest = "b2".repeat(32);
+        let request = fresh_request("rr-replay-resume", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let receipt = make_receipt_for_request(&request)?;
+        let pending_path = runtime_restart_pending_path(&root, &digest);
+        let receipt_path = runtime_restart_receipt_path(&root, &digest);
+        let held = deny_delete_handle(&pending_path)?;
+        assert!(
+            persist_runtime_restart_receipt(&root, &receipt).is_err(),
+            "the stranded pending record is established by a failed cleanup"
+        );
+        drop(held);
+        let receipt_bytes = std::fs::read(&receipt_path)?;
+        assert!(has_runtime_restart_pending(&root, &digest)?);
+        ordering::clear();
+        let resolved = resolve_runtime_restart_replay(&root, None, &digest)?;
+        let RuntimeRestartReplay::Receipt(replayed) = resolved else {
+            return Err("the exact durable receipt must resolve the replay".into());
+        };
+        assert_eq!(replayed, receipt, "the retained receipt identity is replayed");
+        assert!(
+            !has_runtime_restart_pending(&root, &digest)?,
+            "the receipt-confirmed cleanup must retire the stranded pending record"
+        );
+        assert!(!pending_path.exists(), "the pending file must be removed");
+        assert_eq!(
+            std::fs::read(&receipt_path)?,
+            receipt_bytes,
+            "the receipt bytes are not rewritten"
+        );
+        let log = ordering::take_log();
+        let removal = log
+            .iter()
+            .position(|event| event == "pending_remove_attempt")
+            .ok_or("the exact-replay cleanup must actually attempt the removal")?;
+        let commit = log
+            .iter()
+            .position(|event| event == "pending_remove_dir_sync_success")
+            .ok_or("the removal boundary must be committed")?;
+        assert!(removal < commit, "removal precedes its commit: {log:?}");
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_restart_replay_refuses_pending_without_a_durable_receipt() -> TestResult {
+        // Refusal case: a pending intent with no receipt for it has an unknown
+        // outcome, so the gate still refuses and never erases the evidence or
+        // admits a rerun. A mutation with nothing retained stays admissible.
+        let root = temp_root("rr-replay-refuse")?;
+        let host = test_host()?;
+        let digest = "b3".repeat(32);
+        let request = fresh_request("rr-replay-refuse", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        persist_runtime_restart_pending(&root, &request, &host)?;
+        let pending_path = runtime_restart_pending_path(&root, &digest);
+        let pending_bytes = std::fs::read(&pending_path)?;
+        ordering::clear();
+        let refused = resolve_runtime_restart_replay(&root, None, &digest)?;
+        assert!(
+            matches!(refused, RuntimeRestartReplay::OutcomeUnknown),
+            "pending without a durable receipt stays Unknown: {refused:?}"
+        );
+        assert!(
+            pending_path.exists(),
+            "an unconfirmed pending record is never removed"
+        );
+        assert_eq!(std::fs::read(&pending_path)?, pending_bytes);
+        let log = ordering::take_log();
+        assert!(
+            !log.contains(&"pending_remove_attempt".to_owned()),
+            "no cleanup may be attempted without a confirmed receipt: {log:?}"
+        );
+        let fresh_digest = "b4".repeat(32);
+        assert!(matches!(
+            resolve_runtime_restart_replay(&root, None, &fresh_digest)?,
+            RuntimeRestartReplay::Fresh
+        ));
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

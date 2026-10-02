@@ -5495,9 +5495,10 @@ mod runtime_restart_state;
 #[cfg(windows)]
 use runtime_restart_state::{
     HOST_RESTART_EPISODE_BOUND, HostRestartBudget, RuntimeRestartPendingPublication,
-    has_runtime_restart_pending, load_durable_runtime_restarts, load_restart_budget,
-    persist_restart_budget, persist_runtime_restart_pending, persist_runtime_restart_receipt,
-    read_bounded_runtime_restart_file, rebind_runtime_restart_receipt,
+    RuntimeRestartReplay, has_runtime_restart_pending, load_durable_runtime_restarts,
+    load_restart_budget, persist_restart_budget, persist_runtime_restart_pending,
+    persist_runtime_restart_receipt, rebind_runtime_restart_receipt,
+    resolve_runtime_restart_replay,
 };
 #[cfg(all(windows, test))]
 use runtime_restart_state::{
@@ -8802,14 +8803,35 @@ impl HostComposition {
         }
 
         let key = request.mutation_digest.as_str().to_owned();
-        if let Some(existing) = self.runtime_restarts.get(&key).cloned() {
-            return Ok(existing);
-        }
-        if has_runtime_restart_pending(self.launch_options.host_state_root(), &key)? {
-            return Err(HostError::RecoveryRequired(
-                "Kernel restart intent is pending and outcome is unknown; reconcile required"
-                    .to_owned(),
-            ));
+        // The durable receipt is the evidence that this operation's effect
+        // committed; a retained pending record is that same operation's
+        // unfinished cleanup, not a new unknown. The retained receipt is
+        // therefore resolved first — its exact replay re-confirms the committed
+        // receipt entry and retries the receipt-confirmed pending removal — and
+        // the unknown-outcome refusal stands only when this mutation has no
+        // receipt at all. A completed restart is never re-run on this path
+        // (I1.2 Host restart ownership; A13.6 "operations are reconciled by
+        // receipt before replay"; audit 5884445860 "exact replay actually
+        // retries cleanup").
+        match resolve_runtime_restart_replay(
+            self.launch_options.host_state_root(),
+            self.runtime_restarts.get(&key),
+            &key,
+        )? {
+            RuntimeRestartReplay::Receipt(receipt) => {
+                // A replay is readback, never a second commit: the receipt is
+                // admitted exactly as a restart that published it, and the
+                // replay itself is observed inside the receipt publisher.
+                self.runtime_restarts.insert(key.clone(), receipt.clone());
+                return Ok(receipt);
+            }
+            RuntimeRestartReplay::OutcomeUnknown => {
+                return Err(HostError::RecoveryRequired(
+                    "Kernel restart intent is pending and outcome is unknown; reconcile required"
+                        .to_owned(),
+                ));
+            }
+            RuntimeRestartReplay::Fresh => {}
         }
         let active_manifest = self
             .registry
