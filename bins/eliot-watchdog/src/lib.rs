@@ -2334,8 +2334,35 @@ mod tests {
             trust_anchor,
         )
         .unwrap_or_else(|error| panic!("test provisioned supervision authority: {error}"));
+        let installation_root = format!(r"C:\ProgramData\Eliot\installations\{installation}");
+        let runtime_state_roots = serde_json::json!({
+            "profile": "system_service",
+            "profile_anchor_root": r"C:\ProgramData",
+            "installation_root": installation_root,
+            "host_state_root": host_state_root,
+            "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
+            "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
+            "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
+            "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
+            "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
+            "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
+            "roots_digest": roots_digest
+        });
+        let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        let profile_governed_roots = serde_json::json!({
+            "binding_version": eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
+            "immutable_binaries": r"C:\Program Files\Eliot\eliot\test-version",
+            "durable_data": installation_root,
+            "user_config": installer_user_root,
+            "user_cache": installer_user_root,
+            "runtime_state_roots": runtime_state_roots.clone()
+        });
         let descriptor = serde_json::json!({
             "profile": "system_service",
+            "profile_component": "eliot",
+            "profile_version": "test-version",
+            "profile_installation_key": installation,
+            "profile_governed_roots": profile_governed_roots,
             "portable_root": null,
             "installation_epoch": {
                 "installation": installation,
@@ -2360,19 +2387,7 @@ mod tests {
                 "state": "PROVISIONED",
                 "authority": provisioned_authority
             },
-            "runtime_state_roots": {
-                "profile": "system_service",
-                "profile_anchor_root": r"C:\ProgramData",
-                "installation_root": r"C:\ProgramData\Eliot\installations\installation-7",
-                "host_state_root": host_state_root,
-                "kernel_ors_root": r"C:\ProgramData\Eliot\state\kernel\state",
-                "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
-                "store_data_root": r"C:\ProgramData\Eliot\state\store\data",
-                "store_work_root": r"C:\ProgramData\Eliot\state\store\work",
-                "store_temp_root": r"C:\ProgramData\Eliot\state\store\tmp",
-                "watchdog_state_root": r"C:\ProgramData\Eliot\state\watchdog",
-                "roots_digest": roots_digest
-            },
+            "runtime_state_roots": runtime_state_roots,
             "kernel_work_root": r"C:\ProgramData\Eliot\state\kernel\work",
             "kernel_artifact_digest": "0".repeat(64),
             "eliotd_executable_path": r"C:\ProgramData\Eliot\packages\generation-7\eliotd.exe",
