@@ -2398,6 +2398,77 @@ mod tests {
     }
 
     #[test]
+    fn expiry_condition_guard_over_skips_every_row_whose_disposition_is_not_a_temporary_fixture() {
+        // The skip arm, written at `expiry_condition_guard_over` in
+        // crates/eliot-app/src/disposition.rs:1603-1605. It is the guard's only
+        // exemption, it is keyed on the disposition word alone, and it runs
+        // before any refusal can be built. This test proves all three with
+        // values the guard is MEANT to refuse on every other count.
+        for disposition in [Disposition::ExtractToCurrentOwner, Disposition::Remove] {
+            // An undated condition: refused by the undated arm as a fixture.
+            let undated = refused_fixture(
+                disposition,
+                "remove when the current owner for this surface exists under #13",
+            );
+            // A deadline already reached: refused by the expired arm as a fixture.
+            let expired = refused_fixture(
+                disposition,
+                "remove by 2026-09-24, when the legacy route is deleted",
+            );
+            // No removal word at all: refused by arm one as a fixture.
+            let undeletable = refused_fixture(
+                disposition,
+                "retained until the current owner for this surface exists under #13",
+            );
+
+            // Same values, same rule, fixture disposition: every one refused.
+            for (condition, expiry) in [
+                ("an undated removal condition", undated.expiry),
+                ("an already-reached deadline", expired.expiry),
+                ("a condition with no removal word", undeletable.expiry),
+            ] {
+                let as_fixture = refused_fixture(Disposition::TemporaryFixture, expiry);
+                assert!(
+                    expiry_condition_guard_over(std::slice::from_ref(&as_fixture)).is_err(),
+                    "as a temporary fixture, {condition} must be refused"
+                );
+            }
+
+            // Same values, same rule, non-fixture disposition: none refused.
+            for (condition, entry) in [
+                ("an undated removal condition", undated),
+                ("an already-reached deadline", expired),
+                ("a condition with no removal word", undeletable),
+            ] {
+                assert_eq!(
+                    expiry_condition_guard_over(std::slice::from_ref(&entry)),
+                    Ok(()),
+                    "{} carrying {condition} must be skipped by the disposition \
+                     exemption, not inspected: the exemption runs before any refusal \
+                     can be built",
+                    disposition.label()
+                );
+            }
+        }
+
+        // Consequence, stated as executed evidence: a NON-fixture row carrying a
+        // deadline that has ALREADY PASSED is not refused either. This is the
+        // reachable form of the reported finding - the guard does not so much
+        // skip the six undated extract rows as skip every row whose disposition
+        // is not TemporaryFixture, dated or not, reached or not.
+        let already_reached_extract_row = refused_fixture(
+            Disposition::ExtractToCurrentOwner,
+            "remove by 2026-09-24, when host-bundle staging installs the current root plugin route",
+        );
+        assert_eq!(
+            expiry_condition_guard_over(std::slice::from_ref(&already_reached_extract_row)),
+            Ok(()),
+            "an extract row whose removal date is already past is still skipped: the \
+             exemption is keyed on disposition alone, so no date is ever compared for it"
+        );
+    }
+
+    #[test]
     fn assert_inventory_entries_are_live_backs_every_row_with_its_own_baked_proof() {
         // Production guard under test, reached from
         // `run_facade_disposition_guards`.
