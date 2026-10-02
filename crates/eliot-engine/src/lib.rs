@@ -117,8 +117,8 @@ pub use delegation::{
     DelegationBudgetReservation, DelegationBudgetService, DelegationDoctorIntegration,
     DelegationExecutionService, DelegationHealth, DelegationHealthService,
     DelegationOutcomeService, DelegationPolicyContext, DelegationPolicyService,
-    DelegationReportService, ProviderCallCampaignRequest, ProviderCallReservationDecision,
-    ProviderCallReservationOwner, ProviderCallReservationRequest,
+    DelegationReportService, ProviderCallCampaignRequest, ProviderCallLedgerUnknown,
+    ProviderCallReservationDecision, ProviderCallReservationOwner, ProviderCallReservationRequest,
 };
 pub use delegation_calibration::{
     CalibrationEvidenceGapService, CampaignIntegrityReconciliationService,
