@@ -329,6 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_cell_with_no_owner_row_is_refused() {
+        // Arm (I2.23: a cell with an undeclared state owner is a registry
+        // defect): the real `governor.daemon.learning-closure` ref stays
+        // declared but its owner row is removed. Refs and owner rows no longer
+        // describe the same set, yet the eliotd guard reads that as a plain
+        // length mismatch; this guard must instead name the specific cell that
+        // has no owner, because that is the defect an operator has to fix.
+        let result = owners_of_mutated_manifest(
+            "  { cell = \"governor.daemon.learning-closure\", state = \"learning-closure\", owner = \"eliot_governor::LearningClosureService\" },\n",
+            "",
+        );
+
+        assert_eq!(
+            result,
+            Err("capability cell governor.daemon.learning-closure has no mutable-state owner; a cell with an undeclared state owner is a registry defect".to_owned()),
+            "a declared cell with no owner row must be named as a registry defect"
+        );
+    }
+
+    #[test]
     fn one_owner_claiming_two_cells_is_refused() {
         // Arm: the real `governor.daemon.skill-catalogue` row is pointed at the
         // composition owner. Each cell still carries exactly one owner row and
