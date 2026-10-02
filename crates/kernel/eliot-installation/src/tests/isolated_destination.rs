@@ -24,10 +24,12 @@ use super::{must, registering_transaction, test_activation_approval, test_handle
 use crate::isolated_destination::{
     DestinationLeafObservation, IsolationEvidence, PreparedDestinationAdmission,
     PreparedDestinationMaterialisation, ProposedRestorationRequirements,
+    resolve_current_approved_target,
 };
 use crate::{
     ApprovedGeneration, ApprovedGenerationRegistry, CandidateManifest, FileIdentity,
-    InstallationActivationApproval, InstallationError, PlatformHandle,
+    InstallationActivationApproval, InstallationError, IsolatedDestinationError,
+    IsolatedDestinationRefusal, PlatformHandle,
 };
 
 /// Purge-ledger revision the ORS owner reports for the admitted preparation.
@@ -438,6 +440,10 @@ fn stale_source_active_generation_is_refused() {
 /// any pre-write comparison — the source generation it binds still matches the
 /// current active generation, and the destination identity is genuinely new.
 ///
+/// Whether the approved target is the build the authority CURRENTLY approves is
+/// a different question, and it is decided before the record exists at all, by
+/// `resolve_current_approved_target`; the case below proves that site.
+///
 /// The refusal therefore comes from somewhere else, and the case is written
 /// against THAT: `ApprovedGenerationRegistry::validate`, the projection's own
 /// self-consistency pass, refuses a retained admission whose approved target
@@ -480,6 +486,81 @@ fn approved_target_must_be_a_generation_this_authority_approves() {
          and retain it"
     );
     must(fixture.registry.validate());
+}
+
+/// The approved target a destination is prepared FOR must be the build this
+/// authority CURRENTLY approves, and that is decided where the target is
+/// resolved rather than where the record is written.
+///
+/// # Why this is the site the removed clause belonged at
+///
+/// The record path used to hold `active_generation == Some(&admission.
+/// approved_target_build)`. That clause could fire on exactly one input: the
+/// destination's approved target build IS the source's current active
+/// generation, which is the production shape — a restore is prepared FOR the
+/// currently approved build of the installation that owns the archive. So it
+/// refused every legitimate destination, and it never fired for the input it
+/// reads as though it were written for, a destination prepared for a SUPERSEDED
+/// approved build. Nothing was gained by keeping it where it was, and the
+/// guarantee it gestured at is real.
+///
+/// Here it is a comparison between two values the AUTHORITY owns: the handle is
+/// looked up in the approved rows the caller read out of this registry, and the
+/// row it names is then compared with that same set's own `active` bit — which
+/// `ApprovedGenerationRegistry::validate` keeps equal to `active_generation()`.
+/// Both arms are therefore reachable: the currently active row is admitted, and
+/// a retained row the authority has moved off is refused as an identity conflict.
+///
+/// The refusal is pre-effect: the resolver opens nothing, creates nothing and
+/// writes nothing, so nothing has to be rolled back.
+///
+/// Without the currency arm the superseded row below resolves to a row of this
+/// authority's own approved collection, so the destination would be admitted for
+/// a build the authority has already moved off.
+#[test]
+fn approved_target_must_be_the_build_this_authority_currently_approves() {
+    let fixture = fixture();
+    let generations = &fixture.registry.generations;
+
+    let resolved = must(resolve_current_approved_target(
+        generations,
+        &fixture.active_generation,
+    ));
+    assert!(
+        resolved.active && resolved.manifest.generation == fixture.active_generation,
+        "the handle naming the set's own ACTIVE row resolves to that row, which is what the \
+         production caller presents"
+    );
+
+    let superseded = generations
+        .iter()
+        .find(|generation| !generation.active)
+        .map(|generation| generation.manifest.generation.clone())
+        .expect("the fixture retains one approved generation that is not active");
+    assert!(
+        matches!(
+            resolve_current_approved_target(generations, &superseded),
+            Err(IsolatedDestinationError::Installation(
+                InstallationError::IdentityConflict
+            ))
+        ),
+        "a build this authority still approves but is no longer ON is not a current approved \
+         target, however well-formed its approval is"
+    );
+
+    assert!(
+        matches!(
+            resolve_current_approved_target(
+                generations,
+                &test_handle("generation-this-authority-never-approved")
+            ),
+            Err(IsolatedDestinationError::Installation(
+                InstallationError::IncompleteObservation(_)
+            ))
+        ),
+        "a handle naming no row of the authority's approved set is refused before any comparison \
+         against the current row is even possible"
+    );
 }
 
 /// Two operations may never share one destination, and a changed record for the
@@ -685,8 +766,6 @@ fn cleanup_forgets_the_pair_together_and_preserves_a_root_it_does_not_hold() {
 /// with a correctly recomputed digest.
 #[test]
 fn a_non_absent_leaf_observation_is_refused_by_both_records() {
-    use crate::{IsolatedDestinationError, IsolatedDestinationRefusal};
-
     let fixture = fixture();
     let destination = installation_key("c");
     for observation in [

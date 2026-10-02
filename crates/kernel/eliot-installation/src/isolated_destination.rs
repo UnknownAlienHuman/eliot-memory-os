@@ -159,11 +159,11 @@ pub enum IsolatedDestinationRefusal {
     /// a previous operation already admitted.
     ///
     /// The comparison is destination-against-existing-installations, in that
-    /// direction and no other. It is deliberately NOT "the approved target equals
-    /// the source's own active generation": a restore into a brand-new distinct
-    /// installation is prepared FOR an approved target generation, so that
-    /// comparison is one field against itself, it refused every legitimate
-    /// destination, and it proved nothing about the destination at all.
+    /// direction and no other. Whether the destination's APPROVED TARGET BUILD is
+    /// the build this authority currently approves is a different question, it is
+    /// decided earlier, and it is decided against the authority's own active row
+    /// rather than against a field of the claim: see
+    /// `resolve_current_approved_target`.
     #[error("the destination installation is already present in this authority's projection")]
     ExistingInstallation,
 
@@ -1068,8 +1068,15 @@ pub struct PreparedDestinationAdmission {
     pub current_purge_ledger_revision: u64,
     /// Bound target schema digest.
     pub target_schema_digest: PlatformHandle,
-    /// Approved target generation handle (build identity), read from the
-    /// installation authority's approved generation.
+    /// Approved target generation handle (build identity), copied off the
+    /// authority's own CURRENTLY ACTIVE approved row by
+    /// `resolve_current_approved_target`.
+    ///
+    /// It is the build a restore into this destination is prepared for, and it is
+    /// re-checked at record time by the registry, which refuses when the
+    /// approved collection no longer holds it at all. Its CURRENCY is settled
+    /// before the record exists, at admission, because that is the only site that
+    /// holds the approved set.
     pub approved_target_build: PlatformHandle,
     /// Approved target profile token, read from the approved target manifest.
     pub approved_target_profile: PlatformHandle,
@@ -1520,6 +1527,9 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
     /// authority itself already approved, and the approval is then compared
     /// against the manifest of that very row through the crate's existing
     /// [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest).
+    /// The resolved row is also required to be the one this set marks ACTIVE, so
+    /// the currency of the target build is decided by the authority's own record
+    /// rather than by the caller; see `resolve_current_approved_target`.
     ///
     /// The set is the authority's own projection, read by the caller from the
     /// registry it already inspected; an empty set refuses every destination,
@@ -1531,11 +1541,16 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
     /// A destination installation does not exist yet, so this authority has no
     /// approved generation FOR it; the build a restore is prepared for is the
     /// currently approved build of the installation that owns the archive. That
-    /// handle therefore normally equals [`Self::source_active_generation`], and
-    /// no inequality is demanded here — the DESTINCTNESS of the destination is
-    /// decided by the destination identity and by the derived root, not by the
-    /// approved target differing from the source. A handle that names no row in
-    /// the approved set is refused.
+    /// is a statement about which row is CURRENT, not about which row merely
+    /// exists, so the handle must name the row this approved set marks ACTIVE —
+    /// see `resolve_current_approved_target`. A handle that names no row at all,
+    /// or one that names a retained row the authority has moved off, is refused.
+    ///
+    /// No comparison against [`Self::source_active_generation`] is demanded here:
+    /// in the production caller the two are the same field of the same approved
+    /// row, so comparing them would be a field against itself. The DESTINCTNESS
+    /// of the destination is decided by the destination identity and by the
+    /// derived root, not by the approved target differing from the source.
     pub approved_target_generation: &'a PlatformHandle,
     /// Owner-issued restoration requirements for this destination.
     pub restoration_requirements: &'a ProposedRestorationRequirements,
@@ -1547,6 +1562,66 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
     /// This is the EXISTING-INSTALLATION set, and it is compared against the
     /// destination identity and nothing else.
     pub known_installations: &'a [PlatformHandle],
+}
+
+/// Resolves the approved target generation a destination is prepared FOR, out of
+/// the approved set this installation authority retains, and requires that the
+/// resolved row is the generation that set CURRENTLY approves.
+///
+/// # Why the currency comparison lives here and not in the registry
+///
+/// The record path used to hold `active_generation == Some(&admission.
+/// approved_target_build)` and to refuse the destination when it was true. The
+/// concrete input that clause could refuse is the ONLY input it could refuse: it
+/// fires precisely when the destination's approved target build IS the source's
+/// current active generation, and that is the production shape — a restore is
+/// prepared FOR the currently approved build of the installation that owns the
+/// archive — so it refused every legitimate destination and none of the
+/// illegitimate ones. It never fired for a destination prepared for a SUPERSEDED
+/// approved build, which is the case it reads as though it were for.
+///
+/// That case is decided here, at the site where the destination's own approved
+/// build is resolved. The handle is looked up in the authority's OWN approved
+/// rows and the row it names is then compared with that set's own
+/// `ApprovedGeneration::active` bit — the bit `ApprovedGenerationRegistry::validate`
+/// keeps equal to `active_generation()`, and the bit
+/// `ApprovedGenerationRegistry::active()` selects on. Both sides of the
+/// comparison are the authority's retained records rather than fields of the
+/// caller's claim, so the refusal cannot be reached by presenting a target and a
+/// source generation that agree with each other, and a destination cannot be
+/// widened onto an approved build this authority has moved off.
+///
+/// This runs before any effect and creates nothing, so a target the authority has
+/// moved off is refused pre-effect, exactly as the removed record-time clause
+/// refused it — only on the input it was actually about.
+///
+/// # Errors
+///
+/// [`IsolatedDestinationError::Installation`] with
+/// [`InstallationError::IncompleteObservation`] when the handle names no row of
+/// the authority's approved set, and with [`InstallationError::IdentityConflict`]
+/// when it names a retained row the authority no longer has active. The latter is
+/// the same typed class the removed record-time clause produced for this
+/// condition, so one refusal class spans both layers.
+pub(crate) fn resolve_current_approved_target<'a>(
+    approved_generations: &'a [ApprovedGeneration],
+    approved_target_generation: &PlatformHandle,
+) -> Result<&'a ApprovedGeneration, IsolatedDestinationError> {
+    let approved_target = approved_generations
+        .iter()
+        .find(|generation| &generation.manifest.generation == approved_target_generation)
+        .ok_or(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the approved target generation is not one this installation authority approves"
+                    .to_owned(),
+            ),
+        ))?;
+    if !approved_target.active {
+        return Err(IsolatedDestinationError::Installation(
+            InstallationError::IdentityConflict,
+        ));
+    }
+    Ok(approved_target)
 }
 
 /// Admits and allocates a new, distinct, isolated destination installation.
@@ -1577,13 +1652,14 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
 /// 5. the approved target is a generation THIS authority holds in
 ///    [`IsolatedDestinationAdmissionInput::approved_generations`] — so a caller
 ///    cannot present a manifest and an approval that merely agree with each other —
-///    and that row's own activation approval is compared against that row's own
+///    that row's own activation approval is compared against that row's own
 ///    manifest through the crate's existing
-///    [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest).
-///    Distinctness is NOT decided here: the destination installation does not
-///    exist yet, so the build it is prepared for legitimately is the currently
-///    approved build of the source's own installation, and check 4 plus the
-///    derived root are what make the destination a distinct installation;
+///    [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest),
+///    and that row is the one the set currently marks ACTIVE, so a destination is
+///    not prepared FOR an approved build this authority has moved off. Distinctness
+///    is NOT decided here: the destination installation does not exist yet, so
+///    check 4 plus the derived root are what make the destination a distinct
+///    installation;
 /// 6. the owner-declared isolated restore area resolves through its retained
 ///    no-follow protected-root lease to exactly the declared root, and the
 ///    destination root derived from it is strictly inside the area and neither
@@ -1646,10 +1722,10 @@ pub fn admit_prepared_isolated_destination(
     //    set and nothing else. That set covers the ACTIVE installation, every
     //    previously approved generation's installation identity, and every
     //    destination already admitted as prepared. It is the only comparison that
-    //    decides "already an installation": comparing the APPROVED TARGET with the
-    //    source's own active generation answers a different question, and in the
-    //    production shape both values were the same field of the same record, so it
-    //    refused every destination while proving nothing about it.
+    //    decides "already an installation": whether the destination's APPROVED
+    //    TARGET is still current is a different question, and check 5 answers it
+    //    against the authority's own active row rather than against a field of
+    //    the claim.
     if input
         .known_installations
         .iter()
@@ -1662,45 +1738,23 @@ pub fn admit_prepared_isolated_destination(
     //    allocated, and it is proved against the AUTHORITY'S OWN APPROVED SET.
     //    A loose manifest/approval pair would only prove that two caller-presented
     //    values agree with each other; resolving the target out of the set the
-    //    authority retains proves it is a generation this authority approved. The
-    //    approval is then compared against THAT row's own manifest with the
-    //    crate's existing binding validator, so the row's internal consistency is
-    //    established by the same code that established it when it was committed.
-    //    The approval's only constructor is crate-private and its production
-    //    issuer is the signed activation bridge, so no caller can present one.
-    let approved_target = input
-        .approved_generations
-        .iter()
-        .find(|generation| &generation.manifest.generation == input.approved_target_generation)
-        .ok_or(IsolatedDestinationError::Installation(
-            InstallationError::IncompleteObservation(
-                "the approved target generation is not one this installation authority approves"
-                    .to_owned(),
-            ),
-        ))?;
+    //    authority retains proves it is a generation this authority approved AND
+    //    that it is the generation the authority CURRENTLY approves. The approval
+    //    is then compared against THAT row's own manifest with the crate's existing
+    //    binding validator, so the row's internal consistency is established by
+    //    the same code that established it when it was committed. The approval's
+    //    only constructor is crate-private and its production issuer is the signed
+    //    activation bridge, so no caller can present one.
+    let approved_target = resolve_current_approved_target(
+        input.approved_generations,
+        input.approved_target_generation,
+    )?;
     crate::approved_generation_registry::validate_approval_against_manifest(
         &approved_target.approval,
         &approved_target.manifest,
         "prepared_destination.approved_target",
     )?;
     let approved_target_build = approved_target.manifest.generation.clone();
-    // The approved target is NOT compared for inequality against the source's
-    // active generation. A destination installation does not exist yet, so this
-    // authority has no approved generation FOR it: the build a restore is prepared
-    // for is the currently approved build of the installation that owns the
-    // archive, and that legitimately equals the source's active generation. The
-    // DISTINCTNESS of the destination is decided by check 4 — the destination
-    // identity against the existing-installation set — and by the derived root
-    // being a genuinely different object outside the source installation. The
-    // previous form compared `manifest.generation` with the source's active
-    // generation, which in the production caller were the same field of the same
-    // `ApprovedGeneration`, so it was `a == a`: it refused every destination and
-    // proved nothing about the destination.
-    //
-    // What genuinely is checked here is that the target handle named a row this
-    // authority approves, and that the row's own approval binds that row's
-    // manifest — a comparison between the authority's retained records and the
-    // caller's claim, not a field against itself.
 
     // 6. The owner-declared isolated restore area, proved through the retained
     //    no-follow lease the caller already holds, and the destination root
