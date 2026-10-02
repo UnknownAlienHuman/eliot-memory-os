@@ -185,9 +185,16 @@ pub enum MismatchField {
     MigrationClass,
 }
 
-impl fmt::Display for MismatchField {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
+impl MismatchField {
+    /// The stable wire label of this field.
+    ///
+    /// A refusal that crosses a typed boundary has to name the incompatible
+    /// field as a `&'static str`, and these are the exact labels the durable
+    /// [`eliot_ors::CompatibilityRefusal`] record stores, so the reported field
+    /// and the persisted field are one value rather than two spellings.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
             Self::EnvelopeVersion => "envelope_version",
             Self::ProtocolRange => "protocol_range",
             Self::ContractSetDigest => "contract_set_digest",
@@ -197,8 +204,13 @@ impl fmt::Display for MismatchField {
             Self::AuthorityEpoch => "authority_epoch",
             Self::RequiredCapability => "required_capability",
             Self::MigrationClass => "migration_class",
-        };
-        formatter.write_str(label)
+        }
+    }
+}
+
+impl fmt::Display for MismatchField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 

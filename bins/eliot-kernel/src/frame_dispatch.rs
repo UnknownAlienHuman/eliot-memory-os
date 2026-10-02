@@ -48,9 +48,8 @@ use super::{
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
-    CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
-    KernelRuntimeHealthEvidence, NormativePairReceipt, ProcessHealthStatus, ProcessHealthVector,
-    RouteScope, StateMigrationClass, VersionRange, admit_handshake, expected_seal_tag,
+    CapabilityReadiness, HealthDimensionKind, KernelRuntimeHealthEvidence, ProcessHealthStatus,
+    ProcessHealthVector, RouteScope, admit_candidate_activation,
 };
 use eliot_observability_runtime::{ModuleIdentity, WorkClass, WorkTerminationOutcome};
 use eliot_runtime_contracts::{GenerationCutoverState, HealthDimension};
@@ -87,44 +86,62 @@ pub(crate) fn runtime_contract_set_digest() -> Result<String, TransportError> {
 /// generation/epoch. The protocol and canonical-format revisions are the
 /// current I1.12 handshake revisions; the contract-set digest is derived
 /// above from the four public owners rather than from a binary or config hash.
+///
+/// It returns the accepted evidence AND the durable verdict the same admission
+/// produced, so the caller persists exactly the verdict it admitted on rather
+/// than deciding compatibility a second time.
 fn runtime_compatibility_evidence(
     generation: eliot_contracts::ResourceGeneration,
     authority_epoch: &eliot_contracts::EpochId,
-) -> Result<eliot_kernel_core::AcceptedCompatibilityEvidence, TransportError> {
-    let protocol_range = VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
-    let canonical_format_range =
-        VersionRange::new(1, 1).map_err(|_| TransportError::SessionFenced)?;
-    let contract_set_digest = runtime_contract_set_digest()?;
-    let architecture_source_digest = eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST;
-    let normative_receipt = NormativePairReceipt::new(
-        architecture_source_digest,
-        expected_seal_tag(architecture_source_digest),
-    )
-    .map_err(|_| TransportError::SessionFenced)?;
-    let candidate = CompatibilityEnvelope::new(
-        protocol_range,
-        contract_set_digest.clone(),
-        canonical_format_range,
-        architecture_source_digest,
-        normative_receipt,
+) -> Result<
+    (
+        eliot_kernel_core::AcceptedCompatibilityEvidence,
+        eliot_kernel_core::CandidateActivation,
+    ),
+    TransportError,
+> {
+    // The envelope and the durable state are the ones every Kernel process
+    // boundary, the candidate-activation gate and the restart rollback gate
+    // share, so one derivation cannot drift into several.
+    let candidate = super::compatibility_gate::process_compatibility_envelope(
         generation,
-        authority_epoch.clone(),
-        vec![RUNTIME_HEALTH_CAPABILITY.to_owned()],
-        Vec::new(),
-        StateMigrationClass::NoMigration,
+        authority_epoch,
     )
     .map_err(|_| TransportError::SessionFenced)?;
-    let durable = DurableCompatibilityState::new(
-        protocol_range,
-        contract_set_digest,
-        canonical_format_range,
-        architecture_source_digest,
-        authority_epoch.clone(),
-        vec![RUNTIME_HEALTH_CAPABILITY.to_owned()],
-        StateMigrationClass::NoMigration,
+    let durable = super::compatibility_gate::durable_compatibility_state(authority_epoch)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let activation = admit_candidate_activation(
+        &candidate,
+        &durable,
+        i64::try_from(unix_ms()).unwrap_or(i64::MAX),
     )
     .map_err(|_| TransportError::SessionFenced)?;
-    admit_handshake(&candidate, &durable).map_err(|_| TransportError::SessionFenced)
+    let admitted = activation
+        .require_admitted()
+        .map_err(|_| TransportError::SessionFenced)?;
+    Ok((admitted.clone(), activation))
+}
+
+/// Persists the accepted compatibility evidence for the authenticated Module
+/// generation that just handshaked, bound to its own artifact identity,
+/// generation and Authority Epoch.
+///
+/// The durable verdict is the ONLY thing a later rollback is re-verified
+/// against, so an admitted generation whose evidence was not persisted can
+/// never become a rollback target. Staging the recorded verdict is not a route
+/// switch: it leaves the active executable untouched.
+fn persist_runtime_compatibility(
+    ors: &eliot_ors::RedbRecoveryStore,
+    module_generation: &eliot_runtime_contracts::ModuleGeneration,
+    activation: &eliot_kernel_core::CandidateActivation,
+) -> Result<(), TransportError> {
+    super::compatibility_gate::persist_generation_compatibility(
+        ors,
+        module_generation.module_id.as_str(),
+        module_generation.artifact_id.as_str(),
+        activation,
+    )
+    .map_err(|_| TransportError::SessionFenced)
 }
 
 fn observe_frame(event: &'static str, outcome: &'static str) {
@@ -425,9 +442,14 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        let compatibility = runtime_compatibility_evidence(
+        let (compatibility, activation) = runtime_compatibility_evidence(
             policy_generation.generation,
             &policy_generation.state_fence.authority_epoch,
+        )?;
+        persist_runtime_compatibility(
+            &self.generation_gateway.ors,
+            &policy_generation,
+            &activation,
         )?;
         let cutover_state = self.runtime_cutover_state(
             policy_generation.generation,

@@ -16,8 +16,7 @@ use eliot_contracts::StateFence;
 use eliot_ipc::ServerHandshakePolicy;
 use eliot_kernel_core::{
     CompatibilityMismatch, CutoverDecision, DurableCompatibilityState, GenerationRoute,
-    GenerationRouter, RouteScope, StateMigrationClass, VersionRange, admit_rollback,
-    restore_recorded_evidence,
+    GenerationRouter, RouteScope, admit_rollback, restore_recorded_evidence,
 };
 use eliot_kernel_service::KernelService;
 use eliot_ors::{CutoverRouteSnapshot, CutoverRouteTable, OrsError, RedbRecoveryStore};
@@ -167,29 +166,15 @@ pub(crate) struct OrsGenerationCoordinator {
 /// to gate every restored route as a rollback (I1.12, issue #1890 W4).
 ///
 /// Built from the SAME live values the runtime handshake binds
-/// (`frame_dispatch::runtime_compatibility_evidence`), so the rollback gate and
-/// the activation handshake are compared against one durable state rather than
-/// two independently derived projections. It is derived from the running
-/// binary's own protocol/format/contract/architecture identity and the service's
-/// current authority epoch; nothing is invented and no evidence is carried over
-/// from a previous process.
+/// (`frame_dispatch::runtime_compatibility_evidence`) and the candidate-activation
+/// gate compares against (`compatibility_gate::durable_compatibility_state`), so
+/// the rollback gate and the activation handshake are compared against one
+/// durable state rather than three independently derived projections. Nothing is
+/// invented and no evidence is carried over from a previous process.
 fn current_durable_compatibility_state(
     service: &KernelService,
 ) -> Result<DurableCompatibilityState, String> {
-    let protocol_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
-    let canonical_format_range = VersionRange::new(1, 1).map_err(|error| error.to_string())?;
-    let contract_set_digest =
-        super::frame_dispatch::runtime_contract_set_digest().map_err(|error| error.to_string())?;
-    DurableCompatibilityState::new(
-        protocol_range,
-        contract_set_digest,
-        canonical_format_range,
-        eliot_kernel_core::CURRENT_ARCHITECTURE_SOURCE_DIGEST,
-        service.authority_epoch(),
-        vec![super::frame_dispatch::RUNTIME_HEALTH_CAPABILITY.to_owned()],
-        StateMigrationClass::NoMigration,
-    )
-    .map_err(|error| error.to_string())
+    super::compatibility_gate::durable_compatibility_state(&service.authority_epoch())
 }
 
 impl OrsGenerationCoordinator {
