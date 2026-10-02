@@ -1,15 +1,27 @@
-//! Durable Surreal transaction leg for the owner-issued
+//! Surreal transaction leg for the owner-issued
 //! `RecordAuthorityRevocation` revocation record (issue #686).
 //!
 //! Transitive influence revocation is decided by the authority owner
 //! (`eliot-authority`) and recorded by the Governor, which emits the closed
 //! seven-field `RecordAuthorityRevocation` command through
 //! `authority_revocation_envelope`
-//! (`crates/governor/eliot-governor/src/authority_revocation.rs:173`). This leg
-//! persists exactly that record and nothing else: the create-only row, its
-//! payload bytes and the canonical receipt commit in the same prepared
-//! transaction as every other owner row, so a reader can never observe a durable
-//! revocation the receipt does not describe.
+//! (`crates/governor/eliot-governor/src/authority_revocation.rs:179`). This leg
+//! renders exactly that record and nothing else: the create-only row, its
+//! payload bytes and the receipt create are appended into the SAME canonical
+//! transaction as every other owner row, ahead of that receipt, so a reader can
+//! never observe a revocation the receipt does not describe.
+//!
+//! What that proves is ATOMICITY, not durability, and the distinction is
+//! load-bearing rather than a hedge. Rendering into the one canonical
+//! transaction is the whole proven contract of this slice — it is exactly what
+//! `docs/architecture/I05-04-canonical-transition.md` requires of this leg, and
+//! the leg is wired to render there. The durable COMMIT of this row is NOT
+//! proven on this slice: no real-`SurrealDB` edge proof drives this leg end to
+//! end on this tree, and the durable precondition such a commit would need — a
+//! Kernel-ORS-committed `Revoked` `GrantClosureReceipt` at the live composition
+//! fence — has no production producer here. Every durability verb is therefore
+//! scoped below to what is actually observed; nothing in this module may be read
+//! as evidence that a revocation row has landed.
 //!
 //! It adds NO table. The row lives in its own namespace of the existing
 //! `recovery_owner` table — the same mechanism the blackboard item record
@@ -49,11 +61,11 @@
 //! reproduces the producer's EXACT derivation and compares it: the Governor
 //! computes `fence_digest` as `sha256_hex(canonical_json_bytes(&state_fence))`
 //! over the durable closure's `StateFence`
-//! (`authority_revocation.rs:446` and `:489`, via `canonical_digest` at `:136`),
+//! (`authority_revocation.rs:452` and `:495`, via `canonical_digest` at `:142`),
 //! after refusing to emit an envelope unless that fence EQUALS the request
-//! metadata fence (`:548`, and again at `:482` for the second-phase
+//! metadata fence (`:554`, and again at `:488` for the second-phase
 //! coordinates). The envelope carries `request: identity.request.metadata`
-//! (`:232`), so the value the transition records under `state_fence` is
+//! (`:238`), so the value the transition records under `state_fence` is
 //! byte-identical to the fence that was digested. This leg recomputes the same
 //! digest from `transition.state_fence` through the same
 //! `canonical_json_bytes` + `sha256_hex` helpers and refuses with
@@ -75,10 +87,10 @@
 //! the store they remain the PRODUCER's assertion. Six of the seven recorded
 //! fields ARE deep-bound to a committed `GrantClosureReceipt` upstream in the
 //! Governor, not re-derived here: `require_recorded_fields_bind_closure`
-//! (`authority_revocation.rs:410-453`) compares `origin_ref`, `closure_id`,
+//! (`authority_revocation.rs:416-459`) compares `origin_ref`, `closure_id`,
 //! `closure_revision`, `affected_digest`, `affected_count` and `fence_digest`
 //! against the durable closure, and `bind_durable_closure_coordinates` calls it
-//! (`:455-459`) before the envelope is admitted. The seventh,
+//! (`:461-465`) before the envelope is admitted. The seventh,
 //! `invalidation_reason`, is NOT among them: it is carried as the producer's own
 //! recorded value and is never re-derived or compared against the closure
 //! anywhere, in the Governor or in this leg.
@@ -87,9 +99,9 @@
 //!
 //! `closure_revision` and `affected_count` are declared as decimal STRINGS
 //! (`operation_parameters.rs:568-604`) and the producer emits
-//! `u64::to_string()` of each (`:222`, `:224`). The owner refuses a blank field
-//! (`:193-205`) and refuses a zero revision or a zero affected count
-//! (`:206-216`) before it emits anything. A leg that accepted what the owner
+//! `u64::to_string()` of each (`:228`, `:230`). The owner refuses a blank field
+//! (`:199-211`) and refuses a zero revision or a zero affected count
+//! (`:212-222`) before it emits anything. A leg that accepted what the owner
 //! refused would reintroduce exactly the defect class this record exists to
 //! close, so both fields are parsed here and refused when absent, non-string,
 //! blank, not ASCII decimal digits, carrying a non-canonical leading zero,
@@ -251,7 +263,7 @@ pub(crate) fn authority_revocation_statements(
     // digests the `StateFence` alone, so the closure fields are carried here as
     // the authority owner's recorded values, not derived here. Upstream,
     // `require_recorded_fields_bind_closure`
-    // (`authority_revocation.rs:410-453`) deep-binds six of the seven recorded
+    // (`authority_revocation.rs:416-459`) deep-binds six of the seven recorded
     // fields to a committed `GrantClosureReceipt`: `origin_ref`, `closure_id`,
     // `closure_revision`, `affected_digest`, `affected_count` and
     // `fence_digest`. `invalidation_reason` is the seventh and is NOT among
@@ -268,10 +280,10 @@ pub(crate) fn authority_revocation_statements(
 /// Recomputes the exact `fence_digest` the producer emits for one State Fence.
 ///
 /// This is the producer's own derivation
-/// (`authority_revocation.rs:446`, `:489`, `canonical_digest` at `:136`):
+/// (`authority_revocation.rs:452`, `:495`, `canonical_digest` at `:142`):
 /// `sha256_hex(canonical_json_bytes(&state_fence))`. The Governor refuses to
-/// emit unless the closure's fence equals the request metadata fence (`:548`),
-/// and the envelope carries that metadata verbatim as its request (`:232`), so
+/// emit unless the closure's fence equals the request metadata fence (`:554`),
+/// and the envelope carries that metadata verbatim as its request (`:238`), so
 /// the transition's `state_fence` is the very value that was digested.
 fn fence_digest_hex(state_fence: &StateFence) -> Result<String, String> {
     let bytes = canonical_json_bytes(state_fence).map_err(|error| error.to_string())?;
@@ -313,7 +325,7 @@ fn decode_record(
 /// Refuses an absent parameter, a value that is not a JSON string (so `null`, a
 /// number, an object and an array are all refused rather than coerced), a blank
 /// string, and any string carrying control characters — the same refusals the
-/// producer applies before it emits (`authority_revocation.rs:193-205`).
+/// producer applies before it emits (`authority_revocation.rs:199-211`).
 fn declared_text<'a>(
     parameters: &'a BTreeMap<String, Value>,
     name: &'static str,
@@ -342,7 +354,7 @@ fn declared_text<'a>(
 /// declares and emits as its decimal string.
 ///
 /// The producer refuses a zero durable revision and a zero affected count before
-/// emitting anything (`authority_revocation.rs:206-216`) because the origin
+/// emitting anything (`authority_revocation.rs:212-222`) because the origin
 /// itself is always affected; a leg that admitted either would store a record
 /// asserting a closure that never happened. The canonical decimal spelling is
 /// required too: the producer emits `u64::to_string()`, so a leading zero, a

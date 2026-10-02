@@ -66,13 +66,24 @@
 //! renders through [`authority_revocation_envelope`] and
 //! `finish_canonical_revocation` is RENDERED into the canonical transaction as
 //! a create-only `recovery_owner` statement. Rendering is the whole proven
-//! contract of this slice: the leg is wired, and it is not committed. No code
-//! on this tree drives a revocation envelope end to end through that leg, and
-//! the durable precondition it would need — a Kernel-ORS-committed `Revoked`
-//! `GrantClosureReceipt` at the live composition fence — has no production
-//! producer. Should that row ever be committed it still records only the
-//! closure the authority owner already committed and durably fenced, and
-//! grants no re-grant, restoration, or support.
+//! contract of this slice: the leg is wired, and it is not committed.
+//!
+//! Reachable is not entered, and this module must not blur the two. The path
+//! IS production-reachable: the daemon's polled authority-revocation ingress
+//! drives `GovernorComposition::apply_pending_canonical_revocation`, that entry
+//! reaches `finish_canonical_revocation` in `composition.rs`, and that body
+//! builds the envelope here through
+//! [`authority_revocation_envelope_from_closure`] and commits it through the
+//! retained canonical port. No link in that chain carries `#[cfg(test)]`. What
+//! it is not is ENTERED in practice. The durable precondition — a
+//! Kernel-ORS-committed `Revoked` `GrantClosureReceipt` at the live
+//! composition fence — has no production producer: its only non-test writer is
+//! the P-07 owner's `revoke_grant`, which the Governor reaches only through
+//! `GovernorComposition::apply_authority_request`, an entry with zero call
+//! sites, and no shipped code strikes a grant revoke. So on a fresh
+//! installation the chain runs zero times. Should that row ever be committed
+//! it still records only the closure the authority owner already committed and
+//! durably fenced, and grants no re-grant, restoration, or support.
 //! What is still open is the consumer triple of the PAIRED READ, and this
 //! module's decision edge cannot supply it: `GetAuthorityRevocationHistory`
 //! remains known-but-unsupported at that gate and still fails closed with

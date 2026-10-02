@@ -251,12 +251,19 @@
 //! the historical reason, not the present state. That slice supplied the
 //! catalogue row and the typed-validation arm, so an admitted revocation now
 //! resolves to a mutation entry instead of failing closed at this gate, and the
-//! proven per-backend WRITE handler has since landed
+//! per-backend WRITE handler has since landed
 //! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
 //! appended into the canonical atomic transaction by
 //! `append_authority_revocation_statements`), together with the count-test
-//! migration in `tests/operation_manifest_catalogue.rs`. What remains absent is
-//! the consumer triple of the PAIRED READ, so the row still only records the
+//! migration in `tests/operation_manifest_catalogue.rs`.
+//!
+//! Admission is the whole of what this gate settles for that row, and the
+//! distinction matters here: the handler is production-registered and its
+//! rendered statements are unit-proven, but the DURABLE COMMIT of this leg is
+//! NOT proven — no real-Surreal edge proof of it exists — so an admission this
+//! gate now grants is a claim about reachability and shape, never a claim that
+//! a revocation is durably stored. What remains absent at the read edge is the
+//! consumer triple of the PAIRED READ, so the row still only records the
 //! closure the authority owner already committed and durably fenced, and grants
 //! no re-grant, restoration, or support.
 //! `GetAuthorityRevocationHistory` is a named read, not a member of this mutation

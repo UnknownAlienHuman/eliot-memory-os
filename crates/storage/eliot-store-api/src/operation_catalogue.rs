@@ -77,14 +77,29 @@
 //! contract until canonical read/write handlers are available, and
 //! `GetAuthorityRevocationHistory`, whose typed read contract and Governor
 //! evidence decoder are closed but whose read row, proven per-backend handler
-//! and consumer triple are not. What is different about
-//! `RecordAuthorityRevocation` is the read-back leg, not the write leg: unlike
-//! an activated row whose write and read both carry a proven per-backend handler
-//! and a consumer triple, its paired named read
+//! and consumer triple are not. What is true of `RecordAuthorityRevocation`
+//! about the read-back leg is only this: its own paired named read
 //! `GetAuthorityRevocationHistory` still carries none of the three, because the
 //! Kernel serves that read from the retained P-07 ORS before the store bridge
-//! sees it. Recording a revocation is therefore not reading it back, and no
-//! other activated operation's status changes with this row.
+//! sees it. Lacking an activated paired read is NOT what makes this row
+//! remarkable — several other activated mutations are in the same position, and
+//! the three tiers are all visible in these two tables:
+//!
+//! * `ApplyLifecyclePolicy`, `ReconcileRecovery`, `RecordFinishDecision`,
+//!   `RecordFinishEvidence`, `ApplySwarmOwnerRevisions` and `ApplyErasure`
+//!   have no named read of their own at all;
+//! * `AdmitMailboxMessage` and `RecordModuleCatalogSnapshot` name reads that
+//!   are declared in [`NamedReadOperation`](crate::NamedReadOperation) but
+//!   carry no row here, exactly as `GetAuthorityRevocationHistory` does;
+//! * `CaptureObservation`, `AppendAuditEvent`, `ApplyEpistemicRevision` and
+//!   `ApplyProblemOwnerState` are served by range/pack reads rather than by a
+//!   name-paired one.
+//!
+//! What IS specific to this operation is the REASON, not the shape: the Kernel
+//! intercepts that one named read and serves it from the retained P-07 ORS, so
+//! no store read row is owed for it at this gate. Recording a revocation is
+//! therefore not reading it back, and no other activated operation's status
+//! changes with this row.
 //!
 //! Issue #686: `RecordAuthorityRevocation` is activated here. It was
 //! deliberately known-but-unsupported because its typed parameter contract
@@ -95,15 +110,24 @@
 //! known-but-unsupported state; it is not its state now. This slice supplied the
 //! catalogue row and the typed-validation arm, so an admitted revocation resolves
 //! to a mutation entry instead of failing closed with
-//! [`StoreError::UnknownOperation`] at this gate. The proven per-backend WRITE
-//! handler has since landed too
+//! [`StoreError::UnknownOperation`] at this gate. A production-registered
+//! per-backend WRITE handler has since landed too
 //! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`: a
-//! create-only durable `recovery_owner` row in its own namespace of that
-//! existing table, no new table, registered by a `pub(crate) mod` line in that
-//! crate's `apply.rs` and appended into the canonical atomic transaction by
-//! `append_authority_revocation_statements`), and the count-test migration in
-//! `tests/operation_manifest_catalogue.rs` now expects the true entry count of
-//! forty-eight. Committing the row records the closure the authority owner
+//! create-only `recovery_owner` row in its own namespace of that
+//! existing table, no new table and no new DDL, registered by a `pub(crate) mod`
+//! line in that crate's `apply.rs` and appended into the canonical atomic
+//! transaction by `append_authority_revocation_statements`), and the count-test
+//! migration in `tests/operation_manifest_catalogue.rs` now expects the true
+//! entry count of forty-eight.
+//!
+//! The distinction these entries must keep: that handler RENDERS the row into
+//! the one canonical transaction ahead of the receipt create, and its rendering
+//! is unit-proven at the contract level, but it does not yet COMMIT the row. No
+//! real-Surreal edge proof of this leg exists, so nothing here may be read as
+//! describing a durable row, a durable commit, or an end-to-end recorded
+//! revocation; what this catalogue establishes is that an admitted revocation
+//! reaches the canonical write path and renders correctly there. Committing the
+//! row, once such a proof exists, records the closure the authority owner
 //! already committed and durably fenced, and grants no re-grant, restoration, or
 //! support: a revoked influence is never revived by writing this row.
 //!
@@ -113,9 +137,9 @@
 //! Kernel intercepts that named read and serves it from the retained P-07 ORS
 //! before the store bridge ever sees it (`bins/eliot-kernel/src/daemon_request_dispatch.rs`,
 //! handler `crates/kernel/eliot-kernel-service/src/owner_history.rs`). So the
-//! write leg being proven is not a claim that a recorded revocation can be read
-//! back from the store: it cannot, and this catalogue does not advertise that it
-//! can.
+//! write leg being activated and rendered is not a claim that a recorded
+//! revocation can be read back from the store: it cannot, and this catalogue
+//! does not advertise that it can.
 //!
 //! `GetAuthorityRevocationHistory` remains known-but-unsupported at this gate
 //! and still fails closed with [`StoreError::UnknownOperation`] in

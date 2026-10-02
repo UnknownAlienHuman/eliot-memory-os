@@ -9808,9 +9808,28 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the one canonical transaction. What it does not yet do is COMMIT the
     /// row: no real-Surreal edge proof of this leg exists yet, so the rendered
     /// statements are unit-proven while the commit is not, and nothing here
-    /// may be described as a durable row until such a proof exists. No
-    /// production code drives a revocation envelope end to end through this leg
-    /// either; the render is what this branch proves, not the durable write.
+    /// may be described as a durable row until such a proof exists.
+    ///
+    /// That is a PROOF ceiling, not a wiring gap, and the two must not be
+    /// conflated here: the path is production-REACHABLE. The daemon ingress
+    /// pass named above enters this method, this method's own body reaches
+    /// `finish_canonical_revocation`, and that body builds the envelope with
+    /// [`authority_revocation_envelope_from_closure`] and commits it through
+    /// `commit_canonical`. No link in that chain carries `#[cfg(test)]`, so
+    /// reachability is a structural fact rather than a call-site count.
+    ///
+    /// What is true, and is the whole of the remaining ENTRY gap, is the weaker
+    /// and different statement that the chain is not ENTERED in practice: its
+    /// durable precondition has no production producer. It needs a
+    /// Kernel-ORS-committed `Revoked` [`GrantClosureReceipt`] at the live
+    /// composition fence, and the only non-test writer of one is the P-07
+    /// owner's `revoke_grant`, whose Governor side is [`Self::revoke_grant`].
+    /// That method is reached from [`Self::revoke_grant_and_reconcile`] and
+    /// that one from [`Self::apply_admitted_authority_revocation`]; both hang
+    /// off [`Self::apply_authority_request`], which has zero call sites, and no
+    /// shipped code strikes a grant revoke. So on a fresh installation this
+    /// chain runs zero times. Reachable is not entered, and neither is the
+    /// durable write: the render is what this branch proves, not the commit.
     ///
     /// What remains absent is the CONSUMER TRIPLE of the PAIRED READ, and that
     /// is the whole of the remaining gap. `GetAuthorityRevocationHistory` is
