@@ -367,8 +367,11 @@ fn an_undecodable_ledger_never_becomes_a_fresh_budget() -> TestResult {
     assert_eq!(fs::read(&ledger_path)?, truncated);
 
     // One unknown member inside the stored protected budget record.
-    let unknown_member = String::from_utf8(intact)?
-        .replacen("\"campaign_id\"", "\"unknown_member\": 0, \"campaign_id\"", 1);
+    let unknown_member = String::from_utf8(intact)?.replacen(
+        "\"campaign_id\"",
+        "\"unknown_member\": 0, \"campaign_id\"",
+        1,
+    );
     fs::write(&ledger_path, &unknown_member)?;
     assert_undecodable_ledger_refuses(&owner)?;
     assert_eq!(fs::read(&ledger_path)?, unknown_member.as_bytes());
@@ -379,10 +382,7 @@ fn an_undecodable_ledger_never_becomes_a_fresh_budget() -> TestResult {
 /// corruption disposition reaches the readers, and neither `open_campaign` nor
 /// `reserve` may admit a fresh budget or reservation over it.
 fn assert_undecodable_ledger_refuses(owner: &ProviderCallReservationOwner) -> TestResult {
-    for error in [
-        owner.snapshot().err(),
-        owner.snapshot_read_only().err(),
-    ] {
+    for error in [owner.snapshot().err(), owner.snapshot_read_only().err()] {
         assert!(matches!(error, Some(EngineError::ServiceNotReady { .. })));
     }
     assert!(
@@ -394,6 +394,10 @@ fn assert_undecodable_ledger_refuses(owner: &ProviderCallReservationOwner) -> Te
             })
             .is_err()
     );
-    assert!(owner.reserve(request("campaign:corrupt", "second")).is_err());
+    assert!(
+        owner
+            .reserve(request("campaign:corrupt", "second"))
+            .is_err()
+    );
     Ok(())
 }

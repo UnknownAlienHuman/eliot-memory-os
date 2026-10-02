@@ -609,7 +609,12 @@ fn validate_provider_call_reservation_evidence(
                 && reservation.consumes_budget
         }
         ProviderCallReservationState::Dispatched => {
-            started && invoked && !reviewed && !terminal && !explained && reservation.consumes_budget
+            started
+                && invoked
+                && !reviewed
+                && !terminal
+                && !explained
+                && reservation.consumes_budget
         }
         ProviderCallReservationState::Completed => {
             started && invoked && reviewed && terminal && !explained && reservation.consumes_budget
@@ -758,14 +763,12 @@ fn validate_provider_call_ledger(ledger: &ProviderCallLedger) -> Result<(), Engi
                 .filter(|reservation| reservation.terminal_at.is_some())
                 .count(),
         );
-        let remaining = budget
-            .max_calls
-            .saturating_sub(bounded_u32(
-                scoped
-                    .iter()
-                    .filter(|reservation| reservation.consumes_budget)
-                    .count(),
-            ));
+        let remaining = budget.max_calls.saturating_sub(bounded_u32(
+            scoped
+                .iter()
+                .filter(|reservation| reservation.consumes_budget)
+                .count(),
+        ));
         if budget.reserved_slots != reserved
             || budget.dispatched_slots != dispatched
             || budget.terminal_slots != terminal
@@ -803,16 +806,18 @@ fn rejected(message: &str) -> EngineError {
 fn provider_call_ledger_diagnostic(candidate: &Path, error: &serde_json::Error) -> String {
     let label = provider_call_ledger_candidate_label(candidate);
     let category = error.classify();
-    format!("{label}: {category} at line {} column {}", error.line(), error.column())
+    format!(
+        "{label}: {category:?} at line {} column {}",
+        error.line(),
+        error.column()
+    )
 }
 
 fn provider_call_ledger_candidate_label(candidate: &Path) -> String {
-    candidate
-        .file_name()
-        .map_or_else(
-            || "<provider-call-ledger>".to_owned(),
-            |name| name.to_string_lossy().into_owned(),
-        )
+    candidate.file_name().map_or_else(
+        || "<provider-call-ledger>".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Loads the authoritative provider-call ledger, or proves that there is none.
