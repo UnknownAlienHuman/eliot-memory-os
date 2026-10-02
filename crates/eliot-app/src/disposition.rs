@@ -1997,4 +1997,15 @@ mod default_members_guard_tests {
             Err("root Cargo.toml has no default-members section".to_owned())
         );
     }
+
+    /// Refusal arm: `default-members` is present but the list never opens.
+    /// Fails closed as malformed instead of skipping the list.
+    #[test]
+    fn refuses_when_default_members_list_never_opens() {
+        let manifest = "[workspace]\ndefault-members = \"crates/eliot-app\"\n";
+        assert_eq!(
+            default_members_section_refuses_facade(manifest),
+            Err("root Cargo.toml default-members section is malformed".to_owned())
+        );
+    }
 }
