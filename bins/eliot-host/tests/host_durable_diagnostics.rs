@@ -114,6 +114,31 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
 
+/// NON-EMPTINESS PRECONDITION, asserted before any denial over a capture in
+/// this file.
+///
+/// On this Windows host `note_event_log_sink_status` returns early and writes
+/// nothing wherever the #984 Event Log port answers `Ok`
+/// (`host_diagnostics.rs:873`), so a capture can legitimately be empty and
+/// every "the owner did not say X" assertion over it would pass vacuously. A
+/// capture must therefore carry the owner's own `host.entrypoint_stage` record
+/// before any denial may rest on it. That record is one production actually
+/// emits for every `observe_entrypoint_with_detail` call
+/// (`host_diagnostics.rs:588`), under the production target
+/// `HOST_DIAGNOSTICS_TARGET` (`host_diagnostics.rs:41`), so the precondition is
+/// a bound on the capture's CONTENT, never a bare length a non-production byte
+/// could satisfy.
+fn assert_capture_carries_production(capture: &str, contour: &str) {
+    assert!(
+        capture.contains(HOST_DIAGNOSTICS_TARGET),
+        "{contour} must carry production output: {capture}"
+    );
+    assert!(
+        capture.contains("event=\"host.entrypoint_stage\""),
+        "{contour} must carry production output: {capture}"
+    );
+}
+
 fn credential_source() -> String {
     manifest_source("src/credential_control.rs")
 }
@@ -1023,6 +1048,9 @@ fn durable_t_a_replay_is_readback_not_second_commit() {
             "host.store-recovery reconcile receipt readback replay",
         );
     });
+    // Non-emptiness precondition: the three denials below are only meaningful
+    // over a capture that really carries the replay records production emitted.
+    assert_capture_carries_production(&text, "the replay readback capture");
     assert_eq!(
         count_occurrences(
             &text,
@@ -1236,6 +1264,9 @@ fn durable_t_a_single_terminal_per_failed_operation() {
             "host.credential provision consumed receipt",
         );
     });
+    // Non-emptiness precondition: "success emits no terminal" is only
+    // falsifiable over a capture that really carries the success record.
+    assert_capture_carries_production(&succeeded, "the single-terminal success capture");
     assert_eq!(
         count_occurrences(&succeeded, terminal_event),
         0,
@@ -1283,6 +1314,10 @@ fn durable_t_b_canaries_absent_from_observations() {
         );
         observe_terminal_error("host-credential-unknown");
     });
+    // Non-emptiness precondition: the canary loop below scans the capture, not
+    // the sources, so the capture must first be proven to carry the records
+    // production emitted — otherwise every denial passes vacuously.
+    assert_capture_carries_production(&text, "the redaction capture");
     for canary in &canaries {
         assert!(
             !text.contains(canary.as_str()),
@@ -1459,7 +1494,6 @@ fn durable_t_b_sink_failure_leaves_operation_identical() {
     assert_stdout_framing_stays_exactly_one_json_per_line();
 }
 
-// WORK_UNIT_CASE: 893/25
 fn semantic_lines(capture: &str) -> Vec<&str> {
     capture
         .lines()
@@ -1467,6 +1501,7 @@ fn semantic_lines(capture: &str) -> Vec<&str> {
         .collect()
 }
 
+// WORK_UNIT_CASE: 893/25
 #[test]
 fn durable_25_deterministic_captures_under_injected_schedule() {
     // Deterministic semantic captures: the injected-fault seam and the
