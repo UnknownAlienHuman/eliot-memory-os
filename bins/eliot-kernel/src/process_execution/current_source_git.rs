@@ -61,12 +61,9 @@ pub(crate) async fn execute_current_source_git_process_request(
 ) -> ProcessExecutionResponse {
     let context = super::super::kernel_diagnostics::operation_context(None, None, None, None);
     observe_process_in_context(&context, "kernel.process.request_received", "attempt");
-    if let Err(rejection) = validate_git_child_lineage(
-        parent_identity,
-        child_identity,
-        admitted_task_id,
-        session,
-    ) {
+    if let Err(rejection) =
+        validate_git_child_lineage(parent_identity, child_identity, admitted_task_id, session)
+    {
         observe_process_in_context(
             &context,
             "kernel.process.request_rejected",
@@ -80,11 +77,7 @@ pub(crate) async fn execute_current_source_git_process_request(
         &request,
         session,
     ) {
-        observe_process_in_context(
-            &context,
-            "kernel.process.request_rejected",
-            "child_binding",
-        );
+        observe_process_in_context(&context, "kernel.process.request_rejected", "child_binding");
         return ProcessExecutionResponse::Rejected(rejection);
     }
 
@@ -180,15 +173,23 @@ mod tests {
     use std::num::NonZeroU64;
 
     fn lineage_fence(sequence: u64, generation: u64) -> StateFence {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("valid lineage");
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid lineage");
         StateFence::new(
-            EpochId::new(lineage, NonZeroU64::new(sequence).expect("nonzero sequence")),
+            EpochId::new(
+                lineage,
+                NonZeroU64::new(sequence).expect("nonzero sequence"),
+            ),
             ResourceGeneration::new(generation).expect("nonzero generation"),
         )
     }
 
-    fn identity(request_id: &str, session_id: &str, task_id: &str, fence: StateFence) -> RequestIdentity {
+    fn identity(
+        request_id: &str,
+        session_id: &str,
+        task_id: &str,
+        fence: StateFence,
+    ) -> RequestIdentity {
         let clock = ClockReading {
             valid_time_ms: Some(1),
             known_time_ms: Some(1),
@@ -217,8 +218,8 @@ mod tests {
     }
 
     fn process_intent() -> ProcessIntent {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("valid lineage");
+        let lineage =
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("valid lineage");
         let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("nonzero sequence"));
         ProcessIntent::new(
             OperationId::new("git-process-op").expect("operation"),
@@ -231,14 +232,9 @@ mod tests {
             "a".repeat(64),
             vec!["write-tree".to_owned()],
             r"C:\workspace",
-            EnvironmentProjection::new(
-                BTreeMap::new(),
-                Vec::new(),
-                EnvironmentInheritance::None,
-            )
-            .expect("environment"),
-            ResourceLimits::new(30_000, None, None, 4_096, 4_096, 4)
-                .expect("process limits"),
+            EnvironmentProjection::new(BTreeMap::new(), Vec::new(), EnvironmentInheritance::None)
+                .expect("environment"),
+            ResourceLimits::new(30_000, None, None, 4_096, 4_096, 4).expect("process limits"),
         )
         .expect("intent")
     }
@@ -302,8 +298,18 @@ mod tests {
     fn child_lineage_accepts_original_session_task_fence_and_distinct_operation() {
         let fence = lineage_fence(1, 1);
         let task = TaskId::new("task-live-source").expect("task");
-        let parent = identity("selected-source-parent", "session-current", "task-live-source", fence.clone());
-        let child = identity("git-process-op", "session-current", "task-live-source", fence.clone());
+        let parent = identity(
+            "selected-source-parent",
+            "session-current",
+            "task-live-source",
+            fence.clone(),
+        );
+        let child = identity(
+            "git-process-op",
+            "session-current",
+            "task-live-source",
+            fence.clone(),
+        );
         let request = build_current_source_git_start_request(
             process_intent(),
             ActionLeaseRef::new("governor-git-lease").expect("owner lease"),
@@ -340,24 +346,49 @@ mod tests {
     fn child_lineage_refuses_session_task_fence_deadline_and_operation_drift() {
         let fence = lineage_fence(1, 1);
         let task = TaskId::new("task-live-source").expect("task");
-        let parent = identity("selected-source-parent", "session-current", "task-live-source", fence.clone());
-        let child = identity("git-process-op", "session-current", "task-live-source", fence.clone());
+        let parent = identity(
+            "selected-source-parent",
+            "session-current",
+            "task-live-source",
+            fence.clone(),
+        );
+        let child = identity(
+            "git-process-op",
+            "session-current",
+            "task-live-source",
+            fence.clone(),
+        );
         assert!(validate_git_child_identity_lineage(&parent, &child, &task, &fence).is_ok());
 
-        let foreign_session = identity("git-process-op", "session-foreign", "task-live-source", fence.clone());
+        let foreign_session = identity(
+            "git-process-op",
+            "session-foreign",
+            "task-live-source",
+            fence.clone(),
+        );
         assert!(matches!(
             validate_git_child_identity_lineage(&parent, &foreign_session, &task, &fence),
             Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
         ));
 
-        let foreign_task = identity("git-process-op", "session-current", "task-foreign", fence.clone());
+        let foreign_task = identity(
+            "git-process-op",
+            "session-current",
+            "task-foreign",
+            fence.clone(),
+        );
         assert!(matches!(
             validate_git_child_identity_lineage(&parent, &foreign_task, &task, &fence),
             Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"
         ));
 
         let foreign_fence = lineage_fence(2, 2);
-        let foreign_fence_child = identity("git-process-op", "session-current", "task-live-source", foreign_fence);
+        let foreign_fence_child = identity(
+            "git-process-op",
+            "session-current",
+            "task-live-source",
+            foreign_fence,
+        );
         assert!(matches!(
             validate_git_child_identity_lineage(&parent, &foreign_fence_child, &task, &fence),
             Err(ProcessExecutionRejection { code, .. }) if code == "SOURCE_CHILD_LINEAGE_MISMATCH"

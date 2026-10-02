@@ -15,6 +15,7 @@ use eliot_ors::{
 };
 use eliot_protocol::{
     HostRequestEnvelope, HostRequestKind, RequestIdentity, SelectedSourceCaptureInvocation,
+    SelectedSourceCaptureOperation,
     host_request_operation_id,
 };
 use eliot_store_api::{
@@ -36,7 +37,7 @@ pub struct SelectedSourceCaptureStageIntent {
     pub work_item_id: OperationIdentity,
     pub work_lease_id: String,
     pub principal_id: String,
-    pub operation: String,
+    pub operation: SelectedSourceCaptureOperation,
     pub selected_relative_path: String,
     pub selector: Option<String>,
     pub source_digest: String,
@@ -82,10 +83,7 @@ pub fn stage_selected_source_capture(
         || request_identity.idempotency_key != envelope.identity.idempotency_key
         || request_identity.cancellation_id != envelope.identity.cancellation_id
         || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
-        || intent.operation != match invocation.operation {
-            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
-            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
-        }
+        || intent.operation != invocation.operation
         || intent.selected_relative_path != invocation.selected_relative_path
         || intent.selector != invocation.selector
         || now_unix_ms <= 0
@@ -204,7 +202,10 @@ pub fn stage_selected_source_capture(
         })?,
         work_lease_id: intent.work_lease_id.clone(),
         principal_id: intent.principal_id.clone(),
-        operation: intent.operation.clone(),
+        operation: invocation
+            .operation
+            .canonical_serialization()
+            .map_err(|error| error.to_string())?,
         selected_relative_path: intent.selected_relative_path.clone(),
         selector: intent.selector.clone(),
         source_digest: intent.source_digest.clone(),

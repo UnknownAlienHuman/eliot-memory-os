@@ -6911,6 +6911,7 @@ pub enum HostRequestKind {
     Activation,
     Invocation,
     SelectedSourceCapture,
+    InstrumentRegistryRegistration,
     Cancellation,
     Status,
     Reconciliation,
@@ -8614,6 +8615,9 @@ impl HostRequestRecord {
                 eliot_contracts::HostCorrelationDomain::Request
             ) | (
                 HostRequestKind::SelectedSourceCapture,
+                eliot_contracts::HostCorrelationDomain::Request
+            ) | (
+                HostRequestKind::InstrumentRegistryRegistration,
                 eliot_contracts::HostCorrelationDomain::Request
             ) | (
                 HostRequestKind::Cancellation,

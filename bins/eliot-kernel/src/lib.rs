@@ -353,6 +353,8 @@ pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
+#[cfg(windows)]
+mod source_capture_owner_readback;
 pub mod notify_operation_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;

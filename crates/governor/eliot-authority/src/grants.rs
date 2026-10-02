@@ -868,6 +868,30 @@ impl EffectiveCapabilitySnapshot {
             .any(|path| path.grant_path.contains(grant_id))
     }
 
+    /// Returns the exact distinct resources currently admitted for one
+    /// operation and effect across the validated holder paths.
+    ///
+    /// Each returned resource belongs to at least one complete path that
+    /// supports the exact `(operation, resource, effect)` tuple; the method
+    /// does not cross-product an operation from one path with resources from
+    /// another. A caller that selects a returned resource must still use
+    /// [`Self::supporting_path`] before issuing a lease.
+    pub fn supporting_resources(
+        &self,
+        operation: &str,
+        effect: EffectClass,
+    ) -> Vec<String> {
+        let mut resources = BTreeSet::new();
+        for path in &self.paths {
+            if path.authority.operations.contains(operation)
+                && effect_rank(effect) <= effect_rank(path.authority.max_effect)
+            {
+                resources.extend(path.authority.resources.iter().cloned());
+            }
+        }
+        resources.into_iter().collect()
+    }
+
     /// Number of independently supporting effective paths in this snapshot.
     pub fn path_count(&self) -> usize {
         self.paths.len()

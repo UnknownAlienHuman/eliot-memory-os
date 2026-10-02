@@ -5130,6 +5130,7 @@ impl persistence_codec::PersistedValue for HostRequestLegacyPresence {
             self.kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) {
             return Err(OrsError::InvalidField {
@@ -7567,6 +7568,7 @@ impl RedbRecoveryStore {
             record.kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none()
             || (record.session_ref.is_none()
@@ -7632,7 +7634,8 @@ impl RedbRecoveryStore {
     ) -> String {
         match kind {
             crate::HostRequestKind::Invocation
-            | crate::HostRequestKind::SelectedSourceCapture => host_request_legacy_presence_key(
+            | crate::HostRequestKind::SelectedSourceCapture
+            | crate::HostRequestKind::InstrumentRegistryRegistration => host_request_legacy_presence_key(
                 HostRequestLogicalKind::Invocation,
                 session,
                 occurrence,
@@ -7697,6 +7700,7 @@ impl RedbRecoveryStore {
             kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) {
             return Err(OrsError::InvalidField {
@@ -7778,6 +7782,7 @@ impl RedbRecoveryStore {
             record.kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) {
             return Ok(None);
@@ -7801,6 +7806,7 @@ impl RedbRecoveryStore {
                 let kind = match record.kind {
                     crate::HostRequestKind::Invocation => HostRequestLogicalKind::Invocation,
                     crate::HostRequestKind::SelectedSourceCapture => HostRequestLogicalKind::Invocation,
+                    crate::HostRequestKind::InstrumentRegistryRegistration => HostRequestLogicalKind::Invocation,
                     crate::HostRequestKind::Cancellation => HostRequestLogicalKind::Cancellation,
                     _ => return Ok(None),
                 };
@@ -7963,6 +7969,7 @@ impl RedbRecoveryStore {
             record.kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
         {
@@ -8069,6 +8076,7 @@ impl RedbRecoveryStore {
             record.kind,
             crate::HostRequestKind::Invocation
                 | crate::HostRequestKind::SelectedSourceCapture
+                | crate::HostRequestKind::InstrumentRegistryRegistration
                 | crate::HostRequestKind::Cancellation
         ) && (record.correlation_projection.is_none() || record.session_ref.is_none())
         {
@@ -8542,6 +8550,7 @@ impl RedbRecoveryStore {
             crate::HostRequestKind::Activation => "activation",
             crate::HostRequestKind::Invocation => "invocation",
             crate::HostRequestKind::SelectedSourceCapture => "selected_source_capture",
+            crate::HostRequestKind::InstrumentRegistryRegistration => "instrument_registry_registration",
             crate::HostRequestKind::Cancellation => "cancellation",
             crate::HostRequestKind::Status => "status",
             crate::HostRequestKind::Reconciliation => "reconciliation",
@@ -8862,6 +8871,7 @@ impl RedbRecoveryStore {
                     record.kind,
                     crate::HostRequestKind::Invocation
                         | crate::HostRequestKind::SelectedSourceCapture
+                        | crate::HostRequestKind::InstrumentRegistryRegistration
                         | crate::HostRequestKind::Cancellation
                 )
                 && let Some(session) = record.session_ref.as_ref()

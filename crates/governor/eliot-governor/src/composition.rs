@@ -169,8 +169,11 @@ pub use native_worker_binding::{
     NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
 
+#[path = "composition/current_source_git_process_admission.rs"]
+mod current_source_git_process_admission;
 #[path = "composition/source_artifact_read_admission.rs"]
 mod source_artifact_read_admission;
+pub use current_source_git_process_admission::CurrentSourceGitProcessAdmission;
 
 /// Canonical write result kept together with the negative-memory decision
 /// that admitted that exact request.

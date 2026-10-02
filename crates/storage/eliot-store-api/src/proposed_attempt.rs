@@ -15,6 +15,7 @@ use crate::{
     NamedMutationOperation, NamedMutationRequest, RecoveryRecord, RecoveryRecordKey, StateFence,
     StoreError, canonical_json_bytes, sha256_hex, validate_text,
 };
+use eliot_protocol::SelectedSourceCaptureOperation;
 
 /// Namespace of canonical selected-source ProposedAttempt records.
 pub const PROPOSED_ATTEMPT_RECORD_NAMESPACE: &str = "source-capture-proposed-attempt-v1";
@@ -52,7 +53,9 @@ pub struct ProposedAttemptRecord {
     pub work_lease_id: String,
     /// Authenticated principal retained by the source-selection owner.
     pub principal_id: String,
-    /// Closed source-capture operation name.
+    /// Full canonical serialized source-capture operation, including semantic
+    /// query arguments. Historical v1 Diagnostics/ProbeVersion labels remain
+    /// readable for already retained rows.
     pub operation: String,
     /// Selected relative source path.
     pub selected_relative_path: String,
@@ -111,7 +114,7 @@ impl ProposedAttemptRecord {
                 reason: "work item, attempt, and reservation identities must remain distinct",
             });
         }
-        if !matches!(self.operation.as_str(), "Diagnostics" | "ProbeVersion")
+        if validate_source_capture_operation(&self.operation).is_err()
             || self.disposition != "ADMITTED"
             || self.created_at_ms <= 0
         {
@@ -190,6 +193,30 @@ impl ProposedAttemptRecord {
         record.validate()?;
         Ok(record)
     }
+}
+
+fn validate_source_capture_operation(operation: &str) -> Result<(), StoreError> {
+    // Rows committed before the typed operation payload was introduced remain
+    // valid under the existing v1 record schema.
+    if matches!(operation, "Diagnostics" | "ProbeVersion") {
+        return Ok(());
+    }
+    let decoded: SelectedSourceCaptureOperation = serde_json::from_str(operation)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    decoded.validate().map_err(|_| StoreError::InvalidField {
+        field: "proposed_attempt.operation",
+        reason: "must be a valid closed selected-source semantic operation",
+    })?;
+    let canonical = decoded
+        .canonical_serialization()
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if canonical != operation {
+        return Err(StoreError::InvalidField {
+            field: "proposed_attempt.operation",
+            reason: "must preserve the canonical typed operation and all of its arguments",
+        });
+    }
+    Ok(())
 }
 
 /// Derives the deterministic record address for one original work item and

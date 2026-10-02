@@ -282,7 +282,7 @@ fn unique_texts(values: &[String], field: &'static str) -> Result<(), ProtocolEr
     Ok(())
 }
 
-fn lowercase_sha256(value: &str, field: &'static str) -> Result<(), ProtocolError> {
+pub(crate) fn lowercase_sha256(value: &str, field: &'static str) -> Result<(), ProtocolError> {
     if value.len() != 64
         || !value
             .bytes()
@@ -312,7 +312,7 @@ fn windows_sid(value: &str, field: &'static str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn bounded_text(
+pub(crate) fn bounded_text(
     value: &str,
     field: &'static str,
     maximum_bytes: usize,
@@ -3802,6 +3802,9 @@ pub enum HostRequestKind {
     /// This is separate from query/read requests and carries no LocalRead
     /// attempt or Task Controller transition semantics.
     SelectedSourceCapture,
+    /// Typed instrument-registry registration admitted as a distinct owner
+    /// mutation on the HostRequest transport.
+    InstrumentRegistryRegistration,
     /// Cancellation of one exact previously admitted operation.
     Cancellation,
     /// Observation-only status read of one exact admitted operation.
@@ -3818,6 +3821,7 @@ impl HostRequestKind {
             Self::Activation => "ACTIVATION",
             Self::Invocation => "INVOCATION",
             Self::SelectedSourceCapture => "SELECTED_SOURCE_CAPTURE",
+            Self::InstrumentRegistryRegistration => "INSTRUMENT_REGISTRY_REGISTRATION",
             Self::Cancellation => "CANCELLATION",
             Self::Status => "STATUS",
             Self::Reconciliation => "RECONCILIATION",
@@ -4112,6 +4116,32 @@ impl HostRequestIdentity {
                     });
                 }
             }
+            HostRequestKind::InstrumentRegistryRegistration => {
+                if self
+                    .correlation_projection
+                    .as_ref()
+                    .is_some_and(|projection| {
+                        projection.domain() != eliot_contracts::HostCorrelationDomain::Request
+                    })
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "instrument-registry registration projection must use request domain",
+                    });
+                }
+                if self.task_id.is_none() || self.work_scope_id.is_none() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.instrument_registry_registration_identity",
+                        reason: "registration must bind its current Task and WorkScope",
+                    });
+                }
+                if self.parent_operation_id.is_some() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.parent_operation_id",
+                        reason: "instrument-registry registration is a new operation and must not reuse a parent operation identity",
+                    });
+                }
+            }
             HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
@@ -4206,10 +4236,24 @@ pub struct HostRequestEnvelope {
     pub descriptor_sha256: String,
     /// Digest of the exact Kernel-produced transport admission receipt.
     pub peer_admission_receipt_sha256: String,
+    /// Source-specific authentication binding for operator registration.
+    /// `None` preserves the existing bridge descriptor contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_source: Option<HostRequestAuthenticatedSource>,
     /// Ticket/result binding, present only for Activation.
     pub activation_binding: Option<HostRequestActivationBinding>,
     /// Lowercase SHA-256 over every envelope field except this field.
     pub envelope_sha256: String,
+}
+
+/// Source-specific authentication binding for the existing HostRequest
+/// registration queue. Kernel compares the retained identity to the outer
+/// authenticated frame and live operator Session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostRequestAuthenticatedSource {
+    /// Registration issued from the authenticated operator Session.
+    Operator { request_identity: RequestIdentity },
 }
 
 impl HostRequestEnvelope {
@@ -4259,11 +4303,27 @@ impl HostRequestEnvelope {
                 reason: "pre-activation fence must not contain a task revision",
             });
         }
-        lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
-        lowercase_sha256(
-            &self.peer_admission_receipt_sha256,
-            "host_request.peer_admission_receipt_sha256",
-        )?;
+        match &self.authenticated_source {
+            None => {
+                lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
+                lowercase_sha256(
+                    &self.peer_admission_receipt_sha256,
+                    "host_request.peer_admission_receipt_sha256",
+                )?;
+            }
+            Some(HostRequestAuthenticatedSource::Operator { request_identity }) => {
+                request_identity.validate()?;
+                if self.kind != HostRequestKind::InstrumentRegistryRegistration
+                    || !self.descriptor_sha256.is_empty()
+                    || !self.peer_admission_receipt_sha256.is_empty()
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.authenticated_source",
+                        reason: "operator source is only valid for registration and carries no bridge descriptor or receipt",
+                    });
+                }
+            }
+        }
         match (&self.kind, &self.activation_binding) {
             (HostRequestKind::Activation, Some(binding)) => binding.validate()?,
             (HostRequestKind::Activation, None) => {

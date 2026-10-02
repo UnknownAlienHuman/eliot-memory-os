@@ -1556,6 +1556,11 @@ impl ProcessExecutionBinding {
         &self.request_digest
     }
 
+    /// Returns the original immutable ProcessIntent digest bound to this execution.
+    pub fn effect_digest(&self) -> &str {
+        &self.effect_digest
+    }
+
     /// Returns the validation revision.
     pub const fn validation_revision(&self) -> u64 {
         self.validation_revision
@@ -1904,6 +1909,16 @@ impl ExitStatus {
     /// Returns the physical disposition.
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
+    }
+
+    /// Operating-system exit code recorded by the original observation, if any.
+    pub const fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    /// Signal or exception value recorded by the original observation, if any.
+    pub const fn signal(&self) -> Option<i32> {
+        self.signal
     }
 }
 
@@ -3503,6 +3518,22 @@ mod tests {
         assert_eq!(state.view(), before);
         state.reconcile(descendants(&state, true, true)?)?;
         assert_eq!(state.view().lifecycle(), ProcessLifecycle::Reconciled);
+        Ok(())
+    }
+
+    #[test]
+    fn exit_status_accessors_preserve_original_code_and_signal() -> TestResult {
+        let completed = ExitStatus::new(ExitDisposition::Completed, Some(17), None, 100)?;
+        assert_eq!(completed.code(), Some(17));
+        assert_eq!(completed.signal(), None);
+
+        let signalled = ExitStatus::new(ExitDisposition::Signalled, None, Some(9), 101)?;
+        assert_eq!(signalled.code(), None);
+        assert_eq!(signalled.signal(), Some(9));
+
+        let unknown = ExitStatus::new(ExitDisposition::Unknown, None, None, 102)?;
+        assert_eq!(unknown.code(), None);
+        assert_eq!(unknown.signal(), None);
         Ok(())
     }
 

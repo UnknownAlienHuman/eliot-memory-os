@@ -177,7 +177,7 @@ pub use capability_evidence::{
 };
 pub use capability_evidence_commit::{
     capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
-    commit_capability_evidence_record,
+    commit_capability_evidence_record, commit_instrument_registry_snapshot,
 };
 pub use captured_lsp_evidence::CapturedLspEvidenceError;
 pub use composition::*;

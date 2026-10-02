@@ -118,11 +118,11 @@ use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, StateFence};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationRequest, OrderingHeadExpectation,
-    RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
-    WriteReceiptStatus, canonical_json_bytes, decode_capability_evidence_mutation,
-    generated_operation_manifests, operation_manifest_set_digest,
-    reject_direct_capability_evidence_write, sha256_hex,
+    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    OrderingHeadExpectation, RevisionHeadExpectation, ScopeId, SecurityContext, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_json_bytes, decode_capability_evidence_mutation,
+    decode_instrument_registry_mutation, generated_operation_manifests,
+    operation_manifest_set_digest, reject_direct_capability_evidence_write, sha256_hex,
 };
 
 use crate::capability_evidence::{
@@ -417,4 +417,140 @@ pub async fn commit_capability_evidence_record<P: KernelGenerationPort + ?Sized>
             CompositionError::Owner(format!("capability evidence issued revision: {error}"))
         })?;
     Ok((receipt, revision))
+}
+
+/// Commits the exact closed instrument-registry snapshot produced by the
+/// instrument admission boundary through the Governor's existing canonical
+/// owner. Registration persistence is a separate owner operation from any
+/// later source-Blob read authorization.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the original request, scope, proof refs, and live head expectations form one canonical handoff"
+)]
+pub async fn commit_instrument_registry_snapshot<P: KernelGenerationPort + ?Sized>(
+    composition: &GovernorComposition<P>,
+    identity: &RequestIdentity,
+    request: NamedMutationRequest,
+    scope_id: ScopeId,
+    proof_refs: Vec<String>,
+    expected_revision_heads: Vec<RevisionHeadExpectation>,
+    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+) -> Result<WriteReceipt, CompositionError> {
+    if request.operation != NamedMutationOperation::ApplyInstrumentRegistryState {
+        return Err(CompositionError::Owner(
+            "instrument registry guard: direct write outside the closed registry operation refused"
+                .to_owned(),
+        ));
+    }
+    let snapshot_json = decode_instrument_registry_mutation(&request.parameters).map_err(|error| {
+        CompositionError::Owner(format!("instrument registry parameters: {error}"))
+    })?;
+    identity.validate().map_err(|error| {
+        CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
+    })?;
+
+    let snapshot_digest = sha256_hex(snapshot_json.as_bytes());
+    let operation_id = OperationId::new(format!("instrument-registry-{snapshot_digest}"))
+        .map_err(|error| {
+            CompositionError::Owner(format!("instrument registry identity invalid: {error}"))
+        })?;
+    let envelope_fence = identity.request.metadata.state_fence.clone();
+    let idempotency_key = identity.idempotency_key.clone();
+    let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests().map_err(
+        |error| CompositionError::Owner(format!("operation manifest set unavailable: {error}")),
+    )?)
+    .map_err(|error| CompositionError::Owner(format!("operation manifest digest: {error}")))?;
+    let revision_expectations = expected_revision_heads.clone();
+    let ordering_expectations = expected_ordering_heads.clone();
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: idempotency_key.clone(),
+        scope_id,
+        task_id: None,
+        transition_class: TransitionClass::InstrumentRegistry,
+        requested_effect_ceiling: EffectClass::ReversibleMutation,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
+        operation_manifest_digest: manifest_digest,
+        semantic_commands: vec![request],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs,
+        expected_revision_heads,
+        expected_ordering_heads,
+    };
+    let receipt = composition.commit_canonical(identity, envelope).await?;
+    check_instrument_registry_commit_freshness(
+        &receipt,
+        &operation_id,
+        &idempotency_key,
+        &envelope_fence,
+        &revision_expectations,
+        &ordering_expectations,
+    )?;
+    Ok(receipt)
+}
+
+fn check_instrument_registry_commit_freshness(
+    receipt: &WriteReceipt,
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    envelope_fence: &StateFence,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+) -> Result<(), CompositionError> {
+    receipt.validate().map_err(|error| {
+        CompositionError::Owner(format!("instrument registry commit receipt invalid: {error}"))
+    })?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.operation_id != *operation_id
+        || receipt.idempotency_key != idempotency_key
+        || receipt.state_fence != *envelope_fence
+    {
+        return Err(CompositionError::Owner(
+            "instrument registry receipt does not prove the exact committed operation and fence"
+                .to_owned(),
+        ));
+    }
+    for expected in expected_revision_heads {
+        let delta = receipt
+            .revision_before_after
+            .iter()
+            .find(|delta| delta.key == expected.key)
+            .ok_or_else(|| {
+                CompositionError::Owner(format!(
+                    "instrument registry receipt omitted expected revision head {}",
+                    expected.key.as_str(),
+                ))
+            })?;
+        if delta.before != expected.expected_revision || delta.after <= delta.before {
+            return Err(CompositionError::Owner(format!(
+                "instrument registry receipt has a stale revision predecessor for {}",
+                expected.key.as_str(),
+            )));
+        }
+    }
+    for expected in expected_ordering_heads {
+        let head = receipt
+            .ordering_sequences
+            .iter()
+            .find(|head| head.scope == expected.scope)
+            .ok_or_else(|| {
+                CompositionError::Owner(format!(
+                    "instrument registry receipt omitted expected ordering head {}",
+                    expected.scope.as_str(),
+                ))
+            })?;
+        if head.sequence <= expected.expected_sequence {
+            return Err(CompositionError::Owner(format!(
+                "instrument registry receipt has a stale ordering sequence for {}",
+                expected.scope.as_str(),
+            )));
+        }
+    }
+    Ok(())
 }

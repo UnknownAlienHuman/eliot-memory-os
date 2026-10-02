@@ -194,7 +194,7 @@ pub use protocol::{
     NativeWorkerReplayOperation, NativeWorkerReplayPage, NativeWorkerReplayReplayReply,
     NativeWorkerReplayReplayRequest, NativeWorkerReplayStreamBinding,
     NativeWorkerReplayStreamPosition, PROCESS_STREAM_READ_CHUNK_MAX_BYTES,
-    PROCESS_STREAM_READBACK_MAX_BYTES, PROVIDER_CAPABILITY_WIRE_VERSION,
+    PROVIDER_CAPABILITY_WIRE_VERSION,
     ProcessAuthorityHandoffDescriptor, ProcessExecutionRejection, ProcessExecutionRequest,
     ProcessExecutionResponse, ProcessObservation, ProcessStreamReadChunk, ProcessStreamReadRequest,
     ProviderCapabilityError, ProviderCapabilityExpectation, ProviderCapabilityRequest,

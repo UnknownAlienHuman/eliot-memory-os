@@ -56,6 +56,7 @@ use eliot_store_api::{
 use serde::{Deserialize, Serialize};
 
 mod lsp_admission;
+mod current_source_git;
 
 /// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
 ///
@@ -4470,6 +4471,30 @@ impl KernelComposition {
             request,
             Some((&original_identity, &original_task_id)),
             &context,
+        )
+        .await
+    }
+
+    /// Routes an authenticated Git process child through the existing P-03
+    /// gateway only after the caller has retained the exact selected-source
+    /// parent at the dispatch boundary.
+    pub(crate) async fn execute_current_source_git_process_request(
+        &self,
+        session: &Session,
+        session_binding: ProcessSessionBinding,
+        parent_identity: &eliot_protocol::RequestIdentity,
+        child_identity: &eliot_protocol::RequestIdentity,
+        admitted_task_id: &eliot_contracts::TaskId,
+        request: ProcessExecutionRequest,
+    ) -> ProcessExecutionResponse {
+        current_source_git::execute_current_source_git_process_request(
+            self,
+            session,
+            session_binding,
+            parent_identity,
+            child_identity,
+            admitted_task_id,
+            request,
         )
         .await
     }

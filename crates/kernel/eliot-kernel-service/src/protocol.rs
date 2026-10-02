@@ -8,8 +8,8 @@ use eliot_ors::{SupervisionLeaseProjection, SupervisionLeaseSnapshot};
 use eliot_platform::{KernelActivationNonce, PlatformHandle, PortError};
 use eliot_process::{
     CancellationReceipt, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
-    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessStartReceipt,
-    ProcessStreamKind,
+    ProcessExecutionBinding, ProcessExecutionError, ProcessExecutionView, ProcessIntent,
+    ProcessStartReceipt, ProcessStreamKind,
 };
 pub use eliot_protocol::AGENT_BRIDGE_MODULE_ID;
 use eliot_protocol::{
@@ -74,6 +74,13 @@ pub use research_provider::{
 
 fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServiceError> {
     validate_text(value.as_str(), field)
+}
+
+fn stream_limit(intent: &ProcessIntent, stream: ProcessStreamKind) -> u64 {
+    match stream {
+        ProcessStreamKind::Stdout => intent.resource_limits().stdout_bytes(),
+        ProcessStreamKind::Stderr => intent.resource_limits().stderr_bytes(),
+    }
 }
 
 /// Stable identity for the Host↔Kernel lifecycle control wire.
@@ -2422,8 +2429,6 @@ pub fn semantic_store_config_hash_from_json(
     })
 }
 
-/// Largest retained original stream accepted by the bounded readback API.
-pub const PROCESS_STREAM_READBACK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum bytes returned by one original stream readback call.
 pub const PROCESS_STREAM_READ_CHUNK_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -2432,6 +2437,7 @@ pub const PROCESS_STREAM_READ_CHUNK_MAX_BYTES: u64 = 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct ProcessStreamReadRequest {
     start_receipt: ProcessStartReceipt,
+    intent: ProcessIntent,
     stream: ProcessStreamKind,
     offset: u64,
     max_bytes: u64,
@@ -2441,12 +2447,14 @@ impl ProcessStreamReadRequest {
     /// Builds a bounded read request tied to the exact original start receipt.
     pub fn new(
         start_receipt: ProcessStartReceipt,
+        intent: ProcessIntent,
         stream: ProcessStreamKind,
         offset: u64,
         max_bytes: u64,
     ) -> Result<Self, KernelServiceError> {
         let value = Self {
             start_receipt,
+            intent,
             stream,
             offset,
             max_bytes,
@@ -2460,10 +2468,22 @@ impl ProcessStreamReadRequest {
         self.start_receipt
             .validate()
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
-        if self.offset > PROCESS_STREAM_READBACK_MAX_BYTES {
+        self.intent
+            .validate()
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let binding = self.start_receipt.binding();
+        let stream_limit_bytes = stream_limit(&self.intent, self.stream);
+        let requested_end = self.offset.checked_add(self.max_bytes);
+        if self.intent.operation_id() != self.start_receipt.operation_id()
+            || self.intent.effect_digest() != binding.effect_digest()
+            || self.intent.session_id().as_str() != binding.session_id().as_str()
+            || self.intent.generation() != binding.state_fence().generation()
+            || self.offset > stream_limit_bytes
+            || requested_end.is_none_or(|end| end > stream_limit_bytes)
+        {
             return Err(KernelServiceError::InvalidField {
-                field: "stream_read.offset",
-                reason: "must not exceed the bounded retained-stream ceiling",
+                field: "stream_read.intent",
+                reason: "must be the original intent and read range must fit its stream limit",
             });
         }
         if self.max_bytes == 0 || self.max_bytes > PROCESS_STREAM_READ_CHUNK_MAX_BYTES {
@@ -2478,6 +2498,11 @@ impl ProcessStreamReadRequest {
     /// Exact authenticated original start receipt.
     pub const fn start_receipt(&self) -> &ProcessStartReceipt {
         &self.start_receipt
+    }
+
+    /// Exact original validated intent, joined to the start receipt's effect digest.
+    pub const fn intent(&self) -> &ProcessIntent {
+        &self.intent
     }
 
     /// Physical output stream to read.
@@ -2503,6 +2528,8 @@ pub struct ProcessStreamReadChunk {
     operation_id: OperationId,
     binding: ProcessExecutionBinding,
     stream: ProcessStreamKind,
+    process_intent_effect_digest: String,
+    stream_limit_bytes: u64,
     start_receipt_sha256: String,
     stream_evidence_sha256: String,
     observed_sha256: String,
@@ -2521,6 +2548,8 @@ impl ProcessStreamReadChunk {
         operation_id: OperationId,
         binding: ProcessExecutionBinding,
         stream: ProcessStreamKind,
+        process_intent_effect_digest: String,
+        stream_limit_bytes: u64,
         start_receipt_sha256: String,
         stream_evidence_sha256: String,
         observed_sha256: String,
@@ -2540,6 +2569,8 @@ impl ProcessStreamReadChunk {
             operation_id,
             binding,
             stream,
+            process_intent_effect_digest,
+            stream_limit_bytes,
             start_receipt_sha256,
             stream_evidence_sha256,
             observed_sha256,
@@ -2569,12 +2600,14 @@ impl ProcessStreamReadChunk {
                 reason: "chunk end overflowed",
             })?;
         if &self.operation_id != self.binding.operation_id()
+            || self.process_intent_effect_digest != self.binding.effect_digest()
+            || self.stream_limit_bytes == 0
             || self.start_receipt_sha256.len() != 64
             || self.stream_evidence_sha256.len() != 64
             || self.observed_sha256.len() != 64
             || self.chunk_sha256 != sha256_hex(&self.bytes)
             || !self.stream_eof
-            || self.observed_bytes > PROCESS_STREAM_READBACK_MAX_BYTES
+            || self.observed_bytes > self.stream_limit_bytes
             || self.offset > self.observed_bytes
             || end > self.observed_bytes
             || bytes_len > PROCESS_STREAM_READ_CHUNK_MAX_BYTES
@@ -2615,6 +2648,14 @@ impl ProcessStreamReadChunk {
     /// Stream selected by the original evidence.
     pub const fn stream(&self) -> ProcessStreamKind {
         self.stream
+    }
+    /// Original ProcessIntent digest authenticated by the start receipt binding.
+    pub fn process_intent_effect_digest(&self) -> &str {
+        &self.process_intent_effect_digest
+    }
+    /// Original per-stream ProcessIntent resource ceiling.
+    pub const fn stream_limit_bytes(&self) -> u64 {
+        self.stream_limit_bytes
     }
     /// Canonical digest of the exact retained start receipt.
     pub fn start_receipt_sha256(&self) -> &str {

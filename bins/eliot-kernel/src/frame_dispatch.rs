@@ -18,7 +18,8 @@ use super::anchored_review_bridge::{
     ANCHORED_REVIEW_SUBMIT_OPERATION,
 };
 use super::daemon_request_dispatch::{
-    DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
+    DAEMON_STARTUP_EVIDENCE_OPERATION, INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION,
+    INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
     USER_AUTOMATION_PREFLIGHT_SELECTOR, USER_AUTOMATION_RUNTIME_OPERATION,
 };
@@ -1505,6 +1506,9 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "daemon_fatal"
             | super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
             | super::daemon_request_dispatch::EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION
+            | super::daemon_request_dispatch::EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION
+            | INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+            | INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION
             | "agent_activation_claim"
             | "agent_activation_submit"
             | "agent_activation_reconcile"
@@ -1553,6 +1557,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "local_read"
             | "local_read_claim"
             | "local_read_result"
+            | "instrument_registry_registration_claim"
+            | "instrument_registry_registration_result"
             | "semantic_observe_claim"
             | "semantic_observe_result"
             | "semantic_observe_deferred"
@@ -1640,6 +1646,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "task_controller_result"
             | "campaign_packet_claim"
             | "source_capture.claim"
+            | super::daemon_request_dispatch::SOURCE_CAPTURE_OWNER_READBACK_OPERATION
             | "source_capture.stage"
             | "campaign_packet_result"
             // Issue #1741: the finish claim/result legs are separate admitted
@@ -1724,6 +1731,9 @@ pub(crate) fn is_wasm_port_grant_operation(operation: &str) -> bool {
 
 #[cfg(test)]
 mod daemon_operation_tests {
+    use super::super::daemon_request_dispatch::{
+        EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION, SOURCE_CAPTURE_OWNER_READBACK_OPERATION,
+    };
     use super::{DAEMON_STARTUP_EVIDENCE_OPERATION, is_daemon_operation};
     use crate::generation_control::ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION;
 
@@ -1734,12 +1744,19 @@ mod daemon_operation_tests {
         ));
         assert!(is_daemon_operation(DAEMON_STARTUP_EVIDENCE_OPERATION));
         assert!(is_daemon_operation(
+            EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION
+        ));
+        assert!(is_daemon_operation(SOURCE_CAPTURE_OWNER_READBACK_OPERATION));
+        assert!(is_daemon_operation("source_capture.claim"));
+        assert!(is_daemon_operation("source_capture.stage"));
+        assert!(is_daemon_operation(
             super::super::daemon_request_dispatch::DAEMON_SUPERVISION_PROGRESS_OPERATION
         ));
         assert!(!is_daemon_operation(
             "daemon_generation_registry_active_query"
         ));
         assert!(!is_daemon_operation("unowned-operation"));
+        assert!(!is_daemon_operation("source_capture.owner_readbacks"));
     }
 }
 

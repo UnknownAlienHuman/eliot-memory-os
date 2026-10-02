@@ -8,9 +8,7 @@
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::ProcessExecutionReplayState;
-use eliot_kernel_service::{
-    PROCESS_STREAM_READBACK_MAX_BYTES, ProcessStreamReadChunk, ProcessStreamReadRequest,
-};
+use eliot_kernel_service::{ProcessStreamReadChunk, ProcessStreamReadRequest};
 use eliot_process::{
     ProcessExecutionError, ProcessOwnerBinding, ProcessStreamEvidence, ProcessStreamKind,
     StreamEvidenceGap, StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
@@ -39,6 +37,7 @@ fn select_stream(
 fn require_exact_capture(
     evidence: &ProcessStreamEvidence,
     capture: &CapturedStream,
+    stream_limit_bytes: u64,
 ) -> Result<(), ProcessExecutionError> {
     let disallowed_gap = evidence.gaps().iter().any(|gap| {
         !matches!(
@@ -59,7 +58,8 @@ fn require_exact_capture(
         || capture.truncated
         || capture.bytes.len() as u64 != capture.total_bytes
         || capture.total_bytes != evidence.observed_bytes()
-        || capture.total_bytes > PROCESS_STREAM_READBACK_MAX_BYTES
+        || capture.total_bytes > stream_limit_bytes
+        || evidence.observed_bytes() > stream_limit_bytes
         || sha256_hex(&capture.bytes) != evidence.observed_sha256()
     {
         return Err(unknown());
@@ -151,8 +151,13 @@ pub(crate) async fn read_stream_chunk(
     }
 
     let stream_evidence = select_stream(&process_evidence, request.stream())?;
+    let stream_limit_bytes = match request.stream() {
+        ProcessStreamKind::Stdout => request.intent().resource_limits().stdout_bytes(),
+        ProcessStreamKind::Stderr => request.intent().resource_limits().stderr_bytes(),
+    };
     if stream_evidence.binding() != receipt.binding()
         || stream_evidence.stream() != request.stream()
+        || request.intent().effect_digest() != receipt.binding().effect_digest()
     {
         return Err(unknown());
     }
@@ -161,7 +166,7 @@ pub(crate) async fn read_stream_chunk(
         ProcessStreamKind::Stdout => &stdout,
         ProcessStreamKind::Stderr => &stderr,
     };
-    require_exact_capture(stream_evidence, capture)?;
+    require_exact_capture(stream_evidence, capture, stream_limit_bytes)?;
 
     let offset = usize::try_from(request.offset()).map_err(|_| unknown())?;
     let maximum = usize::try_from(request.max_bytes()).map_err(|_| unknown())?;
@@ -179,6 +184,8 @@ pub(crate) async fn read_stream_chunk(
         operation_id,
         receipt.binding().clone(),
         request.stream(),
+        request.intent().effect_digest().to_owned(),
+        stream_limit_bytes,
         start_receipt_sha256,
         stream_evidence_sha256,
         stream_evidence.observed_sha256().to_owned(),

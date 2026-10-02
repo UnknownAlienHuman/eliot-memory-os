@@ -620,6 +620,7 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             envelope.kind,
             HostRequestKind::Invocation
                 | HostRequestKind::SelectedSourceCapture
+                | HostRequestKind::InstrumentRegistryRegistration
                 | HostRequestKind::Cancellation
         ) && (envelope.identity.correlation_projection.is_none()
             || envelope.identity.session_id.is_none())
@@ -640,6 +641,7 @@ impl<'a, P: KernelGovernorPort + ?Sized> KernelHostRequestBinder<'a, P> {
             staged.kind,
             OrsHostRequestKind::Invocation
                 | OrsHostRequestKind::SelectedSourceCapture
+                | OrsHostRequestKind::InstrumentRegistryRegistration
                 | OrsHostRequestKind::Cancellation
         ) {
             self.store.resolve_or_stage_host_request(&staged)
@@ -1148,6 +1150,9 @@ fn requested_host_request_record(
             HostRequestKind::Activation => OrsHostRequestKind::Activation,
             HostRequestKind::Invocation => OrsHostRequestKind::Invocation,
             HostRequestKind::SelectedSourceCapture => OrsHostRequestKind::SelectedSourceCapture,
+            HostRequestKind::InstrumentRegistryRegistration => {
+                OrsHostRequestKind::InstrumentRegistryRegistration
+            }
             HostRequestKind::Cancellation => OrsHostRequestKind::Cancellation,
             HostRequestKind::Status => OrsHostRequestKind::Status,
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
@@ -1686,6 +1691,7 @@ mod local_read_result_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }
@@ -1925,6 +1931,7 @@ mod local_read_build_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

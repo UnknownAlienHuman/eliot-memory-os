@@ -16,7 +16,7 @@ use eliot_ors::{
 };
 use eliot_protocol::{
     AgentActivationResolutionResult, AgentBridgeProcessBinding, HostRequestAdmissionReceipt,
-    HostRequestEnvelope, HostRequestKind,
+    HostRequestAuthenticatedSource, HostRequestEnvelope, HostRequestKind, RequestIdentity,
 };
 use eliot_receipts::{EffectClass, ProofCeiling};
 use schemars::JsonSchema;
@@ -790,6 +790,11 @@ impl KernelService {
         binding: &AgentBridgeProcessBinding,
         resolution: Option<&AgentActivationResolutionResult>,
     ) -> Result<HostRequestAdmissionReceipt, KernelServiceError> {
+        if envelope.kind == HostRequestKind::InstrumentRegistryRegistration {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.operator_admission_required",
+            });
+        }
         // I14.16 step 4 (issue #1953, map item 2): a `shadow_no_authority`
         // candidate accepts no normal work. The `Ready`-only state gate below
         // already refused shadow with this identical value; the named check
@@ -836,6 +841,7 @@ impl KernelService {
             }
             HostRequestKind::Invocation
             | HostRequestKind::SelectedSourceCapture
+            | HostRequestKind::InstrumentRegistryRegistration
             | HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
@@ -859,6 +865,87 @@ impl KernelService {
                 field: "host_request.receipt",
                 reason: "issued admission receipt is not well-formed",
             })?;
+        Ok(receipt)
+    }
+
+    /// Admits one registration from an already authenticated operator Session.
+    /// This source-specific leg uses the existing HostRequest receipt contract;
+    /// it creates no AgentBridge descriptor or peer receipt.
+    pub fn admit_operator_registry_registration(
+        &self,
+        envelope: &HostRequestEnvelope,
+        session: &eliot_ipc::Session,
+        request_identity: &RequestIdentity,
+    ) -> Result<HostRequestAdmissionReceipt, KernelServiceError> {
+        self.admit_shadow_effect()?;
+        if self.generation_fenced {
+            return Err(KernelServiceError::GenerationFenced);
+        }
+        if self.state != KernelServiceState::Ready {
+            return Err(KernelServiceError::AdmissionClosed(self.state));
+        }
+        if session.state != eliot_ipc::SessionState::Open {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.operator_session",
+            });
+        }
+        session.peer.validate().map_err(|_| KernelServiceError::HandshakeMismatch {
+            field: "host_request.operator_peer",
+        })?;
+        request_identity.validate().map_err(|_| KernelServiceError::HandshakeMismatch {
+            field: "host_request.operator_identity",
+        })?;
+        let Some(HostRequestAuthenticatedSource::Operator {
+            request_identity: source_identity,
+        }) = envelope.authenticated_source.as_ref()
+        else {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.operator_source",
+            });
+        };
+        let metadata = &request_identity.request.metadata;
+        let expected_session = metadata.session_id.as_ref().map(ToString::to_string);
+        let expected_task = metadata.task_id.as_ref().map(ToString::to_string);
+        if source_identity != request_identity
+            || envelope.kind != HostRequestKind::InstrumentRegistryRegistration
+            || envelope.identity.capability != "instrument_registry.register"
+            || envelope.identity.payload_schema_id
+                != "eliot.instrument-registry-registration.v1"
+            || !envelope.descriptor_sha256.is_empty()
+            || !envelope.peer_admission_receipt_sha256.is_empty()
+            || envelope.connection_id != session.connection_id
+            || envelope.identity.request_id != metadata.request_id
+            || envelope.identity.idempotency_key != request_identity.idempotency_key
+            || envelope.identity.cancellation_id != request_identity.cancellation_id
+            || envelope.identity.deadline_unix_ms != request_identity.deadline_unix_ms
+            || envelope.identity.session_id != expected_session
+            || envelope.identity.task_id != expected_task
+            || envelope.state_fence != session.module_generation.state_fence
+            || envelope.state_fence != request_identity.request.state_fence
+            || !envelope
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "host_request.operator_binding",
+            });
+        }
+        envelope.validate_for_admission().map_err(|_| {
+            KernelServiceError::HandshakeMismatch {
+                field: "host_request.operator_envelope",
+            }
+        })?;
+        let receipt = HostRequestAdmissionReceipt::issue(envelope).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "host_request.receipt",
+                reason: "cannot issue an operator registration admission receipt",
+            }
+        })?;
+        receipt.validate().map_err(|_| KernelServiceError::InvalidField {
+            field: "host_request.receipt",
+            reason: "issued admission receipt is not well-formed",
+        })?;
         Ok(receipt)
     }
 

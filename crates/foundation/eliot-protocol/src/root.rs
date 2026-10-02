@@ -111,6 +111,20 @@ pub use selected_source_capture::{
     SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID, SelectedSourceCaptureOperation,
 };
 
+mod selected_source_owner_readback;
+pub use selected_source_owner_readback::{
+    SELECTED_SOURCE_OWNER_READBACK_WIRE_ID, SELECTED_SOURCE_OWNER_READBACK_WIRE_VERSION,
+    SelectedSourceOwnerReadback,
+};
+
+mod instrument_registry_registration;
+pub use instrument_registry_registration::{
+    INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION,
+    INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION,
+    InstrumentRegistryRegistrationInvocation, InstrumentRegistryRegistrationOperatorRequest,
+    InstrumentRegistryRegistrationStatusRequest,
+};
+
 mod finish_attempt;
 pub use finish_attempt::{
     FINISH_ATTEMPT_WIRE_ID, FINISH_ATTEMPT_WIRE_VERSION, FINISH_INVOKE_PAYLOAD_SCHEMA_ID,

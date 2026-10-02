@@ -110,6 +110,14 @@ pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervisi
 /// Every leg remains bound to the daemon frame's original request identity
 /// and authenticated session.
 pub(crate) const EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION: &str = "execute_current_source_process";
+/// Authenticated current-source Git child-operation route. The selected-source
+/// parent is revalidated against the retained Kernel claim; the child identity
+/// comes only from the authenticated daemon frame.
+pub(crate) const EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION: &str =
+    "execute_current_source_git_process";
+/// Authenticated same-fence readback of the original selected-source stage,
+/// canonical admission, and ORS activation owners.
+pub(crate) const SOURCE_CAPTURE_OWNER_READBACK_OPERATION: &str = "source_capture.owner_readback";
 /// Authenticated Governor publish operation carrying one live-derivation
 /// projection (issue #1935 AUD1, I7.16). The Governor-owned derivation
 /// publishes its exact revision, exact active fingerprint, and exact
@@ -249,6 +257,13 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// Fence, operation identity, and canonical request hash from authenticated
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
+/// Authenticated operator ingress for the original Instrument Registry
+/// HostRequest mutation pathway.
+pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION;
+/// Same-owner readback for an earlier operator registration.
+pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION;
 
 /// Authenticated named-read selector serving the complete owner-issued
 /// `UserAutomation` preflight projection (issue #1779, I11.12).
@@ -662,6 +677,10 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         INTEGRATION_BRIDGE_APPLY_NAME => INTEGRATION_BRIDGE_APPLY_NAME,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION => EXECUTE_CURRENT_SOURCE_PROCESS_OPERATION,
+        EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION => {
+            EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION
+        }
+        SOURCE_CAPTURE_OWNER_READBACK_OPERATION => SOURCE_CAPTURE_OWNER_READBACK_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
@@ -699,6 +718,8 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        "instrument_registry_registration_claim" => "instrument_registry_registration_claim",
+        "instrument_registry_registration_result" => "instrument_registry_registration_result",
         // Issue #2564: the owner-backed `eliot.state` result travels under its
         // OWN operation so the Kernel can bind it to the State carrier form.
         // Reusing `local_read_result` here would let a state result complete a
@@ -737,6 +758,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
         "bind_operator_session_token" => "bind_operator_session_token",
+        INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION => {
+            INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+        }
+        INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION => {
+            INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION
+        }
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
         _ => "untrusted_operation",
@@ -759,6 +786,18 @@ struct CurrentSourceProcessOperation {
     /// Original Governor owner-read `TaskBinding` identity. The EBP identity is
     /// compared against this value before the process gateway is entered.
     admitted_task_id: eliot_contracts::TaskId,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentSourceGitProcessOperation {
+    /// Exact original selected-source request identity retained by Kernel.
+    parent_identity: RequestIdentity,
+    /// Task binding read back by the current Governor owner.
+    admitted_task_id: eliot_contracts::TaskId,
+    /// Existing closed P-03 request. Child identity is authenticated on frame.
+    request: ProcessExecutionRequest,
 }
 
 /// Strips the daemon transport's routing key from one application body.
@@ -3319,6 +3358,50 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         let context = tracing::Span::current();
         #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let candidate: eliot_protocol::InstrumentRegistryRegistrationOperatorRequest =
+                serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            let value =
+                self.submit_operator_registry_registration(session, &candidate, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION {
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let query: eliot_protocol::InstrumentRegistryRegistrationStatusRequest =
+                serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            let value =
+                self.read_operator_registry_registration_status(session, &query, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
             // The closed UserAutomation operator vocabulary is authenticated by
             // the front-door session, not by the daemon module binding: the
@@ -3720,6 +3803,22 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            EXECUTE_CURRENT_SOURCE_GIT_PROCESS_OPERATION => {
+                #[cfg(windows)]
+                {
+                    self.execute_current_source_git_process_operation(
+                        session,
+                        payload.clone(),
+                        request_identity,
+                    )
+                    .await
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (session, payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "agent_activation_claim" => {
                 #[cfg(windows)]
                 {
@@ -3970,6 +4069,68 @@ impl KernelComposition {
                             "recovery": null,
                         }),
                     })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_claim" => {
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_instrument_registry_registration_pair(session)
+                        .map(|pair| match pair {
+                            Some((envelope, invocation, request_identity, attempt)) => {
+                                serde_json::json!({
+                                    "status": "known",
+                                    "value": { "pair": {
+                                        "envelope": envelope,
+                                        "invocation": invocation,
+                                        "request_identity": request_identity,
+                                        "attempt": attempt,
+                                    } },
+                                    "recovery": null,
+                                })
+                            }
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "pair": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "instrument_registry_registration_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_instrument_registry_registration_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -4338,7 +4499,11 @@ impl KernelComposition {
             "source_capture.claim" => {
                 #[cfg(windows)]
                 {
-                    if payload.as_object().is_none_or(|object| !object.is_empty()) {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 1
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("source_capture.claim")
+                    {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_selected_source_capture_pair(session)
@@ -4365,11 +4530,45 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            SOURCE_CAPTURE_OWNER_READBACK_OPERATION => {
+                #[cfg(windows)]
+                {
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.len() != 1
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some(SOURCE_CAPTURE_OWNER_READBACK_OPERATION)
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let parent_identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    self.read_selected_source_owner_readback(session, parent_identity)
+                        .await
+                        .and_then(|readback| {
+                            let readback = readback
+                                .map(serde_json::to_value)
+                                .transpose()
+                                .map_err(|_| TransportError::SessionFenced)?;
+                            Ok(serde_json::json!({
+                                "status": "known",
+                                "value": { "readback": readback },
+                                "recovery": null,
+                            }))
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (payload, request_identity);
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "source_capture.stage" => {
                 #[cfg(windows)]
                 {
                     let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
-                    if object.len() != 3 {
+                    if object.len() != 4
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some("source_capture.stage")
+                    {
                         return Err(TransportError::SessionFenced);
                     }
                     let operation_id = object
@@ -4388,7 +4587,8 @@ impl KernelComposition {
                                 .ok_or(TransportError::SessionFenced)?,
                         )
                         .map_err(|_| TransportError::SessionFenced)?;
-                    let original_identity = request_identity.ok_or(TransportError::SessionFenced)?;
+                    let original_identity =
+                        request_identity.ok_or(TransportError::SessionFenced)?;
                     let staged = self.stage_selected_source_capture_host_request(
                         session,
                         operation_id,
@@ -5217,6 +5417,48 @@ impl KernelComposition {
                 request,
                 identity,
                 &admitted_task_id,
+            )
+            .await;
+        let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": response,
+            "recovery": null,
+        }))
+    }
+
+    #[cfg(windows)]
+    async fn execute_current_source_git_process_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        child_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: CurrentSourceGitProcessOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let child_identity = child_identity.ok_or(TransportError::SessionFenced)?;
+        let owner_readback = self
+            .read_selected_source_owner_readback(session, &operation.parent_identity)
+            .await?
+            .ok_or(TransportError::UnknownRequest)?;
+        if owner_readback.request_identity != operation.parent_identity {
+            return Err(TransportError::IdentityConflict);
+        }
+        self.validate_selected_source_git_parent(
+            session,
+            &operation.parent_identity,
+            &operation.admitted_task_id,
+        )?;
+        let (_, session_binding) = super::caller_binding(session)?;
+        let response = self
+            .execute_current_source_git_process_request(
+                session,
+                session_binding,
+                &operation.parent_identity,
+                child_identity,
+                &operation.admitted_task_id,
+                operation.request,
             )
             .await;
         let response = serde_json::to_value(response).map_err(|_| TransportError::SessionFenced)?;
@@ -13706,6 +13948,7 @@ mod local_read_dispatch_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

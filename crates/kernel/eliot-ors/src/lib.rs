@@ -38,9 +38,12 @@ pub use admission_reservation::{
     AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
     AdmissionReservationCanonicalAdmission, AdmissionReservationClaimRef,
     AdmissionReservationClaims, AdmissionReservationDisposition,
-    AdmissionReservationLaunchPrerequisite, AdmissionReservationRecord,
+    AdmissionReservationLaunchPrerequisite, AdmissionReservationOwnerExpectation,
+    AdmissionReservationRecord,
     AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
-    AdmissionReservationTransitionRequest, verify_admission_reservation_launch_prerequisite,
+    AdmissionReservationTransitionRequest,
+    adopt_active_admission_reservation_from_owner_snapshot,
+    verify_admission_reservation_launch_prerequisite,
 };
 pub use admission_reservation_release::{
     AdmissionReservationAttemptDisposition, AdmissionReservationCancellationCut,

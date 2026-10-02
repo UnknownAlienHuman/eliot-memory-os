@@ -80,13 +80,16 @@ use eliot_protocol::{
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
     AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
-    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
-    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity, SelectedSourceCaptureInvocation, WatchdogIntentKind, WatchdogSpoolEntryKind,
-    WatchdogSpoolEntryOutcome,
-    WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
-    WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
-    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestAdmissionReceipt,
+    HostRequestAuthenticatedSource, HostRequestEnvelope, HostRequestIdentity,
+    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody,
+    InstrumentRegistryRegistrationInvocation, InstrumentRegistryRegistrationOperatorRequest,
+    InstrumentRegistryRegistrationStatusRequest, LocalReadAttempt, RequestIdentity,
+    SelectedSourceCaptureInvocation, WatchdogIntentKind, WatchdogSpoolEntryKind,
+    WatchdogSpoolEntryOutcome, WatchdogSpoolExportBatchPayload,
+    WatchdogSpoolExportOutcomeSubmission, WatchdogSpoolExportResultPayload,
+    WatchdogSpoolExportSubmission, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
@@ -220,6 +223,275 @@ pub(crate) const AGENT_HOST_REQUEST_PREVIEW_OPERATION: &str = "agent_host_reques
 pub(crate) const HOST_REQUEST_PREVIEW_SOURCE: &str = "kernel-owner-preview.v1";
 /// Route label answered when the previewed tool has no serving read lane.
 pub(crate) const HOST_REQUEST_PREVIEW_ROUTE_WITHHELD: &str = "withheld-no-simulator";
+
+impl KernelComposition {
+    /// Accepts one inert registry candidate from the current authenticated
+    /// operator Session. The candidate carries bytes and scope only; the
+    /// original Governor admission remains the mutation authority.
+    pub(crate) fn submit_operator_registry_registration(
+        &self,
+        session: &Session,
+        candidate: &InstrumentRegistryRegistrationOperatorRequest,
+        request_identity: &RequestIdentity,
+    ) -> Result<serde_json::Value, TransportError> {
+        candidate
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        request_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if request_identity.request.metadata.task_id.is_none()
+            || request_identity
+                .request
+                .metadata
+                .request_id
+                .as_str()
+                .trim()
+                .is_empty()
+            || request_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let invocation = InstrumentRegistryRegistrationInvocation {
+            wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
+            request_identity: request_identity.clone(),
+            authenticated_principal_sha256: authenticated_operator_principal_sha256(session)?,
+            snapshot_json: candidate.snapshot_json.clone(),
+        };
+        let identity = HostRequestIdentity {
+            request_id: request_identity.request.metadata.request_id.clone(),
+            correlation_projection: Some(eliot_contracts::HostCorrelationProjection::Opaque {
+                domain: eliot_contracts::HostCorrelationDomain::Request,
+                occurrence: request_identity.request.metadata.request_id.to_string(),
+            }),
+            idempotency_key: request_identity.idempotency_key.clone(),
+            cancellation_id: request_identity.cancellation_id.clone(),
+            parent_operation_id: None,
+            deadline_unix_ms: request_identity.deadline_unix_ms,
+            capability: "instrument_registry.register".to_owned(),
+            session_id: request_identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(ToString::to_string),
+            task_id: request_identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(ToString::to_string),
+            work_scope_id: Some(candidate.work_scope_id.clone()),
+            payload_schema_id: InstrumentRegistryRegistrationInvocation::PAYLOAD_SCHEMA_ID
+                .to_owned(),
+            payload_sha256: invocation
+                .action_payload_sha256()
+                .map_err(|_| TransportError::SessionFenced)?,
+        };
+        let envelope = HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::InstrumentRegistryRegistration,
+            connection_id: session.connection_id.clone(),
+            identity,
+            state_fence: request_identity.request.state_fence.clone(),
+            descriptor_sha256: String::new(),
+            peer_admission_receipt_sha256: String::new(),
+            authenticated_source: Some(HostRequestAuthenticatedSource::Operator {
+                request_identity: request_identity.clone(),
+            }),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .map_err(|_| TransportError::SessionFenced)?;
+        invocation
+            .validate_for_envelope(&envelope)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let (receipt, record) = self.admit_and_queue_instrument_registry_registration(
+            session,
+            &envelope,
+            &invocation,
+            request_identity,
+        )?;
+        Ok(host_request_admitted_response(&receipt, &record))
+    }
+
+    /// Reads the original durable operator-registration result after a
+    /// reconnect. The current OS principal and exact task/scope/fence join the
+    /// retained original request identity before any result is returned.
+    pub(crate) fn read_operator_registry_registration_status(
+        &self,
+        session: &Session,
+        query: &InstrumentRegistryRegistrationStatusRequest,
+        current_identity: &RequestIdentity,
+    ) -> Result<serde_json::Value, TransportError> {
+        query
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        current_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !session.accepts(&session.authority_epoch, session.session_epoch)
+            || current_identity.request.state_fence != session.module_generation.state_fence
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let operation = OperationIdentity::new(query.operation_id.clone())
+            .map_err(|_| TransportError::UnknownRequest)?;
+        let stored = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation, &query.request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        let durable_scope = stored.scope_ref.as_ref().map(ToString::to_string);
+        if stored.kind != OrsHostRequestKind::InstrumentRegistryRegistration
+            || stored.capability_ref.as_str() != "instrument_registry.register"
+            || stored.operation_id.as_str() != query.operation_id
+            || stored.request_digest != query.request_digest
+            || durable_scope.as_deref() != Some(query.work_scope_id.as_str())
+        {
+            return Err(TransportError::UnknownRequest);
+        }
+        let invocation: InstrumentRegistryRegistrationInvocation = serde_json::from_value(
+            stored
+                .payload_body
+                .clone()
+                .ok_or(TransportError::UnknownRequest)?,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let original_identity = &invocation.request_identity;
+        let original_task = original_identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string);
+        let durable_task = stored.task_ref.as_ref().map(ToString::to_string);
+        let current_principal = authenticated_operator_principal_sha256(session)?;
+        if !operator_registration_status_matches_owner(
+            original_identity,
+            current_identity,
+            original_task.as_deref(),
+            durable_task.as_deref(),
+            &query.work_scope_id,
+            durable_scope.as_deref(),
+            &invocation.authenticated_principal_sha256,
+            &current_principal,
+        ) || original_identity.request.state_fence != session.module_generation.state_fence
+            || stored.fence_digest
+                != sha256_json(&original_identity.request.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?
+            || stored.payload_digest
+                != invocation
+                    .action_payload_sha256()
+                    .map_err(|_| TransportError::SessionFenced)?
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        original_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let original_identity = original_identity.clone();
+        let registration_result = stored.result_response.clone();
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": {
+                "record": stored,
+                "original_request_identity": original_identity,
+                "registration_result": registration_result,
+            },
+            "recovery": null,
+        }))
+    }
+}
+
+fn authenticated_operator_principal_sha256(session: &Session) -> Result<String, TransportError> {
+    session
+        .peer
+        .validate()
+        .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+    let eliot_ipc::PeerIdentity::Authenticated {
+        user_identity,
+        session_identity,
+        ..
+    } = &session.peer
+    else {
+        return Err(TransportError::PeerIdentityUnavailable);
+    };
+    sha256_json(&serde_json::json!({
+        "user_identity": user_identity,
+        "session_identity": session_identity,
+    }))
+    .map_err(|_| TransportError::SessionFenced)
+}
+
+fn operator_registration_status_matches_owner(
+    original_identity: &RequestIdentity,
+    current_identity: &RequestIdentity,
+    original_task: Option<&str>,
+    durable_task: Option<&str>,
+    current_scope: &str,
+    durable_scope: Option<&str>,
+    original_principal_sha256: &str,
+    current_principal_sha256: &str,
+) -> bool {
+    let original_task_from_identity = original_identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(ToString::to_string);
+    let current_task_from_identity = current_identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(ToString::to_string);
+    original_identity.request.metadata.request_id != current_identity.request.metadata.request_id
+        && original_task.is_some()
+        && current_task_from_identity.is_some()
+        && original_task_from_identity.as_deref() == original_task
+        && current_task_from_identity.as_deref() == original_task
+        && durable_task == original_task
+        && durable_scope == Some(current_scope)
+        && original_identity.request.state_fence == current_identity.request.state_fence
+        && original_principal_sha256 == current_principal_sha256
+}
+
+fn is_exact_operator_registration_carrier(operation_ref: &HostRequestOperationRef) -> bool {
+    let (Some(envelope), Some(invocation), Some(identity)) = (
+        operation_ref
+            .instrument_registry_registration_envelope
+            .as_ref(),
+        operation_ref
+            .instrument_registry_registration_invocation
+            .as_ref(),
+        operation_ref
+            .instrument_registry_registration_identity
+            .as_ref(),
+    ) else {
+        return false;
+    };
+    envelope.kind == HostRequestKind::InstrumentRegistryRegistration
+        && operation_ref.operation_id == host_request_operation_id(envelope)
+        && operation_ref.request_digest == envelope.envelope_sha256
+        && invocation.request_identity == *identity
+        && matches!(
+            envelope.authenticated_source.as_ref(),
+            Some(HostRequestAuthenticatedSource::Operator { request_identity })
+                if request_identity == identity
+        )
+        && invocation.validate_for_envelope(envelope).is_ok()
+}
+
+fn exact_terminal_result_replay(stored: &HostRequestRecord, body: &HostRequestResultBody) -> bool {
+    stored.state == HostRequestState::ResultReceived
+        && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
+        && stored.result_response.as_ref() == Some(&body.response)
+}
 
 /// Closed agent-bridge event-delivery entries (Implements #2561, I7.2/I7.23).
 ///
@@ -371,7 +643,7 @@ pub(crate) fn is_watchdog_export_operation(operation: &str) -> bool {
 /// retired or fenced away on completion, expiry, disconnect, restart, epoch
 /// rotation, or revocation. Removal from this index IS invalidation: submit
 /// requires a live record, so a dropped pair can never complete again.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HostRequestOperationRef {
     pub(crate) operation_id: String,
     pub(crate) request_digest: String,
@@ -450,6 +722,12 @@ pub(crate) struct HostRequestOperationRef {
     pub(crate) source_capture_invocation: Option<SelectedSourceCaptureInvocation>,
     pub(crate) source_capture_request_identity: Option<RequestIdentity>,
     pub(crate) source_capture_stage_intent: Option<SelectedSourceCaptureStageIntent>,
+    /// Exact authenticated operator registration carrier and request identity.
+    pub(crate) instrument_registry_registration_envelope: Option<HostRequestEnvelope>,
+    pub(crate) instrument_registry_registration_invocation:
+        Option<InstrumentRegistryRegistrationInvocation>,
+    pub(crate) instrument_registry_registration_identity: Option<RequestIdentity>,
+    pub(crate) instrument_registry_registration_attempt: LocalReadAttemptState,
 }
 
 /// Governed attempt ownership record for one queued local-read pair.
@@ -676,6 +954,7 @@ enum DaemonReadQueue {
     LocalRead,
     State,
     CampaignPacket,
+    InstrumentRegistryRegistration,
 }
 
 /// Queue-lane selector for claimed-lease expiry cleanup (issue #1839).
@@ -686,6 +965,7 @@ enum DaemonReadQueue {
 enum ExpiryRetireLane {
     LocalRead,
     CampaignPacket,
+    InstrumentRegistryRegistration,
     Observe,
     TaskController,
     Finish,
@@ -832,6 +1112,7 @@ impl KernelComposition {
             envelope.kind,
             HostRequestKind::Invocation
                 | HostRequestKind::SelectedSourceCapture
+                | HostRequestKind::InstrumentRegistryRegistration
                 | HostRequestKind::Cancellation
         ) && envelope.identity.correlation_projection.is_none()
         {
@@ -844,7 +1125,78 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        if envelope.kind == HostRequestKind::InstrumentRegistryRegistration
+            || matches!(
+                envelope.authenticated_source.as_ref(),
+                Some(HostRequestAuthenticatedSource::Operator { .. })
+            )
+        {
+            return Err(TransportError::SessionFenced);
+        }
         self.admit_host_request_envelope_with_tool_binding_under_transition(envelope, None)
+    }
+
+    /// Admits the operator-owned registry mutation through the existing
+    /// HostRequest/ORS record and the KernelService's source-specific gate.
+    /// No AgentBridge descriptor or peer receipt is created for this source.
+    fn admit_operator_registry_registration_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+        session: &Session,
+        request_identity: &RequestIdentity,
+    ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
+        Self::validate_host_request_admission(envelope)?;
+        if envelope.kind != HostRequestKind::InstrumentRegistryRegistration
+            || envelope.connection_id != session.connection_id
+            || envelope.state_fence != session.module_generation.state_fence
+            || envelope.state_fence != request_identity.request.state_fence
+            || request_identity.request.metadata.request_id != envelope.identity.request_id
+            || !session.accepts(&session.authority_epoch, session.session_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let admission_receipt = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .admit_operator_registry_registration(envelope, session, request_identity)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let requested = requested_host_request_record(envelope)?;
+        let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stored = self.stage_host_request_record(&requested)?;
+        if activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms) {
+            if !stored.state.is_terminal() {
+                let _ = self.generation_gateway.ors.advance_host_request(
+                    &operation_id,
+                    &envelope.envelope_sha256,
+                    HostRequestState::Expired,
+                    None,
+                );
+            }
+            return Err(TransportError::Timeout);
+        }
+        let admitted = if stored.state == HostRequestState::Requested {
+            self.generation_gateway
+                .ors
+                .advance_host_request(
+                    &operation_id,
+                    &envelope.envelope_sha256,
+                    HostRequestState::Admitted,
+                    None,
+                )
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?
+        } else {
+            stored
+        };
+        self.note_host_request_operation_under_transition(envelope)?;
+        self.audit_host_request_admission(envelope, &admission_receipt, &admitted);
+        Ok((admission_receipt, admitted))
     }
 
     /// Admits an envelope after a linked canonical tool has supplied the
@@ -975,7 +1327,8 @@ impl KernelComposition {
             }
             HostRequestKind::Activation
             | HostRequestKind::Invocation
-            | HostRequestKind::SelectedSourceCapture => {}
+            | HostRequestKind::SelectedSourceCapture
+            | HostRequestKind::InstrumentRegistryRegistration => {}
         }
 
         self.note_host_request_operation_under_transition(envelope)?;
@@ -1899,6 +2252,9 @@ impl KernelComposition {
         if let Some(error) = refused_carrier_error {
             return Err(error);
         }
+        Ok(())
+    }
+
     /// Admits and queues one closed selected-source capture invocation.
     ///
     /// The original `RequestIdentity` comes from the authenticated frame, not
@@ -1926,21 +2282,17 @@ impl KernelComposition {
             || request_identity.idempotency_key != envelope.identity.idempotency_key
             || request_identity.cancellation_id != envelope.identity.cancellation_id
             || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
-            || metadata
-                .session_id
-                .as_ref()
-                .map(|value| value.as_str())
+            || metadata.session_id.as_ref().map(|value| value.as_str())
                 != envelope.identity.session_id.as_deref()
             || metadata.task_id.as_ref().map(|value| value.as_str())
                 != envelope.identity.task_id.as_deref()
         {
             return Err(TransportError::SessionFenced);
         }
-        let payload_bytes = canonical_json_bytes(invocation)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let payload_bytes =
+            canonical_json_bytes(invocation).map_err(|_| TransportError::SessionFenced)?;
         if sha256_hex(&payload_bytes) != envelope.identity.payload_sha256
-            || envelope.identity.capability
-                != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || envelope.identity.capability != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
             || envelope.identity.payload_schema_id
                 != eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
         {
@@ -2027,19 +2379,22 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let retained_principal = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&envelope.connection_id)
-            .and_then(|state| state.activated_binding.as_ref())
-            .map(|binding| binding.principal_id.as_str())
-            .ok_or(TransportError::SessionFenced)?;
+        let retained_principal = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.as_ref())
+                .map(|binding| binding.principal_id.clone())
+                .ok_or(TransportError::SessionFenced)?
+        };
         if retained_principal != intent.principal_id {
             return Err(TransportError::IdentityConflict);
         }
-        let durable_id = OperationIdentity::new(operation_id)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let durable_id =
+            OperationIdentity::new(operation_id).map_err(|_| TransportError::SessionFenced)?;
         let durable = self
             .generation_gateway
             .ors
@@ -2086,6 +2441,135 @@ impl KernelComposition {
         Ok(staged)
     }
 
+    /// Revalidates a selected-source parent against the original retained
+    /// queue entry and ORS host-request row before a distinct Git child
+    /// process request can reach P-03. The parent identity is caller-carried
+    /// provenance only; this comparison makes the Kernel's retained original
+    /// identity and current application/session binding authoritative.
+    pub(crate) fn validate_selected_source_git_parent(
+        &self,
+        session: &Session,
+        parent_identity: &RequestIdentity,
+        admitted_task_id: &eliot_contracts::TaskId,
+    ) -> Result<(), TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        parent_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if session.module_generation.state_fence != parent_identity.request.state_fence
+            || parent_identity.request.metadata.task_id.as_ref() != Some(admitted_task_id)
+            || parent_identity.request.metadata.state_fence != parent_identity.request.state_fence
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let selected = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|row| {
+                    row.source_capture_request_identity.as_ref() == Some(parent_identity)
+                        && row.source_capture_envelope.is_some()
+                        && row.source_capture_invocation.is_some()
+                })
+                .cloned()
+                .ok_or(TransportError::UnknownRequest)?
+        };
+        let envelope = selected
+            .source_capture_envelope
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let invocation = selected
+            .source_capture_invocation
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        let retained_identity = selected
+            .source_capture_request_identity
+            .as_ref()
+            .ok_or(TransportError::UnknownRequest)?;
+        invocation
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        envelope
+            .validate_for_admission()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if retained_identity != parent_identity
+            || envelope.kind != HostRequestKind::SelectedSourceCapture
+            || envelope.state_fence != parent_identity.request.state_fence
+            || envelope.identity.request_id != parent_identity.request.metadata.request_id
+            || envelope.identity.idempotency_key != parent_identity.idempotency_key
+            || envelope.identity.cancellation_id != parent_identity.cancellation_id
+            || envelope.identity.deadline_unix_ms != parent_identity.deadline_unix_ms
+            || envelope.identity.task_id.as_deref() != Some(admitted_task_id.as_str())
+            || parent_identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|id| id.as_str())
+                != envelope.identity.session_id.as_deref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        if activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms) {
+            return Err(TransportError::Timeout);
+        }
+        self.host_request_connection_gate_under_transition(envelope)?;
+        if !self.application_binding_live_for_claim(envelope, &pending, true)? {
+            return Err(TransportError::SessionFenced);
+        }
+        let retained_principal = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.as_ref())
+                .map(|binding| binding.principal_id.clone())
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if retained_principal.trim().is_empty() {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let payload =
+            canonical_json_bytes(invocation).map_err(|_| TransportError::SessionFenced)?;
+        if sha256_hex(&payload) != envelope.identity.payload_sha256 {
+            return Err(TransportError::IdentityConflict);
+        }
+        let operation_id = OperationIdentity::new(selected.operation_id.clone())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let durable = self
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &selected.request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if durable.kind != OrsHostRequestKind::SelectedSourceCapture
+            || durable.state != HostRequestState::Admitted
+            || durable.request_digest != selected.request_digest
+            || durable.deadline_unix_ms != envelope.identity.deadline_unix_ms
+            || durable.task_ref.as_ref().map(|task| task.as_str())
+                != envelope.identity.task_id.as_deref()
+            || durable.session_ref.as_ref().map(|session| session.as_str())
+                != envelope.identity.session_id.as_deref()
+            || durable.scope_ref.as_ref().map(|scope| scope.as_str())
+                != envelope.identity.work_scope_id.as_deref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(())
+    }
+
     /// Revalidates the complete staged source-capture join immediately before
     /// the canonical prepared transition reaches Store.
     pub(crate) fn validate_source_capture_transition_for_commit(
@@ -2100,10 +2584,9 @@ impl KernelComposition {
         identity
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let retained_identity: RequestIdentity = serde_json::from_value(
-            record.request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let retained_identity: RequestIdentity =
+            serde_json::from_value(record.request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         if &retained_identity != identity
             || record.state_fence != context.state_fence
             || transition.state_fence != record.state_fence
@@ -2161,26 +2644,36 @@ impl KernelComposition {
             .source_capture_stage_intent
             .as_ref()
             .ok_or(TransportError::UnknownRequest)?;
+        let operation_commitment = invocation
+            .operation
+            .canonical_serialization()
+            .map_err(|_| TransportError::SessionFenced)?;
         if original_identity != identity
             || envelope.envelope_sha256 != parent_digest
             || host_request_operation_id(envelope) != record.parent_operation_id
             || envelope.kind != HostRequestKind::SelectedSourceCapture
             || envelope.state_fence != record.state_fence
+            || intent.operation != invocation.operation
             || record.work_item_id != intent.work_item_id.as_str()
             || record.work_lease_id != intent.work_lease_id
             || record.principal_id != intent.principal_id
-            || record.operation != intent.operation
+            || record.operation != operation_commitment
             || record.selected_relative_path != intent.selected_relative_path
             || record.selector != intent.selector
             || record.source_digest != intent.source_digest
             || record.configuration_digest != intent.configuration_digest
             || record.action_contract_digest != intent.action_contract_digest
             || record.reservation_claims
-                != serde_json::to_value(&intent.claims).map_err(|_| TransportError::SessionFenced)?
+                != serde_json::to_value(&intent.claims)
+                    .map_err(|_| TransportError::SessionFenced)?
             || record.task_id != envelope.identity.task_id.as_deref().unwrap_or_default()
             || record.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
             || record.work_scope_id
-                != envelope.identity.work_scope_id.as_deref().unwrap_or_default()
+                != envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .unwrap_or_default()
             || record.authority_epoch
                 != serde_json::to_value(
                     &eliot_ors::epoch_lineage_for(&envelope.state_fence.authority_epoch, None)
@@ -2193,14 +2686,17 @@ impl KernelComposition {
         if !self.application_binding_live_for_claim(envelope, &pending, true)? {
             return Err(TransportError::SessionFenced);
         }
-        let retained_principal = self
-            .agent_bridge_connections
-            .lock()
-            .map_err(|_| TransportError::SessionFenced)?
-            .get(&envelope.connection_id)
-            .and_then(|state| state.activated_binding.as_ref())
-            .map(|binding| binding.principal_id.as_str())
-            .ok_or(TransportError::SessionFenced)?;
+        let retained_principal = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            connections
+                .get(&envelope.connection_id)
+                .and_then(|state| state.activated_binding.as_ref())
+                .map(|binding| binding.principal_id.clone())
+                .ok_or(TransportError::SessionFenced)?
+        };
         if retained_principal != record.principal_id {
             return Err(TransportError::IdentityConflict);
         }
@@ -2218,9 +2714,15 @@ impl KernelComposition {
             || durable_parent.deadline_unix_ms != envelope.identity.deadline_unix_ms
             || durable_parent.task_ref.as_ref().map(|value| value.as_str())
                 != envelope.identity.task_id.as_deref()
-            || durable_parent.session_ref.as_ref().map(|value| value.as_str())
+            || durable_parent
+                .session_ref
+                .as_ref()
+                .map(|value| value.as_str())
                 != envelope.identity.session_id.as_deref()
-            || durable_parent.scope_ref.as_ref().map(|value| value.as_str())
+            || durable_parent
+                .scope_ref
+                .as_ref()
+                .map(|value| value.as_str())
                 != envelope.identity.work_scope_id.as_deref()
         {
             return Err(TransportError::IdentityConflict);
@@ -2723,13 +3225,38 @@ impl KernelComposition {
     /// rules. Revocation never fails: every store error is contained because
     /// fencing must hold even when the store is unavailable.
     pub(super) fn fence_host_requests_for_connection(&self, connection_id: &str) {
-        let outstanding = match self.host_request_connection_index.lock() {
+        let indexed = match self.host_request_connection_index.lock() {
             Ok(mut index) => index.remove(connection_id).unwrap_or_default(),
             Err(poisoned) => {
                 let mut index = poisoned.into_inner();
                 index.remove(connection_id).unwrap_or_default()
             }
         };
+        // An accepted operator registration is an independently retained
+        // owner continuation. A short-lived CLI disconnect does not cancel
+        // it; retain only exact original carriers and fence bridge-owned work.
+        let (mut outstanding, accepted): (Vec<_>, Vec<_>) = indexed
+            .into_iter()
+            .partition(|candidate| !is_exact_operator_registration_carrier(candidate));
+        outstanding.retain(|candidate| {
+            !candidate
+                .instrument_registry_registration_envelope
+                .as_ref()
+                .is_some_and(|_| {
+                    accepted.iter().any(|retained| {
+                        retained.operation_id == candidate.operation_id
+                            && retained.request_digest == candidate.request_digest
+                    })
+                })
+        });
+        if !accepted.is_empty() {
+            self.host_request_connection_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(connection_id.to_owned())
+                .or_default()
+                .extend(accepted);
+        }
         // I12.14 step 5: fencing removes these pairs from the index, so their
         // admission charges are returned here from the byte counts recorded at
         // admission. Without this the ledger would keep charging for pairs the
@@ -2807,6 +3334,7 @@ impl KernelComposition {
             }
             HostRequestKind::Invocation
             | HostRequestKind::SelectedSourceCapture
+            | HostRequestKind::InstrumentRegistryRegistration
             | HostRequestKind::Cancellation
             | HostRequestKind::Status
             | HostRequestKind::Reconciliation => {
@@ -3092,8 +3620,7 @@ impl KernelComposition {
         if matches!(
             envelope.kind,
             HostRequestKind::Invocation | HostRequestKind::SelectedSourceCapture
-        )
-            && envelope.identity.capability == OBSERVE_CAPABILITY
+        ) && envelope.identity.capability == OBSERVE_CAPABILITY
             && task_relative_tool.is_none()
         {
             // `eliot.observe` has both cold raw-capture and task-relative
@@ -3549,7 +4076,14 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.host_request_connection_gate_under_transition(envelope)?;
+        if !matches!(
+            envelope.authenticated_source.as_ref(),
+            Some(HostRequestAuthenticatedSource::Operator { .. })
+        ) {
+            self.host_request_connection_gate_under_transition(envelope)?;
+        } else if envelope.kind != HostRequestKind::InstrumentRegistryRegistration {
+            return Err(TransportError::SessionFenced);
+        }
         let mut index = self
             .host_request_connection_index
             .lock()
@@ -3596,6 +4130,7 @@ impl KernelComposition {
                 source_capture_invocation: None,
                 source_capture_request_identity: None,
                 source_capture_stage_intent: None,
+                ..HostRequestOperationRef::default()
             });
         }
         Ok(())
@@ -3945,6 +4480,7 @@ impl KernelComposition {
                 source_capture_invocation: None,
                 source_capture_request_identity: None,
                 source_capture_stage_intent: None,
+                ..HostRequestOperationRef::default()
             });
         }
         // Issue #1837: durable audit evidence for queue admission.
@@ -4614,6 +5150,9 @@ impl KernelComposition {
                     ExpiryRetireLane::CampaignPacket => {
                         candidate.campaign_packet_envelope.is_some()
                     }
+                    ExpiryRetireLane::InstrumentRegistryRegistration => candidate
+                        .instrument_registry_registration_envelope
+                        .is_some(),
                     ExpiryRetireLane::Observe => candidate.observe_envelope.is_some(),
                     ExpiryRetireLane::TaskController => {
                         candidate.task_controller_envelope.is_some()
@@ -4730,16 +5269,23 @@ impl KernelComposition {
             }
             DaemonReadQueue::State => capability == LOCAL_READ_STATE_CAPABILITY,
             DaemonReadQueue::CampaignPacket => capability == "eliot.packet",
+            DaemonReadQueue::InstrumentRegistryRegistration => {
+                capability == "instrument_registry.register"
+            }
         };
         let lane = match queue {
             DaemonReadQueue::LocalRead if capability == LOCAL_READ_QUERY_CAPABILITY => "query",
             DaemonReadQueue::LocalRead => "skill",
             DaemonReadQueue::State => "state",
             DaemonReadQueue::CampaignPacket => "campaign-packet",
+            DaemonReadQueue::InstrumentRegistryRegistration => "instrument-registry-registration",
         };
         let retire = match queue {
             DaemonReadQueue::LocalRead | DaemonReadQueue::State => ExpiryRetireLane::LocalRead,
             DaemonReadQueue::CampaignPacket => ExpiryRetireLane::CampaignPacket,
+            DaemonReadQueue::InstrumentRegistryRegistration => {
+                ExpiryRetireLane::InstrumentRegistryRegistration
+            }
         };
         if stored.operation_id.as_str() != body.operation_id
             || stored.request_digest != body.request_sha256
@@ -4758,10 +5304,7 @@ impl KernelComposition {
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
-        if stored.state == HostRequestState::ResultReceived
-            && stored.result_digest.as_deref() == Some(body.result_digest.as_str())
-            && stored.result_response.as_ref() == Some(&body.response)
-        {
+        if exact_terminal_result_replay(&stored, body) {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
         }
         // Issue #1839: record the adapter-produced native presentation
@@ -4816,6 +5359,11 @@ impl KernelComposition {
                 &body.operation_id,
                 &body.request_sha256,
             )?,
+            DaemonReadQueue::InstrumentRegistryRegistration => self
+                .live_instrument_registry_registration_attempt_under_transition(
+                    &body.operation_id,
+                    &body.request_sha256,
+                )?,
         };
         match (&body.attempt, live) {
             (Some(attempt), Some(state))
@@ -4962,6 +5510,9 @@ impl KernelComposition {
                         candidate.local_read_envelope.clone()
                     }
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
+                    DaemonReadQueue::InstrumentRegistryRegistration => {
+                        candidate.instrument_registry_registration_envelope.clone()
+                    }
                 })
         };
         // I7.24 (#1945): the retained tool bytes for the same pair. The
@@ -4985,6 +5536,7 @@ impl KernelComposition {
                         candidate.local_read_tool.clone()
                     }
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_tool.clone(),
+                    DaemonReadQueue::InstrumentRegistryRegistration => None,
                 })
         };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
@@ -5161,6 +5713,12 @@ impl KernelComposition {
                     &body.request_sha256,
                 );
             }
+            DaemonReadQueue::InstrumentRegistryRegistration => {
+                self.retire_instrument_registry_registration_pair_under_transition(
+                    &body.operation_id,
+                    &body.request_sha256,
+                );
+            }
         }
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
@@ -5214,7 +5772,7 @@ fn advance_tool_exposure_receipt_for_persisted_result(
         DaemonReadQueue::LocalRead | DaemonReadQueue::CampaignPacket => {
             check_local_read_admission(envelope, tool).ok()?
         }
-        DaemonReadQueue::State => return None,
+        DaemonReadQueue::State | DaemonReadQueue::InstrumentRegistryRegistration => return None,
     };
     let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)?;
     let operation = persisted.operation_id.as_str();
@@ -5240,6 +5798,7 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     // view means nothing was consumed beyond transport.
     let used = match queue {
         DaemonReadQueue::LocalRead | DaemonReadQueue::State => delivered,
+        DaemonReadQueue::InstrumentRegistryRegistration => delivered,
         DaemonReadQueue::CampaignPacket => {
             let view_verified = response
                 .get("campaign_learning_state_view")
@@ -5769,6 +6328,7 @@ impl KernelComposition {
                 source_capture_invocation: None,
                 source_capture_request_identity: None,
                 source_capture_stage_intent: None,
+                ..HostRequestOperationRef::default()
             });
         Ok(ObserveQueueReservation::Reserved {
             token,
@@ -7035,6 +7595,9 @@ pub(crate) fn requested_host_request_record(
             HostRequestKind::Activation => OrsHostRequestKind::Activation,
             HostRequestKind::Invocation => OrsHostRequestKind::Invocation,
             HostRequestKind::SelectedSourceCapture => OrsHostRequestKind::SelectedSourceCapture,
+            HostRequestKind::InstrumentRegistryRegistration => {
+                OrsHostRequestKind::InstrumentRegistryRegistration
+            }
             HostRequestKind::Cancellation => OrsHostRequestKind::Cancellation,
             HostRequestKind::Status => OrsHostRequestKind::Status,
             HostRequestKind::Reconciliation => OrsHostRequestKind::Reconciliation,
@@ -7285,20 +7848,18 @@ impl KernelComposition {
                         if object.len() != 3 {
                             return Err(TransportError::SessionFenced);
                         }
-                        let invocation: SelectedSourceCaptureInvocation =
-                            serde_json::from_value(
-                                object
-                                    .get("invocation")
-                                    .cloned()
-                                    .ok_or(TransportError::SessionFenced)?,
-                            )
-                            .map_err(|_| TransportError::SessionFenced)?;
-                        let (receipt, record) = self
-                            .admit_selected_source_capture_host_request(
-                                envelope,
-                                &invocation,
-                                request_identity,
-                            )?;
+                        let invocation: SelectedSourceCaptureInvocation = serde_json::from_value(
+                            object
+                                .get("invocation")
+                                .cloned()
+                                .ok_or(TransportError::SessionFenced)?,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                        let (receipt, record) = self.admit_selected_source_capture_host_request(
+                            envelope,
+                            &invocation,
+                            request_identity,
+                        )?;
                         return Ok(host_request_admitted_response(&receipt, &record));
                     }
                     // Observe bytes ride this same entry (issue #2565): when the
@@ -11113,6 +11674,7 @@ mod invoke_read_tool_tests {
             state_fence: fence,
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }
@@ -11412,6 +11974,7 @@ mod invoke_read_tool_tests {
             source_capture_invocation: None,
             source_capture_request_identity: None,
             source_capture_stage_intent: None,
+            ..HostRequestOperationRef::default()
         }
     }
 
