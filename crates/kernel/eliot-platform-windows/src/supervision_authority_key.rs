@@ -2161,8 +2161,8 @@ mod tests {
                     Ok(bytes)
                 })
                 .unwrap_or_else(|error| panic!("sealed-key write {relative_path}: {error}"));
-            let (identity, sealed_blob_sha256, authority) =
-                written.unwrap_or_else(|| panic!("the write closure never ran for {relative_path}"));
+            let (identity, sealed_blob_sha256, authority) = written
+                .unwrap_or_else(|| panic!("the write closure never ran for {relative_path}"));
 
             let readback = WindowsInstallerRootPrimitive::new()
                 .read_protected_file(&self.spec, &path, SEALED_KEY_FILE_LIMIT)
@@ -2181,7 +2181,10 @@ mod tests {
                 readback.object.volume_serial_number, 0,
                 "the file must be a real OS object"
             );
-            assert_ne!(readback.object.file_index, 0, "the file must be a real OS object");
+            assert_ne!(
+                readback.object.file_index, 0,
+                "the file must be a real OS object"
+            );
             if matches!(mutation, IdentityMutation::None) {
                 assert_eq!(
                     file_identity(&readback.object),
@@ -2208,9 +2211,9 @@ mod tests {
     /// changing its last sub-authority, so the negative control is provably a
     /// different `S-1-5-80-...` text and never the resolved host SID itself.
     fn foreign_service_sid(live: &str) -> String {
-        let tail = live.strip_prefix("S-1-5-80-").unwrap_or_else(|| {
-            panic!("resolved host service SID {live} is not a service SID")
-        });
+        let tail = live
+            .strip_prefix("S-1-5-80-")
+            .unwrap_or_else(|| panic!("resolved host service SID {live} is not a service SID"));
         let mut parts = tail.split('-').map(str::to_owned).collect::<Vec<_>>();
         let last = parts
             .pop()
@@ -2283,7 +2286,9 @@ mod tests {
             "lease-2",
         );
         assert_eq!(
-            store.unseal_for_kernel(spec, kernel_root, &substituted).err(),
+            store
+                .unseal_for_kernel(spec, kernel_root, &substituted)
+                .err(),
             Some(SupervisionAuthorityKeyError::InvalidBinding),
             "the authority the envelope records must be compared with the authority the caller supplied"
         );
@@ -2307,7 +2312,9 @@ mod tests {
             IdentityMutation::SealedBlobSha256,
         );
         assert_eq!(
-            store.unseal_for_kernel(spec, kernel_root, &mutated_blob.authority).err(),
+            store
+                .unseal_for_kernel(spec, kernel_root, &mutated_blob.authority)
+                .err(),
             Some(SupervisionAuthorityKeyError::InvalidBinding),
             "a recorded sealed-blob digest that differs from the parsed envelope bytes must be refused"
         );
@@ -2433,12 +2440,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("resolve the installed host service SID: {error}"));
         let provider = WindowsSupervisionAuthorityKeyProvider::new();
         let sealed = provider
-            .generate_and_seal(
-                &live,
-                "installation-1",
-                "eliot-kernel",
-                "supervision-key-1",
-            )
+            .generate_and_seal(&live, "installation-1", "eliot-kernel", "supervision-key-1")
             .unwrap_or_else(|error| panic!("seal to the exact host service SID: {error}"));
         assert!(
             !sealed.sealed_blob.is_empty(),
