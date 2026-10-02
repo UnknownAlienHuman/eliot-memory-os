@@ -11,19 +11,16 @@
 //! projections of one caller-supplied vector, so it could not observe a missing
 //! import member at all.
 //!
-//! What is proved here, and nothing more:
+//! What is proved here, and nothing more. Read the last column before claiming
+//! any of these as evidence for a particular change; two of the four also pass
+//! at base and pin the census commit rather than the denominator repair.
 //!
-//! 1. [`nonempty_member_set_refuses_known_zero_for_an_untriaged_member`] — the
-//!    audit's discriminator verbatim: `Satisfied` is NOT produced, because the
-//!    snapshot's own declared roster says members exist.
-//! 2. [`empty_member_set_still_produces_known_zero`] — the POSITIVE case: a
-//!    genuinely empty, independently verified member set with an empty
-//!    accumulator DOES produce `Satisfied`. This is what proves the verdict was
-//!    not made unreachable by refusing everything.
-//! 3. [`duplicate_outcome_identifier_is_a_typed_rejection`] — a duplicate
-//!    outcome id is refused at the store boundary with
-//!    `OrsError::DuplicateConflict`, a typed refusal distinguishable from both the
-//!    coverage verdict and a silent collapse.
+//! | test | what it pins | fails at base? |
+//! |---|---|---|
+//! | [`nonempty_member_set_refuses_known_zero_for_an_untriaged_member`] | the audit's discriminator: `Satisfied` is NOT produced, because the snapshot's own declared roster says members exist | no — pins the census commit; the independent denominator makes it stronger but base already refused |
+//! | [`empty_member_set_still_produces_known_zero`] | the POSITIVE case: a genuinely empty, independently verified member set with an empty accumulator DOES produce `Satisfied` | no — pins the census commit; it is the guard against fixing completeness by refusing everything |
+//! | [`duplicate_outcome_identifier_is_a_typed_rejection`] | a duplicate outcome id is refused at the store boundary with `OrsError::DuplicateConflict`, a typed refusal distinguishable from both the coverage verdict and a silent collapse | YES — this is the one test that discriminates the typed-rejection change |
+//! | [`a_foreign_outcome_identifier_is_an_incomplete_coverage_verdict`] | a FOREIGN outcome id (one this archive never declared) cannot report `Satisfied`, and is refused as a verdict on a readable receipt rather than as a boundary `Err` | no for the verdict, yes for the receipt still being readable |
 //!
 //! Every fixture is a REAL temporary redb store and a REAL store-produced
 //! snapshot: the archive is exported by `RedbRecoveryStore::export_backup_snapshot`
@@ -33,6 +30,7 @@
 //! effect: `reconcile_backup_import` emits no store writes, and the export is a
 //! read path.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use eliot_ors::{
@@ -41,7 +39,7 @@ use eliot_ors::{
     MAX_BACKUP_PAGE_ENTRIES, OpaqueLabel, OperationalRecordContext, OperationalRecordInput,
     OperationalRecoveryStore, OrsBackupDestination, OrsBackupFence, OrsBackupImportRequest,
     OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, OrsError, PerEntryOutcome,
-    RedbRecoveryStore, StateFenceSnapshot,
+    RedbRecoveryStore, RowFamilyKind, StateFenceSnapshot,
 };
 use eliot_platform::SecretReference;
 use serde_json::json;
@@ -302,11 +300,47 @@ fn nonempty_member_set_refuses_known_zero_for_an_untriaged_member() -> TestResul
         "a nonempty snapshot reconciled against an EMPTY outcome accumulator must not report a known zero: {:?}",
         receipt.known_zero_verdict
     );
-    // The receipt still carries the per-member outcomes the caller needs to route
-    // reconciliation, and the independent roster it refused against.
-    assert!(receipt.expected_members.len() == expected.len());
-    assert!(receipt.per_entry.is_empty());
-    assert_eq!(receipt.unresolved_count, 0);
+    // The receipt carries the INDEPENDENT roster it refused against, and it is
+    // the SAME roster the snapshot declares — compared as a SET, because the
+    // crate's own rule at `src/backup_snapshot.rs` is explicit that a length
+    // cannot tell a subset from a superset from a different set of the same
+    // size. A length equality here would have been exactly the defect this
+    // issue repairs, restated in the test that proves the repair.
+    let receipt_roster: BTreeSet<(RowFamilyKind, String)> =
+        receipt.expected_members.iter().cloned().collect();
+    let snapshot_roster: BTreeSet<(RowFamilyKind, String)> =
+        expected.iter().cloned().collect();
+    assert_eq!(
+        receipt_roster, snapshot_roster,
+        "the receipt must carry the snapshot's own declared roster verbatim, so the refusal is \
+         attributable to untriaged members rather than to a roster the store rebuilt"
+    );
+    // The half of the repair that a verdict string cannot show: the current
+    // owner was asked about the EXPECTED roster, not about the caller's vector.
+    // Before the repair `observe_current_owner_validation` derived
+    // `validated_record_ids` by deduplicating `per_entry`, so with an empty
+    // accumulator it recorded an EMPTY asked-about roster and the gate compared
+    // two projections of one caller-supplied vector. If that regressed, the
+    // recorded validation would go empty and this assertion fails while the
+    // verdict string stayed exactly the same.
+    let consulted: BTreeSet<String> = receipt
+        .current_owner_validation
+        .validated_record_ids
+        .iter()
+        .cloned()
+        .collect();
+    let expected_ids: BTreeSet<String> = expected.iter().map(|(_, id)| id.clone()).collect();
+    assert_eq!(
+        consulted, expected_ids,
+        "the current owner must have been consulted about the snapshot's declared members, not \
+         about the caller's outcome vector; an empty consulted roster here is the pre-repair \
+         defect and would make the verdict unre-derivable"
+    );
+    assert_eq!(
+        receipt.unresolved_count, 0,
+        "a brand-new empty destination has no row to collide with, so nothing came back \
+         Unresolved — which is exactly why the zero here must NOT be read as a known zero"
+    );
     // The refusal is re-derivable from the recorded validation alone, not carried
     // forward from the verdict string.
     assert!(
@@ -358,9 +392,29 @@ fn empty_member_set_still_produces_known_zero() -> TestResult {
         "an independently verified EMPTY member set with an empty accumulator is a true zero and must be reported as one: {:?}",
         receipt.known_zero_verdict
     );
-    assert!(receipt.expected_members.is_empty());
-    assert!(receipt.per_entry.is_empty());
-    assert_eq!(receipt.unresolved_count, 0);
+    // `expected_members` and `per_entry` are two DIFFERENT obligations — what the
+    // archive DECLARED versus what the caller triaged — and the gate requires both
+    // to be empty. Each is checked against its own independently derived
+    // counterpart rather than against the `&[]` literal the test passed in: the
+    // roster against `expected` (measured empty above, from the archive) and the
+    // accumulator against the caller's own vector. Confusing the two is what a
+    // fix-by-refusing-everything would look like, and this is the case that
+    // distinguishes it.
+    assert!(
+        receipt.expected_members.is_empty(),
+        "the receipt must record an empty EXPECTED roster for a genuinely empty archive; a \
+         non-empty one here would mean the store invented members"
+    );
+    assert!(
+        receipt.per_entry.is_empty(),
+        "the receipt must carry the empty outcome vector through unchanged, so the Satisfied \
+         verdict is over an empty accumulator rather than one that was filled in"
+    );
+    assert_eq!(
+        receipt.unresolved_count, 0,
+        "nothing came back Unresolved from an empty destination, and that zero is what the \
+         Satisfied verdict is allowed to rely on ONLY because coverage was checked first"
+    );
     assert!(
         receipt
             .known_zero_unresolved(&receipt.current_owner_validation)
@@ -433,24 +487,23 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
             },
         ),
     ];
-    assert_eq!(
-        outcomes
-            .iter()
-            .filter(|(id, _)| *id == duplicated_id)
-            .count(),
-        2,
-        "the fixture must actually present a duplicate outcome id"
-    );
-
     // Rejection happens at the store boundary, BEFORE any current-owner
     // observation is recorded: the outcome vector is not a roster, so no
     // validation may be built from it and no receipt may be minted on it.
+    //
+    // The assertion is on the RESULT, not on the fixture: it states what the
+    // store does with this vector, and it is the half of the acceptance
+    // sentence the typed-rejection change introduced. At base the duplicate
+    // collapsed into a `BTreeSet`, the function returned `Ok` with a `Refused`
+    // verdict, and this assertion fails — which is why it, and not the two
+    // coverage tests, is the one that discriminates the typed-rejection change.
     assert!(
         matches!(
             destination.reconcile_backup_import(&import, &snapshot, &outcomes, NOW_MS),
             Err(OrsError::DuplicateConflict)
         ),
-        "a duplicate outcome id must be refused with a TYPED error"
+        "a duplicate outcome id must be refused with a TYPED error, before any receipt is minted; \
+         at base it collapsed into a set and returned Ok(receipt) with a Refused verdict"
     );
 
     // And it is the DUPLICATE refusal, not the coverage one. Dropping the second
@@ -477,6 +530,101 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     assert_eq!(incomplete.per_entry, subset);
     assert!(matches!(
         incomplete.known_zero_unresolved(&incomplete.current_owner_validation),
+        Err(OrsError::ReconciliationMismatch)
+    ));
+
+    cleanup(&source_path);
+    cleanup(&destination_path);
+    Ok(())
+}
+
+/// A FOREIGN outcome identifier cannot report `Satisfied`, and it is refused as
+/// a VERDICT on a receipt the caller can still read.
+///
+/// This is the fourth of the four arms in the acceptance sentence — "an empty,
+/// subset, FOREIGN or duplicated outcome roster" — and the only one of the four
+/// that had no case. It exercises `expected_member_ids`' foreign-id arm: the
+/// outcomes and the expected roster differ in the OTHER direction, so the
+/// coverage set-equality fails even though every count lines up.
+///
+/// The two halves are both load-bearing and they are different guarantees:
+///
+/// - `Satisfied` is NOT reported. A length comparison would PASS here — one
+///   outcome for one declared member — so if the check were ever weakened to a
+///   length equality this assertion fails, which is exactly the defect the
+///   crate's own `sets rather than lengths` rule at `src/backup_snapshot.rs`
+///   exists to prevent.
+/// - The refusal is a VERDICT, not a boundary `Err`. A foreign id is not a
+///   contradiction about one member (that is the duplicate's typed
+///   `DuplicateConflict`), it is a coverage question about a roster, and the
+///   caller needs `per_entry` to route it. So the call returns `Ok` with a
+///   readable receipt — the contrast with the duplicate test above, which
+///   returns `Err`.
+///
+/// One declared member is enough here and is what makes the length trap real: a
+/// foreign outcome REPLACES the declared one, so the counts match exactly.
+#[test]
+fn a_foreign_outcome_identifier_is_an_incomplete_coverage_verdict() -> TestResult {
+    let source_path = database_path("foreign-source");
+    let destination_path = database_path("foreign-destination");
+    cleanup(&source_path);
+    cleanup(&destination_path);
+    let source_store = open_bound(&source_path, SOURCE_INSTALLATION)?;
+    let destination = open_bound(&destination_path, DESTINATION_INSTALLATION)?;
+    let high_water = commit_authority(&source_store, "953-w3k2-foreign-authority")?;
+
+    let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
+
+    let expected = snapshot.expected_member_roster()?;
+    assert_eq!(
+        expected.len(),
+        1,
+        "this case needs exactly ONE declared member so a foreign outcome can replace it and \
+         leave the outcome count equal to the roster count; this one declared {expected:?}"
+    );
+    let declared_id = expected[0].1.clone();
+
+    // An id that is well-formed but that this archive never declared. Built by
+    // suffixing the declared one so it is definitely not a near-miss of some
+    // other rule, and it carries its own outcome so the vector is a plausible
+    // triage result rather than obviously malformed.
+    let foreign_id = format!("{declared_id}-foreign-953-w3k2");
+    assert!(
+        !expected.iter().any(|(_, id)| *id == foreign_id),
+        "the foreign id must not collide with a declared member"
+    );
+    let outcomes = vec![(foreign_id, PerEntryOutcome::Imported)];
+
+    // The trap this case exists for: the outcome count EQUALS the roster count.
+    // A length comparison would call this covered.
+    assert_eq!(
+        outcomes.len(),
+        expected.len(),
+        "the fixture must present the same NUMBER of outcomes as declared members, or the \
+         foreign arm is not distinguishable from the subset arm by length"
+    );
+
+    let receipt = destination.reconcile_backup_import(&import, &snapshot, &outcomes, NOW_MS)?;
+
+    assert!(
+        matches!(
+            receipt.known_zero_verdict,
+            KnownZeroVerdict::Refused { .. }
+        ),
+        "a foreign outcome id answers a question this receipt is not and must not report a \
+         known zero even though the outcome count matches the roster count: {:?}",
+        receipt.known_zero_verdict
+    );
+    // It is a VERDICT, not a boundary refusal: the caller keeps the vector that
+    // says which ids it triaged, which is what lets it route the foreign row.
+    assert_eq!(
+        receipt.per_entry, outcomes,
+        "a foreign outcome must survive on the receipt so the caller can see which id it \
+         triaged; a boundary Err here would destroy that"
+    );
+    // And the verdict is re-derivable from the recorded halves, not carried.
+    assert!(matches!(
+        receipt.known_zero_unresolved(&receipt.current_owner_validation),
         Err(OrsError::ReconciliationMismatch)
     ));
 

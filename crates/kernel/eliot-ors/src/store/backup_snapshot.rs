@@ -93,31 +93,42 @@
 //! from the list was invisible in both directions: not exported, not counted and
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
-//! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
-//! source-bound nonrestorable/forensic exclusion with the reason written next to
-//! it; 43 dispositioned families, each bound to at least one table, so none is
-//! excused from having one. A table with no disposition is refused with
-//! [`OrsError::MigrationRequired`] on all three paths that run —
-//! [`export_page`], [`export_snapshot`] and [`import_page_quarantined`] — so it
-//! cannot be silently exported, imported or counted, and no table disappears
-//! because its name was absent from an old checklist.
+//! that list with BOTH the tables redb reports for the file being read, under the
+//! same transaction as the pages, AND the tables the crate DECLARES
+//! ([`check_declared_tables_are_censused`]). The exact counts are derived, not
+//! transcribed: [`census_counts`] computes the declared total, the dispositioned
+//! total and the family-backed/excluded split from the same lists the check
+//! reads, and `backup_row_family_census_counts` exposes them so a test asserts
+//! them rather than a doc comment claiming them. Every family in
+//! [`row_family_denominator`] is bound to at least one table, so none is excused
+//! from having one; that too is asserted in a test rather than counted here. A
+//! table with no disposition is refused with [`OrsError::MigrationRequired`] on
+//! all three paths that run — [`export_page`], [`export_snapshot`] and
+//! [`import_page_quarantined`] — so it cannot be silently exported, imported or
+//! counted, and no table disappears because its name was absent from an old
+//! checklist.
 //!
-//! Be precise about what that count is. The census is a hand-maintained list of
-//! constants; it is NOT derived from the `TableDefinition::new` declarations, and
-//! nothing in the crate enforces that the two agree. So the live comparison in
-//! check 2 is a real reader that refuses a table the file has and the list does
-//! not — but it only sees a table once some write has MATERIALISED it, and two
-//! of the tables in this count (`CreatedOnFirstWrite`, like the P-06 purge-ledger
-//! pair) exist in no file until their first write. A newly declared table can
-//! therefore still be omitted from the census and stay invisible until a
-//! production write creates it, at which point the fail-closed refusal above
-//! fires. Making that impossible needs a `macro_rules!` declaration macro so a
-//! table cannot exist without a census entry; that is a separate architectural
-//! change and is deliberately not done here. Do not read "70 of 70" as a
-//! compiler-enforced invariant — it is a measurement, and a new table in
-//! `store.rs` is on its author.
+//! Be precise about what that means, because the previous version of this
+//! paragraph was the defect. The census used to compare itself only with
+//! `list_tables()`, and that answer is bounded by MATERIALISATION: a
+//! `CreatedOnFirstWrite` table — one no `initialize_ors_tables` call touches —
+//! exists in no file until its first write, so a newly declared table could be
+//! omitted and stay invisible until a production write created it, at which
+//! point the fail-closed refusal fired on somebody's live installation instead of
+//! in the author's own test run. Five tables were omitted here that way, one at a
+//! time: the two P-06 purge-ledger tables, `KERNEL_RESTART_RECONCILIATIONS`, and
+//! the runtime-lease and bridge-compacted-range tables. The census now also reads
+//! the DECLARATIONS (`store.rs::declared_ors_tables` and
+//! `restore_journal::declared_restore_journal_tables`), so an uncensused
+//! declaration is refused on a store that has never written the row.
+//!
+//! What that still does NOT do is make it impossible to write a
+//! `TableDefinition::new` outside those two functions. Closing that needs a
+//! `macro_rules!` declaration macro so the list and the declaration are one
+//! construct; that remains a separate architectural change. The difference from
+//! before is the difference between "the omission surfaces in production" and
+//! "the omission surfaces in `cargo test` on a fresh store", which is the
+//! difference between an operator's outage and an author's failing test.
 //!
 //! Issue #2883 adds the durable `backup.verify` result family to that same
 //! denominator. `RowFamilyKind::BackupVerificationResults` is one row per distinct
@@ -914,31 +925,52 @@ struct DispositionedTable {
 /// [`check_row_family_census`] is the only place a literal name appears at all —
 /// and there it comes from redb, not from this file.
 ///
-/// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
-/// row family and 29 are explicit source-bound exclusions.
-/// `row_family_denominator` carries 43 families and every one of them is now bound
-/// to a table by this census.
+/// Every physical table the ORS store declares, each with its exact disposition
+/// (issue #953, A5).
 ///
-/// That count is a MEASUREMENT, not an enforced invariant, and the difference
-/// matters. This census is a hand-maintained list of constants; nothing in the
-/// crate derives it from the `TableDefinition::new` declarations themselves, so a
-/// NEW table added to `store.rs` is not automatically censused, and it will not be
-/// caught here until some write materialises it in a file and check 2 reads its
-/// name out of `list_tables()`. The two P-06 purge-ledger tables were exactly
-/// that omission for exactly that long: declared, written by the production
-/// `backup.verify` path, and absent from this list, which refused every export of
-/// every store that had answered one verification. Closing that permanently needs
-/// a `macro_rules!` declaration macro so a table cannot exist without an entry
-/// here, which is a separate architectural change and deliberately not attempted
-/// in this issue. Until it exists, a table added to `store.rs` is on the author.
+/// The table is named by referencing `store.rs`'s own `const`, never by
+/// restating its string, so a renamed or replaced table changes its
+/// `TableDefinition` here too and the two cannot drift apart.
 ///
-/// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// The live-name comparison in [`check_row_family_census`] is the only place a
+/// literal name appears at all, and there it comes from redb rather than from
+/// this file. Membership is not a review convention: it is checked against the
+/// crate's DECLARATIONS by [`check_declared_tables_are_censused`].
+///
+/// Split into reviewable groups so no half can grow past the point where a
+/// reader stops checking it. The group sizes are NOT written down here —
+/// [`census_counts`] derives them from these very lists, so a group that grew or
+/// shrank is reported by a test rather than by a number in a sentence that would
+/// quietly go stale, which is what happened to the transcribed version of that
+/// sentence twice.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
     tables
+}
+
+/// The counts this census has, DERIVED rather than transcribed (issue #953, A5).
+///
+/// Returns `(declared, dispositioned, source_bound_exclusions)`: the number of
+/// physical tables `store.rs` and `store/restore_journal.rs` declare, the number
+/// of census entries, and how many of those are explicit exclusions rather than
+/// family-backed tables.
+///
+/// These were hand-written prose before this change and they were wrong twice —
+/// once before the restore-journal repair and once inside it, which is what a
+/// transcribed number does. This function is the mechanism that makes the
+/// correction mechanical: it counts the same lists
+/// [`check_declared_tables_are_censused`] reads, so a table added anywhere shows
+/// up as a test failure rather than as a silently stale sentence.
+pub(super) fn census_counts() -> (usize, usize, usize) {
+    let declared = super::declared_ors_tables().len()
+        + super::restore_journal::declared_restore_journal_tables().len();
+    let census = dispositioned_tables();
+    let exclusions = census
+        .iter()
+        .filter(|entry| matches!(entry.disposition, TableDisposition::Excluded { .. }))
+        .count();
+    (declared, census.len(), exclusions)
 }
 
 /// Binds one table to the row family that owns it.
@@ -969,7 +1001,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -977,7 +1009,7 @@ fn family_backed_tables() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The 22 tables backing the canonical operational and recovery row families.
+/// The tables backing the canonical operational and recovery row families.
 fn canonical_family_tables() -> Vec<DispositionedTable> {
     vec![
         family(super::ENVELOPES, RowFamilyKind::Envelopes),
@@ -1050,7 +1082,7 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 17 tables backing the supervision, replay, doctor and retention families.
+/// The tables backing the supervision, replay, doctor and retention families.
 ///
 /// A separate function from [`canonical_family_tables`] only because the whole
 /// census must stay inside one reviewable length; the split is at the
@@ -1142,7 +1174,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1152,11 +1184,12 @@ fn source_bound_exclusions() -> Vec<DispositionedTable> {
     tables.extend(projection_family_exclusions());
     tables.extend(effect_replay_family_exclusions());
     tables.extend(purge_ledger_exclusions());
+    tables.extend(runtime_lease_exclusions());
     tables
 }
 
-/// The six exclusions that are owner state: four re-established by the
-/// receiving owner, two superseded or already-committed facts.
+/// The exclusions that are owner state: re-established by the
+/// receiving owner, plus superseded or already-committed facts.
 fn owner_state_exclusions() -> Vec<DispositionedTable> {
     vec![
         // ---- Owner-re-established state, not historical evidence ------------
@@ -1227,8 +1260,8 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The seventeen exclusions that are another owner's projection: four campaign
-/// families and thirteen bridge families.
+/// The exclusions that are another owner's projection: campaign families and
+/// bridge families.
 ///
 /// `ForensicOnly` for all of them, and for the same reason the
 /// `BackupVerificationResults` sibling is: none has a durable `import_*_suspended`
@@ -1374,6 +1407,89 @@ fn projection_family_exclusions() -> Vec<DispositionedTable> {
             RowDisposition::ForensicOnly,
             "replay commitments are minted against the committing store's own evidence; a restored one names a commitment this installation never made",
         ),
+        // #953 (A5). The certified CUMULATIVE compacted boundary that replaces
+        // the per-event `BRIDGE_EVENT_POSITIONS` rows it retired, one row per
+        // owner namespace. It is the same kind of row as the position boundary
+        // above and one step stronger: a restored position retires evidence that
+        // is still exact, while a restored compacted range asserts a whole
+        // retired sequence interval under a stream incarnation, a retiring ack
+        // frontier and a certifying owner revision that the destination never
+        // issued. The bridge owner re-derives its own frontier from the live
+        // stream on the destination, and a range certified here would retire
+        // destination evidence it never compacted, and `BRIDGE_EVENT_POSITIONS`
+        // would then legitimately answer below a boundary the destination still
+        // needs. `ForensicOnly` for the same reason as every bridge row above:
+        // this crate has no `import_*_compacted_range*` path, so `Restorable`
+        // would advertise a re-import that does not exist. Materialised only by
+        // its first certification — neither `initialize_ors_tables` nor
+        // `retire_bridge_event_handoffs_checked`'s earlier stages touch it — so
+        // a store that never retired a handoff exports fine, which is exactly
+        // why the omission hid until `retire_bridge_event_handoffs_checked` ran
+        // in production (`bins/eliot-kernel/src/host_request_route.rs:8378`).
+        excluded(
+            super::BRIDGE_EVENT_COMPACTED_RANGES,
+            RowDisposition::ForensicOnly,
+            "a certified compacted range is the owner's own cumulative retirement boundary for a sequence interval and its certifying owner revision; the destination owner re-derives its frontier from its own live stream, and a restored range would retire destination evidence it never compacted",
+        ),
+    ]
+}
+
+/// The one runtime-lease table: this installation's live ownership of an
+/// activation-granted lease, which is neither re-established by a receiving
+/// owner nor a fact about a past event.
+///
+/// It is `ForensicOnly` for the reason the `EFFECT_OPERATION_LEASES` exclusion
+/// gives, and it is worth saying why the two categories were separated rather
+/// than picking the nearest one.
+///
+/// `NonrestorableHistorical` is the disposition for state the RECEIVING owner
+/// re-establishes from its own writes — `META`'s counters, the write-dedup index,
+/// the derived operation and logical-key indexes. A restored runtime lease is not
+/// in that category either: nothing in a destination re-establishes it. A
+/// destination's Kernel GRANTS its own runtime leases through
+/// `apply_control_request_inner`, so the correct destination state after a
+/// restore is no runtime-lease row at all, and there is no derivation that would
+/// recreate this one. Marking it `NonrestorableHistorical` would claim a
+/// re-establishment path that does not exist.
+///
+/// `ForensicOnly` is the disposition for a row that is genuine evidence about
+/// something this installation did and that has no `import_*_suspended` path in
+/// this crate. That is exactly this row: one durable record per
+/// `record_runtime_lease_current` call, so it is evidence that this installation
+/// granted, renewed or terminally transitioned that lease identity under that
+/// `state_fence` and authority epoch. `grep` finds no
+/// `import_runtime_lease_current*` path, so `Restorable` would advertise a
+/// quarantined re-import that does not exist.
+///
+/// What a restored row would actually MEAN is the operator-visible harm, and it
+/// is stronger than the effect-lease sibling's: the sibling's row is scoped to one
+/// effect slot, while this row carries the lease's own `state_fence` and authority
+/// epoch. `load_runtime_leases_by_state_fence` and the Kernel idle-lease census
+/// runtime leg both select by `lease.state_fence`, and
+/// `reconcile_runtime_lease_for_terminal_disposition` is the single production
+/// entry into `Reconciling`, which moves only an `Active` row through the owner
+/// `RuntimeLease::transition_to` legality. A
+/// restored `Active` row would therefore present the destination as holding an
+/// in-flight runtime lease at a fence and epoch it never established, and the
+/// retirement census would treat that phantom lease as a live obligation it must
+/// discharge.
+fn runtime_lease_exclusions() -> Vec<DispositionedTable> {
+    vec![
+        // #953 (A5). One row per runtime lease identity, written by
+        // `record_runtime_lease_current` when the Kernel grants activation and
+        // re-written on every renewal or terminal transition, so the durable row
+        // is the current revision of a live lease rather than a history. Created
+        // on first write and never touched by `initialize_ors_tables`, which is
+        // why a fresh store exported fine while any installation that had ever
+        // granted a runtime lease was refused `export_backup_snapshot`,
+        // `export_backup_page` and `import_backup_page_quarantined` with
+        // `MigrationRequired` — the production activation-grant path is
+        // `apply_control_request_inner` (`bins/eliot-kernel/src/control_plane.rs:887`).
+        excluded(
+            super::RUNTIME_LEASE_CURRENT,
+            RowDisposition::ForensicOnly,
+            "a runtime-lease current row is this installation's live ownership of an activation-granted lease under its own state fence and authority epoch; a destination Kernel grants its own leases rather than re-establishing them, so a restored row would present the destination as holding an in-flight lease at a fence and epoch it never established, and the retirement census would treat that phantom lease as a live obligation",
+        ),
     ]
 }
 
@@ -1500,6 +1616,59 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
     ]
 }
 
+/// Requires every table the CRATE DECLARES to carry a census disposition
+/// (issue #953, A5; check 6 of [`check_row_family_census`]).
+///
+/// This is the check the issue's "no table disappears because its name was
+/// absent from an old checklist" clause actually needs, and it is deliberately
+/// SEPARATE from that function and runs before it, because the check it replaces
+/// was bounded by materialisation. `read.list_tables()` answers "what does this
+/// FILE contain", so a table declared and written only on first use — every
+/// `CreatedOnFirstWrite` table in this crate — was absent from the answer on a
+/// store that had not yet taken that write. An uncensused declaration of that
+/// shape therefore passed every check in this crate's own test suite and refused
+/// `export_backup_snapshot`, `export_backup_page` and
+/// `import_backup_page_quarantined` with `MigrationRequired` on the first
+/// production installation that did write it. Five tables were omitted here one
+/// at a time for exactly that reason.
+///
+/// Deriving membership from the declarations rather than from a file is what
+/// makes the omission an author's problem instead of an operator's: the declared
+/// list is the crate's own compilation of its schema, so the refusal fires on a
+/// store that has never written the row, and therefore in the author's own test
+/// run rather than in production.
+///
+/// It reads no transaction and touches no table, so it is a pure comparison over
+/// the crate's own constants. That is also what makes it testable without a
+/// store: the test names the guarantee, not a fixture.
+fn check_declared_tables_are_censused() -> Result<(), OrsError> {
+    let census = dispositioned_tables();
+    let mut uncensused: Vec<&str> = Vec::new();
+    for table in super::declared_ors_tables() {
+        let name = table.name();
+        if !census.iter().any(|entry| entry.table.name() == name) {
+            uncensused.push(name);
+        }
+    }
+    for table in super::restore_journal::declared_restore_journal_tables() {
+        let name = table.name();
+        if !census.iter().any(|entry| entry.table.name() == name) {
+            uncensused.push(name);
+        }
+    }
+    if let Some(name) = uncensused.first() {
+        return Err(OrsError::MigrationRequired {
+            reason: format!(
+                "ORS table {name:?} is declared by the store but carries no backup row family \
+                 disposition, and {} declared table(s) in total are uncensused; a declared \
+                 table must carry a disposition whether or not a write has materialised it yet",
+                uncensused.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Refuses a backup whose row-family denominator does not cover the store the
 /// snapshot is being taken from (issue #953, A5).
 ///
@@ -1540,17 +1709,31 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 /// 5. No excluded table claims [`RowDisposition::Restorable`], which would
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
+/// 6. Every table the CRATE DECLARES is dispositioned. This is the check the
+///    issue's clause actually needed and the one that was missing: check 2 is
+///    bounded by what the FILE happens to contain, so a declared table that no
+///    write has materialised yet — a `CreatedOnFirstWrite` table, of which this
+///    crate has several — was invisible to the census until production wrote it.
+///    That is how five declarations went uncensused here one at a time, each
+///    refused only on somebody's live installation and never on a fresh store
+///    that exported cleanly. Check 6 reads [`super::declared_ors_tables`] and
+///    [`super::restore_journal::declared_restore_journal_tables`] — the
+///    declarations themselves, not a file — so the refusal fires in the author's
+///    own test run on a fresh store instead of in production.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
-/// independent of store size: it is a schema census, not a data scan. It runs
-/// once per export entrypoint and once per quarantined import, never per page.
+/// Cost is one `list_tables` plus two linear scans of bounded schema-sized
+/// vectors, all independent of store size: this is a schema census, not a data
+/// scan. It runs once per export entrypoint and once per quarantined import,
+/// never per page.
 ///
-/// What this function does NOT establish is that the census covers every table
-/// the crate declares. Check 2 is bounded by what the FILE contains, so a
-/// declared-but-uncensused table that no write has materialised yet is not seen
-/// here at all; see the module header and [`dispositioned_tables`] for why that
-/// gap is real and what would close it.
+/// What this function still does NOT establish is that [`declared_ors_tables`]
+/// itself lists every declaration. A `TableDefinition::new` written outside that
+/// function is still on its author; what changed in this issue is that a table
+/// listed there and omitted from the census is now a refusal rather than a
+/// silent gap, and the count assertions in the module header are derived rather
+/// than transcribed. See [`dispositioned_tables`] for the residual.
 fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
+    check_declared_tables_are_censused()?;
     let census = dispositioned_tables();
     let mut census_names: Vec<&str> = Vec::with_capacity(census.len());
     for entry in &census {
@@ -1585,6 +1768,9 @@ fn check_row_family_census(read: &ReadTransaction) -> Result<(), OrsError> {
             });
         }
     }
+    // Check 6 was already discharged by `check_declared_tables_are_censused`
+    // before the transaction was read, because it is the one check that must not
+    // depend on a materialised table.
     // Checks 3 and 4, against the family policy this module delegates to.
     let denominator = row_family_denominator();
     for entry in &census {
@@ -3715,15 +3901,17 @@ fn snapshot_completeness(
 /// pre-existing and unchanged in kind by this issue; the two-transaction witness
 /// that existed before behaved identically. It is recorded here because a witness
 /// described without its scope is the same defect as a witness that cannot fire.
-/// The 28 tables the census excludes with a written nonrestorable/forensic reason
-/// are consequently outside BOTH the denominator and this witness. That is the
+/// The tables the census excludes with a written nonrestorable/forensic reason
+/// (the exact count is derived by [`census_counts`], not written here) are
+/// consequently outside BOTH the denominator and this witness. That is the
 /// correct result for a table with no import path, and it is now a DECIDED
 /// exclusion rather than the old A5 gap: an earlier version of this comment
 /// described `RowFamilyKind` enumerating 41 families while roughly 20 physical
 /// tables had no disposition at all, which was true then and is no longer true.
-/// Every declared table now has a disposition, so a table can be outside the
-/// denominator only by a written decision recorded in
-/// [`dispositioned_tables`].
+/// Every declared table now has a disposition — enforced against the
+/// DECLARATIONS by [`check_declared_tables_are_censused`], not merely asserted
+/// here — so a table can be outside the denominator only by a written decision
+/// recorded in [`dispositioned_tables`].
 ///
 /// ASSUMPTION: the capture's wall-clock stamp comes from the store's own
 /// `current_unix_ms()` (a `SystemTime` read). I05-16 lists `created_at`,
@@ -4386,4 +4574,159 @@ pub(super) fn reconcile_lost_import_response(
             },
         };
     replayed
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::{
+        RowFamilyDisposition, TableDisposition, check_declared_tables_are_censused, census_counts,
+        dispositioned_tables, row_family_denominator,
+    };
+    use crate::RedbRecoveryStore;
+    use redb::TableHandle;
+
+    /// `declared_ors_tables` is private to `store`, so it is reached from here as
+    /// the parent this module already sits inside rather than by an absolute
+    /// path that a sibling module's privacy would reject.
+    use super::super::{declared_ors_tables, restore_journal::declared_restore_journal_tables};
+
+    /// Every declared table carries a disposition, checked against the
+    /// DECLARATIONS rather than against a materialised file.
+    ///
+    /// This is the assertion that would have caught all five omissions in this
+    /// crate's history, and it deliberately needs no store. The check it replaces
+    /// read `list_tables()`, whose answer is bounded by materialisation, so a
+    /// `CreatedOnFirstWrite` table was invisible until a production write
+    /// created it — which is why five tables here were each omitted exactly
+    /// once and each omission surfaced on somebody's live installation. Delete
+    /// one census entry and this fails.
+    #[test]
+    fn every_declared_table_carries_a_disposition() {
+    // `is_ok` rather than `unwrap`: the point is that the check FIRED, and
+    // `unwrap` would add a panic the crate's lints warn about.
+    assert!(
+        check_declared_tables_are_censused().is_ok(),
+        "a declared ORS table carries no backup row family disposition: {:?}",
+        check_declared_tables_are_censused().err()
+    );
+    }
+
+    /// The census is a SET over the declarations: no name appears twice, and
+    /// every census entry names a declared table.
+    ///
+    /// A doubled entry lets one physical table look dispositioned twice and hides
+    /// a genuine gap behind the duplicate, and a census entry naming a table the
+    /// store does not declare is a typo that reads as coverage. Neither is
+    /// visible in a count, so both directions are compared as sets.
+    #[test]
+    fn census_is_a_set_over_the_declared_tables() {
+        let mut declared: Vec<&str> = declared_ors_tables()
+            .iter()
+            .map(TableHandle::name)
+            .chain(declared_restore_journal_tables().iter().map(TableHandle::name))
+            .collect();
+        let census: Vec<&str> = dispositioned_tables()
+            .iter()
+            .map(|entry| entry.table.name())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            census.len(),
+            "the census must carry exactly one entry per declared table"
+        );
+        let mut census_sorted = census.clone();
+        census_sorted.sort_unstable();
+        let census_before = census_sorted.len();
+        census_sorted.dedup();
+        assert_eq!(
+            census_before,
+            census_sorted.len(),
+            "the census names a table twice: {census_sorted:?}"
+        );
+        declared.sort_unstable();
+        let declared_before = declared.len();
+        declared.dedup();
+        assert_eq!(
+            declared_before,
+            declared.len(),
+            "the declaration list names a table twice: {declared:?}"
+        );
+        for name in &census {
+            assert!(
+                declared.contains(name),
+                "census entry {name:?} names a table the store does not declare"
+            );
+        }
+    }
+
+    /// The counts are DERIVED, self-consistent, and the public surface returns the
+    /// same numbers.
+    ///
+    /// This replaces three hand-transcribed sentences in this file's own module
+    /// header, which disagreed with each other and with the code. The
+    /// `declared == dispositioned` half is the issue's "every stored row family
+    /// is included or has an explicit source-bound exclusion" as an arithmetic
+    /// identity over an INDEPENDENT set; the split being non-degenerate is what
+    /// stops the identity passing trivially with an empty census.
+    #[test]
+    fn census_counts_are_derived_and_consistent() {
+        let (declared, dispositioned, exclusions) = census_counts();
+        assert_eq!(
+            declared, dispositioned,
+            "every declared table must be dispositioned: {declared} declared, {dispositioned} \
+             dispositioned, {exclusions} exclusions"
+        );
+        assert!(
+            exclusions > 0,
+            "the census must carry explicit source-bound exclusions, not only family-backed tables"
+        );
+        assert!(
+            dispositioned > exclusions,
+            "the census must also carry family-backed tables; a census of pure exclusions would \
+             make the family binding vacuous"
+        );
+        assert_eq!(
+            RedbRecoveryStore::backup_row_family_census_counts(),
+            (declared, dispositioned, exclusions),
+            "the public counts accessor must report the same derived numbers the check reads"
+        );
+    }
+
+    /// Every declared row family is bound to a physical table, and every
+    /// family-backed census entry names a family the denominator dispositions.
+    ///
+    /// Both directions, checked as membership rather than as counts. This is what
+    /// the module header used to assert with a transcribed "43", which was wrong
+    /// twice; deriving it here means a new family without a table, or a table
+    /// bound to a family the policy does not disposition, is a test failure.
+    #[test]
+    fn every_family_is_bound_to_a_table_in_both_directions() {
+        let denominator: Vec<RowFamilyDisposition> = row_family_denominator();
+        let census = dispositioned_tables();
+        assert!(
+            !denominator.is_empty(),
+            "the denominator must disposition at least one family"
+        );
+        for disposition in &denominator {
+            assert!(
+                census.iter().any(|entry| {
+                    entry.disposition == TableDisposition::Family(disposition.kind)
+                }),
+                "row family {:?} is dispositioned as a backup row family but no ORS table is \
+                 bound to it",
+                disposition.kind
+            );
+        }
+        for entry in &census {
+            let TableDisposition::Family(kind) = entry.disposition else {
+                continue;
+            };
+            assert!(
+                denominator.iter().any(|d| d.kind == kind),
+                "table {:?} is bound to row family {kind:?}, which the backup row family \
+                 denominator does not disposition",
+                entry.table.name()
+            );
+        }
+    }
 }

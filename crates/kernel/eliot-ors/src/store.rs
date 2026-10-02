@@ -3498,6 +3498,116 @@ const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
 /// items name no operation identity and cannot use the effect-replay family.
 const KERNEL_RESTART_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_kernel_restart_reconciliations_v1");
+
+/// Every physical table THIS module declares, in one list (issue #953, A5).
+///
+/// This is the derivation the backup row-family census reads, and it exists
+/// because the census previously compared itself only with what redb reported
+/// for a FILE. That comparison is bounded by materialisation: a
+/// `CreatedOnFirstWrite` table — one no `initialize_ors_tables` call touches —
+/// exists in no file until its first write, so an uncensused declaration was
+/// invisible on a fresh store and only surfaced as a `MigrationRequired` on
+/// somebody's live installation once production had written it. Five tables
+/// were omitted that way in this crate's history, one at a time: the two P-06
+/// purge-ledger tables, `KERNEL_RESTART_RECONCILIATIONS`, `RUNTIME_LEASE_CURRENT`
+/// and `BRIDGE_EVENT_COMPACTED_RANGES`. That repeated, silent, one-at-a-time
+/// failure is the whole reason this list exists.
+///
+/// Reading it is an ENFORCED obligation rather than a review convention:
+/// `store::backup_snapshot::check_declared_tables_are_censused` iterates this
+/// function and refuses the export when a name here has no census disposition.
+/// It is a census refusal rather than a `const` assertion — this function
+/// returns a `Vec`, not a `const`, so nothing here is compiler-enforced — but
+/// it fires on every export and every quarantined import, and because it is
+/// built from the DECLARATIONS rather than from a file it fires on a fresh store
+/// too, in the author's own test run, instead of on a user's installation.
+///
+/// The entries are the constants themselves, never a re-spelled literal, so a
+/// renamed table cannot drift from this list or from its census entry. The
+/// three restore-journal tables are declared in
+/// [`restore_journal::declared_restore_journal_tables`] because they are
+/// declared in a different module; `status.rs`'s four supervision tables and its
+/// `PURGE_LEDGER_META` are read-only MIRRORS of names owned here and are
+/// deliberately not repeated, because a mirror is not a second physical table.
+fn declared_ors_tables() -> Vec<TableDefinition<&'static str, &'static str>> {
+    vec![
+        META,
+        ENVELOPES,
+        RESERVATIONS,
+        RESERVATION_ORDERS,
+        OPERATIONS,
+        WRITE_IDEMPOTENCY,
+        SCOPE_HEADS,
+        SCOPE_TERMINALS,
+        OPERATIONAL_CURRENT,
+        OPERATIONAL_HISTORY,
+        RECOVERY_INBOX,
+        RECOVERY_INBOX_HISTORY,
+        PROCESS_START_REPLAY,
+        AUTHORITY_HANDOFFS,
+        PROCESS_EVIDENCE,
+        PROCESS_STREAM_RECOVERY,
+        SUPERVISION_LEASE_STAGED,
+        SUPERVISION_LEASE_CURRENT,
+        SUPERVISION_LEASE_HISTORY,
+        SUPERVISION_LEASE_RESULTS,
+        SUPERVISION_LEASE_STAGE_RESOLUTIONS,
+        RUNTIME_LEASE_CURRENT,
+        STORE_REBIND_REPLAY,
+        STORE_FAILURE_RETENTION,
+        UNKNOWN_COMMIT_RECOVERY,
+        SCAN_DISCLOSURE_RECORDS,
+        COLD_START_READINESS_RECORDS,
+        COLD_START_READINESS_HEADS,
+        COLD_START_READINESS_BINDINGS,
+        BACKUP_VERIFICATION_RESULTS,
+        PURGE_LEDGER,
+        PURGE_LEDGER_REVISION_BINDINGS,
+        CUTOVER_OWNERSHIP,
+        CANONICAL_STORE_ROUTE_OWNERSHIP,
+        HOST_REQUESTS,
+        HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS,
+        VERSIONED_ARTIFACTS,
+        BRIDGE_EVENT_RECORDS,
+        BRIDGE_EVENT_CURSORS,
+        BRIDGE_EVENT_OWNER_MAINTENANCE_CURSORS,
+        BRIDGE_EVENT_GAPS,
+        BRIDGE_EVENT_HANDOFFS,
+        BRIDGE_EVENT_PROJECTIONS,
+        BRIDGE_STREAM_OWNERS,
+        BRIDGE_STREAM_OWNER_LIST_INDEX,
+        BRIDGE_EVENT_RECOVERY_WINDOWS,
+        BRIDGE_EVENT_RECOVERY_CUTS,
+        BRIDGE_EVENT_RECOVERY_REVISIONS,
+        BRIDGE_EVENT_POSITIONS,
+        BRIDGE_EVENT_REPLAY_COMMITMENTS,
+        BRIDGE_EVENT_COMPACTED_RANGES,
+        HOST_REQUEST_LOGICAL_KEYS,
+        CAMPAIGN_LEARNING_STATE_VIEWS,
+        CAMPAIGN_SOURCE_RECORDS,
+        CAMPAIGN_SOURCE_HEADS,
+        CAMPAIGN_SOURCE_PENDING,
+        ACTIVATION_RESULT_RETENTION,
+        ACTIVATION_LIFECYCLES,
+        NATIVE_WORKER_CLAIMS,
+        REPLAY_STREAMS,
+        REPLAY_REQUESTS,
+        REPLAY_EVENTS,
+        REPLAY_ACKS,
+        DOCTOR_ATTEMPTS,
+        DOCTOR_EFFECTS,
+        DOCTOR_BUDGETS,
+        RECOVERY_PROBLEMS,
+        GRANT_CLOSURE_LEGACY_CURRENT,
+        GRANT_CLOSURE_CURRENT,
+        GRANT_CLOSURE_SECOND_PHASE_CURRENT,
+        GRANT_GRAPH_REVISION_CURRENT,
+        EFFECT_OPERATION_LEASES,
+        KERNEL_EXECUTION_MANIFESTS,
+        EFFECT_REPLAY_RECONCILIATIONS,
+        KERNEL_RESTART_RECONCILIATIONS,
+    ]
+}
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const RECOVERY_RESERVATION_REVISION: &str = "ors_recovery_reservations_revision_v1";
 const RECOVERY_OPERATIONAL_CURRENT_REVISION: &str = "ors_recovery_operational_current_revision_v1";
@@ -5010,6 +5120,32 @@ impl RedbRecoveryStore {
     /// Exact row-family backup disposition for every ORS row family.
     pub fn backup_row_family_denominator() -> Vec<crate::backup_snapshot::RowFamilyDisposition> {
         backup_snapshot::row_family_denominator()
+    }
+
+    /// The backup row-family census's own counts, DERIVED at call time (issue
+    /// #953, A5).
+    ///
+    /// Returns `(declared, dispositioned, source_bound_exclusions)`, counting
+    /// `store.rs`'s declarations, `store/restore_journal.rs`'s declarations, and
+    /// the census entries themselves. It reads no store and opens no
+    /// transaction.
+    ///
+    /// This exists because those three numbers used to be written by hand in
+    /// this crate's doc comments, and they were wrong twice: once before the
+    /// restore-journal repair and once inside it, where the header said 75/46/29
+    /// while the code held 78/46/30. A transcribed number in a comment is not a
+    /// guarantee and cannot be made one by editing it again, so the counts are
+    /// computed from the same lists `backup_snapshot::check_declared_tables_are_censused` reads
+    /// and a test asserts them. Adding a table now shows up as a test failure
+    /// rather than as a sentence that quietly stopped being true.
+    ///
+    /// `declared == dispositioned` is the load-bearing relation: it is the
+    /// issue's "every stored row family is included or has an explicit
+    /// source-bound exclusion, no table disappears" as an arithmetic identity
+    /// over an independent set, and it holds because
+    /// `check_declared_tables_are_censused` refuses the export otherwise.
+    pub fn backup_row_family_census_counts() -> (usize, usize, usize) {
+        backup_snapshot::census_counts()
     }
 
     /// Reconciles quarantined per-entry outcomes into one import receipt.

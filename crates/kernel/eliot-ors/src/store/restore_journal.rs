@@ -59,6 +59,25 @@ pub(super) const RESTORE_JOURNAL_RESULTS: TableDefinition<'static, &'static str,
 /// Dedicated journal meta table: schema, bindings, fences and unique indexes.
 pub(super) const RESTORE_JOURNAL_META: TableDefinition<'static, &'static str, &'static str> =
     TableDefinition::new("ors_restore_journal_meta_v1");
+/// Every physical table THIS module declares, in one list (issue #953, A5).
+///
+/// The restore-journal tables are declared here rather than in `store.rs`, so
+/// the backup row-family census reads this list beside
+/// [`super::declared_ors_tables`] instead of a name restated at the call site.
+/// See that function for why the census derives its completeness check from the
+/// declarations rather than from what a file happens to contain: all three of
+/// these are created by `initialize_restore_journal_schema`, so a
+/// materialisation-bounded check would have covered them by luck, while a table
+/// declared here and left out of the census would refuse every export of every
+/// store that had ever run a restore.
+pub(super) fn declared_restore_journal_tables()
+-> Vec<TableDefinition<'static, &'static str, &'static str>> {
+    vec![
+        RESTORE_JOURNAL_INTENTS,
+        RESTORE_JOURNAL_RESULTS,
+        RESTORE_JOURNAL_META,
+    ]
+}
 /// Schema marker row inside the meta table.
 const RESTORE_JOURNAL_SCHEMA_ROW: &str = "schema";
 /// Ceiling on a persisted table name, marker, or tombstone key, checked BEFORE
