@@ -767,7 +767,9 @@ mod rollback_contour_tests {
             tracing::subscriber::with_default(subscriber, body);
             sink.bytes
                 .lock()
-                .expect("capture is poisoned only by a panicking writer")
+                .unwrap_or_else(|error| {
+                    panic!("capture is poisoned only by a panicking writer: {error:?}")
+                })
                 .clone()
         };
         String::from_utf8_lossy(&bytes).into_owned()

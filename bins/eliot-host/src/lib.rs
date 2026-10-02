@@ -2803,10 +2803,8 @@ mod host_lifecycle_boundary_table_tests {
         let refused = capture_records(|| {
             super::host_lifecycle_observe_drain(super::BOUNDARY_STOP_REQUESTED);
             let _guard = super::HostTerminalGuard::armed(super::BOUNDARY_STOP_TERMINAL);
-            let outcome: Result<(), super::HostError> = (|| {
-                super::host_lifecycle_observe_drain(super::BOUNDARY_DRAIN_REQUESTED);
-                nested_stop_phase()
-            })();
+            super::host_lifecycle_observe_drain(super::BOUNDARY_DRAIN_REQUESTED);
+            let outcome: Result<(), super::HostError> = nested_stop_phase();
             assert!(
                 matches!(outcome, Err(super::HostError::Stopped)),
                 "an already-stopped Host must refuse the stop with the typed error"
@@ -15314,7 +15312,7 @@ impl HostComposition {
     /// revalidation (I1.5 requires a pre-linearization observable-use trigger to
     /// return the same generation to `ACTIVE` after readiness revalidation, and
     /// that revalidation is this exact authenticated proof - never the
-    /// cancellation itself). Every other state (Starting, DegradedRecovery,
+    /// cancellation itself). Every other state (Starting, `DegradedRecovery`,
     /// missing, unreadable, committed, or still `Draining` behind a live drain)
     /// remains a visible recovery boundary.
     ///
