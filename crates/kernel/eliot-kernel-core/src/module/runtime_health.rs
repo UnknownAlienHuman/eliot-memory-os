@@ -6,8 +6,12 @@
 //! module validates the projection and never derives authority from `status`.
 //!
 //! "Authenticated" here refers to the session that carried the carrier, not to
-//! the normative-pair seal inside it: the seal is a published recomputation over
-//! two peer-supplied values and no issuer stands behind it. See
+//! the normative-pair seal inside it: the seal is a published, unkeyed
+//! recomputation whose operands travel in the carrier, and no issuer stands
+//! behind it. Because [`KernelRuntimeHealthEvidence::validate`] pins one of those
+//! operands to a receiver-held constant, the re-derivation there is a real
+//! constraint on the carrier's tag rather than a restatement of it — it is still
+//! not evidence of who the producer is. See
 //! `super::compatibility_handshake::expected_seal_tag`.
 
 use std::collections::BTreeSet;
@@ -127,14 +131,22 @@ impl KernelRuntimeHealthEvidence {
     /// Revalidates a deserialized carrier at a consumer boundary.
     ///
     /// The normative-pair seal is re-derived here from the carrier's own
-    /// architecture digest and its own tag, so both operands come from the same
-    /// producer-supplied message and the re-derivation adds no assurance beyond
-    /// the carrier's internal consistency. What does carry assurance is the
-    /// separate comparison below against the receiver-held
-    /// [`CURRENT_ARCHITECTURE_SOURCE_DIGEST`], [`CURRENT_NORMATIVE_PAIR_KEY`]
-    /// and [`CURRENT_IMPLEMENTATION_SOURCE_DIGEST`], which the producer cannot
-    /// choose. The seal re-derivation is retained so a corrupted carrier is
-    /// still refused, not because it is a second independent gate.
+    /// architecture digest and its own tag. Both fields travel in the producer's
+    /// message, so the re-derivation on its own establishes only that the
+    /// message is internally consistent; it cannot say who the producer is.
+    ///
+    /// It is not redundant in this function, and a former comment here calling
+    /// it redundant would have licensed deleting a live check. The comparison
+    /// further down against [`CURRENT_ARCHITECTURE_SOURCE_DIGEST`],
+    /// [`CURRENT_NORMATIVE_PAIR_KEY`] and
+    /// [`CURRENT_IMPLEMENTATION_SOURCE_DIGEST`] FORCES this carrier's
+    /// architecture digest to a value the producer cannot choose, so the producer
+    /// cannot choose the input to the re-derivation either. That makes the
+    /// re-derivation the SOLE check on `seal_tag` in this whole function: a
+    /// carrier with the correct Architecture digest, the correct pair key and the
+    /// correct implementation digest, but `seal_tag = "c"*64`, is refused here
+    /// and nowhere else. It is kept for exactly that reason, and it is strictly
+    /// load-bearing rather than a second independent gate.
     pub fn validate(&self) -> KernelResult<()> {
         if self.status != "OPEN" {
             return Err(KernelError::InvalidField {
@@ -152,9 +164,12 @@ impl KernelRuntimeHealthEvidence {
                 reason: "contains an unsupported or zero version",
             });
         }
-        // The seal re-derivation below reads two producer-supplied operands, so
-        // it checks this carrier's internal consistency only. The receiver-held
-        // constants compared further down are what a producer cannot choose.
+        // The seal re-derivation below reads the carrier's own tag and the
+        // carrier's own architecture digest, so it looks like a pair the producer
+        // chose on both sides. It is not symmetric with the constant comparison
+        // further down: that comparison forces this digest to the receiver's
+        // CURRENT_ARCHITECTURE_SOURCE_DIGEST, which makes the re-derivation the
+        // only check in this function on the tag itself.
         if !is_lower_sha256(compatibility.contract_set_digest())
             || !is_lower_sha256(compatibility.architecture_source_digest())
             || !is_lower_sha256(compatibility.seal_tag())

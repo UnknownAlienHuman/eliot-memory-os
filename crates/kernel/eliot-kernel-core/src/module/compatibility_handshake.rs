@@ -18,15 +18,38 @@
 //! [`expected_seal_tag`] for the precise statement; two properties are worth
 //! repeating here:
 //!
-//! - The seal check is strictly redundant with the Architecture-digest check
-//!   against durable state. Every seal verification in this crate compares two
-//!   peer-supplied operands ([`NormativePairReceipt::verifies`]) or recomputes
-//!   from a recorded peer value ([`admit_rollback`],
-//!   `KernelRuntimeHealthEvidence::validate`), so a peer presenting a
-//!   self-consistent pair passes both. The seal therefore contributes no
-//!   assurance the digest check does not already contribute. It is retained
-//!   because redundancy that a threat model can retire is not this module's to
-//!   remove.
+//! - The seal check adds no assurance about the PEER'S IDENTITY beyond the
+//!   Architecture-digest check against durable state, because its operands are
+//!   peer-supplied and it can therefore only agree or disagree with the peer
+//!   about the peer. That is the accurate reason a tag is forgeable in principle.
+//!   It is NOT accurate, and must not be read, that the check is redundant or
+//!   dead. It is the only constraint on a presented `seal_tag`, and there is at
+//!   least one call site where it is the SOLE check on that field. It is retained
+//!   on that basis; it is not retained "pending a threat model", and this module
+//!   does not document it as removable.
+//!
+//! - In [`admit_handshake`] it is the only constraint on the presented
+//!   `seal_tag`. With `durable.architecture_source_digest = D` and a candidate
+//!   whose `architecture_source_digest` is also `D` and whose receipt is
+//!   `NormativePairReceipt::new(D, "c"*64)` — which `new` accepts, because it
+//!   requires only lowercase hex — the Architecture-digest check passes and the
+//!   seal check is what refuses the peer, with [`MismatchField::NormativeSeal`].
+//!   Nothing else in this crate reads the presented tag. Deleting the seal check
+//!   admits that envelope.
+//!
+//! - In [`admit_rollback`] the same holds for a durable row. An ORS row whose
+//!   `architecture_source_digest` equals durable and whose `seal_tag` is
+//!   `"c"*64` passes the digest comparison and is refused at the seal check
+//!   alone. That is the whole reason the check is still here.
+//!
+//! - In `KernelRuntimeHealthEvidence::validate` the receiver-held constant
+//!   comparison FORCES the carrier's `architecture_source_digest` to the
+//!   receiver's own `CURRENT_ARCHITECTURE_SOURCE_DIGEST`, so the producer cannot
+//!   choose the re-derivation input. The re-derivation is therefore the sole
+//!   check on `seal_tag` in that entire function: a carrier with the correct
+//!   Architecture digest, the correct pair key and the correct implementation
+//!   digest but `seal_tag = "c"*64` is refused there and nowhere else. In this
+//!   crate the check is strictly load-bearing, not redundant.
 //! - What is genuinely independent of peer-supplied values is
 //!   `Session::establish_with_server` in `eliot-ipc`, which compares the peer's
 //!   `artifact_hash` and `module_generation` against
@@ -46,12 +69,23 @@ use crate::error::{KernelError, validate_id};
 /// Versioned envelope wire revision for the I1.12 handshake.
 pub const HANDSHAKE_ENVELOPE_VERSION: u32 = 1;
 
-/// Seal domain from the accepted external normative-pair receipt
-/// (`docs/normative-pair.toml`, `pair_key_algorithm =
-/// "sha256-domain-separated-v1"`).
+/// The domain tag this crate separates the normative-pair tag with.
 ///
-/// The value is published here, so it separates the digest from other uses of
-/// SHA-256 but is not secret and confers no secrecy on anything.
+/// The literal is named in the prose of the accepted receipt's `pair_key_input`
+/// (`docs/normative-pair.toml`: "UTF-8 domain tag eliot-normative-pair-v1 and
+/// lowercase document digests separated and terminated by NUL bytes"), and this
+/// constant is the executable definition the algorithm below uses. Stated
+/// precisely, because the previous wording here claimed the value came "from the
+/// accepted external normative-pair receipt" while the next paragraph said the
+/// value is published here: the receipt DOCUMENTS the domain tag in prose, and
+/// this constant DEFINES it for this crate. The receipt does not issue it,
+/// attest to it, or supply it to a peer, and no external seal issuer exists in
+/// this repository. The same literal also appears in
+/// `crates/foundation/eliot-bootstrap/src/normative.rs`, which is a separate
+/// owner of the same value outside this crate; that is not an issuer either.
+///
+/// Because the value is published in source, the domain separates the tag from
+/// other uses of SHA-256 but is not secret and confers no secrecy on anything.
 pub const NORMATIVE_SEAL_DOMAIN: &str = "eliot-normative-pair-v1";
 
 /// Computes the pair tag expected for an Architecture digest.
@@ -86,11 +120,19 @@ pub const NORMATIVE_SEAL_DOMAIN: &str = "eliot-normative-pair-v1";
 /// > constant. Precise statement: **the seal is not a forged-secret bypass; it is
 /// > the absence of any issuer.**
 ///
-/// Minting is not an admission bypass precisely because the Architecture-digest
-/// check against durable state runs first and holds a value the receiver did not
-/// take from the peer. Given that, the seal check in [`admit_handshake`] is
-/// strictly redundant with it and is kept anyway: redundancy that a later change
-/// with a full threat model can retire is not this module's to remove.
+/// Minting is not an admission bypass because the Architecture-digest check
+/// against durable state runs first and holds a value the receiver did not take
+/// from the peer. Given that, the seal check in [`admit_handshake`] adds no
+/// assurance about the peer's identity that the digest check does not already
+/// establish, because both of its operands are peer-supplied. It is not, however,
+/// redundant in the sense of removable, and it must not be described that way:
+/// it is the ONLY constraint on the presented `seal_tag`. With durable
+/// `architecture_source_digest = D` and a candidate whose digest is also `D` and
+/// whose receipt is `NormativePairReceipt::new(D, "c"*64)`, the digest check
+/// passes and this seal is the only thing that refuses the envelope, with
+/// [`MismatchField::NormativeSeal`]. That is why it is kept. A former comment
+/// here called it "strictly redundant with it", which would have licensed
+/// deleting a live check.
 #[must_use]
 pub fn expected_seal_tag(architecture_source_digest: &str) -> String {
     sha256_hex(
@@ -353,7 +395,14 @@ impl NormativePairReceipt {
         })
     }
 
-    /// Returns the Architecture source digest this receipt is sealed against.
+    /// Returns the Architecture source digest this receipt carries.
+    ///
+    /// The value is the peer-supplied field itself. It is what this receipt is
+    /// *presented* as sealing, not a digest this receipt independently sealed:
+    /// nothing was sealed against it here, and nothing consulted a receiver-held
+    /// truth to produce or check it. The digest that can be checked against
+    /// receiver-held state is [`DurableCompatibilityState::architecture_source_digest`],
+    /// and it is compared separately.
     #[must_use]
     pub fn architecture_source_digest(&self) -> &str {
         &self.architecture_source_digest
@@ -372,11 +421,18 @@ impl NormativePairReceipt {
     /// Returns `true` when the presented tag equals
     /// [`expected_seal_tag`] of the presented digest.
     ///
-    /// Both operands are peer-supplied: nothing the receiver holds is consulted,
-    /// so this is a self-consistency check between two fields of one peer message
-    /// and not a check against receiver-held truth. It is strictly redundant with
-    /// the Architecture-digest comparison [`admit_handshake`] performs against
-    /// durable state, which is the check that can actually refuse a peer.
+    /// Both operands are peer-supplied: nothing the receiver holds is consulted, so
+    /// this is a self-consistency check between two fields of one peer message
+    /// and not a check against receiver-held truth. It therefore adds no
+    /// assurance about the peer's identity beyond the Architecture-digest
+    /// comparison [`admit_handshake`] performs against durable state. That is the
+    /// accurate limit of what this predicate establishes.
+    ///
+    /// It is NOT redundant, and a former comment here saying it was would have
+    /// licensed deleting a live check. This is the only constraint on a presented
+    /// `seal_tag` anywhere in the crate: a candidate whose Architecture digest
+    /// equals durable but whose tag is arbitrary passes the digest comparison and
+    /// is refused at [`MismatchField::NormativeSeal`] here and nowhere else.
     #[must_use]
     pub fn verifies(&self) -> bool {
         self.seal_tag == expected_seal_tag(&self.architecture_source_digest)
@@ -497,7 +553,12 @@ impl CompatibilityEnvelope {
         &self.architecture_source_digest
     }
 
-    /// Returns the sealed normative-pair receipt.
+    /// Returns the presented normative-pair receipt, exactly as the peer supplied it.
+    ///
+    /// The field carries no issuer behind it: it is a receipt as presented, and a
+    /// caller that reads its tag as an issued seal is reading the peer's own
+    /// claim. Whether the tag is self-consistent is
+    /// [`NormativePairReceipt::verifies`]'s question, answered separately.
     #[must_use]
     pub const fn normative_receipt(&self) -> &NormativePairReceipt {
         &self.normative_receipt
@@ -717,12 +778,23 @@ impl AcceptedCompatibilityEvidence {
 /// be the recomputed tag of the presented Architecture source digest before the
 /// peer is accepted.
 ///
-/// The Architecture-digest comparison against `durable` is the check that can
-/// refuse a peer, because `durable` is state the receiver did not take from the
-/// peer. The seal comparison that follows it reads only peer-supplied operands
-/// ([`NormativePairReceipt::verifies`]) and is therefore strictly redundant
-/// with the digest comparison just made; it is retained, not relied upon. See
-/// [`expected_seal_tag`] for the precise statement.
+/// The Architecture-digest comparison against `durable` is the check that
+/// establishes the peer's identity, because `durable` is state the receiver did
+/// not take from the peer. The seal comparison that follows it reads only
+/// peer-supplied operands ([`NormativePairReceipt::verifies`]), so it adds no
+/// assurance about identity beyond the digest comparison just made — which is
+/// what makes a presented tag forgeable in principle.
+///
+/// It is not redundant in the removable sense, and the previous wording here,
+/// which called it "strictly redundant", was false in this function. This check
+/// is the ONLY constraint on the presented `seal_tag`. With
+/// `durable.architecture_source_digest = D` and a candidate whose
+/// `architecture_source_digest` is also `D` and whose receipt is
+/// `NormativePairReceipt::new(D, "c"*64)` — which `new` accepts, because it
+/// requires only lowercase hex — the digest comparison passes and this check
+/// refuses the peer with [`MismatchField::NormativeSeal`]. Deleting it would
+/// admit that envelope. See [`expected_seal_tag`] for the precise statement on
+/// what the seal can and cannot prove.
 pub fn admit_handshake(
     candidate: &CompatibilityEnvelope,
     durable: &DurableCompatibilityState,
@@ -1044,16 +1116,20 @@ fn recorded_migration_class(value: &str) -> Result<StateMigrationClass, Compatib
 ///
 /// A previously launched artifact is not "last known good" on its own: its
 /// recorded protocol and canonical format versions must lie inside the
-/// current durable ranges, its digests and migration class must match, and its
-/// epoch lineage must be the durable lineage. Any drift is refused with the
-/// exact mismatching field.
+/// current durable ranges, its digests, its seal and its migration class must
+/// match, and its epoch lineage must be the durable lineage. Any drift is
+/// refused with the exact mismatching field.
 ///
 /// The recorded tag is re-derived here exactly as [`NormativePairReceipt::verifies`]
 /// derives it: from the recorded digest, which came from the peer at admission
 /// time. It is a consistency check on the stored record, not an independent
-/// attestation, and it is redundant with the recorded-architecture-digest
-/// comparison above it. It is retained so a corrupted or rewritten ORS row is
-/// still refused.
+/// attestation, and it adds no assurance beyond the recorded-architecture-digest
+/// comparison above it. It is NOT removable on that basis, and it is not dead:
+/// it is the only constraint on the recorded tag. An ORS row whose
+/// `architecture_source_digest` equals durable and whose `seal_tag` is `"c"*64`
+/// passes the digest comparison and is refused at
+/// [`MismatchField::NormativeSeal`] by this check alone. That is exactly why it
+/// is retained: so a corrupted or rewritten ORS row is still refused.
 pub fn admit_rollback(
     evidence: &AcceptedCompatibilityEvidence,
     durable: &DurableCompatibilityState,
