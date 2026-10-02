@@ -34,20 +34,33 @@ fn test_binding() -> Result<AuthorityBinding, Box<dyn Error>> {
     })
 }
 
+/// Builds one canonical delegation edge.
+///
+/// `operations` is an explicit parameter because the narrowing validator
+/// requires a child's authority to be a STRICT subset of its parent's: a
+/// child that repeats its parent's operations is refused, and
+/// `GrantGraph::from_grants` rejects the whole graph before any assertion
+/// runs. Each chain level therefore drops one trailing operation.
+///
+/// The issuer is the principal that holds the grant, which is what the
+/// narrowing clauses require of a delegation edge: a child's issuer must be
+/// its parent's holder, so one held-by-`holder-1` chain is issued by the
+/// holder it narrows for.
 fn grant(
     id: &str,
     parent: Option<&str>,
     root: &str,
     binding: AuthorityBinding,
+    operations: &[&str],
 ) -> Result<CapabilityGrant, Box<dyn Error>> {
     Ok(CapabilityGrant {
         grant_id: GrantId::new(id)?,
         parent_grant_id: parent.map(GrantId::new).transpose()?,
         authority_root_ref: root.to_owned(),
-        issuer: PrincipalRef::new("governor")?,
+        issuer: PrincipalRef::new("holder-1")?,
         holder: PrincipalRef::new("holder-1")?,
         authority: AuthoritySet::new(
-            ["op.read".to_owned()],
+            operations.iter().map(|operation| (*operation).to_owned()),
             ["res:1".to_owned()],
             EffectClass::Read,
         )?,
@@ -64,26 +77,35 @@ fn chain_graph() -> Result<GrantGraph, Box<dyn Error>> {
     let binding = test_binding()?;
     GrantGraph::from_grants(
         [
-            grant("grant-origin", None, "root-test", binding.clone())?,
+            grant(
+                "grant-origin",
+                None,
+                "root-test",
+                binding.clone(),
+                &["op.read", "op.write", "op.admin", "op.audit"],
+            )?,
             grant(
                 "grant-mid",
                 Some("grant-origin"),
                 "root-test",
                 binding.clone(),
+                &["op.read", "op.write", "op.admin"],
             )?,
             grant(
                 "grant-leaf",
                 Some("grant-mid"),
                 "root-test",
                 binding.clone(),
+                &["op.read", "op.write"],
             )?,
             grant(
                 "grant-tip",
                 Some("grant-leaf"),
                 "root-test",
                 binding.clone(),
+                &["op.read"],
             )?,
-            grant("grant-other", None, "root-other", binding)?,
+            grant("grant-other", None, "root-other", binding, &["op.read"])?,
         ],
         7,
     )
