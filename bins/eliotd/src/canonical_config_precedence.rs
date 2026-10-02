@@ -28,6 +28,7 @@
 //! launch file, so an effective configuration that cannot be resolved refuses
 //! the load and the generation never becomes ready.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -147,6 +148,8 @@ pub struct ResolvedContribution {
     pub narrowed: bool,
     /// True when this layer expanded under a higher-layer delegation.
     pub delegated_expansion: bool,
+    /// Accepted ceiling this layer delegated to lower layers, if any.
+    pub delegation_ceiling: Option<u64>,
 }
 
 /// The resolved setting chain: winning value plus every contributing layer
@@ -236,9 +239,9 @@ pub enum PrecedenceError {
 /// can explicitly delegate an interval up to its `delegation_ceiling` only
 /// within the ceiling it inherited from higher layers; a full inherited
 /// ceiling is valid explicit delegation and is not a special strict-
-/// sub-envelope policy. Abstaining layers (`None`) contribute no value but
-/// may explicitly delegate within their inherited authority; an invalid
-/// over-ceiling claim mints nothing.
+/// sub-envelope policy. An abstaining layer (`None`) with an accepted
+/// delegation contributes an inspection record carrying the unchanged running
+/// value; an invalid over-ceiling claim mints nothing and contributes no grant.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
@@ -271,6 +274,11 @@ pub fn resolve_canonical_chain(
         applied_value: seed,
         narrowed: false,
         delegated_expansion: false,
+        delegation_ceiling: inputs
+            .iter()
+            .find(|input| input.layer == ConfigLayer::CompiledDefaults)
+            .and_then(|input| input.delegation_ceiling)
+            .filter(|ceiling| *ceiling <= seed),
     }];
     // Effective authority available to the next lower layer. A delegation
     // replaces this ceiling only when it is within the ceiling inherited from
@@ -296,6 +304,14 @@ pub fn resolve_canonical_chain(
         let Some(requested) = input.limit else {
             if let Some(ceiling) = delegation {
                 lower_expansion_ceiling = ceiling;
+                contributions.push(ResolvedContribution {
+                    order: layer.order(),
+                    layer: layer.name(),
+                    applied_value: running,
+                    narrowed: false,
+                    delegated_expansion: false,
+                    delegation_ceiling: Some(ceiling),
+                });
             }
             continue;
         };
@@ -306,6 +322,7 @@ pub fn resolve_canonical_chain(
                 applied_value: requested,
                 narrowed: requested < running,
                 delegated_expansion: false,
+                delegation_ceiling: delegation,
             });
             running = requested;
         } else if requested <= lower_expansion_ceiling {
@@ -315,6 +332,7 @@ pub fn resolve_canonical_chain(
                 applied_value: requested,
                 narrowed: false,
                 delegated_expansion: true,
+                delegation_ceiling: delegation,
             });
             running = requested;
         } else {
@@ -339,7 +357,7 @@ pub fn resolve_canonical_chain(
 }
 
 /// Typed layer document shared by the JSON and TOML decoders.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalLayerDocument {
     layer: String,
@@ -354,7 +372,7 @@ impl CanonicalLayerDocument {
             return Err(PrecedenceError::InvalidKey(self.key));
         }
         Ok(LayerInput {
-            layer: ConfigLayer::from_name(self.layer.trim())?,
+            layer: ConfigLayer::from_name(&self.layer)?,
             limit: self.limit,
             delegation_ceiling: self.delegation_ceiling,
         })
@@ -537,40 +555,21 @@ pub fn parse_canonical_layer_toml(text: &str) -> Result<LayerInput, PrecedenceEr
 
 /// Published JSON Schema for the canonical layer document.
 ///
-/// This is the generated schema for the supported TOML/JSON layer files:
-/// `layer` is the seven-name enum, `key` is the proven setting chain,
-/// `limit`/`delegation_ceiling` are optional non-negative integers, and
-/// unknown properties are forbidden.
+/// The schema is generated from [`CanonicalLayerDocument`]. The layer enum and
+/// setting key constraint are then narrowed to the canonical values enforced
+/// by [`ConfigLayer::name`] and [`CANONICAL_SETTING_KEY`].
 #[must_use]
 pub fn canonical_layer_json_schema() -> serde_json::Value {
-    serde_json::json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://eliot.local/schemas/canonical-layer/v1",
-        "title": "CanonicalLayerDocument",
-        "type": "object",
-        "required": ["layer", "key"],
-        "additionalProperties": false,
-        "properties": {
-            "layer": {
-                "type": "string",
-                "enum": [
-                    "compiled_defaults",
-                    "installation_config",
-                    "system_owner_policy",
-                    "workscope_profile",
-                    "task_policy",
-                    "session_capability_token",
-                    "exact_human_approval"
-                ]
-            },
-            "key": {
-                "type": "string",
-                "const": CANONICAL_SETTING_KEY
-            },
-            "limit": { "type": "integer", "minimum": 0 },
-            "delegation_ceiling": { "type": "integer", "minimum": 0 }
-        }
-    })
+    let mut schema = schemars::schema_for!(CanonicalLayerDocument).to_value();
+    schema["properties"]["layer"]["enum"] = serde_json::json!(
+        ALL_LAYERS
+            .iter()
+            .map(|layer| layer.name())
+            .collect::<Vec<_>>()
+    );
+    schema["properties"]["key"]["const"] = serde_json::json!(CANONICAL_SETTING_KEY);
+    schema["$id"] = serde_json::json!("https://eliot.local/schemas/canonical-layer/v1");
+    schema
 }
 
 /// Pretty-printed rendering of [`canonical_layer_json_schema`] for publishing.
@@ -663,9 +662,9 @@ pub fn resolve_effective_configuration(
 )]
 mod tests {
     use super::{
-        CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PolicyDocument, PrecedenceError,
-        canonical_layer_json_schema, parse_canonical_layer_json, parse_canonical_layer_toml,
-        resolve_canonical_chain, resolve_effective_configuration,
+        ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PolicyDocument,
+        PrecedenceError, canonical_layer_json_schema, parse_canonical_layer_json,
+        parse_canonical_layer_toml, resolve_canonical_chain, resolve_effective_configuration,
     };
 
     fn narrowing_chain() -> Vec<LayerInput> {
@@ -723,6 +722,58 @@ mod tests {
         let mut sorted = orders.clone();
         sorted.sort_unstable();
         assert_eq!(orders, sorted, "contributions must be in canonical order");
+    }
+
+    #[test]
+    fn accepted_delegation_only_layers_are_visible_in_canonical_order() {
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(64),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: Some(32),
+                delegation_ceiling: Some(64),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: None,
+                delegation_ceiling: Some(64),
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(50),
+                delegation_ceiling: None,
+            },
+        ];
+        let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect("task expansion within delegated ceiling must resolve");
+
+        assert_eq!(chain.winning_value(), 50);
+        assert_eq!(
+            chain
+                .contributions()
+                .iter()
+                .map(|item| item.layer)
+                .collect::<Vec<_>>(),
+            vec![
+                ConfigLayer::CompiledDefaults.name(),
+                ConfigLayer::InstallationConfig.name(),
+                ConfigLayer::SystemOwnerPolicy.name(),
+                ConfigLayer::TaskPolicy.name(),
+            ]
+        );
+        let owner = chain.contributions()[2];
+        assert_eq!(owner.applied_value, 32);
+        assert_eq!(owner.delegation_ceiling, Some(64));
+        assert!(!owner.narrowed);
+        assert!(!owner.delegated_expansion);
+        let task = chain.contributions()[3];
+        assert_eq!(task.applied_value, 50);
+        assert!(task.delegated_expansion);
+        assert_eq!(task.delegation_ceiling, None);
     }
 
     #[test]
@@ -1192,6 +1243,24 @@ mod tests {
     }
 
     #[test]
+    fn layer_names_must_match_the_canonical_identity_exactly() {
+        let json = br#"{"layer":" task_policy ","key":"task.budget.per_job","limit":40}"#;
+        assert!(matches!(
+            parse_canonical_layer_json(json),
+            Err(PrecedenceError::UnknownLayer(layer)) if layer == " task_policy "
+        ));
+
+        let toml = r#"layer = " task_policy "
+key = "task.budget.per_job"
+limit = 40
+"#;
+        assert!(matches!(
+            parse_canonical_layer_toml(toml),
+            Err(PrecedenceError::UnknownLayer(layer)) if layer == " task_policy "
+        ));
+    }
+
+    #[test]
     fn script_and_untyped_input_rejected_with_schema_error() {
         let script = b"#!/bin/sh\nexport LIMIT=999\n";
         let error = parse_canonical_layer_json(script).expect_err("script must be refused");
@@ -1220,11 +1289,47 @@ mod tests {
             serde_json::json!(false),
             "schema must forbid unknown properties"
         );
+        assert_eq!(
+            schema["$id"],
+            serde_json::json!("https://eliot.local/schemas/canonical-layer/v1")
+        );
         assert!(
             schema["properties"]["layer"]["enum"]
                 .as_array()
-                .is_some_and(|names| names.len() == 7),
+                .is_some_and(|names| {
+                    names
+                        == &ALL_LAYERS
+                            .iter()
+                            .map(|layer| serde_json::json!(layer.name()))
+                            .collect::<Vec<_>>()
+                }),
             "schema must enumerate all seven layers"
         );
+        assert_eq!(
+            schema["properties"]["key"]["const"],
+            serde_json::json!(CANONICAL_SETTING_KEY),
+            "schema must constrain the key to the supported setting"
+        );
+        assert!(schema_accepts_null(&schema["properties"]["limit"]));
+        assert!(schema_accepts_null(
+            &schema["properties"]["delegation_ceiling"]
+        ));
+        let null_optionals = br#"{"layer":"task_policy","key":"task.budget.per_job","limit":null,"delegation_ceiling":null}"#;
+        let parsed = parse_canonical_layer_json(null_optionals)
+            .expect("JSON null retains the Option<u64> wire meaning");
+        assert_eq!(parsed.limit, None);
+        assert_eq!(parsed.delegation_ceiling, None);
+    }
+
+    fn schema_accepts_null(schema: &serde_json::Value) -> bool {
+        schema["type"] == "null"
+            || schema["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+            || ["anyOf", "oneOf"]
+                .iter()
+                .filter_map(|key| schema[*key].as_array())
+                .flatten()
+                .any(schema_accepts_null)
     }
 }

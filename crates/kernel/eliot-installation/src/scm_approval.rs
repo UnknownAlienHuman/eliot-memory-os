@@ -5,7 +5,7 @@ use std::path::Path;
 use eliot_contracts::sha256_hex;
 use eliot_platform_windows::{
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
-    ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+    ELIOT_HOST_SERVICE_NAME, ELIOT_HOST_SERVICE_SID, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME, SERVICE_EXPECTED_GROUP_SID,
     SERVICE_EXPECTED_OWNER_SID, ServiceAccount, ServiceBootstrapArguments,
     ServiceControlGrantReadback, ServiceRegistrationRequest, ServiceStartMode,
@@ -29,7 +29,7 @@ use super::{
 pub struct InstallerServiceControlGrantReceipt {
     /// Canonical service name whose deterministic SID receives the grant.
     pub(super) principal_service: PlatformHandle,
-    /// Exact OS-resolved `S-1-5-80-...` service SID.
+    /// Exact canonical Host service SID read back from SCM.
     pub(super) principal_sid: PlatformHandle,
     /// Concrete minimal service-object rights mask.
     pub(super) access_mask: u32,
@@ -170,20 +170,8 @@ impl InstallerServiceControlGrantReceipt {
             &self.security_descriptor_digest,
             "service_control_grant.security_descriptor_digest",
         )?;
-        let sid_tail = self
-            .principal_sid
-            .as_str()
-            .strip_prefix("S-1-5-80-")
-            .map(|tail| tail.split('-').collect::<Vec<_>>());
         if self.principal_service.as_str() != ELIOT_HOST_SERVICE_NAME
-            || sid_tail.as_ref().is_none_or(|parts| {
-                parts.len() != 5
-                    || parts.iter().any(|part| {
-                        part.is_empty()
-                            || !part.bytes().all(|byte| byte.is_ascii_digit())
-                            || part.parse::<u32>().is_err()
-                    })
-            })
+            || self.principal_sid.as_str() != ELIOT_HOST_SERVICE_SID
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -338,6 +326,23 @@ impl InstallerServiceRegistrationApproval {
         match (self.role, &self.service_control_grant) {
             (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, Some(receipt)) => {
                 receipt.validate()?;
+                let (expected_mask, expected_digest) = match self.role {
+                    InstallerServiceRole::Host => (
+                        ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                        host_service_security_descriptor_digest(ELIOT_HOST_SERVICE_SID),
+                    ),
+                    InstallerServiceRole::Watchdog => (
+                        ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                        watchdog_service_security_descriptor_digest(ELIOT_HOST_SERVICE_SID),
+                    ),
+                };
+                if receipt.access_mask() != expected_mask
+                    || !expected_digest.is_ok_and(|expected| {
+                        expected == receipt.security_descriptor_digest().as_str()
+                    })
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
             }
             (InstallerServiceRole::Host | InstallerServiceRole::Watchdog, None) => {
                 return Err(InstallationError::IdentityConflict);

@@ -69,6 +69,11 @@ pub const ELIOT_HOST_SERVICE_NAME: &str = "EliotHost";
 pub const ELIOT_WATCHDOG_SERVICE_NAME: &str = "EliotWatchdog";
 pub const ELIOT_HOST_SERVICE_DISPLAY_NAME: &str = "Eliot Host";
 pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
+/// Deterministic service SID reported by `sc.exe showsid EliotHost`.
+/// Windows derives service SIDs from the service name (SHA-1); this pinned
+/// canonical value lets durable offline approvals bind to the same identity.
+pub const ELIOT_HOST_SERVICE_SID: &str =
+    "S-1-5-80-4150682637-387058470-2234560498-321112900-3048288665";
 
 /// Exact service-object rights granted to the `EliotHost` service SID on the
 /// canonical `EliotWatchdog` registration.

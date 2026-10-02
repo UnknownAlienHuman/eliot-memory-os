@@ -556,7 +556,7 @@ mod tests {
         let image =
             std::env::current_exe().unwrap_or_else(|error| panic!("approval-cause image: {error}"));
         let grant_digest = eliot_platform_windows::watchdog_service_security_descriptor_digest(
-            "S-1-5-80-1-2-3-4-5",
+            eliot_platform_windows::ELIOT_HOST_SERVICE_SID,
         )
         .unwrap_or_else(|error| panic!("approval-cause grant digest: {error}"));
         let wire = serde_json::json!({
@@ -579,7 +579,7 @@ mod tests {
             "configuration_digest": "0".repeat(64),
             "service_control_grant": {
                 "principal_service": "EliotHost",
-                "principal_sid": "S-1-5-80-1-2-3-4-5",
+                "principal_sid": eliot_platform_windows::ELIOT_HOST_SERVICE_SID,
                 "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
                 "security_descriptor_owner": eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
                 "security_descriptor_group": eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
