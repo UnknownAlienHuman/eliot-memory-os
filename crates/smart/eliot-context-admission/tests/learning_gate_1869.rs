@@ -518,10 +518,7 @@ fn memory_demand_1869(generation: ResourceGeneration) -> HeadroomDemand {
 /// validated, with an owner reference read from the frozen owner map and a
 /// capacity class derived from the demand's own operation tag rather than
 /// asserted beside it.
-fn granted_permit_1869(
-    demand: &HeadroomDemand,
-    expires_at_ms: u64,
-) -> Box<CapacityPermitBinding> {
+fn granted_permit_1869(demand: &HeadroomDemand, expires_at_ms: u64) -> Box<CapacityPermitBinding> {
     let request = &demand.request;
     Box::new(CapacityPermitBinding {
         permit_id: "permit-1869".to_owned(),
@@ -1018,7 +1015,10 @@ fn both_gates_run_on_the_reserved_path_and_selection_is_unchanged() {
     // only check this crate can report after it verified owner evidence; a
     // caller who reached selection with a reservation nobody checked would get
     // `NotReserved` here instead, and this panic would fire.
-    let HeadroomCheck::Admitted { occupancy_available } = reserved_check else {
+    let HeadroomCheck::Admitted {
+        occupancy_available,
+    } = reserved_check
+    else {
         panic!("a verified reservation must report a proven occupancy")
     };
     // The figure is the recipe's own declared envelope minus the declared
@@ -1057,8 +1057,10 @@ fn both_gates_run_on_the_reserved_path_and_selection_is_unchanged() {
     // A reservation changes what the decision REPORTS, not what it selects: the
     // two arms reach the SAME selection and the same per-material traces.
     assert_eq!(reserved_ids, admitted_atom_ids(&unreserved_result));
-    let mut unreserved_trace_ids: Vec<_> =
-        unreserved_traces.iter().map(|t| t.atom_id.clone()).collect();
+    let mut unreserved_trace_ids: Vec<_> = unreserved_traces
+        .iter()
+        .map(|t| t.atom_id.clone())
+        .collect();
     unreserved_trace_ids.sort();
     assert_eq!(trace_ids, unreserved_trace_ids);
 }
