@@ -31,7 +31,6 @@ pub struct SurrealServerSupervisor {
     config: SurrealServerConfig,
 }
 
-#[derive(Debug)]
 pub struct ReadySurrealServer {
     transport: Option<Arc<SurrealRpcTransport>>,
     started_pid: Option<u32>,
@@ -45,13 +44,34 @@ pub struct ReadySurrealServer {
     /// handle here is what makes an owned server end with its owner: the kernel
     /// evaluates `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` when this value is
     /// dropped, and when the owning process itself ends for any reason.
-    /// Retained for its `Drop`; `#[derive(Debug)]` prints it as retained.
-    #[cfg(windows)]
+    ///
+    /// `JobObject` is a raw-kernel handle owner and deliberately implements no
+    /// `Debug` - printing a live job handle would invite formatting it as if it
+    /// were a plain value. The field therefore carries a hand-written `Debug`
+    /// that reports only whether a job is held, never the handle itself.
     _kill_on_close_job: Option<JobObject>,
     // Probe handle on the bridge data-root lease, held for the session so a
     // bridge generation cannot claim the same production root mid-session
     // (I5.2/A5). `std::fs::File` is `Send + Debug`; released on drop.
     _data_root_guard: Option<std::fs::File>,
+}
+
+/// Hand-written `Debug` for [`ReadySurrealServer`].
+///
+/// The derived form cannot be used because [`JobObject`] is a raw kernel handle
+/// owner that deliberately implements no `Debug`: printing a live handle would
+/// invite treating it as a plain value. This reports only whether a kill-on-close
+/// job is HELD, which is the fact that decides whether an owned server ends with
+/// its owner - and never the handle itself.
+impl std::fmt::Debug for ReadySurrealServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReadySurrealServer")
+            .field("started_pid", &self.started_pid)
+            .field("lease_path", &self.lease_path)
+            .field("holds_kill_on_close_job", &self._kill_on_close_job.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Outcome of releasing this runtime's handle on the canonical `SurrealDB` server.
@@ -163,10 +183,16 @@ impl<'a> SpawnedServerFinalizer<'a> {
 
     /// Terminates the whole assigned process set through the Job Object, so
     /// cleanup cannot leave a descendant of this server behind.
+    ///
+    /// The handle is TAKEN, not borrowed in place: the caller is already holding
+    /// a `&mut Child` from this same finalizer, so borrowing the field as well
+    /// would borrow it twice. Taking it also guarantees the Job is closed
+    /// exactly once, on whichever path terminates the assigned set first.
     #[cfg(windows)]
-    fn terminate_assigned_set(&mut self, exit_code: u32) {
-        if let Some(job) = self.kill_on_close_job.as_ref() {
-            let _terminated = job.terminate(exit_code);
+    fn terminate_assigned_set(&mut self, exit_code: u32) -> Result<(), WindowsAdapterError> {
+        match self.kill_on_close_job.take() {
+            Some(job) => job.terminate(exit_code),
+            None => Ok(()),
         }
     }
 
@@ -190,8 +216,12 @@ impl<'a> SpawnedServerFinalizer<'a> {
     async fn finalize_error(mut self, primary: StoreError) -> StoreError {
         let mut cleanup_failures = Vec::new();
 
-        if let Some(child) = self.child.as_mut() {
-            let child_is_live = match child.try_wait() {
+        // Liveness is probed in its OWN scope so the `&mut Child` borrow ends
+        // before the assigned set is terminated. Terminating needs the Job field
+        // of the same finalizer, and holding the child borrow across it would
+        // borrow `self` twice.
+        let child_is_live = match self.child.as_mut() {
+            Some(child) => match child.try_wait() {
                 Ok(Some(_status)) => {
                     // `try_wait` returned the exit status and reaped this exact
                     // child, so there is no live process left to kill.
@@ -202,13 +232,20 @@ impl<'a> SpawnedServerFinalizer<'a> {
                     cleanup_failures.push(format!("exact child status probe: {error}"));
                     true
                 }
-            };
-            if child_is_live {
-                // Terminate the whole assigned set through the Job before
-                // waiting on the root child, so a descendant cannot survive the
-                // failed launch.
-                #[cfg(windows)]
-                self.terminate_assigned_set(0xE1_04);
+            },
+            None => false,
+        };
+
+        if child_is_live {
+            // Terminate the whole assigned set through the Job before
+            // waiting on the root child, so a descendant cannot survive the
+            // failed launch. The helper TAKES the handle (see its doc), which is
+            // also what guarantees the Job is closed exactly once.
+            #[cfg(windows)]
+            if let Err(error) = self.terminate_assigned_set(0xE1_04) {
+                cleanup_failures.push(format!("assigned set terminate: {error:?}"));
+            }
+            if let Some(child) = self.child.as_mut() {
                 if let Err(error) = child.start_kill() {
                     cleanup_failures.push(format!("exact child kill: {error}"));
                 }
@@ -222,7 +259,7 @@ impl<'a> SpawnedServerFinalizer<'a> {
                     Err(_elapsed) => cleanup_failures.push(format!(
                         "exact child wait exceeded {}ms",
                         wait_bound.as_millis()
-                    )),
+)),
                 }
             }
         }
