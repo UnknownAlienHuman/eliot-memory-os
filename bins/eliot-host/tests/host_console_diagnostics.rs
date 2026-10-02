@@ -20,7 +20,46 @@ fn host_console_boundaries_are_complete_and_singular() {
         assert!(MAIN.contains(m), "marker missing: {m}");
     }
     assert_eq!(MAIN.matches("install_host_diagnostics").count(), 1);
-    assert_eq!(MAIN.matches("observe_terminal_error").count(), 1);
+    // One terminal per failed operation, and no second terminal emitter. The
+    // occurrence count of the callee name is not the invariant: a correct fix
+    // adds a second, differently-owned emission for a different operation. The
+    // invariant is the exact set of (owning function, typed terminal code)
+    // pairs, which stays red if one operation grows a second terminal or
+    // reuses another operation's code.
+    let lines: Vec<&str> = MAIN.lines().collect();
+    let mut owner = String::new();
+    let mut terminals: Vec<(String, String)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(name) = line.strip_prefix("fn ") {
+            owner = name.split('(').next().unwrap_or(name).trim().to_owned();
+        }
+        if !line.trim_end().ends_with("observe_terminal_error(") {
+            continue;
+        }
+        let code = lines
+            .get(index + 1)
+            .and_then(|next| next.rsplit("::").next())
+            .unwrap_or_default();
+        let code = code.trim().trim_end_matches(',');
+        assert!(!code.is_empty(), "terminal emission must name its typed code");
+        terminals.push((owner.clone(), code.to_owned()));
+    }
+    assert_eq!(
+        terminals,
+        vec![
+            ("main".to_owned(), "HOST_TERMINAL_CODE_CONSOLE_FAILED".to_owned()),
+            (
+                "fail_scm_dispatcher".to_owned(),
+                "HOST_TERMINAL_CODE_DISPATCHER_FAILED".to_owned()
+            ),
+        ],
+        "one terminal emitter per failed operation"
+    );
+    assert!(
+        MAIN.contains("if console.failed() {")
+            && MAIN.contains("fn fail_scm_dispatcher(error: u32) -> ! {"),
+        "each terminal emission is guarded by its own operation and ends that process"
+    );
     assert_eq!(MAIN.matches("write_response(&").count(), 4);
     assert_eq!(MAIN.matches("std::process::exit(").count(), 2);
     assert_eq!(MAIN.matches("match host.stop()").count(), 2);

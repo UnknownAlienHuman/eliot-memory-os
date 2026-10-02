@@ -331,7 +331,7 @@ fn console_process_exit_code() -> i32 {
 //     (`EntrypointStage::ScmDispatch`), the typed `HostStopCode` discriminant as
 //     the observation label, the typed `HostError` discriminant as the reason
 //     where one is in hand, and the launch identities only from options that
-//     already parsed. The six `fail_host_service` classes —
+//     already parsed. The nine `fail_host_service` classes —
 //     `InvalidScmArgvOrBootstrap`, `InvalidRegistration`,
 //     `ReporterStartFailed`, `OpenHostFailed`, `ReporterProgressFailed`,
 //     `CredentialControlFailed`, `SpawnCredentialFailed`,
@@ -348,8 +348,15 @@ fn console_process_exit_code() -> i32 {
 // B15 start-failure capsule/stderr/SCM status and the process exit code: the
 //     receipt owners, unchanged. Every observation above is additive on the
 //     #889 facade only; stderr text, capsule content, `dwWin32ExitCode` 1066,
-//     `dwServiceSpecificExitCode`, and the console/dispatch exit code are byte
-//     and value identical to before.
+//     `dwServiceSpecificExitCode`, and the dispatch exit code are byte and
+//     value identical to before, and the console exit code is unchanged on
+//     every path that already reported failure. Three console paths
+//     deliberately are not: a Ready write failure, a read error, and a
+//     response write failure now fix the run as `Failed` even when the drain
+//     succeeded, so they exit 1066 with a `ConsoleFailed` capsule where they
+//     previously returned the drain result and exited 0 with no capsule. The
+//     audit requires a protocol, read, or write failure to stay a failure
+//     even when cleanup succeeded.
 
 /// Reads the admitted profile supervisor switch from the process arguments,
 /// leaving every other launch argument untouched.
