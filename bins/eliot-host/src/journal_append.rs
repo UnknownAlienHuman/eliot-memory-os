@@ -993,6 +993,198 @@ pub(super) fn test_activation_ingress() -> ActivationIngress {
 }
 
 #[cfg(test)]
+mod journal_owner_case_tests {
+    use std::path::PathBuf;
+
+    use eliot_host_state::{FaultPoint, MemoryBackend};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::TestResult;
+
+    fn temp_root(label: &str) -> Result<PathBuf, crate::TestError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-journal-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    /// Runs `emit` under a scoped `tracing` subscriber whose only sink is a
+    /// file inside the test's own isolated directory, then returns what the
+    /// production path emitted plus the value it produced.
+    fn capture<T>(dir: &std::path::Path, emit: impl FnOnce() -> T) -> (T, String) {
+        let path = dir.join("diagnostic-capture.log");
+        let file = std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(file)
+            .finish();
+        let mut outcome = None;
+        tracing::subscriber::with_default(subscriber, || {
+            outcome = Some(emit());
+        });
+        let captured = std::fs::read_to_string(&path).unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_file(&path);
+        (outcome.unwrap_or_else(|| unreachable!()), captured)
+    }
+
+    /// The bounded `detail` values the #889 facade emitted, in emission order.
+    fn details(captured: &str) -> Vec<String> {
+        const KEY: &str = "detail=\"";
+        let mut fields = Vec::new();
+        let mut rest = captured;
+        while let Some(index) = rest.find(KEY) {
+            rest = &rest[index + KEY.len()..];
+            let end = rest.find('"').unwrap_or_else(|| unreachable!());
+            fields.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        fields
+    }
+
+    /// One Activation record for this Host epoch, built once so the exact same
+    /// bytes can be appended again.
+    fn one_activation_record(
+        host: &HostInstallationEpoch,
+    ) -> Result<HostStateRecord, HostError> {
+        Ok(HostStateRecord::Activation(initial_activation_record(
+            host,
+            &fresh_identity("journal-case-activation")?,
+            &crate::root_epoch(fresh_lineage_id()?),
+            ActivationState::Starting,
+            "journal-case-starting",
+            &test_activation_ingress(),
+        )?))
+    }
+
+    // WORK_UNIT_CASE: 981/11
+    #[test]
+    fn committed_replay_is_readback_and_not_a_second_commit() -> TestResult {
+        let root = temp_root("case-11")?;
+        let host = crate::fresh_host_epoch(
+            PlatformHandle::new("installation:journal-case-11")?,
+            None,
+        )?;
+        // The real journal owner, not a stub: an idempotent append owner that
+        // answers `Applied` for a new commit and `Replayed` for an exact
+        // replay of an already committed operation.
+        let journal = HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
+        let record = one_activation_record(&host)?;
+
+        let (applied, applied_records) = capture(&root, || append_reconciled(&journal, record.clone()));
+        let applied = applied?;
+        assert_eq!(applied.disposition(), AppendDisposition::Applied);
+        let committed_sequence = applied.sequence();
+        assert_eq!(
+            journal.snapshot()?.sequence,
+            committed_sequence,
+            "the first append is this call's own durable commit"
+        );
+        assert_eq!(
+            details(&applied_records),
+            vec![
+                "host.journal append requested".to_owned(),
+                "host.journal append durable observed".to_owned(),
+            ],
+            "a new commit is observed as a durable append: {applied_records}"
+        );
+
+        // The genuinely identical record, appended again.
+        let (replay, replay_records) = capture(&root, || append_reconciled(&journal, record));
+        let replay = replay?;
+        assert_eq!(
+            replay.disposition(),
+            AppendDisposition::Replayed,
+            "the owner must report a replay for the identical committed operation"
+        );
+        assert_eq!(
+            replay.sequence(),
+            committed_sequence,
+            "a replay reads back the original commit sequence"
+        );
+        assert_eq!(
+            journal.snapshot()?.sequence,
+            committed_sequence,
+            "a replay must not append a second frame"
+        );
+        assert_eq!(
+            journal.snapshot()?.applied_operations.len(),
+            1,
+            "a replay must not create a second applied operation"
+        );
+        assert_eq!(
+            details(&replay_records),
+            vec![
+                "host.journal append requested".to_owned(),
+                "host.journal append committed replay observed".to_owned(),
+            ],
+            "a committed replay is observed as readback, never a second append: {replay_records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 981/12
+    #[test]
+    fn nested_append_propagation_emits_exactly_one_terminal() -> TestResult {
+        let root = temp_root("case-12")?;
+        let host = crate::fresh_host_epoch(
+            PlatformHandle::new("installation:journal-case-12")?,
+            None,
+        )?;
+        // The owner's own first append attempt is lost: prepare reports the
+        // outcome unknown, so `append_reconciled` reconciles it through the
+        // nested `reconcile_unknown_outcome` helper and fails there.
+        let journal = HostStateJournalService::from_backend(
+            MemoryBackend::with_fault(FaultPoint::PrepareUnknown),
+            host.clone(),
+        )?;
+        let record = one_activation_record(&host)?;
+
+        // The production single-terminal mechanism of the crate root, armed
+        // exactly as `Host::open` arms it around this append chain.
+        let owner_terminal =
+            crate::HostTerminalGuard::armed(crate::boundary_by_event("host-open-failed"));
+        let (outcome, records) = capture(&root, || {
+            let outcome = append_reconciled(&journal, record);
+            drop(owner_terminal);
+            outcome
+        });
+        let Err(error) = outcome else {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err("the lost append must not report success".into());
+        };
+        assert!(
+            matches!(error, HostError::Journal(JournalError::OutcomeUnknown { .. })),
+            "the owner's exact typed error must survive the nested helpers: {error:?}"
+        );
+        assert_eq!(
+            details(&records),
+            vec![
+                "host.journal append requested".to_owned(),
+                "host.journal append outcome unknown observed".to_owned(),
+                "host.journal reconcile not committed observed".to_owned(),
+            ],
+            "the correlated lower stages each report their own phase: {records}"
+        );
+        assert_eq!(
+            records.matches("host.terminal_error").count(),
+            1,
+            "one underlying failure yields exactly one terminal: {records}"
+        );
+        assert_eq!(
+            records.matches("host-open-failed").count(),
+            1,
+            "the terminal is the outer owner's own code: {records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod governance_profile_tests {
     use super::super::{fresh_host_epoch, root_epoch};
     use super::*;

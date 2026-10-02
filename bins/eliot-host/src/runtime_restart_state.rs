@@ -944,6 +944,399 @@ mod durability_repair_tests {
         )
     }
 
+    /// Runs `emit` under a scoped `tracing` subscriber whose only sink is a
+    /// file inside the test's own isolated directory, then returns what the
+    /// production path emitted plus the value it produced. The subscriber is
+    /// thread-local, so parallel tests never share a capture.
+    fn capture<T>(dir: &Path, emit: impl FnOnce() -> T) -> (T, String) {
+        let path = dir.join("diagnostic-capture.log");
+        let file = std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(file)
+            .finish();
+        let mut outcome = None;
+        tracing::subscriber::with_default(subscriber, || {
+            outcome = Some(emit());
+        });
+        let captured = std::fs::read_to_string(&path).unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_file(&path);
+        (outcome.unwrap_or_else(|| unreachable!()), captured)
+    }
+
+    /// The bounded `detail` values the #889 facade emitted, in emission order.
+    /// Timestamps and sink framing are excluded, so the result is exactly the
+    /// semantic fields a record carries.
+    fn details(captured: &str) -> Vec<String> {
+        const KEY: &str = "detail=\"";
+        let mut fields = Vec::new();
+        let mut rest = captured;
+        while let Some(index) = rest.find(KEY) {
+            rest = &rest[index + KEY.len()..];
+            let end = rest.find('"').unwrap_or_else(|| unreachable!());
+            fields.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        fields
+    }
+
+    // WORK_UNIT_CASE: 981/7
+    #[test]
+    fn restart_pending_intent_replay_and_durable_receipt_stay_distinct() -> TestResult {
+        let root = temp_root("rr-case-7")?;
+        let host = test_host()?;
+        let digest = "c7".repeat(32);
+        let request = fresh_request("rr-case-7", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+
+        // A pending intent is published as a pending intent only.
+        let (created, created_records) = capture(&root, || {
+            persist_runtime_restart_pending(&root, &request, &host)
+        });
+        assert_eq!(created?, RuntimeRestartPendingPublication::Created);
+        assert_eq!(
+            details(&created_records),
+            vec![
+                "host.restart pending requested".to_owned(),
+                "host.restart pending published observed".to_owned(),
+            ],
+            "a fresh pending intent is not a receipt: {created_records}"
+        );
+        assert!(runtime_restart_pending_path(&root, &digest).exists());
+        assert!(!runtime_restart_receipt_path(&root, &digest).exists());
+        assert!(
+            load_durable_runtime_restarts(&root)?.is_empty(),
+            "a pending intent is never adopted as a durable receipt"
+        );
+
+        // The exact same pending record replays as readback, never as a second
+        // publication.
+        let (replay, replay_records) = capture(&root, || {
+            persist_runtime_restart_pending(&root, &request, &host)
+        });
+        assert_eq!(replay?, RuntimeRestartPendingPublication::Replay);
+        let replayed_details = details(&replay_records);
+        assert!(
+            replayed_details.starts_with(&["host.restart pending requested".to_owned()])
+                && replayed_details.ends_with(
+                    &["host.restart pending replay observed".to_owned()],
+                ),
+            "an exact pending replay is readback, never a fresh publication: {replay_records}"
+        );
+        assert!(
+            !replayed_details
+                .contains(&"host.restart pending published observed".to_owned()),
+            "a replay must not claim a fresh publication: {replay_records}"
+        );
+
+        // The durable receipt is a distinct observed completion, and it retires
+        // the pending intent.
+        let receipt = make_receipt(&digest)?;
+        let (durable, receipt_records) =
+            capture(&root, || persist_runtime_restart_receipt(&root, &receipt));
+        durable?;
+        let published = details(&receipt_records);
+        assert!(published.contains(&"host.restart receipt requested".to_owned()));
+        assert!(published.contains(&"host.restart receipt durable observed".to_owned()));
+        assert!(published.contains(&"host.restart receipt published observed".to_owned()));
+        assert!(!runtime_restart_pending_path(&root, &digest).exists());
+        assert!(load_durable_runtime_restarts(&root)?.contains_key(&digest));
+
+        // A replay of the already durable receipt is readback only: no durable
+        // and no published phase is claimed a second time.
+        let (replayed, replayed_records) =
+            capture(&root, || persist_runtime_restart_receipt(&root, &receipt));
+        replayed?;
+        let replayed_details = details(&replayed_records);
+        assert!(replayed_details.contains(&"host.restart receipt replay observed".to_owned()));
+        assert!(!replayed_details.contains(&"host.restart receipt durable observed".to_owned()));
+        assert!(!replayed_details.contains(&"host.restart receipt published observed".to_owned()));
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 981/8
+    #[test]
+    fn corrupt_pending_codec_keeps_exact_failure_without_payload_bytes() -> TestResult {
+        let root = temp_root("rr-case-8")?;
+        std::fs::create_dir_all(runtime_restart_store_dir(&root))?;
+        let digest = "c8".repeat(32);
+        let path = runtime_restart_pending_path(&root, &digest);
+        // A truncated record whose bytes carry a credential canary.
+        const CANARY: &str = "case-08-credential-canary";
+        std::fs::write(&path, format!("{{\"wire\":\"{CANARY}\""))?;
+
+        let (result, records) = capture(&root, || super::read_runtime_restart_pending_identity(&path));
+        let Err(error) = result else {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err("a corrupt pending codec record must not decode".into());
+        };
+        assert!(
+            matches!(error, crate::HostError::RecoveryRequired(_)),
+            "a corrupt pending record stays a typed failure: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("runtime restart pending record is malformed"),
+            "the exact codec failure is retained: {message}"
+        );
+        assert!(
+            !message.contains(CANARY) && !records.contains(CANARY),
+            "no payload byte may reach the failure or the record: {message} / {records}"
+        );
+        assert!(
+            !records.contains(&digest),
+            "no record byte may reach the diagnostic history: {records}"
+        );
+        assert_eq!(
+            details(&records),
+            vec!["host.restart pending malformed observed".to_owned()],
+            "a corrupt record keeps exactly its own disposition: {records}"
+        );
+        assert_eq!(
+            records.matches("host.terminal_error").count(),
+            0,
+            "the codec owns no terminal: {records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// One pending publication under the named sink disposition: the owner
+    /// disposition it returned, the detail fields that sink received, the
+    /// persistence call order, and the resulting store contents.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the comparison needs the disposition, records, call order and store contents together"
+    )]
+    fn publish_pending_under_sink(
+        sink: &str,
+        label: &str,
+    ) -> Result<
+        (
+            RuntimeRestartPendingPublication,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+        ),
+        crate::TestError,
+    > {
+        let root = temp_root(&format!("rr-case-13-{label}"))?;
+        let host = test_host()?;
+        let digest = "cb".repeat(32);
+        let request = fresh_request("rr-case-13", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        ordering::clear();
+        let path = root.join("diagnostic-capture.log");
+        let (publication, captured) = match sink {
+            // A dropped sink: the filter admits no record at all.
+            "dropped" => {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("off"))
+                    .finish();
+                let mut outcome = None;
+                tracing::subscriber::with_default(subscriber, || {
+                    outcome = Some(persist_runtime_restart_pending(&root, &request, &host));
+                });
+                (
+                    outcome.unwrap_or_else(|| unreachable!()),
+                    String::new(),
+                )
+            }
+            // A failing sink: the writer is a read-only handle, so every
+            // diagnostic write fails inside the subscriber.
+            "failing" => {
+                std::fs::write(&path, b"")?;
+                let read_only = std::fs::File::open(&path)?;
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .log_internal_errors(false)
+                    .with_writer(read_only)
+                    .finish();
+                let mut outcome = None;
+                tracing::subscriber::with_default(subscriber, || {
+                    outcome = Some(persist_runtime_restart_pending(&root, &request, &host));
+                });
+                (
+                    outcome.unwrap_or_else(|| unreachable!()),
+                    std::fs::read_to_string(&path).unwrap_or_else(|_| unreachable!()),
+                )
+            }
+            // A working sink.
+            _ => capture(&root, || {
+                persist_runtime_restart_pending(&root, &request, &host)
+            }),
+        };
+        let mut store = std::fs::read_dir(runtime_restart_store_dir(&root))?
+            .map(|entry| {
+                entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<String>, std::io::Error>>()?;
+        store.sort();
+        let calls = ordering::take_log();
+        let _ = std::fs::remove_dir_all(&root);
+        Ok((publication?, details(&captured), calls, store))
+    }
+
+    // WORK_UNIT_CASE: 981/13
+    #[test]
+    fn dropped_and_failing_sinks_leave_persistence_calls_and_cleanup_identical() -> TestResult {
+        let (working, working_details, working_calls, working_store) =
+            publish_pending_under_sink("working", "working")?;
+        let (dropped, dropped_details, dropped_calls, dropped_store) =
+            publish_pending_under_sink("dropped", "dropped")?;
+        let (failing, failing_details, failing_calls, failing_store) =
+            publish_pending_under_sink("failing", "failing")?;
+
+        // The working sink really observed the path, so the comparison below is
+        // against a live observation and not against two empty sinks.
+        assert_eq!(
+            working_details,
+            vec![
+                "host.restart pending requested".to_owned(),
+                "host.restart pending published observed".to_owned(),
+            ],
+            "the working sink must observe the real path"
+        );
+        assert!(dropped_details.is_empty(), "the dropped sink admits nothing");
+        assert!(failing_details.is_empty(), "the failing sink admits nothing");
+
+        assert_eq!(working, RuntimeRestartPendingPublication::Created);
+        assert_eq!(
+            dropped, working,
+            "a dropped sink must not change the returned disposition"
+        );
+        assert_eq!(
+            failing, working,
+            "a failing sink must not change the returned disposition"
+        );
+        assert!(!working_calls.is_empty(), "the call order must be observable");
+        assert_eq!(
+            dropped_calls, working_calls,
+            "a dropped sink must not change persistence call count or order"
+        );
+        assert_eq!(
+            failing_calls, working_calls,
+            "a failing sink must not change persistence call count or order"
+        );
+        assert_eq!(working_store.len(), 1, "only the pending record survives");
+        assert_eq!(
+            dropped_store, working_store,
+            "a dropped sink must not change the published store"
+        );
+        assert_eq!(
+            failing_store, working_store,
+            "a failing sink must not change cleanup or the published store"
+        );
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 981/14
+    #[test]
+    fn primary_publication_failure_survives_a_failing_cleanup_commit() -> TestResult {
+        let root = temp_root("rr-case-14")?;
+        let host = test_host()?;
+        let digest = "ce".repeat(32);
+        const CANARY: &str = "rr-case-14-credential-canary";
+        let request = fresh_request(CANARY, &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        ordering::clear();
+        // The publication fails first; the cleanup directory commit fails too.
+        pending_write_fault::inject_write_fault();
+        test_fault::inject_sync_fault(std::io::ErrorKind::PermissionDenied);
+        let (result, records) =
+            capture(&root, || persist_runtime_restart_pending(&root, &request, &host));
+        pending_write_fault::clear_write_fault();
+        test_fault::clear_sync_fault();
+
+        let calls = ordering::take_log();
+        let Err(error) = result else {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err("the injected publication failure must not report success".into());
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("injected runtime restart pending file flush failure"),
+            "the primary publication failure must survive: {message}"
+        );
+        assert!(
+            !message.contains("injected durability fault"),
+            "the cleanup commit failure must not rename the primary error: {message}"
+        );
+        assert!(
+            calls.contains(&"pending_file_write_fault_injected".to_owned()),
+            "the publication failure must be real: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"dir_sync_fault_injected".to_owned()),
+            "the cleanup commit must have failed as well: {calls:?}"
+        );
+        assert!(
+            !runtime_restart_pending_path(&root, &digest).exists(),
+            "a failed publication publishes no pending record"
+        );
+        assert_eq!(
+            details(&records),
+            vec![
+                "host.restart pending requested".to_owned(),
+                "host.restart pending publication failed observed".to_owned(),
+            ],
+            "the failed phase stays a publication failure: {records}"
+        );
+        assert!(
+            !records.contains(CANARY) && !records.contains(&digest),
+            "no protected payload byte may reach a record: {records}"
+        );
+        assert_eq!(
+            records.matches("host.terminal_error").count(),
+            0,
+            "the restart phase owns no terminal: {records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// One pending publication into a fresh isolated root, returning only the
+    /// semantic fields its records carried.
+    fn pending_details_once(label: &str) -> Result<Vec<String>, crate::TestError> {
+        let root = temp_root(label)?;
+        let host = test_host()?;
+        let digest = "cf".repeat(32);
+        let request = fresh_request("rr-case-15", &digest)?;
+        test_fault::clear_sync_fault();
+        pending_write_fault::clear_write_fault();
+        let (publication, records) = capture(&root, || {
+            persist_runtime_restart_pending(&root, &request, &host)
+        });
+        publication?;
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(details(&records))
+    }
+
+    // WORK_UNIT_CASE: 981/15
+    #[test]
+    fn actual_pending_path_captures_deterministic_semantic_fields() -> TestResult {
+        let first = pending_details_once("rr-case-15-first")?;
+        let second = pending_details_once("rr-case-15-second")?;
+        let expected = vec![
+            "host.restart pending requested".to_owned(),
+            "host.restart pending published observed".to_owned(),
+        ];
+        assert_eq!(
+            first, expected,
+            "the actual path emits exactly the frozen literal fields"
+        );
+        assert_eq!(
+            second, first,
+            "identical observations must capture identical semantic fields"
+        );
+        Ok(())
+    }
+
     #[test]
     fn runtime_restart_pending_file_flush_failure_is_not_success() -> TestResult {
         let root = temp_root("rr-pending-flush")?;

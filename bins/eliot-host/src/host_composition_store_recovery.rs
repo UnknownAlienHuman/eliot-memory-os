@@ -1523,3 +1523,182 @@ impl HostComposition {
         Ok(receipt)
     }
 }
+
+#[cfg(all(test, windows))]
+mod store_recovery_evidence_case_tests {
+    use std::path::{Path, PathBuf};
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::TestResult;
+
+    fn temp_root(label: &str) -> Result<PathBuf, crate::TestError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-recovery-evidence-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    /// Runs `emit` under a scoped `tracing` subscriber whose only sink is a
+    /// file inside the test's own isolated directory, then returns what the
+    /// production path emitted plus the value it produced.
+    fn capture<T>(dir: &Path, emit: impl FnOnce() -> T) -> (T, String) {
+        let path = dir.join("diagnostic-capture.log");
+        let file = std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(file)
+            .finish();
+        let mut outcome = None;
+        tracing::subscriber::with_default(subscriber, || {
+            outcome = Some(emit());
+        });
+        let captured = std::fs::read_to_string(&path).unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_file(&path);
+        (outcome.unwrap_or_else(|| unreachable!()), captured)
+    }
+
+    /// The bounded `detail` values the #889 facade emitted, in emission order.
+    fn details(captured: &str) -> Vec<String> {
+        const KEY: &str = "detail=\"";
+        let mut fields = Vec::new();
+        let mut rest = captured;
+        while let Some(index) = rest.find(KEY) {
+            rest = &rest[index + KEY.len()..];
+            let end = rest.find('"').unwrap_or_else(|| unreachable!());
+            fields.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        fields
+    }
+
+    /// Whether any emitted record carries `label` as its leading detail token.
+    /// A bound record appends ` key=value` pairs to its label, so an exact
+    /// string comparison would never match the real projection records.
+    fn carries_label(details: &[String], label: &str) -> bool {
+        details
+            .iter()
+            .any(|detail| detail == label || detail.starts_with(&format!("{label} ")))
+    }
+
+    // WORK_UNIT_CASE: 981/9
+    #[test]
+    fn missing_or_mismatched_store_recovery_evidence_stays_incomplete() -> TestResult {
+        let root = temp_root("case-9")?;
+        let host = crate::fresh_host_epoch(
+            PlatformHandle::new("installation:recovery-case-9")?,
+            None,
+        )?;
+        let mutation = "9a".repeat(32);
+        let other_mutation = "9b".repeat(32);
+        let request = HostRuntimeControlRequest::new_with_mutation_digest(
+            HostRuntimeControlOperation::RecoverStore,
+            PlatformHandle::new("recovery-case-9-request")?,
+            PlatformHandle::new(mutation.clone())?,
+        )?;
+        // The real durable intent: a pending record exists, nothing else.
+        assert_eq!(
+            persist_store_recovery_pending(&root, &request, &host)?,
+            StoreRecoveryPendingPublication::Created
+        );
+
+        // Missing termination evidence stays missing: it is never synthesized
+        // into a binding.
+        let (absent, absent_records) =
+            capture(&root, || read_store_recovery_termination_evidence(&root, &mutation));
+        assert!(
+            absent?.is_none(),
+            "absent termination evidence stays absent"
+        );
+        assert!(
+            !absent_records.contains("host.recovery termination observed"),
+            "absence must not be reported as an observed termination: {absent_records}"
+        );
+
+        // The durable projection still yields a fence with no termination and
+        // no inner binding, so the recovery remains incomplete.
+        let (projection, projection_records) =
+            capture(&root, || load_durable_store_recoveries(&root));
+        let fences = projection?;
+        assert_eq!(fences.len(), 1);
+        assert!(fences[0].termination.is_none() && fences[0].inner.is_none());
+        let projected_details = details(&projection_records);
+        assert!(
+            carries_label(
+                &projected_details,
+                "host.store-recovery projection admitted"
+            ),
+            "the projection reports its own admitted phase: {projection_records}"
+        );
+        assert_eq!(
+            projected_details
+                .iter()
+                .filter(|detail| detail.starts_with("host.store-recovery projection"))
+                .count(),
+            2,
+            "one requested and one admitted projection phase: {projection_records}"
+        );
+
+        // Termination evidence bound to a different mutation is a preserved
+        // mismatch, never an adopted completion.
+        let mismatched = StoreRecoveryTerminationEvidence {
+            wire: request.wire.as_str().to_owned(),
+            operation: HostRuntimeControlOperation::RecoverStore,
+            request_id: request.request_id.as_str().to_owned(),
+            mutation_digest: other_mutation.clone(),
+            request_digest: request.request_digest.as_str().to_owned(),
+            host_epoch: host.epoch.current.sequence.get(),
+            host_lineage: host.epoch.current.lineage_id.as_str().to_owned(),
+            process_id: 4_101,
+            process_start_time_100ns: 41_010,
+            process_image_path: r"C:\Eliot\store-old.exe".to_owned(),
+            job_name: r"Local\Eliot-Store-old".to_owned(),
+            job_empty: true,
+            root_reaped: true,
+            restart_attempt: 1,
+        };
+        std::fs::write(
+            store_recovery_termination_path(&root, &mutation),
+            serde_json::to_vec(&mismatched)?,
+        )?;
+        let (rejected, rejected_records) =
+            capture(&root, || load_durable_store_recoveries(&root));
+        let Err(error) = rejected else {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err("mismatched termination evidence must not be adopted".into());
+        };
+        assert!(
+            matches!(error, crate::HostError::RecoveryRequired(_)),
+            "a mismatch is a typed refusal: {error:?}"
+        );
+        let rejected_details = details(&rejected_records);
+        assert!(
+            carries_label(&rejected_details, "host.store-recovery projection requested"),
+            "the refused projection still reports that it ran: {rejected_records}"
+        );
+        assert!(
+            !carries_label(&rejected_details, "host.store-recovery projection admitted"),
+            "a refused projection must not claim admission: {rejected_records}"
+        );
+        for protected in [
+            mismatched.process_image_path.as_str(),
+            mismatched.job_name.as_str(),
+            other_mutation.as_str(),
+        ] {
+            assert!(
+                !rejected_records.contains(protected),
+                "no protected payload byte may reach a record: {rejected_records}"
+            );
+        }
+        assert_eq!(
+            rejected_records.matches("host.terminal_error").count(),
+            0,
+            "the evidence readers own no terminal: {rejected_records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+}

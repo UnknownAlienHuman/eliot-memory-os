@@ -565,6 +565,194 @@ pub(super) fn open_production_epoch_from_backend(
     ))
 }
 
+#[cfg(test)]
+mod store_recovery_fence_reopen_case_tests {
+    use std::path::{Path, PathBuf};
+
+    use eliot_host_state::MemoryBackend;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::TestResult;
+
+    fn temp_root(label: &str) -> Result<PathBuf, crate::TestError> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-host-reopen-fence-{label}-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    /// Runs `emit` under a scoped `tracing` subscriber whose only sink is a
+    /// file inside the test's own isolated directory, then returns what the
+    /// production path emitted plus the value it produced.
+    fn capture<T>(dir: &Path, emit: impl FnOnce() -> T) -> (T, String) {
+        let path = dir.join("diagnostic-capture.log");
+        let file = std::fs::File::create(&path).unwrap_or_else(|_| unreachable!());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(file)
+            .finish();
+        let mut outcome = None;
+        tracing::subscriber::with_default(subscriber, || {
+            outcome = Some(emit());
+        });
+        let captured = std::fs::read_to_string(&path).unwrap_or_else(|_| unreachable!());
+        let _ = std::fs::remove_file(&path);
+        (outcome.unwrap_or_else(|| unreachable!()), captured)
+    }
+
+    /// The bounded `detail` values the #889 facade emitted, in emission order.
+    fn details(captured: &str) -> Vec<String> {
+        const KEY: &str = "detail=\"";
+        let mut fields = Vec::new();
+        let mut rest = captured;
+        while let Some(index) = rest.find(KEY) {
+            rest = &rest[index + KEY.len()..];
+            let end = rest.find('"').unwrap_or_else(|| unreachable!());
+            fields.push(rest[..end].to_owned());
+            rest = &rest[end..];
+        }
+        fields
+    }
+
+    /// One reopened-epoch fixture: the exact durable owner epoch, the
+    /// activation generation its clean journal retains, and the durable
+    /// backend those records actually landed in.
+    fn fixture(
+        installation: PlatformHandle,
+    ) -> Result<(HostInstallationEpoch, EpochTransition, MemoryBackend), crate::TestError> {
+        let host = crate::fresh_host_epoch(installation, None)?;
+        let activation_generation = root_epoch(fresh_lineage_id()?);
+        let activation_id = fresh_identity("reopen-case-10-activation")?;
+        let journal =
+            HostStateJournalService::from_backend(MemoryBackend::default(), host.clone())?;
+        append_reconciled(
+            &journal,
+            HostStateRecord::Activation(initial_activation_record(
+                &host,
+                &activation_id,
+                &activation_generation,
+                ActivationState::Stopped,
+                "reopen-case-10-stopped",
+                &crate::journal_append::test_activation_ingress(),
+            )?),
+        )?;
+        // The clean marker is the owner's own proof that this epoch closed, so
+        // the reopen reaches the fence decision instead of the unclean stop.
+        crate::append_clean_marker(&journal, &host, &activation_id, &activation_generation)?;
+        Ok((host, activation_generation, journal.into_backend()?))
+    }
+
+    // WORK_UNIT_CASE: 981/10
+    #[test]
+    fn recovery_fence_stays_fenced_until_the_owner_actually_clears_it() -> TestResult {
+        let root = temp_root("case-10")?;
+        let installation = PlatformHandle::new("installation:reopen-case-10")?;
+
+        // With the exact unresolved fence present, the reopen must stay fenced
+        // and retain the durable owner epoch.
+        let (fenced_host, fenced_generation, fenced_backend) = fixture(installation.clone())?;
+        let fence = StoreRecoveryReopenFence {
+            mutation_digest: "9a".repeat(32),
+            request_id: "reopen-case-10-request".to_owned(),
+            request_digest: "9b".repeat(64),
+            host_epoch: fenced_host.epoch.current.sequence.get(),
+            host_lineage: fenced_host.epoch.current.lineage_id.as_str().to_owned(),
+            termination: None,
+            inner: None,
+        };
+        let (fenced, fenced_records) = capture(&root, || {
+            reopen_existing_epoch(
+                HostStateJournalService::from_backend(fenced_backend, fenced_host.clone())?,
+                &fenced_host,
+                &installation,
+                None,
+                None,
+                std::slice::from_ref(&fence),
+            )
+        });
+        let (_, retained_host, retained_generation, startup_fence, _) = fenced?;
+        assert!(
+            startup_fence.is_fenced(),
+            "an unresolved recovery fence must keep startup fenced"
+        );
+        assert_eq!(
+            startup_fence.bindings().len(),
+            1,
+            "the exact fence is retained verbatim, never narrowed"
+        );
+        assert_eq!(
+            retained_host, fenced_host,
+            "a fenced reopen retains the exact owner epoch"
+        );
+        assert_eq!(
+            retained_generation, fenced_generation,
+            "a fenced reopen retains the exact activation generation"
+        );
+        assert_eq!(
+            details(&fenced_records),
+            vec![
+                "host.epoch reopen existing requested".to_owned(),
+                "host.epoch pending reconcile observed".to_owned(),
+                "host.recovery fence no inner observed".to_owned(),
+                "host.epoch reopen fence observed".to_owned(),
+                "host.epoch owner epoch retained".to_owned(),
+            ],
+            "the fenced reopen reports retention, never a child epoch: {fenced_records}"
+        );
+
+        // The same durable epoch with no unresolved fence is the owner
+        // clearance: the fence lifts and the epoch advances.
+        let (clear_host, _, clear_backend) = fixture(installation.clone())?;
+        let (clear, clear_records) = capture(&root, || {
+            reopen_existing_epoch(
+                HostStateJournalService::from_backend(clear_backend, clear_host.clone())?,
+                &clear_host,
+                &installation,
+                None,
+                None,
+                &[],
+            )
+        });
+        let (_, child_host, _, startup_fence, _) = clear?;
+        assert!(
+            !startup_fence.is_fenced(),
+            "an absent fence is clearance, not an unresolved unknown"
+        );
+        assert!(startup_fence.bindings().is_empty());
+        assert_eq!(
+            child_host.epoch.current.sequence.get(),
+            clear_host.epoch.current.sequence.get() + 1,
+            "only actual clearance advances the owner epoch"
+        );
+        assert_eq!(
+            child_host.epoch.current.lineage_id.as_str(),
+            clear_host.epoch.current.lineage_id.as_str(),
+            "the advancing arm keeps one lineage"
+        );
+        assert_eq!(
+            details(&clear_records),
+            vec![
+                "host.epoch reopen existing requested".to_owned(),
+                "host.epoch pending reconcile observed".to_owned(),
+                "host.epoch reopen fence observed".to_owned(),
+                "host.epoch owner child epoch observed".to_owned(),
+            ],
+            "the clear reopen reports the child epoch, never retention: {clear_records}"
+        );
+        assert_eq!(
+            fenced_records.matches("host.terminal_error").count()
+                + clear_records.matches("host.terminal_error").count(),
+            0,
+            "a reopen owns no terminal: {fenced_records} / {clear_records}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+}
+
 #[cfg(all(windows, test))]
 pub(super) fn open_test_support_epoch(
     path: &Path,
