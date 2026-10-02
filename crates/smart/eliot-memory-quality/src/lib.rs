@@ -1133,7 +1133,7 @@ pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-s
 /// next to [`CONSUMED_FREEZE_DIGEST`]; the previous r8 pin and its
 /// identical-literal self-comparison were removed because a constant compared
 /// with itself can never detect the freeze moving under it.
-pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r12";
+pub const CONSUMED_FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r13";
 
 /// Lowercase sha256 over the exact [`FREEZE_BYTES`] this consumer is bound to.
 ///
