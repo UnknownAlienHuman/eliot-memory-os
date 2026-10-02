@@ -1,10 +1,41 @@
-//! I1.12 compatibility envelope at every process boundary the Kernel owns.
+//! I1.12 compatibility envelope on the process boundaries this Kernel binary
+//! admits.
 //!
 //! One versioned handshake envelope, one durable compatibility state, one
-//! verdict. Kernel, the candidate `eliotd`, the store bridge, the Blob Store
-//! generation and replaceable Module generations all reach their verdict
-//! through this module, so no boundary can drift into a second spelling of the
-//! comparison. The verdict it admits travels with the candidate's generation and
+//! verdict, so no Kernel-owned boundary can drift into a second spelling of the
+//! comparison. This module owns the envelope for the boundaries this BINARY
+//! admits: a replaceable Module generation on the front-door route
+//! ([`super::frame_dispatch::runtime_module_compatibility`]), the store-bridge
+//! seam ([`super::canonical_store_runtime`]), and the generation-cutover
+//! candidate ([`super::generation_control::admit_cutover_candidate`]).
+//!
+//! Not every process handshake reaches it, and naming the ones that do not is
+//! part of the claim rather than a caveat to it. The `eliotd` process boundary
+//! is gated at the peer, in `eliotd`'s own
+//! `daemon_kernel_client::handshake::admit_kernel_peer_compatibility`, which
+//! runs in the OTHER process, constructs no `CompatibilityEnvelope`, calls
+//! neither `admit_handshake` nor this module. It compares THREE of the I1.12
+//! items — protocol range, Authority Epoch and the required capability — and
+//! records the FIVE its `ServerHello` does not present
+//! (`UNPRESENTED_HANDSHAKE_FIELDS` there) rather than comparing them. That
+//! ceiling was measured to be movable and was NOT moved, for a reason worth
+//! stating here: `config_snapshot` is a free-form JSON object and could carry
+//! the five, but three whole-object SHA-256 pins compare it against
+//! installation-owned declarations — `agent_bridge::begin_agent_bridge_inner`,
+//! `verify_harness_kernel_policy` and `eliot-cli`'s `expected_config_snapshot_
+//! sha256` — and two closed decoders (`eliot-cli`'s `KernelConfigSnapshot`,
+//! issue #1810; `eliot-mod-research`'s `ServerConfigSnapshot`, issue #24) would
+//! reject the added keys outright. Reissuing the pins is an installation
+//! concern and `application-client.json` has no in-tree producer at all.
+//! Binding those two fields on that boundary is therefore real work on other
+//! issues' paths, and fabricating them from the daemon's own values would make
+//! each one a self-comparison. The Blob Store generation is not routed through
+//! this module at
+//! all: `blob_store_controller` admits it from the approved manifest, a
+//! readiness/integrity probe and a durable receipt whose generation must match,
+//! with no envelope, no contract-set digest and no epoch-lineage comparison.
+//!
+//! The verdict this module admits travels with the candidate's generation and
 //! Authority Epoch lineage and is persisted in ORS, which is what makes a later
 //! rollback re-verify recorded compatibility against current durable state
 //! instead of trusting "it launched once" (I1.12).
@@ -26,14 +57,24 @@
 //! normative pair rather than issued by the external owner, so nothing here is
 //! evidence of an externally sealed receipt.
 //!
-//! The consequence is a named ceiling, not a claim: on a Kernel-owned boundary
-//! this gate fails closed when the envelope cannot be built at all (reported as
-//! `envelope_version`), and it refuses a candidate whose Authority Epoch the
-//! CALLER supplied lies outside the live epoch lineage (reported as
-//! `authority_epoch`; `generation_control::admit_cutover_candidate` compares the
-//! candidate's epoch lineage against the live service epoch before this gate
-//! runs). A canonical-format, sealed normative-pair, contract-set or
-//! migration-class incompatibility is only observable once a candidate presents
+//! The consequence is a named ceiling, not a claim: on a boundary this binary
+//! admits, the ONLY outcome this gate can produce today is a construction
+//! failure, reported as `envelope_version` when the envelope or the durable
+//! state cannot be built at all. Every other field is the same value on both
+//! sides, so it cannot disagree and cannot refuse.
+//!
+//! That includes the Authority Epoch, which is worth being exact about because
+//! it looks like the one field a caller could get wrong:
+//! [`admit_generation_activation`] builds the candidate envelope AND the durable
+//! state from the SAME caller-supplied epoch, so the `authority_epoch` arm of
+//! the comparison is structurally unreachable from here — it compares that one
+//! value with itself. The epoch-lineage refusal that really happens on the
+//! cutover path belongs to `generation_control::admit_cutover_candidate`, which
+//! is a SEPARATE comparison it makes itself, against the live service epoch,
+//! before this gate runs; it reports `authority_epoch` from its own check and
+//! never reaches the arm above. A canonical-format, sealed normative-pair,
+//! contract-set or migration-class incompatibility is likewise only observable
+//! once a candidate presents
 //! an envelope issued by its own artifact owner — an owner-issued declaration
 //! whose values are not derived from what it is compared against, carrying a
 //! digest recomputed over its canonical bytes so a post-issuance edit is refused,
@@ -46,7 +87,26 @@
 //! ## The half that IS enforced against durable state
 //!
 //! [`persist_generation_compatibility`] records the admitted evidence with its
-//! generation and epoch lineage under the boundary's own module identity, and
+//! generation and epoch lineage, keyed by the ROUTE SCOPE the boundary is
+//! routed under — [`super::frame_dispatch::RUNTIME_HEALTH_ROUTE_SCOPE`] on the
+//! Module-generation seam, `super::STORE_BRIDGE_ROUTE` on the store-bridge seam
+//! — NOT by the boundary's own module id, even though this function's parameter
+//! is still named `module_id`.
+//!
+//! It must be the route scope, because the key half of the lookup is not
+//! negotiable: `generation_recovery::admit_generation_rollback` iterates the
+//! committed cutover records and calls itself with each record's own
+//! `route_scope`, and the ORS read it performs is
+//! `VersionedArtifactRegistry::compatibility`, a strict `(key, generation)`
+//! lookup into `staged` and then `retained` with no fallback and no second
+//! spelling. A module id is a DIFFERENT namespace from the route scope — the
+//! front-door policy's module is `eliotd` while the route it is admitted under
+//! is `daemon` — so recording under the module id writes a row no rollback gate
+//! can ever find, and every restored `daemon` route is refused with "no recorded
+//! compatibility verdict exists for this generation" no matter what the durable
+//! state was. The artifact identity recorded beside it is still that
+//! generation's own; only the lookup key is the route owner.
+//!
 //! `generation_recovery::admit_generation_rollback` re-reads exactly that record
 //! and re-compares it with the compatibility state the Kernel runs under NOW. A
 //! generation whose evidence was never recorded is refused as a rollback target,
@@ -57,9 +117,11 @@
 //!
 //! ## The one field whose two sides are not this build's own constants
 //!
-//! Every field above is a constant of this build on both sides of the comparison,
-//! so it cannot disagree with a peer. The Store API operation-manifest catalogue
-//! digest is the single exception on this binary, and only on the rollback half:
+//! Every field above is either a constant of this build or the one value the
+//! CALLER supplied, and it is that same value on both sides of the comparison,
+//! so none of them can disagree with a peer. The Store API operation-manifest
+//! catalogue digest is the single exception on this binary, and only on the
+//! rollback half:
 //! the store-bridge seam records the digest the store PROCESS presented onto the
 //! evidence it persists, so the recorded half of that comparison is a peer
 //! operand while the receiver-held half is
@@ -173,14 +235,22 @@ pub(crate) fn process_compatibility_envelope(
 /// a refusal carries the exact mismatching I1.12 field.
 ///
 /// What this call can refuse is bounded by its arguments, and that bound is the
-/// point of stating it: the candidate envelope and the durable state are both
-/// derived from this build's own identity (see the module documentation), so the
-/// fields that can disagree here are the envelope's own construction and the
-/// Authority Epoch the caller passed in. It does NOT refuse an artifact whose
-/// protocol, contracts, canonical formats, sealed normative-pair receipt or
-/// migration class differ from this build, because nothing in this call is
-/// derived from the candidate artifact; such a refusal requires a caller that
-/// presents an envelope issued by that artifact's own owner.
+/// point of stating it. The candidate envelope and the durable state are both
+/// derived from this build's own identity, and from the SAME caller-supplied
+/// `authority_epoch` on both sides, so the only mismatch it can observe is its
+/// own failure to build one of them — reported as `envelope_version` by
+/// [`gate_construction_failure`]. The `authority_epoch` arm of the underlying
+/// comparison is unreachable from this call for the same reason: it would
+/// compare that one value with itself. A caller that wants an epoch-lineage
+/// refusal makes that comparison itself against its own live epoch; on the
+/// cutover path that caller is
+/// [`super::generation_control::admit_cutover_candidate`].
+///
+/// It does NOT refuse an artifact whose protocol, contracts, canonical formats,
+/// sealed normative-pair receipt or migration class differ from this build,
+/// because nothing in this call is derived from the candidate artifact; such a
+/// refusal requires a caller that presents an envelope issued by that artifact's
+/// own owner.
 ///
 /// `observed_at_ms` is the caller's observation clock; the decision itself reads
 /// no clock, and the value is recorded only on a refusal.
@@ -190,7 +260,7 @@ pub(crate) fn admit_generation_activation(
     observed_at_ms: i64,
 ) -> Result<CandidateActivation, CompatibilityMismatch> {
     let candidate = process_compatibility_envelope(generation, authority_epoch)
-        .map_err(|reason| gate_construction_failure(reason))?;
+        .map_err(gate_construction_failure)?;
     let durable =
         durable_compatibility_state(authority_epoch).map_err(gate_construction_failure)?;
     admit_candidate_activation(&candidate, &durable, observed_at_ms)
@@ -208,6 +278,15 @@ fn gate_construction_failure(reason: String) -> CompatibilityMismatch {
 
 /// Persists the accepted compatibility evidence with the candidate's own
 /// generation and epoch lineage.
+///
+/// `module_id` is the LOOKUP KEY, and callers pass the ROUTE SCOPE the boundary
+/// is routed under — [`super::frame_dispatch::RUNTIME_HEALTH_ROUTE_SCOPE`] or
+/// `super::STORE_BRIDGE_ROUTE` — not a module id, despite the parameter name.
+/// `generation_recovery::admit_generation_rollback` reads the row back under a
+/// committed cutover record's `route_scope` through a strict
+/// `(key, generation)` ORS lookup with no fallback, so a different namespace
+/// here makes the verdict unreachable to the gate that consumes it. See the
+/// module documentation.
 ///
 /// The ORS commit is the durable point: the versioned-artifact registry is the
 /// only place the rollback gate reads a verdict from, so a candidate whose

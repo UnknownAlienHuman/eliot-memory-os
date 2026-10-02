@@ -326,10 +326,19 @@ pub fn handshake_canonical_format_range() -> Result<VersionRange, KernelError> {
 /// Derives the I1.12 `contract-set digest` from the ordered contract identities.
 ///
 /// The digest is SHA-256 over the canonical JSON encoding of the four public
-/// contract identities in wire order — `eliot-contracts`,
-/// `eliot-kernel-service`, `eliot-protocol`, `eliot-runtime-contracts` — and
-/// never over an artifact or configuration hash, so a matching digest states
-/// that the same public surfaces were admitted on both sides of the carrier.
+/// contract identities in wire order - `eliot-contracts`,
+/// `eliot-kernel-service`, `eliot-protocol`, `eliot-runtime-contracts` - and
+/// never over an artifact or configuration hash, so it states WHICH public
+/// surfaces were admitted, never which artifact or configuration was.
+///
+/// What a matching digest does NOT prove, stated here rather than implied: on a
+/// boundary where one producer builds both sides - as the current Kernel ingress
+/// does, `compatibility_gate::durable_compatibility_state` against
+/// `compatibility_gate::process_compatibility_envelope` - both operands come from
+/// this build's own constants, so the value is compared with itself and cannot
+/// disagree with a peer. The only comparison on a handshake path whose two
+/// operands are genuinely derived in two different processes is the Store API
+/// catalogue comparison at the store-bridge seam.
 ///
 /// The derivation lives here, in the envelope's owner crate, so a producer in
 /// another binary derives the digest exactly as this crate's own producers do

@@ -65,8 +65,8 @@ use eliot_evaluation_contracts::{
 
 use crate::{
     AcpSessionBinding, AllowedHostManifestView, CoverageManifestPlan, CoverageManifestRun,
-    DurableHostEventJournal, FingerprintIngestRunOutcome, IngestError, ReplayItem,
-    run_ingest_for_fingerprint,
+    DurableHostEventJournal, ExecutionUnitRunError, FingerprintIngestRunOutcome, IngestError,
+    ReplayItem, run_ingest_for_fingerprint,
 };
 
 /// Caller-declared denominator halves for one ACP fingerprint run (issue #1936
@@ -173,23 +173,31 @@ pub fn run_fingerprint_coverage_denominator(
     owner: &mut DurableHostEventJournal,
     run: &FingerprintCoverageRun<'_>,
     mut deliver: impl FnMut(&ReplayItem) -> bool,
-) -> Result<FingerprintIngestRunOutcome, IngestError> {
+) -> Result<FingerprintIngestRunOutcome, ExecutionUnitRunError> {
     run.session
         .validate()
-        .map_err(|_| IngestError::InvalidInput("session.binding"))?;
-    run.execution.validate_internal()?;
-    run.admission.validate()?;
+        .map_err(|_| ExecutionUnitRunError::Ingest(IngestError::InvalidInput("session.binding")))?;
+    run.execution
+        .validate_internal()
+        .map_err(IngestError::Contract)
+        .map_err(ExecutionUnitRunError::Ingest)?;
+    run.admission
+        .validate()
+        .map_err(IngestError::Contract)
+        .map_err(ExecutionUnitRunError::Ingest)?;
     if run.session.attempt_id != run.execution.attempt_id
         || run.session.attempt_id != run.admission.attempt_id
     {
-        return Err(IngestError::InvalidInput("coverage_manifest.attempt_id"));
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
+            "coverage_manifest.attempt_id",
+        )));
     }
     if run.session.route != run.execution.route
         || run.admission.selected_route.as_ref() != Some(&run.session.route)
     {
-        return Err(IngestError::InvalidInput(
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
             "coverage_manifest.route_fingerprint",
-        ));
+        )));
     }
     // The roster is the journal's own observed stream set, never a caller list:
     // facts are resolved over exactly the streams the denominator will measure.
@@ -226,7 +234,15 @@ pub fn run_fingerprint_coverage_denominator(
         forbidden_tool_names: run.allowed.forbidden_tool_names,
         plan,
     };
-    let outcome = run_ingest_for_fingerprint(owner, &manifest_run, &mut deliver)?;
+    // An EMPTY declared-event slice, stated rather than hidden: this contour
+    // drives the per-fingerprint coverage denominator only. It resolves facts
+    // over the journal's own observed roster and retains the denominator; it
+    // never presents an execution-unit frame, because its run input carries
+    // declarations and admitted bindings, not frames. So the execution-unit
+    // production step is a genuine no-op here rather than a fabricated event -
+    // `produce_execution_unit_events` is handed no event and produces none, and
+    // the events it DOES drive are the recorded ones it later reads back.
+    let outcome = run_ingest_for_fingerprint(owner, &manifest_run, &[], &mut deliver)?;
     // The retained denominator must measure exactly the roster the facts were
     // resolved over; a divergence between the resolved roster and the measured
     // cursor partition fails closed instead of retaining a denominator that
@@ -243,7 +259,9 @@ pub fn run_fingerprint_coverage_denominator(
         measured == stream_ids
     };
     if !roster_matches_measurement {
-        return Err(IngestError::InvalidInput("coverage_manifest.streams"));
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
+            "coverage_manifest.streams",
+        )));
     }
     Ok(outcome)
 }

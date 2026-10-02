@@ -171,9 +171,24 @@ pub(crate) fn admit_rebound_store_bridge_compatibility(
     requirement: &HostStoreBootstrapRequirement,
     presented_store_api_contract_set_digest: Option<&str>,
 ) -> Result<(), KernelBuildError> {
-    let _admitted =
-        decide_store_bridge_compatibility(requirement, presented_store_api_contract_set_digest)?;
-    Ok(())
+    // The activation the ONE decision admitted is bound here exactly as the
+    // bootstrap seam binds it, so this path cannot return `Ok` for an activation
+    // the shared decision refused. Discarding it would be a fail-open asymmetry
+    // on the very seam whose contract says it "runs the SAME decision".
+    let StoreBridgeAdmission {
+        activation,
+        confirmed_store_api_contract_set_digest,
+    } = decide_store_bridge_compatibility(requirement, presented_store_api_contract_set_digest)?;
+    activation
+        .record_store_api_contract_set(confirmed_store_api_contract_set_digest)
+        .map(|_| ())
+        .map_err(|mismatch| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.rebind_rejected:compatibility_evidence",
+            );
+            KernelBuildError::Core(mismatch.to_string())
+        })
 }
 
 /// The admitted store-bridge verdict together with the peer operand that admitted

@@ -161,12 +161,14 @@ pub fn run_ingest_for_fingerprint(
     }
     let manifest = run_coverage_manifest(owner, run)?;
     if manifest.manifest.fingerprint != *run.plan.fingerprint {
-        return Err(IngestError::InvalidInput("coverage_manifest.fingerprint"));
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
+            "coverage_manifest.fingerprint",
+        )));
     }
     if manifest.manifest.allowed_manifest_digest != run.manifest_digest {
-        return Err(IngestError::InvalidInput(
+        return Err(ExecutionUnitRunError::Ingest(IngestError::InvalidInput(
             "coverage_manifest.allowed_manifest_digest",
-        ));
+        )));
     }
     Ok(FingerprintIngestRunOutcome {
         produced,

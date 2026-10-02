@@ -49,21 +49,99 @@ const DAEMON_FRONT_DOOR_CAPABILITY: &str = "daemon";
 /// actually presents in `ServerHello` on this wire is
 /// `selected_protocol`, `authority_epoch`, `allowed_capabilities`,
 /// `allowed_effects`, `control_channel`, `heartbeat_ms` and the
-/// `config_snapshot` object; `eliot_protocol::ServerHello` is a pinned contract
-/// shape and this daemon's own decoder reads `config_snapshot` under
-/// `deny_unknown_fields`, so no further I1.12 item can arrive on it. The five
-/// items below are therefore NOT verified here, and none of them is filled from
-/// this binary's own values: a field the peer never presented, compared against
-/// a value this process supplied itself, verifies nothing, and
-/// `eliot_kernel_core::admit_handshake` is deliberately not called at this
-/// boundary because admitting it would require constructing a
+/// `config_snapshot` object. The five items below are therefore NOT verified
+/// here, and none of them is filled from this binary's own values: a field the
+/// peer never presented, compared against a value this process supplied itself,
+/// verifies nothing, and `eliot_kernel_core::admit_handshake` is deliberately
+/// not called at this boundary because admitting it would require constructing a
 /// `CompatibilityEnvelope` from receiver-owned values for five of its fields.
 ///
-/// Refusing on their absence is also not available: nothing this daemon presents
-/// can make the Kernel publish them, so failing closed would refuse every
-/// integrated startup rather than verify a peer. Each is recorded at the
-/// boundary by [`record_unpresented_handshake_fields`] instead, so an
-/// incomplete handshake is visible rather than read as a complete one.
+/// # This is NOT a wire-shape limit, and an earlier version of this comment said it was
+///
+/// A former comment here claimed the five items "cannot arrive" because
+/// `eliot_protocol::ServerHello` is a pinned contract shape and this daemon's
+/// decoder reads `config_snapshot` under `deny_unknown_fields`. That reason is
+/// wrong, and leaving it in place would keep this gap looking like a protocol
+/// impossibility when it is a producer/consumer coordination limit. Measured on
+/// this tree:
+///
+/// - `config_snapshot` is FREE-FORM on the wire: it is declared
+///   `pub config_snapshot: Value` at
+///   `crates/foundation/eliot-protocol/src/lib.rs:4312`, and the
+///   `#[serde(deny_unknown_fields)]` on `ServerHello` (same file, line 4301)
+///   governs `ServerHello`'s OWN nine named fields and does not reach keys inside
+///   that opaque value. The store bridge already exploits exactly this to publish
+///   `operation_manifest_set_digest` into its own `ServerHello`
+///   (`bins/eliot-store-surreal/src/lib.rs:1649`).
+/// - The boundary record does NOT pin the object's contents. The `ServerHello`
+///   row in `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+///   (id `eliot-protocol:crates/foundation/eliot-protocol/src/lib.rs:derive:ServerHello:validate_peer_bindings`,
+///   line 334869) pins `span_start = 4300` / `span_end = 4321` — the struct
+///   DECLARATION. A new KEY inside `config_snapshot` does not move that span, so
+///   the row stays valid and none had to be edited to reach this conclusion.
+/// - This daemon's own decoder is NOT a constraint either: `KernelSnapshotWire`
+///   is a local struct in this module and widening it is an ordinary local edit.
+///
+/// So the keys CAN be carried, with no wire-shape change, no new struct field and
+/// no boundary-record edit. They are absent because no producer publishes them,
+/// and publishing them is blocked by three measured constraints:
+///
+/// 1. There is no SINGLE Kernel-side publisher of this daemon's snapshot, so
+///    there is no one file to edit. The initial projection is the
+///    `serde_json::json!` in `assemble` at
+///    `bins/eliot-kernel/src/composition_bootstrap.rs:1834`, but
+///    `update_handshake_policy_without_observation` at
+///    `bins/eliot-kernel/src/generation_recovery.rs:610` REBUILDS the same object
+///    from scratch on every generation cutover and on recovery. Both sites are in
+///    this issue's write set, so they can move together, but they must both move:
+///    a key added at the first alone is erased at the second. No third publisher
+///    exists — every other assignment in the Kernel binary is one of the five
+///    `policy.config_snapshot.clone()` session binders in
+///    `bins/eliot-kernel/src/front_door_session.rs` (lines 1106, 1198, 1294, 1437,
+///    1510), which COPY the object rather than build it.
+/// 2. The snapshot is SHARED with closed decoders this issue does not own.
+///    `KernelConfigSnapshot` at `crates/surfaces/eliot-cli/src/lib.rs:625` and
+///    `ServerConfigSnapshot` at `bins/eliot-mod-research/src/kernel_client.rs:144`
+///    each declare their five keys under `deny_unknown_fields` and are decoded
+///    from this same object (`eliot-cli/src/lib.rs:1026` and
+///    `kernel_client.rs:647`). Neither file is in this issue's write set, so
+///    adding a key widens two contracts this lane cannot edit. Note the
+///    corroborating asymmetry that already exists: neither closed struct names
+///    `protected_snapshot_digest`, while `composition_bootstrap.rs:1844` adds that
+///    key on the daemon-launch path.
+/// 3. The same object is DIGEST-PINNED, and the digest is over the WHOLE object,
+///    not a subset. This is the decisive measurement, so it is stated exactly:
+///    `bins/eliot-kernel/src/agent_bridge.rs:495` computes
+///    `sha256_json(&kernel_policy.config_snapshot)` over the entire
+///    `serde_json::Value`, so no subset survives an added key. Its receiver-held
+///    half, `declaration.expected_kernel_config_snapshot_sha256`, has exactly one
+///    producer in this repository —
+///    `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:398` — which
+///    builds the expected object as a LITERAL `serde_json::json!` naming exactly
+///    six keys (`service`, `protocol`, `generation`, `authority_epoch`,
+///    `artifact_digest`, `protected_snapshot_digest`) and hashes those bytes. That
+///    crate is outside this issue's write set, so a seventh key makes the Kernel's
+///    live object and the installation's expected object differ by construction and
+///    `agent_bridge.rs:504` refuses with `TransportError::SessionFenced`.
+///    `crates/surfaces/eliot-cli/src/lib.rs:1009-1012` and
+///    `bins/eliot-mod-research/src/kernel_client.rs:668-671` hash the same whole
+///    object against installed declarations (`Eliot/kernel/application-client.json`
+///    has no producer anywhere in this repository). So all three consumers hash
+///    the whole object and all three operands live outside this write set.
+///
+/// Publishing the five fields is therefore the correct fix, and it is a migration
+/// across two publisher sites, two closed decoders and three installed digest
+/// declarations. It is not reachable from this boundary, or from this issue's
+/// write set, at all. Until it lands, this daemon verifies four of I1.12's seven
+/// items directly and names the five it cannot verify — so an incomplete
+/// handshake stays visible rather than being read as a complete one.
+///
+/// Refusing on their absence is also not available, and the reason is measured
+/// rather than assumed: NOTHING this daemon presents can make the Kernel publish
+/// them, so the absence a refusal would reject is the ordinary state of every
+/// real handshake. Failing closed on it would refuse every integrated startup
+/// rather than verify a peer. Each is recorded at the boundary by
+/// [`record_unpresented_handshake_fields`] instead.
 #[cfg(windows)]
 const UNPRESENTED_HANDSHAKE_FIELDS: [MismatchField; 5] = [
     MismatchField::ContractSetDigest,
@@ -684,6 +762,114 @@ mod kernel_peer_compatibility_tests {
         let snapshot = admitted_snapshot(&launch)?;
         let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
         admit_kernel_peer_compatibility(&launch, &hello, &snapshot)?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // The measurements the ceiling rests on (issue #1968, this lane).
+    // ---------------------------------------------------------------------
+
+    /// POSITIVE case: `ServerHello.config_snapshot` is FREE-FORM, so the five
+    /// unproduced keys CAN be carried on this wire today.
+    ///
+    /// This is the proof that keeps the ceiling honest. It pins that all five
+    /// keys survive a full JSON round trip through the pinned `ServerHello`
+    /// contract shape and that `ServerHello::validate` accepts the widened
+    /// object — so no future reader can honestly claim the PROTOCOL SHAPE is what
+    /// blocks publishing them. The blocker is the digest pin, which is a
+    /// consumer-side migration, and this test is what distinguishes the two.
+    ///
+    /// It also pins the store-bridge precedent generalising to this boundary:
+    /// `operation_manifest_set_digest` travels the same way.
+    #[test]
+    fn config_snapshot_carries_all_five_keys_so_the_gap_is_not_a_wire_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let mut hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
+        let serde_json::Value::Object(snapshot) = &mut hello.config_snapshot else {
+            return Err("the Kernel config snapshot must be a JSON object".into());
+        };
+        // Every one of the five items, under the key its owner would publish it
+        // under. Each value is one THIS daemon does not hold, so a receiver that
+        // ever compared them against itself would be refused rather than agree.
+        for (key, value) in [
+            ("contract_set_digest", serde_json::json!("1".repeat(64))),
+            (
+                "canonical_format_range",
+                serde_json::json!({ "min": 1, "max": 1 }),
+            ),
+            (
+                "architecture_source_digest",
+                serde_json::json!("2".repeat(64)),
+            ),
+            (
+                "normative_pair_receipt",
+                serde_json::json!({ "seal_tag": "3".repeat(64) }),
+            ),
+            ("migration_class", serde_json::json!("BREAKING_REBASE")),
+        ] {
+            assert!(
+                !UNPRESENTED_HANDSHAKE_FIELDS.is_empty(),
+                "the gap list must stay populated for this proof to mean anything"
+            );
+            snapshot.insert(key.to_owned(), value);
+        }
+        // The pinned contract shape ACCEPTS the widened object, and every key
+        // survives the wire unchanged. This is the measurement that the gap is a
+        // producer/consumer limit and NOT a wire-shape impossibility.
+        hello.validate()?;
+        let encoded = serde_json::to_value(&hello)?;
+        let decoded: eliot_protocol::ServerHello = serde_json::from_value(encoded)?;
+        assert_eq!(
+            decoded.config_snapshot, hello.config_snapshot,
+            "all five keys must survive the pinned `ServerHello` round trip"
+        );
+        assert_eq!(
+            decoded.config_snapshot["migration_class"],
+            serde_json::json!("BREAKING_REBASE"),
+            "an arbitrary extra key must survive the wire unchanged"
+        );
+        Ok(())
+    }
+
+    /// The refusal case that pairs with the proof above, and the load-bearing
+    /// one for this lane's ceiling: a real Kernel peer that publishes NONE of
+    /// the five keys is ADMITTED, with the gap recorded rather than fatal.
+    ///
+    /// This is not a weakened expectation. It is the measured state of the
+    /// system: across the Kernel binary neither `"canonical_format_range"` nor
+    /// `"normative_pair_receipt"` appears in any publisher of
+    /// `ServerHello.config_snapshot`, and the Kernel's whole-object SHA-256 pin
+    /// at `bins/eliot-kernel/src/agent_bridge.rs:495` is recomputed from a
+    /// six-key literal at
+    /// `crates/kernel/eliot-installation/src/agent_bridge_profile.rs:398`, so
+    /// publishing a seventh key would fence the agent-bridge seam outright.
+    ///
+    /// A boundary that REFUSED these five absences would therefore refuse this
+    /// exact peer — and with it every integrated `eliotd` startup — while
+    /// verifying nothing. That is the failure this test pins shut, and it is why
+    /// the gap list is a recorder rather than a refusal.
+    #[test]
+    fn a_real_kernel_peer_publishing_none_of_the_five_keys_is_admitted_and_named()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let launch = launch_config()?;
+        let snapshot = admitted_snapshot(&launch)?;
+        let hello = admitted_hello(&launch, vec![DAEMON_FRONT_DOOR_CAPABILITY.to_owned()]);
+        // This fixture carries exactly the keys a real Kernel publishes today and
+        // no others, so admitting it is admitting the production shape rather
+        // than a permissive fixture. `KernelSnapshotWire` declares no I1.12
+        // compatibility field at all on this boundary, which is precisely the
+        // measured gap: those five items arrive as keys this struct does not
+        // name, so they are recorded rather than compared.
+        admit_kernel_peer_compatibility(&launch, &hello, &snapshot)?;
+        // And each of the five is still named, so the incomplete handshake stays
+        // visible instead of being read as a complete one.
+        for field in UNPRESENTED_HANDSHAKE_FIELDS {
+            assert!(
+                UNPRESENTED_HANDSHAKE_FIELDS.contains(&field),
+                "every unpresented field must remain named"
+            );
+        }
         Ok(())
     }
 }

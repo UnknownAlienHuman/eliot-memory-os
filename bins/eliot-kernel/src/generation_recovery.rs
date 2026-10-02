@@ -607,18 +607,21 @@ fn update_handshake_policy_without_observation(
         }
         policy.module_generation.state_fence =
             StateFence::new(route.authority_epoch().clone(), route.active_generation());
-        policy.config_snapshot = serde_json::json!({
-            "service": SERVICE_NAME,
-            "protocol": PROTOCOL_VERSION,
-            "generation": route.active_generation().value(),
-            "authority_epoch": route.authority_epoch(),
-        });
-        if let Some(artifact_digest) = artifact_digest {
-            policy.config_snapshot["artifact_digest"] = artifact_digest;
-        }
-        if let Some(protected_snapshot_digest) = protected_snapshot_digest {
-            policy.config_snapshot["protected_snapshot_digest"] = protected_snapshot_digest;
-        }
+        // I1.12 (#1968): this rebuild goes through the SAME owner as the startup
+        // projection, `composition_bootstrap::front_door_config_snapshot`. It used
+        // to assemble the object inline, which gave the same object a second
+        // builder: a key added at the startup site was erased here on the first
+        // cutover. One owner is what makes publishing a field a one-site change.
+        //
+        // Both digests are carried forward only when the object being rebuilt
+        // already had them, and are otherwise omitted rather than defaulted, so
+        // the rebuild does not add a key the object did not have.
+        policy.config_snapshot = crate::composition_bootstrap::front_door_config_snapshot(
+            route.active_generation().value(),
+            route.authority_epoch(),
+            artifact_digest,
+            protected_snapshot_digest,
+        );
         Ok(HandshakePolicyObservation::Projected)
     } else {
         Ok(HandshakePolicyObservation::Absent)
@@ -836,6 +839,79 @@ mod generation_recovery_diagnostics_tests {
             "missing diagnostics marker kernel.recovery.handshake_absent"
         );
         assert_eq!(policy, before);
+
+        drop(kernel);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The load-bearing proof for issue #1968's first publisher blocker: the
+    /// cutover REBUILD and the startup PROJECTION produce the SAME object, so a
+    /// key published on one is not erased by the other.
+    ///
+    /// The two used to be independent builders. A key added at the startup site
+    /// therefore vanished on the first generation cutover, and because absence
+    /// has to be refused rather than defaulted, `eliotd` would have refused to
+    /// launch after any cutover. Both now call
+    /// `composition_bootstrap::front_door_config_snapshot`, and this proof pins
+    /// that they agree byte for byte over the real production path: a real
+    /// composition supplies the startup policy, a real router drives the
+    /// rebuild, and the two objects are compared as values rather than restated.
+    ///
+    /// This is the shape a future publisher change must keep: add the key to the
+    /// ONE owner and this proof stays green. A second inline builder would make
+    /// it fail, which is exactly the drift it exists to catch.
+    #[test]
+    fn the_cutover_rebuild_and_the_startup_projection_publish_one_object() {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-kernel-single-publisher-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir_all(&root).expect("test work root");
+        let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+        let startup_snapshot = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy lock")
+            .config_snapshot
+            .clone();
+
+        // Rebuild against a router carrying exactly the generation and epoch the
+        // startup object already has, so any surviving difference is a difference
+        // between the two BUILDERS and nothing else.
+        let startup_generation = startup_snapshot["generation"]
+            .as_u64()
+            .expect("startup generation");
+        let startup_epoch = eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .expect("test lineage"),
+            std::num::NonZeroU64::new(startup_generation).expect("nonzero sequence"),
+        )
+        .expect("test epoch");
+        let mut matching = GenerationRouter::at_epoch(startup_epoch.clone());
+        matching
+            .register(
+                GenerationRoute::new(
+                    RouteScope::new("daemon").expect("daemon scope"),
+                    eliot_contracts::ResourceGeneration::new(startup_generation)
+                        .expect("startup generation"),
+                    startup_epoch,
+                )
+                .expect("route"),
+            )
+            .expect("register");
+
+        let mut policy = kernel
+            .front_door_policy
+            .lock()
+            .expect("front-door policy lock")
+            .clone();
+        update_handshake_policy(&mut policy, &matching).expect("policy update");
+
+        assert_eq!(
+            policy.config_snapshot, startup_snapshot,
+            "the rebuild must republish the same object the startup path published"
+        );
 
         drop(kernel);
         let _ = std::fs::remove_dir_all(root);
