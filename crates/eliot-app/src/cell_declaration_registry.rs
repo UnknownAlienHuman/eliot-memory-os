@@ -247,7 +247,7 @@ fn check_residual_markers(contract: &toml::Value) -> Result<(), String> {
 mod tests {
     use super::{
         CELL_CONTRACT, CONTRACT_DECLARED_BY, ELIOTD_MANIFEST, cell_declaration_guard,
-        manifest_cells, manifest_owners,
+        check_contract_mirror, manifest_cells, manifest_owners,
     };
 
     /// The real baked pair the production guard reads.
@@ -326,6 +326,40 @@ mod tests {
             panic!("the real declaration must name one owner per cell: {reason}")
         });
         (cells, owners)
+    }
+
+    /// Run the real contract-mirror stage over one mutation of the real contract.
+    fn mirror_of_mutated_contract(from: &str, to: &str) -> Result<(), String> {
+        let mutated: toml::Value = toml::from_str(&replace_once(REAL_CONTRACT, from, to))
+            .unwrap_or_else(|error| panic!("the mutated contract must still parse: {error}"));
+        let (cells, owners) = real_declaration();
+        check_contract_mirror(&mutated, &cells, &owners)
+    }
+
+    #[test]
+    fn a_contract_row_for_an_undeclared_cell_is_refused() {
+        // Arm: the real generated contract block projects a ninth cell the
+        // real manifest never declares. Every manifest cell is still projected
+        // with its own owner, so the forward pass succeeds; only the reverse
+        // pass can catch a projection with no declaration behind it.
+        let invented = "governor.daemon.fabricated";
+        let extra = format!(
+            "[[declared_functional_cell]]\ncell = \"{invented}\"\ndeclared_by = \
+             \"{CONTRACT_DECLARED_BY}\"\nmutable_state_owner = \
+             \"eliotd::FabricatedMutableStateOwner\"\n"
+        );
+        let result = mirror_of_mutated_contract(
+            "# END GENERATED declared_functional_cell",
+            &format!("{extra}# END GENERATED declared_functional_cell"),
+        );
+
+        assert_eq!(
+            result,
+            Err(format!(
+                "contract projects capability cell {invented}, which the manifest source does not declare"
+            )),
+            "a projected cell with no manifest declaration must be refused"
+        );
     }
 
     #[test]
