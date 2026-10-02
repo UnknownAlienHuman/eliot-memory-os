@@ -1649,9 +1649,7 @@ impl ModuleLifecycle {
     ) -> Result<Option<ModuleControlEffect>, ProtocolError> {
         match self.control_effects.get(&identity.idempotency_key) {
             None => Ok(None),
-            Some(record) if record.message == frame.message_type => {
-                Ok(Some(record.effect.clone()))
-            }
+            Some(record) if record.message == frame.message_type => Ok(Some(record.effect.clone())),
             Some(_) => Err(ProtocolError::ReplayConflict),
         }
     }
@@ -1706,14 +1704,11 @@ impl ModuleLifecycle {
                 field: "request_id",
                 reason: "required for lifecycle control requests",
             })?;
-        let published = match &frame.payload {
-            ProtocolPayload::Json(value) => value,
-            _ => {
-                return Err(ProtocolError::InvalidField {
-                    field: "payload",
-                    reason: "checkpoint requires the module-published snapshot as a JSON payload",
-                });
-            }
+        let ProtocolPayload::Json(published) = &frame.payload else {
+            return Err(ProtocolError::InvalidField {
+                field: "payload",
+                reason: "checkpoint requires the module-published snapshot as a JSON payload",
+            });
         };
         let bytes = canonical_json_bytes(published)
             .map_err(|error| ProtocolError::Json(error.to_string()))?;
@@ -1768,15 +1763,13 @@ impl ModuleLifecycle {
     fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         Self::control_identity(frame)?;
         let active_operations = match &frame.payload {
-            ProtocolPayload::Json(Value::Object(object)) => {
-                object
-                    .get("active_operations")
-                    .and_then(Value::as_u64)
-                    .ok_or(ProtocolError::InvalidField {
-                        field: "payload.active_operations",
-                        reason: "drain status requires the observed in-flight operation count",
-                    })?
-            }
+            ProtocolPayload::Json(Value::Object(object)) => object
+                .get("active_operations")
+                .and_then(Value::as_u64)
+                .ok_or(ProtocolError::InvalidField {
+                    field: "payload.active_operations",
+                    reason: "drain status requires the observed in-flight operation count",
+                })?,
             _ => {
                 return Err(ProtocolError::InvalidField {
                     field: "payload",
@@ -1923,10 +1916,13 @@ impl LifecycleExecuteLedger {
                 reason: "required for lifecycle Execute requests",
             })?;
         identity.validate()?;
-        let request_id = frame.request_id.clone().ok_or(ProtocolError::InvalidField {
-            field: "request_id",
-            reason: "required for lifecycle Execute requests",
-        })?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for lifecycle Execute requests",
+            })?;
         if let Some(prior) = self.entries.get(&identity.idempotency_key) {
             return Ok(LifecycleExecuteDisposition::Duplicate(prior.clone()));
         }
