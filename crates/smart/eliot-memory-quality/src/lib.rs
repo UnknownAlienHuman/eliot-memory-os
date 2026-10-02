@@ -725,13 +725,14 @@ impl MemoryEcologyAssessment {
                 reason: "known denominator must exactly partition items, omissions, and frontier",
             });
         }
-        if self.truncated != !self.frontier.is_empty() {
+        if self.truncated == self.frontier.is_empty() {
             return Err(QualityError::InvalidField {
                 field: "assessment.truncated",
                 reason: "truncation must match frontier presence exactly",
             });
         }
-        if (self.truncated || !self.batch_omissions.is_empty()) && !self.revalidation_required {
+        let lossy_recovery = self.truncated || !self.batch_omissions.is_empty();
+        if lossy_recovery && !self.revalidation_required {
             return Err(QualityError::InvalidField {
                 field: "assessment.revalidation_required",
                 reason: "lossy recovery requires revalidation",

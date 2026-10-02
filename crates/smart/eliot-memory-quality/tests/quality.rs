@@ -550,7 +550,9 @@ fn a_persisted_assessment_rechecks_its_own_recovery_partition() {
         receipts: vec![],
     };
     let assessment = assess_quality(&candidate).expect("quality assessment");
-    assessment.validate().expect("the carried identities partition");
+    assessment
+        .validate()
+        .expect("the carried identities partition");
     // The frontier handle is also an assessed item: recovery identities may
     // not overlap the dispositions, or one observed record is both returned
     // and lost.
