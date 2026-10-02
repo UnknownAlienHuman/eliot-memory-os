@@ -1244,13 +1244,43 @@ mod tests {
         Ok(kind)
     }
 
+    /// A per-test scratch root under `std::env::temp_dir()` (#876).
+    ///
+    /// The root is named from this issue (#876), the owning test's tag and a
+    /// fresh v4 run id, so no two tests in this crate can ever share a temp
+    /// root: the process id alone is not a discriminator, because every test
+    /// in one lib-test binary runs on a shared process id in parallel threads
+    /// and can therefore collide with a sibling fixture. The root is removed
+    /// on every exit path, including a panic or an early `return Err(..)`, so
+    /// a later test's emptiness check can never observe this fixture's
+    /// residue.
+    struct ScratchRoot(std::path::PathBuf);
+
+    impl ScratchRoot {
+        /// `tag` identifies the owning test; the v4 run id identifies this run.
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("eliot-i876-{tag}-{}", uuid::Uuid::new_v4()));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn cleanup_owned_temp_reports_removal_absent_and_unowned_states()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "eliot-cleanup-owned-temp-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = ScratchRoot::new("owned-temp-states");
+        let temp_dir = scratch.path().to_path_buf();
         std::fs::create_dir_all(&temp_dir)?;
 
         let owned = temp_dir.join("blob-stage-owned");
@@ -1295,10 +1325,8 @@ mod tests {
     #[test]
     fn noncapacity_failure_with_failed_cleanup_keeps_both_causes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "eliot-cleanup-compound-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = ScratchRoot::new("noncapacity-compound-cleanup");
+        let temp_dir = scratch.path().to_path_buf();
         let store = BlobStore::open(&BlobStoreConfig {
             root: temp_dir.display().to_string(),
         })?;
@@ -1392,10 +1420,8 @@ mod tests {
     #[test]
     fn noncapacity_failure_with_removed_staging_keeps_legacy_variants()
     -> Result<(), Box<dyn std::error::Error>> {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "eliot-cleanup-legacy-variant-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = ScratchRoot::new("noncapacity-legacy-cleanup");
+        let temp_dir = scratch.path().to_path_buf();
         let store = BlobStore::open(&BlobStoreConfig {
             root: temp_dir.display().to_string(),
         })?;
