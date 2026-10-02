@@ -1108,7 +1108,10 @@ fn a_current_source_generation_materialises_the_destination_on_disk() {
         "the publication created the destination root at {destination_root}"
     );
     assert!(
-        materialisation.destination_root_identity.volume_serial_number != 0
+        materialisation
+            .destination_root_identity
+            .volume_serial_number
+            != 0
             && materialisation.destination_root_identity.file_index != 0,
         "the creation receipt carries a real observed identity for the created object"
     );
