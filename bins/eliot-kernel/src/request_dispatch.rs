@@ -3070,6 +3070,178 @@ fn answer_verify_protocol_arm(
     .into_reply(idempotency_key)
 }
 
+/// Decides which admitted arm a `backup.verify` request is, and returns the INLINE
+/// arm's presented bytes and succession pointer, or the reply that ends the route.
+///
+/// The PROTOCOL arm is decided here and nowhere else, and it is decided in exactly
+/// two steps, in this order.
+///
+/// First the ADMISSION REFERENCE. `BackupAdmissionRef::validate` decides the
+/// authority/scope/epoch bindings but deliberately leaves `admission_receipt` an
+/// opaque reference, so until #2862 I2 closed that field it was free text any
+/// caller could satisfy. This boundary now issues its own receipt for this request
+/// through the repository's one `ReceiptId` issuer, from the LIVE module scope,
+/// fence and authenticated principal, and requires the presented reference to BE
+/// that receipt. A request admitted under another session, epoch, generation or
+/// principal is the caller's payload and names a field, so it is answered `invalid`
+/// here — before the owner-name refusal, which would have told the caller the ARM
+/// was unavailable for a request this boundary never admitted.
+///
+/// Second, the ABSENT OWNER. The receipt admits the request; it does not resolve
+/// the retained handle into the bytes that handle names, and only a
+/// retained-archive owner can do that. None exists on this product, so the arm is
+/// refused by NAME. That answer is still a real one: the request was decoded and
+/// passed the protocol's own `validate()` first, and it has now passed this
+/// boundary's own admission receipt.
+///
+/// `caller` is the ADMITTED caller, resolved after [`admit_verify_bundle`] and
+/// before this step because issuing the admission receipt needs it. The INLINE arm
+/// is byte-for-byte what it was: the exact bytes the caller presented and their
+/// optional succession pointer, with no protocol request and no owner evidence, so
+/// nothing on the later route may borrow the protocol arm's.
+fn admitted_inline_verify_arm(
+    session: &Session,
+    admitted: AdmittedVerifyBundle,
+    caller: &CaptureCallerAuth,
+    idempotency_key: &str,
+) -> Result<(Vec<u8>, Option<BackupVerifySuccessorPointer>), Value> {
+    match admitted {
+        AdmittedVerifyBundle::Inline {
+            bundle_raw,
+            successor,
+        } => Ok((bundle_raw, successor)),
+        AdmittedVerifyBundle::Protocol { request } => Err(answer_verify_protocol_arm(
+            session,
+            caller,
+            &request,
+            idempotency_key,
+        )),
+    }
+}
+
+/// Gates the owner-issued archive provenance for THIS verification operation and
+/// returns the evidence every later step must bind against, or the refusal that
+/// ends the route at this step.
+///
+/// `request` is `None` on the only arm that reaches this gate, and that is the
+/// gate's own argument rather than a default; see below.
+///
+/// #2862 (items I3/I4): the owner-issued archive provenance for THIS
+/// operation is resolved and every owner-issued value it holds is bound
+/// to the archive the capture owner just reported, BEFORE any verdict is
+/// produced. On today's tree the answer is
+/// `OwnerProvenanceEvidence::unissued` — no admitted owner resolves a
+/// retained handle and no owner channel authenticates as
+/// `BackupRole::CaptureOwner` or `BackupRole::Verifier` for a backup
+/// archive (the measured reasons are enumerated in
+/// `backup_verify_provenance`'s module docs) — so this check is the reason
+/// a mismatched receipt can never reach a provenance-qualified verdict
+/// rather than an incidental guard: the refusal path is the same
+/// structural `invalid_reply` an archive-invalid frame already gets, and
+/// it carries no ceiling and no class claim. It runs AFTER the successor
+/// branch on purpose, so I10's caller-presented `successor_of` behaviour
+/// is byte-for-byte unchanged.
+///
+/// The admitted protocol request is a GATE argument, not a fallback: a
+/// frame that presented one has an owner-issued handle and receipt
+/// REQUIRED, and a frame that presented none must have issued none, so
+/// neither arm can borrow the other's evidence. On the INLINE arm — the
+/// only arm that reaches this point — that argument is `None`, and `None`
+/// is this arm's own answer rather than a default: it is exactly what makes
+/// the gate require the owner to have issued nothing.
+fn gated_owner_provenance(
+    report: &CaptureReport,
+    bundle_raw: &[u8],
+    idempotency_key: &str,
+) -> Result<OwnerProvenanceEvidence, Value> {
+    let provenance = OwnerProvenanceEvidence::unissued();
+    if let Err(refusal) = check_provenance_binding(&provenance, None, report, bundle_raw) {
+        return Err(invalid_reply(
+            BACKUP_VERIFY_OPERATION,
+            idempotency_key,
+            refusal.field(),
+            &bounded_reason(&refusal.reason()),
+        ));
+    }
+    Ok(provenance)
+}
+
+/// Builds the accepted request identity against the GATED provenance, and reads the
+/// two owner-issued digests out of it in the order the durable row needs them.
+///
+/// `provenance` is the evidence [`gated_owner_provenance`] has already accepted —
+/// the gate is a SEPARATE step and must not be folded back in here — and the
+/// request argument is `None` on this arm for the same reason the gate's is: an
+/// inline frame must have issued nothing. The identity therefore cannot be built
+/// from evidence that skipped the gate, and no verdict can be projected from an
+/// identity that was never built.
+///
+/// A request whose identity cannot produce both the request digest and the
+/// namespace key is not recorded, and both of those refusals are the same
+/// `verification_not_recorded_reply`, so a request missing either answers once and
+/// identically whichever is asked for first.
+fn bound_verify_identity(
+    session: &Session,
+    caller: &CaptureCallerAuth,
+    report: &CaptureReport,
+    bundle_raw: &[u8],
+    provenance: &OwnerProvenanceEvidence,
+    idempotency_key: &str,
+) -> Result<(BackupVerifyRequestIdentity, String, String), Value> {
+    let identity = match backup_verify_identity(
+        session,
+        caller,
+        report,
+        bundle_raw,
+        provenance,
+        None,
+        idempotency_key,
+    ) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            return Err(invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.verify",
+                &bounded_reason(&reason),
+            ));
+        }
+    };
+    let Ok(request_digest) = backup_verify_request_digest(&identity) else {
+        return Err(verification_not_recorded_reply(idempotency_key));
+    };
+    let Ok(record_key) = identity.namespace_digest() else {
+        return Err(verification_not_recorded_reply(idempotency_key));
+    };
+    Ok((identity, request_digest, record_key))
+}
+
+/// Projects the owner's own class evidence into the shared successful-answer shape,
+/// or names the class ceiling that cannot be projected.
+///
+/// The class ceiling is the owner's own value: this step never reads it from
+/// anything but the accepted identity and the report, so no matching text and no
+/// matching digest can promote a level on this path. `record_key` is the SAME
+/// namespace digest the durable readback below is addressed by, so the answer, the
+/// durable key and the stored identity are one value read once.
+fn projected_verification(
+    report: &CaptureReport,
+    identity: &BackupVerifyRequestIdentity,
+    request_digest: String,
+    record_key: &str,
+    idempotency_key: &str,
+) -> Result<VerifiedProjection, Value> {
+    projection_from_report(report, identity, request_digest, record_key.to_owned())
+        .map_err(|reason| {
+            invalid_reply(
+                BACKUP_VERIFY_OPERATION,
+                idempotency_key,
+                "backup.class_ceiling",
+                &bounded_reason(&reason),
+            )
+        })
+}
+
 /// Admits the optional succession pointer and checks both of its digests for the
 /// route's own 64-hex shape.
 ///
@@ -3360,94 +3532,57 @@ impl KernelComposition {
     /// behind the receipt, and the verifier role behind the attestation. Both take
     /// the admitted request as a parameter, so a retained-archive owner supplies
     /// bytes at this point and the rest of the route proceeds with no new shape.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one linear admit-decode-reprove-bind-project-readback sequence per verify operation; splitting it would hide the exact order in which the successor branch, the provenance gate and the durable row are decided"
-    )]
+    ///
+    /// The body below is ONE ordered sequence — admit, decide the arm, re-prove,
+    /// reconcile, gate, bind, project, read back — and each step is a named
+    /// function, so the order is legible at the call site instead of hidden inside
+    /// one long body. The order is itself load-bearing and each step's own
+    /// documentation says what must run before it: [`reproved_verify_report`] before
+    /// [`Self::answer_successor_verification`], and [`gated_owner_provenance`]
+    /// AFTER the successor branch and BEFORE [`bound_verify_identity`]. Every step
+    /// answers with the reply that ENDS the route, so each refusal leaves by
+    /// exactly one door and no step can be skipped past.
+    ///
+    /// The admission has ONE closed two-arm result and there is no second admission
+    /// path to keep in step with it. Both refusal classes are rendered by
+    /// `VerifyAdmissionRefusal::into_reply` where they are shape failures and
+    /// by this function's own match on the arm where the missing owner is what
+    /// is absent, and that is what keeps a caller payload fault (`invalid`,
+    /// with a `field`) distinguishable from the absent retained-archive owner
+    /// (`refused`/`plan_gap`, with `missing_owner`): the second is not the
+    /// caller's to correct.
     fn handle_backup_verify(
         &self,
         session: &Session,
         payload: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TransportError> {
-        // The admission has ONE closed two-arm result and there is no second admission
-        // path to keep in step with it. Both refusal classes are rendered by
-        // `VerifyAdmissionRefusal::into_reply` where they are shape failures and
-        // by this function's own match on the arm where the missing owner is what
-        // is absent, and that is what keeps a caller payload fault (`invalid`,
-        // with a `field`) distinguishable from the absent retained-archive owner
-        // (`refused`/`plan_gap`, with `missing_owner`): the second is not the
-        // caller's to correct.
         let admitted = match admit_verify_bundle(payload) {
             Ok(admitted) => admitted,
             Err(refusal) => return Ok(refusal.into_reply(idempotency_key)),
         };
         let caller = admit_backup_caller(session)?;
-        // The PROTOCOL arm is decided here and nowhere else, and it is decided
-        // in exactly two steps, in this order.
-        //
-        // First the ADMISSION REFERENCE. `BackupAdmissionRef::validate` decides
-        // the authority/scope/epoch bindings but deliberately leaves
-        // `admission_receipt` an opaque reference, so until #2862 I2 closed that
-        // field it was free text any caller could satisfy. This boundary now
-        // issues its own receipt for this request through the repository's one
-        // `ReceiptId` issuer, from the LIVE module scope, fence and authenticated
-        // principal, and requires the presented reference to BE that receipt. A
-        // request admitted under another session, epoch, generation or principal
-        // is the caller's payload and names a field, so it is answered
-        // `invalid` here — before the owner-name refusal below, which would have
-        // told the caller the ARM was unavailable for a request this boundary
-        // never admitted.
-        //
-        // Second, the ABSENT OWNER. The receipt admits the request; it does not
-        // resolve the retained handle into the bytes that handle names, and only
-        // a retained-archive owner can do that. None exists on this product, so
-        // the arm is refused by NAME. That answer is still a real one: the
-        // request was decoded and passed the protocol's own `validate()` first,
-        // and it has now passed this boundary's own admission receipt.
-        let (bundle_raw, successor) = match admitted {
-            AdmittedVerifyBundle::Inline {
-                bundle_raw,
-                successor,
-            } => (bundle_raw, successor),
-            AdmittedVerifyBundle::Protocol { request } => {
-                return Ok(answer_verify_protocol_arm(
-                    session,
-                    &caller,
-                    &request,
-                    idempotency_key,
-                ));
-            }
-        };
-        let report = match self.backup_capture().verify_only(
-            &bundle_raw,
+        let (bundle_raw, successor) = match admitted_inline_verify_arm(
+            session,
+            admitted,
             &caller,
-            &session.module_generation.state_fence,
+            idempotency_key,
+        ) {
+            Ok(inline) => inline,
+            Err(reply) => return Ok(reply),
+        };
+        // Re-prove the caller's presented bytes with the capture owner. Both of this
+        // step's refusals are real answers and both end the route here; the structural
+        // one consults the bound row first (see `reproved_verify_report`).
+        let report = match self.reproved_verify_report(
+            session,
+            &caller,
+            &bundle_raw,
             idempotency_key,
         ) {
             Ok(report) => report,
-            // #2802: the bound row is consulted BEFORE the structural refusal is
-            // returned, so bytes that are not the archive this key is bound to answer
-            // the I5.27 identity conflict instead of an archive-invalid reply. The
-            // recompute is what failed, not the identity: `successor_of` is answered
-            // further down and is a read of another operation, so a successor whose
-            // named predecessor cannot be reconciled still answers from the archive
-            // owner's own refusal.
-            Err(error) => {
-                if let Some(conflict) = self.changed_bytes_identity_conflict(
-                    session,
-                    &caller,
-                    &bundle_raw,
-                    idempotency_key,
-                ) {
-                    return Ok(conflict);
-                }
-                return Ok(capture_error_reply(idempotency_key, &error));
-            }
+            Err(reply) => return Ok(reply),
         };
-        if let Some(refusal) = undecided_report_reply(&report, idempotency_key) {
-            return Ok(refusal);
-        }
         // A permitted successor reconciles a prior operation by naming it
         // exactly, and that answer comes from the predecessor's own row. It is
         // answered before the fresh identity is even built, because a
@@ -3464,81 +3599,92 @@ impl KernelComposition {
                 idempotency_key,
             ));
         }
-        // #2862 (items I3/I4): the owner-issued archive provenance for THIS
-        // operation is resolved and every owner-issued value it holds is bound
-        // to the archive the capture owner just reported, BEFORE any verdict is
-        // produced. On today's tree the answer is
-        // `OwnerProvenanceEvidence::unissued` — no admitted owner resolves a
-        // retained handle and no owner channel authenticates as
-        // `BackupRole::CaptureOwner` or `BackupRole::Verifier` for a backup
-        // archive (the measured reasons are enumerated in
-        // `backup_verify_provenance`'s module docs) — so this check is the reason
-        // a mismatched receipt can never reach a provenance-qualified verdict
-        // rather than an incidental guard: the refusal path is the same
-        // structural `invalid_reply` an archive-invalid frame already gets, and
-        // it carries no ceiling and no class claim. It runs AFTER the successor
-        // branch on purpose, so I10's caller-presented `successor_of` behaviour
-        // is byte-for-byte unchanged.
-        //
-        // The admitted protocol request is a GATE argument, not a fallback: a
-        // frame that presented one has an owner-issued handle and receipt
-        // REQUIRED, and a frame that presented none must have issued none, so
-        // neither arm can borrow the other's evidence. On the INLINE arm — the
-        // only arm that reaches this point — that argument is `None`, and `None`
-        // is this arm's own answer rather than a default: it is exactly what makes
-        // the gate require the owner to have issued nothing.
-        let provenance = OwnerProvenanceEvidence::unissued();
-        if let Err(refusal) = check_provenance_binding(&provenance, None, &report, &bundle_raw) {
-            return Ok(invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                refusal.field(),
-                &bounded_reason(&refusal.reason()),
-            ));
-        }
-        let identity = match backup_verify_identity(
+        // The owner-issued archive provenance gate. It runs AFTER the successor
+        // branch on purpose, so I10's caller-presented `successor_of` behaviour is
+        // byte-for-byte unchanged, and BEFORE the identity is built, so no verdict
+        // is ever produced from ungated evidence.
+        let provenance = match gated_owner_provenance(&report, &bundle_raw, idempotency_key) {
+            Ok(provenance) => provenance,
+            Err(reply) => return Ok(reply),
+        };
+        // The accepted request identity, and the two owner-issued digests read out
+        // of it in the order the durable row below needs them.
+        let (identity, request_digest, record_key) = match bound_verify_identity(
             session,
             &caller,
             &report,
             &bundle_raw,
             &provenance,
-            None,
             idempotency_key,
         ) {
-            Ok(identity) => identity,
-            Err(reason) => {
-                return Ok(invalid_reply(
-                    BACKUP_VERIFY_OPERATION,
-                    idempotency_key,
-                    "backup.verify",
-                    &bounded_reason(&reason),
-                ));
-            }
+            Ok(bound) => bound,
+            Err(reply) => return Ok(reply),
         };
-        let Ok(request_digest) = backup_verify_request_digest(&identity) else {
-            return Ok(verification_not_recorded_reply(idempotency_key));
+        // STRUCTURAL → PROVENANCE → CLASS: the owner's own class evidence, projected.
+        let fresh = match projected_verification(
+            &report,
+            &identity,
+            request_digest,
+            record_key.as_str(),
+            idempotency_key,
+        ) {
+            Ok(fresh) => fresh,
+            Err(reply) => return Ok(reply),
         };
-        let Ok(record_key) = identity.namespace_digest() else {
-            return Ok(verification_not_recorded_reply(idempotency_key));
-        };
-        let fresh =
-            match projection_from_report(&report, &identity, request_digest, record_key.clone()) {
-                Ok(fresh) => fresh,
-                Err(reason) => {
-                    return Ok(invalid_reply(
-                        BACKUP_VERIFY_OPERATION,
-                        idempotency_key,
-                        "backup.class_ceiling",
-                        &bounded_reason(&reason),
-                    ));
-                }
-            };
         let Ok(prior) =
             self.load_prior_verification(&identity, record_key.as_str(), idempotency_key)
         else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
         Ok(self.answer_backup_verify(session, prior, &identity, &fresh, idempotency_key))
+    }
+
+    /// Re-proves the caller's presented bytes with the capture owner and returns the
+    /// owner's own report, or the reply that ends the route at this step.
+    ///
+    /// `Ok` here is the ONE value that can reach the rest of the route: a structural
+    /// refusal and an undecided report are both answers, not fall-through.
+    ///
+    /// #2802: the bound row is consulted BEFORE the structural refusal is
+    /// returned, so bytes that are not the archive this key is bound to answer
+    /// the I5.27 identity conflict instead of an archive-invalid reply. The
+    /// recompute is what failed, not the identity: `successor_of` is answered by
+    /// the caller after this step and is a read of another operation, so a
+    /// successor whose named predecessor cannot be reconciled still answers from
+    /// the archive owner's own refusal.
+    ///
+    /// The presented bytes are this caller's own admission, so nothing here reads
+    /// through a retained handle.
+    fn reproved_verify_report(
+        &self,
+        session: &Session,
+        caller: &CaptureCallerAuth,
+        bundle_raw: &[u8],
+        idempotency_key: &str,
+    ) -> Result<CaptureReport, Value> {
+        let report = match self.backup_capture().verify_only(
+            bundle_raw,
+            caller,
+            &session.module_generation.state_fence,
+            idempotency_key,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                if let Some(conflict) = self.changed_bytes_identity_conflict(
+                    session,
+                    caller,
+                    bundle_raw,
+                    idempotency_key,
+                ) {
+                    return Err(conflict);
+                }
+                return Err(capture_error_reply(idempotency_key, &error));
+            }
+        };
+        if let Some(refusal) = undecided_report_reply(&report, idempotency_key) {
+            return Err(refusal);
+        }
+        Ok(report)
     }
 
     /// Answers the I5.27 identity conflict for presented bytes that are NOT the archive
