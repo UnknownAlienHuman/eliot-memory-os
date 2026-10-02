@@ -776,8 +776,8 @@ mod tests {
         );
         assert!(matches!(
             parse_manifest(&unowned),
-            Err(CellRegistryError::RefsOwnersMismatch { detail })
-                if detail == "refs carry 1 cells, owners carry 0"
+            Err(CellRegistryError::MalformedManifest { detail })
+                if detail == "functional_cell_state_owners: no owner rows"
         ));
 
         assert!(matches!(
