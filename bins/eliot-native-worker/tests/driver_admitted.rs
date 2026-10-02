@@ -10,11 +10,11 @@
 //! `ProcessRequest`, and no direct `std::process::Command`.
 //!
 //! Proves one real admitted contour reaches `Ready` and serves a bounded
-//! frame, lost start/restart reconciles without a second process, invalid
-//! admission invokes no factory/start, and the `KernelReplayPort` thin
-//! transport (no worker-local journal, M3) carries the five replay ops with
-//! claim/replay binding and echo checks. T9-05 coordinator verification is
-//! not consumed by this contour.
+//! frame, a failed response writer leaves the exact request replayable, lost
+//! start/restart reconciles without a second process, invalid admission invokes
+//! no factory/start, and the `KernelReplayPort` thin transport (no worker-local
+//! journal, M3) carries the five replay ops with claim/replay binding and echo
+//! checks. T9-05 coordinator verification is not consumed by this contour.
 
 #![cfg(windows)]
 
@@ -1045,6 +1045,137 @@ fn admitted_drive_reaches_ready_and_serves_bounded_frame() {
     );
 
     remove_bat("drive-ready");
+}
+
+#[test]
+fn response_writer_failure_keeps_claimed_request_replayable() {
+    struct BrokenPipeWriter {
+        attempted_writes: usize,
+        output: Vec<u8>,
+    }
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.attempted_writes += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "response channel closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (
+        mut worker,
+        _,
+        registration,
+        claim_value,
+        hello_value,
+        process,
+        evidence,
+        admissions,
+        bat,
+    ) = build_driver(
+        "drive-output-refusal",
+        "operation-output-refusal-1",
+        "tree-output-refusal-1",
+        "nonce-output-refusal-1",
+    );
+    let operation_id = claim_value.operation_id.as_str().to_owned();
+    assert_eq!(process.operation_id().as_str(), operation_id.as_str());
+    let admission = claim_request(&registration, &claim_value);
+    let reconcile = reconcile_for(&claim_value);
+    let readiness = readiness_for(&claim_value);
+    let mut lifecycle = FakeLifecycle::new();
+
+    let ready = block_on(drive_admitted_claimed(
+        &mut lifecycle,
+        &mut worker,
+        &registration,
+        &admission,
+        hello_value,
+        process,
+        &reconcile,
+        &readiness,
+    ))
+    .unwrap_or_else(|error| panic!("output-refusal worker must reach Ready, got {error:?}"));
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(ready.stream_id, "claim-1/gen-1");
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str())
+    );
+
+    let frame = stdio_frame("output-refusal-request-1", WorkerFrameBody::Health);
+    let mut failing_reader = Cursor::new(encode_frame(&frame));
+    let mut failing_writer = BrokenPipeWriter {
+        attempted_writes: 0,
+        output: Vec::new(),
+    };
+    let refused = block_on(worker.serve_one_frame(&mut failing_reader, &mut failing_writer));
+    assert!(
+        matches!(
+            &refused,
+            Err(NativeWorkerError::Io(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ),
+        "a closed response channel must return the typed I/O refusal, got {refused:?}"
+    );
+    assert_eq!(failing_writer.attempted_writes, 1);
+    assert!(failing_writer.output.is_empty());
+    assert_eq!(worker.lifecycle(), WorkerLifecycle::Ready);
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str()),
+        "response refusal must leave the admitted operation bound to its original claim"
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    // The same request identity reads the committed result through the normal
+    // replay port after the output refusal; a repeated read returns that same
+    // event identity instead of starting another operation.
+    let mut replay_reader = Cursor::new(encode_frame(&frame));
+    let mut replay_output = Vec::new();
+    let shutdown = block_on(worker.serve_one_frame(&mut replay_reader, &mut replay_output))
+        .unwrap_or_else(|error| panic!("refused response must remain replayable, got {error:?}"));
+    assert!(!shutdown);
+    let replay = decode_response(&replay_output);
+    assert_eq!(replay.request_id.as_str(), frame.request_id.as_str());
+    assert_eq!(replay.connection_id, frame.connection_id);
+    assert_eq!(replay.trace_context, frame.trace_context);
+    assert!(!replay.response.events.is_empty());
+    assert!(replay.response.events.iter().all(|event| {
+        event.request_id.as_str() == frame.request_id.as_str()
+            && event.stream_id == ready.stream_id
+    }));
+
+    let replay_events = serde_json::to_value(&replay.response.events).expect("replay events");
+    let mut repeated_reader = Cursor::new(encode_frame(&frame));
+    let mut repeated_output = Vec::new();
+    let shutdown = block_on(worker.serve_one_frame(&mut repeated_reader, &mut repeated_output))
+        .unwrap_or_else(|error| panic!("repeated request must replay, got {error:?}"));
+    assert!(!shutdown);
+    let repeated = decode_response(&repeated_output);
+    assert_eq!(
+        serde_json::to_value(&repeated.response.events).expect("repeated events"),
+        replay_events,
+        "the original request must keep its committed replay event identity"
+    );
+    assert_eq!(
+        lifecycle.claim.as_ref().map(|claim| claim.operation_id.as_str()),
+        Some(operation_id.as_str())
+    );
+    assert_eq!(*lock(&admissions), 1);
+    assert_eq!(lock(&evidence).len(), 1);
+
+    remove_bat("drive-output-refusal");
 }
 
 #[test]
