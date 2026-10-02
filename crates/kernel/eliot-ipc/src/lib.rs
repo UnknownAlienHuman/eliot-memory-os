@@ -602,9 +602,9 @@ pub fn dispatch_lifecycle_message(
 ) -> Result<LifecycleMessageOutcome, TransportError> {
     frame.validate()?;
     match frame.message_type {
-        MessageType::Event => Ok(LifecycleMessageOutcome::Event(dispatch_lifecycle_event(
-            frame, ledger,
-        )?)),
+        MessageType::Event => Ok(LifecycleMessageOutcome::Event(Box::new(
+            dispatch_lifecycle_event(frame, ledger)?,
+        ))),
         MessageType::Cancel => Ok(LifecycleMessageOutcome::Cancel(dispatch_lifecycle_cancel(
             frame, registry,
         )?)),
@@ -646,7 +646,12 @@ pub enum LifecycleMessageOutcome {
     /// and an explicit cancellation are distinguishable recorded outcomes.
     Terminal(LifecycleRequestOutcome),
     /// A lifecycle `Event` was routed through the replay/ack envelope.
-    Event(LifecycleEventDispatch),
+    ///
+    /// Boxed because this variant carries at least 320 bytes while the
+    /// second-largest carries 104: held inline it made every
+    /// `LifecycleMessageOutcome` on every dispatch path - including the control,
+    /// terminal and cancel arms that never touch it - 320 bytes wide.
+    Event(Box<LifecycleEventDispatch>),
     /// An explicit `Cancel` was applied through the cancellation registry.
     Cancel(CancellationDisposition),
 }
@@ -4452,7 +4457,7 @@ mod tests {
                 &mut lifecycle,
                 &mut ledger,
             )?,
-            LifecycleMessageOutcome::Event(LifecycleEventDispatch::New(_))
+            LifecycleMessageOutcome::Event(dispatch) if matches!(dispatch.as_ref(), LifecycleEventDispatch::New(_))
         ));
         assert!(matches!(
             dispatch_lifecycle_message(
@@ -4462,7 +4467,7 @@ mod tests {
                 &mut lifecycle,
                 &mut ledger,
             )?,
-            LifecycleMessageOutcome::Event(LifecycleEventDispatch::Duplicate(_))
+            LifecycleMessageOutcome::Event(dispatch) if matches!(dispatch.as_ref(), LifecycleEventDispatch::Duplicate(_))
         ));
 
         // Fatal is the explicit terminal control flow.

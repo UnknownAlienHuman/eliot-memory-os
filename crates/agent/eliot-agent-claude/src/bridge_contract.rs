@@ -36,9 +36,9 @@
 //!   [`crate::execution::prepare`] compares it to the route of the admitted
 //!   attempt. A declaration issued for a different route generation is refused
 //!   - the route digest the declaration carries (its
-//!   `contract.admitted_binding_digest`, recomputed here with the route owner's
-//!   own [`route_fingerprint_digest_for`]) is then a digest over the wrong
-//!   generation.
+//!     `contract.admitted_binding_digest`, recomputed here with the route owner's
+//!     own [`route_fingerprint_digest_for`]) is then a digest over the wrong
+//!     generation.
 //! - `declaration.state_fence` is the I6.10 authority epoch identity of the
 //!   generation the owner admitted. It is compared to the live current fence. A
 //!   declaration issued under a retired or foreign epoch is refused.
