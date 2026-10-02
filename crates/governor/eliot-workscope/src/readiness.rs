@@ -668,10 +668,10 @@ pub fn evaluate_material_request(
 mod tests {
     #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
     use super::super::{
-        ColdStartController, GenerationEvidence, GoverningSource, GoverningSourceRole,
-        GoverningSourceSet, OnboardingLease, OnboardingLeaseState, PrivacyProfile,
-        RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding, ScopeBindingGuard,
-        ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus, TaskBindingInput,
+        AuthorityBasis, ColdStartController, GenerationEvidence, GoverningSource,
+        GoverningSourceRole, GoverningSourceSet, OnboardingLease, OnboardingLeaseState,
+        PrivacyProfile, RepositoryLineageIdentity, ResourceExecutionIdentity, ScopeBinding,
+        ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeLifecycle, SourceStatus, TaskBindingInput,
         WorkScopeCandidate, WorkspaceInstanceIdentity,
     };
     use super::*;
@@ -788,7 +788,9 @@ mod tests {
                 status: SourceStatus::Admitted,
                 domains: Vec::new(),
                 digest: "a".repeat(64),
-                authority_basis: None,
+                authority_basis: Some(AuthorityBasis::HumanOwner {
+                    owner_ref: "owner:architecture".into(),
+                }),
             }],
             Vec::new(),
         ) {
