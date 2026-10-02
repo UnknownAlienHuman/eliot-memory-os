@@ -114,6 +114,7 @@ pub use negative_memory_read::{
 };
 mod controlboard_projection;
 mod learning_admission;
+mod learning_attribution;
 mod learning_closure;
 mod learning_delta_integration;
 mod learning_promotion;
@@ -204,6 +205,13 @@ pub use learning_admission::{
     LEARNING_ADMISSION_SCHEMA_VERSION, LearningAdmissionClaim, LearningAdmissionError,
     LearningAdmissionPermit, VerifiedLearningAdmission, issue_learning_admission,
     issue_learning_ticket, verify_learning_admission, verify_learning_ticket,
+};
+pub use learning_attribution::{
+    AttributionOutcome, AttributionRefusal, AttributorIdentity, DecisionOwnerRecord,
+    DeliveredUseOwnerRecord, FailureDomain, IndependenceOutcome, IndependentObservation,
+    IndependentObservationReceipt, IndependentObservationRoute, UseAttributionOwnerInput,
+    UseBasisOwnerRecord, attribute_committed_attempt, attribute_observed_use,
+    issue_independence_receipt,
 };
 pub use learning_closure::{
     CanonicalLearningDeltaStore, CanonicalLearningDeltaStoreError, ClosureIdentityInput,
