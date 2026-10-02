@@ -850,7 +850,7 @@ fn check_curation_member_identity(
             ),
         ),
     ];
-    curation_identity(declared, &members, &inputs.conflict.conflict_set)
+    curation_identity(declared, &members, inputs.conflict.conflict_set)
 }
 
 /// Compares every curation-typed member against the declared closure.
