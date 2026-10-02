@@ -151,9 +151,15 @@ pub(crate) const HOOK_INPUT_PROFILE_ID: &str = "eliot.agent-bridge.hook-input.v1
 ///   owner's aggregate-retention row, keeping the acquisition plus retained
 ///   bytes at the accepted ratio of one record plus bounded decoder state.
 /// - `max_json_string_bytes`, `max_container_items`, `max_scalar_values` and
-///   `max_nesting_depth` are reused unchanged from the owner's decode
-///   pre-scan rows so hook decode-stage budget matches the request path instead
-///   of introducing a second scale of numbers.
+///   `max_nesting_depth` are reused unchanged from the owner's decode pre-scan
+///   rows so this profile carries no second scale of numbers. They are NOT
+///   enforced on the hook branch: that branch calls only `read_bounded_record`,
+///   never the owner's `prevalidate_record` / `check_request_envelope` decode
+///   pre-scan. Together with `max_buffered_bytes` and the intrinsic
+///   `validate` / `scratch_budget` checks they are carried for profile-shape
+///   identity, not as hook behaviour. The rows `read_bounded_record` actually
+///   enforces are exactly `max_record_bytes`, `max_oversize_discard_bytes` and
+///   `oversize_disposition`.
 /// - `max_oversize_discard_bytes = 4_194_304` (4 MiB) is reused unchanged from
 ///   the owner's resynchronization row. This is the owner's own Bridge-local
 ///   acquisition decision and NOT I7.2's 4 MiB transport frame default
@@ -272,77 +278,420 @@ pub(crate) enum ReadOutcome {
 ///
 /// The ceiling is enforced incrementally with checked arithmetic while
 /// collecting, before any `String` / `Value` allocation. LF terminates a
-/// record; a single trailing CR is stripped as part of a CRLF terminator, and
-/// neither terminator byte counts toward the ceiling. A final record at EOF
-/// without a newline is returned when within bound. A complete within-bound
-/// record that is not valid UTF-8 yields `InvalidUtf8`. An overlong record
-/// stops buffering immediately and is resynchronized according to the
-/// profile's oversize disposition without buffering during discard.
+/// record; a CR the LF immediately follows is terminator framing and counts
+/// neither toward the ceiling nor toward the accepted bytes, and neither
+/// terminator byte is ever buffered. A final record at EOF without a newline
+/// is returned when within bound. A complete within-bound record that is not
+/// valid UTF-8 yields `InvalidUtf8`. An overlong record stops buffering
+/// immediately and is resynchronized according to the profile's oversize
+/// disposition without buffering during discard.
+///
+/// # The ceiling is on content bytes, on every chunking path
+///
+/// The total compared against `max_record_bytes` is the content length with
+/// both terminator bytes removed, whatever the caller's read size is. Two
+/// mechanisms produce that, and together they are why the ceiling is not a
+/// property of the fills:
+///
+/// - **Content charging is exact.** A fill that is not itself the ambiguous
+///   case charges its content bytes once, through `checked_add`, and consumes
+///   every byte it charges. No byte is counted twice and none is counted
+///   twice-then-dropped.
+/// - **A fill ending on a lone CR is consumed whole, and the CR is buffered
+///   UNCHARGED rather than buffered out of place.** That fill leaves the stream
+///   entirely - its content is consumed WITH the CR, not merely charged short
+///   of it - so the next fill cannot re-receive bytes this one already
+///   consumed. The CR is appended to `record` immediately, at the position it
+///   occupies in the stream, and `record_content_len` deliberately does NOT
+///   advance: the byte is present but unproven. The next fill then classifies
+///   it by the byte that FOLLOWS it, never by the size of the fill that follows
+///   it: it is the terminator's own byte exactly when that next byte is the LF
+///   ending this record, and is CONTENT in every other case (any intervening
+///   byte, or EOF). A framing CR is discharged - that exact byte is removed
+///   from `record` and stays uncharged; a content CR is charged against the
+///   ceiling exactly once, in the iteration that appended it and in no other.
+///   A CR is therefore never both charged and then dropped, and never dropped
+///   uncharged.
+///
+/// The second mechanism is what covers the arrival the LF-only scan cannot
+/// classify in the fill that carries it: the byte that ends the fill and the
+/// newline that would prove it framing land in different fills, so at that
+/// moment the byte is indistinguishable from content and charging it there and
+/// then never charging it again would make a record of exactly
+/// `max_record_bytes` arrive as `ceiling + 1` and be REFUSED, while the
+/// identical byte stream delivered in one fill, or in fills that land on a
+/// content byte, was ACCEPTED. The first mechanism covers everything the second
+/// never touches - fills that divide neither the ceiling nor the terminator,
+/// where no CR is ever held and every byte is charged once as ordinary content.
+///
+/// The classification is a function of the byte stream alone: the "next byte"
+/// test is read off the same measured window as `chunk_len`, so a record's
+/// disposition and its accepted bytes are identical for every caller read size.
+/// Nothing is deferred beyond that one CR, so the collected prefix never
+/// exceeds the ceiling even transiently: a record can neither exceed the
+/// ceiling nor be silently shortened, and no terminator byte is ever removed
+/// after the fact.
+///
+/// # The accepted bytes are the stream's content bytes, in stream order
+///
+/// A CR that a fill held is buffered at its true stream position, and it is
+/// removed - if it is framing - at that position (`Vec::remove`), by index and
+/// not by "whatever is at the end". The index is the reliable fact: it is
+/// written only by the arm that appended that byte, every append in this loop
+/// goes to the end of `record`, and the only removal is this one, so nothing is
+/// ever inserted or removed in front of `held_at` and the byte named there is
+/// still the byte that was held.
+///
+/// What is NOT a fact is that the held byte is the last one. A fill after the
+/// one that held the CR may charge and append content of its own, and those
+/// bytes land behind the held byte: on `x\rx\r\n` in two-byte fills, the
+/// second fill charges its `x` and appends it after the held CR, so `record`
+/// is `x`, `\r`, `x`, `\r` with the terminator's CR held at `3`. Today the
+/// discharge cannot observe that case, because it only runs when the
+/// terminating fill carries no content of its own, which is what makes the held
+/// byte the last one at that moment - so removing the last element happens to
+/// remove the right byte. That is a property of the reaching condition, not a
+/// property of "the held byte is last", and the discharge reads `held_at` for a
+/// reason: removing the named index keeps it correct under any of the fills,
+/// where removing the last element is correct only while no fill has appended
+/// behind the held byte.
+///
+/// `Vec::remove` is what preserves stream order for everything after the held
+/// byte: it closes the gap and shifts the tail in, so the bytes the stream
+/// placed after the CR keep their order among themselves and stay after
+/// everything the stream placed before it. `held_at < record.len()` proves the
+/// held byte is still buffered, and discharging requires `terminated &&
+/// !carriage_return_was_content`, which is exactly the proven-framing
+/// observation. Two held CRs cannot overlap because a fill that ends on a CR
+/// resolves the previous one before holding its own.
+///
+/// # Why the ordering cannot depend on the fills
+///
+/// Every appended byte is appended at `record.len()`, and the appends happen
+/// in stream order: the held CR occupies the position it was consumed at, the
+/// fill's content is appended after it, and a later fill's bytes are appended
+/// after those. The only bytes that are ever NOT appended are terminator
+/// framing - the LF, and a CR proven to frame it - and each of those is
+/// excluded from `chunk_len` before anything is copied. So `record` is
+/// always a prefix of the stream's content, and on the terminating iteration
+/// it is the whole of it, for every caller read size.
 pub(crate) fn read_bounded_record<R: std::io::BufRead>(
     reader: &mut R,
     profile: RequestInputProfile,
 ) -> std::io::Result<ReadOutcome> {
     let mut record: Vec<u8> = Vec::new();
+    // Content bytes already charged to the ceiling. A held carriage return is
+    // deliberately absent from this counter: it is buffered at its true stream
+    // position, but it is content only once a later fill proves no newline
+    // follows it.
+    let mut record_content_len: usize = 0;
+    // Stream index of a carriage return this function buffered but has not yet
+    // charged, or `None` when no carriage return is held. Index arithmetic
+    // cannot wrap, so `Some(pos)` with `pos < record.len()` proves the held byte
+    // is buffered at exactly that position.
+    let mut carriage_return_held_at: Option<usize> = None;
     loop {
-        let (content_len, consume_len, terminated) = {
+        // The bytes this iteration appends are copied out of the SAME buffer
+        // the classification below measured. Calling `fill_buf` a second
+        // time to re-read them is wrong: a conforming `BufRead` is allowed
+        // to return a different window on the next call (a real
+        // `BufReader` will, and a chunked reader here does), so the ceiling
+        // would be compared against one buffer's length while the record is
+        // filled from another's.
+        //
+        // Borrow the measured window once and slice both facts out of it.
+        let chunk = {
             let available = reader.fill_buf()?;
-            if available.is_empty() {
-                if record.is_empty() {
-                    return Ok(ReadOutcome::Eof);
-                }
-                if std::str::from_utf8(&record).is_err() {
-                    return Ok(ReadOutcome::InvalidUtf8);
-                }
-                return Ok(ReadOutcome::Record(record));
-            }
-            match available.iter().position(|byte| *byte == b'\n') {
-                Some(newline) => {
-                    let mut content_len = newline;
-                    if content_len > 0 && available[content_len - 1] == b'\r' {
-                        content_len -= 1;
+            let (
+                chunk_len,
+                consume_len,
+                terminated,
+                eof_final,
+                lone_carriage_return,
+                carriage_return_frames_newline,
+            ) = if available.is_empty() {
+                (0, 0, true, true, false, false)
+            } else {
+                match available.iter().position(|byte| *byte == b'\n') {
+                    // The newline's own index is the content length, minus
+                    // a carriage return that immediately precedes it: that
+                    // CR belongs to the CRLF TERMINATOR, not to the
+                    // content, so it must not be charged to the ceiling.
+                    //
+                    // `carriage_return_frames_newline` answers, from the STREAM
+                    // rather than from this fill's content count, whether the
+                    // carriage return a previous iteration HELD is the one that
+                    // immediately precedes this newline. When the newline sits
+                    // at index 0 the only byte before it in the stream is that
+                    // held CR, so it frames; when the newline is preceded inside
+                    // this fill, the CR at `newline - 1` is the terminator's own
+                    // byte and nothing was held, so nothing frames here.
+                    Some(newline) => {
+                        let (content_len, frames) =
+                            if newline > 0 && available[newline - 1] == b'\r' {
+                                (newline - 1, false)
+                            } else {
+                                (newline, newline == 0)
+                            };
+                        (
+                            content_len,
+                            newline.saturating_add(1),
+                            true,
+                            false,
+                            false,
+                            frames,
+                        )
                     }
-                    (content_len, newline.saturating_add(1), true)
+                    // A fill that ENDS on a CR but carries no newline
+                    // yet is the contested arrival: the LF that would
+                    // prove the CR is terminator framing arrives in a
+                    // LATER fill, so at this moment the byte is
+                    // indistinguishable from content. It is therefore
+                    // HELD - excluded from this fill's charged chunk, and
+                    // buffered at its stream position without being
+                    // charged - and the next fill resolves it. This is
+                    // what makes the ceiling identical whether the record
+                    // arrives in one fill or many: charging the CR here
+                    // and then never charging it again would make a
+                    // record of exactly `max_record_bytes` arrive as
+                    // `ceiling + 1` and be refused.
+                    //
+                    // Consuming this fill's CONTENT with it is not
+                    // optional. This iteration charges and buffers those
+                    // bytes, so leaving them for the next `fill_buf`
+                    // would re-deliver them and the next fill would
+                    // charge the same content a SECOND time: that is
+                    // how a record of exactly `max_record_bytes` whose
+                    // CR ends a fill arrived charged as `ceiling + 1`
+                    // on every arrival whose fill exceeds the ceiling.
+                    // The whole fill leaves the stream here, and the one
+                    // CR that is held is the only byte whose
+                    // classification is deferred.
+                    None if available.last() == Some(&b'\r') => (
+                        available.len() - 1,
+                        available.len(),
+                        false,
+                        false,
+                        true,
+                        false,
+                    ),
+                    None => (available.len(), available.len(), false, false, false, false),
                 }
-                None => (available.len(), available.len(), false),
-            }
-        };
-        if terminated {
-            let Some(combined_len) = record.len().checked_add(content_len) else {
-                return discard_oversize_record(reader, profile);
             };
-            if combined_len > profile.max_record_bytes {
-                return discard_oversize_record(reader, profile);
+            (
+                chunk_len,
+                consume_len,
+                terminated,
+                eof_final,
+                lone_carriage_return,
+                carriage_return_frames_newline,
+                // Only the measured prefix is copied; the borrow ends before
+                // `consume` so the buffer's lifetime rules stay satisfied.
+                available[..chunk_len].to_vec(),
+            )
+        };
+        let (chunk_len, consume_len, terminated, eof_final, lone_carriage_return) =
+            (chunk.0, chunk.1, chunk.2, chunk.3, chunk.4);
+        // Whether the byte this iteration is about to see is an LF that
+        // IMMEDIATELY follows a held carriage return, measured from the stream.
+        let carriage_return_frames_newline = chunk.5;
+        let measured_content = &chunk.6;
+        if lone_carriage_return {
+            // This fill's own CONTENT is charged and buffered first: the held CR
+            // is the only byte that is deferred, never the bytes that preceded it
+            // in the same fill. Dropping `chunk_len` here would silently shorten
+            // the record by every content byte that shared a fill with the CR.
+            if !measured_content.is_empty() {
+                let Some(total) = record_content_len.checked_add(measured_content.len()) else {
+                    return discard_oversize_record(reader, profile);
+                };
+                if total > profile.max_record_bytes {
+                    return discard_oversize_record(reader, profile);
+                }
+                record.extend_from_slice(measured_content);
+                record_content_len = total;
             }
-            {
-                let available = reader.fill_buf()?;
-                record.extend_from_slice(&available[..content_len]);
+            if let Some(held_at) = carriage_return_held_at.take() {
+                // Two lone carriage returns in a row: the first one is content
+                // after all, because no newline can follow it here. Charge it
+                // against the ceiling before the loop continues. The charge and
+                // the buffered position are the same byte - the one buffered at
+                // `held_at`, which the preceding `extend_from_slice` left where
+                // it was and the appends that followed moved after it - so the
+                // buffer already contains the byte this charge counts and the
+                // charge counts it exactly once.
+                let Some(total) = record_content_len.checked_add(1) else {
+                    return discard_oversize_record(reader, profile);
+                };
+                if total > profile.max_record_bytes {
+                    return discard_oversize_record(reader, profile);
+                }
+                debug_assert!(record.get(held_at) == Some(&b'\r'));
+                record_content_len = total;
             }
+            // The CR this fill ends on is appended at its TRUE stream position -
+            // the position the stream reaches next, which is `record.len()` - and
+            // is NOT charged yet. Holding it out of `record` instead, and
+            // appending it when a later fill resolves it, is what loses the order:
+            // the resolve then appends a byte that belonged BEFORE the content
+            // this same fill already buffered, and the accepted record is no
+            // longer the stream's content. So the byte is in place and merely
+            // uncharged, and the next fill either charges it (content) or
+            // discharges it (framing).
+            carriage_return_held_at = Some(record.len());
+            record.push(b'\r');
             reader.consume(consume_len);
-            if content_len == 0 && record.last() == Some(&b'\r') {
-                // A CRLF terminator split across buffer fills: the carriage
-                // return was buffered as content by an earlier chunk because
-                // the newline had not been observed yet. Removing it keeps
-                // split and unsplit CRLF identical; both terminator bytes stay
-                // excluded from the ceiling since removal only shrinks the
-                // already-bounded record.
-                record.pop();
-            }
-            if std::str::from_utf8(&record).is_err() {
-                return Ok(ReadOutcome::InvalidUtf8);
-            }
-            return Ok(ReadOutcome::Record(record));
+            continue;
         }
-        let Some(combined_len) = record.len().checked_add(content_len) else {
+        // A held CR is the terminator's own byte ONLY when the very next byte
+        // in the stream is the LF that ends this record - which is exactly what
+        // `carriage_return_frames_newline` reports, because that newline sits at
+        // index 0 of this fill, so nothing can stand between the held CR and it.
+        //
+        // Every other observation leaves the held CR as CONTENT the ceiling must
+        // charge: another byte in this fill - `chunk_len` counts exactly the
+        // bytes between the held CR and the newline, so `chunk_len > 0` IS that
+        // evidence - or EOF, where no newline ever claimed it. The answer
+        // therefore depends only on the stream, never on how many content bytes
+        // a fill happened to carry, so the same bytes are classified identically
+        // and charged identically under every chunking.
+        //
+        // "This fill carried no content bytes" is NOT the test, and treating it
+        // as one is what let an over-limit record through. A genuine trailing
+        // content CR followed by the terminator's own CR, delivered so the
+        // terminator's CRLF alone filled the next window, satisfied
+        // `terminated && !eof_final && chunk_len == 0`: the content CR was
+        // declared framing, dropped uncharged, and the ceiling compared a total
+        // that was short by exactly one.
+        let carriage_return_held_at_here = carriage_return_held_at;
+        let carriage_return_was_content =
+            carriage_return_held_at_here.is_some() && !carriage_return_frames_newline;
+        // `chunk_len` is this fill's own content bytes; the held CR is not among
+        // them, because the previous iteration consumed it, and it is already
+        // buffered at its stream position. So the held CR is `owed`'s only
+        // contribution and it is charged EXACTLY once, here or in the resolve
+        // the lone-CR arm performs above - never both and never neither.
+        let owed = usize::from(carriage_return_was_content);
+        let Some(combined_len) = record_content_len
+            .checked_add(owed)
+            .and_then(|total| total.checked_add(chunk_len))
+        else {
             return discard_oversize_record(reader, profile);
         };
         if combined_len > profile.max_record_bytes {
             return discard_oversize_record(reader, profile);
         }
-        {
-            let available = reader.fill_buf()?;
-            record.extend_from_slice(&available[..content_len]);
+        // The ceiling is compared BEFORE the fill is buffered, on a total that
+        // counts every content byte this iteration will retain - the held CR
+        // when it is content, plus this fill's own content - so the collected
+        // prefix cannot exceed the ceiling even transiently, and neither
+        // `extend_from_slice` nor the discharge below is a check the ceiling
+        // depends on.
+        //
+        // Discharge the held CR BY POSITION. It can only run on the
+        // proven-framing observation (terminated, holding a CR, and that CR not
+        // content), which is `newline == 0` on a non-EOF fill. Removing the byte
+        // at `held_at` - rather than the last element - is what makes the
+        // discharge independent of how much content a later fill appended
+        // behind the held byte: `Vec::remove` takes exactly the byte this
+        // function buffered as held and shifts the tail in, so every byte the
+        // stream placed after it keeps its order relative to every byte the
+        // stream placed before it. `pop` would be right only while the held byte
+        // is also the last one, which the condition above happens to guarantee
+        // today (the terminating fill carries no content, so nothing is appended
+        // behind the held byte) - but that is a property of the CONDITION, not
+        // of `pop`, and reading `held_at` and then acting on `record.len() - 1`
+        // is how a fill that did append behind it would silently drop the wrong
+        // byte. The index is the fact; the position in the vector at discharge
+        // time is not.
+        if terminated && !carriage_return_was_content {
+            if let Some(held_at) = carriage_return_held_at {
+                // Discharge at the position that was NAMED. `Vec::remove`
+                // removes exactly the byte at that index and shifts the tail in,
+                // so the bytes the stream placed after the held CR keep their
+                // order and their place behind everything the stream placed
+                // before it. Removing the last element instead is correct only
+                // while nothing has been appended behind the held byte, which is
+                // a property of the reaching condition rather than of the held
+                // byte, so the discharge acts on the index it recorded.
+                //
+                // Framing: the CR the terminator's LF immediately follows was
+                // buffered uncharged and is removed uncharged, so the charge that
+                // would have accounted for it never existed.
+                // `record_content_len` is deliberately NOT decremented: the byte
+                // it never counted is the byte just removed, so the charge and
+                // the buffer are equal again. The value `remove` hands back is
+                // the byte that left, so asserting it is `\r` is the assertion
+                // that the byte removed is the byte that was held - and that it
+                // is what the previous version got wrong by measuring the length
+                // AFTER the removal.
+                match record.remove(held_at) {
+                    b'\r' => {}
+                    // Unreachable: the byte at `held_at` is the byte this
+                    // function buffered as held, so it is always a carriage
+                    // return. Fail closed rather than assume it.
+                    _ => return discard_oversize_record(reader, profile),
+                }
+                // The charge and the buffer stand equal at the end of a
+                // discharge, which is the invariant every path returning a
+                // `Record` depends on. The previous assertion here compared
+                // `held_at + 1` against the length measured AFTER the removal,
+                // which is one less than it must be for any input, so it fired on
+                // every discharge - including the ones these tests exercise.
+                // Nothing about the charge is asserted separately: this equality
+                // is what states it, since the loop cannot have moved the charge
+                // since the comparison above.
+                debug_assert_eq!(record.len(), record_content_len);
+            }
         }
+        record.extend_from_slice(measured_content);
         reader.consume(consume_len);
+        record_content_len = combined_len;
+        carriage_return_held_at = None;
+        if terminated {
+            if eof_final {
+                // End of input with no content is the owner's Eof; end of
+                // input with content is the EOF-final record.
+                //
+                // Nothing further is charged, appended or discharged here. A CR
+                // that is still held reached EOF with no newline after it, so no
+                // terminator ever claimed it and it is content - but
+                // `carriage_return_was_content` above already charged it,
+                // against the ceiling, in this same iteration, and it is
+                // already buffered at its stream position, so nothing is left to
+                // do. This fill appends nothing, so the charge and the buffer
+                // stand equal here: the one owed charge was for a byte already
+                // buffered, so `record.len() == record_content_len` and that is
+                // what the check below states.
+                debug_assert_eq!(record.len(), record_content_len);
+                if record_content_len == 0 {
+                    return Ok(ReadOutcome::Eof);
+                }
+            }
+            // No terminator byte is ever APPENDED: the LF is excluded from
+            // `chunk_len`, and the CR a LF immediately follows either arrives
+            // inside a fill that excludes it from `chunk_len` or is buffered
+            // uncharged by the lone-CR arm and discharged above. The old
+            // post-hoc CR removal is gone for the same reason - its predecessor
+            // tried to undo the charge after the fact by requiring `record` to
+            // end with `\r\n`, and that arm was dead on every path, because no
+            // LF is ever appended to `record`, so `record[len - 1]` was never
+            // `\n` and the pop never ran. The invariant it was reaching for is
+            // now carried by the decision itself, from the byte that follows a
+            // held CR: that CR is framing only when an LF immediately follows
+            // it, and it is content in every other case, so a charge is never
+            // undone and `record_content_len == record.len()` holds on every
+            // path that returns a `Record`.
+            if std::str::from_utf8(&record).is_err() {
+                return Ok(ReadOutcome::InvalidUtf8);
+            }
+            // Every byte this record retains is content, and every content byte
+            // is retained: the charge and the buffer are equal on the path that
+            // hands the bytes back. A framing CR was buffered uncharged and
+            // removed uncharged, so it never made the two disagree.
+            debug_assert_eq!(record.len(), record_content_len);
+            return Ok(ReadOutcome::Record(record));
+        }
     }
 }
 
@@ -1577,6 +1926,108 @@ mod tests {
         assert!(matches!(
             read_bounded_record(&mut crlf_blank, SMALL),
             Ok(ReadOutcome::Record(record)) if record.is_empty()
+        ));
+    }
+
+    // WORK_UNIT_CASE: 977/3
+    #[test]
+    fn a_carriage_return_is_never_charged_to_the_ceiling_or_lost() {
+        // The owner's ceiling is on content bytes, so a record exactly at
+        // `max_record_bytes` is accepted however the bytes arrive. A fill of
+        // exactly one CR is the arrival the LF-only scan cannot classify, and
+        // it is where the ceiling used to depend on the caller's read size:
+        // the held CR is excluded from the total while the next fill decides
+        // whether it frames the newline.
+        let body = "{\"a\":1,\"b\":2}";
+        let exact = format!("{body}{}", " ".repeat(SMALL.max_record_bytes - body.len()));
+        assert_eq!(exact.len(), SMALL.max_record_bytes);
+
+        // CR on a fill of its own: accepted, and the CR is framing, so the
+        // accepted record is byte-identical to the one the unsplit arrival
+        // returns.
+        let mut crlf = format!("{exact}\r\n");
+        let mut crlf_split = ChunkReader::new(crlf.as_bytes(), 1);
+        let split_outcome = read_bounded_record(&mut crlf_split, SMALL);
+        assert!(
+            matches!(&split_outcome, Ok(ReadOutcome::Record(record)) if record.len() == SMALL.max_record_bytes && record == exact.as_bytes()),
+            "a record at the ceiling is accepted with the CR framing excluded, saw {split_outcome:?}"
+        );
+
+        // One byte over the ceiling is refused identically on that same
+        // arrival, so the two dispositions cannot disagree between chunkings.
+        let over = format!("{exact} ");
+        assert_eq!(over.len(), SMALL.max_record_bytes + 1);
+        let mut crlf_over = format!("{over}\r\n");
+        let mut crlf_split_over = ChunkReader::new(crlf_over.as_bytes(), 1);
+        assert!(matches!(
+            read_bounded_record(&mut crlf_split_over, SMALL),
+            Ok(ReadOutcome::Oversize { .. })
+        ));
+
+        // A lone CR is CONTENT, never a record boundary: the owner terminates a record
+        // on LF alone, and only strips a CR that is immediately followed by that
+        // LF (the CRLF terminator). So `{"a":1}\r{"b":2}\n` is ONE record whose
+        // content is `{"a":1}\r{"b":2}` - the mid-line CR is kept and the bytes
+        // after it are still the same record. What the held-CR machinery must
+        // guarantee is not a split here but that the byte is neither charged
+        // twice nor dropped, and that it is charged against the ceiling exactly
+        // once. A CR that really does end a record has to be followed by LF.
+        let mut cr_mid_record = ChunkReader::new(b"{\"a\":1}\r{\"b\":2}\n", 7);
+        assert!(matches!(
+            read_bounded_record(&mut cr_mid_record, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}\r{\"b\":2}"
+        ));
+
+        // The CR is content at EOF too, when it is the last byte before the
+        // stream ends with no newline: the record keeps it and the charged length
+        // includes it.
+        let mut cr_final = ChunkReader::new(b"{\"a\":1}\r", 7);
+        assert!(matches!(
+            read_bounded_record(&mut cr_final, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}\r"
+        ));
+
+        // And the next record still frames exactly after a CR-terminated one.
+        let mut cr_then_record = ChunkReader::new(b"{\"a\":1}\r\n{\"b\":2}\n", 7);
+        assert!(matches!(
+            read_bounded_record(&mut cr_then_record, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}"
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut cr_then_record, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"b\":2}"
+        ));
+
+        // The same holds when the second CR is also alone on its fill: a fill
+        // that cannot be framing proves the held CR was content, and both
+        // bytes are charged before either is buffered.
+        let mut cr_then_cr = ChunkReader::new(b"{\"a\":1}\r\r\n", 1);
+        assert!(matches!(
+            read_bounded_record(&mut cr_then_cr, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"{\"a\":1}\r"
+        ));
+
+        // A record that is nothing but a CR is content too, never an empty
+        // record: one byte in, one byte out.
+        let mut only_cr = ChunkReader::new(b"\r", 1);
+        assert!(matches!(
+            read_bounded_record(&mut only_cr, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == b"\r"
+        ));
+        assert!(matches!(
+            read_bounded_record(&mut only_cr, SMALL),
+            Ok(ReadOutcome::Eof)
+        ));
+
+        // A ceiling-length record whose last content byte is a CR is still
+        // content at the boundary, and is accepted only because the byte is
+        // inside the ceiling, not because it was dropped.
+        let cr_content = format!("{} \r", "x".repeat(SMALL.max_record_bytes - 2));
+        assert_eq!(cr_content.len(), SMALL.max_record_bytes);
+        let mut cr_content_reader = ChunkReader::new(cr_content.as_bytes(), 1);
+        assert!(matches!(
+            read_bounded_record(&mut cr_content_reader, SMALL),
+            Ok(ReadOutcome::Record(record)) if record == cr_content.as_bytes()
         ));
     }
 
