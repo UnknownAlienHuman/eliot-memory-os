@@ -6,14 +6,6 @@ mod request_input;
 use eliot_agent_bridge::opencode_host_events::{
     BridgeIntroductionStore, HostEventsServiceError, serve_host_events,
 };
-use eliot_user_broker_core::{
-    MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES, OPENCODE_BRIDGE_ENV_INTRODUCTION,
-    OpenCodeBridgeProcessProjection, OpenCodeRouteCredentials, OpenCodeSecretBoundary,
-    OpenCodeSessionFacts,
-};
-use secrecy::SecretString;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_agent_bridge::{
     AdmissionBasis, BootstrapContext, BootstrapTaskInputs, BridgeRunner, CliError,
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
@@ -51,16 +43,24 @@ use eliot_protocol::{
     AckPhase, AgentActivationResolutionDisposition, EventDisposition, EventEnvelope,
     HARD_STRUCTURED_RESPONSE_BYTES,
 };
+use eliot_user_broker_core::{
+    MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES, OPENCODE_BRIDGE_ENV_INTRODUCTION,
+    OpenCodeBridgeProcessProjection, OpenCodeRouteCredentials, OpenCodeSecretBoundary,
+    OpenCodeSessionFacts,
+};
 use request_input::{
     REQUEST_INPUT_LIMIT_TABLE, REQUEST_INPUT_PROFILE, REQUEST_INPUT_PROFILE_ID, ReadOutcome,
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
     read_bounded_record, scratch_budget,
 };
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
@@ -3206,9 +3206,7 @@ fn owner_now_ms() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())
-        .and_then(|elapsed| {
-            u64::try_from(elapsed.as_millis()).map_err(|error| error.to_string())
-        })
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).map_err(|error| error.to_string()))
 }
 
 /// The current route composition this bridge process serves: the User
@@ -3237,19 +3235,17 @@ fn host_events_route_composition() -> Result<HostEventsRouteComposition, String>
     let raw = std::env::var(OPENCODE_BRIDGE_ENV_INTRODUCTION).map_err(|_| {
         format!("{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not materialized by the owner")
     })?;
-    let projection: OpenCodeBridgeProcessProjection = serde_json::from_str(&raw).map_err(
-        |error| {
+    let projection: OpenCodeBridgeProcessProjection =
+        serde_json::from_str(&raw).map_err(|error| {
             format!(
                 "{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not the owner's closed projection: {error}"
             )
-        },
-    )?;
+        })?;
     let facts = projection
         .facts(now_ms)
         .map_err(|error| format!("{OPENCODE_BRIDGE_ENV_INTRODUCTION} is not current: {error}"))?;
-    let credential = std::env::var(HOST_EVENTS_CREDENTIAL_ENV).map_err(|_| {
-        format!("{HOST_EVENTS_CREDENTIAL_ENV} is not materialized by the owner")
-    })?;
+    let credential = std::env::var(HOST_EVENTS_CREDENTIAL_ENV)
+        .map_err(|_| format!("{HOST_EVENTS_CREDENTIAL_ENV} is not materialized by the owner"))?;
     if credential.is_empty() || credential.len() > MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES {
         return Err(format!(
             "{HOST_EVENTS_CREDENTIAL_ENV} is outside the owner's route-credential shape"
@@ -3261,11 +3257,7 @@ fn host_events_route_composition() -> Result<HostEventsRouteComposition, String>
     let handle = projection.introduction.credential.clone();
     let mut credentials = OpenCodeRouteCredentials::new();
     let issued = credentials
-        .issue(
-            handle.provider(),
-            handle.key(),
-            credential.into_boxed_str(),
-        )
+        .issue(handle.provider(), handle.key(), credential.into_boxed_str())
         .map_err(|error| format!("route credential refused: {error}"))?;
     if issued != handle {
         return Err("route credential handle is not the introduction's own".to_owned());
