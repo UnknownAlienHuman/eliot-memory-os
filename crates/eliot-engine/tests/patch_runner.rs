@@ -149,10 +149,32 @@ async fn patch_records_patch_run_through_writer_actor() -> TestResult {
     Ok(())
 }
 
+/// The exact summary the verifier runner records when this lane's
+/// governed-lane refusal reaches the recording seam: the acceptance-eligibility
+/// quarantine marker, then the rendered `EngineError::ServiceNotReady`.
+///
+/// Source of truth, unmodified: `QUARANTINED_LEGACY_LANE`,
+/// `GOVERNED_BUILD_LANE_SERVICE`, `governed_lane_refusal` and
+/// `recorded_lane_refusal` in `crates/eliot-engine/src/patch.rs`, plus the
+/// `ServiceNotReady` display format in `crates/eliot-engine/src/error.rs`.
+const GOVERNED_LANE_REFUSAL_SUMMARY: &str = concat!(
+    "[quarantined legacy verifier lane: no governed profile receipt; issue #1813 W6]",
+    " service governed-build-lane is not ready: ",
+    "I2.22 forbids the repository target/ directory for a governed instrument, and ",
+    "the engine patch/verifier lane holds no BuildFingerprint candidate identity, ",
+    "contract revision, toolchain, target or environment class to derive a governed ",
+    "target root from; refusing rather than inventing them (issue #1897 AUD7)"
+);
+
 #[tokio::test]
 async fn verifier_runs_required_checks() -> TestResult {
     let bundle = Bundle::new("verifier-runs-required", value_diff("2"))?;
     let harness = bundle.verifier();
+    // The runner records the required checks it was asked for. RECORDED, NOT
+    // PROPAGATED: `run_plan` resolves `Ok` even though nothing may launch,
+    // because propagating the refusal would abort `PatchRunner::apply` after
+    // `git apply` had already mutated the checkout, skipping the rollback that
+    // containment depends on.
     let runs = harness
         .run_plan(
             bundle.lease.project_id,
@@ -162,9 +184,55 @@ async fn verifier_runs_required_checks() -> TestResult {
         )
         .await?;
 
-    assert!(runs.iter().any(|run| {
-        run.required_for_done && run.name == "cargo-check" && run.status == VerifierStatus::Passed
-    }));
+    // Every requirement in the plan yields exactly one recorded run, and the
+    // required requirement is the one this test is about.
+    assert_eq!(
+        runs.len(),
+        bundle.verifier_plan.required.len() + bundle.verifier_plan.optional.len()
+    );
+    let required = runs
+        .iter()
+        .filter(|run| run.required_for_done)
+        .collect::<Vec<_>>();
+    assert_eq!(required.len(), 1);
+    let cargo_check = required[0];
+    assert_eq!(cargo_check.name, "cargo-check");
+    assert_eq!(cargo_check.command_kind, VerifierCommandKind::CargoCheck);
+    assert_eq!(cargo_check.command_display, "cargo check");
+
+    // ATTEMPTED AND REFUSED WITH THE EXACT TYPED CAUSE. This lane holds no
+    // BuildFingerprint candidate identity, contract revision, toolchain, target
+    // or environment class, so the launch seam refuses Cargo before a process
+    // exists (issue #1897 AUD7). A refused launch has no exit code and no
+    // retained output, so their absence is what proves nothing ran.
+    assert_eq!(cargo_check.status, VerifierStatus::NotAllowed);
+    assert!(cargo_check.exit_code.is_none());
+    assert_eq!(cargo_check.duration_ms, 0);
+    assert!(cargo_check.stdout_blob.is_none());
+    assert!(cargo_check.stderr_blob.is_none());
+    assert_eq!(cargo_check.summary, GOVERNED_LANE_REFUSAL_SUMMARY);
+    assert!(
+        runs.iter().all(|run| run.status != VerifierStatus::Passed),
+        "a lane that refuses to launch Cargo cannot record a passed verifier run"
+    );
+
+    // `required_for_done` IS UNSATISFIABLE, SO THE PATCH CANNOT BE ADMITTED:
+    // the admission predicate demands both `Passed` and an unquarantined
+    // summary, and a recorded refusal satisfies neither. The patch therefore
+    // rolls back, and the refusal is what the failure reasons name.
+    let (patch_run, apply_runs) = bundle.apply().await?;
+    assert_eq!(patch_run.status, PatchRunStatus::RolledBack);
+    assert_eq!(apply_runs.len(), runs.len());
+    assert!(
+        patch_run
+            .failure_reasons
+            .contains(&"required_verifier_failed".to_owned())
+    );
+    assert!(
+        patch_run
+            .failure_reasons
+            .contains(&"verifier_failed:cargo-check:NotAllowed".to_owned())
+    );
     Ok(())
 }
 
