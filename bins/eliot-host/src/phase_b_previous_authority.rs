@@ -219,6 +219,9 @@ pub(super) fn phase_b_observe_previous_binding(
             "Phase-B previous authority has no exact prior Host binding".to_owned(),
         ));
     };
+    // The marker parse above is the owner that proved this prior Host epoch
+    // against this exact installation, manifest digest, and generation, so the
+    // bind happens only after that verification, from the parsed marker.
     identity.bind_host_epoch(&previous_host_epoch);
     if previous_host_epoch == host.epoch.current
         && previous_activation_generation == *activation_generation
@@ -259,7 +262,10 @@ pub(super) fn phase_b_validate_durable_previous_binding(
     identity: &mut PhaseBAuthorityIdentity,
 ) -> Result<(), HostError> {
     // Both sides of this exact comparison are already produced: the observed
-    // historical descriptor digest and the committed durable expectation.
+    // historical descriptor digest and the committed durable expectation. The
+    // bound epoch is the one the caller's marker parse already proved against
+    // this exact installation, manifest digest, and generation — a proven
+    // value of the retained record, never an unverified claim.
     identity.bind_host_epoch(&observed.host.epoch.current);
     identity.bind_authority_descriptor(&observed.authority_digest);
     identity.bind_durable_authority_descriptor(&durable.authority_descriptor_digest);
@@ -349,7 +355,6 @@ pub(super) fn phase_b_validate_authority(
         ))
     })?;
     identity.bind_state_fence(&descriptor.state_fence);
-    identity.bind_host_epoch(&descriptor.state_fence.authority_epoch);
     identity.bind_declared_descriptor(&descriptor);
     if !allow_expired_exact_replay {
         let now_ms = SystemTime::now()
@@ -389,6 +394,14 @@ pub(super) fn phase_b_validate_authority(
                 .to_owned(),
         ));
     }
+    // The record's own Host epoch is the LIVE epoch, and it is bound here and
+    // only here: the exact `is_same_authority` match above is what proves the
+    // descriptor's claimed authority epoch and the live Host epoch are the same
+    // authority. Binding the claim itself before that proof would put an
+    // owner-unproven Host epoch into a slot that documents the record's PROVEN
+    // one (and would only restate `fence`), so a rejected descriptor now leaves
+    // this slot at its explicit missing-evidence disposition instead.
+    identity.bind_host_epoch(&host.epoch.current);
     let manifest_digest = phase_b_manifest_digest(manifest)?;
     let marker =
         phase_b_authority_marker(&manifest_digest, host, activation_generation, &descriptor)?;
