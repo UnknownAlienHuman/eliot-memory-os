@@ -177,6 +177,7 @@ pub use capability_evidence_commit::{
     commit_capability_evidence_record,
 };
 pub use composition::*;
+pub use eliot_observation::CurrentTaskSelection;
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
     ControlBoardProjectionError, ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
