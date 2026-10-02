@@ -700,6 +700,22 @@ pub(super) fn run() -> Result<(), String> {
         winning_value = canonical.winning_value(),
         contributing_layers = ?canonical.contributions(),
     );
+    // I3.9/I3.11: the same load resolved the second proven setting chain, the
+    // declared `retention_and_backup_policy` ref set, over the same retained
+    // documents. It is published as the resolved declared set so the operator
+    // can see which retention policies this generation admits, and it is
+    // non-empty by construction: a document set that could not resolve it
+    // refused the load above, so the Governor's retention schedule owner is
+    // never composed over a defaulted or empty attested set. Diagnostics only:
+    // it grants nothing and the refusal is the config load, not this record.
+    let retention = config.retention_policy_set();
+    tracing::info!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.retention_policy_set_effective",
+        key = retention.key(),
+        declared_policy_refs = ?retention.policy_refs(),
+        contributing_layers = ?retention.contributions(),
+    );
     // I3.9 (#1966 W4): publish the generated schema for the supported
     // TOML/JSON layer files on the same diagnostics surface. The text is
     // generated at runtime from the single typed shape the decoders enforce,

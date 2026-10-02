@@ -17,7 +17,8 @@ use eliot_runtime_contracts::{
 };
 
 use super::canonical_config_precedence::{
-    PolicyDocument, ResolvedChain, resolve_effective_configuration,
+    PolicyDocument, ResolvedChain, ResolvedRetentionSet, resolve_effective_configuration,
+    resolve_effective_retention_set,
 };
 use super::{DaemonError, KERNEL_PIPE_NAME, KernelLaunchBinding, MAX_CONFIG_BYTES, SERVICE_NAME};
 
@@ -54,6 +55,42 @@ fn observed_runtime_identity() -> Result<(String, u32), DaemonError> {
 /// an unknown or duplicated layer, and a lower-layer expansion that no higher
 /// layer delegated all fail this function.
 fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
+    let retained = read_canonical_layer_documents()?;
+    let documents = layer_documents(&retained);
+    resolve_effective_configuration(&documents)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
+}
+
+/// Resolves the effective declared retention policy set from the same I3.9 typed
+/// documents, through the same protected reads and the same typed decoders.
+///
+/// This runs alongside [`resolve_effective_canonical_config`] over one retained
+/// document set, so both proven setting chains are resolved from the same bytes
+/// at the same protected paths. A document set that cannot resolve the declared
+/// retention set refuses the load: the schedule owner must never be composed
+/// with a defaulted or an empty attested ref set, because that would make every
+/// retention-gated read refuse.
+fn resolve_effective_retention_policy_set() -> Result<ResolvedRetentionSet, DaemonError> {
+    let retained = read_canonical_layer_documents()?;
+    let documents = layer_documents(&retained);
+    resolve_effective_retention_set(&documents)
+        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
+}
+
+/// Views the retained `(file name, bytes)` pairs as typed policy documents.
+fn layer_documents(retained: &[(&str, Vec<u8>)]) -> Vec<PolicyDocument<'_>> {
+    retained
+        .iter()
+        .map(|(file_name, bytes)| PolicyDocument {
+            file_name,
+            bytes: bytes.as_slice(),
+        })
+        .collect()
+}
+
+/// Reads every present I3.9 typed layer document through the protected path
+/// lease, so both proven setting chains are decoded from the same retained bytes.
+fn read_canonical_layer_documents() -> Result<Vec<(&str, Vec<u8>)>, DaemonError> {
     let mut retained: Vec<(&str, Vec<u8>)> = Vec::new();
     for relative in [INSTALLATION_CONFIG_RELATIVE, SYSTEM_OWNER_POLICY_RELATIVE] {
         let path = protected_program_data_path(relative)?;
@@ -75,15 +112,7 @@ fn resolve_effective_canonical_config() -> Result<ResolvedChain, DaemonError> {
         }
         retained.push((relative, lease.read_bounded(MAX_CONFIG_BYTES)?));
     }
-    let documents: Vec<PolicyDocument<'_>> = retained
-        .iter()
-        .map(|(file_name, bytes)| PolicyDocument {
-            file_name,
-            bytes: bytes.as_slice(),
-        })
-        .collect();
-    resolve_effective_configuration(&documents)
-        .map_err(|error| DaemonError::LaunchConfig(error.to_string()))
+    Ok(retained)
 }
 
 /// Loads and admits the immutable runtime manifest shipped beside this
@@ -163,6 +192,11 @@ pub struct DaemonConfig {
     pub(super) config_lease: Option<ProtectedRuntimePathLease>,
     pub(super) kernel_binding: KernelLaunchBinding,
     pub(super) canonical_chain: ResolvedChain,
+    /// The effective declared retention policy set, resolved from the same
+    /// retained I3.9 documents. It is retained beside the numeric chain so the
+    /// protected boundary proves both proven chains resolve from the same bytes
+    /// and refuses a document set that resolves neither into a usable value.
+    pub(super) retention_policy_set: ResolvedRetentionSet,
 }
 
 impl DaemonConfig {
@@ -279,6 +313,7 @@ impl DaemonConfig {
             config_lease: None,
             kernel_binding,
             canonical_chain: resolve_effective_canonical_config()?,
+            retention_policy_set: resolve_effective_retention_policy_set()?,
         })
     }
 
@@ -325,6 +360,7 @@ impl DaemonConfig {
             config_lease: None,
             kernel_binding,
             canonical_chain: resolve_effective_canonical_config()?,
+            retention_policy_set: resolve_effective_retention_policy_set()?,
         })
     }
 
@@ -340,6 +376,16 @@ impl DaemonConfig {
     #[must_use]
     pub const fn canonical_chain(&self) -> &ResolvedChain {
         &self.canonical_chain
+    }
+
+    /// Returns the effective declared retention policy set: the exact closed set
+    /// of retention policy refs the I3.11 `retention_and_backup_policy`
+    /// declaration resolves to, and each contributing layer in canonical
+    /// precedence order. It is never empty, so a retention-gated read is refused
+    /// for a genuinely undeclared policy and never for an absent declaration.
+    #[must_use]
+    pub const fn retention_policy_set(&self) -> &ResolvedRetentionSet {
+        &self.retention_policy_set
     }
 
     /// Returns the retained protected config identity path.

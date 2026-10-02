@@ -95,6 +95,7 @@ use eliot_maintenance::{
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation_contracts::RetentionSchedule;
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -4083,11 +4084,39 @@ pub struct PolicyOwnerSnapshot {
     pub snapshot: ConfigPolicySnapshot,
 }
 
+/// The schedule identity of one admitted policy snapshot.
+///
+/// A schedule is "one Governor configuration stream"
+/// (`records.rs:630`), and the admitted Config/Policy snapshot is exactly that
+/// stream: I3.10 makes every admitted operation reference one immutable
+/// snapshot, and the policy owner recovers precisely one. The identity is
+/// therefore the snapshot's own id, carried under the schedule's own namespace
+/// so it cannot collide with a caller-minted id that happens to spell the same
+/// string. The scope is not part of the identity: the snapshot id already binds
+/// machine, scope, revision and fence, and adding scope would create a second,
+/// weaker identity for the same stream.
+fn retention_schedule_id(snapshot: &ConfigPolicySnapshot) -> String {
+    format!(
+        "{}:{}",
+        RETENTION_SCHEDULE_ID_NAMESPACE, snapshot.snapshot_id
+    )
+}
+
+/// Namespace prefix of every owner-issued retention schedule identity.
+const RETENTION_SCHEDULE_ID_NAMESPACE: &str = "eliot.retention.schedule";
+
 /// Policy projection bound to the Host-approved generation.
 ///
 /// `None` at the owner set means the Kernel does not serve the Policy named
 /// read yet: policy-gated evidence stays explicitly absent (fail-closed),
 /// never defaulted. A present owner is always a fully correlated recovery.
+///
+/// A present owner also carries the owner-issued [`RetentionSchedule`] for the
+/// same admitted snapshot, issued at recovery (below). The schedule is not a
+/// separate configuration read: its `known_policy_refs` is the declared
+/// `retention_and_backup_policy` set of the very snapshot this owner holds, so
+/// an owner-issued schedule and the configuration that produced it cannot
+/// disagree.
 #[derive(Clone, Debug)]
 pub struct PolicyOwner {
     state_fence: StateFence,
@@ -4095,6 +4124,7 @@ pub struct PolicyOwner {
     canonical_digest: String,
     snapshot_digest: String,
     snapshot: ConfigPolicySnapshot,
+    retention_schedule: RetentionSchedule,
 }
 
 impl PolicyOwner {
@@ -4105,8 +4135,10 @@ impl PolicyOwner {
     ///
     /// Returns [`CompositionError::Recovery`] for a foreign owner, stale fence,
     /// zero revision, out-of-bound or digest-mismatched payload, a rejected
-    /// snapshot schema, or any fence/revision/digest disagreement between the
-    /// reply, the wire envelope, and the embedded snapshot.
+    /// snapshot schema, any fence/revision/digest disagreement between the
+    /// reply, the wire envelope, and the embedded snapshot, a retention
+    /// declaration that expands the compiled vocabulary or is otherwise not a
+    /// declaration, or a schedule the contract refuses to issue.
     pub fn recover(
         reply: &KernelNamedReadReply,
         expected_fence: &StateFence,
@@ -4175,13 +4207,54 @@ impl PolicyOwner {
                 "policy digest does not match the canonical snapshot bytes".to_owned(),
             ));
         }
+        // The owner-issued retention schedule. This is the only production
+        // caller of `RetentionSchedule::issue` in the tree, and it is the caller
+        // its own contract names: "Only the schedule owner (Governor
+        // configuration) calls this" (records.rs:642-643), and
+        // `bank_admission.rs:70-71` names the cross-copy consumer of that call
+        // as the "Governor configuration owner", which is this owner. The
+        // declared ref set comes from the admitted snapshot's
+        // `retention_and_backup_policy` settings, the fence is the owner fence
+        // the same recovery already correlated, and the revision is the durable
+        // policy revision, so `schedule_revision` strictly increases per
+        // snapshot exactly as the contract requires. The digest is computed by
+        // the contract over that declared content and is never recomputed here.
+        let declared_policy_refs = eliot_config::declared_retention_policy_refs(&wire.snapshot)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("retention policy declaration: {error}"))
+            })?;
+        let retention_schedule = RetentionSchedule::issue(
+            retention_schedule_id(&wire.snapshot),
+            wire.revision,
+            expected_fence.clone(),
+            declared_policy_refs,
+        )
+        .map_err(|error| {
+            CompositionError::Recovery(format!("retention schedule issuance: {error}"))
+        })?;
         Ok(Self {
             state_fence: expected_fence.clone(),
             revision: wire.revision,
             canonical_digest: reply.value_digest.clone(),
             snapshot_digest: wire.policy_digest,
             snapshot: wire.snapshot,
+            retention_schedule,
         })
+    }
+
+    /// Returns the owner-issued retention schedule for the admitted snapshot.
+    ///
+    /// `known_policy_refs` is exactly the declared
+    /// `retention_and_backup_policy` set of [`Self::snapshot`], so
+    /// `resolve_retention_read` admits a record whose
+    /// `retention_policy_ref` this configuration declared and refuses every
+    /// other ref as `ExperienceRetentionReadPosture::UnknownPolicy`. The
+    /// schedule is never absent while the owner is present and never carries a
+    /// defaulted or empty ref set, so this owner is not an always-refusing
+    /// issuer.
+    #[must_use]
+    pub const fn retention_schedule(&self) -> &RetentionSchedule {
+        &self.retention_schedule
     }
 
     /// Returns the fence of the recovered policy projection.
@@ -12005,6 +12078,108 @@ mod tests {
             policy.canonical_digest(),
             composition.owners().config.snapshot_digest(),
             "policy evidence is never a relabeled config digest"
+        );
+    }
+
+    /// Positive case for the retention-schedule owner seam: the owner recovered
+    /// at composition construction issues a schedule over the declared
+    /// configuration, and a record whose `retention_policy_ref` that
+    /// configuration names is admitted as `Readable`.
+    #[test]
+    fn recovered_policy_owner_admits_a_declared_retention_policy() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        let policy = composition.owners().policy.as_ref().expect("policy owner");
+        let schedule = policy.retention_schedule();
+        let declared = eliot_config::COMPILED_SAFE_DEFAULT_RETENTION_POLICY_REFS;
+        assert_eq!(
+            schedule.known_policy_refs,
+            declared.map(str::to_owned),
+            "known_policy_refs is the declared configuration, never a defaulted set"
+        );
+        let posture = eliot_observation_contracts::resolve_retention_read(
+            &eliot_observation_contracts::PrivacyRetentionDisclosure {
+                privacy_domain_ref: "governor-experience".to_owned(),
+                retention_policy_ref: declared[0].to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            schedule,
+            &observed.state_fence(),
+            None,
+        )
+        .expect("retention read");
+        assert_eq!(
+            posture,
+            eliot_observation_contracts::ExperienceRetentionReadPosture::Readable {
+                policy_ref: declared[0].to_owned(),
+            }
+        );
+    }
+
+    /// Refusal case: a record under a policy the declared configuration does not
+    /// name, and a record whose fence the schedule was not in force at, are both
+    /// refused as the existing typed `UnknownPolicy` gap rather than read.
+    #[test]
+    fn recovered_policy_owner_refuses_undeclared_and_stale_fence_reads() {
+        let observed = snapshot();
+        let expected = KernelGenerationExpectation::from_snapshot(&observed).expect("expectation");
+        let composition = GovernorComposition::new(
+            Arc::new(fake_kernel(observed.clone())),
+            None,
+            &expected,
+            QueueLimits::default(),
+        )
+        .expect("composition");
+        let schedule = composition
+            .owners()
+            .policy
+            .as_ref()
+            .expect("policy owner")
+            .retention_schedule();
+        let declared = eliot_observation_contracts::PrivacyRetentionDisclosure {
+            privacy_domain_ref: "governor-experience".to_owned(),
+            retention_policy_ref: eliot_config::COMPILED_SAFE_DEFAULT_RETENTION_POLICY_REFS[0]
+                .to_owned(),
+            disclosure_class: "internal".to_owned(),
+        };
+        let undeclared = eliot_observation_contracts::PrivacyRetentionDisclosure {
+            retention_policy_ref: "eliot.governor.retention.forever:1.0.0".to_owned(),
+            privacy_domain_ref: declared.privacy_domain_ref.clone(),
+            disclosure_class: declared.disclosure_class.clone(),
+        };
+        assert_eq!(
+            eliot_observation_contracts::resolve_retention_read(
+                &undeclared,
+                schedule,
+                &observed.state_fence(),
+                None,
+            )
+            .expect("retention read"),
+            eliot_observation_contracts::ExperienceRetentionReadPosture::UnknownPolicy {
+                retention_policy_ref: "eliot.governor.retention.forever:1.0.0".to_owned(),
+            }
+        );
+        let mut other_generation = observed.state_fence();
+        other_generation.resource_generation =
+            eliot_contracts::ResourceGeneration::new(2).expect("next generation");
+        assert_eq!(
+            eliot_observation_contracts::resolve_retention_read(
+                &declared,
+                schedule,
+                &other_generation,
+                None,
+            )
+            .expect("retention read"),
+            eliot_observation_contracts::ExperienceRetentionReadPosture::UnknownPolicy {
+                retention_policy_ref: declared.retention_policy_ref.clone(),
+            }
         );
     }
 
