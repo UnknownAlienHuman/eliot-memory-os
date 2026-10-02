@@ -470,6 +470,7 @@ def load_producer(root: Path) -> Any:
         ) from exc
     for required in (
         "discover_context_measurements",
+        "enumerate_measurement_candidates",
         "classify_context_measurement",
         "build_inventory",
         "load_owner_map",
@@ -893,6 +894,114 @@ def _producer_check(
             f"{fresh_header.get('coverage_reason')}",
         )
     return "stale", "producer re-emission differs from the stored artifact"
+
+
+def _enumerated_unaccounted(
+    root: Path,
+    producer: Any,
+    rows: list[dict[str, Any]],
+    scan_roots: list[str],
+) -> list[dict[str, Any]]:
+    """Independently enumerate the producer's scan roots and diff vs the rows.
+
+    This is the C7 repair. The declared-identity check above asks the producer
+    to re-locate the signals the *stored rows already declare*, so it can only
+    ever re-find what the artifact already accounts for: an estimator added to a
+    declared scan root with no stored row is invisible to it. That is the
+    "C7 is impossible" defect -- the universe was seeded from the very thing it
+    was supposed to check.
+
+    Here the universe is NOT seeded from stored rows. The producer's own
+    :func:`enumerate_measurement_candidates` walks each declared scan root and
+    returns every site the accepted rules already match, before any owner
+    allocation, so a newly written estimator is seen *because the producer's own
+    grammar sees it* and not because of any list written here.
+
+    Accounting is then a set difference over exact ``(path, span_start)`` spans:
+    an enumerated site with no stored row at that span is an
+    ``UNACCOUNTED_CANDIDATE`` finding naming its path, span and the producer rule
+    that matched it. A declared-exclusion site is the producer's own answer for
+    that location and is not re-reported.
+
+    Only the forward direction is claimed. The producer's trigger arms
+    (``ESTIMATOR_HELPER_RE``/``ESTIMATOR_CALL_RE``/``CHAR_RATIO``/``BYTE_RATIO``)
+    match estimators *by lexical shape*; most declared denominator rows anchor on
+    a plain identifier such as ``declared_len`` or ``serialized_bytes`` that no
+    trigger arm matches, so "row present but not enumerated" is not a defect and
+    asserting it here would invent a second, stricter denominator. Row-to-source
+    truth is settled by the declared-identity arm above, which re-locates every
+    declared signal through the producer's own locator.
+
+    The finding carries ``rule`` so the audit can name WHICH accepted rule
+    fired, and ``case_ref`` is empty for a site no row declares -- an undeclared
+    estimator has no case identity, and inventing one would be inventing the
+    very accounting this check exists to force.
+    """
+    if not scan_roots:
+        return []
+    try:
+        enumerated = producer.enumerate_measurement_candidates(root, tuple(scan_roots))
+    except producer.InventoryError as exc:
+        raise OracleError(
+            "SOURCE_UNREADABLE",
+            f"a declared scan root could not be enumerated by the "
+            f"#{PRODUCER_ISSUE} producer: {exc.code}: {exc.detail}",
+        ) from exc
+
+    # A stored row is accounted at its span START: that is the anchor both the
+    # producer's locator and its row schema agree on.
+    accounted: dict[tuple[str, int], str] = {}
+    for row in rows:
+        accounted[(str(row["path"]), int(row["span_start"]))] = str(row["case_ref"])
+
+    findings: list[dict[str, Any]] = []
+    for cand in enumerated:
+        rel = str(cand["path"])
+        span_start = int(cand["span_start"])
+        label = str(cand["classification"])
+        if label == "declared-exclusion":
+            # The producer already declared this exact unrelated metric with its
+            # own reason. Re-reporting it would be a second, weaker answer to a
+            # question the sole producer has already answered.
+            continue
+        if label == "test-only":
+            # The producer's own rule 1 classes a test-scope site as carrying
+            # no shipped measurement. #787 audits SHIPPED measurement ownership,
+            # so it does not re-litigate that scope decision with a stricter rule
+            # of its own -- doing so would manufacture findings the sole
+            # classification authority never makes, and would report every
+            # #[cfg(test)] assertion that touches the estimator vocabulary.
+            continue
+        if (rel, span_start) in accounted:
+            # A stored row already sits at this exact span. The declared-identity
+            # arm above checks whether that row still matches live source, so the
+            # same site is never reported twice for one defect.
+            continue
+        code = "CANDIDATE_UNCLASSIFIED" if label == "unclassified" else "UNACCOUNTED_CANDIDATE"
+        findings.append(
+            {
+                "code": code,
+                "path": rel,
+                "span_start": span_start,
+                "span_end": int(cand["span_end"]),
+                "signal": str(cand["signal"]),
+                "case_ref": "",
+                "rule": str(cand["rule"]),
+                "label": label,
+                "item": str(cand["item"]),
+                "item_scope": str(cand["item_scope"]),
+                "evidence": (
+                    f"the #{PRODUCER_ISSUE} producer independently enumerates a measurement "
+                    f"candidate at {rel}:{span_start}-{cand['span_end']} (rule "
+                    f"{cand['rule']}, class {label}, {cand['item_scope']} scope, inside "
+                    f"`{cand['item']}`) but no stored inventory row accounts for that span; "
+                    f"an estimator added to a declared scan root must carry its own row: "
+                    f"{cand['evidence']}"
+                ),
+            }
+        )
+    findings.sort(key=lambda item: (item["code"], item["path"], item["span_start"]))
+    return findings
 
 
 def _unaccounted_candidates(
@@ -1525,8 +1634,30 @@ def evaluate(root: Path) -> OwnershipResult:
             rule="unaccounted-candidate",
         )
 
-    # --- Exactly one canonical measurement implementation owner. ---------
+    # --- Independent enumeration of the producer's scan roots (C7). -------
+    #
+    # The universe is derived from the LIVE SOURCE by the producer's own
+    # enumeration, never from the stored rows, so an estimator that was added
+    # to a declared scan root with no denominator row is now detectable. This
+    # is the arm that makes C7 possible; the arm above re-locates only what the
+    # artifact already declares and could never see it.
     scan_roots = sorted({str(r["path"]) for r in rows})
+    enumerated_unaccounted = _enumerated_unaccounted(root, producer, rows, scan_roots)
+    for item in enumerated_unaccounted:
+        # The finding names the PRODUCER rule that fired (BYTE_RATIO,
+        # ESTIMATOR_HELPER_RE, ...), because the audit must be able to say
+        # which accepted rule observed the site, not merely that something did.
+        add(
+            str(item["code"]),
+            str(item["evidence"]),
+            case_ref=str(item.get("case_ref", "")),
+            path=str(item.get("path", "")),
+            span_start=int(item.get("span_start", 0) or 0),
+            span_end=int(item.get("span_end", 0) or 0),
+            rule=str(item.get("rule", "")) or "unaccounted-candidate",
+        )
+
+    # --- Exactly one canonical measurement implementation owner. ---------
     owner_sites = _measurement_owner_sites(root, producer, scan_roots)
     owner_paths = sorted({s["path"] for s in owner_sites})
     owner_paths_outside = [
@@ -1713,7 +1844,7 @@ def evaluate(root: Path) -> OwnershipResult:
         inventory_digest=inventory_digest,
         candidates=candidates,
         check_status=check_status,
-        unaccounted=unaccounted,
+        unaccounted=unaccounted + enumerated_unaccounted,
         dependency=dependency,
         schema_sites=schema_sites,
         owner_sites=owner_sites,
