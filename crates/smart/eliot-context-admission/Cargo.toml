@@ -54,6 +54,17 @@ eliot-security-contracts.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }
+# #1869 TEST-ONLY edge: the reserved-path proof builds a REAL owner-evidence
+# reservation, so the fixture has to name the owner's own request vocabulary.
+# `HeadroomDemand::request` and `CapacityPermitBinding` are
+# `eliot_runtime_contracts` types, and `DownstreamHeadroomResult::validate_against`
+# refuses an empty demand list, so a demanded-dimension fixture is not
+# constructible without this edge. Target-gated for the same reason the host-only
+# owner evidence above is: this crate's whole test surface is
+# `#![cfg(not(target_arch = "wasm32"))]`, so the wasm32 guest contour gains
+# nothing, and `src/` gains no dependency at all.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+eliot-runtime-contracts = { path = "../../foundation/eliot-runtime-contracts", version = "0.1.0" }
 
 [lints]
 workspace = true
