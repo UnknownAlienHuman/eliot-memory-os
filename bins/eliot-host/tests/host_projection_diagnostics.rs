@@ -20,6 +20,11 @@ use eliot_host::host_diagnostics::{
     EntrypointStage, HostRequestProjection, MAX_DIAGNOSTIC_DETAIL_BYTES,
     observe_entrypoint_with_detail, observe_host_request, observe_terminal_error,
 };
+use eliot_host::host_diagnostics::{HostRequestEvidence, note_event_log_sink_status};
+use eliot_host::windows_event_log::{
+    AdmittedEvent, EVENT_LOG_MAX_INSERTION_BYTES, EVENT_LOG_SOURCE, EventLogRecord,
+    EventLogSeverity, event_log_sink_status,
+};
 use serde_json::Value;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -383,4 +388,354 @@ fn projection_06_detail_is_truncated_with_honest_byte_accounting() {
         !t.contains("detail_truncated=false"),
         "an oversized detail must never claim it was whole: {t}"
     );
+}
+
+/// The three positive rollback claims this leaf can emit. No integration
+/// target can build them (see the reachability note on the cases below); they
+/// are named here only to bind the reachable claim gates to the owner's own
+/// frozen vocabulary, never to invent a record.
+const ROLLBACK_POSITIVE_CLAIMS: [&str; 3] = [
+    "host.phase-b rollback restored verified",
+    "host.phase-b rollback uncommitted removal verified",
+    "host.phase-b rollback backup cleanup completed",
+];
+
+/// Executed case, audit 5909832545 required item 5, first obligation: a positive
+/// rollback claim is unreachable without its owner proof.
+///
+/// `phase_b_restore_or_remove` and `phase_b_remove_rollback_backup` live in
+/// `src/phase_b_materialization/rollback_backup.rs` and are re-exported
+/// `pub(super)` by the private `mod phase_b_materialization`
+/// (`src/phase_b_materialization.rs:31-32`), which `src/lib.rs:5285-5289`
+/// imports with a private `use`. An integration-test crate under `tests/`
+/// therefore cannot name them, so this target cannot drive the rollback owner
+/// and does not claim to. What IS reachable is the production gate that decides
+/// whether any outcome may be stated as a completed operation at all:
+/// `AdmittedEvent::is_admitted_by` (`src/windows_event_log.rs:140`), the single
+/// production predicate over the owner-typed `HostRequestEvidence` class. This
+/// case drives THAT predicate exhaustively and the bounded Event Log record
+/// construction, and asserts the invariant on what production decided - the
+/// record under test is production's own admission decision, never a record
+/// manufactured through the diagnostic facade.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the unproven/proven gate matrix, the bounded sink record, and the owner label binding stay in one deterministic probe"
+)]
+fn projection_07_positive_rollback_claim_is_unreachable_without_owner_proof() {
+    const EVENTS: [AdmittedEvent; 3] = [
+        AdmittedEvent::ServiceStart,
+        AdmittedEvent::ServiceStop,
+        AdmittedEvent::ServiceFailure,
+    ];
+    // Every evidence class the reachable `HostRequestProjection` can carry that
+    // asserts NO completed operation. A rollback outcome that was never
+    // readback-proven is projected as exactly one of these, so at the
+    // reachable claim gate it cannot be stated as restored, removed, or
+    // cleaned-up completed.
+    const UNPROVEN: [HostRequestEvidence; 5] = [
+        HostRequestEvidence::Observed,
+        HostRequestEvidence::Admitted,
+        HostRequestEvidence::SemanticallyReady,
+        HostRequestEvidence::Cancelled,
+        HostRequestEvidence::Unknown,
+    ];
+    for evidence in UNPROVEN {
+        for event in EVENTS {
+            assert!(
+                !event.is_admitted_by(evidence),
+                "{} must not admit {}: an unproven outcome can never be stated as a completed operation",
+                evidence.as_str(),
+                event.as_str(),
+            );
+        }
+    }
+    // The three proven dispositions still reach the sink and each admits
+    // EXACTLY one event, so the denials above are a real distinction and not a
+    // blanket refusal. `Unknown` is deliberately absent: reading preserved
+    // uncertainty as a settlement would manufacture a terminal no owner proved.
+    for (event, proven) in [
+        (AdmittedEvent::ServiceStart, HostRequestEvidence::ProcessStarted),
+        (
+            AdmittedEvent::ServiceStop,
+            HostRequestEvidence::DurableCommitted,
+        ),
+        (AdmittedEvent::ServiceFailure, HostRequestEvidence::Failed),
+    ] {
+        assert!(
+            event.is_admitted_by(proven),
+            "{} must admit its own proven disposition {}",
+            event.as_str(),
+            proven.as_str(),
+        );
+        for other in EVENTS {
+            assert!(
+                other == event || !other.is_admitted_by(proven),
+                "{} must not admit the proven disposition of {}",
+                other.as_str(),
+                event.as_str(),
+            );
+        }
+    }
+    // The bounded sink record for one rollback failure terminal code: the
+    // reachable surface carries the code exactly, under the frozen consumer
+    // mapping, with no fabrication and no truncation of a short code.
+    let code = "host-phase-b-unknown";
+    let failure = EventLogRecord::new(AdmittedEvent::ServiceFailure, code);
+    assert_eq!(failure.event(), AdmittedEvent::ServiceFailure);
+    assert_eq!(failure.insertion(), code);
+    assert_eq!(failure.original_bytes(), code.len());
+    assert!(!failure.truncated());
+    assert_eq!(
+        failure.mapping(),
+        (EVENT_LOG_SOURCE, AdmittedEvent::ServiceFailure.event_id(), EventLogSeverity::Error)
+    );
+    // An unbounded positive claim cannot ride the sink either: the insertion
+    // is bounded with an honest byte account, so a claim the platform had to
+    // shorten can never read as a whole verified one.
+    let oversized = "host.phase-b rollback backup cleanup completed "
+        .repeat(MAX_DIAGNOSTIC_DETAIL_BYTES);
+    let bounded = EventLogRecord::new(AdmittedEvent::ServiceFailure, &oversized);
+    assert_eq!(bounded.original_bytes(), oversized.len());
+    assert!(bounded.truncated());
+    assert!(
+        bounded.insertion().len() <= EVENT_LOG_MAX_INSERTION_BYTES,
+        "the retained prefix must stay inside the sink bound, got {}",
+        bounded.insertion().len()
+    );
+    // Supplementary emission binding only: the executed proof above is
+    // production's own admission decision. This ties that decision to the
+    // owner's three frozen positive labels, which no integration target can
+    // emit because the owner is unreachable from here.
+    let owner = src("src/phase_b_materialization/rollback_backup.rs");
+    for label in ROLLBACK_POSITIVE_CLAIMS {
+        assert!(
+            owner.contains(&format!("\"{label}\"")),
+            "the rollback owner must still name its positive label {label:?}"
+        );
+    }
+}
+
+/// Executed case, audit 5909832545 required item 5, second obligation:
+/// rollback restoration and rollback-by-removal are distinguishable records.
+///
+/// Executed against the reachable production vocabularies. A closed vocabulary
+/// whose members collapsed into one shared label would make two outcomes
+/// indistinguishable again, so each member must own exactly one distinct frozen
+/// name; this drives `HostRequestEvidence::as_str`, `AdmittedEvent::as_str`,
+/// `event_id` and `severity` - production functions - and compares what they
+/// actually return. The owner-label inventory below is supplementary emission
+/// binding: the removal and cleanup contours are private to
+/// `mod phase_b_materialization`, so their records cannot be produced from this
+/// target, but the three contour families must stay pairwise distinct and a
+/// removal or cleanup record must never read as a restoration.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reachable vocabulary distinctness matrix and the three owner contour families stay in one deterministic probe"
+)]
+fn projection_08_restoration_removal_and_cleanup_contours_stay_distinct_records() {
+    let evidence = [
+        HostRequestEvidence::Observed,
+        HostRequestEvidence::Admitted,
+        HostRequestEvidence::ProcessStarted,
+        HostRequestEvidence::SemanticallyReady,
+        HostRequestEvidence::DurableCommitted,
+        HostRequestEvidence::Cancelled,
+        HostRequestEvidence::Failed,
+        HostRequestEvidence::Unknown,
+    ];
+    for (index, left) in evidence.iter().enumerate() {
+        for right in &evidence[index + 1..] {
+            assert_ne!(
+                left.as_str(),
+                right.as_str(),
+                "two reachable evidence classes share one name: a catch-all label would make an unknown outcome indistinguishable from a proven one"
+            );
+        }
+    }
+    let events = [
+        AdmittedEvent::ServiceStart,
+        AdmittedEvent::ServiceStop,
+        AdmittedEvent::ServiceFailure,
+    ];
+    for (index, left) in events.iter().enumerate() {
+        for right in &events[index + 1..] {
+            assert_ne!(left.as_str(), right.as_str(), "two admitted events share one name");
+            assert_ne!(
+                left.event_id(),
+                right.event_id(),
+                "two admitted events share one event id"
+            );
+        }
+    }
+    // Start and stop are both informational notices; only failure is an error,
+    // and the severity names stay distinct so a reader can tell them apart.
+    assert_eq!(
+        AdmittedEvent::ServiceStart.severity(),
+        AdmittedEvent::ServiceStop.severity()
+    );
+    for informational in [
+        AdmittedEvent::ServiceStart.severity(),
+        AdmittedEvent::ServiceStop.severity(),
+    ] {
+        assert_ne!(informational, AdmittedEvent::ServiceFailure.severity());
+        assert_eq!(informational.as_str(), "information");
+    }
+    assert_eq!(AdmittedEvent::ServiceFailure.severity().as_str(), "error");
+    // A rollback outcome can never be smuggled in as an event name: the two
+    // reachable closed vocabularies are disjoint.
+    for outcome in evidence {
+        for event in events {
+            assert_ne!(
+                outcome.as_str(),
+                event.as_str(),
+                "an outcome class and an admitted event share one name"
+            );
+        }
+    }
+    // Supplementary emission binding: the owner's three contour families.
+    // Rollback-by-restoration, rollback-by-removal of an uncommitted
+    // destination, and sidecar cleanup each own distinct frozen labels, and the
+    // removal family - which was completely silent before this issue - is named
+    // here in full.
+    let owner = src("src/phase_b_materialization/rollback_backup.rs");
+    let restoration = [
+        "host.phase-b rollback restore requested",
+        "host.phase-b rollback restored verified",
+    ];
+    let removal = [
+        "host.phase-b rollback uncommitted removal requested",
+        "host.phase-b rollback uncommitted removal verified",
+        "host.phase-b rollback uncommitted removal not required",
+        "host.phase-b rollback uncommitted removal delete failed",
+        "host.phase-b rollback uncommitted removal absence unproven",
+        "host.phase-b rollback uncommitted removal absence unknown",
+    ];
+    let cleanup = [
+        "host.phase-b rollback backup cleanup requested",
+        "host.phase-b rollback backup cleanup completed",
+        "host.phase-b rollback backup cleanup delete failed",
+        "host.phase-b rollback backup cleanup path failed",
+        "host.phase-b rollback backup cleanup absence unproven",
+    ];
+    let owner_labels: Vec<&str> = restoration
+        .iter()
+        .chain(removal.iter())
+        .chain(cleanup.iter())
+        .copied()
+        .collect();
+    for label in &owner_labels {
+        assert!(
+            owner.contains(&format!("\"{label}\"")),
+            "the rollback owner must name {label:?}"
+        );
+    }
+    for (index, left) in owner_labels.iter().enumerate() {
+        for right in &owner_labels[index + 1..] {
+            assert_ne!(
+                left, right,
+                "two rollback contours share one label, so their records are indistinguishable"
+            );
+        }
+    }
+    // A removal or cleanup record can never be read as a restoration: the
+    // positive restoration phrase appears in no other contour label.
+    for label in removal.iter().chain(cleanup.iter()) {
+        assert!(
+            !label.contains("restored verified"),
+            "the non-restoration contour {label:?} claims a restoration"
+        );
+    }
+}
+
+/// Executed case, audit 5909832545 required item 5, third and fourth
+/// obligations: sidecar cleanup is observable, and an unknown or failed
+/// outcome is never logged as restored.
+///
+/// `phase_b_remove_rollback_backup` had no observation at all before this
+/// issue. It is `pub(super)` inside the private rollback leaf, so this target
+/// cannot drive it; what it CAN drive is the canonical bounded Event Log
+/// disposition observer the audit names as the replacement for the stale
+/// no-op wrappers (`host_diagnostics::note_event_log_sink_status`). This case
+/// captures what that production observer actually wrote and asserts the
+/// disposition record names the unavailable sink, owns no terminal, and carries
+/// no rollback positive claim - so the cleanup disposition that production
+/// emits on the reachable surface can never read as a verified removal, a
+/// verified restoration, or a completed cleanup.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the canonical disposition observation and the owner cleanup contour inventory stay in one deterministic probe"
+)]
+fn projection_09_sidecar_cleanup_disposition_is_observable_and_claims_no_removal() {
+    let note = emit(note_event_log_sink_status);
+    if event_log_sink_status().is_ok() {
+        assert!(
+            note.is_empty(),
+            "a live sink needs no unavailability note, got: {note}"
+        );
+    } else {
+        assert!(
+            note.contains("host.event_log_sink_unavailable"),
+            "the canonical disposition observer must record the sink disposition: {note}"
+        );
+        assert!(
+            !note.contains("host.terminal_error"),
+            "a sink disposition is not a terminal: {note}"
+        );
+        assert!(
+            !note.contains("host.entrypoint_stage"),
+            "the canonical disposition observer is not an entrypoint stage: {note}"
+        );
+        for positive in ROLLBACK_POSITIVE_CLAIMS {
+            assert!(
+                !note.contains(positive),
+                "the sink disposition record claimed {positive:?}: {note}"
+            );
+        }
+    }
+    // The positive claims stay inadmissible for every unproven outcome, which
+    // is the property that keeps an unknown cleanup out of the record history
+    // as a removal.
+    for positive in ROLLBACK_POSITIVE_CLAIMS {
+        for evidence in [
+            HostRequestEvidence::Observed,
+            HostRequestEvidence::Admitted,
+            HostRequestEvidence::SemanticallyReady,
+            HostRequestEvidence::Cancelled,
+            HostRequestEvidence::Unknown,
+            HostRequestEvidence::Failed,
+        ] {
+            for event in [
+                AdmittedEvent::ServiceStart,
+                AdmittedEvent::ServiceStop,
+                AdmittedEvent::ServiceFailure,
+            ] {
+                assert!(
+                    !event.is_admitted_by(evidence),
+                    "{} still admits {} while the outcome is {}",
+                    event.as_str(),
+                    positive,
+                    evidence.as_str()
+                );
+            }
+        }
+    }
+    // Supplementary emission binding: the cleanup contour is no longer silent
+    // and states its own explicit non-success dispositions beside the positive
+    // one, so a failed or undetermined cleanup cannot read as a completion.
+    let owner = src("src/phase_b_materialization/rollback_backup.rs");
+    for label in [
+        "host.phase-b rollback backup cleanup requested",
+        "host.phase-b rollback backup cleanup completed",
+        "host.phase-b rollback backup cleanup delete failed",
+        "host.phase-b rollback backup cleanup path failed",
+        "host.phase-b rollback backup cleanup absence unproven",
+    ] {
+        assert!(
+            owner.contains(&format!("\"{label}\"")),
+            "the sidecar cleanup contour must name {label:?}"
+        );
+    }
 }

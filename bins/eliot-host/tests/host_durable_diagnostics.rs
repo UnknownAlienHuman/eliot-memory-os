@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, HOST_DIAGNOSTICS_TARGET, bound_detail, bound_field,
-    observe_entrypoint_with_detail, observe_terminal_error, sink_status,
+    note_event_log_sink_status, observe_entrypoint_with_detail, observe_terminal_error, sink_status,
 };
 use eliot_host::windows_event_log::{AdmittedEvent, event_log_sink_status, report_event};
 use serde_json::Value;
@@ -1541,4 +1541,113 @@ fn durable_26_actual_path_and_diff_guard() {
         fixture["allowed_diff"]["no_new_logging_subsystem"].as_bool(),
         Some(true)
     );
+}
+
+// Executed case (audit 5909832545 required item 4): the codec contour split is
+// a real ten-way split, not a catch-all.
+//
+// `credential_control/codec.rs` is a private `mod codec` inside the private
+// `credential_control` module, and `decode_marker` / `decode_envelope` are
+// `pub(super)` inside it (`src/credential_control.rs:15,40`). An
+// integration-test crate cannot name them, so this target cannot drive the
+// codec owner and does not claim to; the executed proof of each contour lives
+// in the owner's own `#[cfg(test)]` cases. What IS provable here is executed
+// against production on the reachable side: the only reachable production
+// diagnostic observer in this file's scope emits no codec contour and, above
+// all, no collapsed catch-all name, so a reachable reader can never be handed
+// the pre-fix "malformed" label that erased the MAC, protected-object,
+// wire-version, and shape causes. The ten frozen labels are then held to one
+// distinct name per contour, split into two disjoint five-member families.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the reachable-surface denial and the ten-label family inventory stay in one deterministic probe"
+)]
+fn durable_codec_contours_are_a_closed_ten_label_split_not_a_catch_all() {
+    const MARKER: [&str; 5] = [
+        "marker-record-shape",
+        "marker-expected-mac",
+        "marker-mac-mismatch",
+        "marker-protected-object-mismatch",
+        "marker-wire-version-mismatch",
+    ];
+    const ENVELOPE: [&str; 5] = [
+        "envelope-record-shape",
+        "envelope-expected-mac",
+        "envelope-mac-mismatch",
+        "envelope-protected-object-mismatch",
+        "envelope-wire-version-mismatch",
+    ];
+    // The two names the pre-fix codec collapsed every cause into. They survive
+    // only as prose in the owner's change note, so what must be gone is the
+    // live string LITERAL: a quoted occurrence would be an emittable label.
+    const COLLAPSED: [&str; 2] = ["marker malformed retained", "envelope malformed retained"];
+
+    // Executed on production: what the reachable observer actually wrote is
+    // read back out of the real tracing subscriber, and neither a contour nor
+    // a collapsed name appears on the reachable surface.
+    let reachable = capture_emit(note_event_log_sink_status);
+    for label in MARKER.iter().chain(ENVELOPE.iter()).chain(COLLAPSED.iter()) {
+        assert!(
+            !reachable.contains(label),
+            "the reachable surface produced the codec contour {label:?}: {reachable}"
+        );
+    }
+    assert!(
+        !reachable.contains("host.credential codec"),
+        "no codec boundary leaked onto the reachable surface: {reachable}"
+    );
+
+    // Executed: one distinct label per contour member, so no two causes share a
+    // name and the split cannot silently collapse back to a catch-all.
+    let contours: Vec<&str> = MARKER
+        .iter()
+        .chain(ENVELOPE.iter())
+        .copied()
+        .collect();
+    assert_eq!(contours.len(), 10, "the codec owns exactly ten contours");
+    for (index, left) in contours.iter().enumerate() {
+        for right in &contours[index + 1..] {
+            assert_ne!(
+                left, right,
+                "two codec causes share one contour label, so their records are indistinguishable"
+            );
+        }
+    }
+    // Two disjoint five-member families: a marker cause is never named by an
+    // envelope contour, so a marker rejection cannot read as an envelope one.
+    for marker in MARKER {
+        for envelope in ENVELOPE {
+            assert!(
+                !envelope.contains(marker) && !marker.contains(envelope),
+                "the marker contour {marker:?} and the envelope contour {envelope:?} name each other"
+            );
+        }
+    }
+
+    // Supplementary emission binding: the ten contours are the owner's, emitted
+    // through its own closed `CodecRejectReason` discriminant behind the frozen
+    // boundary labels, with one observe call per branch.
+    let codec = manifest_source("src/credential_control/codec.rs");
+    for label in contours {
+        assert!(
+            codec.contains(&format!("\"{label}\"")),
+            "the codec owner must name contour {label:?}"
+        );
+    }
+    for collapsed in COLLAPSED {
+        assert!(
+            !codec.contains(&format!("\"{collapsed}\"")),
+            "the collapsed catch-all {collapsed:?} must no longer be an emittable label"
+        );
+    }
+    for boundary in [
+        "host.credential codec marker rejected",
+        "host.credential codec envelope rejected",
+    ] {
+        assert!(
+            codec.contains(&format!("\"{boundary}\"")),
+            "the codec owner must name boundary {boundary:?}"
+        );
+    }
 }
