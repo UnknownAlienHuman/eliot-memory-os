@@ -22,8 +22,8 @@ use eliot_kernel::{
     BlobOwnerClient, CanonicalOwnerClient, DESTINATION_ADMISSION_FILE, DestinationManifestEvidence,
     InvalidationKind, InvalidationOwnerClient, KernelBackupRestore, KernelIsolatedDestination,
     KernelRestoreError, PinnedDestinationAdmission, PurgeOwnerClient, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
-    phase_owner, require_production_admitted,
+    RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
+    check_kernel_effect_fence, phase_owner, require_production_admitted,
 };
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -106,6 +106,14 @@ fn production_admission() -> RestoreJournalAdmission {
             .expect("production admission fixture");
     assert!(!admission.fixture_proof_only);
     assert_eq!(admission.database_ref, RESTORE_JOURNAL_OWNER_LABEL);
+    // The durable CHANNEL this owner writes every restore-journal row under,
+    // and the exact value `OrsRestoreJournalOwner::durable_journal_record`
+    // issues. Asserted here so the fixture cannot drift back to a value no
+    // owner-issued producer can emit: `restore` now refuses such an admission
+    // in `restore_with_owner`, and a placeholder in the fixture would make
+    // every case below fail for a reason that has nothing to do with what each
+    // case is measuring.
+    assert_eq!(admission.journal_identity_ref, RESTORE_JOURNAL_IDENTITY);
     admission
 }
 
@@ -537,6 +545,139 @@ fn unadmitted_or_fixture_journal_refuses_production_effects() {
             "banned {banned} in coordinator"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// POSITIVE case for the durable-journal-channel rule that
+/// `restore_with_owner` now enforces for BOTH public entries.
+///
+/// `restore` is the entry whose `J` is a caller-supplied parameter, so it is
+/// the one on which a hand-built admission could previously be paired with an
+/// arbitrary `RestoreJournalPort` and still reach production effects. Here the
+/// admission is the one `OrsRestoreJournalOwner` issues — it names the durable
+/// ORS restore-journal CHANNEL, `RESTORE_JOURNAL_IDENTITY` — and the execution
+/// is admitted and runs to its validated receipt.
+///
+/// FAILS WITHOUT THE CHANGE: this also passes on the pre-change source, and
+/// that is stated rather than hidden. The gate's positive direction cannot
+/// fail at base, because at base NOTHING checked the channel on this arm. The
+/// positive case exists so the new refusal has a demonstrated accepted side —
+/// a stricter gate that refuses everything would satisfy the case below too,
+/// and only this pins that the rule rejects a foreign channel rather than all
+/// channels. The rule that fails at base is the refusal case below.
+#[test]
+fn admission_naming_the_durable_ors_channel_is_admitted() {
+    let target = "t960-960a";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("960a");
+    let fence = bundle.export_fence.state_fence.clone();
+    let admission = production_admission();
+    // The value compared is the Kernel-owned constant, read from the crate, not
+    // a copy of the string in the fixture: a renamed channel cannot leave this
+    // case asserting against a stale copy.
+    assert_eq!(admission.journal_identity_ref, RESTORE_JOURNAL_IDENTITY);
+    assert!(require_production_admitted(&admission).is_ok());
+    // The destination is admitted for THIS work root, so the channel field is
+    // the only thing that can decide the answer. `production_ports` leaves the
+    // destination unadmitted, which the destination-admission gate refuses
+    // before any effect.
+    let evidence = manifest_evidence(&root);
+    let ports = RestorePorts {
+        journal_admission: &admission,
+        kernel_fence: &fence,
+        keys: None,
+        blob_scope: None,
+        manifest_evidence: Some(evidence),
+        rehearsal: false,
+    };
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let mut journal = FixtureJournal::default();
+    let outcome = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect("an admission naming the durable ORS channel restores");
+    outcome.receipt.validate().expect("receipt validates");
+    // The outcome reports the admitted journal owner, so the channel the rule
+    // required is the one the caller is told about.
+    assert!(outcome.journal_owner.contains(RESTORE_JOURNAL_IDENTITY));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REFUSAL case for the same rule: an admission that is structurally valid,
+/// production-grade (not fixture-flagged) and durable-recovery-admitting, but
+/// names NO durable ORS restore-journal channel, is refused before any effect.
+///
+/// This is the shape `OrsRestoreJournalOwner::durable_journal_record` cannot
+/// produce — it reports `RESTORE_JOURNAL_IDENTITY` and nothing else — so no
+/// owner-issued producer can hand this value out. Every OTHER admission check
+/// passes on it, which is the point: the case would be vacuous if it were
+/// merely "a malformed admission".
+///
+/// FAILS WITHOUT THE CHANGE, and specifically on this source shape: at base
+/// `restore` reached the engine with it. The gate lived only inside
+/// `check_ors_journal_binding`, which is reached solely from
+/// `restore_with_ors_journal`; the injected-journal seam that takes `J` as a
+/// parameter ran the whole phase engine — prepare, purge, rebuild, verify,
+/// finalize — under an admission naming no durable journal, staged every
+/// member and a final evidence document, and returned `Ok`. The two
+/// `assert!`s below fail at base: the call returns `Ok` instead of `Err`, and
+/// the isolated destination directory does not exist after a refusal that never
+/// ran. The pre-change production-admission fixture itself carried exactly this
+/// placeholder (`journal_identity_ref =
+/// "per-execution-stream-key-requires-a-live-restore-plan"`), which is direct
+/// evidence that the rule was absent rather than merely untested.
+#[test]
+fn admission_naming_another_journal_channel_refuses_before_any_effect() {
+    let target = "t960-960b";
+    let bundle = test_bundle(target);
+    let context = test_context(target);
+    let root = work_root("960b");
+    let fence = bundle.export_fence.state_fence.clone();
+    // Built on the production fixture so every other admission fact is the
+    // owner's; ONLY the channel field is substituted. This is a refusal case,
+    // not a fixture-admission case: `require_production_admitted` still accepts
+    // it, so the channel comparison is the only thing that can refuse.
+    let mut foreign_channel = production_admission();
+    foreign_channel.journal_identity_ref = "in-process-restore-journal".to_owned();
+    assert!(
+        require_production_admitted(&foreign_channel).is_ok(),
+        "the refusal under test must not be the fixture-flag gate"
+    );
+    assert_ne!(foreign_channel.journal_identity_ref, RESTORE_JOURNAL_IDENTITY);
+    // The destination is admitted exactly as in the positive case, so the only
+    // difference between the two runs is the channel field. Without that, the
+    // case could be passing for the destination gate instead.
+    let evidence = manifest_evidence(&root);
+    let ports = RestorePorts {
+        journal_admission: &foreign_channel,
+        kernel_fence: &fence,
+        keys: None,
+        blob_scope: None,
+        manifest_evidence: Some(evidence),
+        rehearsal: false,
+    };
+    let coordinator = KernelBackupRestore::bind(root.clone());
+    let mut journal = FixtureJournal::default();
+    let refused = coordinator
+        .restore(&bundle, context, &ports, &mut journal)
+        .expect_err("an admission naming another journal channel must refuse");
+    // Typed refusal with its own class, not a formatted string and not the
+    // generic target failure: this is owner evidence that does not hold.
+    assert_eq!(
+        refused,
+        KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal admission does not name the durable ORS restore journal".to_owned()
+        )
+    );
+    // No destination byte, no pinned admission, no phase receipt, no journal
+    // write: the refusal sits beside the admission gate, before the effect
+    // fence and before `KernelIsolatedDestination::open` constructs the root.
+    let area = root.join(".eliot").join(RESTORE_ISOLATED_AREA);
+    assert!(!area.join(target).exists(), "destination must not be constructed");
+    assert!(
+        journal.record.is_none(),
+        "no journal row may be written before the refusal"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
