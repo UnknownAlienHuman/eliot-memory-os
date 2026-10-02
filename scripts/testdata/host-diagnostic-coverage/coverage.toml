@@ -106,7 +106,7 @@ note = "#984 consumer seam (typed-unavailable)"
 
 [[file]]
 path = "bins/eliot-host/src/activation_lifecycle.rs"
-sha256 = "da6fc83aadd02a9d4e6f4236a4937c7e200de9f2dbe60fe6e9f32a95788f201d"
+sha256 = "ae08915c5ccbc701d7a6e3e9716f28612501ae350f8ebe30f7e0a20a55a27fed"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -116,7 +116,7 @@ owner = 891
 
 [[file]]
 path = "bins/eliot-host/src/backup_config_projection.rs"
-sha256 = "b0f8db57133413d403e4a4dc2dfb10b7b0b628a934a6782599ab965c78cd6c5a"
+sha256 = "3128f537d1b026b2178366b6e72524b159c515740a4dc1e5a61daa5d1a1e056f"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -126,7 +126,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_cutover.rs"
-sha256 = "ed71ad534890680342f414641ba5a17683e1877fbfa7c7a69bd13b2cde89a415"
+sha256 = "637964b08c9373ce78644aae70d8b70d2796fd838e89380f2e245f1ea1187913"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -136,7 +136,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/backup_preparation.rs"
-sha256 = "20d7df25540244302876865d5f41604119ab22b5463503a9bb832c26436a95fb"
+sha256 = "87ae87174f2fe084ee8931f1a44ee3bf11c778a979f1d152fea0193c9314b59a"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -146,7 +146,7 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/credential_control.rs"
-sha256 = "cc045df6ba271a82fceb7adff96ed0664e311564762574dfcf54d741a4a4f5ae"
+sha256 = "4737c0b6cc1298a78faec0d3f4173e1d6c55e32ef78fb2d36b3481b7b9034fb2"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -156,7 +156,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/credential_control/codec.rs"
-sha256 = "0e1304429beb9c1552021ba88db1564970845aa31324133b06f5765b293574fa"
+sha256 = "5cee268fbfc34774cf00f738fa13efb94232ec2df74427a988fb9d0e2dfa69a5"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/credential_control.rs"
@@ -166,7 +166,7 @@ owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/host_activation_durable.rs"
-sha256 = "61b1bacd6da2405aad1fda101c48a8757a523d4e69b13f99653877029d5c5b78"
+sha256 = "e5178a5c94968b28c942040855fb0f1cea8c1cdef97ae8df2847957c918c43ba"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -176,7 +176,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_phase_b.rs"
-sha256 = "bb22203b9072922a9a95f079e56c40434dc9704f1c7db19fdcee64086427ff87"
+sha256 = "9e2490d80a981cf86407116f9f2227f3650b6eddd9d99e6c6f9d0943f6b63002"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -186,7 +186,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_store_recovery.rs"
-sha256 = "7ebf0428fe32793bcd2527fafb2e815b9587e2b76806e0359fd960101534dfda"
+sha256 = "a890672790788817e842cc889be4456e71d4a65c05690429f30631c13c27f7a8"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -196,7 +196,7 @@ owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/host_composition_validation.rs"
-sha256 = "b3372a5f9af3162a43ce6ec39eb186bc05215803a25d049c243b28cb50368262"
+sha256 = "1415eb2524d07bcff8e096eac32a5cdfd8b8d3e8b9b29fdc23b3d04a4716c1cc"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -216,7 +216,7 @@ owner = 982
 
 [[file]]
 path = "bins/eliot-host/src/host_diagnostics.rs"
-sha256 = "3bf37eec18d285c7cf35027d8e5ccf297c9c27db7322d1e7ed03063c11913daf"
+sha256 = "8fad8ceffbe95e03bb3475c9df4944c2d2f52dc788b88f7b43421bdcbe664c79"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -230,23 +230,23 @@ sha256 = "83a212cc0584489eb33830ff558b90cf91b78dcb92aa90f77598a3d850141d95"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5199
+parent_line = 8927
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/host_epoch_reopen.rs"
-sha256 = "d5366e4dc173e90b83a0235903f519ba11d6552f68373767e4d77b5d37acb146"
+sha256 = "a5e21bfe4102cebbfdd402ba93d7cb5c49bf5c04cb396f6616ebaebedb1b97dd"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5190
+parent_line = 8918
 parent_cfg = ""
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/host_job_launch.rs"
-sha256 = "c6384881dadb06a583241fa7d18ae56bd36a0247babc3aea5dcfc6a354dc159c"
+sha256 = "c4190164d04c5a4a77208013f12520161c1b49892591351cf44219ae74d58b68"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -256,7 +256,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/host_launch_options.rs"
-sha256 = "a5ce65613fa19020a06e1a06d8f80d4d1f74de74f8ffd9ff3e7c5cd8772080d2"
+sha256 = "deafe77d015b9e411abac14d0bc7257b1203d9fb1acde26cd59c2bf4e77e3322"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/launch_options.rs"
@@ -266,11 +266,11 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/host_startup_evidence.rs"
-sha256 = "ada0bfdbd846bee76cd0fe8e243b0a8758d641ebd6284c1acd7d7ef6042df614"
+sha256 = "cbe16be94d95934240dd10bfe6b35095f5d05959a4b9bab2c87b6aa56fe0c739"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1845
+parent_line = 5345
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -286,11 +286,11 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/journal_append.rs"
-sha256 = "6a77d16415e83c327d06fdccf476fd18f0e7b100040784fcb51cb4972d85c790"
+sha256 = "5a7dffc60f5cafaffd13466122afb98e106a027001ab453c3e3d6742f9b6cb12"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5156
+parent_line = 8884
 parent_cfg = ""
 owner = 981
 
@@ -316,21 +316,21 @@ exclusion = "test_only"
 
 [[file]]
 path = "bins/eliot-host/src/journal_tests.rs"
-sha256 = "64e20f93d954f3f89cad38225c90318837797e402960bef2b30558bc49c8c1ce"
+sha256 = "3ce31d8c6227349e314212a7ec70bacc88b4e19cf6f0cfb6705e630eb52760cb"
 cfg = "test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10896
+parent_line = 16684
 parent_cfg = "#[cfg(test)]"
 exclusion = "test_only"
 
 [[file]]
 path = "bins/eliot-host/src/kernel_activation_driver.rs"
-sha256 = "0d3f92f103589f029f6a922f4c1f08d2acdf7b716529183ef6babc1b6da89036"
+sha256 = "e26eb16dc6c22f91ae6b6852e0146e7ecda0a22798c5a7636fc8f2ab6d3fd449"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1840
+parent_line = 5336
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -340,7 +340,7 @@ sha256 = "20655540abf52391be10131e3fc4519e41fff36eae1267b82dbec2b0fa6ef77e"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1847
+parent_line = 5347
 parent_cfg = "#[cfg(windows)]"
 owner = 978
 
@@ -357,7 +357,7 @@ exclusion_target = "bins/eliot-host/src/launch_artifact_lease.rs"
 
 [[file]]
 path = "bins/eliot-host/src/launch_artifact_lease.rs"
-sha256 = "7b3fd7c19e56cbc6a94303a8508ed26bf64c5dbc02aa483fef6fe742904985f2"
+sha256 = "b34cad39223286cc7922e5a2f39a9e922325ee35ce1affe3e034b6ec3b0a16f5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/launch_artifact.rs"
@@ -367,7 +367,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/launch_descriptor_validation.rs"
-sha256 = "3ffc592ff13a9f3e24af5f309c4c4f03e50c74f97953d7b22f0077d581143252"
+sha256 = "ce6a2bf877636745b9c93683dead7508c1c67f53ef751f4c1cda3115396219d8"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -392,13 +392,13 @@ sha256 = "c9444f75c24aaa4153c3d2d09c08c9a5b34e3db4a5253ded519095ced250c8c0"
 cfg = "test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1708
+parent_line = 5168
 parent_cfg = "#[cfg(test)]"
 exclusion = "test_only"
 
 [[file]]
 path = "bins/eliot-host/src/lease_drain.rs"
-sha256 = "7a83c0d8e25b269e8f9b91bb84d076de38588faefb248788f4ddd51c0c1f8098"
+sha256 = "5d3f0766862fda27466dca6077bcbd45c984472daaf081941cfdcae25506332f"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -408,14 +408,14 @@ owner = 983
 
 [[file]]
 path = "bins/eliot-host/src/lib.rs"
-sha256 = "9f2c2ff81e3ec36e2a4952a5e55b38a588f90cd953d2386e4dd2776f89d45244"
+sha256 = "bf8ef9a5929d0dd285ed7df6c15393b1ba224be4c9afa7e43069a43f055c0948"
 cfg = "always"
 target = "lib"
 owner = 891
 
 [[file]]
 path = "bins/eliot-host/src/main.rs"
-sha256 = "66f79bc46357920d2ba99e67c1abf87ef5655117d0911108ec92fa920796b53f"
+sha256 = "afb1c545197412462de2c076efc65f5a2a1206e37a9c9dfb102dc5eb0e9f49c7"
 cfg = "bin"
 target = "bin"
 owner = 982
@@ -426,47 +426,47 @@ sha256 = "8501730bf489b5f3613f214aaf9d4220a647a8adb0b5869d4af783946509c2a6"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1795
+parent_line = 5291
 parent_cfg = ""
 owner = 1780
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_materialization.rs"
-sha256 = "f9aacb6dc9bc0b6c0245e8a08e3c94749fb60e318363c078912dc04104750312"
+sha256 = "a50f74d5c0e4bfe2ef0544fc4ed0329b7933caa297eb0f7c7d956b8fcc1f24bc"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1785
+parent_line = 5281
 parent_cfg = "#[cfg(windows)]"
 owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_materialization/rollback_backup.rs"
-sha256 = "a3b328388080cc4e905985f8cd8e6378d536830108617c080e7a220731ca92d5"
+sha256 = "699af6f2478770f25f44dd87af5d1b0e68882f8c904a413a9217603466a52be7"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/phase_b_materialization.rs"
-parent_line = 30
+parent_line = 31
 parent_cfg = ""
 owner = 893
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_previous_authority.rs"
-sha256 = "6071bb5c6d9ffd2a42e334188c5acd99a85fff63995d9a2d7615492dfaeb0fb9"
+sha256 = "f0aa3186359854a195f3c360bf3e872724cf047ee9533890b157b9ef9deab2ab"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1777
+parent_line = 5273
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/phase_b_previous_projection.rs"
-sha256 = "98894f97a1cb691e82b6fb3c4018895d1f987d7c1d9eeba82d26c91b87612e7b"
+sha256 = "25ae335a2693ef9733181ac9561ff2d61cc1fb8f7793ebe0ba1d5d74a0ce618f"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1805
+parent_line = 5301
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
@@ -476,13 +476,13 @@ sha256 = "a01dc364acb704a6f0e59c0a14139cc983f9d7c826b1ef8a1d9a15cd6f189ca5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 1766
+parent_line = 5262
 parent_cfg = "#[cfg(windows)]"
 owner = 980
 
 [[file]]
 path = "bins/eliot-host/src/reactive_context_delivery.rs"
-sha256 = "e64aad1ca530b693e1fd2b936b5d96977d9d2cf6769e357ba65801d0da378c6e"
+sha256 = "4571d9a3a29771b763b7e47cb12f4751b9195e409430a2cc0b98fec5bd436248"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -496,13 +496,13 @@ sha256 = "55dc6a82abdd861c29bbe3b27e9c9c5130eca5302cd23c8ddc2861912e91df71"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 2156
+parent_line = 5656
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/readiness_gate/contract.rs"
-sha256 = "813939092580e5cb0f4230e14a655a6f515f7932841df0c6f1d08ce77cea073d"
+sha256 = "67c119e52f5a9565f451c19ee5dfebec8a2bbd2e7e1f233466f1a26b756874a6"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/readiness_gate.rs"
@@ -512,11 +512,11 @@ owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/runtime_restart_state.rs"
-sha256 = "29e8b98b1017d2462397816e50404bb3b1fea501a8ce003f1756897645a7b3d7"
+sha256 = "e5444187420071a4d96aa79022dd96319b99300437ca14a112b69bac3bad3e9c"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5202
+parent_line = 8930
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
@@ -526,13 +526,13 @@ sha256 = "5e31f80bc04b1b4f2908d84305abe2cae2a02994101f122eca8330d5695ef9c5"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/runtime_restart_state.rs"
-parent_line = 12
+parent_line = 13
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/scm_launch.rs"
-sha256 = "abe7342726f25a27e0c44cdc56e2db3275dba5005eff17757e9d5f86df506484"
+sha256 = "468776909600dcc5474f024e2d9492a0607b1ea13c33a6512c1cbf52e3324638"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -542,7 +542,7 @@ owner = 978
 
 [[file]]
 path = "bins/eliot-host/src/store_kernel_launch_sequence.rs"
-sha256 = "17763da3f27d53b0304ed09ee2f826ea5177a61d6b0928dc759e7a5ff7a9af56"
+sha256 = "01e4b0cec4412288f2ecccbcb6ce7bfd8e201600c21105590f88530fd30d82db"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -556,7 +556,7 @@ sha256 = "37223be2684562ca2733b42adaf5c6b87f4168cc3599862a5b9fce0ec8e4ffeb"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5232
+parent_line = 8961
 parent_cfg = "#[cfg(windows)]"
 owner = 981
 
@@ -566,17 +566,17 @@ sha256 = "19084819a1e99b590c9dd773a1c83c8401cede854c248a5e7e8c16b357f72b37"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5184
+parent_line = 8912
 parent_cfg = ""
 owner = 981
 
 [[file]]
 path = "bins/eliot-host/src/store_recovery_persistence.rs"
-sha256 = "185312e1ceb98fc979fec4c057573f744b9fd903c49c8cf28cd1cdd47f65992a"
+sha256 = "e60d9d09629ba501cf1e0c044cc71092a1a23938e8b4b3d8cfb4722d61f82e74"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5215
+parent_line = 8944
 parent_cfg = "#[cfg(windows)]"
 owner = 893
 
@@ -586,7 +586,7 @@ sha256 = "8596fea4847953570275f1f298d64ddf72766576a7f1634a90fa71974f3cf62d"
 cfg = "windows+test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10899
+parent_line = 16687
 parent_cfg = "#[cfg(all(test, windows))]"
 exclusion = "test_only"
 
@@ -596,7 +596,7 @@ sha256 = "dd157772b1ac01b0e66d8c5d4ecc5051df9e6e162b0219ca060622519e7e7bf1"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5030
+parent_line = 8758
 parent_cfg = "#[cfg(windows)]"
 owner = 891
 
@@ -616,7 +616,7 @@ sha256 = "55c806edb037c59e91c088b7c632117d26fd4e68d97f74a30e9597b12a4892d9"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5022
+parent_line = 8750
 parent_cfg = "#[cfg(windows)]"
 owner = 979
 
@@ -636,7 +636,7 @@ sha256 = "3286273abaa64347b758245fc33582447752d98c5de33f14c96e639a9bf1a82d"
 cfg = "windows"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 5002
+parent_line = 8730
 parent_cfg = "#[cfg(windows)]"
 owner = 979
 
@@ -656,7 +656,7 @@ sha256 = "2ee533570b62702d2bbe367657877d3d272dfb52dd0a2f826d3cb65a144de4cb"
 cfg = "windows+test"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
-parent_line = 10893
+parent_line = 16681
 parent_cfg = "#[cfg(all(test, windows))]"
 exclusion = "test_only"
 
@@ -672,7 +672,7 @@ owner = 979
 
 [[file]]
 path = "bins/eliot-host/src/windows_event_log.rs"
-sha256 = "939e1bdb7d5d2e3ef643ee7ed5278c430b52d17c8e44793d2b42038e392267b0"
+sha256 = "196a64ca07ad0031ea7dc1e75a4ce74ae6f748f87e23bda97c4d4a90836afd73"
 cfg = "always"
 target = "lib"
 parent = "bins/eliot-host/src/lib.rs"
@@ -686,31 +686,31 @@ sha256 = "e9fc646dcd19d6d4bf1f252f5b1c6d1508920a9343f067e42b981e0e48ac9ccf"
 
 [[input]]
 path = "bins/eliot-host/tests/host_console_diagnostics.rs"
-sha256 = "02d4ebec55c0879ad2b709b25278bf1015ea550a279d4baa523411723dc23686"
+sha256 = "64df32fbc7912875a9e8456d275de55f0f6f9702b0c3501581a257c877aab5b3"
 
 [[input]]
 path = "bins/eliot-host/tests/host_diagnostics_contract.rs"
-sha256 = "51a56f6f4a47706e2c796c4778f627b24f17d13126cc110dbb4fffd3c24f0f75"
+sha256 = "c828e42dd609344a697e226993c079f64dd130e5316f4bb06c2a70a573494200"
 
 [[input]]
 path = "bins/eliot-host/tests/host_durable_diagnostics.rs"
-sha256 = "82bfc8ba70326c5d78056514127d9c2cad81dea207fcb6ee157a5903fc5badda"
+sha256 = "1a142dc33a94291d9f25e23e9196bf48b36d61619e0a4d6e920a0c6ebd74fc79"
 
 [[input]]
 path = "bins/eliot-host/tests/host_journal_diagnostics.rs"
-sha256 = "8f140081621c1b755c4606ad5b0c0a0308da0881eec475d1a5b50f9dd3d68b48"
+sha256 = "88836cc2b359a298424268617c6e3657dd434cd6b5a780f0b153b2613bc38c81"
 
 [[input]]
 path = "bins/eliot-host/tests/host_launch_diagnostics.rs"
-sha256 = "bde8a47b9328da7f7cee6930cf3cd9a84894717f9318a5ab611126ba88673218"
+sha256 = "e3f3990054f582b02d12e876aff053b676bad21750bfbf31415094a7e1e965e1"
 
 [[input]]
 path = "bins/eliot-host/tests/host_lifecycle_diagnostics.rs"
-sha256 = "a37bf4050433c9123ef77d6b09163d953c36c3824da2218520e245b27b93d570"
+sha256 = "8ed54a708a939772c1fbd2c0ffe6ee0244e7c91dac0b559da4214eeb9c7f7623"
 
 [[input]]
 path = "bins/eliot-host/tests/host_projection_diagnostics.rs"
-sha256 = "3befa09939a5b2860ef39d06e5303c356fec50a0a46e71f50f6dc9df774ed8ad"
+sha256 = "a196c0fbb9bb70514a130a62779ac9f911e49070bd5893067b5f74ee2ff6be13"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_console_diagnostics.json"
@@ -734,7 +734,7 @@ sha256 = "f77096c538a0b31a9322c9c781566670dcc8eec3eacc733b618128a5da1f017a"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_lifecycle_diagnostics.json"
-sha256 = "a7f4912a1297d8ce912313453febb8cb2c5df31621f9b20d79a87ea71745fbf9"
+sha256 = "8a3aba564dd60ded15c2c2cb51d59f18c8d98c917bc8e2f467f21ae8ef8654e5"
 
 [[input]]
 path = "bins/eliot-host/tests/data/host_projection_diagnostics.json"
@@ -742,7 +742,7 @@ sha256 = "8810026f66cfd0d4bf48b7761dae1d1a7ed0e56c27bc005bbed72fa0186f3064"
 
 [[input]]
 path = "crates/kernel/eliot-platform-windows/src/event_log.rs"
-sha256 = "1da6da86d9d737c6e18cedad30dfc9818a6045e8e9ae902e3f94b42eb39ac041"
+sha256 = "4a69de321b2910025f86274c7680a8798e93ebcf4902e6a87c997a4e231d18c6"
 
 [[input]]
 path = "crates/kernel/eliot-platform-windows/tests/data/event-log/admitted-profile.json"
