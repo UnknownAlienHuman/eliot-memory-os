@@ -121,7 +121,7 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
+    AuthorityBasis, BootDelta, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
@@ -5325,7 +5325,8 @@ pub struct ColdStartSurfaceView {
 /// `record.terminal.receipt_bytes` and `receipt_digest` are returned from the
 /// durable owner unchanged so dispatch can carry the original receipt without
 /// reserializing or rehashing it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColdStartOwnerReadback {
     /// Exact validated ORS record as read from the durable owner.
     pub record: ColdStartReadinessOrsRecord,
@@ -5335,6 +5336,17 @@ pub struct ColdStartOwnerReadback {
     pub receipt: eliot_workscope::OnboardingReadinessReceipt,
     /// Surface projected from that same exact lease/receipt pair.
     pub surface: ColdStartSurfaceView,
+}
+
+/// One validated cold-start owner readback together with its bounded delta
+/// from an optional previous owner terminal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartOwnerBootstrapReadback {
+    /// Current exact owner record and its decoded projections.
+    pub readback: ColdStartOwnerReadback,
+    /// Additive delta derived from the current and prior owner terminals.
+    pub delta: BootDelta,
 }
 
 /// Ephemeral capability held only by the composition invocation that won the
@@ -8650,6 +8662,293 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             receipt,
             surface,
         })
+    }
+
+    /// Reads the current canonical cold-start terminal and, when supplied, the
+    /// exact prior owner terminal named by its original claim. The returned
+    /// delta is derived only from these validated owner records; it never
+    /// reconstructs a prior claim from a revision number or caller projection.
+    ///
+    /// The two immutable records are read separately through the same ORS
+    /// owner. `delta.expansion_handle` is the current terminal's own
+    /// `receipt_ref`, which resolves through this owner readback route.
+    pub fn cold_start_owner_readback_with_delta_for_claim(
+        &self,
+        current_claim: &ColdStartReadinessClaim,
+        previous_claim: Option<&ColdStartReadinessClaim>,
+        now: u64,
+    ) -> Result<ColdStartOwnerBootstrapReadback, CompositionError> {
+        let current = self.cold_start_owner_readback_with_record_for_claim(current_claim, now)?;
+        let previous = if let Some(previous_claim) = previous_claim {
+            previous_claim
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "cold-start readiness owner has no admitted installation contour".to_owned(),
+                )
+            })?;
+            if previous_claim.key.installation_id != contour.installation_id()
+                || previous_claim.key.installation_id != current_claim.key.installation_id
+                || previous_claim.key.lineage_candidate_ref
+                    != current_claim.key.lineage_candidate_ref
+                || previous_claim.key.workspace_instance_candidate_ref
+                    != current_claim.key.workspace_instance_candidate_ref
+                || previous_claim.key.filesystem_identity_ref
+                    != current_claim.key.filesystem_identity_ref
+                || previous_claim.key.vcs_identity_ref != current_claim.key.vcs_identity_ref
+                || previous_claim.key.privacy_boundary_ref
+                    != current_claim.key.privacy_boundary_ref
+                || previous_claim.key.privacy_class != current_claim.key.privacy_class
+            {
+                return Err(CompositionError::ActivationScopeSelectionRequired);
+            }
+            let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+                CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+            })?;
+            let record = owner
+                .load_cold_start_readiness_for_binding(&previous_claim.binding_digest)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                .ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "no durable prior cold-start terminal for the complete owner claim"
+                            .to_owned(),
+                    )
+                })?;
+            record
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if record.claim != *previous_claim {
+                return Err(CompositionError::ActivationStaleFence);
+            }
+            let terminal = record.terminal.as_ref().ok_or_else(|| {
+                CompositionError::Recovery(
+                    "prior durable cold-start lease has no terminal readiness receipt".to_owned(),
+                )
+            })?;
+            let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            lease
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            let receipt: eliot_workscope::OnboardingReadinessReceipt =
+                serde_json::from_str(&terminal.receipt_bytes)
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            receipt
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            if receipt.receipt_ref != terminal.receipt_ref
+                || receipt.receipt_revision != terminal.receipt_revision
+                || lease.lease_ref != record.claim.lease_ref
+                || lease.deadline != record.claim.lease_deadline
+                || lease.lineage_candidate_ref != previous_claim.key.lineage_candidate_ref
+                || lease.workspace_instance_candidate_ref
+                    != previous_claim.key.workspace_instance_candidate_ref
+                || lease.privacy_class != previous_claim.key.privacy_class
+                || lease.governing_source_generation
+                    != previous_claim.key.governing_source_generation
+                || receipt.lease_ref != lease.lease_ref
+                || receipt.governing_source_generation != lease.governing_source_generation
+                || receipt.expiry_tick != lease.deadline
+                || !fences_match_exact(&receipt.state_fence, &previous_claim.key.state_fence)
+            {
+                return Err(CompositionError::ActivationStaleFence);
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+
+        if let Some(previous) = &previous {
+            let current_receipt = &current.receipt;
+            if previous.principal_ref != current_receipt.principal_ref
+                || previous.session_ref != current_receipt.session_ref
+                || previous.scope.scope_ref != current_receipt.scope.scope_ref
+                || previous.scope.kind != current_receipt.scope.kind
+                || previous.scope.lineage_ref != current_receipt.scope.lineage_ref
+                || previous.scope.instance_ref != current_receipt.scope.instance_ref
+                || previous.scope.root_identity != current_receipt.scope.root_identity
+                || previous.instance.instance_ref != current_receipt.instance.instance_ref
+                || previous.instance.root_identity != current_receipt.instance.root_identity
+                || previous.instance.vcs_identity_ref != current_receipt.instance.vcs_identity_ref
+                || previous.lineage != current_receipt.lineage
+            {
+                return Err(CompositionError::ActivationScopeSelectionRequired);
+            }
+        }
+
+        let source_inputs_changed = previous_claim.is_some_and(|previous| {
+            previous.key.governing_source_generation
+                != current_claim.key.governing_source_generation
+                || previous.key.governing_source_set_ref
+                    != current_claim.key.governing_source_set_ref
+                || previous.key.governing_source_digests
+                    != current_claim.key.governing_source_digests
+        });
+        let delta = Self::cold_start_boot_delta(
+            &current.receipt,
+            previous.as_ref(),
+            source_inputs_changed,
+        )?;
+        delta
+            .validate(current.receipt.receipt_revision)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(ColdStartOwnerBootstrapReadback {
+            readback: current,
+            delta,
+        })
+    }
+
+    fn cold_start_boot_delta(
+        current: &eliot_workscope::OnboardingReadinessReceipt,
+        previous: Option<&eliot_workscope::OnboardingReadinessReceipt>,
+        source_inputs_changed: bool,
+    ) -> Result<BootDelta, CompositionError> {
+        let previous_receipt_revision = previous.map(|receipt| receipt.receipt_revision);
+        if previous_receipt_revision.is_some_and(|revision| revision >= current.receipt_revision) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let current_handles = Self::cold_start_receipt_reference_handles(current);
+        let changed_handles = if let Some(previous) = previous {
+            let previous_handles = Self::cold_start_receipt_reference_handles(previous);
+            let mut changed = current_handles
+                .into_iter()
+                .filter(|handle| !previous_handles.contains(handle))
+                .collect::<Vec<_>>();
+            if current.task_binding != previous.task_binding {
+                Self::push_changed_receipt_handles(current, &mut changed);
+            }
+            if source_inputs_changed
+                || current.governing_source_generation != previous.governing_source_generation
+            {
+                if !changed.contains(&current.governing_source_set_ref) {
+                    changed.push(current.governing_source_set_ref.clone());
+                }
+                if !changed.contains(&current.governance_profile_ref) {
+                    changed.push(current.governance_profile_ref.clone());
+                }
+                Self::push_changed_source_handles(current, &mut changed);
+            }
+            if current.projection_generation != previous.projection_generation
+                && !changed.contains(&current.projection_source_ref)
+            {
+                changed.push(current.projection_source_ref.clone());
+            }
+            if (current.scope.generation != previous.scope.generation
+                || current.instance.generation != previous.instance.generation)
+                && !changed.contains(&current.scope.scope_ref)
+            {
+                changed.push(current.scope.scope_ref.clone());
+            }
+            changed
+        } else {
+            current_handles
+        };
+        let mut changed_handles = changed_handles;
+        changed_handles.truncate(eliot_workscope::MAX_BOOT_DELTA_HANDLES);
+
+        Ok(BootDelta {
+            previous_receipt_revision,
+            receipt_revision: current.receipt_revision,
+            changed_handles,
+            expansion_handle: current.receipt_ref.clone(),
+        })
+    }
+
+    fn push_changed_receipt_handles(
+        receipt: &eliot_workscope::OnboardingReadinessReceipt,
+        handles: &mut Vec<String>,
+    ) {
+        let current_handles = Self::cold_start_receipt_reference_handles(receipt);
+        for handle in current_handles {
+            if !handles.contains(&handle) {
+                handles.push(handle);
+            }
+        }
+    }
+
+    fn push_changed_source_handles(
+        receipt: &eliot_workscope::OnboardingReadinessReceipt,
+        handles: &mut Vec<String>,
+    ) {
+        for handle in receipt
+            .discovered_source_refs
+            .iter()
+            .chain(&receipt.admitted_source_refs)
+            .chain(&receipt.conflicting_source_refs)
+            .chain(&receipt.unavailable_source_refs)
+            .chain(receipt.scan_receipt_ref.iter())
+        {
+            if !handles.contains(handle) {
+                handles.push(handle.clone());
+            }
+        }
+    }
+
+    fn cold_start_receipt_reference_handles(
+        receipt: &eliot_workscope::OnboardingReadinessReceipt,
+    ) -> Vec<String> {
+        let mut handles = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut push = |handle: &str| {
+            if !handle.trim().is_empty() && seen.insert(handle.to_owned()) {
+                handles.push(handle.to_owned());
+            }
+        };
+
+        match &receipt.task_binding {
+            TaskBindingState::None_ => {}
+            TaskBindingState::Exploratory { task_ref, .. }
+            | TaskBindingState::Stale { task_ref, .. } => push(task_ref),
+            TaskBindingState::CurrentTaskContract {
+                task_ref,
+                selection_source_ref,
+                evidence_ref,
+                ..
+            } => {
+                push(task_ref);
+                push(selection_source_ref);
+                push(evidence_ref);
+            }
+            TaskBindingState::Ambiguous { candidate_handles } => {
+                for handle in candidate_handles {
+                    push(handle);
+                }
+            }
+        }
+        for handle in &receipt.minimum_understanding_seed {
+            push(handle);
+        }
+        for handle in &receipt.admitted_source_refs {
+            push(handle);
+        }
+        for handle in &receipt.conflicting_source_refs {
+            push(handle);
+        }
+        for handle in &receipt.unavailable_source_refs {
+            push(handle);
+        }
+        for handle in &receipt.discovered_source_refs {
+            push(handle);
+        }
+        for handle in [
+            Some(receipt.governing_source_set_ref.as_str()),
+            Some(receipt.governance_profile_ref.as_str()),
+            Some(receipt.route_profile_ref.as_str()),
+            Some(receipt.projection_source_ref.as_str()),
+            receipt.scan_receipt_ref.as_deref(),
+            receipt.store_identity_ref.as_deref(),
+            Some(receipt.scope.scope_ref.as_str()),
+            Some(receipt.instance.instance_ref.as_str()),
+            receipt.lineage.as_ref().map(|lineage| lineage.lineage_ref.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push(handle);
+        }
+        handles
     }
 
     pub(crate) fn cold_start_readiness_terminal_for_claim(

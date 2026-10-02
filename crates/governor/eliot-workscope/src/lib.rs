@@ -535,6 +535,98 @@ pub enum WorkScopeError {
     ScanReceiptUnknownCommit,
 }
 
+/// Maximum number of changed owner references carried inline by a boot delta.
+///
+/// The delta is an additive preview; the full current terminal remains
+/// reachable through `expansion_handle` and required bootstrap fields stay
+/// inline independently of this bound.
+pub const MAX_BOOT_DELTA_HANDLES: usize = 16;
+
+/// Maximum UTF-8 byte length of a boot-delta reference handle.
+pub const MAX_BOOT_DELTA_HANDLE_LEN: usize = 256;
+
+/// Bounded boot delta carried beside a readiness surface (I7.8 step 4, I7.11).
+///
+/// It names the readiness revision last delivered, when one exists, the
+/// current revision, owner-issued references that changed, and an owner-issued
+/// handle for expanding the full delta. A first bootstrap has no previous
+/// revision; `None` is not rewritten to zero. The delta is additive and never
+/// replaces task selection, authority, or recovery information.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BootDelta {
+    /// Readiness receipt revision the last delivered bootstrap carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_receipt_revision: Option<u64>,
+    /// Receipt revision this delta moves to.
+    pub receipt_revision: u64,
+    /// Bounded owner-issued references that changed.
+    #[serde(default)]
+    pub changed_handles: Vec<String>,
+    /// Bounded owner handle that expands the full delta.
+    pub expansion_handle: String,
+}
+
+/// A stable validation code/detail pair for a shared boot-delta contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("{code}: {detail}")]
+pub struct BootDeltaValidationError {
+    /// Stable bridge-facing error code.
+    pub code: &'static str,
+    /// Short validation detail.
+    pub detail: &'static str,
+}
+
+impl BootDelta {
+    /// Validates the delta's shape and its relation to the accompanying
+    /// readiness surface, preserving the bridge's stable refusal vocabulary.
+    pub fn validate(&self, receipt_revision: u64) -> Result<(), BootDeltaValidationError> {
+        if self.receipt_revision == 0 {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_REVISION_MISSING",
+                detail: "boot delta carries a zero readiness receipt revision",
+            });
+        }
+        if self.receipt_revision != receipt_revision {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_REVISION_STALE",
+                detail: "boot delta names another readiness receipt revision than the surface it accompanies",
+            });
+        }
+        if let Some(previous) = self.previous_receipt_revision
+            && previous >= self.receipt_revision
+        {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_REVISION_STALE",
+                detail: "boot delta does not move the readiness receipt forward",
+            });
+        }
+        if self.expansion_handle.trim().is_empty()
+            || self.expansion_handle.len() > MAX_BOOT_DELTA_HANDLE_LEN
+        {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_EXPANSION_MISSING",
+                detail: "boot delta expansion handle is blank or exceeds bound",
+            });
+        }
+        if self.changed_handles.len() > MAX_BOOT_DELTA_HANDLES {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_BOUND",
+                detail: "changed handle list exceeds bound",
+            });
+        }
+        if self.changed_handles.iter().any(|handle| {
+            handle.trim().is_empty() || handle.len() > MAX_BOOT_DELTA_HANDLE_LEN
+        }) {
+            return Err(BootDeltaValidationError {
+                code: "BOOT_DELTA_BOUND",
+                detail: "changed handle is blank or exceeds bound",
+            });
+        }
+        Ok(())
+    }
+}
+
 fn text(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         Err(WorkScopeError::InvalidText { field })
@@ -4184,5 +4276,48 @@ mod tests {
         assert!(!question.trim().is_empty());
         assert_eq!(lease.consumed, 0);
         assert!(store.stored.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod boot_delta_tests {
+    use super::{BootDelta, MAX_BOOT_DELTA_HANDLES};
+
+    #[test]
+    fn first_owner_boot_delta_validates_without_inventing_a_prior_revision() {
+        let delta = BootDelta {
+            previous_receipt_revision: None,
+            receipt_revision: 4,
+            changed_handles: vec!["task:current".to_owned()],
+            expansion_handle: "receipt:owner-current".to_owned(),
+        };
+        assert_eq!(delta.validate(4), Ok(()));
+    }
+
+    #[test]
+    fn owner_boot_delta_refuses_stale_revisions_and_unbounded_handles() {
+        let stale = BootDelta {
+            previous_receipt_revision: Some(4),
+            receipt_revision: 4,
+            changed_handles: Vec::new(),
+            expansion_handle: "receipt:owner-current".to_owned(),
+        };
+        assert_eq!(
+            stale.validate(4).map_err(|error| error.code),
+            Err("BOOT_DELTA_REVISION_STALE")
+        );
+
+        let unbounded = BootDelta {
+            previous_receipt_revision: None,
+            receipt_revision: 4,
+            changed_handles: (0..=MAX_BOOT_DELTA_HANDLES)
+                .map(|index| format!("source:{index}"))
+                .collect(),
+            expansion_handle: "receipt:owner-current".to_owned(),
+        };
+        assert_eq!(
+            unbounded.validate(4).map_err(|error| error.code),
+            Err("BOOT_DELTA_BOUND")
+        );
     }
 }
