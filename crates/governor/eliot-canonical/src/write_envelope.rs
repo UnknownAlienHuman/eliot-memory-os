@@ -448,12 +448,18 @@ mod tests {
     use eliot_store_api::{
         EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
         OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId, ScopeId,
-        SecurityContext, TransitionClass,
+        SecurityContext, TransitionClass, generated_operation_manifests,
+        operation_manifest_set_digest, supported_admission_contract_set_digest,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// The one write intent these fixtures declare. It is the submitter's
+    /// literal, so an assertion against it checks a propagated declared value
+    /// rather than a value compared with itself.
+    const DECLARED_INTENT: &str = "intent-1928";
 
     fn fence() -> StateFence {
         let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test lineage");
@@ -473,6 +479,23 @@ mod tests {
         }
     }
 
+    /// Admission contract-set digest of THIS receiving build, as
+    /// `CanonicalWriteEnvelope::validate` compares it.
+    ///
+    /// The digest is build-derived (`eliot_store_api`), never request data.
+    fn admission_contract_set_digest() -> String {
+        supported_admission_contract_set_digest().expect("build supports its contract set")
+    }
+
+    /// Catalogue manifest-set digest of THIS receiving build.
+    ///
+    /// Also build-derived; the fixture never invents a manifest identity
+    /// because the store validates this value against the generated set.
+    fn manifest_set_digest() -> OperationManifestDigest {
+        let manifests = generated_operation_manifests().expect("generated manifests are present");
+        operation_manifest_set_digest(&manifests).expect("manifest set digest computes")
+    }
+
     fn envelope(fence: &StateFence, operation: &str, idem: &str) -> CanonicalWriteEnvelope {
         CanonicalWriteEnvelope {
             operation_id: OperationId::new(operation).expect("operation id"),
@@ -482,9 +505,12 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-1928")
-                .expect("manifest digest"),
+            // Both digests are the receiving build's OWN identity, read from
+            // the owner rather than written into the fixture: a placeholder
+            // here fails admission as `Store(ManifestMismatch)` before any
+            // write-intent rule is reached, which would test nothing.
+            admission_contract_set_digest: admission_contract_set_digest(),
+            operation_manifest_digest: manifest_set_digest(),
             semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([(
@@ -516,7 +542,7 @@ mod tests {
     ) -> VersionedWriteSubmission {
         VersionedWriteSubmission::bind(
             WRITE_ENVELOPE_PROTOCOL_VERSION,
-            "intent-1928".to_owned(),
+            DECLARED_INTENT.to_owned(),
             envelope(fence, operation, idem),
             mode,
         )
@@ -635,22 +661,40 @@ mod tests {
             corrected.operation_id().as_str(),
             first.operation_id().as_str()
         );
-        assert_ne!(
-            corrected.idempotency_key(),
-            first.idempotency_key()
-        );
+        assert_ne!(corrected.idempotency_key(), first.idempotency_key());
         assert_ne!(
             corrected.canonical_request_hash,
             first.canonical_request_hash
         );
-        // ...while the submitter's declared write intent is unchanged, and the
-        // intent carried on the wire is the envelope's own value.
-        assert_eq!(corrected.write_intent_id, first.write_intent_id);
-        assert_eq!(corrected.protocol_version, first.protocol_version);
-        assert_eq!(corrected.write_intent().write_intent_id, first.write_intent_id);
-        corrected
+        // ...while the submitter's declared write intent is UNCHANGED, and it
+        // is the declared literal rather than something derived from either
+        // attempt's per-attempt identity.
+        assert_eq!(corrected.write_intent_id, DECLARED_INTENT);
+        assert_eq!(first.write_intent_id, DECLARED_INTENT);
+        assert_eq!(corrected.protocol_version, WRITE_ENVELOPE_PROTOCOL_VERSION);
+        assert_eq!(first.protocol_version, WRITE_ENVELOPE_PROTOCOL_VERSION);
+        // The intent each attempt carries on the wire is the declared one.
+        assert_eq!(corrected.write_intent().write_intent_id, DECLARED_INTENT);
+        assert_eq!(
+            corrected.write_intent().write_intent_id,
+            first.write_intent_id
+        );
+        // The correction admits the ORIGINAL attempt's intent: carry-through is
+        // checked across two independently bound attempts, not against itself.
+        first
             .admit_wire_intent(&corrected.write_intent())
-            .expect("the envelope's own intent is admitted");
+            .expect("the first attempt's declared intent survives the correction");
+        // The value is not a constant of the boundary: a submission declaring a
+        // DIFFERENT intent carries that declared value instead.
+        let other = VersionedWriteSubmission::bind(
+            WRITE_ENVELOPE_PROTOCOL_VERSION,
+            "intent-1928-other".to_owned(),
+            envelope(&fence, "op-1928-c", "idem-1928-c"),
+            WriteResponseMode::WaitForCommit,
+        )
+        .expect("a submission under another declared intent binds");
+        assert_eq!(other.write_intent_id, "intent-1928-other");
+        assert_ne!(other.write_intent_id, corrected.write_intent_id);
         // Both attempts are separate submissions under their own keys.
         let mut ledger = WriteEnvelopeLedger::new();
         let SubmitOutcome::AcceptedNew { operation_id } =
@@ -679,7 +723,17 @@ mod tests {
             "idem-1928",
             WriteResponseMode::WaitForCommit,
         );
-        // Another envelope's intent presented with this envelope's transition.
+        // The bound submission's own intent, rebuilt from the declared literal
+        // rather than read back off the submission, is admitted. Every refusal
+        // below is therefore attributable to the ONE term it differs in.
+        bound
+            .admit_wire_intent(&WriteIntent::new(
+                WRITE_ENVELOPE_PROTOCOL_VERSION,
+                DECLARED_INTENT.to_owned(),
+            ))
+            .expect("the envelope's own declared intent is admitted");
+        // Another envelope's intent presented with this envelope's transition:
+        // the intent id is the only differing term, and it is refused.
         let foreign = WriteIntent::new(WRITE_ENVELOPE_PROTOCOL_VERSION, "intent-other".to_owned());
         assert!(matches!(
             bound.admit_wire_intent(&foreign),
@@ -689,8 +743,14 @@ mod tests {
             })
         ));
         // An intent under an unsupported protocol version is refused too, and
-        // the refusal never downgrades to the bound envelope's version.
-        let future = WriteIntent::new(WRITE_ENVELOPE_PROTOCOL_VERSION + 1, bound.write_intent_id.clone());
+        // the refusal never downgrades to the bound envelope's version: the
+        // protocol version is the only differing term here, and admitting it
+        // would mean silently rewriting `protocol_version + 1` to the bound
+        // value. The bound submission's own version is likewise never moved.
+        let future = WriteIntent::new(
+            WRITE_ENVELOPE_PROTOCOL_VERSION + 1,
+            bound.write_intent_id.clone(),
+        );
         assert!(matches!(
             bound.admit_wire_intent(&future),
             Err(CanonicalError::InvalidField {
@@ -698,6 +758,7 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(bound.protocol_version, WRITE_ENVELOPE_PROTOCOL_VERSION);
         // A blank intent never binds: there is no default or synthesized
         // fallback value.
         assert!(matches!(

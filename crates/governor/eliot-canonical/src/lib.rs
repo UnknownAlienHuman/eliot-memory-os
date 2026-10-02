@@ -39,7 +39,7 @@ pub use contract_rejection::{
 pub mod epistemic_revision;
 pub mod write_envelope;
 pub use write_envelope::{
-    WriteIntent, WRITE_ENVELOPE_PROTOCOL_VERSION, VersionedWriteSubmission, WriteEnvelopeLedger,
+    VersionedWriteSubmission, WRITE_ENVELOPE_PROTOCOL_VERSION, WriteEnvelopeLedger, WriteIntent,
     validate_write_intent_id,
 };
 
@@ -837,6 +837,48 @@ impl<S: CanonicalStoreClient> CanonicalTransitionOwner<S> {
     /// derived here from the operation id or the idempotency key: a submitter
     /// with no intent to declare has no envelope to bind, and no caller can
     /// reach this method without one.
+    ///
+    /// # Reachability: this method is not yet on a production path
+    ///
+    /// Measured on this tree, stated rather than implied. The live canonical
+    /// write is `commit_testd_terminal_owner_fact`
+    /// (`bins/eliotd/src/testd_terminal_completion.rs`, driven from
+    /// `bins/eliotd/src/daemon_runtime.rs`), which reaches Governor and then
+    /// `KernelTransitionPort::apply_prepared`. It never reaches this owner:
+    /// the composition-level write entry
+    /// `GovernorComposition::commit_canonical`
+    /// (`crates/governor/eliot-governor/src/composition.rs`) calls
+    /// `CanonicalAdmissionOwner::commit`, a different owner with no
+    /// `VersionedWriteSubmission` in it. So `bind` is reachable from no
+    /// production caller today, and this method does not change that.
+    ///
+    /// The chain dead-ends one level below this owner, on the missing declared
+    /// value, not on a missing call:
+    ///
+    /// - `CanonicalAdmissionOwner::commit` receives exactly
+    ///   `identity: &RequestIdentity` and `envelope: CanonicalWriteEnvelope`.
+    /// - `RequestIdentity` (`crates/foundation/eliot-protocol/src/lib.rs`)
+    ///   carries `request`, `idempotency_key`, `deadline_unix_ms` and
+    ///   `cancellation_id` — no write intent and no response mode.
+    /// - No ingress wire type declares one either: `write_intent_id` appears in
+    ///   the repository only as (a) the two rejection slots
+    ///   `ContractError::write_intent_id`
+    ///   (`crates/governor/eliot-canonical/src/contract_rejection.rs`) and
+    ///   `RejectionRecord::write_intent_id`
+    ///   (`crates/kernel/eliot-kernel-service/src/contract_rejection_gate.rs`),
+    ///   both `Option<String>` that production is REQUIRED to leave `None`
+    ///   (I6.8: a `NOT_ATTEMPTED` rejection never consumes an intent), and (b)
+    ///   the types in this module. `I5.5` lists `protocol_version`,
+    ///   `write_intent_id` and `response_mode` as envelope identity terms and
+    ///   the in-repo envelope carries none of the three.
+    ///
+    /// What the owning lane must supply, therefore, is upstream of this owner:
+    /// the write-intake ingress owner has to carry the submitter's declared
+    /// `protocol_version` and `write_intent_id` (and the requested
+    /// `response_mode`) from the agent/user request into
+    /// `commit_canonical`. Deriving them here from the operation id, the
+    /// idempotency key or the request id would be a synthesized intent, which
+    /// this method exists to prevent, so none is invented.
     pub fn submit(
         &self,
         intent: &WriteIntent,

@@ -1321,7 +1321,8 @@ fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/11 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt).expect("992/11 evidence binds");
+    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt)
+        .expect("992/11 evidence binds");
     let closed =
         finalize_reservation(&owner, &reconciliation).expect("992/11 exact receipt closes");
     assert_eq!(
@@ -1352,8 +1353,8 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/13 projection seals");
     let cancelled = receipt_for(&request, WriteReceiptStatus::Cancelled);
-    let reconciliation =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &cancelled).expect("992/13 evidence binds");
+    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &cancelled)
+        .expect("992/13 evidence binds");
     let released =
         finalize_reservation(&owner, &reconciliation).expect("992/13 proved-not-applied closes");
     assert_eq!(
@@ -1430,8 +1431,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     if let Some(envelope) = forged.envelope.as_mut() {
         envelope.identity.canonical_sha256 = "f".repeat(64);
     }
-    let error =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &forged).expect_err("992/14 forged envelope must fail");
+    let error = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &forged)
+        .expect_err("992/14 forged envelope must fail");
     assert!(
         matches!(
             error,
@@ -1455,8 +1456,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     // A fully valid receipt for another operation: self-consistent, but
     // foreign to this token.
     let foreign = receipt_for(&f_request, WriteReceiptStatus::Committed);
-    let error =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &foreign).expect_err("992/14 foreign receipt must fail");
+    let error = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &foreign)
+        .expect_err("992/14 foreign receipt must fail");
     assert!(
         matches!(error, ReservationWriteError::Binding { .. }),
         "992/14 foreign operation fails as a binding mismatch, got {error:?}"
@@ -1464,8 +1465,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
 
     let mut partial = receipt_for(&request, WriteReceiptStatus::Committed);
     partial.ordering_sequences.pop();
-    let error =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &partial).expect_err("992/14 partial scope set must fail");
+    let error = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &partial)
+        .expect_err("992/14 partial scope set must fail");
     assert!(
         matches!(
             error,
@@ -1477,7 +1478,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
     let mut stale = receipt_for(&request, WriteReceiptStatus::Committed);
     let fixture = fixture_992();
     stale.state_fence = stale_fence_with(&fixture);
-    let error = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &stale).expect_err("992/14 stale fence must fail");
+    let error = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &stale)
+        .expect_err("992/14 stale fence must fail");
     assert!(
         matches!(
             error,
@@ -1517,7 +1519,8 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
             .expect("992/14c projection seals");
     let r_receipt = receipt_for(&r_request, WriteReceiptStatus::Committed);
     let r_reconciliation =
-        reconcile_receipt(&fixture_recovery_owner(), &r_sealed.token, &r_receipt).expect("992/14c evidence binds");
+        reconcile_receipt(&fixture_recovery_owner(), &r_sealed.token, &r_receipt)
+            .expect("992/14c evidence binds");
     let error = finalize_reservation(&reject_owner, &r_reconciliation)
         .expect_err("992/14 rejecting provider must refuse the close");
     assert!(
@@ -1814,7 +1817,8 @@ fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/23 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt).expect("992/23 evidence binds");
+    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt)
+        .expect("992/23 evidence binds");
     let closed =
         finalize_reservation(&owner, &reconciliation).expect("992/23 exact receipt closes");
     assert_eq!(
@@ -1988,8 +1992,8 @@ fn durable_rebind_recovers_identity_and_fences_stale_writers() {
     let request = project_reserved_write(&replayed, &context, &transition, revision, ordering)
         .expect("992/24 request rebuilds");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation =
-        reconcile_receipt(&fixture_recovery_owner(), &replayed.token, &receipt).expect("992/24 evidence binds");
+    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &replayed.token, &receipt)
+        .expect("992/24 evidence binds");
     let closed =
         finalize_reservation(&recovered, &reconciliation).expect("992/24 recovery finalizes");
     assert_eq!(
@@ -2053,7 +2057,8 @@ fn terminal_status_without_not_applied_proof_stays_unknown() {
         cancelled_disposition(),
     );
     let reconciliation =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &cancelled_proof).expect("992/25 proved binds");
+        reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &cancelled_proof)
+            .expect("992/25 proved binds");
     let released = finalize_reservation(&owner, &reconciliation).expect("992/25 proved releases");
     assert_eq!(
         released.state,
@@ -2079,7 +2084,8 @@ fn terminal_status_without_not_applied_proof_stays_unknown() {
         WriteReceiptStatus::DeadLetter,
         failure_disposition(),
     );
-    let d_reconciliation = reconcile_receipt(&fixture_recovery_owner(), &d_sealed.token, &dead).expect("992/25b proved binds");
+    let d_reconciliation = reconcile_receipt(&fixture_recovery_owner(), &d_sealed.token, &dead)
+        .expect("992/25b proved binds");
     let d_released =
         finalize_reservation(&owner, &d_reconciliation).expect("992/25b proved releases");
     assert_eq!(
@@ -2242,7 +2248,8 @@ fn queued_normal_work_holds_no_provider_lock_or_protected_resource() {
             .expect("992/9b projection seals");
     let receipt_b = receipt_for(&request_b, WriteReceiptStatus::Committed);
     let reconciliation_b =
-        reconcile_receipt(&fixture_recovery_owner(), &sealed_b.token, &receipt_b).expect("992/9b evidence binds");
+        reconcile_receipt(&fixture_recovery_owner(), &sealed_b.token, &receipt_b)
+            .expect("992/9b evidence binds");
     let closed_b =
         finalize_reservation(&owner, &reconciliation_b).expect("992/9b disjoint work finalizes");
     assert_eq!(
@@ -2378,7 +2385,8 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
         "992/29 projection carries the mutated identity"
     );
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt).expect("992/29 evidence binds");
+    let reconciliation = reconcile_receipt(&fixture_recovery_owner(), &sealed.token, &receipt)
+        .expect("992/29 evidence binds");
     let closed =
         finalize_reservation(&owner, &reconciliation).expect("992/29 exact receipt closes");
     assert_eq!(
@@ -3254,7 +3262,8 @@ mod gateway_cases {
                 .expect("992/18 request rebuilds");
         let receipt_a = receipt_for(&request_a, WriteReceiptStatus::Committed);
         let reconciliation_a =
-            reconcile_receipt(&fixture_recovery_owner(), &replayed.token, &receipt_a).expect("992/18 evidence binds");
+            reconcile_receipt(&fixture_recovery_owner(), &replayed.token, &receipt_a)
+                .expect("992/18 evidence binds");
         let closed = finalize_reservation(&owner, &reconciliation_a)
             .expect("992/18 recovery finalizes at the durable owner");
         assert_eq!(
@@ -3314,7 +3323,12 @@ mod gateway_cases {
         let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
         let closed = setup
             .gateway
-            .reconcile_reserved(&fixture_recovery_owner(), &replayed.token, &request, &receipt)
+            .reconcile_reserved(
+                &fixture_recovery_owner(),
+                &replayed.token,
+                &request,
+                &receipt,
+            )
             .expect("992/20 exact receipt reconciles");
         assert_eq!(
             closed.state,
@@ -4515,7 +4529,10 @@ fn reconcile_receipt_carries_the_declared_owner_and_ors_rejects_a_substituted_on
     let error = finalize_reservation(&owner, &substituted)
         .expect_err("a substituted reconciliation owner must not close the token");
     assert!(
-        matches!(error, ReservationWriteError::Ors(OrsError::ReconciliationMismatch)),
+        matches!(
+            error,
+            ReservationWriteError::Ors(OrsError::ReconciliationMismatch)
+        ),
         "ORS compares the reconciliation owner against the persisted token owner, got {error:?}"
     );
     // The owned reconciliation still closes the token exactly.
