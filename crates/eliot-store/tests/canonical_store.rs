@@ -1,4 +1,4 @@
-use eliot_store::{CanonicalStore, SurrealServerSupervisor};
+use eliot_store::{CanonicalStore, ReadySurrealServer, SurrealServerSupervisor, SurrealShutdown};
 use eliot_types::{
     AgentId, AutonomyRunContract, AutonomyRunState, AutonomyRunTransitionReceipt,
     CanonicalTraceCompletenessContract, ClaimCardInput, ClaimId, CredentialProviderKind,
@@ -28,6 +28,26 @@ use time::OffsetDateTime;
 
 struct RestartTestRoot {
     path: Option<PathBuf>,
+    /// Every server this root's tests started and have not yet stopped
+    /// (#1888, K-STORE).
+    ///
+    /// Each `ReadySurrealServer` owns the kill-on-close Job Object that holds the
+    /// `surreal.exe` it spawned. Before this root owned them, a test that failed,
+    /// panicked, or returned early left that server running: the root's `drop`
+    /// removed the data directory while the provider still held it and kept its
+    /// port. Storing the handles here means `drop` stops whatever the root
+    /// started and the test body did not, and a `ReadySurrealServer` that drops
+    /// on its own still ends its provider through the same job.
+    ///
+    /// The handles are held by value, never cloned: a clone would duplicate the
+    /// sole owning Job handle, and closing either copy would kill the server out
+    /// from under the other.
+    owned_servers: Vec<ReadySurrealServer>,
+    /// Runtime that stops the owned servers on drop. `shutdown_if_spawned` is
+    /// async, and `Drop` cannot await, so the root drives a private current-thread
+    /// runtime. It stops only servers this root started; a test that connected to
+    /// a pre-existing server is reported as not owned and left running.
+    shutdown_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl RestartTestRoot {
@@ -46,7 +66,62 @@ impl RestartTestRoot {
             return Err("restart-test root crossed a forbidden host boundary".into());
         }
         fs::create_dir_all(&path)?;
-        Ok(Self { path: Some(path) })
+        Ok(Self {
+            path: Some(path),
+            owned_servers: Vec::new(),
+            shutdown_runtime: Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?,
+            ),
+        })
+    }
+
+    /// Takes ownership of a started server and hands the same handle to the caller.
+    ///
+    /// The caller uses it for its own reads (`started_pid`) and normally stops
+    /// it through [`RestartTestRoot::stop_owned_server`], which takes it back
+    /// out of the root first. Anything the caller does not stop is stopped by
+    /// this root's `drop`, so a failed assertion or an early `?` cannot leave a
+    /// provider running against this root's data directory.
+    fn own(&mut self, server: ReadySurrealServer) -> ReadySurrealServer {
+        self.owned_servers.push(server);
+        self.owned_servers.pop().expect("just-pushed server")
+    }
+
+    /// Stops every server this root still owns, in reverse start order.
+    ///
+    /// Reverse order mirrors the restart tests themselves: each stops its first
+    /// generation before starting its second, so the newest owned server is the
+    /// one still running.
+    fn stop_owned_servers(&mut self) {
+        let Some(runtime) = self.shutdown_runtime.take() else {
+            return;
+        };
+        for server in self.owned_servers.drain(..).rev() {
+            let _stopped = runtime.block_on(server.shutdown_if_spawned());
+        }
+    }
+
+    /// Stops one owned server by the pid the caller observed at start.
+    ///
+    /// A pid identifies the exact generation, so a restart test that stops its
+    /// first server cannot accidentally stop its second. The server is taken
+    /// back from the root before it is stopped, so `drop` does not stop it twice.
+    fn stop_owned_server(&mut self, pid: u32) -> Result<SurrealShutdown, Box<dyn Error>> {
+        let Some(position) = self
+            .owned_servers
+            .iter()
+            .position(|server| server.started_pid() == Some(pid))
+        else {
+            return Err(format!("restart-test root does not own the server pid {pid}").into());
+        };
+        let server = self.owned_servers.remove(position);
+        let runtime = self
+            .shutdown_runtime
+            .as_ref()
+            .ok_or("restart-test root has no shutdown runtime")?;
+        Ok(runtime.block_on(server.shutdown_if_spawned())?)
     }
 
     fn path(&self) -> Result<&Path, Box<dyn Error>> {
@@ -71,6 +146,10 @@ impl RestartTestRoot {
     }
 
     fn remove(&mut self) -> Result<PathBuf, Box<dyn Error>> {
+        // Stop first, then delete: the servers hold the data root this removes,
+        // and removing it underneath a running provider both strands the provider
+        // and makes the directory undeletable until it exits.
+        self.stop_owned_servers();
         let path = self
             .path
             .take()
@@ -95,6 +174,11 @@ impl RestartTestRoot {
 
 impl Drop for RestartTestRoot {
     fn drop(&mut self) {
+        // The root owns the servers it started, so this stops any the test body
+        // did not stop itself (a failed assertion, a panic, an early `?`). This
+        // runs BEFORE the directory removal below, because a provider still
+        // holding the data root would survive both.
+        self.stop_owned_servers();
         if let Some(path) = self.path.take()
             && path.starts_with(std::env::temp_dir())
         {
@@ -1212,9 +1296,11 @@ async fn graph_health_is_project_scoped_schema_aware_and_restart_stable()
         "Task 01 graph-health certification requires SurrealDB 3.1.4"
     );
 
-    let first_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let first_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
     let first_pid = first_server
         .started_pid()
         .ok_or("graph-health test did not own the first SurrealDB process")?;
@@ -1250,15 +1336,12 @@ async fn graph_health_is_project_scoped_schema_aware_and_restart_stable()
     }
 
     drop(store);
-    assert!(
-        first_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
+    assert!(root.stop_owned_server(first_pid)?.stopped_owned_process);
+    let second_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
     );
-    let second_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
     let second_pid = second_server
         .started_pid()
         .ok_or("graph-health test did not own the restarted SurrealDB process")?;
@@ -1268,12 +1351,7 @@ async fn graph_health_is_project_scoped_schema_aware_and_restart_stable()
     let after = restarted_store.graph_health(project_id).await?;
     assert_eq!(serde_json::to_value(after)?, serde_json::to_value(before)?);
     drop(restarted_store);
-    assert!(
-        second_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
-    );
+    assert!(root.stop_owned_server(second_pid)?.stopped_owned_process);
     let removed = root.remove()?;
     assert!(!removed.exists());
     Ok(())
@@ -1286,9 +1364,11 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
     let mut root = RestartTestRoot::new()?;
     let port = free_local_port()?;
     let config = root.config(port)?;
-    let first_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let first_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
     let first_pid = first_server
         .started_pid()
         .ok_or("restart-test supervisor did not own the first process")?;
@@ -1313,15 +1393,12 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
     assert_pre_exact_lookup_authority(&store, project_id, task_id, &pre_exact_lookup).await?;
 
     drop(store);
-    assert!(
-        first_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
+    assert!(root.stop_owned_server(first_pid)?.stopped_owned_process);
+    let second_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
     );
-    let second_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
     let second_pid = second_server
         .started_pid()
         .ok_or("restart-test supervisor did not own the second process")?;
@@ -1368,12 +1445,7 @@ async fn physical_surreal_restart_preserves_canonical_l10_l12_records() -> Resul
         .await?;
 
     drop(restarted_store);
-    assert!(
-        second_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
-    );
+    assert!(root.stop_owned_server(second_pid)?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     report_physical_restart_evidence(
@@ -1394,9 +1466,14 @@ async fn exact_result_and_latest_authority_queries_survive_bounded_history()
 -> Result<(), Box<dyn Error>> {
     let mut root = RestartTestRoot::new()?;
     let config = root.config(free_local_port()?)?;
-    let server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
+    let server_pid = server
+        .started_pid()
+        .ok_or("restart-test supervisor did not own the server process")?;
     let store = CanonicalStore::new(config);
     store.migrate_schema().await?;
     let project_id = ProjectId::new_v7();
@@ -1520,7 +1597,7 @@ async fn exact_result_and_latest_authority_queries_survive_bounded_history()
     );
 
     drop(store);
-    assert!(server.shutdown_if_spawned().await?.stopped_owned_process);
+    assert!(root.stop_owned_server(server_pid)?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())
@@ -1533,9 +1610,14 @@ async fn authenticated_canonical_blob_reference_scan_is_complete_and_evidence_bo
     let mut root = RestartTestRoot::new()?;
     let port = free_local_port()?;
     let config = root.config(port)?;
-    let server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
+    let server_pid = server
+        .started_pid()
+        .ok_or("restart-test supervisor did not own the server process")?;
     let store = CanonicalStore::new(config);
     store.migrate_schema().await?;
 
@@ -1590,7 +1672,7 @@ async fn authenticated_canonical_blob_reference_scan_is_complete_and_evidence_bo
     );
 
     drop(store);
-    assert!(server.shutdown_if_spawned().await?.stopped_owned_process);
+    assert!(root.stop_owned_server(server_pid)?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())
@@ -1755,9 +1837,14 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
     let mut root = RestartTestRoot::new()?;
     let port = free_local_port()?;
     let config = root.config(port)?;
-    let first_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let first_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
+    let first_pid = first_server
+        .started_pid()
+        .ok_or("restart-test supervisor did not own the first process")?;
     let first_store = CanonicalStore::new(config.clone());
     first_store.migrate_schema().await?;
 
@@ -1785,16 +1872,16 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
             .await?,
     ];
     drop(first_store);
-    assert!(
-        first_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
-    );
+    assert!(root.stop_owned_server(first_pid)?.stopped_owned_process);
 
-    let second_server = SurrealServerSupervisor::new(config.clone())
-        .start_or_connect()
-        .await?;
+    let second_server = root.own(
+        SurrealServerSupervisor::new(config.clone())
+            .start_or_connect()
+            .await?,
+    );
+    let second_pid = second_server
+        .started_pid()
+        .ok_or("restart-test supervisor did not own the second process")?;
     let restarted_store = CanonicalStore::new(config);
     restarted_store.migrate_schema().await?;
     let mut start = 200_u64;
@@ -1843,12 +1930,7 @@ async fn canonical_operator_paging_survives_restart_without_gaps_or_duplicates()
         1_011
     );
     drop(restarted_store);
-    assert!(
-        second_server
-            .shutdown_if_spawned()
-            .await?
-            .stopped_owned_process
-    );
+    assert!(root.stop_owned_server(second_pid)?.stopped_owned_process);
     let removed_root = root.remove()?;
     assert!(!removed_root.exists());
     Ok(())

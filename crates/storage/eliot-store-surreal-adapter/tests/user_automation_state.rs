@@ -300,7 +300,8 @@ fn prepare_initial_root_user(exe: &Path, bind: &str, data: &Path, work: &Path, t
     let password = SecretString::new("automation-test-secret".into());
     let data_url = format!("surrealkv://{}", data.to_string_lossy().replace('\\', "/"));
     let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args([
             "start",
             "--no-banner",
@@ -322,9 +323,18 @@ fn prepare_initial_root_user(exe: &Path, bind: &str, data: &Path, work: &Path, t
         .env("TMP", tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("preparation provider");
+        .stderr(Stdio::null());
+    // One launch path (#1888, K-STORE): the preparation provider is admitted into
+    // a kill-on-close Job Object that is held for its whole life, so it cannot
+    // outlive this fixture even when the test process is killed from the
+    // outside and no `Drop` runs. A refused admission terminates and reaps the
+    // child instead of continuing uncontained.
+    let (mut child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+        || command.spawn(),
+        |child: &std::process::Child| child.id(),
+        eliot_store_surreal_adapter::reap_refused_std_child,
+    )
+    .expect("preparation provider is admitted into its kill-on-close job");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if std::net::TcpStream::connect(bind).is_ok() {

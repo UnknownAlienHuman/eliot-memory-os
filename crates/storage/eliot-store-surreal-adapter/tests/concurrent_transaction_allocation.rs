@@ -274,10 +274,19 @@ impl Harness {
         harness
     }
 
+    /// Starts one short-lived bootstrap provider through the job-owned launch
+    /// path (#1888, K-STORE).
+    ///
+    /// The spawned child is admitted into a kill-on-close Job Object immediately
+    /// and the lease is held for the whole bootstrap window, so this provider
+    /// ends with its owner even when the test process is terminated from the
+    /// outside and no `Drop` ever runs. A refused admission kills and reaps the
+    /// child instead of continuing uncontained: there is no unassigned fallback.
     async fn bootstrap(&self) {
         use std::os::windows::process::CommandExt;
         let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
-        let mut child = std::process::Command::new(&self.config.provider_executable_path)
+        let mut command = std::process::Command::new(&self.config.provider_executable_path);
+        command
             .args(&self.config.provider_arguments)
             .current_dir(&self.config.store_work_root)
             .env_clear()
@@ -290,9 +299,13 @@ impl Harness {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .expect("bootstrap provider");
+            .creation_flags(0x0800_0000);
+        let (mut child, _kill_on_close) = eliot_store_surreal_adapter::launch_fixture_provider(
+            || command.spawn(),
+            |child: &std::process::Child| child.id(),
+            eliot_store_surreal_adapter::reap_refused_std_child,
+        )
+        .expect("bootstrap provider is admitted into its kill-on-close job");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(

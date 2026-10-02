@@ -8,6 +8,7 @@
 //! outcome and exact-operation reconciliation once the dispatch boundary
 //! supplies the admitted operation identity.
 
+use eliot_platform_windows::WindowsAdapterError;
 use eliot_store_api::StoreError;
 use thiserror::Error;
 
@@ -46,6 +47,20 @@ pub enum AdapterError {
     NamedOperationUnavailable { operation: String },
     #[error("configuration error: {0}")]
     Config(String),
+    /// A provider launch was refused because the spawned child could not be
+    /// admitted into the kill-on-close Job Object that must own it (#1888).
+    ///
+    /// There is no unassigned fallback: an owned provider that is not inside the
+    /// Job outlives its owner, so the refusal is the outcome. The child is
+    /// already terminated by the time this surfaces, and the cause is the exact
+    /// typed platform-adapter error the existing `JobObject` primitives
+    /// returned rather than prose.
+    #[error("provider launch refused: kill-on-close job assignment failed: {cause:?}")]
+    LaunchJobAssignmentFailed {
+        /// Typed `eliot_platform_windows::WindowsAdapterError` from
+        /// `JobObject::new_kill_on_close` or `JobObject::assign_process`.
+        cause: WindowsAdapterError,
+    },
     #[error("canonical serialization failed: {0}")]
     Serialization(String),
     #[error("store error: {0}")]
@@ -89,6 +104,10 @@ impl AdapterError {
                 field: "store.configuration",
                 reason: "invalid store configuration",
             },
+            // A refused kill-on-close Job admission is a launch that never
+            // became a usable provider, so it is deterministically unavailable
+            // work, not a semantic conflict and not an unknown outcome.
+            Self::LaunchJobAssignmentFailed { .. } => StoreError::Unavailable,
             Self::Serialization(_) => StoreError::Serialization(
                 "canonical provider response serialization failed".to_owned(),
             ),
