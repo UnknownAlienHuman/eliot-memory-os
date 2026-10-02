@@ -945,13 +945,15 @@ impl RedbInstallationRegistry {
     /// contended record, [`InstallationError::Duplicate`] when the destination
     /// is this authority's active or already-approved installation, and
     /// [`InstallationError::InvalidField`] when the materialisation does not
-    /// realise the admission it was given.
+    /// realise the admission it was given, or when the created root no longer
+    /// carries the identity the materialisation recorded.
     pub fn record_prepared_isolated_destination_creation(
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         admission: &PreparedDestinationAdmission,
         materialisation: &PreparedDestinationMaterialisation,
+        current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
         let _guard = host
             .live_guard()
@@ -969,12 +971,23 @@ impl RedbInstallationRegistry {
                 field: "prepared_destination_materialisation".to_owned(),
                 reason: error.to_string(),
             })?;
+        // The created root is RE-OBSERVED here, at record time, through a fresh
+        // no-follow protected-root lease, and its LIVE identity is compared with
+        // the identity the materialisation RECORDED. `destination_root_identity`
+        // is the evidence that this operation created the object at the admitted
+        // name; without this comparison it was written once and read by nobody, so
+        // a root replaced between creation and recording would be retained as if
+        // this operation owned it. A root that cannot be re-proved is refused, and
+        // nothing is deleted by name: removal stays with the handle-bound
+        // publication teardown that can only act on an object it created itself.
+        verify_materialised_destination_root(materialisation)?;
         let admission = admission.clone();
         let materialisation = materialisation.clone();
         self.mutate_atomic(expected_revision, |registry| {
             registry.record_prepared_isolated_destination_creation_unchecked(
                 &admission,
                 &materialisation,
+                current_purge_ledger_revision,
             )
         })
     }
@@ -1008,19 +1021,32 @@ impl RedbInstallationRegistry {
     /// input conflicts instead of allocating a second installation, and a
     /// destination already held under another operation is refused outright.
     ///
+    /// `current_purge_ledger_revision` is the revision the ORS purge-ledger owner
+    /// reports NOW. It is REQUIRED, not optional, because the revision the
+    /// admission bound would otherwise be compared only against `0`: a stale and
+    /// a current binding would be indistinguishable after admission, while
+    /// A13.7 requires the restore to apply the CURRENT privacy purge.
+    /// `IsolationEvidence::source_active_generation` is likewise compared against
+    /// this projection's own current active generation, so a preparation bound to
+    /// a configuration snapshot the source has since moved on from is refused
+    /// rather than retained as current.
+    ///
     /// # Errors
     ///
     /// Returns [`InstallationError::CompareAndSaveConflict`] when `expected
     /// _revision` no longer matches, [`InstallationError::IdentityConflict`]
-    /// for a changed same-operation record, a destination another operation
-    /// holds, or a caller that is not this installation's owner, and
-    /// [`InstallationError::Duplicate`] when the destination is this authority's
-    /// active or already-approved installation.
+    /// for a changed same-operation record, a stale source generation, a
+    /// destination another operation holds, or a caller that is not this
+    /// installation's owner, [`InstallationError::IncompleteObservation`] when
+    /// the live purge-ledger revision disagrees with the bound one, and
+    /// [`InstallationError::Duplicate`] when the destination is an installation
+    /// identity this authority already holds.
     pub fn record_prepared_isolated_destination(
         &self,
         host: &HostOwnerEpochCapability,
         expected_revision: u64,
         admission: &PreparedDestinationAdmission,
+        current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationAdmission, InstallationError> {
         let _guard = host
             .live_guard()
@@ -1034,7 +1060,10 @@ impl RedbInstallationRegistry {
             })?;
         let admission = admission.clone();
         self.mutate_atomic(expected_revision, |registry| {
-            registry.record_prepared_isolated_destination_unchecked(&admission)
+            registry.record_prepared_isolated_destination_unchecked(
+                &admission,
+                current_purge_ledger_revision,
+            )
         })
     }
 
@@ -1077,7 +1106,11 @@ impl RedbInstallationRegistry {
     /// created for its operation. It is a pure read of a durable projection: it
     /// grants no mutation authority, and both records are re-validated on the way
     /// out, so a consumer learns the created root only together with the
-    /// admission digest that root was recorded against.
+    /// admission digest that root was recorded against. The created root is
+    /// additionally RE-OBSERVED through a fresh no-follow protected-root lease,
+    /// so a caller learns the identity of the object this operation created and
+    /// not merely the name it once wrote; a root that no longer carries the
+    /// recorded identity is refused and preserved, never deleted by name.
     ///
     /// # Errors
     ///
@@ -1086,6 +1119,15 @@ impl RedbInstallationRegistry {
     /// [`InstallationError::InvalidField`] when the retained pair is not
     /// self-consistent — which the durable projection already refuses, so a
     /// failure here means the bytes on disk changed under a reader.
+    ///
+    /// An [`InstallationError::InvalidField`] naming `destination_root_identity`
+    /// means the created root no longer carries the identity the record asserts,
+    /// or cannot be re-proved at all. That is deliberately a DIFFERENT variant
+    /// from the [`InstallationError::IncompleteObservation`] this method returns
+    /// for a genuinely absent record, because the two mean opposite things to a
+    /// caller: absence means "allocate", and a contradicted identity means
+    /// "refuse". Collapsing them would let a repeated request answer a
+    /// substituted root with a fresh allocation.
     pub fn read_prepared_isolated_destination_creation(
         &self,
         host: &HostOwnerEpochCapability,
@@ -1145,6 +1187,11 @@ impl RedbInstallationRegistry {
                     .to_owned(),
             });
         }
+        // The recorded created root is re-observed here too: this read hands a
+        // caller the identity of an object it is about to install into, so it
+        // must be the object this operation created rather than whatever now
+        // carries the recorded name.
+        verify_materialised_destination_root(&materialisation)?;
         Ok((admission, materialisation))
     }
 
@@ -1840,41 +1887,159 @@ impl InstallationHostRootClass {
     }
 }
 
-/// Classifies `path` against this crate's installation-host-root layout.
+/// Classifies `path` against the installation owner's DECLARED installation
+/// layout, which `declared_installations_root` supplies.
 ///
-/// The classification is purely lexical and over the owner-declared layout
-/// (`<...>/eliot/installations/<key>[/host]`), exactly as the crate-private
-/// [`validate_installation_host_root`] is; it observes no filesystem, so it
-/// proves shape and never existence. Existence and reparse freedom remain the
-/// protected-root lease's proof and are composed by the caller on top.
-#[must_use]
-pub fn classify_installation_host_root(path: &Path) -> InstallationHostRootClass {
-    let Ok(identity) =
-        WindowsPathIdentity::parse_root(&path.to_string_lossy(), "installation_registry.host_root")
-    else {
-        return InstallationHostRootClass::Unowned;
+/// # Why the declared root, not a component name
+///
+/// The previous form searched the path for a component spelled `installations`
+/// and reported `Unowned` for everything else. That decided the question by a
+/// NAME, and it answered it vacuously for the layout that matters: the
+/// owner-declared isolated restore area is a *sibling* of `installations`, so
+/// every derived destination leaf is lexically guaranteed `Unowned` and the
+/// refusal could never fire. Comparing against the owner's own declared
+/// installations root makes the answer a property of the LAYOUT: a destination
+/// that lands inside `<installations_root>` is refused because it is inside an
+/// installation contour, whether or not any component happens to be spelled
+/// `installations`.
+///
+/// The classification is still purely lexical over two already-validated
+/// owner-derived paths — it observes no filesystem, so it proves CONTAINMENT
+/// and never existence. Existence and reparse freedom remain the protected-root
+/// lease's proof and are composed by the caller on top.
+///
+/// # Errors
+///
+/// Returns [`InstallationError::IncompleteObservation`] when either path is not
+/// a comparable Windows root, because a classification that cannot be computed
+/// is never `Unowned`: absence of proof is not proof of absence.
+pub fn classify_installation_host_root(
+    path: &Path,
+    declared_installations_root: &PlatformHandle,
+) -> Result<InstallationHostRootClass, InstallationError> {
+    let candidate = WindowsPathIdentity::parse_root(
+        &path.to_string_lossy(),
+        "installation_registry.classify.candidate",
+    )?;
+    let declared = WindowsPathIdentity::parse_root(
+        declared_installations_root.as_str(),
+        "installation_registry.classify.declared_installations_root",
+    )?;
+    // A candidate the declared installations area does not CONTAIN is outside
+    // every installation contour by definition, which is exactly what
+    // `Unowned` means. Only a path that cannot be parsed as a comparable
+    // Windows root above is a fault: absence of a classification is never
+    // `Unowned`, but a classification of "outside the area" is one.
+    let Some(relative) = candidate.relative_to(&declared) else {
+        return Ok(InstallationHostRootClass::Unowned);
     };
-    let Some(key_index) = identity
-        .components
-        .iter()
-        .rposition(|component| component == "installations")
-    else {
-        return InstallationHostRootClass::Unowned;
-    };
-    let key = identity.components.get(key_index + 1);
-    let Some(key) = key else {
-        return InstallationHostRootClass::Unowned;
-    };
+    // The declared installations root itself is the installation AREA: it is the
+    // parent every installation root is created under, not any installation's
+    // own Host root.
+    if relative.is_empty() {
+        return Ok(InstallationHostRootClass::InstallationArea);
+    }
+    let key = relative.first().ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "the candidate path names no installation below the declared installations root"
+                .to_owned(),
+        )
+    })?;
     if !valid_installation_key(key) {
-        return InstallationHostRootClass::Unowned;
+        return Ok(InstallationHostRootClass::Unowned);
     }
-    // A component past the key is an installation area unless it is exactly the
-    // `host` leaf, which is the installation Host root itself. Both a wrong leaf
-    // and an absent leaf are the same classification, so they share one arm.
-    match identity.components.get(key_index + 2) {
-        Some(leaf) if leaf == "host" => InstallationHostRootClass::InstallationHostRoot,
-        _ => InstallationHostRootClass::InstallationArea,
+    // Exactly `<installations_root>\<key>\host` is an installation Host root.
+    // Every other depth below a valid key — the key itself, a wrong leaf, or a
+    // deeper path — is the installation's own area, which an unrelated
+    // operation may never write into either.
+    if relative.len() == 2 && relative[1] == "host" {
+        return Ok(InstallationHostRootClass::InstallationHostRoot);
     }
+    Ok(InstallationHostRootClass::InstallationArea)
+}
+
+/// Re-observes a recorded materialised destination root and compares the LIVE
+/// object with what the record said was created.
+///
+/// `PreparedDestinationMaterialisation::destination_root_identity` is the only
+/// evidence that THIS operation created the object at the admitted name. Written
+/// once at materialisation time and never read by anybody, it would still be true
+/// of a root that has since been replaced, so both the record seam and the
+/// readback re-observe the root through a fresh reparse-free
+/// [`ProtectedRootLease`] and compare:
+///
+/// 1. the lease's own retained identity is stable across the observation,
+/// 2. the lease resolves back to exactly the recorded
+///    `destination_installation_root`, and
+/// 3. the lease's identity EQUALS the recorded `destination_root_identity`.
+///
+/// # Why this never deletes
+///
+/// The object that would have to be removed is precisely the one whose ownership
+/// just failed to be proved, so a failed re-observation reports the uncertainty
+/// and preserves the directory. Removal stays with the handle-bound publication
+/// teardown, which can only act on an object it created itself.
+///
+/// # Errors
+///
+/// [`InstallationError::InvalidField`] naming
+/// `destination_root_identity` in every failure case: the record asserts a
+/// stable identity for a specific object, and the re-observation either
+/// contradicts that assertion or cannot corroborate it, so the record is not
+/// valid to write or to hand back. A caller can therefore tell this refusal
+/// from [`InstallationError::IncompleteObservation`], which is what
+/// [`Self::read_prepared_isolated_destination_creation`] uses for the genuinely
+/// ABSENT case of "this authority retains no record for that operation" — a
+/// distinction a caller needs, because an absent record means "allocate" while a
+/// contradicted record means "refuse".
+fn verify_materialised_destination_root(
+    materialisation: &PreparedDestinationMaterialisation,
+) -> Result<(), InstallationError> {
+    fn contradicted(reason: String) -> InstallationError {
+        InstallationError::InvalidField {
+            field: "prepared_destination_materialisation.destination_root_identity".to_owned(),
+            reason,
+        }
+    }
+    let lease = ProtectedRootLease::open_existing(Path::new(
+        &materialisation.destination_installation_root,
+    ))
+    .map_err(|error| {
+        contradicted(format!(
+            "the recorded isolated destination root could not be re-proved through a no-follow \
+             protected-root lease, so its ownership is no longer established: {error}"
+        ))
+    })?;
+    lease.verify_stable_identity().map_err(|error| {
+        contradicted(format!(
+            "the recorded isolated destination root did not keep the identity it was observed \
+             with: {error}"
+        ))
+    })?;
+    let observed_root = lease.canonical_path().map_err(|error| {
+        contradicted(format!(
+            "the recorded isolated destination root could not be resolved through its retained \
+             lease: {error}"
+        ))
+    })?;
+    if !eliot_platform_windows::windows_paths_equal(
+        &observed_root,
+        Path::new(&materialisation.destination_installation_root),
+    ) {
+        return Err(contradicted(
+            "the recorded isolated destination root no longer resolves to the root this operation \
+             created"
+                .to_owned(),
+        ));
+    }
+    if lease.identity() != materialisation.destination_root_identity {
+        return Err(contradicted(
+            "the identity now observed for the recorded isolated destination root is not the \
+             identity this operation created"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_installation_host_root(path: &Path) -> Result<(), InstallationError> {

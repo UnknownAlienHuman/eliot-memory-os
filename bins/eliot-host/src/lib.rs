@@ -6771,9 +6771,13 @@ impl HostComposition {
     ///   `ProposedRestorationRequirements`;
     /// - this composition's registry-committed owner evidence
     ///   ([`crate::backup_preparation::OwnerEvidence::inspect`]), which supplies
-    ///   the source runtime roots, the approved target manifest and that
-    ///   manifest's owner-issued activation approval, and the current
-    ///   purge-ledger revision read from the ORS purge-ledger owner;
+    ///   the source runtime roots, the SET of approved generations this authority
+    ///   itself retains (from which the installation authority resolves the
+    ///   approved target and validates that row's own approval against that same
+    ///   row's manifest), the set of installation identities already in existence,
+    ///   and the current purge-ledger revision read from the ORS purge-ledger owner
+    ///   — the same revision then handed to the record seam, which compares it
+    ///   against the one the admission bound rather than against zero;
     /// - a retained no-follow `ProtectedRootLease` over the owner-declared
     ///   isolated restore area, which the installation authority resolves and
     ///   re-verifies.
@@ -6829,25 +6833,39 @@ impl HostComposition {
             |_| "the installation registry could not be opened to admit the isolated destination",
         )?;
         let capability = self.owner_lease.activation_capability();
-        if let Ok((retained, materialisation)) =
-            store.read_prepared_isolated_destination_creation(&capability, &facts.operation_id)
-        {
-            if retained.archive_id != facts.archive_id
-                || retained.archive_digest != facts.archive_digest
-                || retained.archive_class != facts.archive_class
-                || retained.target_schema_digest != facts.target_schema_digest
-                || retained.source_installation != facts.source_installation
-                || retained.destination_installation != facts.destination_installation
-                || materialisation.destination_installation != retained.destination_installation
-                || materialisation.destination_installation_root
-                    != retained.isolation.destination_installation_root
-            {
+        // The readback is matched, not swallowed. `IncompleteObservation` is this
+        // authority's own "retains no record for that operation" signal and is the
+        // ONLY outcome that means "allocate"; every other error — a capability
+        // refusal, a durable read fault, or a created root that no longer carries
+        // the identity the record claims — is reported rather than answered with a
+        // fresh allocation. Treating any error as absence would let a faulted read
+        // allocate a SECOND destination for an operation that already owns one.
+        match store.read_prepared_isolated_destination_creation(&capability, &facts.operation_id) {
+            Err(eliot_installation::InstallationError::IncompleteObservation(_)) => {}
+            Err(_) => {
                 return Err(
-                    "a different isolated destination was already admitted for this operation, so \
-                     the request conflicts instead of allocating a second installation",
+                    "the retained isolated destination for this operation could not be read back \
+                     with its created root re-proved, so no second destination is allocated",
                 );
             }
-            return Ok(());
+            Ok((retained, materialisation)) => {
+                if retained.archive_id != facts.archive_id
+                    || retained.archive_digest != facts.archive_digest
+                    || retained.archive_class != facts.archive_class
+                    || retained.target_schema_digest != facts.target_schema_digest
+                    || retained.source_installation != facts.source_installation
+                    || retained.destination_installation != facts.destination_installation
+                    || materialisation.destination_installation != retained.destination_installation
+                    || materialisation.destination_installation_root
+                        != retained.isolation.destination_installation_root
+                {
+                    return Err(
+                        "a different isolated destination was already admitted for this operation, \
+                         so the request conflicts instead of allocating a second installation",
+                    );
+                }
+                return Ok(());
+            }
         }
 
         let evidence = crate::backup_preparation::OwnerEvidence::inspect(&self.registry_host_root)
@@ -6871,17 +6889,25 @@ impl HostComposition {
             ProposedRestorationRequirements::issue_for_facts(&facts, max_restore_bytes)
                 .map_err(|error| Self::isolated_destination_reason(&error))?;
         let known = evidence.known_installations();
-        let approved = evidence.approved();
-        let active_generation = approved.manifest.generation.clone();
+        // The approved target is resolved by the installation authority out of the
+        // approved set this composition's OWN registry retains, and the ACTIVE
+        // generation is that set's own active row — the same record, for the reason
+        // documented on the input field: a restore is prepared FOR the currently
+        // approved build of the installation that owns the archive, so no inequality
+        // against the source is demanded. What is demanded is that the handle name
+        // a row this authority approved, with that row's own approval validated
+        // against that same row's manifest.
+        let approved_generations = evidence.approved_generations();
+        let approved_target_generation = evidence.approved().manifest.generation.clone();
         let allocation = eliot_installation::admit_prepared_isolated_destination(
             &IsolatedDestinationAdmissionInput {
                 facts: &facts,
                 max_restore_bytes,
                 source_roots: roots,
-                source_active_generation: &active_generation,
+                source_active_generation: &approved_target_generation,
                 isolated_area_lease: &area_lease,
-                approved_target_manifest: &approved.manifest,
-                approved_target_approval: &approved.approval,
+                approved_generations,
+                approved_target_generation: &approved_target_generation,
                 restoration_requirements: &requirements,
                 current_purge_ledger_revision: purge_revision,
                 known_installations: &known,
@@ -6916,6 +6942,7 @@ impl HostComposition {
                 evidence.revision(),
                 &allocation.admission,
                 &materialisation,
+                purge_revision,
             )
             .map(|_| ())
             .map_err(|_| {

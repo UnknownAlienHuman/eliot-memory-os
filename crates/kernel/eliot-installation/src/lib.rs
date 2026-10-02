@@ -190,11 +190,12 @@ pub use integration_discovery::{
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
 };
 pub use isolated_destination::{
-    IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation, IsolatedDestinationError,
-    IsolatedDestinationRefusal, IsolationEvidence, PREPARED_DESTINATION_ADMISSION_WIRE,
-    PREPARED_DESTINATION_MATERIALISATION_WIRE, PreparedDestinationAdmission,
-    PreparedDestinationFacts, PreparedDestinationMaterialisation, ProposedRestorationRequirements,
-    admit_prepared_isolated_destination, materialise_prepared_isolated_destination,
+    DestinationLeafObservation, IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation,
+    IsolatedDestinationError, IsolatedDestinationRefusal, IsolationEvidence,
+    PREPARED_DESTINATION_ADMISSION_WIRE, PREPARED_DESTINATION_MATERIALISATION_WIRE,
+    PreparedDestinationAdmission, PreparedDestinationFacts, PreparedDestinationMaterialisation,
+    ProposedRestorationRequirements, admit_prepared_isolated_destination,
+    materialise_prepared_isolated_destination,
 };
 
 pub use managed_change_plan::{

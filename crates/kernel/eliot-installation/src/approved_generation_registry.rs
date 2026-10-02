@@ -3793,8 +3793,12 @@ impl ApprovedGenerationRegistry {
         &mut self,
         admission: &PreparedDestinationAdmission,
         materialisation: &PreparedDestinationMaterialisation,
+        current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationMaterialisation, InstallationError> {
-        self.record_prepared_isolated_destination_unchecked(admission)?;
+        self.record_prepared_isolated_destination_unchecked(
+            admission,
+            current_purge_ledger_revision,
+        )?;
         materialisation
             .validate()
             .map_err(|error| InstallationError::InvalidField {
@@ -3863,7 +3867,15 @@ impl ApprovedGenerationRegistry {
                 field: "prepared_destination_materialisation".to_owned(),
                 reason: error.to_string(),
             })?;
-        if self.active_generation.as_ref() == Some(&admission.approved_target_build) {
+        if self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+        }) || self.active_generation.as_ref() == Some(&admission.approved_target_build)
+        {
             return Err(InstallationError::IdentityConflict);
         }
         let Some(index) = self
@@ -3912,9 +3924,14 @@ impl ApprovedGenerationRegistry {
     /// [`InstallationError::IdentityConflict`], and a destination this
     /// projection already holds under a different operation is refused outright,
     /// because two operations may never share one destination.
+    /// `current_purge_ledger_revision` is the purge-ledger revision the ORS
+    /// owner reports NOW, at record time. It is compared against the revision
+    /// the admission bound; see
+    /// [`Self::record_prepared_isolated_destination_unchecked`].
     pub(crate) fn record_prepared_isolated_destination_unchecked(
         &mut self,
         admission: &PreparedDestinationAdmission,
+        current_purge_ledger_revision: u64,
     ) -> Result<PreparedDestinationAdmission, InstallationError> {
         self.validate()?;
         admission
@@ -3923,26 +3940,57 @@ impl ApprovedGenerationRegistry {
                 field: "prepared_isolated_destination".to_owned(),
                 reason: error.to_string(),
             })?;
-        // An active/source installation is never a destination. The owner can
-        // tell because the destination identity would then be a generation THIS
-        // projection already approves and, if it is the active one, an
-        // installation that is currently serving effects.
-        if let Some(active) = self.active_generation.as_ref()
-            && (&admission.destination_installation == active
-                || admission.approved_target_build == *active)
+        // The purge-ledger revision the admission bound is compared against the
+        // revision the ORS purge-ledger owner reports NOW. Without this the field
+        // was only ever compared with `0`, so a destination admitted against a
+        // stale revision and one admitted against the current revision were
+        // indistinguishable after admission — and A13.7 requires the restore to
+        // apply the CURRENT privacy purge, not whatever was current when
+        // preparation started. The ORS owner is not reachable from this crate,
+        // so the live value arrives as a required argument from the caller that
+        // holds that lease, and this authority refuses when the two disagree.
+        if current_purge_ledger_revision == 0
+            || current_purge_ledger_revision != admission.current_purge_ledger_revision
         {
-            return Err(InstallationError::Duplicate {
-                kind: "active installation offered as an isolated destination".to_owned(),
-                identity: admission.destination_installation.as_str().to_owned(),
-            });
+            return Err(InstallationError::IncompleteObservation(format!(
+                "the destination admission is bound to purge-ledger revision {} but the ORS owner \
+                 reports {}",
+                admission.current_purge_ledger_revision, current_purge_ledger_revision
+            )));
         }
-        if self
-            .generations
-            .iter()
-            .any(|generation| generation.manifest.generation == admission.destination_installation)
-        {
+        // The source generation the admission was prepared against is compared
+        // against this projection's OWN current active generation. The field
+        // existed to be compared and nothing read it, so a preparation bound to a
+        // configuration snapshot the source has since moved on from was retained
+        // as if it were current. A mismatch means the bound configuration is
+        // stale, which is refused rather than recorded.
+        if Some(&admission.isolation.source_active_generation) != self.active_generation.as_ref() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        // The DESTINATION identity is compared against the EXISTING-INSTALLATION
+        // identities this projection holds, in the SAME identity space, and
+        // against nothing else: the installation identity of every approved
+        // generation, plus the source installation identity the admission claims.
+        //
+        // It is deliberately NOT `approved_target_build == active_generation`.
+        // That compares the destination's APPROVED TARGET against the source's
+        // own active generation, which in the production shape were the same
+        // field of the same record, so it refused every legitimate destination
+        // while proving nothing about the destination itself. Nor is
+        // `destination_installation == manifest.generation`: a generation handle
+        // and an installation key are different identity spaces, so that
+        // comparison could not decide "already an installation" either.
+        let known_installation = self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+        });
+        if known_installation {
             return Err(InstallationError::Duplicate {
-                kind: "approved generation offered as an isolated destination".to_owned(),
+                kind: "known installation offered as an isolated destination".to_owned(),
                 identity: admission.destination_installation.as_str().to_owned(),
             });
         }
@@ -3981,7 +4029,22 @@ impl ApprovedGenerationRegistry {
                 field: "prepared_isolated_destination".to_owned(),
                 reason: error.to_string(),
             })?;
-        if self.active_generation.as_ref() == Some(&admission.approved_target_build) {
+        // "Never activated" is decided against this projection's OWN current
+        // state: the destination must not have become one of the installation
+        // identities this authority holds, and the approved target must not have
+        // become active. The previous form compared the approved target with the
+        // active generation, which in the production shape were the same field of
+        // the same record, so cleanup could never recognise an activated
+        // destination.
+        if self.generations.iter().any(|generation| {
+            generation
+                .manifest
+                .runtime_launch
+                .installation_epoch
+                .installation
+                == admission.destination_installation
+        }) || self.active_generation.as_ref() == Some(&admission.approved_target_build)
+        {
             return Err(InstallationError::IdentityConflict);
         }
         let Some(index) = self
@@ -5010,13 +5073,52 @@ impl ApprovedGenerationRegistry {
                     identity: admission.destination_installation.as_str().to_owned(),
                 });
             }
-            if self.active_generation.as_ref() == Some(&admission.destination_installation)
-                || self.active_generation.as_ref() == Some(&admission.approved_target_build)
+            // The DESTINATION must not be an installation identity this projection
+            // already holds. Compared in the SAME identity space — the
+            // `installation_epoch.installation` of every approved generation —
+            // and never against `manifest.generation`, which is a generation
+            // handle rather than an installation key.
+            //
+            // The APPROVED TARGET is a generation HANDLE, so it is compared as one: it must
+            // be a generation this projection approves. That is a real cross-check
+            // against an independent expected set — the registry's own approved
+            // rows — and it is exactly what a caller cannot fake by presenting a
+            // manifest and an approval that merely agree with each other.
+            //
+            // It is deliberately NOT also compared for inequality against the
+            // active generation. A destination installation does not exist yet, so
+            // this authority has no approved generation FOR it: the build a restore
+            // is prepared for is the currently approved build of the installation
+            // that owns the archive. DISTINCTNESS is decided solely by the
+            // destination-identity comparison above, and demanding that the target
+            // differ from the active generation would compare one field of the
+            // source's own record with itself and refuse every real destination.
+            if self.generations.iter().any(|generation| {
+                generation
+                    .manifest
+                    .runtime_launch
+                    .installation_epoch
+                    .installation
+                    == admission.destination_installation
+            }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            if !self
+                .generations
+                .iter()
+                .any(|generation| generation.manifest.generation == admission.approved_target_build)
             {
                 return Err(InstallationError::IdentityConflict);
             }
-            if self.generations.iter().any(|generation| {
-                generation.manifest.generation == admission.destination_installation
+            // The source generation the admission was prepared against must be a
+            // generation this projection approves. This is a SELF-consistency
+            // check, deliberately weaker than the record-time check that also
+            // compares it against the CURRENT active generation: `validate` runs
+            // on every load, and the source legitimately advances generations
+            // afterwards, so requiring activity here would make a retained
+            // preparation unreadable the moment the source was updated.
+            if !self.generations.iter().any(|generation| {
+                generation.manifest.generation == admission.isolation.source_active_generation
             }) {
                 return Err(InstallationError::IdentityConflict);
             }

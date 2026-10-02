@@ -59,11 +59,30 @@
 //!
 //! [`IsolationEvidence`] records what the owner OBSERVED, not what a name
 //! suggests: the canonical path resolved from the retained no-follow lease, the
-//! lease's own stable file identity, the owner's declaration that the destination
-//! leaf did not exist at admission time, and the exact source roots and
-//! installation root it is compared against. A predictable name is never
-//! ownership, and `IsolationEvidence::validate` re-derives its own digest and
-//! compares it, so a hand-written or stale evidence row cannot pass.
+//! lease's own stable file identity, the exact result of the owner's own
+//! no-follow observation of the destination leaf
+//! ([`DestinationLeafObservation`]), and the exact source roots and installation
+//! root it is compared against. A predictable name is never ownership.
+//!
+//! No boolean in either record asserts "absent" or "reparse-free". Such a bit
+//! cannot be re-derived by a later reader and would only ever be written `true`
+//! by its own issuer, so it is evidence of nothing. What is recorded instead is
+//! the observation the owner actually made — [`DestinationLeafObservation`] — and
+//! what is re-observed later is compared against THAT recorded value:
+//! [`prove_isolated_destination_root`] re-runs the same no-follow observer at
+//! materialise time and refuses when the fresh observation disagrees with the
+//! recorded one, and the durable store re-observes the created root's identity
+//! through a fresh no-follow lease before it retains or hands back a
+//! materialisation.
+//!
+//! `IsolationEvidence::validate` checks INTERNAL CONSISTENCY — shape, non-zero
+//! identities, and the content digest recomputed over the recorded content — and
+//! deliberately asserts nothing about the filesystem. It is not authenticity:
+//! these records are `pub` with `Deserialize`, so an outside writer can
+//! recompute a consistent digest over content of its own. Authenticity is the
+//! existing owner capability seam — every mutation of this projection requires
+//! the live exclusive [`HostOwnerEpochCapability`] this crate already demands of
+//! [`RedbInstallationRegistry`] — and no new MAC is introduced here.
 //!
 //! # The destination is actually created, and the record proves it
 //!
@@ -89,10 +108,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CandidateManifest, FileIdentity, InstallationActivationApproval, InstallationError,
-    InstallationHostRootClass, PlatformHandle, RuntimeStateRoots, canonical_json_bytes,
-    classify_installation_host_root, handle, joined_windows_path, sha256_handle, sha256_hex, text,
-    valid_installation_key,
+    ApprovedGeneration, FileIdentity, InstallationError, InstallationHostRootClass, PlatformHandle,
+    RuntimeStateRoots, canonical_json_bytes, classify_installation_host_root, handle,
+    joined_windows_path, sha256_handle, sha256_hex, text, valid_installation_key,
 };
 
 /// Durable wire discriminator of one prepared, unactivated destination
@@ -136,9 +154,16 @@ pub enum IsolatedDestinationRefusal {
     #[error("the destination root is not isolated from the source installation root")]
     DestinationOverlapsSource,
 
-    /// The destination is a generation this installation authority already
-    /// knows about, so it is an active or previously admitted installation
-    /// rather than a new distinct one.
+    /// The DESTINATION identity is already an installation this authority holds —
+    /// its active installation, one of its approved generations, or a destination
+    /// a previous operation already admitted.
+    ///
+    /// The comparison is destination-against-existing-installations, in that
+    /// direction and no other. It is deliberately NOT "the approved target equals
+    /// the source's own active generation": a restore into a brand-new distinct
+    /// installation is prepared FOR an approved target generation, so that
+    /// comparison is one field against itself, it refused every legitimate
+    /// destination, and it proved nothing about the destination at all.
     #[error("the destination installation is already present in this authority's projection")]
     ExistingInstallation,
 
@@ -146,13 +171,15 @@ pub enum IsolatedDestinationRefusal {
     /// installation contour, so this operation does not own it.
     ///
     /// This is the "preexisting foreign owner is rejected" clause, decided by
-    /// the owner rather than by a name. It fires wherever the owner-declared
-    /// layout can be classified: the source's own Host root must BE an
-    /// installation Host root (otherwise the source is a foreign directory and
-    /// every isolation statement derived from it is a claim), and the isolated
-    /// area and the derived destination leaf must NOT be inside any
-    /// installation tree. A destination that a foreign installation already owns
-    /// at that name is refused here, never reused, and never removed by name.
+    /// the owner against its own DECLARED layout — the installation owner's
+    /// `installations_root`, which the owner derives from its validated profile
+    /// anchor — and not by the lexical shape of a path. The source's own Host
+    /// root must BE an installation Host root of that declared layout (otherwise
+    /// the source is a foreign directory and every isolation statement derived
+    /// from it is a claim), and the isolated area and the derived destination
+    /// leaf must NOT be inside that declared installation contour. A destination
+    /// a foreign installation already owns at that name is refused here, never
+    /// reused, and never removed by name.
     #[error(
         "the destination is inside a foreign installation's own contour, so this operation does \
          not own it"
@@ -196,6 +223,79 @@ pub const PREPARED_DESTINATION_MATERIALISATION_WIRE: &str =
 const MATERIALISATION_DOMAIN: &str =
     "eliot.installation.prepared-destination-materialisation-binding.v1";
 
+/// The owner's own no-follow OBSERVATION of one destination leaf.
+///
+/// # Why this is an enum and not a boolean
+///
+/// A `bool` field can only ever be written `true` by the code that constructs
+/// the record, so `validate()` comparing it with `true` compares a literal with
+/// itself and proves nothing; and no later reader can re-derive it, so it is
+/// evidence of nothing either. This enum instead records WHICH observation the
+/// owner actually made, from [`observe_destination_leaf`] — the single observer
+/// every step of this module uses, which uses `symlink_metadata` so a junction
+/// is SEEN rather than followed.
+///
+/// [`Self::Absent`] is reachable only when that observer ran and reported
+/// absence; a record that claims `Present` or `Unobserved` is refused by
+/// [`PreparedDestinationMaterialisation::validate`] and
+/// [`IsolationEvidence::validate`].
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DestinationLeafObservation {
+    /// The leaf was observed to not exist.
+    Absent,
+    /// The leaf was observed to exist. A junction is reported here too, because
+    /// `symlink_metadata` does not follow it.
+    Present,
+    /// The leaf could not be observed at all, so absence is NOT established.
+    Unobserved,
+}
+
+impl DestinationLeafObservation {
+    /// Current durable wire spelling of this observation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "ABSENT",
+            Self::Present => "PRESENT",
+            Self::Unobserved => "UNOBSERVED",
+        }
+    }
+}
+
+/// Runs THE single no-follow observation of one destination leaf.
+///
+/// It is the only place this module looks at the destination leaf's existence,
+/// so admission, materialisation and the recorded evidence cannot disagree by
+/// construction. `symlink_metadata` does not follow a reparse point, so a
+/// junction planted at the destination name is REPORTED as [`Present`] rather
+/// than resolved through — a followed link here would be an alias
+/// substitution.
+///
+/// # Errors
+///
+/// Returns [`InstallationError::IncompleteObservation`] when the leaf cannot be
+/// observed at all. That is deliberately distinct from `Absent`: absence of
+/// proof is never treated as proof of absence, and a fault here refuses the
+/// destination rather than admitting a name nobody could check.
+fn observe_destination_leaf(
+    destination_root: &str,
+) -> Result<DestinationLeafObservation, InstallationError> {
+    match std::fs::symlink_metadata(destination_root) {
+        Ok(_) => Ok(DestinationLeafObservation::Present),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DestinationLeafObservation::Absent)
+        }
+        Err(_) => Err(InstallationError::IncompleteObservation(
+            "the destination leaf could not be observed, so this operation cannot claim it owns \
+             that name"
+                .to_owned(),
+        )),
+    }
+}
+
 /// Owner-observed proof that the ADMITTED destination root was actually
 /// created, and that the object at the admitted name is the object this
 /// operation created.
@@ -212,14 +312,15 @@ const MATERIALISATION_DOMAIN: &str =
 /// to correlate.
 ///
 /// What it proves, and what it does not: it records the `FileIdentity` the
-/// owner's own reparse-free protected-root lease OBSERVED for the created
-/// root, the identity the same lease observed for the isolated area the
-/// publication was made under, and the absence/reparse observations. A
-/// predictable name proves nothing — a hand-written row naming a real foreign
-/// directory fails [`Self::validate`] because the digest is recomputed over the
-/// recorded content, and a reader that re-proves the root against
-/// [`materialise_prepared_isolated_destination`] compares the lease's live
-/// identity with the identity recorded HERE.
+/// owner's own no-follow protected-root lease OBSERVED for the created root,
+/// the identity the same lease observed for the isolated area the publication
+/// was made under, and the owner's own no-follow observation of the
+/// destination leaf immediately before the publication. A predictable name
+/// proves nothing — the created object's identity is compared against the
+/// publication receipt's own identity before it is recorded, and every reader
+/// re-observes it through a fresh no-follow lease before it retains or returns
+/// the record, so a row naming a foreign directory fails on the live comparison
+/// rather than on its own digest.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedDestinationMaterialisation {
@@ -247,13 +348,27 @@ pub struct PreparedDestinationMaterialisation {
     pub isolated_area_identity: FileIdentity,
     /// The owner-derived destination root that was created.
     pub destination_installation_root: String,
-    /// Identity the owner's reparse-free lease observed for the created root.
+    /// Identity the owner's no-follow lease observed for the created root.
+    ///
+    /// This is the load-bearing evidence of ownership, and it is compared by
+    /// its consumers: the creation step compares it against the publication
+    /// receipt's own `destination_identity`, and
+    /// [`crate::RedbInstallationRegistry::read_prepared_isolated_destination_creation`]
+    /// plus
+    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination_creation`]
+    /// re-observe it through a fresh no-follow lease before the record is
+    /// retained or handed back. A recorded identity that no longer names the
+    /// object at the recorded root is refused, not believed.
     pub destination_root_identity: FileIdentity,
-    /// Whether the owner's lease proved the created root reparse-free.
-    pub destination_reparse_free: bool,
-    /// Whether the owner observed the destination leaf absent immediately
-    /// before the publication.
-    pub destination_observed_absent: bool,
+    /// The owner's own no-follow observation of the destination leaf taken
+    /// immediately before the publication.
+    ///
+    /// It is a recorded OBSERVATION, not an assertion: the value came from
+    /// [`observe_destination_leaf`], the same single observer the pre-effect
+    /// proof uses, and [`Self::validate`] requires it to be
+    /// [`DestinationLeafObservation::Absent`] — which is only reachable if the
+    /// observer ran and said so. See [`DestinationLeafObservation`].
+    pub destination_leaf_observation: DestinationLeafObservation,
     /// SHA-256 over every field except this field.
     pub materialisation_digest: PlatformHandle,
 }
@@ -273,8 +388,7 @@ impl PreparedDestinationMaterialisation {
             &self.isolated_area_identity,
             &self.destination_installation_root,
             &self.destination_root_identity,
-            self.destination_reparse_free,
-            self.destination_observed_absent,
+            self.destination_leaf_observation,
         )
     }
 
@@ -291,8 +405,7 @@ impl PreparedDestinationMaterialisation {
         isolated_area_identity: &FileIdentity,
         destination_installation_root: &str,
         destination_root_identity: &FileIdentity,
-        destination_reparse_free: bool,
-        destination_observed_absent: bool,
+        destination_leaf_observation: DestinationLeafObservation,
     ) -> Result<PlatformHandle, InstallationError> {
         let bytes = canonical_json_bytes(&(
             MATERIALISATION_DOMAIN,
@@ -306,8 +419,7 @@ impl PreparedDestinationMaterialisation {
             destination_installation_root,
             destination_root_identity.volume_serial_number,
             destination_root_identity.file_index,
-            destination_reparse_free,
-            destination_observed_absent,
+            destination_leaf_observation.as_str(),
         ))
         .map_err(|error| InstallationError::InvalidField {
             field: "prepared_destination.materialisation.materialisation_digest".to_owned(),
@@ -319,13 +431,63 @@ impl PreparedDestinationMaterialisation {
         })
     }
 
-    /// Validates the record against its own digest and the observations it
-    /// claims.
+    /// Test-only seam over the private pre-record digest computation.
     ///
-    /// The digest is what makes the row non-forgeable from outside: it is
-    /// compared with the digest of the recorded CONTENT, so a hand-written row
-    /// naming another destination, another area or a false absence observation
-    /// fails here rather than being believed because it exists.
+    /// A record cannot compute its own digest before it exists, so the ISSUER
+    /// path needs [`Self::digest_over_fields`]; a test needs the same value to
+    /// build one internally consistent record whose only fault is the field it
+    /// varies. This exposes exactly that call and nothing else.
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the digest covers exactly these fields, and the TEST needs them to build a record"
+    )]
+    fn computed_digest_for_test(
+        wire: &PlatformHandle,
+        operation_id: &PlatformHandle,
+        destination_installation: &PlatformHandle,
+        admission_digest: &PlatformHandle,
+        isolated_area_root: &str,
+        isolated_area_identity: &FileIdentity,
+        destination_installation_root: &str,
+        destination_root_identity: &FileIdentity,
+        destination_leaf_observation: DestinationLeafObservation,
+    ) -> Result<PlatformHandle, InstallationError> {
+        Self::digest_over_fields(
+            wire,
+            operation_id,
+            destination_installation,
+            admission_digest,
+            isolated_area_root,
+            isolated_area_identity,
+            destination_installation_root,
+            destination_root_identity,
+            destination_leaf_observation,
+        )
+    }
+
+    /// Validates the record against its own content and the observation it
+    /// claims to have made.
+    ///
+    /// # What this proves, precisely
+    ///
+    /// It proves INTERNAL CONSISTENCY: shape, non-zero stable identities, that
+    /// the recorded leaf observation really is
+    /// [`DestinationLeafObservation::Absent`], and that the recorded digest
+    /// equals the digest recomputed over the recorded content. A row that
+    /// claims a different destination, a different area, or claims the leaf was
+    /// present fails here.
+    ///
+    /// # What this does NOT prove
+    ///
+    /// It does not prove AUTHENTICITY. These records are `pub` with
+    /// `Deserialize`, so an outside writer can build a row and recompute a
+    /// perfectly consistent digest over its own content; that is why the digest
+    /// is never described here as making a record non-forgeable. Authenticity is
+    /// the existing owner capability seam: only a caller holding the live
+    /// exclusive [`HostOwnerEpochCapability`] this crate already requires of
+    /// every mutation of this projection may retain or read one, and the readers
+    /// re-observe the created root's identity through a fresh no-follow lease.
     pub fn validate(&self) -> Result<(), IsolatedDestinationError> {
         handle(&self.wire, "prepared_destination.materialisation.wire")
             .map_err(IsolatedDestinationError::Installation)?;
@@ -380,15 +542,12 @@ impl PreparedDestinationMaterialisation {
                 ),
             ));
         }
-        if !self.destination_observed_absent {
+        // The recorded leaf observation is compared against the ONE value that
+        // makes this record a creation receipt. `Present` cannot be a creation
+        // receipt at all, and `Unobserved` records that the owner never observed
+        // the leaf — which is exactly the state a literal `true` used to claim.
+        if self.destination_leaf_observation != DestinationLeafObservation::Absent {
             return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into());
-        }
-        if !self.destination_reparse_free {
-            return Err(IsolatedDestinationError::Installation(
-                InstallationError::IncompleteObservation(
-                    "the created destination root was not proved reparse-free".to_owned(),
-                ),
-            ));
         }
         if self.materialisation_digest != self.computed_digest()? {
             return Err(IsolatedDestinationError::Installation(
@@ -665,9 +824,27 @@ impl ProposedRestorationRequirements {
 ///
 /// Every path here is the path the owner RESOLVED through its retained
 /// no-follow lease, never a name the caller spelled. Every identity is the
-/// lease's own observed file identity. The `*_absent` flags record what the
-/// owner observed about existence at admission time; they are evidence of the
-/// observation, not a claim that a predictable name is owned.
+/// lease's own observed file identity. The leaf observation records what
+/// [`observe_destination_leaf`] actually reported.
+///
+/// # What a later reader must re-prove
+///
+/// Three of these fields exist to be COMPARED, and each has a named consumer:
+///
+/// - [`Self::source_active_generation`] is compared by
+///   [`crate::RedbInstallationRegistry::record_prepared_isolated_destination`]
+///   against the source installation authority's OWN current active generation.
+///   An admission bound to a generation the source has since moved on from is
+///   refused as [`crate::InstallationError::IdentityConflict`], which is what
+///   stops a stale configuration snapshot from being bound as current.
+/// - [`Self::source_installation_root`] and [`Self::source_host_root`] are
+///   re-compared by [`prove_isolated_destination_root`] at materialise time:
+///   the destination is re-proved DISJOINT from the recorded source root, so a
+///   source root that was moved under the destination between admission and
+///   materialisation is caught before anything is created.
+/// - [`Self::destination_leaf_observation`] is re-observed at materialise time
+///   by the same [`observe_destination_leaf`] observer and refused when the
+///   fresh observation is not [`DestinationLeafObservation::Absent`].
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IsolationEvidence {
@@ -687,16 +864,17 @@ pub struct IsolationEvidence {
     /// Source Host root the preparation reads from.
     pub source_host_root: String,
     /// Active generation the source installation authority currently holds.
-    pub source_active_generation: PlatformHandle,
-    /// Whether the destination leaf was observed ABSENT by the owner at
-    /// admission time.
     ///
-    /// A destination that already existed is not a new distinct allocation, so
-    /// this must be `true` for a fresh admission; the flag is stored rather than
-    /// assumed so a reader can see the observation, not infer it.
-    pub destination_observed_absent: bool,
-    /// Whether the retained lease proved the isolated area reparse-free.
-    pub isolated_area_reparse_free: bool,
+    /// Compared against the authority's own current active generation by
+    /// [`crate::RedbInstallationRegistry::record_prepared_isolated_destination`];
+    /// a mismatch is refused rather than recorded.
+    pub source_active_generation: PlatformHandle,
+    /// The owner's own no-follow observation of the destination leaf at
+    /// admission time, taken by [`observe_destination_leaf`].
+    ///
+    /// Re-observed at materialise time by the same observer and refused when it
+    /// is not [`DestinationLeafObservation::Absent`].
+    pub destination_leaf_observation: DestinationLeafObservation,
     /// SHA-256 over every field except this field.
     pub evidence_digest: PlatformHandle,
 }
@@ -716,14 +894,13 @@ impl IsolationEvidence {
             &self.source_installation_root,
             &self.source_host_root,
             &self.source_active_generation,
-            self.destination_observed_absent,
-            self.isolated_area_reparse_free,
+            self.destination_leaf_observation,
         )
     }
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the digest covers exactly these ten fields"
+        reason = "the digest covers exactly these nine fields"
     )]
     fn digest_over_fields(
         wire: &PlatformHandle,
@@ -734,8 +911,7 @@ impl IsolationEvidence {
         source_installation_root: &str,
         source_host_root: &str,
         source_active_generation: &PlatformHandle,
-        destination_observed_absent: bool,
-        isolated_area_reparse_free: bool,
+        destination_leaf_observation: DestinationLeafObservation,
     ) -> Result<PlatformHandle, InstallationError> {
         let bytes = canonical_json_bytes(&(
             ISOLATION_EVIDENCE_DOMAIN,
@@ -748,8 +924,7 @@ impl IsolationEvidence {
             source_installation_root,
             source_host_root,
             source_active_generation.as_str(),
-            destination_observed_absent,
-            isolated_area_reparse_free,
+            destination_leaf_observation.as_str(),
         ))
         .map_err(|error| InstallationError::InvalidField {
             field: "prepared_destination.isolation.evidence_digest".to_owned(),
@@ -761,14 +936,27 @@ impl IsolationEvidence {
         })
     }
 
-    /// Validates the evidence against its own digest and the observations it
-    /// claims.
+    /// Validates the evidence against its own content and the observation it
+    /// claims to have made.
     ///
-    /// The digest check is what makes the record non-forgeable from the outside:
-    /// a hand-written row that names another source, another destination or a
-    /// false absence observation fails here, because the recorded digest is
-    /// compared with the digest of the recorded CONTENT rather than the record
-    /// merely existing.
+    /// # What this proves, precisely
+    ///
+    /// Shape, non-zero stable identities, that the recorded leaf observation is
+    /// [`DestinationLeafObservation::Absent`], and that the recorded digest
+    /// equals the digest recomputed over the recorded content. A row that names
+    /// another source, another destination, or claims the leaf was present or
+    /// unobserved fails here.
+    ///
+    /// # What this does NOT prove
+    ///
+    /// It does not prove AUTHENTICITY — these records are `pub` with
+    /// `Deserialize`, so an outside writer can recompute a consistent digest over
+    /// its own content, which is why this function is never described as making
+    /// a record non-forgeable. Authenticity is the existing owner capability
+    /// seam, and the fields that can go stale against the live authority
+    /// ([`Self::source_active_generation`], [`Self::source_installation_root`],
+    /// [`Self::source_host_root`]) are compared by the registry and by
+    /// [`prove_isolated_destination_root`] rather than believed here.
     pub fn validate(&self) -> Result<(), IsolatedDestinationError> {
         handle(&self.wire, "prepared_destination.isolation.wire")
             .map_err(IsolatedDestinationError::Installation)?;
@@ -823,16 +1011,8 @@ impl IsolationEvidence {
                 ),
             ));
         }
-        if !self.destination_observed_absent {
+        if self.destination_leaf_observation != DestinationLeafObservation::Absent {
             return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into());
-        }
-        if !self.isolated_area_reparse_free {
-            return Err(IsolatedDestinationError::Installation(
-                InstallationError::IncompleteObservation(
-                    "the isolated area retained lease did not prove a reparse-free contour"
-                        .to_owned(),
-                ),
-            ));
         }
         if self.evidence_digest != self.computed_digest()? {
             return Err(IsolatedDestinationError::Installation(
@@ -1322,24 +1502,42 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
     /// Retained, no-follow protected-root lease over the owner-declared
     /// isolated restore area.
     pub isolated_area_lease: &'a ProtectedRootLease,
-    /// The approved target manifest: the installation authority's own approved
-    /// generation manifest, whose profile and roots digest are the approved
-    /// target build/profile.
-    pub approved_target_manifest: &'a CandidateManifest,
-    /// The installation authority's own activation approval for that manifest.
+    /// Every APPROVED generation this installation authority holds, with each
+    /// row's own activation approval.
     ///
-    /// This is the proof that the target build/profile is approved, and it is
-    /// read out of the owner's `ApprovedGeneration` row rather than supplied by
-    /// the caller: its only constructor is crate-private and its production
-    /// issuer is the signed activation bridge, so a caller cannot present one.
-    pub approved_target_approval: &'a InstallationActivationApproval,
+    /// The approved target is resolved from THIS set rather than handed in as a
+    /// loose manifest/approval pair. That is what makes the approved-target
+    /// proof non-vacuous: the caller cannot present a manifest and an approval
+    /// that merely agree with each other, it can only point at a generation the
+    /// authority itself already approved, and the approval is then compared
+    /// against the manifest of that very row through the crate's existing
+    /// [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest).
+    ///
+    /// The set is the authority's own projection, read by the caller from the
+    /// registry it already inspected; an empty set refuses every destination,
+    /// because a destination with no approved target build is not admitted.
+    pub approved_generations: &'a [ApprovedGeneration],
+    /// Approved target generation this destination is being prepared FOR, as a
+    /// handle into [`Self::approved_generations`].
+    ///
+    /// A destination installation does not exist yet, so this authority has no
+    /// approved generation FOR it; the build a restore is prepared for is the
+    /// currently approved build of the installation that owns the archive. That
+    /// handle therefore normally equals [`Self::source_active_generation`], and
+    /// no inequality is demanded here — the DESTINCTNESS of the destination is
+    /// decided by the destination identity and by the derived root, not by the
+    /// approved target differing from the source. A handle that names no row in
+    /// the approved set is refused.
+    pub approved_target_generation: &'a PlatformHandle,
     /// Owner-issued restoration requirements for this destination.
     pub restoration_requirements: &'a ProposedRestorationRequirements,
     /// Current purge-ledger revision read from the ORS purge-ledger owner.
     pub current_purge_ledger_revision: u64,
-    /// Installation identities this authority already knows about. Used to
-    /// refuse an existing (active or previously admitted) installation as the
-    /// destination.
+    /// Installation identities this authority already holds. Used to refuse an
+    /// existing installation as the destination.
+    ///
+    /// This is the EXISTING-INSTALLATION set, and it is compared against the
+    /// destination identity and nothing else.
     pub known_installations: &'a [PlatformHandle],
 }
 
@@ -1363,25 +1561,33 @@ pub struct IsolatedDestinationAdmissionInput<'a> {
 ///    operation and archive identities and must be an owner installation key,
 ///    so there is no parameter through which a path could arrive;
 /// 3. the destination is not the owner-issued source installation;
-/// 4. the destination is not an installation this authority already knows —
-///    the active one, any approved generation, or any destination already
-///    admitted as prepared — and the approved target is not the source's own
-///    active generation over the same root topology, so an active or
-///    same-installation contour can never be the destination;
-/// 5. the approved target build/profile is proved by the installation
-///    authority's own activation approval for the approved manifest, through
-///    the crate's existing [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest),
-///    BEFORE anything is allocated;
+/// 4. the DESTINATION identity is not one of the installation identities this
+///    authority already holds — the active installation, every approved
+///    generation's installation, or every destination already admitted as
+///    prepared. That is the whole of the "existing installation" clause, and it
+///    is a comparison in that direction only;
+/// 5. the approved target is a generation THIS authority holds in
+///    [`IsolatedDestinationAdmissionInput::approved_generations`] — so a caller
+///    cannot present a manifest and an approval that merely agree with each other —
+///    and that row's own activation approval is compared against that row's own
+///    manifest through the crate's existing
+///    [`validate_approval_against_manifest`](crate::approved_generation_registry::validate_approval_against_manifest).
+///    Distinctness is NOT decided here: the destination installation does not
+///    exist yet, so the build it is prepared for legitimately is the currently
+///    approved build of the source's own installation, and check 4 plus the
+///    derived root are what make the destination a distinct installation;
 /// 6. the owner-declared isolated restore area resolves through its retained
 ///    no-follow protected-root lease to exactly the declared root, and the
 ///    destination root derived from it is strictly inside the area and neither
 ///    contains, is contained by, nor equals the source installation root; the
-///    owner's own layout classification additionally requires the source Host
-///    root to BE an installation Host root and requires the area and the derived
-///    leaf NOT to be inside any installation tree, which is the "preexisting
+///    owner's own layout classification, decided against its DECLARED
+///    `installations_root`, additionally requires the source Host root to BE an
+///    installation Host root and requires the area and the derived leaf NOT to be
+///    inside that declared installation contour, which is the "preexisting
 ///    foreign owner" clause decided by the owner rather than by a name;
-/// 7. the destination leaf is OBSERVED absent, so the allocation is new and
-///    distinct rather than a reuse or a delete by name;
+/// 7. the destination leaf is OBSERVED absent by the single no-follow observer
+///    [`observe_destination_leaf`], so the allocation is new and distinct rather
+///    than a reuse or a delete by name;
 /// 8. the owner-issued restoration requirements admit exactly the bound archive
 ///    class, exactly the bound target schema, and no fewer bytes than the owner
 ///    admitted;
@@ -1428,9 +1634,14 @@ pub fn admit_prepared_isolated_destination(
         return Err(IsolatedDestinationRefusal::SourceInstallationDestination.into());
     }
 
-    // 4. An installation this authority already knows is never the destination:
-    //    that covers the ACTIVE installation, every previously approved
-    //    generation, and every destination already admitted as prepared.
+    // 4. The DESTINATION identity is compared against the EXISTING-INSTALLATION
+    //    set and nothing else. That set covers the ACTIVE installation, every
+    //    previously approved generation's installation identity, and every
+    //    destination already admitted as prepared. It is the only comparison that
+    //    decides "already an installation": comparing the APPROVED TARGET with the
+    //    source's own active generation answers a different question, and in the
+    //    production shape both values were the same field of the same record, so it
+    //    refused every destination while proving nothing about it.
     if input
         .known_installations
         .iter()
@@ -1440,57 +1651,88 @@ pub fn admit_prepared_isolated_destination(
     }
 
     // 5. The approved target build/profile is proved BEFORE anything is
-    //    allocated. Both records are owner records -- the approved generation's
-    //    manifest and the activation approval the installation authority issued
-    //    for it -- and they are checked with the crate's own binding validator,
-    //    so an unapproved build or profile cannot reach the allocation step. The
-    //    approval's only constructor is crate-private and its production issuer
-    //    is the signed activation bridge, so no caller can present one.
-    input.approved_target_manifest.validate()?;
-    input.approved_target_approval.validate()?;
+    //    allocated, and it is proved against the AUTHORITY'S OWN APPROVED SET.
+    //    A loose manifest/approval pair would only prove that two caller-presented
+    //    values agree with each other; resolving the target out of the set the
+    //    authority retains proves it is a generation this authority approved. The
+    //    approval is then compared against THAT row's own manifest with the
+    //    crate's existing binding validator, so the row's internal consistency is
+    //    established by the same code that established it when it was committed.
+    //    The approval's only constructor is crate-private and its production
+    //    issuer is the signed activation bridge, so no caller can present one.
+    let approved_target = input
+        .approved_generations
+        .iter()
+        .find(|generation| &generation.manifest.generation == input.approved_target_generation)
+        .ok_or(IsolatedDestinationError::Installation(
+            InstallationError::IncompleteObservation(
+                "the approved target generation is not one this installation authority approves"
+                    .to_owned(),
+            ),
+        ))?;
     crate::approved_generation_registry::validate_approval_against_manifest(
-        input.approved_target_approval,
-        input.approved_target_manifest,
+        &approved_target.approval,
+        &approved_target.manifest,
         "prepared_destination.approved_target",
     )?;
-    let approved_target_build = input.approved_target_manifest.generation.clone();
-    if approved_target_build == *input.source_active_generation
-        && input.approved_target_manifest.runtime_state_roots_digest
-            == input.source_roots.roots_digest
-    {
-        // The approved target IS the source's own active generation over the same
-        // root topology, so materialising a "distinct" installation from it would
-        // not be a new installation at all -- it is the same-installation
-        // restart/rebind contour this issue explicitly excludes.
-        return Err(IsolatedDestinationRefusal::ExistingInstallation.into());
-    }
+    let approved_target_build = approved_target.manifest.generation.clone();
+    // The approved target is NOT compared for inequality against the source's
+    // active generation. A destination installation does not exist yet, so this
+    // authority has no approved generation FOR it: the build a restore is prepared
+    // for is the currently approved build of the installation that owns the
+    // archive, and that legitimately equals the source's active generation. The
+    // DISTINCTNESS of the destination is decided by check 4 — the destination
+    // identity against the existing-installation set — and by the derived root
+    // being a genuinely different object outside the source installation. The
+    // previous form compared `manifest.generation` with the source's active
+    // generation, which in the production caller were the same field of the same
+    // `ApprovedGeneration`, so it was `a == a`: it refused every destination and
+    // proved nothing about the destination.
+    //
+    // What genuinely is checked here is that the target handle named a row this
+    // authority approves, and that the row's own approval binds that row's
+    // manifest — a comparison between the authority's retained records and the
+    // caller's claim, not a field against itself.
 
     // 6. The owner-declared isolated restore area, proved through the retained
     //    no-follow lease the caller already holds, and the destination root
     //    DERIVED from it. I5.13's "restore to isolated root" is therefore a
     //    position inside an owner-declared area, never a supplied name.
     input.source_roots.validate()?;
-    // 5b. The "preexisting foreign owner" clause, decided by the owner against
-    //     its own declared LAYOUT rather than against a name. The source's Host
-    //     root must really BE an installation Host root of this layout -- if it
-    //     is not, the source is a foreign directory and every isolation
-    //     statement derived from its roots is a claim, not a fact. The isolated
-    //     area and the derived destination leaf must NOT classify as any part of
-    //     an installation tree, because a destination that some foreign
-    //     installation already owns is not a new distinct isolated
-    //     installation. Both directions are pure layout classification: they
-    //     observe no filesystem, so existence and reparse freedom stay the
-    //     protected-root lease's proof, composed on top.
-    if !classify_installation_host_root(std::path::Path::new(
-        input.source_roots.host_state_root.as_str(),
-    ))
+    // 5b. The "preexisting foreign owner" clause, decided by the owner against its
+    //     own DECLARED installations root -- the root the owner derives from its
+    //     validated profile anchor -- rather than against a path component NAME.
+    //     The previous form searched for a component spelled `installations` and
+    //     reported `Unowned` for everything else, which made both arms
+    //     unreachable: the owner-declared isolated restore area is a SIBLING of
+    //     `installations`, so every derived leaf was lexically guaranteed
+    //     `Unowned`. Against the declared root, the answer is a property of the
+    //     LAYOUT and the arm can fire.
+    //
+    //     The source's Host root must really BE an installation Host root of that
+    //     declared layout -- if it is not, the source is a foreign directory and
+    //     every isolation statement derived from its roots is a claim, not a fact.
+    //     The isolated area and the derived destination leaf must NOT be inside
+    //     that declared installation contour, because a destination some foreign
+    //     installation already owns is not a new distinct isolated installation.
+    //     The classification is pure layout containment: it observes no
+    //     filesystem, so existence and reparse freedom stay the protected-root
+    //     lease's proof, composed on top.
+    let declared_installations_root = input.source_roots.installations_root()?;
+    if !classify_installation_host_root(
+        std::path::Path::new(input.source_roots.host_state_root.as_str()),
+        &declared_installations_root,
+    )?
     .is_installation_host_root()
     {
         return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
     }
     let declared_area = input.source_roots.isolated_restore_root()?;
     if !matches!(
-        classify_installation_host_root(std::path::Path::new(declared_area.as_str())),
+        classify_installation_host_root(
+            std::path::Path::new(declared_area.as_str()),
+            &declared_installations_root,
+        )?,
         InstallationHostRootClass::Unowned
     ) {
         return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
@@ -1529,12 +1771,15 @@ pub fn admit_prepared_isolated_destination(
     if !(strictly_inside_area && disjoint_from_source) {
         return Err(IsolatedDestinationRefusal::DestinationOverlapsSource.into());
     }
-    // The derived leaf is classified against the SAME owner layout before it is
-    // observed: a destination that resolves inside some installation's own tree
-    // belongs to that installation, whatever this operation intends to write
-    // there.
+    // The derived leaf is classified against the SAME declared installations root
+    // before it is observed: a destination that resolves inside some
+    // installation's own contour belongs to that installation, whatever this
+    // operation intends to write there.
     if !matches!(
-        classify_installation_host_root(std::path::Path::new(&destination_installation_root)),
+        classify_installation_host_root(
+            std::path::Path::new(&destination_installation_root),
+            &declared_installations_root,
+        )?,
         InstallationHostRootClass::Unowned
     ) {
         return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
@@ -1544,7 +1789,15 @@ pub fn admit_prepared_isolated_destination(
     //    rather than inferring it from a name: a leaf that already exists is not
     //    owned by this operation, so it is refused -- never reused, and never
     //    deleted by path name.
-    if std::path::Path::new(&destination_installation_root).exists() {
+    //
+    //    The observation is THE single no-follow observer this module uses, and
+    //    its RESULT is what the evidence records. The previous `Path::exists`
+    //    check is not equivalent: it FOLLOWS a reparse point, so a junction
+    //    planted at the destination name could be resolved through and reported
+    //    absent while the record claimed a non-existent name nobody inspected.
+    let destination_leaf_observation = observe_destination_leaf(&destination_installation_root)
+        .map_err(IsolatedDestinationError::Installation)?;
+    if destination_leaf_observation != DestinationLeafObservation::Absent {
         return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into());
     }
 
@@ -1584,7 +1837,11 @@ pub fn admit_prepared_isolated_destination(
         ));
     }
 
-    let profile_token = match input.approved_target_manifest.runtime_launch.profile {
+    // The profile token is read off the APPROVED TARGET's own launch contour --
+    // the generation this destination is prepared for -- not off the source, so
+    // it changes with the target rather than being a copy of the source's own
+    // value.
+    let profile_token = match approved_target.manifest.runtime_launch.profile {
         super::InstallationProfile::SystemService => "system_service",
         super::InstallationProfile::UserMode => "user_mode",
         super::InstallationProfile::PortableDev => "portable_dev",
@@ -1611,8 +1868,7 @@ pub fn admit_prepared_isolated_destination(
         source_installation_root: source_installation_root.clone(),
         source_host_root: source_host_root.clone(),
         source_active_generation: input.source_active_generation.clone(),
-        destination_observed_absent: true,
-        isolated_area_reparse_free: true,
+        destination_leaf_observation,
         evidence_digest: IsolationEvidence::digest_over_fields(
             &isolation_wire,
             &resolved_area_text,
@@ -1622,8 +1878,7 @@ pub fn admit_prepared_isolated_destination(
             &source_installation_root,
             &source_host_root,
             input.source_active_generation,
-            true,
-            true,
+            destination_leaf_observation,
         )?,
     };
     isolation.validate()?;
@@ -1717,13 +1972,35 @@ pub fn admit_prepared_isolated_destination(
 ///    parent handle is compared with the lease's live area identity -- a second,
 ///    independent measurement of the same fact by the creating code path;
 /// 4. the identity of the object that now carries the destination name is
-///    observed through a fresh reparse-free protected-root lease and RECORDED,
-///    so a later reader can compare the live identity with the recorded one.
+///    observed through a fresh no-follow protected-root lease, compared with the
+///    publication receipt's own `destination_identity`, and RECORDED -- and the
+///    durable store re-observes it again through
+///    [`RedbInstallationRegistry::record_prepared_isolated_destination_creation`]
+///    and
+///    [`RedbInstallationRegistry::read_prepared_isolated_destination_creation`]
+///    before it retains or hands the record back, so a later reader compares the
+///    LIVE identity with the recorded one instead of trusting the row.
 ///
 /// The recorded destination name is never used as the ownership argument: the
 /// record carries an identity, and re-running this function against a name that
 /// a foreign owner now holds is refused at step 1 of
 /// [`OwnedDirectoryPublication::create`] rather than adopted.
+///
+/// # What else is re-proved here
+///
+/// The pre-effect proof also re-derives the destination from the retained lease
+/// AND re-checks the isolation the admission claimed, so the admission-time
+/// geometry is not assumed to still hold:
+///
+/// - the destination root is RE-DERIVED from the lease's live resolution and
+///   compared with the recorded one;
+/// - it is re-proved DISJOINT from the recorded source installation root and from
+///   the recorded source Host root, so a source root moved under the destination
+///   between admission and materialisation is refused before anything is created;
+/// - the leaf is RE-OBSERVED by the single no-follow
+///   [`observe_destination_leaf`] observer, so a junction planted at the admitted
+///   name after admission is SEEN (`Present`) rather than followed, and the fresh
+///   observation must be [`DestinationLeafObservation::Absent`].
 ///
 /// # Errors
 ///
@@ -1760,6 +2037,11 @@ pub fn materialise_prepared_isolated_destination(
     let proved = prove_isolated_destination_root(admission, isolated_area_lease)?;
     let derived_destination_root = proved.destination_root;
     let observed_area_identity = proved.isolated_area_identity;
+    // The fresh no-follow observation, carried out of the pre-effect proof, is
+    // what the materialisation RECORDED. It is the same observer the admission
+    // used and the same value class, so the two records cannot disagree by
+    // construction and neither can claim a boolean nobody observed.
+    let destination_leaf_observation = proved.destination_leaf_observation;
 
     let destination_root_identity = create_and_reprove_isolated_destination_root(
         &derived_destination_root,
@@ -1784,8 +2066,7 @@ pub fn materialise_prepared_isolated_destination(
         &observed_area_identity,
         &derived_destination_root,
         &destination_root_identity,
-        true,
-        true,
+        destination_leaf_observation,
     )?;
     let materialisation = PreparedDestinationMaterialisation {
         wire: materialisation_wire,
@@ -1796,8 +2077,7 @@ pub fn materialise_prepared_isolated_destination(
         isolated_area_identity: observed_area_identity,
         destination_installation_root: derived_destination_root,
         destination_root_identity,
-        destination_reparse_free: true,
-        destination_observed_absent: true,
+        destination_leaf_observation,
         materialisation_digest,
     };
     materialisation.validate()?;
@@ -1817,6 +2097,9 @@ struct ProvedIsolatedDestinationRoot {
     destination_root: String,
     /// Identity the retained lease observed for the isolated area.
     isolated_area_identity: FileIdentity,
+    /// The fresh no-follow observation of the destination leaf, which the
+    /// materialisation records verbatim.
+    destination_leaf_observation: DestinationLeafObservation,
 }
 
 /// Proves which root the admission authorises, before anything is created.
@@ -1861,34 +2144,104 @@ fn prove_isolated_destination_root(
         }
         .into());
     }
+    // The isolation the admission claimed is RE-PROVED here rather than assumed to
+    // still hold. `IsolationEvidence::source_installation_root` and
+    // `IsolationEvidence::source_host_root` exist to be compared, and this is
+    // their consumer: a source root moved under the destination between
+    // admission and materialisation is refused before anything is created,
+    // rather than discovered later as a restore that read its own source.
+    for (recorded_source_root, field) in [
+        (
+            &admission.isolation.source_installation_root,
+            "source_installation_root",
+        ),
+        (&admission.isolation.source_host_root, "source_host_root"),
+    ] {
+        if same_windows_root_text(&derived_destination_root, recorded_source_root)
+            || path_is_within(&derived_destination_root, recorded_source_root)
+            || path_is_within(recorded_source_root, &derived_destination_root)
+        {
+            return Err(IsolatedDestinationRefusal::BoundRecordConflict { field }.into());
+        }
+    }
+    // The derived leaf is classified against the SAME declared layout, resolved
+    // from the source roots the admission recorded, so a destination that a
+    // foreign installation owns at that name is refused here and never adopted.
+    let declared_installations_root = declared_installations_root_for_recorded_source(admission)?;
     if !matches!(
-        classify_installation_host_root(std::path::Path::new(&derived_destination_root)),
+        classify_installation_host_root(
+            std::path::Path::new(&derived_destination_root),
+            &declared_installations_root,
+        )?,
         InstallationHostRootClass::Unowned
     ) {
         return Err(IsolatedDestinationRefusal::ForeignInstallationOwner.into());
     }
 
-    // The owner must observe absence itself, immediately before the create. A
-    // name a caller can predict is not evidence that this operation owns it, so
-    // a leaf that is present -- including a junction, which `symlink_metadata`
-    // reports without following -- is refused, never reused and never removed.
-    match std::fs::symlink_metadata(&derived_destination_root) {
-        Ok(_) => return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(IsolatedDestinationError::Installation(
-                InstallationError::IncompleteObservation(
-                    "the destination leaf could not be observed as absent, so this operation \
-                     cannot claim it owns that name"
-                        .to_owned(),
-                ),
-            ));
-        }
+    // The owner must observe absence itself, immediately before the create, with
+    // THE single no-follow observer -- the same one the admission used. A name a
+    // caller can predict is not evidence that this operation owns it, so a leaf
+    // that is present -- including a junction, which `symlink_metadata` reports
+    // without following -- is refused, never reused and never removed.
+    let destination_leaf_observation = observe_destination_leaf(&derived_destination_root)
+        .map_err(IsolatedDestinationError::Installation)?;
+    // The fresh observation is compared with the value the admission RECORDED, so
+    // the recorded evidence is what the reader re-checks rather than a constant.
+    // Both values must be `Absent`: `Absent` is the only observation that makes
+    // this a new distinct allocation rather than a reuse of somebody else's name,
+    // and a leaf that appeared between admission and materialisation is exactly
+    // that case.
+    if destination_leaf_observation != admission.isolation.destination_leaf_observation
+        || destination_leaf_observation != DestinationLeafObservation::Absent
+    {
+        return Err(IsolatedDestinationRefusal::DestinationNotAbsent.into());
     }
 
     Ok(ProvedIsolatedDestinationRoot {
         destination_root: derived_destination_root,
         isolated_area_identity: observed_area_identity,
+        destination_leaf_observation,
+    })
+}
+
+/// Re-derives the owner-declared `installations_root` from the source roots the
+/// admission recorded, so the materialise-time layout classification is decided
+/// against the SAME declared root the admission used rather than a value the
+/// caller supplies again.
+///
+/// The admission does not serialize the whole `RuntimeStateRoots` — only the two
+/// source paths it compares against — so this derives the shared installation
+/// area from the recorded source installation root itself: the owner-declared
+/// layout is `<installations_root>\<installation key>`, so the parent of a
+/// validated installation root IS the declared installations root. That keeps the
+/// derivation in the installation authority, out of the durable record, and out
+/// of the caller's hands.
+///
+/// # Errors
+///
+/// [`InstallationError::IncompleteObservation`] when the recorded source
+/// installation root is not a well-formed Windows root, which means the
+/// admission cannot be re-classified and therefore must not be materialised.
+fn declared_installations_root_for_recorded_source(
+    admission: &PreparedDestinationAdmission,
+) -> Result<PlatformHandle, IsolatedDestinationError> {
+    let recorded = admission.isolation.source_installation_root.clone();
+    let parent = std::path::Path::new(recorded.as_str())
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|parent| !parent.is_empty())
+        .ok_or_else(|| {
+            IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+                "the recorded source installation root has no parent, so the declared \
+                 installations root cannot be re-derived"
+                    .to_owned(),
+            ))
+        })?;
+    PlatformHandle::new(parent).map_err(|error| {
+        IsolatedDestinationError::Installation(InstallationError::InvalidField {
+            field: "prepared_destination.isolation.source_installation_root".to_owned(),
+            reason: error.to_string(),
+        })
     })
 }
 
@@ -1975,15 +2328,16 @@ fn create_and_reprove_isolated_destination_root(
     // protected-root contour, the same no-follow pin -- and its identity is what
     // gets recorded. A junction swapped in immediately after the move is
     // refused here rather than adopted.
-    let created_lease =
-        ProtectedRootLease::open_existing(std::path::Path::new(derived_destination_root))
-            .map_err(|_| {
-                IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
+    let created_lease = ProtectedRootLease::open_existing(std::path::Path::new(
+        derived_destination_root,
+    ))
+    .map_err(|_| {
+        IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
         "the created isolated destination could not be re-proved through a protected-root lease, \
          so its ownership is not established"
             .to_owned(),
     ))
-            })?;
+    })?;
     created_lease.verify_stable_identity().map_err(|_| {
         IsolatedDestinationError::Installation(InstallationError::IncompleteObservation(
             "the created isolated destination root did not keep its retained identity".to_owned(),
@@ -2032,4 +2386,199 @@ fn path_is_within(candidate: &str, ancestor: &str) -> bool {
 /// Separator-aware equality over already-resolved Windows paths.
 fn same_windows_root_text(left: &str, right: &str) -> bool {
     left.replace('/', "\\").to_lowercase() == right.replace('/', "\\").to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    // A test asserts with `assert!`/`assert_eq!` rather than `expect`, so a
+    // fixture fault reports as a failure with its own message instead of a
+    // panic from a helper. The workspace lint denies `expect_used` outside
+    // tests, and this module keeps the same rule inside them.
+    #![allow(
+        clippy::expect_used,
+        reason = "tests assert deliberately and name the fixture fault they rule out"
+    )]
+
+    use super::{
+        DestinationLeafObservation, IsolatedDestinationError, IsolatedDestinationRefusal,
+        PreparedDestinationMaterialisation,
+    };
+    use crate::{FileIdentity, InstallationError, PlatformHandle};
+
+    /// A syntactically valid identity, so a refusal under test is the
+    /// OBSERVATION arm and never a zero-identity arm.
+    fn observed_identity(volume_serial_number: u32, file_index: u64) -> FileIdentity {
+        FileIdentity {
+            volume_serial_number,
+            file_index,
+        }
+    }
+
+    /// A fixed-shape lowercase hex handle. The test never depends on WHICH
+    /// value it is, only that the record under test is well formed.
+    fn handle(value: &str) -> PlatformHandle {
+        let mut padded = value.to_owned();
+        padded.push_str(&"0".repeat(64usize.saturating_sub(value.len())));
+        PlatformHandle::new(padded).expect("a 64-character handle is well formed")
+    }
+
+    /// One internally consistent materialisation, so only the recorded
+    /// OBSERVATION varies between cases and every other arm is satisfied.
+    ///
+    /// The recorded paths are never read: `validate` checks their SHAPE, and
+    /// the filesystem comparison this record exists for happens in the
+    /// registry seams that hold a live lease, not here.
+    fn consistent_materialisation(
+        observation: DestinationLeafObservation,
+    ) -> Result<PreparedDestinationMaterialisation, IsolatedDestinationError> {
+        // The wire discriminator is the one value `validate` compares against a
+        // constant, so the fixture uses the real one and varies nothing else.
+        let wire =
+            PlatformHandle::new(PreparedDestinationMaterialisation::WIRE).map_err(|error| {
+                IsolatedDestinationError::Installation(InstallationError::InvalidField {
+                    field: "prepared_destination.materialisation.wire".to_owned(),
+                    reason: error.to_string(),
+                })
+            })?;
+        let operation_id = handle("1111");
+        let destination_installation = handle("2222");
+        let admission_digest = handle("3333");
+        let isolated_area_root = r"C:\ProgramData\Eliot\installations-isolated".to_owned();
+        let isolated_area_identity = observed_identity(7, 11);
+        let destination_root = r"C:\ProgramData\Eliot\installations-isolated\a1b2c3".to_owned();
+        let destination_root_identity = observed_identity(7, 13);
+        let materialisation_digest = PreparedDestinationMaterialisation::computed_digest_for_test(
+            &wire,
+            &operation_id,
+            &destination_installation,
+            &admission_digest,
+            &isolated_area_root,
+            &isolated_area_identity,
+            &destination_root,
+            &destination_root_identity,
+            observation,
+        )?;
+        Ok(PreparedDestinationMaterialisation {
+            wire,
+            operation_id,
+            destination_installation,
+            admission_digest,
+            isolated_area_root,
+            isolated_area_identity,
+            destination_installation_root: destination_root,
+            destination_root_identity,
+            destination_leaf_observation: observation,
+            materialisation_digest,
+        })
+    }
+
+    /// The refusal class is reachable at all: without a NON-absent observation
+    /// there is nothing for [`IsolatedDestinationRefusal::DestinationNotAbsent`]
+    /// to fire on in a materialisation, which is the state a literal `true` left
+    /// the record in.
+    #[test]
+    fn materialisation_refuses_a_present_leaf_with_the_refusal_class() {
+        let record = consistent_materialisation(DestinationLeafObservation::Present)
+            .expect("the fixture itself is internally consistent");
+        assert!(
+            matches!(
+                record.validate(),
+                Err(IsolatedDestinationError::Refused(
+                    IsolatedDestinationRefusal::DestinationNotAbsent
+                ))
+            ),
+            "a present leaf is a refusal class, not an installation fault"
+        );
+    }
+
+    /// A record whose ONLY fault is the recorded leaf observation is accepted
+    /// when it is `Absent` and refused for every other value.
+    ///
+    /// This is exactly the arms a `bool` could never reach: `Present` and
+    /// `Unobserved` are distinct recorded values, each of which `validate` must
+    /// refuse. A construction that could only ever write `true` had nothing to
+    /// refuse here, so the check proved nothing about the row.
+    #[test]
+    fn materialisation_accepts_only_the_observed_absent_leaf() {
+        let absent = consistent_materialisation(DestinationLeafObservation::Absent)
+            .expect("an absent observation is a creation receipt");
+        assert!(
+            absent.validate().is_ok(),
+            "an Absent observation with a matching digest is a valid creation receipt"
+        );
+        for refused in [
+            DestinationLeafObservation::Present,
+            DestinationLeafObservation::Unobserved,
+        ] {
+            let record = consistent_materialisation(refused)
+                .expect("the fixture itself is internally consistent");
+            assert_eq!(
+                record.validate(),
+                Err(IsolatedDestinationRefusal::DestinationNotAbsent.into()),
+                "{refused:?} must be refused as a destination leaf that is not an absent new name"
+            );
+        }
+    }
+
+    /// Every observation is INSIDE the digest, so a record whose content no
+    /// longer matches its recorded digest is refused ON THE DIGEST rather than
+    /// accepted because the field that happened to be edited has no semantic
+    /// arm of its own.
+    ///
+    /// The edited field is the isolated area ROOT, deliberately: the
+    /// observation has its own earlier arm, so editing the observation would be
+    /// refused for the reason this test is not about. Editing a field with no
+    /// semantic arm leaves the digest as the only possible detector, which is
+    /// precisely the claim under test.
+    #[test]
+    fn materialisation_digest_binds_the_recorded_content() {
+        let mut edited = consistent_materialisation(DestinationLeafObservation::Absent)
+            .expect("the fixture itself is internally consistent");
+        edited.isolated_area_root.push_str("\\swapped");
+        match edited.validate() {
+            Err(IsolatedDestinationError::Installation(InstallationError::InvalidField {
+                field,
+                ..
+            })) => assert_eq!(
+                field, "prepared_destination.materialisation.materialisation_digest",
+                "the digest is the only thing that can detect this edit"
+            ),
+            other => panic!("the digest must be the refusal: {other:?}"),
+        }
+    }
+
+    /// An observation edited behind the record's back is caught by its OWN arm
+    /// and never reaches a digest comparison.
+    #[test]
+    fn edited_observation_is_refused_by_its_own_arm() {
+        let mut edited = consistent_materialisation(DestinationLeafObservation::Absent)
+            .expect("the fixture itself is internally consistent");
+        edited.destination_leaf_observation = DestinationLeafObservation::Present;
+        assert_eq!(
+            edited.validate(),
+            Err(IsolatedDestinationRefusal::DestinationNotAbsent.into())
+        );
+    }
+
+    /// Every non-`Absent` observation is distinguishable on the wire, so a
+    /// recorded value cannot be silently read back as another one.
+    #[test]
+    fn leaf_observation_wire_values_are_distinct() {
+        let rendered = [
+            DestinationLeafObservation::Absent,
+            DestinationLeafObservation::Present,
+            DestinationLeafObservation::Unobserved,
+        ]
+        .map(DestinationLeafObservation::as_str);
+        assert_eq!(rendered, ["ABSENT", "PRESENT", "UNOBSERVED"]);
+        for observation in [
+            DestinationLeafObservation::Absent,
+            DestinationLeafObservation::Present,
+            DestinationLeafObservation::Unobserved,
+        ] {
+            let encoded = serde_json::to_string(&observation)
+                .expect("the observation serializes as a unit variant");
+            assert_eq!(encoded, format!("\"{}\"", observation.as_str()));
+        }
+    }
 }

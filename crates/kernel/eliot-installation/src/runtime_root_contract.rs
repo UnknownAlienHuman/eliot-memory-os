@@ -435,6 +435,45 @@ impl RuntimeStateRoots {
         }
     }
 
+    /// Derives the exact owner-declared root that contains EVERY installation
+    /// of this profile (`<profile_root>\installations`).
+    ///
+    /// This is the owner's own declaration of where installations live, derived
+    /// from the same already-validated profile anchor as every other declared
+    /// root. It exists because "is this path inside an installation contour?"
+    /// can only be answered against a DECLARED root: a path-shape guess (a
+    /// component that happens to be spelled `installations`) is decided by a
+    /// name, not by this installation owner's layout, and answers a different
+    /// question than the one a caller is asking.
+    ///
+    /// Derived, not serialized, exactly like [`Self::isolated_restore_root`] and
+    /// [`Self::canary_evidence_root`]: it adds no field to the digest-bound
+    /// topology, re-keys no committed installation and is not a second
+    /// independently asserted authority. [`Self::installer_root_hierarchy`] is
+    /// its single consumer, so the hierarchy and every reader agree on one
+    /// derived value.
+    ///
+    /// `portable_dev` is refused for the same reason
+    /// [`Self::isolated_restore_root`] refuses it: a portable contour retains
+    /// no shared installation area, so there is no declared root to answer an
+    /// installation-contour question against.
+    pub fn installations_root(&self) -> Result<PlatformHandle, InstallationError> {
+        if self.profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev declares no shared installations root, so it cannot classify a path \
+                 against an installation contour"
+                    .to_owned(),
+            ));
+        }
+        let profile_root = self.installer_profile_root()?;
+        PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations")).map_err(
+            |error| InstallationError::InvalidField {
+                field: "runtime_state_roots.installations_root".to_owned(),
+                reason: error.to_string(),
+            },
+        )
+    }
+
     pub(super) fn expected_staging_root(
         &self,
     ) -> Result<Option<PlatformHandle>, InstallationError> {
@@ -530,12 +569,7 @@ impl RuntimeStateRoots {
                     "profiled roots require a deterministic packages root".to_owned(),
                 )
             })?;
-            let installations_root =
-                PlatformHandle::new(joined_windows_path(profile_root.as_str(), "installations"))
-                    .map_err(|error| InstallationError::InvalidField {
-                        field: "runtime_state_roots.installations_root".to_owned(),
-                        reason: error.to_string(),
-                    })?;
+            let installations_root = self.installations_root()?;
             hierarchy.push(("profile_root", profile_root));
             hierarchy.push(("packages_root", packages_root));
             hierarchy.push(("installations_root", installations_root));
