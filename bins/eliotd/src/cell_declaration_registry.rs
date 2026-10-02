@@ -603,6 +603,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_contract_end_marker_is_malformed_contract() {
+        // Arm: the GENERATED block's end marker is gone, so the contract
+        // projection has no lower bound and the guard fails closed instead of
+        // reading a truncated declaration set as complete.
+        let unterminated = replace_once(
+            CONTRACT_TEXT,
+            "# END GENERATED declared_functional_cell",
+            "# block end marker removed",
+        );
+
+        let Err(error) = parse_contract(&unterminated) else {
+            panic!("a contract without the generated end marker must not parse");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::MalformedContract {
+                detail: "generated block end marker is missing".to_owned(),
+            },
+            "the typed refusal must name the missing generated-block end marker"
+        );
+    }
+
+    #[test]
     fn missing_declaration_section_is_malformed_manifest() {
         // Arm: `MANIFEST_SECTION` is absent, so `manifest_section` cannot find
         // the declaration at all and the guard fails closed on the manifest
