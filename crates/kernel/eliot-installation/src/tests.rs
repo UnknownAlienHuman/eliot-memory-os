@@ -1287,7 +1287,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
 }
 
 fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
-    let principal_sid = "S-1-5-80-1-2-3-4-5";
+    let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
     let receipt = InstallerServiceControlGrantReceipt {
         principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
         principal_sid: test_handle(principal_sid),
@@ -1307,12 +1307,12 @@ fn test_watchdog_control_grant() -> InstallerServiceControlGrantReceipt {
 // DACL shape (principal Host SID, Host mask
 // `ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK`, Host policy digest computed by
 // the real platform Host digest authority
-// `host_service_security_descriptor_digest` for a distinct valid Host SID),
+// `host_service_security_descriptor_digest` for the canonical Host SID),
 // so the Host proof round-trips through the same marker/evidence/approval
 // gates as the Watchdog proof without canned digests. The Watchdog fixture
 // above stays on the Watchdog mask/digest (byte-identical behavior).
 fn test_host_service_control_grant() -> InstallerServiceControlGrantReceipt {
-    let principal_sid = "S-1-5-80-9-8-7-6-5";
+    let principal_sid = eliot_platform_windows::ELIOT_HOST_SERVICE_SID;
     let receipt = InstallerServiceControlGrantReceipt {
         principal_service: test_handle(ELIOT_HOST_SERVICE_NAME),
         principal_sid: test_handle(principal_sid),
@@ -6433,6 +6433,20 @@ fn service_registration_projection_is_durable_and_exact() {
     ] {
         assert!(substituted.validate().is_err());
     }
+
+    let mut host_with_watchdog_grant = approvals[0].clone();
+    host_with_watchdog_grant.service_control_grant = Some(watchdog_grant.clone());
+    assert!(host_with_watchdog_grant.validate().is_err());
+    let mut watchdog_with_host_grant = approvals[1].clone();
+    watchdog_with_host_grant.service_control_grant = Some(host_grant.clone());
+    assert!(watchdog_with_host_grant.validate().is_err());
+    let alternate_valid_sid = "S-1-5-80-6-7-8-9-10";
+    let mut alternate_sid_grant = watchdog_grant.clone();
+    alternate_sid_grant.principal_sid = test_handle(alternate_valid_sid);
+    alternate_sid_grant.security_descriptor_digest = test_handle(must(
+        watchdog_service_security_descriptor_digest(alternate_valid_sid),
+    ));
+    assert!(alternate_sid_grant.validate().is_err());
 
     let transaction_store = SharedStore::default();
     *transaction_store

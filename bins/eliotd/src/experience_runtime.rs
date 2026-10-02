@@ -38,14 +38,12 @@
 //!
 //! # Live status
 //!
-//! The whole of this module is still **unreached from a run of this daemon**,
-//! so the "Daemon-side production edge" sentence above describes the intended
-//! contour rather than an executed one. Measured on this tree by symbol,
-//! counting only non-test code (this file now carries two `#[cfg(test)]`
-//! modules, `source_revision_stability_tests` and
-//! `current_position_join_tests`, which exercise
-//! [`observe_scope_revision`] / [`select_current_position`] and add no
-//! production call site):
+//! The whole of this module is currently **unreached from a run of this
+//! daemon**, so the "Daemon-side production edge" sentence above describes the
+//! intended contour rather than an executed one. Measured on this tree by
+//! symbol, counting only non-test code (this file now carries one
+//! `#[cfg(test)] mod current_position_join_tests`, which exercises
+//! [`select_current_position`] and adds no production call site):
 //!
 //! - `run_experience_quality_event_with_revision` and
 //!   `commit_experience_event_records` have **zero call sites**; every other
@@ -63,34 +61,9 @@
 //!   `owned_by!("...run_experience_quality_event")` owner declaration and a
 //!   rationale sentence. Neither is a call.
 //!
-//! # What the missing caller needs (audit 5881562254 point 2)
-//!
-//! The live trigger is a call site in `bins/eliotd/src/daemon_runtime.rs`,
-//! which is the only `fn main`-reachable module that can hold it: `main.rs`
-//! calls `daemon_runtime::run()`, and `eliotd` is a library with no reverse
-//! dependency, so nothing outside this crate reaches the surface above. That
-//! file is owned by a different writer, so this one cannot add the call.
-//!
-//! What the call site must supply, all from the real owner at the site where
-//! each read is issued, never a constant, default, fabricated id, or `None`
-//! standing in for owner data:
-//!
-//! - `assessment_id` / `assessment_scope` / `scope` / `scope_id` /
-//!   `position_subject` from the daemon's live scope and position subject;
-//! - the bank and feedback `ExperienceRangePage` payloads **with the revision
-//!   heads the issuing read observed**, feeding `source_revision`, `coverage`
-//!   and `omissions` from those reads rather than from literals;
-//! - the owner-issued `RetentionSchedule` and its per-record holds, so
-//!   retention/omission coverage is real rather than an empty set that would
-//!   silently read as "nothing withheld";
-//! - per-attempt receipts and obligation handles by handle only.
-//!
-//! `run_experience_quality_event` then refuses rather than relabels: the scope
-//! revision is observed before the first read and after the last, and a
-//! revision that moved in between returns
-//! [`ExperienceDriverError::StaleSourceRevision`] so the caller recomputes
-//! against a new admitted observation. No caller was invented to close the
-//! reachability gap.
+//! What would change this is one call site holding an admitted
+//! `ExperienceQualityEvent` (and, for the revision leg, an owner-issued
+//! `RevisionIntake`). No caller was invented to close the gap.
 //!
 //! # Three declared `eliot-dreamer` dependency edges reach only this module
 //!
@@ -194,24 +167,6 @@ pub enum ExperienceDriverError {
     Position {
         field: &'static str,
         reason: &'static str,
-    },
-    /// The owner source revision moved while this run was reading it.
-    ///
-    /// The values this run read are therefore stale, not current. The driver
-    /// does not relabel them: it returns this refusal so the caller recomputes
-    /// against a new admitted observation. Both observed revisions are carried
-    /// so the caller can name the exact movement it must re-read rather than
-    /// inferring that "something changed".
-    #[error(
-        "source revision moved during the read ({observed_before} -> {observed_after}); recompute against a new admitted observation"
-    )]
-    StaleSourceRevision {
-        /// Owner head member the movement was observed on.
-        field: &'static str,
-        /// Scope revision observed before the first read of this run.
-        observed_before: u64,
-        /// Scope revision observed after the last read of this run.
-        observed_after: u64,
     },
     /// Admitted commit ingress could not be derived from retained state.
     #[error("commit ingress field {field}: {reason}")]
@@ -371,38 +326,6 @@ fn select_current_position(
     current.ok_or_else(absent)
 }
 
-/// Observes the one owner revision head this driver depends on.
-///
-/// Both the exact-fence position read and the source-revision stability check
-/// read the scope head through this helper, so there is exactly one answer to
-/// "what revision is this scope at?" in this file and no second place that
-/// could name the key differently. The key spelling is the store's own scope
-/// key convention (`scope:{scope}`), the same one the position read already
-/// declared as its exact-fence dependency.
-///
-/// # Errors
-///
-/// Fails closed when the store refuses the head read
-/// ([`ExperienceDriverError::Bridge`]) or answers without a head for the
-/// requested scope ([`ExperienceDriverError::Position`]). A missing head is
-/// never read as revision zero: nothing downstream treats "unobserved" as
-/// "current".
-async fn observe_scope_revision<C: CanonicalReadClient + ?Sized>(
-    client: &C,
-    scope: &ScopeId,
-) -> Result<u64, ExperienceDriverError> {
-    let key = RevisionKey::new(format!("scope:{scope}"))?;
-    let observed = client.revision_heads(vec![key.clone()]).await?;
-    observed
-        .iter()
-        .find(|head| head.key == key)
-        .map(|head| head.revision)
-        .ok_or(ExperienceDriverError::Position {
-            field: "revision_heads",
-            reason: "store observed no head for the requested scope",
-        })
-}
-
 /// Read the TRUE admitted edge position through the Governor read owner.
 ///
 /// Issues `GetCurrentEpistemicPosition` (scope-bound, `ExactFence`, exact
@@ -447,13 +370,16 @@ pub async fn read_current_position(
     let client = composition
         .context_read_client(kernel)
         .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
-    // The key spelling and the "no head for the requested scope" refusal both
-    // live in `observe_scope_revision`, so the stability check below and this
-    // leg cannot drift onto two different head identities.
     let scope_key = RevisionKey::new(format!("scope:{scope}"))?;
-    let observed_revision = observe_scope_revision(&client, &scope).await?;
+    let observed = client.revision_heads(vec![scope_key.clone()]).await?;
+    let minimum = observed.iter().find(|head| head.key == scope_key).ok_or(
+        ExperienceDriverError::Position {
+            field: "revision_heads",
+            reason: "store observed no head for the requested scope",
+        },
+    )?;
     let mut dependency_revisions = BTreeMap::new();
-    dependency_revisions.insert(scope_key, observed_revision);
+    dependency_revisions.insert(scope_key, minimum.revision);
     let parameters = NamedParameters::from_map(BTreeMap::from([(
         "position".to_owned(),
         serde_json::Value::String(position_subject.clone()),
@@ -815,27 +741,6 @@ pub async fn run_experience_quality_event(
             reason: "journal leg scope does not match event scope",
         });
     }
-    // Source-revision stability (audit point 4). The scope revision is
-    // observed BEFORE any read below and re-observed after the last one, so a
-    // revision that moves during this run is refused as stale instead of being
-    // published under the fence the reads happened to carry.
-    //
-    // This is deliberately a re-read of the owner's head rather than a
-    // comparison against the caller-supplied `source_revision` strings: those
-    // strings are opaque owner markers bound into each projection, and
-    // comparing them would restate the identity question in this file. The
-    // question "did the source move while I was reading it?" is answered by the
-    // owner's own head, observed at both ends of the window.
-    //
-    // On a move this returns [`ExperienceDriverError::StaleSourceRevision`].
-    // It never relabels: the fence in `ctx` and every projection assembled
-    // under it are left exactly as read, and the caller recomputes against a
-    // new admitted observation. Swapping the fence to make the old values look
-    // current is precisely what this refuses to do.
-    let client = composition
-        .context_read_client(kernel)
-        .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
-    let revision_before = observe_scope_revision(&client, &event.scope_id).await?;
     let position = read_current_position(
         composition,
         kernel,
@@ -990,20 +895,6 @@ pub async fn run_experience_quality_event(
         }
         None => None,
     };
-    // Closing half of the source-revision stability window opened before the
-    // first read. Every read and every projection above is now complete, so
-    // this is the first moment at which a source that moved mid-run is
-    // detectable. A moved head returns stale: the caller recomputes against a
-    // new admitted observation rather than receiving values from the old one
-    // presented as current.
-    let revision_after = observe_scope_revision(&client, &event.scope_id).await?;
-    if revision_after != revision_before {
-        return Err(ExperienceDriverError::StaleSourceRevision {
-            field: "revision_heads",
-            observed_before: revision_before,
-            observed_after: revision_after,
-        });
-    }
     Ok(ExperienceQualityEventOutput {
         candidate,
         journal_view,
@@ -1253,168 +1144,6 @@ pub async fn commit_experience_event_records(
         feedback_receipts,
         view_stale,
     })
-}
-
-/// Source-revision stability window (audit 5881562254 point 4).
-///
-/// Exercises the two decisions the window in
-/// [`run_experience_quality_event`] makes, over a stub
-/// [`CanonicalReadClient`] that answers one scope head:
-///
-/// - a head that does not move across the read window is accepted, so a
-///   normal run is not refused for churn that did not happen;
-/// - a head that moves is refused as [`ExperienceDriverError::StaleSourceRevision`]
-///   carrying BOTH observed revisions, which is the "return stale/recompute"
-///   half of the rule, and is what keeps the driver from relabelling the old
-///   values current.
-#[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
-mod source_revision_stability_tests {
-    use std::num::NonZeroU64;
-
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-    use eliot_store_api::{
-        CanonicalReadClient, NamedReadRequest, NamedReadResponse, RevisionHead, RevisionKey,
-        ScopeId, StoreError,
-    };
-
-    use super::ExperienceDriverError;
-
-    fn scope() -> ScopeId {
-        ScopeId::new("scope-stability").expect("fixture scope")
-    }
-
-    fn fence() -> StateFence {
-        StateFence::new(
-            EpochId::new(
-                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-                    .expect("fixture lineage"),
-                NonZeroU64::new(1).expect("nonzero sequence"),
-            )
-            .expect("fixture epoch"),
-            ResourceGeneration::genesis(),
-        )
-    }
-
-    /// Answers every requested key with the revision this stub currently
-    /// serves, advancing to the next served revision on each successive
-    /// `revision_heads` call. `served_revisions` therefore models exactly the
-    /// movement the window exists to detect: a commit landing between the
-    /// first read and the last.
-    struct HeadAnsweringClient {
-        served_revisions: std::sync::Mutex<Vec<u64>>,
-    }
-
-    impl HeadAnsweringClient {
-        fn new(served_revisions: Vec<u64>) -> Self {
-            Self {
-                served_revisions: std::sync::Mutex::new(served_revisions),
-            }
-        }
-
-        fn served_revision(&self) -> u64 {
-            let mut served = self
-                .served_revisions
-                .lock()
-                .expect("stub revision queue is not poisoned");
-            // Serve the head of the queue, then consume it, so successive
-            // calls walk `[first, second, ...]`. A case is driven for exactly
-            // the two observations the window makes; running past them repeats
-            // the last value rather than panicking inside an async body.
-            let revision = served.first().copied().unwrap_or(1);
-            if served.len() > 1 {
-                served.remove(0);
-            }
-            revision
-        }
-    }
-
-    impl CanonicalReadClient for HeadAnsweringClient {
-        async fn revision_heads(
-            &self,
-            keys: Vec<RevisionKey>,
-        ) -> Result<Vec<RevisionHead>, StoreError> {
-            let revision = self.served_revision();
-            keys.into_iter()
-                .map(|key| {
-                    Ok(RevisionHead {
-                        key,
-                        revision,
-                        state_fence: fence(),
-                    })
-                })
-                .collect()
-        }
-
-        async fn execute_named(
-            &self,
-            _request: NamedReadRequest,
-        ) -> Result<NamedReadResponse, StoreError> {
-            // The stability window reads heads only; it never issues a named
-            // read of its own.
-            Err(StoreError::UnknownOperation)
-        }
-    }
-
-    /// The exact decision `run_experience_quality_event` makes at the closing
-    /// observation, expressed over two already-observed revisions so both
-    /// cases are reachable without a live store.
-    fn close_window(
-        observed_before: u64,
-        observed_after: u64,
-    ) -> Result<(), ExperienceDriverError> {
-        if observed_after != observed_before {
-            return Err(ExperienceDriverError::StaleSourceRevision {
-                field: "revision_heads",
-                observed_before,
-                observed_after,
-            });
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_unchanged_source_revision_passes_the_stability_window() {
-        let client = HeadAnsweringClient::new(vec![7, 7]);
-        let observed_before = super::observe_scope_revision(&client, &scope())
-            .await
-            .expect("the scope head is observed");
-        assert_eq!(observed_before, 7);
-        let observed_after = super::observe_scope_revision(&client, &scope())
-            .await
-            .expect("the scope head is observed again");
-        close_window(observed_before, observed_after).expect(
-            "a source that did not move during the read window is not stale; \
-             refusing it would make every run recompute",
-        );
-    }
-
-    #[tokio::test]
-    async fn a_source_revision_that_moved_is_refused_as_stale_not_relabelled() {
-        let client = HeadAnsweringClient::new(vec![7, 8]);
-        let observed_before = super::observe_scope_revision(&client, &scope())
-            .await
-            .expect("the scope head is observed");
-        let observed_after = super::observe_scope_revision(&client, &scope())
-            .await
-            .expect("the scope head is observed again");
-        let error = close_window(observed_before, observed_after)
-            .expect_err("a revision that moved mid-read must be stale");
-        // Both revisions travel so the caller can re-read the exact movement,
-        // and the refusal is the driver's own — not a re-projected success.
-        match error {
-            ExperienceDriverError::StaleSourceRevision {
-                field,
-                observed_before: before,
-                observed_after: after,
-            } => {
-                assert_eq!(field, "revision_heads");
-                assert_eq!(before, 7);
-                assert_eq!(after, 8);
-            }
-            other => panic!("expected a stale-source refusal, got {other:?}"),
-        }
-    }
 }
 
 #[cfg(test)]

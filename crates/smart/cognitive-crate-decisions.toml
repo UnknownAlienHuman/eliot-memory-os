@@ -800,7 +800,7 @@ infers_use = false
 # The asymmetry carried over from r11 still holds and is worth reading before the
 # table: every one of these four families has a MEASURED first consumer, unlike
 # the memory-selection family at r11 which had none. But two of them also carry a
-# measured SCOPE gap -- r13 freezes one slice of a much larger crate -- and that
+# measured SCOPE gap -- r12 freezes one slice of a much larger crate -- and that
 # is recorded per row rather than left for a reader to discover.
 # ---------------------------------------------------------------------------
 
@@ -810,7 +810,7 @@ family = "eliot-observation-governor-classification"
 owning_crate = "eliot-observation"
 functional_cell = "governor.observation.admission"
 existing_decision_reference = "this file's order 1 eliot-observation IS the owning cell for this family, and this is the only one of the four r12 families that is assigned in this 1-43 decision set. Its manifest is classifier.module.toml, not module.toml, and it carries status = PROTOTYPE with workspace_admission recorded as forbidden pending implementation, package proof, edge proof, a current-main rebase and integration-owner review."
-field_contract_state = "FROZEN_EXACT at 11 of 11 frozen types as of freeze r13, with a resolving validator anchor on every row and a typed GovernorObservationError variant on every field"
+field_contract_state = "FROZEN_EXACT at 11 of 11 frozen types as of freeze r12, with a resolving validator anchor on every row and a typed GovernorObservationError variant on every field"
 first_consumer = "eliot-governor, and independently eliot-cue-binding"
 first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
 first_consumer_note = "crates/governor/eliot-governor/src/observation_reconciliation.rs drives ObservationJournal::admit; crates/smart/eliot-cue-binding/src/derive.rs reads ObservationAdmissionReceipt and branches on candidate_disposition == CandidateDisposition::TaskBound at line 692. Both located by git grep on the r12 base commit."
@@ -825,7 +825,7 @@ family = "eliot-dreamer-contracts-self-query-source"
 owning_crate = "eliot-dreamer-contracts"
 functional_cell = "smart.dreamer.contracts"
 existing_decision_reference = "this file's order 3 eliot-dreamer-contracts is the owner of the WHOLE Dreamer contract hub; r12 freezes one job family inside it and does not re-decide the cell"
-field_contract_state = "FROZEN_EXACT at 6 source-closure members plus 1 REFERENCED_NOT_FROZEN status enum as of freeze r13. PARTIAL BY SCOPE, and the number is stated so it cannot be read as whole-crate coverage: the crate declares roughly 387 public struct/enum declarations and the remaining families are named as out of scope in the freeze coverage_accounting row."
+field_contract_state = "FROZEN_EXACT at 6 source-closure members plus 1 REFERENCED_NOT_FROZEN status enum as of freeze r12. PARTIAL BY SCOPE, and the number is stated so it cannot be read as whole-crate coverage: the crate declares roughly 387 public struct/enum declarations and the remaining families are named as out of scope in the freeze coverage_accounting row."
 first_consumer = "eliot-dreamer-self-query, and independently eliot-understanding-assessment"
 first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
 first_consumer_note = "crates/smart/eliot-dreamer-self-query/src/lib.rs takes AcceptedSourceProjection by reference at lines 171, 209 and 257; crates/smart/eliot-understanding-assessment/src/lib.rs names both types. Both located by git grep."
@@ -839,15 +839,15 @@ issue = 261
 family = "eliot-context-contracts-binding-view-omission"
 owning_crate = "eliot-context-contracts"
 functional_cell = "smart.context.contracts"
-existing_decision_reference = "this file's order 15 eliot-context-contracts is the owner of the whole context contract hub; r13 freezes the canonical binding, view and omission types inside it"
-field_contract_state = "FROZEN_EXACT at 4 types plus 1 REFERENCED_NOT_FROZEN role enum as of freeze r13. PARTIAL BY SCOPE: the crate declares 191 public declarations and the reactive path is excluded by the crate's own pre-existing note."
+existing_decision_reference = "this file's order 15 eliot-context-contracts is the owner of the whole context contract hub; r12 freezes the canonical binding, view and omission types inside it"
+field_contract_state = "FROZEN_EXACT at 4 types plus 1 REFERENCED_NOT_FROZEN role enum as of freeze r12. PARTIAL BY SCOPE: the crate declares 191 public declarations and the reactive path is excluded by the crate's own pre-existing note."
 first_consumer = "eliotd, and independently eliot-context-assembly"
 first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
 first_consumer_note = "crates/smart/eliot-context-assembly/src/assemble.rs drives assemble_active_view and independently re-derives canonical_output_digest at measurement.rs line 151; bins/eliotd/src/experience_runtime.rs imports ActiveUnderstandingView directly. Both located by git grep."
-owning_task_for_the_gap = "CLOSED at freeze r13: the DIS-CTX-VIEW-EXECUTION-POLICY summary-list drift was repaired in the ordered repin, where the [[frozen_type]].fields row for ActiveUnderstandingView went from nine to all eleven (execution and policy_sha256 added). Remaining gap in this row: this cell's own integrator for the reactive-path types"
+owning_task_for_the_gap = "the freeze owner named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml, for the DIS-CTX-VIEW-EXECUTION-POLICY summary-list drift; and this cell's own integrator for the reactive-path types"
 package_action_unchanged = true
 rust_change_needed = false
-note = "The crate's declared invariant that whole units and handles are first-class is exactly what the r13 rows state: the omission record is a first-class typed record rather than a gap, and its reason set is closed at ten members with no catch-all, so an omission always names a real cause."
+note = "The crate's declared invariant that whole units and handles are first-class is exactly what the r12 rows state: the omission record is a first-class typed record rather than a gap, and its reason set is closed at ten members with no catch-all, so an omission always names a real cause."
 
 [[contract_ownership_note]]
 issue = 261
@@ -855,11 +855,11 @@ family = "eliot-learning-contracts-binding-denominator"
 owning_crate = "eliot-learning-contracts"
 functional_cell = "smart.learning.contracts"
 existing_decision_reference = "this file does NOT assign order 32 eliot-learning-contracts; that cell sits in cognitive-micromodules-wave-02 per its own module.toml. It is recorded here because the family is a W0 consumer of the shared contracts this decision set governs, not because this file owns it."
-field_contract_state = "FROZEN_EXACT at 2 of 2 shared types as of freeze r13. PARTIAL BY SCOPE: the crate declares 80 public types across nine modules and r13 freezes the two shared types every durable candidate is bound by."
+field_contract_state = "FROZEN_EXACT at 2 of 2 shared types as of freeze r12. PARTIAL BY SCOPE: the crate declares 80 public types across nine modules and r12 freezes the two shared types every durable candidate is bound by."
 first_consumer = "eliot-learning-state-view"
 first_consumer_status = "MEASURED_EXISTS_SINGLE_CONSUMER"
 first_consumer_note = "crates/smart/eliot-learning-state-view/src/lib.rs line 239 constructs SourceDenominator { declared, observed }. No other crate constructs this type, and that measured absence of a second consumer is recorded as-is rather than padded."
-owning_task_for_the_gap = "CLOSED at freeze r13: the DIS-LEA-ACTIVATION-SURFACE summary-list drift was repaired in the ordered repin, where the [[frozen_type]].fields row for HarnessActivationReceiptCandidate went from fifteen to all thirty-three, and that row's prose counts thirty-two and seventeen were corrected to thirty-three and eighteen. Remaining gap in this row: this cell's own integrator for the six candidate families the freeze does not freeze"
+owning_task_for_the_gap = "the freeze owner named as integration_owner at crates/smart/cognitive-rev12-contract-schema-freeze.toml, for the DIS-LEA-ACTIVATION-SURFACE summary-list drift; and this cell's own integrator for the six candidate families r12 does not freeze"
 package_action_unchanged = true
 rust_change_needed = false
-note = "The crate's declared invariant that there is no self-promotion field and no evaluator or authority ownership is restated by the r13 rows on proof_ceiling: the ceiling is a declaration of what the family will claim, not a parameter a caller can raise, and schema_version is an exact equality so a record cannot be reinterpreted under another shape."
+note = "The crate's declared invariant that there is no self-promotion field and no evaluator or authority ownership is restated by the r12 rows on proof_ceiling: the ceiling is a declaration of what the family will claim, not a parameter a caller can raise, and schema_version is an exact equality so a record cannot be reinterpreted under another shape."

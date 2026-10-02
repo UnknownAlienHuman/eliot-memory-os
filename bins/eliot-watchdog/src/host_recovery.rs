@@ -230,16 +230,27 @@ impl RecoveryTarget {
 /// What one fresh boundary readback proved.
 ///
 /// A readback that proves less than this cannot admit an irreversible effect:
-/// `registration_unchanged` is the approved-registration check, the identity
+/// `observed_registration` is the approved-registration check, the identity
 /// digest is the runtime-identity check, and the generation is the
 /// expected-generation check. The three are independent; none substitutes for
 /// another, and none is satisfied by the service name or by an earlier status
 /// query.
+///
+/// Every field is the OBSERVED value, never a verdict about it. A boolean such
+/// as "the registration did not change" is a caller's assertion about a
+/// comparison it need not have performed, and it is indistinguishable from the
+/// assertion made over a substituted registration, so no boolean can carry the
+/// approved-only-start guarantee. The boundary compares each observed value by
+/// content against the value the operation recorded at challenge time
+/// ([`RecoveryTarget::registration`], `identity_digest`, `generation`), so a
+/// substitution between the challenge and the effect fails the comparison
+/// instead of satisfying it. `None` is an explicit absence and refuses; it is
+/// never read as agreement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundaryEvidence {
-    /// Does the live SCM configuration still match the approved registration
-    /// this target was bound to?
-    pub registration_unchanged: bool,
+    /// Approved-registration identity this fresh readback compared the live SCM
+    /// configuration against, when it compared one.
+    pub observed_registration: Option<PlatformHandle>,
     /// Digest of the process identity the same readback carried, when it carried
     /// one.
     pub identity_digest: Option<PlatformHandle>,
@@ -254,6 +265,9 @@ pub struct BoundaryEvidence {
 /// none is recoverable by re-issuing the same request without new evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryRefusal {
+    /// The readback compared no approved registration, so registration identity
+    /// cannot be revalidated at this boundary.
+    RegistrationUnavailable,
     /// The approved registration is no longer the one this target was bound to.
     RegistrationChanged,
     /// The readback carried no process identity, so runtime identity cannot be
@@ -590,7 +604,8 @@ pub enum RecoveryStep {
     /// A start of the currently approved unchanged registration was requested.
     StartRequested,
     /// A readback proved the replacement is running, bound to its newly observed
-    /// identity and the epoch the replacement Host issued for itself.
+    /// identity and the epoch the replacement Host issued for itself. Neither
+    /// may replay the fenced target's own value.
     StartedObserved {
         /// Digest of the replacement's newly observed process identity.
         identity_digest: PlatformHandle,
@@ -754,11 +769,16 @@ impl RecoveryOperation {
     /// is a real precondition, and an unknown phase is terminal for this operation
     /// so the original operation is reconciled before any retry.
     ///
+    /// The replacement observation is bound to its newly observed identity: an
+    /// epoch that replays the fenced one, or an identity digest that replays the
+    /// fenced one, is refused rather than recorded as a fresh Host issuance.
+    ///
     /// # Errors
     ///
     /// Returns [`RecoveryError::IllegalPhase`] when the step does not follow the
     /// current phase, and [`RecoveryError::Invalid`] when a replacement observation
-    /// carries no Host-issued epoch or reuses the fenced one.
+    /// carries no Host-issued epoch, or reuses the fenced epoch or the fenced
+    /// identity.
     pub fn apply(&mut self, step: &RecoveryStep) -> Result<(), RecoveryError> {
         let next = step.target_phase();
         let follows = matches!(
@@ -777,24 +797,47 @@ impl RecoveryOperation {
         if !self.phase.is_open() || !follows {
             return Err(RecoveryError::IllegalPhase);
         }
-        if let RecoveryStep::StartedObserved {
+        let replacement = if let RecoveryStep::StartedObserved {
             identity_digest,
             host_issued_epoch,
         } = step
         {
             validated("replacement identity digest", identity_digest)?;
             validated("replacement host-issued epoch", host_issued_epoch)?;
+            // The Watchdog only records the epoch the replacement Host issued
+            // for itself: it never derives the next epoch from the fenced one.
+            // The two refusals are what make "issued for a new lineage" a real
+            // property rather than a shape — a replayed epoch would claim a
+            // fresh issuance for the fenced Host, and a replayed identity digest
+            // would attach the new epoch to the process the boundary already
+            // fenced instead of to the replacement it observed.
             if *host_issued_epoch == self.target.owner_epoch {
                 return Err(RecoveryError::Invalid(
                     "replacement reused the fenced owner epoch".to_owned(),
                 ));
             }
-            self.replacement_identity_digest = Some(identity_digest.clone());
-            self.replacement_owner_epoch = Some(host_issued_epoch.clone());
+            if *identity_digest == self.target.identity_digest {
+                return Err(RecoveryError::Invalid(
+                    "replacement reused the fenced target identity".to_owned(),
+                ));
+            }
+            Some((identity_digest.clone(), host_issued_epoch.clone()))
+        } else {
+            None
+        };
+        // The step is applied to a candidate row and installed only once the
+        // candidate is canonical, so a refused step can never leave the caller's
+        // operation half-advanced (I13.5).
+        let mut advanced = self.clone();
+        advanced.phase = next;
+        advanced.revision = advanced.revision.saturating_add(1);
+        if let Some((identity_digest, host_issued_epoch)) = replacement {
+            advanced.replacement_identity_digest = Some(identity_digest);
+            advanced.replacement_owner_epoch = Some(host_issued_epoch);
         }
-        self.phase = next;
-        self.revision = self.revision.saturating_add(1);
-        self.validate()
+        advanced.validate()?;
+        *self = advanced;
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), RecoveryError> {
@@ -967,14 +1010,60 @@ pub struct RecoveryFence<'audit> {
     pub now_ms: u64,
 }
 
+/// Compares one fresh boundary readback against the values this operation
+/// recorded when the challenge was issued.
+///
+/// This is the single approved-only-start comparison, shared by the opening
+/// fence and by every effect-requesting step, so the two boundaries cannot drift
+/// apart. Each observed value is compared by CONTENT with the operation's own
+/// recorded target; an absent value is an explicit refusal, never agreement, and
+/// a service name or an earlier status query cannot satisfy any of the three.
+///
+/// # Errors
+///
+/// Returns [`BoundaryRefusal::RegistrationUnavailable`],
+/// [`BoundaryRefusal::RegistrationChanged`],
+/// [`BoundaryRefusal::IdentityNotRetained`], [`BoundaryRefusal::IdentityChanged`],
+/// [`BoundaryRefusal::GenerationUnavailable`], or
+/// [`BoundaryRefusal::GenerationChanged`] for the first value that is absent or
+/// no longer the one this operation was opened against.
+pub fn revalidate_boundary(
+    target: &RecoveryTarget,
+    evidence: &BoundaryEvidence,
+) -> Result<(), BoundaryRefusal> {
+    match evidence.observed_registration.as_ref() {
+        None => return Err(BoundaryRefusal::RegistrationUnavailable),
+        Some(observed) if observed != &target.registration => {
+            return Err(BoundaryRefusal::RegistrationChanged);
+        }
+        Some(_) => {}
+    }
+    match evidence.identity_digest.as_ref() {
+        None => return Err(BoundaryRefusal::IdentityNotRetained),
+        Some(observed) if observed != &target.identity_digest => {
+            return Err(BoundaryRefusal::IdentityChanged);
+        }
+        Some(_) => {}
+    }
+    match evidence.generation.as_ref() {
+        None => return Err(BoundaryRefusal::GenerationUnavailable),
+        Some(observed) if observed != &target.generation => {
+            return Err(BoundaryRefusal::GenerationChanged);
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
 /// Revalidates one boundary and decides whether a recovery attempt may proceed.
 ///
 /// The checks run from the most specific evidence to the structural limit, so the
 /// refusal that surfaces is the most specific one: approved registration, then
-/// runtime identity, then expected generation, then the installation policy's
-/// recipe, epoch, failure-threshold, cooldown, and audit rules, then the
-/// competing-attempt exclusion, and finally whether the adapter itself can exclude a
-/// generation substitution.
+/// runtime identity, then expected generation (all three compared by content
+/// against the operation's own target by [`revalidate_boundary`]), then the
+/// installation policy's recipe, epoch, failure-threshold, cooldown, and audit
+/// rules, then the competing-attempt exclusion, and finally whether the adapter
+/// itself can exclude a generation substitution.
 ///
 /// # Errors
 ///
@@ -983,23 +1072,7 @@ pub struct RecoveryFence<'audit> {
 pub fn fence_recovery(
     fence: &RecoveryFence<'_>,
 ) -> Result<AdmittedRecoveryIntent, BoundaryRefusal> {
-    if !fence.evidence.registration_unchanged {
-        return Err(BoundaryRefusal::RegistrationChanged);
-    }
-    match fence.evidence.identity_digest.as_ref() {
-        None => return Err(BoundaryRefusal::IdentityNotRetained),
-        Some(observed) if observed != &fence.target.identity_digest => {
-            return Err(BoundaryRefusal::IdentityChanged);
-        }
-        Some(_) => {}
-    }
-    match fence.evidence.generation.as_ref() {
-        None => return Err(BoundaryRefusal::GenerationUnavailable),
-        Some(observed) if observed != &fence.target.generation => {
-            return Err(BoundaryRefusal::GenerationChanged);
-        }
-        Some(_) => {}
-    }
+    revalidate_boundary(fence.target, &fence.evidence)?;
     if fence.target.recipe_digest != fence.policy.recipe_digest {
         return Err(BoundaryRefusal::RecipeNotAdmitted);
     }
@@ -1303,16 +1376,17 @@ pub fn begin_recovery_operation(
 /// The stored row is re-read inside the transaction and compared content-wise with
 /// the caller's `expected`, so an interleaved writer can neither be overwritten nor
 /// substituted. A mismatch is a conflict, never a silent advance (I13.5). A step
-/// that requests an irreversible effect additionally revalidates the operation's own
-/// approved registration and expected generation against a fresh readback, so only
-/// the currently approved unchanged registration is ever started, and only after the
-/// required old-target disposition.
+/// that requests an irreversible effect additionally revalidates, by content and
+/// against this operation's own recorded target, the approved registration, the
+/// runtime identity, and the expected generation (`revalidate_boundary`), so only
+/// the currently approved unchanged registration is ever started, and only after
+/// the required old-target disposition.
 ///
 /// # Errors
 ///
 /// Returns [`RecoveryError::Conflict`] when the stored row is not the exact expected
 /// row, [`RecoveryError::Boundary`] when a fresh readback no longer matches the
-/// operation's approved registration or expected generation,
+/// operation's approved registration, runtime identity, or expected generation,
 /// [`RecoveryError::IllegalPhase`] when the step does not follow the current phase,
 /// and [`RecoveryError::Invalid`] for a non-canonical step.
 pub fn commit_recovery_step(
@@ -1339,15 +1413,12 @@ pub fn commit_recovery_step(
         stored
     };
     if step.requests_effect() {
-        let target = stored.target();
-        if !evidence.registration_unchanged {
-            return Err(RecoveryError::Boundary(
-                BoundaryRefusal::RegistrationChanged,
-            ));
-        }
-        if evidence.generation.as_ref() != Some(&target.generation) {
-            return Err(RecoveryError::Boundary(BoundaryRefusal::GenerationChanged));
-        }
+        // The effect boundary repeats the SAME content comparison the opening
+        // fence used, against the values this operation itself recorded: the
+        // approved registration, the runtime identity, and the expected
+        // generation. Only the currently approved unchanged registration is
+        // ever started, and only after the required old-target disposition.
+        revalidate_boundary(stored.target(), evidence).map_err(RecoveryError::Boundary)?;
     }
     stored.apply(step)?;
     let bytes = encode(&stored)?;
@@ -1495,4 +1566,335 @@ struct RecoveryAuditRow {
     sequence: u64,
     correlation: AuditCorrelation,
     kind: AuditEventKind,
+}
+
+/// Boundary revalidation proofs for the approved-only-start and
+/// replacement-binding rules (#1757 W11).
+#[cfg(test)]
+mod recovery_boundary_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
+
+    /// A private journal file for one test. The recovery cell owns the file it
+    /// is handed, and two tests never share one.
+    fn temp_journal(label: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let index = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "eliot-watchdog-recovery-{label}-{}-{index}",
+            std::process::id()
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    /// An opaque coordination identity. It carries no process value and no
+    /// approval: only the recovery cell's own comparison semantics use it.
+    fn coordination(character: char) -> Fallible<PlatformHandle> {
+        Ok(PlatformHandle::new(character.to_string().repeat(32))?)
+    }
+
+    fn process(process_id: u32, start_time_100ns: u64) -> ProcessIdentity {
+        ProcessIdentity {
+            process_id,
+            start_time_100ns,
+            image_path: "C:\\Program Files\\Eliot\\eliot-host.exe".to_owned(),
+        }
+    }
+
+    /// One installed-recipe sibling scope, written out branch by branch: the
+    /// completeness rule compares against `RECOVERY_SIBLING_BRANCHES` itself, so
+    /// a fixture that copied that list would prove nothing about it.
+    fn installed_scope() -> Fallible<RecoveryScope> {
+        RecoveryScope::new(vec![
+            SiblingBranchDisposition {
+                branch: SiblingBranch::HostKernelLineage,
+                disposition: SiblingDisposition::ClosedWithHostJobObject,
+            },
+            SiblingBranchDisposition {
+                branch: SiblingBranch::CanonicalStoreBranch,
+                disposition: SiblingDisposition::PreservedUnderExistingPolicy,
+            },
+            SiblingBranchDisposition {
+                branch: SiblingBranch::WatchdogService,
+                disposition: SiblingDisposition::IndependentSiblingService,
+            },
+        ])
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    }
+
+    fn fenced_target() -> Fallible<(RecoveryTarget, ProcessIdentity)> {
+        let identity = process(4_200, 1_000_000);
+        let target = RecoveryTarget::bind(
+            coordination('a')?,
+            coordination('b')?,
+            coordination('c')?,
+            coordination('d')?,
+            &identity,
+        )?;
+        Ok((target, identity))
+    }
+
+    /// What a fresh boundary readback produces while the live SCM configuration
+    /// is still the approved registration this operation was opened against.
+    fn reproduces_target(target: &RecoveryTarget) -> BoundaryEvidence {
+        BoundaryEvidence {
+            observed_registration: Some(target.registration.clone()),
+            identity_digest: Some(target.identity_digest.clone()),
+            generation: Some(target.generation.clone()),
+        }
+    }
+
+    /// Opens one operation for `target` and reconciles its stop phase, leaving
+    /// the durable row parked in `StopObserved` with a start as the next legal
+    /// step. The stop observation carries no boundary evidence because a
+    /// reconciliation step requests no irreversible effect.
+    fn opened_and_stopped(
+        database: &Database,
+        target: &RecoveryTarget,
+    ) -> Fallible<RecoveryOperation> {
+        let correlation = AuditCorrelation::new(&coordination('e')?, &coordination('f')?, target)?;
+        let operation = RecoveryOperation::begin(
+            correlation,
+            target.clone(),
+            HostResponsiveness::AliveUnresponsive,
+            RecoveryBudgetDecision::Admitted {
+                remaining_attempts: 1,
+            },
+            installed_scope()?,
+        )?;
+        let opened = begin_recovery_operation(database, None, &operation)?;
+        commit_recovery_step(
+            database,
+            &opened,
+            &RecoveryStep::StopObserved,
+            &BoundaryEvidence {
+                observed_registration: None,
+                identity_digest: None,
+                generation: None,
+            },
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })
+    }
+
+    /// Positive: evidence that reproduces the operation's own recorded
+    /// registration, runtime identity, and generation agrees, so the approved
+    /// unchanged registration is started — only after the observed stop — and the
+    /// replacement is recorded with the epoch its Host issued for it.
+    #[test]
+    fn approved_unchanged_evidence_admits_start_and_binds_replacement() -> TestResult {
+        let journal = temp_journal("approved-start");
+        let database = Database::create(&journal)?;
+        let (target, _fenced_identity) = fenced_target()?;
+        assert_eq!(
+            revalidate_boundary(&target, &reproduces_target(&target)),
+            Ok(())
+        );
+        let stopped = opened_and_stopped(&database, &target)?;
+        assert_eq!(stopped.phase(), RecoveryPhase::StopObserved);
+        let requested = commit_recovery_step(
+            &database,
+            &stopped,
+            &RecoveryStep::StartRequested,
+            &reproduces_target(&target),
+        )?;
+        assert_eq!(requested.phase(), RecoveryPhase::StartIntentCommitted);
+        let replacement = process(4_201, 2_000_000);
+        let replacement_digest = identity_digest(&replacement)?;
+        let host_issued_epoch = coordination('9')?;
+        let observed = commit_recovery_step(
+            &database,
+            &requested,
+            &RecoveryStep::StartedObserved {
+                identity_digest: replacement_digest.clone(),
+                host_issued_epoch: host_issued_epoch.clone(),
+            },
+            &reproduces_target(&target),
+        )?;
+        assert_eq!(observed.phase(), RecoveryPhase::StartedObserved);
+        let (old_identity, new_identity, new_epoch) = observed.target_evidence();
+        assert_eq!(old_identity, &target.identity_digest);
+        assert_eq!(new_identity, Some(&replacement_digest));
+        assert_eq!(new_epoch, Some(&host_issued_epoch));
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// Refusal: a boundary readback that carries a DIFFERENT approved
+    /// registration is refused by content comparison, and the durable operation
+    /// stays exactly where the refusal left it.
+    #[test]
+    fn substituted_registration_refuses_start_and_preserves_operation() -> TestResult {
+        let journal = temp_journal("substituted-registration");
+        let database = Database::create(&journal)?;
+        let (target, _fenced_identity) = fenced_target()?;
+        let stopped = opened_and_stopped(&database, &target)?;
+        let substituted = BoundaryEvidence {
+            observed_registration: Some(coordination('7')?),
+            ..reproduces_target(&target)
+        };
+        let refused = commit_recovery_step(
+            &database,
+            &stopped,
+            &RecoveryStep::StartRequested,
+            &substituted,
+        );
+        assert_eq!(
+            refused.err(),
+            Some(RecoveryError::Boundary(
+                BoundaryRefusal::RegistrationChanged
+            ))
+        );
+        let Some(stored) = read_recovery_operation(&database)? else {
+            panic!("the refused start must leave the operation row readable");
+        };
+        assert_eq!(stored, stopped);
+        assert_eq!(stored.phase(), RecoveryPhase::StopObserved);
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// Refusal: an observed value the readback could not carry is an explicit
+    /// absence, never agreement. Each of the three refuses under its own typed
+    /// reason, and the registration refuses first because it is compared first.
+    #[test]
+    fn missing_observed_value_refuses_instead_of_agreeing() -> TestResult {
+        let (target, _fenced_identity) = fenced_target()?;
+        assert_eq!(
+            revalidate_boundary(
+                &target,
+                &BoundaryEvidence {
+                    observed_registration: None,
+                    identity_digest: None,
+                    generation: None,
+                }
+            ),
+            Err(BoundaryRefusal::RegistrationUnavailable)
+        );
+        assert_eq!(
+            revalidate_boundary(
+                &target,
+                &BoundaryEvidence {
+                    observed_registration: None,
+                    ..reproduces_target(&target)
+                }
+            ),
+            Err(BoundaryRefusal::RegistrationUnavailable)
+        );
+        assert_eq!(
+            revalidate_boundary(
+                &target,
+                &BoundaryEvidence {
+                    identity_digest: None,
+                    ..reproduces_target(&target)
+                }
+            ),
+            Err(BoundaryRefusal::IdentityNotRetained)
+        );
+        assert_eq!(
+            revalidate_boundary(
+                &target,
+                &BoundaryEvidence {
+                    generation: None,
+                    ..reproduces_target(&target)
+                }
+            ),
+            Err(BoundaryRefusal::GenerationUnavailable)
+        );
+        Ok(())
+    }
+
+    /// Refusal: a replacement that presents an epoch a Host issued but the
+    /// identity digest of the process this operation already fenced is not a
+    /// replacement. The new epoch would otherwise be recorded against the fenced
+    /// lineage, and the durable row stays in its start phase.
+    #[test]
+    fn replacement_reusing_fenced_identity_is_refused() -> TestResult {
+        let journal = temp_journal("replayed-replacement-identity");
+        let database = Database::create(&journal)?;
+        let (target, fenced_identity) = fenced_target()?;
+        let stopped = opened_and_stopped(&database, &target)?;
+        let requested = commit_recovery_step(
+            &database,
+            &stopped,
+            &RecoveryStep::StartRequested,
+            &reproduces_target(&target),
+        )?;
+        let replayed = RecoveryStep::StartedObserved {
+            identity_digest: identity_digest(&fenced_identity)?,
+            host_issued_epoch: coordination('9')?,
+        };
+        let refused = commit_recovery_step(
+            &database,
+            &requested,
+            &replayed,
+            &reproduces_target(&target),
+        );
+        assert_eq!(
+            refused.err(),
+            Some(RecoveryError::Invalid(
+                "replacement reused the fenced target identity".to_owned()
+            ))
+        );
+        let Some(stored) = read_recovery_operation(&database)? else {
+            panic!("the refused replacement must leave the operation row readable");
+        };
+        assert_eq!(stored.phase(), RecoveryPhase::StartIntentCommitted);
+        assert_eq!(stored.target_evidence().1, None);
+        assert_eq!(stored.target_evidence().2, None);
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
+
+    /// Refusal through the production fence: with a policy, a durable budget, and
+    /// a correlated audit record in hand, a substituted approved registration is
+    /// refused before any recipe, epoch, threshold, cooldown, or adapter decision
+    /// is reached.
+    #[test]
+    fn fence_refuses_substituted_registration_before_policy() -> TestResult {
+        let journal = temp_journal("fence-registration");
+        let database = Database::create(&journal)?;
+        let (target, _fenced_identity) = fenced_target()?;
+        let budget = read_recovery_budget(&database)?;
+        let policy = ApprovedRecoveryPolicy {
+            installation: coordination('1')?,
+            service: coordination('2')?,
+            owner_epoch_digest: target.owner_epoch.clone(),
+            recipe_digest: target.recipe_digest.clone(),
+            failure_threshold: 1,
+            max_attempts: 3,
+            budget_window_secs: 3_600,
+            cooldown_secs: 0,
+            exclusive_attempt: true,
+            audit_failure_refuses_effects: false,
+        };
+        let audit = DualAuditRecord::new(
+            AuditCorrelation::new(&coordination('e')?, &coordination('f')?, &target)?,
+            AuditEventKind::ChallengeTimeout,
+        );
+        let substituted = BoundaryEvidence {
+            observed_registration: Some(coordination('7')?),
+            ..reproduces_target(&target)
+        };
+        let fence = RecoveryFence {
+            policy: &policy,
+            target: &target,
+            evidence: substituted,
+            guarantee: EXISTING_SCM_ADAPTER_GUARANTEE,
+            open_operation: None,
+            budget: &budget,
+            audit: &audit,
+            now_ms: 0,
+        };
+        assert_eq!(
+            fence_recovery(&fence).err(),
+            Some(BoundaryRefusal::RegistrationChanged)
+        );
+        let _ = std::fs::remove_file(&journal);
+        Ok(())
+    }
 }

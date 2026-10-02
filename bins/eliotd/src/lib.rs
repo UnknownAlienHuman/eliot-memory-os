@@ -183,9 +183,10 @@ pub use agent_fabric::{
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
 pub use authority_revocation_ingress::{
-    AUTHORITY_REVOCATION_RESUME_BLOCKED, AuthorityRevocationIngressPlan,
-    AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
-    capture_authority_revocation_ingress_plan, scan_authority_revocation_ingress,
+    AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED, AdmittedCanonicalRevocationResume,
+    AuthorityRevocationIngressPlan, AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
+    admit_canonical_revocation_resumes, capture_authority_revocation_ingress_plan,
+    scan_authority_revocation_ingress,
 };
 
 use controlboard_adapters::SharedOperatorReplay;
@@ -228,8 +229,8 @@ pub use cue_activation_route::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
-    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationReconcileError, ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome,
+    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -4110,6 +4111,25 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(&mut self.governor_authority)
+    }
+
+    /// Mutably borrows this composition's single live Governor composition
+    /// (issue #686).
+    ///
+    /// The `governor` field stays private to this library crate on purpose: the
+    /// `eliotd` binary's run loop is a sibling crate, so it reaches the
+    /// Governor owner only through a named accessor on this type, exactly as it
+    /// reaches every other composed cell. The borrow is handed out rather than a
+    /// guard, so the caller keeps whatever composition-lock discipline it already
+    /// holds; this accessor adds no lock of its own.
+    ///
+    /// Unlike [`Self::governor_authority_mut`] it declares no readiness gate of
+    /// its own. Governor is the admission authority for its own calls and
+    /// refuses with [`CompositionError::NotReady`] itself, so restating the gate
+    /// here would add a second refusal vocabulary for one condition instead of
+    /// keeping the owner's own refusal observable at the call site.
+    pub fn governor_mut(&mut self) -> &mut GovernorComposition<dyn KernelGenerationPort> {
+        &mut self.governor
     }
 
     /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).

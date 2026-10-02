@@ -3286,15 +3286,6 @@ fn host_events_route_composition() -> Result<HostEventsRouteComposition, String>
 /// admitted request re-proves the live attach binding again. The stop and
 /// generation senders are held for the whole serving life, so a dropped
 /// supervisor channel can never be mistaken for a supervised stop.
-///
-/// Once the route has served, both typed shutdowns — a supervised stop and a
-/// rotated generation — retire the served introduction inside
-/// [`serve_host_events`], before the loopback endpoint leaves this process; the
-/// owner's credential handle is retired here. A stale client therefore holds
-/// neither an admissible introduction nor a usable secret against a port this
-/// process no longer exclusively owns. The refusals that never served
-/// ([`HostEventsServiceError::Unintroduced`], a bind failure) opened no socket,
-/// so there is no endpoint for a stale client to inherit.
 fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
     let mut composition = match host_events_route_composition() {
         Ok(composition) => composition,
@@ -3327,21 +3318,18 @@ fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
     let (_active_generation, active_generation) = tokio::sync::watch::channel(live_generation);
     let outcome = serve_host_events(
         runner,
-        store,
+        store.clone(),
         None,
         resolve_credential,
         stop,
         active_generation,
     );
-    // `serve_host_events` owns the serving store for the whole serving life and
-    // retires the served introduction itself, while its loopback socket is
-    // still bound: the revocation id is retired and the current introduction is
-    // cleared before this process can release the endpoint, so a stale client
-    // holds no admissible introduction against a port this process no longer
-    // owns. Retiring a copy here would order the other way round, so the store
-    // is moved into the serve call rather than cloned.
-    // The credential handle is retired here, because it belongs to the
-    // physical owner's secret boundary rather than to the serving loop.
+    // Every exit retires the route before this process can serve another
+    // generation: the installed introduction's revocation id is retired, the
+    // store is cleared, and the credential handle stops resolving, so a stale
+    // client holds neither an admissible introduction nor a usable secret.
+    store.revoke(&composition.projection.introduction.revocation_id);
+    store.clear();
     // `retire` is `&mut self`, and `resolve_credential` above moved an `Arc`
     // clone into the serve call, so the handle was shared while the route ran.
     // That clone is dropped by the time `serve_host_events` returns, which is

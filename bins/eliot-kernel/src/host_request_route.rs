@@ -54,7 +54,7 @@
 
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::AuditEventDraft;
-use super::trace_manifest::{TraceEvidence, TraceManifest};
+use super::trace_manifest::TraceManifest;
 use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
@@ -2592,6 +2592,142 @@ impl KernelComposition {
             && digest.as_deref() == Some(retained.kernel_owner_bundle_sha256.as_str())
     }
 
+    /// Returns the principal established by this connection's retained
+    /// Resolved activation, after rejoining that binding to the durable host
+    /// request and its original fence. The authenticated bridge peer is a
+    /// transport owner and is deliberately not used as the application caller.
+    fn retained_host_request_caller_principal(
+        &self,
+        session: &Session,
+        stored: &HostRequestRecord,
+        envelope: Option<&HostRequestEnvelope>,
+    ) -> Result<Option<String>, TransportError> {
+        let connection_id = stored.connection_ref.as_str();
+        if envelope.is_some_and(|envelope| {
+            envelope.connection_id != connection_id
+                || envelope.identity.request_id.as_str() != stored.request_id.as_str()
+                || envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|claimed| {
+                        stored.session_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+                    })
+                || envelope.identity.task_id.as_deref().is_some_and(|claimed| {
+                    stored.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+                })
+                || envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .is_some_and(|claimed| {
+                        stored.scope_ref.as_ref().map(OpaqueLabel::as_str) != Some(claimed)
+                    })
+        }) {
+            return Err(TransportError::SessionFenced);
+        }
+        let fence = envelope.map_or(&session.module_generation.state_fence, |envelope| {
+            &envelope.state_fence
+        });
+        if sha256_json(fence).map_err(|_| TransportError::SessionFenced)? != stored.fence_digest
+            || !fence
+                .authority_epoch
+                .is_same_authority(&stored.authority_epoch)
+            || fence.resource_generation.value() != stored.generation
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let retained = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(connection_id)
+            .and_then(|state| state.activated_binding.clone());
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        if retained.principal_id.trim().is_empty()
+            || stored
+                .session_ref
+                .as_ref()
+                .is_some_and(|value| retained.session_id != value.as_str())
+            || stored
+                .task_ref
+                .as_ref()
+                .is_some_and(|value| retained.task_id != value.as_str())
+            || stored
+                .scope_ref
+                .as_ref()
+                .is_some_and(|value| retained.work_scope_id != value.as_str())
+            || retained.activation_generation != fence.resource_generation
+            || !retained
+                .authority_epoch
+                .is_same_authority(&fence.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(&admission_owner, &retained, connection_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(Some(retained.principal_id))
+    }
+
+    fn retained_application_principal_for_envelope(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<Option<String>, TransportError> {
+        let retained = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&envelope.connection_id)
+            .and_then(|state| state.activated_binding.clone());
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        if retained.principal_id.trim().is_empty()
+            || !envelope
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || envelope.state_fence.resource_generation != retained.activation_generation
+            || envelope
+                .identity
+                .session_id
+                .as_deref()
+                .is_some_and(|value| value != retained.session_id)
+            || envelope
+                .identity
+                .task_id
+                .as_deref()
+                .is_some_and(|value| value != retained.task_id)
+            || envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .is_some_and(|value| value != retained.work_scope_id)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(
+            &admission_owner,
+            &retained,
+            &envelope.connection_id,
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(Some(retained.principal_id))
+    }
+
     /// Verifies claimed application session/task/scope continuity against the
     /// exact binding retained from this connection's `Resolved` activation
     /// (issue #1746).
@@ -4577,7 +4713,8 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_tool.clone(),
                 })
         };
-        validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
+        let active_view_packet_manifest =
+            validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope.as_ref() {
             if !session
                 .authority_epoch
@@ -4594,6 +4731,11 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        let caller_principal = self.retained_host_request_caller_principal(
+            session,
+            &stored,
+            queued_envelope.as_ref(),
+        )?;
         // Issue #1837: durable audit evidence for the validated daemon
         // submission. The submission leg causally precedes the Kernel
         // binding, so its record is fsync-sealed before the ORS completion
@@ -4679,23 +4821,14 @@ impl KernelComposition {
         // bound result through the single audit chain. The seal is downstream
         // of the binding it describes, so it follows the binding append and
         // does not participate in the #1837 binding/spool reconciliation.
-        // `TraceEvidence::observed` reads the I16.12 principal, policy
-        // snapshot, Active View/packet manifest, and verifier/artifact result
-        // classes from the durable row this same call persisted; a class the
-        // row does not carry stays absent and is sealed as a missing part.
-        let observed_evidence = TraceEvidence::observed(
-            &persisted,
-            queued_envelope
-                .as_ref()
-                .map(|envelope| &envelope.state_fence),
-        );
         let manifest = TraceManifest::seal(
             session,
             body,
             &persisted,
             queued_envelope.as_ref(),
             lane,
-            &observed_evidence,
+            caller_principal.as_deref(),
+            active_view_packet_manifest.as_deref(),
         );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
@@ -6118,6 +6251,11 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        let caller_principal = self.retained_host_request_caller_principal(
+            session,
+            &stored,
+            queued_envelope.as_ref(),
+        )?;
         // Issue #1853 W2: the executor-observed evidence is persisted with the
         // completion, in the same owner transaction.
         let retained = retained_result_provenance(body)?;
@@ -6183,23 +6321,15 @@ impl KernelComposition {
             ));
         }
         // Issue #1838: seal the canonical replayable trace manifest for the
-        // bound result through the single audit chain. The four I16.12
-        // evidence classes are projected from the durable row just persisted
-        // here, so a class that owner does not carry stays absent and is
-        // sealed as a missing part rather than as a completion claim.
-        let observed_evidence = TraceEvidence::observed(
-            &persisted,
-            queued_envelope
-                .as_ref()
-                .map(|envelope| &envelope.state_fence),
-        );
+        // bound result through the single audit chain.
         let manifest = TraceManifest::seal(
             session,
             body,
             &persisted,
             queued_envelope.as_ref(),
             lane,
-            &observed_evidence,
+            caller_principal.as_deref(),
+            None,
         );
         // I16.5 (issue #1841): the sealed finish is also the
         // trace-completeness metric sample, counted once per seal.
@@ -6405,12 +6535,12 @@ fn validate_campaign_view_result(
     stored: &HostRequestRecord,
     envelope: Option<&HostRequestEnvelope>,
     response: &serde_json::Value,
-) -> Result<(), TransportError> {
+) -> Result<Option<String>, TransportError> {
     let Some(value) = response.get("campaign_learning_state_view") else {
-        return Ok(());
+        return Ok(None);
     };
     if value.is_null() {
-        return Ok(());
+        return Ok(None);
     }
     if stored.capability_ref.as_str() != "eliot.packet" {
         return Err(TransportError::SessionFenced);
@@ -6431,7 +6561,7 @@ fn validate_campaign_view_result(
     {
         return Err(TransportError::SessionFenced);
     }
-    Ok(())
+    Ok(Some(publication.view_id.as_str().to_owned()))
 }
 
 /// Builds the Kernel-observed bridge process binding from retained state.
@@ -6932,7 +7062,23 @@ impl KernelComposition {
                     // operation already received its bounded answer, so the
                     // admitted shape is the result-bearing response: no second
                     // shape, no duplicated body, no frame-ceiling risk.
-                    host_request_admitted_response(&receipt, &record)
+                    let mut response = host_request_admitted_response(&receipt, &record);
+                    if record.result_digest.is_some() && record.result_response.is_some() {
+                        // The caller receives the Kernel's original persisted
+                        // trace as top-level metadata. The retained result body
+                        // and its digest remain byte-for-byte the ORS values.
+                        let manifest =
+                            self.local_read_replay_manifest(&receipt, &record, envelope)?;
+                        response
+                            .as_object_mut()
+                            .ok_or(TransportError::SessionFenced)?
+                            .insert(
+                                "trace_manifest".to_owned(),
+                                serde_json::to_value(manifest)
+                                    .map_err(|_| TransportError::SessionFenced)?,
+                            );
+                    }
+                    response
                 }
                 AGENT_HOST_REQUEST_PREVIEW_OPERATION => {
                     let tool = host_request_tool_from_payload(payload)?;
@@ -10051,6 +10197,188 @@ pub(crate) fn local_read_replay_response(
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
     Ok(Some(host_request_admitted_response(receipt, record)))
+}
+
+impl KernelComposition {
+    /// Reads the original trace manifest from the Kernel's single audit chain
+    /// and joins it to the already admitted, retained local-read result.
+    ///
+    /// The caller must run this after existing admission and disclosure checks.
+    /// This method performs no dispatch or second-store IO. A matching event
+    /// is insufficient by itself: operation/request/result identities, the
+    /// original State Fence digest, and the durable caller Session must all
+    /// agree across the receipt, envelope, ORS row, and sealed manifest.
+    pub fn local_read_replay_manifest(
+        &self,
+        receipt: &HostRequestAdmissionReceipt,
+        record: &HostRequestRecord,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<Option<TraceManifest>, TransportError> {
+        envelope
+            .validate_for_admission()
+            .map_err(|_| TransportError::SessionFenced)?;
+        receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let expected_operation = host_request_operation_id(envelope);
+        if receipt.operation_id != expected_operation
+            || record.operation_id.as_str() != expected_operation
+            || receipt.request_sha256 != envelope.envelope_sha256
+            || record.request_digest != envelope.envelope_sha256
+            || record.request_id.as_str() != envelope.identity.request_id.as_str()
+            || record.connection_ref.as_str() != envelope.connection_id
+            || receipt.connection_id != envelope.connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let Some(result_digest) = record.result_digest.as_deref() else {
+            return Ok(None);
+        };
+        let Some(result_response) = record.result_response.as_ref() else {
+            return Ok(None);
+        };
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+
+        let records = self
+            .audit_chain_records()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let matching_seal_exists = records.iter().any(|audit| {
+            audit.kind == super::kernel_audit::AuditEventKind::TRACE_MANIFEST_SEALED
+                && audit.lineage.operation_id.as_deref() == Some(expected_operation.as_str())
+        });
+        if !matching_seal_exists {
+            return Ok(None);
+        }
+        let Some(manifest) = TraceManifest::find_sealed(&records, &expected_operation) else {
+            return Err(TransportError::SessionFenced);
+        };
+
+        let current_caller_principal =
+            self.retained_application_principal_for_envelope(envelope)?;
+        let active_view_packet_manifest =
+            validate_campaign_view_result(record, Some(envelope), result_response)?;
+        if !recorded_trace_manifest_matches_result(
+            &manifest,
+            record,
+            envelope,
+            current_caller_principal.as_deref(),
+            active_view_packet_manifest.as_deref(),
+            result_digest,
+        )? {
+            return Err(TransportError::SessionFenced);
+        }
+
+        Ok(Some(manifest))
+    }
+}
+
+/// Purely compares a decoded manifest to the exact retained operation and
+/// result evidence that produced it. It reads only the passed audit projection,
+/// envelope, and ORS record; it never resolves or manufactures a replacement.
+fn recorded_trace_manifest_matches_result(
+    manifest: &TraceManifest,
+    record: &HostRequestRecord,
+    envelope: &HostRequestEnvelope,
+    current_caller_principal: Option<&str>,
+    active_view_packet_manifest: Option<&str>,
+    result_digest: &str,
+) -> Result<bool, TransportError> {
+    let expected_operation = host_request_operation_id(envelope);
+    let expected_session = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .or_else(|| record.session_ref.as_ref().map(OpaqueLabel::as_str));
+    let expected_task = envelope
+        .identity
+        .task_id
+        .as_deref()
+        .or_else(|| record.task_ref.as_ref().map(OpaqueLabel::as_str));
+    let expected_scope = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .or_else(|| record.scope_ref.as_ref().map(OpaqueLabel::as_str));
+    let expected_policy_snapshot = record
+        .result_lineage
+        .as_ref()
+        .and_then(|lineage| lineage.policy_fence.as_ref())
+        .filter(|policy_fence| policy_fence.state_fence == envelope.state_fence)
+        .map(|policy_fence| policy_fence.policy_snapshot_id.as_str());
+    let fence_digest =
+        sha256_json(&envelope.state_fence).map_err(|_| TransportError::SessionFenced)?;
+    let expected_authority_epoch =
+        super::kernel_audit::authority_epoch_text(&envelope.state_fence.authority_epoch);
+    let expected_module_generation = envelope.state_fence.resource_generation.value().to_string();
+    let expected_durable_state = format!("{:?}", record.state);
+    let evidence = record.result_evidence.as_ref();
+    let expected_verifier_result = record
+        .result_lineage
+        .as_ref()
+        .filter(|lineage| {
+            matches!(
+                lineage.result_class,
+                HostRequestRetainedResultClass::VerifierObservation
+            ) && lineage.output_digest.as_str() == result_digest
+        })
+        .map(|lineage| lineage.output_digest.as_str());
+    let expected_lease_attempt = record
+        .attempt
+        .as_ref()
+        .map(|attempt| attempt.attempt_id.as_str());
+    let expected_fencing_generation = record.attempt.as_ref().map(|attempt| attempt.generation);
+
+    Ok(
+        manifest.format_version == super::trace_manifest::TRACE_MANIFEST_FORMAT_VERSION
+            && manifest.operation_id == expected_operation
+            && manifest.trace_id == envelope.identity.request_id.as_str()
+            && manifest.connection_id.as_deref() == Some(record.connection_ref.as_str())
+            && manifest.capability.as_deref() == Some(record.capability_ref.as_str())
+            && manifest.capability.as_deref() == Some(envelope.identity.capability.as_str())
+            && manifest.payload_digest.as_deref() == Some(record.payload_digest.as_str())
+            && manifest.payload_digest.as_deref()
+                == Some(envelope.identity.payload_sha256.as_str())
+            && manifest.state_fence.as_ref() == Some(&envelope.state_fence)
+            && fence_digest == record.fence_digest
+            && manifest.session_id.as_deref() == expected_session
+            && manifest.task_id.as_deref() == expected_task
+            && manifest
+                .principal
+                .as_deref()
+                .is_none_or(|recorded| Some(recorded) == current_caller_principal)
+            && manifest.work_scope_id.as_deref() == expected_scope
+            && manifest.policy_snapshot.as_deref() == expected_policy_snapshot
+            && manifest.authority_epoch.as_deref() == Some(expected_authority_epoch.as_str())
+            && manifest.module_generation.as_deref() == Some(expected_module_generation.as_str())
+            && manifest.requested_route.as_deref() == Some(record.capability_ref.as_str())
+            && manifest.lease_attempt_id.as_deref() == expected_lease_attempt
+            && manifest.fencing_generation == expected_fencing_generation
+            && manifest.durable_state.as_deref() == Some(expected_durable_state.as_str())
+            && manifest.actual_route.as_deref()
+                == evidence.and_then(|evidence| evidence.actual_route.as_deref())
+            && manifest.invoked_operation.as_deref()
+                == evidence.and_then(|evidence| evidence.invoked_operation.as_deref())
+            && manifest.input_handle.as_deref()
+                == evidence.and_then(|evidence| evidence.input_handle.as_deref())
+            && manifest.output_handle.as_deref()
+                == evidence.and_then(|evidence| evidence.output_handle.as_deref())
+            && manifest.adapter_identity.as_deref()
+                == evidence.and_then(|evidence| evidence.adapter_identity.as_deref())
+            && manifest.executor_identity.as_deref()
+                == evidence.and_then(|evidence| evidence.executor_identity.as_deref())
+            && manifest.side_effects.as_deref()
+                == evidence.and_then(|evidence| evidence.side_effects.as_deref())
+            && manifest.active_view_packet_manifest.as_deref() == active_view_packet_manifest
+            && manifest.verifier_result.as_deref() == expected_verifier_result
+            && manifest.result_digest.as_deref() == Some(result_digest)
+            && manifest
+                .output_handle
+                .as_deref()
+                .is_none_or(|handle| handle == result_digest),
+    )
 }
 
 /// Joins one retained result to the source revision it was derived from.

@@ -38,7 +38,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_contracts::ScreenBinding;
-use eliot_dreamer_contracts::candidate::PRESERVATION_DIMENSIONS;
+use eliot_dreamer_contracts::candidate::{PRESERVATION_DIMENSIONS, PreservationReport};
 use eliot_dreamer_contracts::grounding::{
     ClaimKind, MaterialClaim, PositionAssertability, PrecisionPayload, PropositionId,
     StructuredModelDraft, proposition_content_digest,
@@ -374,65 +374,7 @@ fn grounding_handoff_binds_the_owner_carrier_for_admitted_material() {
          got {observed} against {job_deadline_ms}"
     );
 
-    // The preservation report is derived from the admitted bundle, and this
-    // asserts that provenance rather than the shape of a constant: the report
-    // for this admitted job must differ from the report for a job with a
-    // different admitted handle set, and each of the seven verdicts must carry
-    // its own computed finding. A length assertion alone would hold for any
-    // single canned verdict repeated seven times.
-    assert_eq!(
-        carrier.preservation.verdicts.len(),
-        PRESERVATION_DIMENSIONS.len(),
-        "every owner preservation dimension must be present exactly once"
-    );
-    if let Err(error) = carrier.preservation.overall() {
-        panic!(
-            "the derived preservation verdicts must satisfy the owner's own judgement, got \
-             {error:?}"
-        );
-    }
-    let notes: BTreeSet<&str> = carrier
-        .preservation
-        .verdicts
-        .iter()
-        .map(|verdict| verdict.note.as_str())
-        .collect();
-    assert_eq!(
-        notes.len(),
-        PRESERVATION_DIMENSIONS.len(),
-        "each preservation dimension must report its own derived finding, not one shared note: \
-         {notes:?}"
-    );
-    let mut sparse_job = job_with_handles("job-e2e-handoff-sparse", JobClass::Orientation);
-    sparse_job.memory_handles.clear();
-    sparse_job.architecture_handles.clear();
-    let sparse_admission = admitted_admission("job-e2e-handoff-sparse");
-    let sparse_admitted = match admission_of(&sparse_admission, &sparse_job) {
-        Ok(admitted) => admitted,
-        Err(error) => panic!("sparse e2e admission must derive, got {error:?}"),
-    };
-    let sparse_bundle = match bundle_of(&sparse_admission, &sparse_job) {
-        Ok(bundle) => bundle,
-        Err(error) => panic!("sparse e2e bundle must derive, got {error:?}"),
-    };
-    let sparse_manifest = match manifest_of(&sparse_bundle) {
-        Ok(manifest) => manifest,
-        Err(error) => panic!("sparse e2e manifest must derive, got {error:?}"),
-    };
-    let sparse_report = match preservation_of(
-        &sparse_admitted,
-        &sparse_bundle,
-        &sparse_manifest,
-        &sparse_job,
-    ) {
-        Ok(report) => report,
-        Err(error) => panic!("sparse e2e preservation must derive, got {error:?}"),
-    };
-    assert_ne!(
-        carrier.preservation, sparse_report,
-        "the preservation report must be computed from the admitted bundle: a job with no \
-         omitted handle must not produce the same report as one that omits two"
-    );
+    assert_preservation_is_computed_from_the_bundle(&carrier.preservation);
 
     // What this root does not hold stays what it is. Rival declarations are
     // genuinely absent, and the carrier's frozen cancellation field admits no
@@ -463,6 +405,82 @@ fn grounding_handoff_binds_the_owner_carrier_for_admitted_material() {
         !output_digest.is_empty(),
         "the accepted candidate must bind its output digest"
     );
+}
+
+/// The preservation report must be *computed from the admitted bundle*.
+///
+/// This asserts that provenance rather than the shape of a constant: the report
+/// for this admitted job must differ from the report for a job with a different
+/// admitted handle set, and each of the seven verdicts must carry its own
+/// computed finding. A length assertion alone would hold for any single canned
+/// verdict repeated across all seven dimensions, which is why the negative
+/// comparison is over a real derived report rather than a count.
+fn assert_preservation_is_computed_from_the_bundle(report: &PreservationReport) {
+    assert_eq!(
+        report.verdicts.len(),
+        PRESERVATION_DIMENSIONS.len(),
+        "every owner preservation dimension must be present exactly once"
+    );
+    if let Err(error) = report.overall() {
+        panic!(
+            "the derived preservation verdicts must satisfy the owner's own judgement, got \
+             {error:?}"
+        );
+    }
+    let notes: BTreeSet<&str> = report
+        .verdicts
+        .iter()
+        .map(|verdict| verdict.note.as_str())
+        .collect();
+    assert_eq!(
+        notes.len(),
+        PRESERVATION_DIMENSIONS.len(),
+        "each preservation dimension must report its own derived finding, not one shared note: \
+         {notes:?}"
+    );
+    let sparse_report = sparse_preservation_report();
+    assert_ne!(
+        *report, sparse_report,
+        "the preservation report must be computed from the admitted bundle: a job with no \
+         omitted handle must not produce the same report as one that omits two"
+    );
+}
+
+/// The preservation report for an admitted job that omits two handles.
+///
+/// This is the negative comparison for
+/// [`grounding_handoff_binds_the_owner_carrier_for_admitted_material`]: the
+/// report must be *computed from the admitted bundle*, so a job whose admitted
+/// handle set differs must produce a different report. A length assertion alone
+/// would hold for any single canned verdict repeated across all seven
+/// dimensions, which is why this returns a real derived report rather than a
+/// count.
+fn sparse_preservation_report() -> PreservationReport {
+    let mut sparse_job = job_with_handles("job-e2e-handoff-sparse", JobClass::Orientation);
+    sparse_job.memory_handles.clear();
+    sparse_job.architecture_handles.clear();
+    let sparse_admission = admitted_admission("job-e2e-handoff-sparse");
+    let sparse_admitted = match admission_of(&sparse_admission, &sparse_job) {
+        Ok(admitted) => admitted,
+        Err(error) => panic!("sparse e2e admission must derive, got {error:?}"),
+    };
+    let sparse_bundle = match bundle_of(&sparse_admission, &sparse_job) {
+        Ok(bundle) => bundle,
+        Err(error) => panic!("sparse e2e bundle must derive, got {error:?}"),
+    };
+    let sparse_manifest = match manifest_of(&sparse_bundle) {
+        Ok(manifest) => manifest,
+        Err(error) => panic!("sparse e2e manifest must derive, got {error:?}"),
+    };
+    match preservation_of(
+        &sparse_admitted,
+        &sparse_bundle,
+        &sparse_manifest,
+        &sparse_job,
+    ) {
+        Ok(report) => report,
+        Err(error) => panic!("sparse e2e preservation must derive, got {error:?}"),
+    }
 }
 
 /// Refusal case for the same handoff: a claim that declares its own content

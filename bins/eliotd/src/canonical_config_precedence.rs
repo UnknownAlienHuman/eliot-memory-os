@@ -14,22 +14,10 @@
 //! Arbitrary executable scripts are invalid policy input, never a fallback
 //! configuration source.
 //!
-//! Proven setting chains: [`CANONICAL_SETTING_KEY`] (`task.budget.per_job`),
+//! Proven setting chain: [`CANONICAL_SETTING_KEY`] (`task.budget.per_job`),
 //! a per-job budget limit where a smaller value narrows authority/cost.
 //! Lower layers may narrow this limit; they may not expand it unless a higher
 //! layer's `delegation_ceiling` covers the exact requested value.
-//!
-//! Second proven chain: [`RETENTION_POLICY_SETTING_KEY`]
-//! (`retention_and_backup_policy`), the I3.11 WorkScope Profile field that
-//! declares the closed set of retention policy refs the schedule owner attests.
-//! It is ref-typed rather than numeric, so it has no numeric limit: it is
-//! resolved by the same seven-layer narrow-only merge and the same typed
-//! decoders, and a layer may only narrow the running ref set. A ref vocabulary
-//! has no interval to delegate, so a ref the running set does not name is
-//! refused ([`PrecedenceError::UndeclaredRetentionPolicy`]) rather than granted.
-//! The set is never empty: an empty attestation would refuse every retention
-//! read, so both the resolver and the declared owner
-//! (`eliot_config::declared_retention_policy_refs`) refuse it.
 //!
 //! The legacy `governor.toml` surface (`bins/eliot`, #1687) adopts nothing:
 //! a present legacy file still fails closed through the legacy rejector,
@@ -40,23 +28,14 @@
 //! launch file, so an effective configuration that cannot be resolved refuses
 //! the load and the generation never becomes ready.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The numeric proven setting chain for issue #1966.
+/// The single proven setting chain for issue #1966.
 ///
 /// A per-job budget limit: smaller narrows cost/authority, larger expands it.
 pub const CANONICAL_SETTING_KEY: &str = "task.budget.per_job";
-
-/// The I3.11 WorkScope Profile retention/backup declaration.
-///
-/// The exact spelling is owned by the immutable-configuration owner
-/// (`eliot_config::RETENTION_POLICY_SETTING_KEY`, I3.11
-/// `retention_and_backup_policy:`); this module re-exports that one name rather
-/// than declaring a second spelling of the same setting, so the decoder here
-/// and the declared owner in `eliot-governor` cannot disagree about which field
-/// names the retention policy set.
-pub use eliot_config::RETENTION_POLICY_SETTING_KEY;
 
 /// Compiled safe default for [`CANONICAL_SETTING_KEY`], the broadest layer.
 ///
@@ -169,6 +148,8 @@ pub struct ResolvedContribution {
     pub narrowed: bool,
     /// True when this layer expanded under a higher-layer delegation.
     pub delegated_expansion: bool,
+    /// Accepted ceiling this layer delegated to lower layers, if any.
+    pub delegation_ceiling: Option<u64>,
 }
 
 /// The resolved setting chain: winning value plus every contributing layer
@@ -213,6 +194,15 @@ pub enum PrecedenceError {
     /// The document names a layer outside the seven canonical layers.
     #[error("unknown configuration layer: {0}")]
     UnknownLayer(String),
+    /// A document claimed a layer other than the one owned by its source.
+    #[error(
+        "policy document {file_name} declared layer {declared}, expected source layer {expected}"
+    )]
+    SourceLayerMismatch {
+        file_name: String,
+        expected: &'static str,
+        declared: &'static str,
+    },
     /// Two contributions name the same canonical layer. Layer authority
     /// must be unambiguous: the first contribution must not silently win
     /// over a conflicting same-layer document.
@@ -235,35 +225,6 @@ pub enum PrecedenceError {
         current: u64,
         requested: u64,
     },
-    /// A layer declared a retention policy ref the running set does not name.
-    ///
-    /// I3.9:15 permits narrowing only, and a ref vocabulary has no interval for
-    /// a higher layer to delegate, so an expansion has no legal form and is
-    /// refused instead of being granted by an undeclared vocabulary.
-    #[error(
-        "layer {layer} may not declare retention policy ref {policy_ref} that the running {key} set does not name"
-    )]
-    UndeclaredRetentionPolicy {
-        layer: &'static str,
-        key: String,
-        policy_ref: String,
-    },
-    /// A layer declared no retention policy ref at all.
-    ///
-    /// An empty set attests nothing, so every retention-gated read would resolve
-    /// to `ExperienceRetentionReadPosture::UnknownPolicy`. That is an
-    /// always-refusing issuer, not a policy, so it is refused here rather than
-    /// published as a successful resolution.
-    #[error("layer {layer} may not leave {key} with no declared retention policy ref")]
-    EmptyRetentionPolicySet { layer: &'static str, key: String },
-    /// A layer declared the same retention policy ref twice.
-    ///
-    /// A repeated ref is ambiguous about whether the layer declared a set or a
-    /// scalar, and the schedule contract rejects a duplicate in
-    /// `known_policy_refs`, so the declaration is refused here rather than
-    /// silently collapsed.
-    #[error("layer {layer} declared a duplicate retention policy ref for {key}")]
-    DuplicateRetentionPolicy { layer: &'static str, key: String },
 }
 
 /// Resolves one setting chain across all seven layers in canonical order.
@@ -278,9 +239,9 @@ pub enum PrecedenceError {
 /// can explicitly delegate an interval up to its `delegation_ceiling` only
 /// within the ceiling it inherited from higher layers; a full inherited
 /// ceiling is valid explicit delegation and is not a special strict-
-/// sub-envelope policy. Abstaining layers (`None`) contribute no value but
-/// may explicitly delegate within their inherited authority; an invalid
-/// over-ceiling claim mints nothing.
+/// sub-envelope policy. An abstaining layer (`None`) with an accepted
+/// delegation contributes an inspection record carrying the unchanged running
+/// value; an invalid over-ceiling claim mints nothing and contributes no grant.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] when the key is unsupported, defaults are
@@ -313,6 +274,11 @@ pub fn resolve_canonical_chain(
         applied_value: seed,
         narrowed: false,
         delegated_expansion: false,
+        delegation_ceiling: inputs
+            .iter()
+            .find(|input| input.layer == ConfigLayer::CompiledDefaults)
+            .and_then(|input| input.delegation_ceiling)
+            .filter(|ceiling| *ceiling <= seed),
     }];
     // Effective authority available to the next lower layer. A delegation
     // replaces this ceiling only when it is within the ceiling inherited from
@@ -338,6 +304,14 @@ pub fn resolve_canonical_chain(
         let Some(requested) = input.limit else {
             if let Some(ceiling) = delegation {
                 lower_expansion_ceiling = ceiling;
+                contributions.push(ResolvedContribution {
+                    order: layer.order(),
+                    layer: layer.name(),
+                    applied_value: running,
+                    narrowed: false,
+                    delegated_expansion: false,
+                    delegation_ceiling: Some(ceiling),
+                });
             }
             continue;
         };
@@ -348,6 +322,7 @@ pub fn resolve_canonical_chain(
                 applied_value: requested,
                 narrowed: requested < running,
                 delegated_expansion: false,
+                delegation_ceiling: delegation,
             });
             running = requested;
         } else if requested <= lower_expansion_ceiling {
@@ -357,6 +332,7 @@ pub fn resolve_canonical_chain(
                 applied_value: requested,
                 narrowed: false,
                 delegated_expansion: true,
+                delegation_ceiling: delegation,
             });
             running = requested;
         } else {
@@ -380,137 +356,26 @@ pub fn resolve_canonical_chain(
     })
 }
 
-/// One layer's typed contribution to the declared retention policy set.
-///
-/// `policy_refs` is the layer's proposed set (`None` = the layer abstains and
-/// the running set carries forward). The narrow-only rule is the same one
-/// `resolve_canonical_chain` applies to a numeric limit, minus delegation: a
-/// requested set must be a subset of the running set. There is no
-/// `delegation_ceiling` counterpart, because I3.9:15 lets a higher layer
-/// delegate only when it "explicitly delegates expansion", and a closed ref
-/// vocabulary has no such declaration anywhere in the configuration surface.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RetentionLayerInput {
-    /// The layer this contribution claims.
-    pub layer: ConfigLayer,
-    /// The declared ref set, or `None` when the layer abstains.
-    pub policy_refs: Option<Vec<String>>,
-}
-
-/// One accepted layer contribution to the declared retention policy set.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ResolvedRetentionContribution {
-    /// Canonical precedence position of the contributing layer.
-    pub order: u8,
-    /// Stable layer identity.
-    pub layer: &'static str,
-    /// Ref set applied after this layer merged.
-    pub applied_policy_refs: Vec<String>,
-    /// True when this layer changed the running set.
-    pub narrowed: bool,
-}
-
-/// The resolved declared retention policy set.
-///
-/// `policy_refs` is the exact closed set the schedule owner attests; it is
-/// never empty, so a retention-gated read is refused for a genuinely undeclared
-/// policy and never for an absent declaration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedRetentionSet {
-    key: String,
-    policy_refs: Vec<String>,
-    contributions: Vec<ResolvedRetentionContribution>,
-}
-
-impl ResolvedRetentionSet {
-    /// The resolved setting key.
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    /// The winning declared ref set after all seven layers merged.
-    #[must_use]
-    pub fn policy_refs(&self) -> &[String] {
-        &self.policy_refs
-    }
-
-    /// Each contributing layer in canonical precedence order.
-    #[must_use]
-    pub fn contributions(&self) -> &[ResolvedRetentionContribution] {
-        &self.contributions
-    }
-}
-
 /// Typed layer document shared by the JSON and TOML decoders.
-///
-/// One document carries one setting chain's value, discriminated by `key`:
-/// `limit`/`delegation_ceiling` belong to the numeric chain, and
-/// `policy_refs` belongs to the retention chain. A document that mixes the two,
-/// or that omits its own chain's value, is a schema rejection rather than a
-/// silently defaulted contribution.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalLayerDocument {
     layer: String,
     key: String,
     limit: Option<u64>,
     delegation_ceiling: Option<u64>,
-    policy_refs: Option<Vec<String>>,
-}
-
-/// One decoded layer contribution, typed by the chain its `key` names.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DecodedLayerInput {
-    /// A contribution to the numeric budget chain.
-    Budget(LayerInput),
-    /// A contribution to the declared retention policy set.
-    Retention(RetentionLayerInput),
 }
 
 impl CanonicalLayerDocument {
-    fn into_input(self) -> Result<DecodedLayerInput, PrecedenceError> {
-        let key = self.key.trim();
-        let layer = ConfigLayer::from_name(self.layer.trim())?;
-        match key {
-            CANONICAL_SETTING_KEY => {
-                if self.policy_refs.is_some() {
-                    return Err(PrecedenceError::SchemaRejected(format!(
-                        "field \"policy_refs\" does not belong to setting key {key}"
-                    )));
-                }
-                Ok(DecodedLayerInput::Budget(LayerInput {
-                    layer,
-                    limit: self.limit,
-                    delegation_ceiling: self.delegation_ceiling,
-                }))
-            }
-            RETENTION_POLICY_SETTING_KEY => {
-                if self.limit.is_some() || self.delegation_ceiling.is_some() {
-                    return Err(PrecedenceError::SchemaRejected(format!(
-                        "numeric limit fields do not belong to setting key {key}"
-                    )));
-                }
-                let Some(policy_refs) = self.policy_refs else {
-                    return Err(PrecedenceError::SchemaRejected(format!(
-                        "field \"policy_refs\" is required for setting key {key}"
-                    )));
-                };
-                if policy_refs
-                    .iter()
-                    .any(|policy_ref| policy_ref.trim().is_empty())
-                {
-                    return Err(PrecedenceError::SchemaRejected(format!(
-                        "field \"policy_refs\" must not contain a blank ref for setting key {key}"
-                    )));
-                }
-                Ok(DecodedLayerInput::Retention(RetentionLayerInput {
-                    layer,
-                    policy_refs: Some(policy_refs),
-                }))
-            }
-            _ => Err(PrecedenceError::InvalidKey(key.to_owned())),
+    fn into_input(self) -> Result<LayerInput, PrecedenceError> {
+        if self.key.trim().is_empty() || self.key != CANONICAL_SETTING_KEY {
+            return Err(PrecedenceError::InvalidKey(self.key));
         }
+        Ok(LayerInput {
+            layer: ConfigLayer::from_name(&self.layer)?,
+            limit: self.limit,
+            delegation_ceiling: self.delegation_ceiling,
+        })
     }
 }
 
@@ -571,13 +436,11 @@ pub fn classify_policy_input(file_name: &str, bytes: &[u8]) -> Result<(), Preced
 /// Decodes one typed layer document from JSON.
 ///
 /// Unknown fields are rejected (`deny_unknown_fields`); scripts are refused
-/// before decoding; only [`CANONICAL_SETTING_KEY`] and
-/// [`RETENTION_POLICY_SETTING_KEY`] are admitted, and the returned
-/// [`DecodedLayerInput`] names which chain the document's value belongs to.
+/// before decoding; only [`CANONICAL_SETTING_KEY`] is admitted.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] for script, schema, layer, or key failures.
-pub fn parse_canonical_layer_json(bytes: &[u8]) -> Result<DecodedLayerInput, PrecedenceError> {
+pub fn parse_canonical_layer_json(bytes: &[u8]) -> Result<LayerInput, PrecedenceError> {
     classify_policy_input("layer.json", bytes)?;
     let text = std::str::from_utf8(bytes)
         .map_err(|_| PrecedenceError::SchemaRejected("policy input is not UTF-8".to_owned()))?;
@@ -597,30 +460,20 @@ pub fn parse_canonical_layer_json(bytes: &[u8]) -> Result<DecodedLayerInput, Pre
 /// delegation_ceiling = 80
 /// ```
 ///
-/// and, for the declared retention policy set:
-///
-/// ```toml
-/// layer = "workscope_profile"
-/// key = "retention_and_backup_policy"
-/// policy_refs = ["<declared retention policy ref>"]
-/// ```
-///
 /// `layer` and `key` are required double-quoted strings; `limit` and
-/// `delegation_ceiling` are optional bare integers; `policy_refs` is a
-/// single-line array of double-quoted refs. Any other field, duplicate field,
-/// missing required field, or unquoted value is a schema rejection. Unknown TOML
-/// features (tables, multi-line arrays, inline documents) are rejected as
-/// untyped input. Scripts are refused before decoding.
+/// `delegation_ceiling` are optional bare integers; any other field,
+/// duplicate field, missing required field, or unquoted value is a schema
+/// rejection. Unknown TOML features (tables, arrays, inline documents) are
+/// rejected as untyped input. Scripts are refused before decoding.
 ///
 /// # Errors
 /// Returns [`PrecedenceError`] for script, schema, layer, or key failures.
-pub fn parse_canonical_layer_toml(text: &str) -> Result<DecodedLayerInput, PrecedenceError> {
+pub fn parse_canonical_layer_toml(text: &str) -> Result<LayerInput, PrecedenceError> {
     classify_policy_input("layer.toml", text.as_bytes())?;
     let mut layer: Option<String> = None;
     let mut key: Option<String> = None;
     let mut limit: Option<u64> = None;
     let mut delegation_ceiling: Option<u64> = None;
-    let mut policy_refs: Option<Vec<String>> = None;
     let mut seen: Vec<&'static str> = Vec::new();
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -644,7 +497,6 @@ pub fn parse_canonical_layer_toml(text: &str) -> Result<DecodedLayerInput, Prece
             "key" => "key",
             "limit" => "limit",
             "delegation_ceiling" => "delegation_ceiling",
-            "policy_refs" => "policy_refs",
             _ => {
                 return Err(PrecedenceError::SchemaRejected(format!(
                     "unknown layer field {field:?}"
@@ -673,9 +525,6 @@ pub fn parse_canonical_layer_toml(text: &str) -> Result<DecodedLayerInput, Prece
                     key = Some(unquoted.to_owned());
                 }
             }
-            "policy_refs" => {
-                policy_refs = Some(parse_policy_ref_array(value)?);
-            }
             _ => {
                 let parsed: u64 = value.parse().map_err(|_| {
                     PrecedenceError::SchemaRejected(format!(
@@ -700,107 +549,27 @@ pub fn parse_canonical_layer_toml(text: &str) -> Result<DecodedLayerInput, Prece
         key,
         limit,
         delegation_ceiling,
-        policy_refs,
     }
     .into_input()
 }
 
-/// Parses the single-line `policy_refs` array of a retention layer document.
-///
-/// Only a one-line array of double-quoted, non-blank, duplicate-free refs is
-/// accepted, and the count is bounded by the same ceiling the declared owner
-/// uses, so this minimal TOML subset cannot express an unbounded ref list. A
-/// multi-line array, a non-string element, a blank ref, or a repeated ref is a
-/// schema rejection rather than a partially accepted set.
-fn parse_policy_ref_array(value: &str) -> Result<Vec<String>, PrecedenceError> {
-    let Some(inner) = value
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-    else {
-        return Err(PrecedenceError::SchemaRejected(
-            "field \"policy_refs\" must be a single-line array of double-quoted refs".to_owned(),
-        ));
-    };
-    let mut refs: Vec<String> = Vec::new();
-    for element in inner.split(',') {
-        let element = element.trim();
-        if element.is_empty() {
-            continue;
-        }
-        let unquoted = element
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix('"'))
-            .ok_or_else(|| {
-                PrecedenceError::SchemaRejected(
-                    "each \"policy_refs\" element must be a double-quoted string".to_owned(),
-                )
-            })?;
-        if unquoted.trim().is_empty() {
-            return Err(PrecedenceError::SchemaRejected(
-                "\"policy_refs\" must not contain a blank ref".to_owned(),
-            ));
-        }
-        if refs.iter().any(|seen| seen == unquoted) {
-            return Err(PrecedenceError::SchemaRejected(format!(
-                "duplicate retention policy ref {unquoted:?}"
-            )));
-        }
-        refs.push(unquoted.to_owned());
-    }
-    if refs.len() > eliot_config::MAX_DECLARED_RETENTION_POLICY_REFS {
-        return Err(PrecedenceError::SchemaRejected(format!(
-            "\"policy_refs\" exceeds the bound of {} refs",
-            eliot_config::MAX_DECLARED_RETENTION_POLICY_REFS
-        )));
-    }
-    Ok(refs)
-}
-
 /// Published JSON Schema for the canonical layer document.
 ///
-/// This is the generated schema for the supported TOML/JSON layer files:
-/// `layer` is the seven-name enum, `key` is one of the two proven setting
-/// chains, `limit`/`delegation_ceiling` are the optional non-negative integers
-/// of the numeric chain, `policy_refs` is the bounded ref array of the retention
-/// chain, and unknown properties are forbidden. Exactly one chain's value shape
-/// is admitted per document, and the decoder refuses a document that carries
-/// both, so the schema admits the pair and the decoder discriminates by `key`.
+/// The schema is generated from [`CanonicalLayerDocument`]. The layer enum and
+/// setting key constraint are then narrowed to the canonical values enforced
+/// by [`ConfigLayer::name`] and [`CANONICAL_SETTING_KEY`].
 #[must_use]
 pub fn canonical_layer_json_schema() -> serde_json::Value {
-    serde_json::json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://eliot.local/schemas/canonical-layer/v1",
-        "title": "CanonicalLayerDocument",
-        "type": "object",
-        "required": ["layer", "key"],
-        "additionalProperties": false,
-        "properties": {
-            "layer": {
-                "type": "string",
-                "enum": [
-                    "compiled_defaults",
-                    "installation_config",
-                    "system_owner_policy",
-                    "workscope_profile",
-                    "task_policy",
-                    "session_capability_token",
-                    "exact_human_approval"
-                ]
-            },
-            "key": {
-                "type": "string",
-                "enum": [CANONICAL_SETTING_KEY, RETENTION_POLICY_SETTING_KEY]
-            },
-            "limit": { "type": "integer", "minimum": 0 },
-            "delegation_ceiling": { "type": "integer", "minimum": 0 },
-            "policy_refs": {
-                "type": "array",
-                "items": { "type": "string", "minLength": 1 },
-                "maxItems": eliot_config::MAX_DECLARED_RETENTION_POLICY_REFS,
-                "uniqueItems": true
-            }
-        }
-    })
+    let mut schema = schemars::schema_for!(CanonicalLayerDocument).to_value();
+    schema["properties"]["layer"]["enum"] = serde_json::json!(
+        ALL_LAYERS
+            .iter()
+            .map(|layer| layer.name())
+            .collect::<Vec<_>>()
+    );
+    schema["properties"]["key"]["const"] = serde_json::json!(CANONICAL_SETTING_KEY);
+    schema["$id"] = serde_json::json!("https://eliot.local/schemas/canonical-layer/v1");
+    schema
 }
 
 /// Pretty-printed rendering of [`canonical_layer_json_schema`] for publishing.
@@ -815,6 +584,10 @@ pub struct PolicyDocument<'a> {
     /// File name of the document. Its extension selects the typed decoder and
     /// refuses executable script extensions before any decoding runs.
     pub file_name: &'a str,
+    /// Layer assigned to this source by its owning boundary. The document's
+    /// `layer` field must match; payload text cannot claim another owner's
+    /// precedence position.
+    pub expected_layer: ConfigLayer,
     /// Exact document bytes as read through the protected config boundary.
     pub bytes: &'a [u8],
 }
@@ -833,12 +606,12 @@ pub struct PolicyDocument<'a> {
 /// [`resolve_canonical_chain`] merges the documents in canonical precedence
 /// order and refuses any lower-layer expansion that no higher layer delegated,
 /// so the returned chain is the effective configuration or the call fails
-/// closed. A document may not claim a layer outside the seven canonical
-/// layers, and two documents may not claim the same layer.
+/// closed. Each document must declare the layer assigned to its source by the
+/// caller, and two documents may not claim the same layer.
 ///
 /// # Errors
-/// Returns [`PrecedenceError`] for script, schema, unknown-layer,
-/// duplicate-layer, or undelegated-expansion input.
+/// Returns [`PrecedenceError`] for script, schema, unknown-layer, source-layer
+/// mismatch, duplicate-layer, or undelegated-expansion input.
 pub fn resolve_effective_configuration(
     documents: &[PolicyDocument<'_>],
 ) -> Result<ResolvedChain, PrecedenceError> {
@@ -855,190 +628,30 @@ pub fn resolve_effective_configuration(
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        match extension.as_str() {
-            "json" => {
-                if let DecodedLayerInput::Budget(input) =
-                    parse_canonical_layer_json(document.bytes)?
-                {
-                    inputs.push(input);
-                }
-            }
+        let input = match extension.as_str() {
+            "json" => parse_canonical_layer_json(document.bytes)?,
             "toml" => {
                 let text = std::str::from_utf8(document.bytes).map_err(|_| {
                     PrecedenceError::SchemaRejected("policy input is not UTF-8".to_owned())
                 })?;
-                if let DecodedLayerInput::Budget(input) = parse_canonical_layer_toml(text)? {
-                    inputs.push(input);
-                }
+                parse_canonical_layer_toml(text)?
             }
             _ => {
                 return Err(PrecedenceError::SchemaRejected(format!(
                     "unsupported policy file type for {file_name}"
                 )));
             }
-        }
-    }
-    resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
-}
-
-/// Resolves the effective declared retention policy set from the same I3.9
-/// typed configuration files.
-///
-/// The declared vocabulary
-/// ([`eliot_config::COMPILED_SAFE_DEFAULT_RETENTION_POLICY_REFS`]) seeds the
-/// chain, so a document set that names no layer still resolves to a non-empty
-/// declared set and the schedule owner is never an always-refusing issuer. The
-/// documents are read, classified, and decoded exactly as
-/// [`resolve_effective_configuration`] reads them, through the same
-/// [`classify_policy_input`] gate and the same typed decoders; only documents
-/// naming [`RETENTION_POLICY_SETTING_KEY`] contribute to this chain, so a
-/// document set may carry both proven chains without either one reading the
-/// other's value.
-///
-/// [`resolve_canonical_retention_set`] merges in canonical precedence order and
-/// refuses any lower layer that declares a ref the running set does not name
-/// (I3.9:15 permits narrowing only) or that declares no ref at all, so the
-/// returned set is the effective declared policy set or the call fails closed.
-///
-/// # Errors
-/// Returns [`PrecedenceError`] for script, schema, unknown-layer,
-/// duplicate-layer, undeclared-ref, or empty-set input.
-pub fn resolve_effective_retention_set(
-    documents: &[PolicyDocument<'_>],
-) -> Result<ResolvedRetentionSet, PrecedenceError> {
-    let mut inputs = vec![RetentionLayerInput {
-        layer: ConfigLayer::CompiledDefaults,
-        policy_refs: Some(eliot_config::compiled_default_retention_policy_refs()),
-    }];
-    for document in documents {
-        let file_name = document.file_name;
-        classify_policy_input(file_name, document.bytes)?;
-        let extension = file_name
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match extension.as_str() {
-            "json" => {
-                if let DecodedLayerInput::Retention(input) =
-                    parse_canonical_layer_json(document.bytes)?
-                {
-                    inputs.push(input);
-                }
-            }
-            "toml" => {
-                let text = std::str::from_utf8(document.bytes).map_err(|_| {
-                    PrecedenceError::SchemaRejected("policy input is not UTF-8".to_owned())
-                })?;
-                if let DecodedLayerInput::Retention(input) = parse_canonical_layer_toml(text)? {
-                    inputs.push(input);
-                }
-            }
-            _ => {
-                return Err(PrecedenceError::SchemaRejected(format!(
-                    "unsupported policy file type for {file_name}"
-                )));
-            }
-        }
-    }
-    resolve_canonical_retention_set(RETENTION_POLICY_SETTING_KEY, &inputs)
-}
-
-/// Resolves the declared retention policy set across all seven layers in
-/// canonical order.
-///
-/// [`ConfigLayer::CompiledDefaults`] must seed the chain, exactly as for the
-/// numeric chain: without the broadest layer there is no declared vocabulary to
-/// narrow, and seeding from anywhere else would let a narrower layer define the
-/// ceiling. Each lower layer carrying `Some(policy_refs)` must declare a subset
-/// of the running set; an abstaining layer (`None`) contributes no value and
-/// the running set carries forward. A requested set is applied in the running
-/// set's canonical order, so the resolved set is a function of the layer order
-/// and not of the order the refs were written in a document.
-///
-/// # Errors
-/// Returns [`PrecedenceError`] when the key is unsupported, defaults are
-/// missing, a layer repeats, a layer declares a ref outside the running set, or
-/// a layer would leave the set empty.
-pub fn resolve_canonical_retention_set(
-    key: &str,
-    inputs: &[RetentionLayerInput],
-) -> Result<ResolvedRetentionSet, PrecedenceError> {
-    if key.trim().is_empty() || key != RETENTION_POLICY_SETTING_KEY {
-        return Err(PrecedenceError::InvalidKey(key.to_owned()));
-    }
-    let mut claimed = [false; ALL_LAYERS.len()];
-    for input in inputs {
-        let slot = input.layer.order() as usize;
-        if claimed[slot] {
-            return Err(PrecedenceError::DuplicateLayer(input.layer.name()));
-        }
-        claimed[slot] = true;
-    }
-    let seed = inputs
-        .iter()
-        .find(|input| input.layer == ConfigLayer::CompiledDefaults)
-        .and_then(|input| input.policy_refs.clone())
-        .ok_or(PrecedenceError::MissingCompiledDefaults)?;
-    if seed.is_empty() {
-        return Err(PrecedenceError::EmptyRetentionPolicySet {
-            layer: ConfigLayer::CompiledDefaults.name(),
-            key: key.to_owned(),
-        });
-    }
-    let mut running = seed;
-    let mut contributions = vec![ResolvedRetentionContribution {
-        order: ConfigLayer::CompiledDefaults.order(),
-        layer: ConfigLayer::CompiledDefaults.name(),
-        narrowed: false,
-        applied_policy_refs: running.clone(),
-    }];
-    for layer in ALL_LAYERS.iter().skip(1) {
-        let Some(input) = inputs.iter().find(|input| input.layer == *layer) else {
-            continue;
         };
-        let Some(requested) = input.policy_refs.as_ref() else {
-            continue;
-        };
-        if requested.is_empty() {
-            return Err(PrecedenceError::EmptyRetentionPolicySet {
-                layer: layer.name(),
-                key: key.to_owned(),
+        if input.layer != document.expected_layer {
+            return Err(PrecedenceError::SourceLayerMismatch {
+                file_name: file_name.to_owned(),
+                expected: document.expected_layer.name(),
+                declared: input.layer.name(),
             });
         }
-        // A ref vocabulary has no delegated interval, so narrowing is a plain
-        // subset test against the running set. The applied set keeps the running
-        // set's order, so the result is deterministic per layer order.
-        let mut narrowed: Vec<String> = Vec::with_capacity(requested.len());
-        for policy_ref in requested {
-            if !running.iter().any(|known| known == policy_ref) {
-                return Err(PrecedenceError::UndeclaredRetentionPolicy {
-                    layer: layer.name(),
-                    key: key.to_owned(),
-                    policy_ref: policy_ref.clone(),
-                });
-            }
-            if narrowed.contains(policy_ref) {
-                return Err(PrecedenceError::DuplicateRetentionPolicy {
-                    layer: layer.name(),
-                    key: key.to_owned(),
-                });
-            }
-            narrowed.push(policy_ref.clone());
-        }
-        contributions.push(ResolvedRetentionContribution {
-            order: layer.order(),
-            layer: layer.name(),
-            narrowed: narrowed != running,
-            applied_policy_refs: narrowed.clone(),
-        });
-        running = narrowed;
+        inputs.push(input);
     }
-    Ok(ResolvedRetentionSet {
-        key: key.to_owned(),
-        policy_refs: running,
-        contributions,
-    })
+    resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
 }
 
 #[cfg(test)]
@@ -1049,11 +662,9 @@ pub fn resolve_canonical_retention_set(
 )]
 mod tests {
     use super::{
-        CANONICAL_SETTING_KEY, COMPILED_SAFE_DEFAULT_PER_JOB_BUDGET, ConfigLayer,
-        DecodedLayerInput, LayerInput, PolicyDocument, RETENTION_POLICY_SETTING_KEY,
-        RetentionLayerInput, canonical_layer_json_schema, parse_canonical_layer_json,
-        parse_canonical_layer_toml, resolve_canonical_chain, resolve_canonical_retention_set,
-        resolve_effective_configuration, resolve_effective_retention_set,
+        ALL_LAYERS, CANONICAL_SETTING_KEY, ConfigLayer, LayerInput, PolicyDocument,
+        PrecedenceError, canonical_layer_json_schema, parse_canonical_layer_json,
+        parse_canonical_layer_toml, resolve_canonical_chain, resolve_effective_configuration,
     };
 
     fn narrowing_chain() -> Vec<LayerInput> {
@@ -1111,6 +722,58 @@ mod tests {
         let mut sorted = orders.clone();
         sorted.sort_unstable();
         assert_eq!(orders, sorted, "contributions must be in canonical order");
+    }
+
+    #[test]
+    fn accepted_delegation_only_layers_are_visible_in_canonical_order() {
+        let inputs = vec![
+            LayerInput {
+                layer: ConfigLayer::CompiledDefaults,
+                limit: Some(64),
+                delegation_ceiling: None,
+            },
+            LayerInput {
+                layer: ConfigLayer::InstallationConfig,
+                limit: Some(32),
+                delegation_ceiling: Some(64),
+            },
+            LayerInput {
+                layer: ConfigLayer::SystemOwnerPolicy,
+                limit: None,
+                delegation_ceiling: Some(64),
+            },
+            LayerInput {
+                layer: ConfigLayer::TaskPolicy,
+                limit: Some(50),
+                delegation_ceiling: None,
+            },
+        ];
+        let chain = resolve_canonical_chain(CANONICAL_SETTING_KEY, &inputs)
+            .expect("task expansion within delegated ceiling must resolve");
+
+        assert_eq!(chain.winning_value(), 50);
+        assert_eq!(
+            chain
+                .contributions()
+                .iter()
+                .map(|item| item.layer)
+                .collect::<Vec<_>>(),
+            vec![
+                ConfigLayer::CompiledDefaults.name(),
+                ConfigLayer::InstallationConfig.name(),
+                ConfigLayer::SystemOwnerPolicy.name(),
+                ConfigLayer::TaskPolicy.name(),
+            ]
+        );
+        let owner = chain.contributions()[2];
+        assert_eq!(owner.applied_value, 32);
+        assert_eq!(owner.delegation_ceiling, Some(64));
+        assert!(!owner.narrowed);
+        assert!(!owner.delegated_expansion);
+        let task = chain.contributions()[3];
+        assert_eq!(task.applied_value, 50);
+        assert!(task.delegated_expansion);
+        assert_eq!(task.delegation_ceiling, None);
     }
 
     #[test]
@@ -1524,6 +1187,51 @@ mod tests {
     }
 
     #[test]
+    fn installation_document_resolves_when_its_source_layer_matches() {
+        let document =
+            b"layer = \"installation_config\"\nkey = \"task.budget.per_job\"\nlimit = 48\n";
+        let resolved = resolve_effective_configuration(&[PolicyDocument {
+            file_name: "installation.toml",
+            expected_layer: ConfigLayer::InstallationConfig,
+            bytes: document,
+        }])
+        .expect("installation source must resolve its owned layer");
+
+        assert_eq!(resolved.winning_value(), 48);
+        assert_eq!(resolved.contributions().len(), 2);
+        assert_eq!(resolved.contributions()[1].layer, "installation_config");
+    }
+
+    #[test]
+    fn installation_document_cannot_claim_system_owner_or_human_approval() {
+        for declared in [
+            ConfigLayer::SystemOwnerPolicy,
+            ConfigLayer::ExactHumanApproval,
+        ] {
+            let document = format!(
+                "layer = \"{}\"\nkey = \"{}\"\nlimit = 80\n",
+                declared.name(),
+                CANONICAL_SETTING_KEY,
+            );
+            let error = resolve_effective_configuration(&[PolicyDocument {
+                file_name: "installation.toml",
+                expected_layer: ConfigLayer::InstallationConfig,
+                bytes: document.as_bytes(),
+            }])
+            .expect_err("installation payload must not impersonate another owner");
+
+            assert_eq!(
+                error,
+                PrecedenceError::SourceLayerMismatch {
+                    file_name: "installation.toml".to_owned(),
+                    expected: ConfigLayer::InstallationConfig.name(),
+                    declared: declared.name(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn repeated_json_fields_reject_as_ambiguous() {
         let repeated =
             br#"{"layer":"task_policy","key":"task.budget.per_job","limit":40,"limit":90}"#;
@@ -1532,6 +1240,24 @@ mod tests {
             error.to_string().contains("duplicate"),
             "unexpected: {error}"
         );
+    }
+
+    #[test]
+    fn layer_names_must_match_the_canonical_identity_exactly() {
+        let json = br#"{"layer":" task_policy ","key":"task.budget.per_job","limit":40}"#;
+        assert!(matches!(
+            parse_canonical_layer_json(json),
+            Err(PrecedenceError::UnknownLayer(layer)) if layer == " task_policy "
+        ));
+
+        let toml = r#"layer = " task_policy "
+key = "task.budget.per_job"
+limit = 40
+"#;
+        assert!(matches!(
+            parse_canonical_layer_toml(toml),
+            Err(PrecedenceError::UnknownLayer(layer)) if layer == " task_policy "
+        ));
     }
 
     #[test]
@@ -1563,212 +1289,47 @@ mod tests {
             serde_json::json!(false),
             "schema must forbid unknown properties"
         );
+        assert_eq!(
+            schema["$id"],
+            serde_json::json!("https://eliot.local/schemas/canonical-layer/v1")
+        );
         assert!(
             schema["properties"]["layer"]["enum"]
                 .as_array()
-                .is_some_and(|names| names.len() == 7),
+                .is_some_and(|names| {
+                    names
+                        == &ALL_LAYERS
+                            .iter()
+                            .map(|layer| serde_json::json!(layer.name()))
+                            .collect::<Vec<_>>()
+                }),
             "schema must enumerate all seven layers"
         );
-        assert!(
-            schema["properties"]["key"]["enum"]
+        assert_eq!(
+            schema["properties"]["key"]["const"],
+            serde_json::json!(CANONICAL_SETTING_KEY),
+            "schema must constrain the key to the supported setting"
+        );
+        assert!(schema_accepts_null(&schema["properties"]["limit"]));
+        assert!(schema_accepts_null(
+            &schema["properties"]["delegation_ceiling"]
+        ));
+        let null_optionals = br#"{"layer":"task_policy","key":"task.budget.per_job","limit":null,"delegation_ceiling":null}"#;
+        let parsed = parse_canonical_layer_json(null_optionals)
+            .expect("JSON null retains the Option<u64> wire meaning");
+        assert_eq!(parsed.limit, None);
+        assert_eq!(parsed.delegation_ceiling, None);
+    }
+
+    fn schema_accepts_null(schema: &serde_json::Value) -> bool {
+        schema["type"] == "null"
+            || schema["type"]
                 .as_array()
-                .is_some_and(|keys| keys.len() == 2),
-            "schema must enumerate both proven setting chains"
-        );
-    }
-
-    // Declared retention policy set (I3.11 `retention_and_backup_policy`).
-    //
-    // The declared ref is read through the owner constant so this test cannot
-    // drift from the declaration it proves.
-
-    fn declared_ref(index: usize) -> String {
-        eliot_config::COMPILED_SAFE_DEFAULT_RETENTION_POLICY_REFS[index].to_owned()
-    }
-
-    fn retention_inputs(
-        seed: Option<Vec<String>>,
-        lower: &[(ConfigLayer, Option<Vec<String>>)],
-    ) -> Vec<RetentionLayerInput> {
-        let mut inputs = vec![RetentionLayerInput {
-            layer: ConfigLayer::CompiledDefaults,
-            policy_refs: seed,
-        }];
-        inputs.extend(
-            lower
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+            || ["anyOf", "oneOf"]
                 .iter()
-                .map(|(layer, policy_refs)| RetentionLayerInput {
-                    layer: *layer,
-                    policy_refs: policy_refs.clone(),
-                }),
-        );
-        inputs
-    }
-
-    #[test]
-    fn declared_set_resolves_from_the_compiled_default_and_narrows() {
-        // Positive: with no document the compiled declared vocabulary is the
-        // effective set, so the schedule owner is never empty.
-        let expected = eliot_config::compiled_default_retention_policy_refs();
-        let effective = resolve_effective_retention_set(&[]).expect("compiled default resolves");
-        assert_eq!(effective.key(), RETENTION_POLICY_SETTING_KEY);
-        assert_eq!(effective.policy_refs(), expected);
-
-        // A narrower layer restating the compiled ref narrows to the same set.
-        let narrowed = resolve_canonical_retention_set(
-            RETENTION_POLICY_SETTING_KEY,
-            &retention_inputs(
-                Some(vec![declared_ref(0)]),
-                &[(ConfigLayer::WorkScopeProfile, Some(vec![declared_ref(0)]))],
-            ),
-        )
-        .expect("a narrower restatement resolves");
-        assert_eq!(narrowed.policy_refs(), expected);
-        assert!(
-            narrowed
-                .contributions()
-                .last()
-                .is_some_and(|item| item.order == ConfigLayer::WorkScopeProfile.order()),
-            "the narrowing layer must be recorded in canonical order"
-        );
-    }
-
-    #[test]
-    fn declared_set_refuses_expansion_empty_and_missing_defaults() {
-        let expanded = resolve_canonical_retention_set(
-            RETENTION_POLICY_SETTING_KEY,
-            &retention_inputs(
-                Some(vec![declared_ref(0)]),
-                &[(
-                    ConfigLayer::SystemOwnerPolicy,
-                    Some(vec!["eliot.governor.retention.forever:1.0.0".to_owned()]),
-                )],
-            ),
-        )
-        .expect_err("I3.9:15 permits narrowing only");
-        assert!(
-            expanded.to_string().contains("does not name"),
-            "unexpected: {expanded}"
-        );
-
-        let emptied = resolve_canonical_retention_set(
-            RETENTION_POLICY_SETTING_KEY,
-            &retention_inputs(
-                Some(vec![declared_ref(0)]),
-                &[(ConfigLayer::SystemOwnerPolicy, Some(Vec::new()))],
-            ),
-        )
-        .expect_err("an always-refusing issuer must be refused");
-        assert!(
-            emptied
-                .to_string()
-                .contains("no declared retention policy ref"),
-            "unexpected: {emptied}"
-        );
-
-        let unseeded = resolve_canonical_retention_set(
-            RETENTION_POLICY_SETTING_KEY,
-            &retention_inputs(None, &[]),
-        )
-        .expect_err("the broadest layer must seed the chain");
-        assert!(
-            unseeded.to_string().contains("compiled safe defaults"),
-            "unexpected: {unseeded}"
-        );
-
-        let repeated = resolve_canonical_retention_set(
-            RETENTION_POLICY_SETTING_KEY,
-            &retention_inputs(
-                Some(vec![declared_ref(0)]),
-                &[(
-                    ConfigLayer::ExactHumanApproval,
-                    Some(vec![declared_ref(0), declared_ref(0)]),
-                )],
-            ),
-        )
-        .expect_err("a repeated ref is ambiguous");
-        assert!(
-            repeated.to_string().contains("duplicate"),
-            "unexpected: {repeated}"
-        );
-    }
-
-    #[test]
-    fn declared_set_documents_decode_by_key_and_do_not_cross_chains() {
-        let standard = declared_ref(0);
-        let toml = format!(
-            "layer = \"system_owner_policy\"\nkey = \"{RETENTION_POLICY_SETTING_KEY}\"\npolicy_refs = [\"{standard}\"]\n"
-        );
-        let decoded = parse_canonical_layer_toml(&toml).expect("retention document must decode");
-        match decoded {
-            DecodedLayerInput::Retention(RetentionLayerInput {
-                layer,
-                policy_refs: Some(decoded_refs),
-            }) => {
-                assert_eq!(layer, ConfigLayer::SystemOwnerPolicy);
-                assert_eq!(decoded_refs, vec![standard.clone()]);
-            }
-            other => panic!("retention document decoded as the wrong chain: {other:?}"),
-        }
-        // The retention document contributes to the retention chain only; the
-        // numeric chain must not read it, and vice versa.
-        let documents = [PolicyDocument {
-            file_name: "policy.toml",
-            bytes: toml.as_bytes(),
-        }];
-        assert_eq!(
-            resolve_effective_configuration(&documents)
-                .expect("numeric chain unaffected")
-                .winning_value(),
-            COMPILED_SAFE_DEFAULT_PER_JOB_BUDGET
-        );
-        assert_eq!(
-            resolve_effective_retention_set(&documents)
-                .expect("retention chain resolves")
-                .policy_refs(),
-            eliot_config::compiled_default_retention_policy_refs()
-        );
-
-        // A budget field inside a retention document, or a retention field inside
-        // a budget document, is a schema rejection rather than a defaulted value.
-        let crossed = format!(
-            "layer = \"task_policy\"\nkey = \"{RETENTION_POLICY_SETTING_KEY}\"\nlimit = 10\n"
-        );
-        assert!(
-            parse_canonical_layer_toml(&crossed)
-                .expect_err("a numeric field cannot cross into the retention chain")
-                .to_string()
-                .contains("schema rejected")
-        );
-        let crossed_other = format!(
-            "layer = \"task_policy\"\nkey = \"{CANONICAL_SETTING_KEY}\"\npolicy_refs = [\"{standard}\"]\n"
-        );
-        assert!(
-            parse_canonical_layer_toml(&crossed_other)
-                .expect_err("a ref array cannot cross into the numeric chain")
-                .to_string()
-                .contains("schema rejected")
-        );
-
-        // A duplicated ref list is refused at decode rather than collapsed, so
-        // a document cannot mean either a set or a scalar.
-        let repeated = format!(
-            "layer = \"system_owner_policy\"\nkey = \"{RETENTION_POLICY_SETTING_KEY}\"\npolicy_refs = [{standard},{standard}]\n"
-        );
-        assert!(
-            parse_canonical_layer_toml(&repeated)
-                .expect_err("a repeated ref is ambiguous")
-                .to_string()
-                .contains("duplicate")
-        );
-        let blank = format!(
-            "layer = \"system_owner_policy\"\nkey = \"{RETENTION_POLICY_SETTING_KEY}\"\npolicy_refs = [\"\"]\n"
-        );
-        assert!(
-            parse_canonical_layer_toml(&blank)
-                .expect_err("a blank ref is not a declaration")
-                .to_string()
-                .contains("blank")
-        );
+                .filter_map(|key| schema[*key].as_array())
+                .flatten()
+                .any(schema_accepts_null)
     }
 }
