@@ -603,6 +603,40 @@ mod tests {
     }
 
     #[test]
+    fn one_owner_claiming_two_cells_is_duplicate_owner() {
+        // Arm (I2.23 second-owner defect): the real
+        // `governor.daemon.startup-binding` row is pointed at the composition
+        // owner, so one symbol would own two mutable states. The guard must
+        // refuse on that defect even though refs and owner rows still agree
+        // one-for-one, and must name both cells.
+        let result = enforce_mutated_manifest(
+            &owner_row(
+                "governor.daemon.startup-binding",
+                "startup-capability-bindings",
+                "eliotd::StartupCapabilityBindings",
+            ),
+            &owner_row(
+                "governor.daemon.startup-binding",
+                "startup-capability-bindings",
+                "eliotd::DaemonComposition",
+            ),
+        );
+
+        let Err(error) = result else {
+            panic!("two cells sharing one mutable-state owner must not parse");
+        };
+        assert_eq!(
+            error,
+            super::CellRegistryError::DuplicateOwner {
+                owner: "eliotd::DaemonComposition".to_owned(),
+                first_cell: "governor.daemon.composition".to_owned(),
+                second_cell: "governor.daemon.startup-binding".to_owned(),
+            },
+            "the typed refusal must name the shared owner and both cells"
+        );
+    }
+
+    #[test]
     fn owner_row_without_its_ref_is_refs_owners_mismatch() {
         // Arm: the real `governor.daemon.operator-replay` owner row is renamed
         // to a cell the declaration does not declare, so refs and owner rows
