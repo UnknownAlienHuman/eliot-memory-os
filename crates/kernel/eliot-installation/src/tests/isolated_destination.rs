@@ -868,7 +868,7 @@ impl LiveArea {
         let LiveArea {
             lease,
             path,
-            serial,
+            _serial: serial,
         } = self;
         drop(lease);
         let _ = std::fs::remove_dir_all(path);
