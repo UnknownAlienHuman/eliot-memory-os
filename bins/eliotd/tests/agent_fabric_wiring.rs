@@ -15,7 +15,11 @@ use eliot_agent_api::{
     AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, BudgetEnvelope, EffectCeiling, EffectKind,
     LaunchRequestId, LowercaseSha256, RouteFingerprint, TaskId, WorkUnitId,
 };
-use eliot_agent_contracts::RevisionId;
+use eliot_agent_contracts::{
+    ExecutionUpdateProposal, RevisionId, SemanticCeilings, SwarmAdmissionId, SwarmCoordinatorLease,
+    SwarmDefinitionId, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
+    SwarmPlanAdmission, SwarmPlanDefinition, SwarmPlanDefinitionLifecycle, TaskControllerLease,
+};
 use eliot_agent_coordinator::{
     CandidateId, CoordinatorConfig, LearningRole, RecipeId, RecipeManifest, RoleProfileId,
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
@@ -27,14 +31,20 @@ use eliot_governor::{
     CapabilityEvidenceRecord, CapabilitySource, CapabilityStatus, RouteScopeFingerprint,
 };
 use eliot_security_contracts::PrivacyClass;
+use eliot_store_api::{
+    CommitId, OperationId, OperationManifestDigest, OrderingHead, Resubmission,
+    SwarmOwnerAuthorization, SwarmOwnerRevision, SwarmSemanticOwnerKind, TransitionClass,
+    WriteReceipt, WriteReceiptStatus,
+};
 use eliotd::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE, CancellationLifecycle, DispatchAck,
     DispatchEgressPort, DispatchIntent, FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION,
-    FabricAdmission, FabricError, FabricPorts, GovernorCapabilityAdmission, ModelRegistryPort,
-    PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
-    SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config, plan_candidate,
-    prereq_ports,
+    FabricAdmission, FabricError, FabricPorts, FabricSnapshot, GovernorCapabilityAdmission,
+    ModelRegistryPort, PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements,
+    SwarmControlPort, SwarmDefinition, SwarmEntryReceipt, WorkerAck, daemon_coordinator_config,
+    plan_candidate, prereq_ports,
+    semantic_revision_store::SEMANTIC_REVISION_DIR,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1916,5 +1926,811 @@ fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
     );
     assert_eq!(counter_value(&world.admission.stage_calls), 0);
     assert_eq!(counter_value(&world.admission.commit_calls), 0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1702 A1: the production caller of the contract refusal.
+//
+// `AgentFabric::record_semantic_execution` is the one production path that
+// accepts a coordinator `SwarmExecutionRevision` and publishes it through the
+// canonical `SemanticRevisionStore::commit`. A second revision presented under
+// an execution identity the fabric already holds is an execution UPDATE, so
+// that path runs `AgentFabric::check_semantic_execution_update` — which applies
+// the old-wave disposition gate and then the contract owner's own
+// `check_execution_update` — before the revision can become current. The
+// fixtures below build the real records and the real durable Store evidence
+// those methods require; no authority is short-circuited.
+// ---------------------------------------------------------------------------
+
+const SWARM_TASK_CONTROLLER: &str = "task-controller-1702";
+const SWARM_COORDINATOR: &str = "swarm-coordinator-1702";
+
+fn swarm_ceilings() -> SemanticCeilings {
+    SemanticCeilings {
+        privacy_class: "privacy-internal".to_owned(),
+        budget_ref: "budget-ref-1702".to_owned(),
+        route_classes: vec!["route-class-a".to_owned()],
+        max_depth: 3,
+        max_fanout: 4,
+        max_wip: 2,
+    }
+}
+
+/// A frozen Task-Controller definition whose `definition_digest` really binds
+/// its own frozen content, so the contract validator accepts it.
+fn frozen_swarm_definition(fence: &StateFence, suffix: &str) -> TestResult<SwarmPlanDefinition> {
+    let mut definition = SwarmPlanDefinition {
+        definition_id: SwarmDefinitionId::new(format!("definition-1702-{suffix}"))
+            .expect("definition id"),
+        definition_revision: RevisionId::new("1").expect("definition revision"),
+        lifecycle: SwarmPlanDefinitionLifecycle::Frozen,
+        task_id: format!("task-1702-{suffix}"),
+        task_revision: "1".to_owned(),
+        recipe_id: "recipe-1702".to_owned(),
+        recipe_revision: RevisionId::new("1").expect("recipe revision"),
+        controller: TaskControllerLease {
+            holder: SWARM_TASK_CONTROLLER.to_owned(),
+            epoch: 1,
+        },
+        objective_ref: "objective-1702".to_owned(),
+        acceptance_refs: vec!["acceptance-1702-a".to_owned()],
+        root_context_revision: "root-1702".to_owned(),
+        work_graph_digest: sha256_hex(b"work-graph-1702"),
+        definition_digest: String::new(),
+        ceilings: swarm_ceilings(),
+        stop_conditions_digest: sha256_hex(b"stop-conditions-1702"),
+        supersedes: None,
+        state_fence: fence.clone(),
+    };
+    definition.definition_digest = definition
+        .content_digest()
+        .expect("definition content digest");
+    Ok(definition)
+}
+
+fn admitted_swarm_admission(
+    definition: &SwarmPlanDefinition,
+    fence: &StateFence,
+) -> SwarmPlanAdmission {
+    SwarmPlanAdmission::admit_for(
+        definition,
+        SwarmAdmissionId::new("admission-1702").expect("admission id"),
+        definition.ceilings.clone(),
+        "governor-receipt-1702".to_owned(),
+        fence.clone(),
+    )
+    .expect("admitted admission")
+}
+
+/// The real owner-issued Store evidence one semantic write requires: canonical
+/// record bytes, the owner revision that commits exactly those bytes, and a
+/// `Committed` task-control receipt carrying that revision's ordering head.
+struct DurableSwarmCommit {
+    revision: SwarmOwnerRevision,
+    receipt: WriteReceipt,
+}
+
+fn durable_swarm_commit<T: serde::Serialize>(
+    owner_kind: SwarmSemanticOwnerKind,
+    owner_id: &str,
+    record: &T,
+    fence: &StateFence,
+    revision: u64,
+) -> TestResult<DurableSwarmCommit> {
+    let value = serde_json::to_value(record).map_err(|error| format!("encode record: {error}"))?;
+    let bytes = eliot_contracts::canonical_json_bytes(&value)?;
+    let content_digest = sha256_hex(&bytes);
+    let canonical_request_hash = sha256_hex(bytes.as_slice());
+    let owner_revision = SwarmOwnerRevision {
+        owner_kind,
+        authorization: SwarmOwnerAuthorization {
+            owner_kind,
+            presenter: match owner_kind {
+                SwarmSemanticOwnerKind::AgentCoordinator => SWARM_COORDINATOR.to_owned(),
+                SwarmSemanticOwnerKind::TaskController => SWARM_TASK_CONTROLLER.to_owned(),
+                SwarmSemanticOwnerKind::Governor => "governor-1702".to_owned(),
+            },
+            epoch: 1,
+        },
+        owner_id: owner_id.to_owned(),
+        revision,
+        expected_predecessor: revision.checked_sub(1).filter(|predecessor| *predecessor > 0),
+        content_digest,
+        record_json: String::from_utf8(bytes)
+            .map_err(|error| format!("canonical record bytes are not utf-8: {error}"))?,
+    };
+    owner_revision
+        .validate()
+        .map_err(|error| format!("owner revision fixture must validate: {error}"))?;
+    let scope = owner_revision.ordering_scope()?;
+    let receipt = WriteReceipt {
+        operation_id: OperationId::new(&format!("operation-1702-{owner_id}-{revision}"))?,
+        idempotency_key: format!("idempotency-1702-{owner_id}-{revision}"),
+        canonical_request_hash,
+        transition_class: TransitionClass::TaskControl,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new(&format!(
+            "commit-1702-{owner_id}-{revision}"
+        ))?),
+        state_fence: fence.clone(),
+        ordering_sequences: vec![OrderingHead {
+            scope,
+            sequence: revision,
+            state_fence: fence.clone(),
+        }],
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec![format!("command-1702-{owner_id}")],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: OperationManifestDigest::new(&format!(
+            "manifest-1702-{owner_id}"
+        ))?,
+        admission_digest: sha256_hex(b"admission-digest-1702"),
+        mutation_plan_digest: sha256_hex(b"mutation-plan-digest-1702"),
+        semantic_source_revisions: Vec::new(),
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: fence.policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some("2026-01-01T00:00:00Z".to_owned()),
+        envelope: None,
+    };
+    receipt
+        .validate()
+        .map_err(|error| format!("receipt fixture must validate: {error}"))?;
+    Ok(DurableSwarmCommit {
+        revision: owner_revision,
+        receipt,
+    })
+}
+
+/// A private protected state root for one test's owner-separated revision
+/// envelope. The store writes under a protected runtime path lease whose root
+/// is this exact directory, so the test's envelope lands on real durable
+/// storage rather than in-memory state, and both are torn down with the value.
+struct SwarmStateRoot {
+    root: std::path::PathBuf,
+    _override: eliot_platform_windows::test_support::ProtectedRootOverride,
+}
+
+impl SwarmStateRoot {
+    fn new(suffix: &str) -> TestResult<Self> {
+        let root = std::env::temp_dir().join(format!(
+            "eliotd-1702-semantic-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("state root {}: {error}", root.display()))?;
+        // The guard canonicalizes its own test root through
+        // `canonical_windows_path`, which drops the `\\?\` verbatim prefix that
+        // `std::fs::canonicalize` hands back. Resolving the root through that
+        // same helper keeps the state root and the protected contour in one
+        // path form, so the leaf this store owns stays inside the contour
+        // instead of being refused as outside it.
+        let root = eliot_platform_windows::canonical_windows_path(&root)
+            .map_err(|error| format!("canonicalize state root {}: {error}", root.display()))?;
+        // The store owns `<state root>/<SEMANTIC_REVISION_DIR>/owner-revisions.json`
+        // and does not create that directory itself, while the protected runtime
+        // path lease resolves the absent leaf's parent to decide the contour.
+        // This fixture owns the root, so it supplies the shape the store expects
+        // and the lease has a real parent to resolve. `Drop` removes the whole
+        // tree, so the directory is torn down with the root.
+        let revision_dir = root.join(SEMANTIC_REVISION_DIR);
+        std::fs::create_dir_all(&revision_dir).map_err(|error| {
+            format!(
+                "revision directory {}: {error}",
+                revision_dir.display()
+            )
+        })?;
+        let override_root = eliot_platform_windows::test_support::override_protected_root(&root);
+        Ok(Self {
+            root,
+            _override: override_root,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
+impl Drop for SwarmStateRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Registers, admits and launches one live semantic wave, returning the running
+/// execution revision this fabric now holds as current.
+fn admitted_running_execution(
+    fabric: &mut AgentFabric,
+    fence: &StateFence,
+    suffix: &str,
+    revision: u64,
+) -> TestResult<SwarmExecutionRevision> {
+    let definition = frozen_swarm_definition(fence, suffix)?;
+    let admission = admitted_swarm_admission(&definition, fence);
+    let execution = SwarmExecutionRevision::begin(
+        &definition,
+        &admission,
+        SwarmExecutionId::new("execution-1702").expect("execution id"),
+        SwarmCoordinatorLease {
+            holder: SWARM_COORDINATOR.to_owned(),
+            epoch: 1,
+        },
+        RevisionId::new("1").expect("wave"),
+        sha256_hex(b"coverage-1702-empty"),
+    )
+    .expect("execution begun");
+    let running = SwarmExecutionRevision {
+        state: SwarmExecutionState::Running,
+        ..execution
+    };
+
+    let definition_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::TaskController,
+        definition.definition_id.as_str(),
+        &definition,
+        fence,
+        revision,
+    )?;
+    fabric.register_semantic_definition(
+        definition.clone(),
+        SWARM_TASK_CONTROLLER,
+        1,
+        &definition_commit.revision,
+        &definition_commit.receipt,
+    )?;
+    let admission_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::Governor,
+        admission.admission_id.as_str(),
+        &admission,
+        fence,
+        revision,
+    )?;
+    fabric.bind_semantic_admission(
+        admission.clone(),
+        &admission_commit.revision,
+        &admission_commit.receipt,
+    )?;
+    let execution_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        running.execution_id.as_str(),
+        &running,
+        fence,
+        revision,
+    )?;
+    fabric.record_semantic_execution(
+        running.clone(),
+        SWARM_COORDINATOR,
+        1,
+        &execution_commit.revision,
+        &execution_commit.receipt,
+    )?;
+    Ok(running)
+}
+
+// WORK_UNIT_CASE: 1702/A1 — mechanical execution update is admitted. The
+// production caller `AgentFabric::record_semantic_execution` routes a changed
+// revision under a held execution identity through the contract refusal before
+// accepting it; a coordinator advancing its own running wave — the recorded
+// state edge and the coverage handle moving, wave and root unchanged — passes
+// that guard and is durably committed, so the update path is reachable rather
+// than refused for every input.
+#[test]
+fn mechanical_semantic_execution_update_is_admitted_and_committed() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("advance")?;
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "advance", 1)?;
+
+    // The mechanical advance: RUNNING -> PAUSED, new coverage, same wave, same
+    // root, same frozen definition digest, same admitted ceilings.
+    let advanced = SwarmExecutionRevision {
+        state: SwarmExecutionState::Paused,
+        coverage_digest: sha256_hex(b"coverage-1702-advanced"),
+        ..running.clone()
+    };
+    let commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        advanced.execution_id.as_str(),
+        &advanced,
+        &fence,
+        2,
+    )?;
+    world.fabric.record_semantic_execution(
+        advanced.clone(),
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    )?;
+
+    // The advance is current, durably, under its own execution identity.
+    let stored = world.fabric.snapshot()?;
+    let current = stored
+        .semantic_executions
+        .get(advanced.execution_id.as_str())
+        .ok_or("advanced execution must be current")?;
+    assert_eq!(current, &advanced);
+    assert_eq!(
+        world
+            .fabric
+            .ledger_events()
+            .into_iter()
+            .filter(|event| event == "semantic_execution_updated")
+            .count(),
+        1,
+        "the update must record itself on the ledger"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a semantic execution update is refused. The same
+// production caller refuses an update that moves a frozen dimension: here the
+// wave is substituted in place, which is the exact change
+// `check_execution_update` reports as `SemanticDrift("update.wave")`. The
+// typed refusal reaches the caller — nothing is swallowed, and the previously
+// current revision stays current because the guard refuses before the map moves
+// or the durable commit runs.
+#[test]
+fn semantic_execution_update_changing_frozen_wave_is_refused_typed() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("drift")?;
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "drift", 1)?;
+
+    // In-place wave substitution: the wave moves while the definition digest is
+    // unchanged, so the frozen root/wave pairing this execution was admitted
+    // under is rewritten rather than re-admitted.
+    let drifted = SwarmExecutionRevision {
+        wave: RevisionId::new("2").expect("drifted wave"),
+        state: SwarmExecutionState::Paused,
+        coverage_digest: sha256_hex(b"coverage-1702-drifted"),
+        ..running.clone()
+    };
+    let commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        drifted.execution_id.as_str(),
+        &drifted,
+        &fence,
+        2,
+    )?;
+    match world.fabric.record_semantic_execution(
+        drifted,
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    ) {
+        Err(FabricError::SemanticDrift(field)) => assert_eq!(field, "update.wave"),
+        other => {
+            return Err(format!(
+                "semantic wave change must refuse typed SemanticDrift, got {other:?}"
+            )
+            .into());
+        }
+    }
+
+    // Nothing moved: the previously current revision is still exactly what this
+    // fabric holds, and the refused update was never recorded as current.
+    let stored = world.fabric.snapshot()?;
+    let current = stored
+        .semantic_executions
+        .get(running.execution_id.as_str())
+        .ok_or("execution must remain current")?;
+    assert_eq!(current, &running);
+    assert!(
+        !world
+            .fabric
+            .ledger_events()
+            .into_iter()
+            .any(|event| event == "semantic_execution_updated"),
+        "a refused update must not record an update"
+    );
+    Ok(())
+}
+
+/// Requires the refusal to be the typed one and to name the exact drifted
+/// field. Asserting only "an error came back" would prove nothing about which
+/// dimension was refused, so the field name is part of the claim.
+fn assert_semantic_drift(result: Result<(), FabricError>, field: &str, case: &str) -> TestResult {
+    match result {
+        Err(FabricError::SemanticDrift(refused)) => {
+            assert_eq!(refused, field, "{case} must refuse the exact drifted field");
+            Ok(())
+        }
+        other => {
+            Err(format!("{case} must refuse typed SemanticDrift({field}), got {other:?}").into())
+        }
+    }
+}
+
+/// The frozen content one live execution runs under: the definition's five
+/// dimensions plus the wave and root the execution itself carries, so a base
+/// proposal restates the exact content a strict caller would claim.
+struct FrozenSwarmContent {
+    work_graph_digest: String,
+    objective_ref: String,
+    acceptance_refs: Vec<String>,
+    ceilings: SemanticCeilings,
+    stop_conditions_digest: String,
+    wave: RevisionId,
+    root_context_revision: String,
+}
+
+/// Reads back the frozen plan content the live definition, admission and
+/// execution really carry, from the fabric's own maps rather than from a
+/// restated fixture.
+fn frozen_swarm_content(snapshot: &FabricSnapshot, suffix: &str) -> TestResult<FrozenSwarmContent> {
+    let definition = snapshot
+        .semantic_definitions
+        .get(&format!("definition-1702-{suffix}"))
+        .ok_or("registered definition must be readable back")?;
+    let admission = snapshot
+        .semantic_admissions
+        .get("admission-1702")
+        .ok_or("bound admission must be readable back")?;
+    let execution = snapshot
+        .semantic_executions
+        .get("execution-1702")
+        .ok_or("recorded execution must be readable back")?;
+    Ok(FrozenSwarmContent {
+        work_graph_digest: definition.work_graph_digest.clone(),
+        objective_ref: definition.objective_ref.clone(),
+        acceptance_refs: definition.acceptance_refs.clone(),
+        ceilings: admission.admitted_ceilings.clone(),
+        stop_conditions_digest: definition.stop_conditions_digest.clone(),
+        wave: execution.wave.clone(),
+        root_context_revision: execution.root_context_revision.clone(),
+    })
+}
+
+/// A proposal that CLAIMS every frozen dimension at its exact admitted value:
+/// the live execution identity, wave and root, the definition's work graph,
+/// objective, acceptance and stop conditions, and the admitted ceilings. The
+/// one mutation a caller may apply is the single drifted dimension under test,
+/// so a refusal can only be that dimension's.
+fn claimed_semantic_proposal(
+    frozen: &FrozenSwarmContent,
+    drift: impl FnOnce(&mut ExecutionUpdateProposal),
+) -> ExecutionUpdateProposal {
+    let mut proposal = ExecutionUpdateProposal {
+        execution_id: SwarmExecutionId::new("execution-1702").expect("execution id"),
+        wave: frozen.wave.clone(),
+        work_graph_digest: Some(frozen.work_graph_digest.clone()),
+        objective_ref: Some(frozen.objective_ref.clone()),
+        acceptance_refs: Some(frozen.acceptance_refs.clone()),
+        ceilings: Some(frozen.ceilings.clone()),
+        stop_conditions_digest: Some(frozen.stop_conditions_digest.clone()),
+        root_context_revision: Some(frozen.root_context_revision.clone()),
+    };
+    drift(&mut proposal);
+    proposal
+}
+
+/// Runs one claimed change of exactly one frozen dimension against the same
+/// live execution identity and demands the contract's typed refusal of THAT
+/// field.
+fn assert_claimed_dimension_refused(
+    name: &str,
+    dimension: &str,
+    drift: impl FnOnce(&FrozenSwarmContent) -> ExecutionUpdateProposal,
+) -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new(name)?;
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, name, 1)?;
+
+    // The proposal CLAIMS a changed value for one dimension and restates every
+    // other dimension exactly as frozen. `None` means unclaimed, so an absent
+    // field would prove nothing: this fixture's whole claim is that `Some(..)`
+    // with drifted content is what the guard refuses.
+    let frozen = frozen_swarm_content(&world.fabric.snapshot()?, name)?;
+    let proposal = drift(&frozen);
+    assert_semantic_drift(
+        world.fabric.check_semantic_execution_update(
+            &running.admission_id,
+            &running.execution_id,
+            &proposal,
+            SWARM_COORDINATOR,
+            1,
+        ),
+        dimension,
+        name,
+    )?;
+    // Refused is refused: the current revision never moved.
+    assert_eq!(
+        world
+            .fabric
+            .snapshot()?
+            .semantic_executions
+            .get(running.execution_id.as_str()),
+        Some(&running),
+        "{name} must leave the current execution revision untouched"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed work-graph change is refused. `Some(..)`
+// with content other than the frozen `work_graph_digest` is refused with
+// `SemanticDrift("update.work_graph_digest")`.
+#[test]
+fn claimed_work_graph_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused("workgraph", "update.work_graph_digest", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.work_graph_digest = Some(sha256_hex(b"work-graph-rewritten"));
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed objective change is refused with
+// `SemanticDrift("update.objective_ref")`.
+#[test]
+fn claimed_objective_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused("objective", "update.objective_ref", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.objective_ref = Some("objective-rewritten-1702".to_owned());
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed acceptance change is refused with
+// `SemanticDrift("update.acceptance_refs")`.
+#[test]
+fn claimed_acceptance_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused("acceptance", "update.acceptance_refs", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.acceptance_refs = Some(vec!["acceptance-rewritten-1702".to_owned()]);
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed budget/privacy/route-ceiling widening is
+// refused with `SemanticDrift("update.ceilings")`. Three separate widenings of
+// the one admitted ceiling set are checked, one per sub-dimension, because the
+// contract compares the whole `SemanticCeilings` as a set.
+#[test]
+fn claimed_budget_privacy_route_ceiling_widening_is_refused_typed() -> TestResult {
+    // The budget envelope handle the plan was admitted under.
+    assert_claimed_dimension_refused("ceilingbudget", "update.ceilings", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .budget_ref = "budget-ref-widened-1702".to_owned();
+        })
+    })?;
+
+    // The privacy class the plan was admitted under.
+    assert_claimed_dimension_refused("ceilingprivacy", "update.ceilings", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .privacy_class = "privacy-widened-1702".to_owned();
+        })
+    })?;
+
+    // The admissible route classes the plan was admitted under.
+    assert_claimed_dimension_refused("ceilingsroute", "update.ceilings", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .route_classes = vec![
+                "route-class-a".to_owned(),
+                "route-class-widened-1702".to_owned(),
+            ];
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed stop-conditions change is refused with
+// `SemanticDrift("update.stop_conditions_digest")`.
+#[test]
+fn claimed_stop_conditions_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused(
+        "stopconditions",
+        "update.stop_conditions_digest",
+        |frozen| {
+            claimed_semantic_proposal(frozen, |proposal| {
+                proposal.stop_conditions_digest = Some(sha256_hex(b"stop-conditions-rewritten"));
+            })
+        },
+    )
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed root-context change is refused with
+// `SemanticDrift("update.root_context_revision")`.
+#[test]
+fn claimed_root_context_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused("rootcontext", "update.root_context_revision", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.root_context_revision = Some("root-rewritten-1702".to_owned());
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a claimed foreign-execution change is refused with
+// `ForeignOwnerField("update.execution_id")`.
+#[test]
+fn claimed_foreign_execution_change_is_refused_typed() -> TestResult {
+    assert_claimed_dimension_refused("foreignexecution", "update.execution_id", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.execution_id =
+                SwarmExecutionId::new("execution-foreign-1702").expect("foreign execution id");
+        })
+    })
+}
+
+// WORK_UNIT_CASE: 1702/A1 — the FULLY CLAIMED, UNCHANGED proposal is admitted.
+// Every frozen dimension is claimed at its exact admitted value, so this is the
+// strictest reading of "advance mechanically, change nothing" that a caller can
+// express: it proves the guard does not refuse a proposal merely for naming the
+// plan it is running under.
+#[test]
+fn fully_claimed_unchanged_proposal_is_admitted() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("allclaimed")?;
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "allclaimed", 1)?;
+    let frozen = frozen_swarm_content(&world.fabric.snapshot()?, "allclaimed")?;
+
+    world.fabric.check_semantic_execution_update(
+        &running.admission_id,
+        &running.execution_id,
+        &claimed_semantic_proposal(&frozen, |_| {}),
+        SWARM_COORDINATOR,
+        1,
+    )?;
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a revision binding a digest that is no longer the
+// frozen definition is refused. A coordinator present carries none of the work
+// graph, objective, acceptance, ceilings or stop conditions on the execution
+// record, so a semantic rewrite can only reach them by re-authoring the
+// execution onto a different `definition_digest`. That is refused as a BROKEN
+// OWNERSHIP JOIN rather than as a work-graph drift:
+// `check_semantic_execution_update` hands `check_execution_update` the STORED
+// execution, definition and admission, so the presented revision never enters
+// those comparisons and `SemanticDrift("update.work_graph_digest")` cannot be
+// the refusal. The guard returns Ok here, and the refusal that actually fires is
+// `check_owner_join`'s execution-binding check run against the PRESENTED
+// revision — `BrokenOwnershipLink("execution binding")`. The rewrite is
+// stopped either way; the assertion pins the refusal that really happens rather
+// than the one this path would need a different entry point to produce.
+#[test]
+fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_typed() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("digest")?;
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "digest", 1)?;
+
+    // A real re-authored plan — different work graph, objective, acceptance and
+    // stop conditions — presented as this execution's own revision, durably
+    // committed under this coordinator's own owner stream. Nothing here is a
+    // stand-in: the substituted digest really does bind that rewritten content.
+    let mut rewritten = frozen_swarm_definition(&fence, "rewritten")?;
+    rewritten.work_graph_digest = sha256_hex(b"work-graph-rewritten-1702");
+    rewritten.objective_ref = "objective-rewritten-1702".to_owned();
+    rewritten.acceptance_refs = vec!["acceptance-rewritten-1702".to_owned()];
+    rewritten.stop_conditions_digest = sha256_hex(b"stop-conditions-rewritten-1702");
+    rewritten.definition_digest = rewritten
+        .content_digest()
+        .expect("rewritten definition content digest");
+    let rewritten_execution = SwarmExecutionRevision {
+        definition_digest: rewritten.definition_digest.clone(),
+        state: SwarmExecutionState::Paused,
+        coverage_digest: sha256_hex(b"coverage-1702-rewritten"),
+        ..running.clone()
+    };
+    let commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        rewritten_execution.execution_id.as_str(),
+        &rewritten_execution,
+        &fence,
+        2,
+    )?;
+
+    match world.fabric.record_semantic_execution(
+        rewritten_execution,
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    ) {
+        Err(FabricError::BrokenOwnershipLink(refused)) => {
+            assert_eq!(
+                refused, "execution binding",
+                "a foreign digest must refuse as the broken execution binding it is"
+            );
+        }
+        other => {
+            return Err(format!(
+                "foreign definition digest must refuse the broken execution binding, got {other:?}"
+            )
+            .into());
+        }
+    }
+
+    // Refused is refused: the previously current revision is still exactly what
+    // this fabric holds, and nothing was recorded as an update.
+    let stored = world.fabric.snapshot()?;
+    assert_eq!(
+        stored
+            .semantic_executions
+            .get(running.execution_id.as_str()),
+        Some(&running),
+        "a foreign-digest update must leave the current revision untouched"
+    );
+    assert!(
+        !world
+            .fabric
+            .ledger_events()
+            .into_iter()
+            .any(|event| event == "semantic_execution_updated"),
+        "a refused update must not record an update"
+    );
     Ok(())
 }

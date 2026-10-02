@@ -81,8 +81,9 @@ use eliot_agent_contracts::{
     ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
     SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
     SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
-    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_update,
-    check_owner_join, check_stored_links, check_supersession, join_view, reassign_coordinator,
+    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author,
+    check_execution_transition, check_execution_update, check_owner_join, check_stored_links,
+    check_supersession, join_view, reassign_coordinator,
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
@@ -1354,6 +1355,66 @@ fn contract_rejection(error: eliot_agent_contracts::ContractError) -> FabricErro
             FabricError::BrokenOwnershipLink(link.to_owned())
         }
         other => FabricError::Contract(format!("semantic contract: {other}")),
+    }
+}
+
+/// Derives the update proposal a presented execution revision claims.
+///
+/// `Some(..)` means CLAIMED — the proposal asserts that exact value, and
+/// [`check_execution_update`] refuses the update when it differs from the
+/// frozen content (`None` would assert nothing and be unchecked). So every
+/// field a coordinator present names is claimed here, and a revision that
+/// moves a frozen dimension cannot reach currency unchecked.
+///
+/// A `SwarmExecutionRevision` names two of the six frozen dimensions on the
+/// record itself — its `wave` and its `root_context_revision` — so those are
+/// claimed verbatim from the presented revision and the guard compares them
+/// against the stored execution's wave and the frozen root.
+///
+/// The other four live on the frozen `SwarmPlanDefinition` this revision
+/// binds, which is the admission's own definition. Naming that frozen content
+/// verbatim is NOT an independent claim of it, and this is worth stating
+/// exactly, because the difference decides which refusal a rewrite actually
+/// meets: [`check_semantic_execution_update`] resolves the STORED execution,
+/// definition and admission by identity and hands those — never the presented
+/// revision — to [`check_execution_update`], whose work-graph, objective,
+/// acceptance, ceilings and stop-conditions arms each compare a claim taken
+/// from one stored record against the same stored record. On this path those
+/// four `SemanticDrift` arms are therefore tautological and cannot refuse, and
+/// `SemanticDrift("update.work_graph_digest")` is unreachable here.
+///
+/// What refuses a semantic rewrite is the ownership join the PRESENTED
+/// revision still owes once the guard returns:
+/// [`AgentFabric::record_semantic_execution`] re-runs [`check_owner_join`]
+/// against the presented revision, so a revision re-authored onto a different
+/// `definition_digest` fails the execution-BINDING check with
+/// `BrokenOwnershipLink("execution binding")` — a broken join, not a work-graph
+/// drift. [`check_execution_update`] carries the same binding condition
+/// (`eliot-agent-contracts/src/lib.rs:2125-2130`), but it is handed the stored
+/// revision, so the two records agree there by construction.
+///
+/// `wave` and `root_context_revision` are the only two dimensions a coordinator
+/// revision really carries, and they are the two that stay comparable: the wave
+/// against the stored revision's wave and the root against both the frozen root
+/// and the stored revision's root.
+///
+/// This is a derivation, not a comparison. Every field-vs-frozen decision is
+/// made once, by the contract owner, inside
+/// [`check_semantic_execution_update`].
+fn execution_update_proposal(
+    definition: &SwarmPlanDefinition,
+    admission: &SwarmPlanAdmission,
+    execution: &SwarmExecutionRevision,
+) -> ExecutionUpdateProposal {
+    ExecutionUpdateProposal {
+        execution_id: execution.execution_id.clone(),
+        wave: execution.wave.clone(),
+        work_graph_digest: Some(definition.work_graph_digest.clone()),
+        objective_ref: Some(definition.objective_ref.clone()),
+        acceptance_refs: Some(definition.acceptance_refs.clone()),
+        ceilings: Some(admission.admitted_ceilings.clone()),
+        stop_conditions_digest: Some(definition.stop_conditions_digest.clone()),
+        root_context_revision: Some(execution.root_context_revision.clone()),
     }
 }
 
@@ -3217,9 +3278,24 @@ impl AgentFabric {
     /// live wave takes new execution identities: once a replacement
     /// definition is recorded, or once the admission leaves `ADMITTED`, the
     /// old wave freezes and new identities record through the replacement
-    /// admission. Same-identity replay is exact; changed content conflicts.
-    /// Terminal states are retained verbatim: history is never rewritten and
-    /// `UNKNOWN_OUTCOME` never becomes a clean failure here.
+    /// admission. Same-identity replay is exact. Terminal states are retained
+    /// verbatim: history is never rewritten and `UNKNOWN_OUTCOME` never becomes
+    /// a clean failure here.
+    ///
+    /// #1702 A1: a DIFFERENT revision presented under an execution identity
+    /// this fabric already holds is a semantic execution UPDATE, and this is
+    /// the production caller of [`AgentFabric::check_semantic_execution_update`].
+    /// An update is checked as an update before it can become current, so a
+    /// mechanical advance (the recorded state edge and the coverage handle
+    /// moving, the wave and root unchanged) is admitted and committed while an
+    /// attempt to change the work graph, objective, acceptance,
+    /// budget/privacy/route ceilings or stop conditions is refused with the
+    /// typed [`FabricError::SemanticDrift`] naming the exact field — the same
+    /// refusal a brand-new execution identity would meet, because a semantic
+    /// change is never an execution update at all. Nothing about the guard is
+    /// re-implemented here: the proposal is derived from the presented
+    /// revision by [`execution_update_proposal`] and every field-vs-frozen
+    /// decision belongs to the contract owner.
     ///
     /// The execution revision is published as current only after the canonical
     /// Store transaction that durably persists it committed; see
@@ -3233,9 +3309,9 @@ impl AgentFabric {
     /// coordinator, [`FabricError::Superseded`] for a new identity under a
     /// superseded definition, [`FabricError::RevisionNotDurable`] when the
     /// durable commit is absent or does not bind this exact owner stream and
-    /// revision, the semantic contract rejection for a broken join, or
-    /// [`FabricError::DefinitionConflict`] for changed content under a live
-    /// execution identity.
+    /// revision, [`FabricError::SemanticDrift`] for an update attempting to
+    /// change frozen plan semantics, or the semantic contract rejection for a
+    /// broken join and an illegal state edge.
     pub fn record_semantic_execution(
         &mut self,
         execution: SwarmExecutionRevision,
@@ -3277,9 +3353,44 @@ impl AgentFabric {
                 self.record("semantic_execution_replayed", &key);
                 return Ok(());
             }
-            return Err(FabricError::DefinitionConflict(format!(
-                "semantic execution {key} reused with different bytes"
-            )));
+            // #1702 A1: a second revision under an execution identity this
+            // fabric already holds is an EXECUTION UPDATE, not a second
+            // record, so it is checked as one. The typed semantic refusal
+            // (`SemanticDrift`, `StaleOwnerLease`, `Superseded`) is what a
+            // coordinator attempting to change frozen plan semantics meets
+            // here, instead of the same-identity generic conflict that cannot
+            // distinguish a mechanical wave advance from a semantic rewrite.
+            // The comparison itself stays with the contract owner: this call
+            // derives the proposal from the presented revision and hands it to
+            // `check_semantic_execution_update`, which applies the old-wave
+            // disposition gate and delegates to `check_execution_update`
+            // against the revision this fabric currently holds.
+            self.check_semantic_execution_update(
+                &execution.admission_id,
+                &execution.execution_id,
+                &execution_update_proposal(&definition, &admission, &execution),
+                coordinator_holder,
+                coordinator_epoch,
+            )?;
+            // The guard compared the STORED revision, so the presented one still
+            // owes the same ownership join a first revision does: it must bind
+            // this exact frozen definition and this exact admitted admission.
+            check_owner_join(&definition, &admission, &execution).map_err(contract_rejection)?;
+            // A mechanical update still has to be a legal I14.20 transition of
+            // the state it is advancing from; the guard above bounds WHICH
+            // content may move, this bounds the state edge itself.
+            check_execution_transition(stored.state, execution.state)
+                .map_err(contract_rejection)?;
+            self.semantic_executions.insert(key.clone(), execution);
+            // #1702 W2: the advanced revision is durable before it is reported
+            // current, exactly as the first revision of this identity was; an
+            // unproven write leaves the previous revision current.
+            if let Err(error) = self.publish_semantic_revision() {
+                self.semantic_executions.insert(key.clone(), stored);
+                return Err(error);
+            }
+            self.record("semantic_execution_updated", &key);
+            return Ok(());
         }
         if self
             .semantic_supersessions
