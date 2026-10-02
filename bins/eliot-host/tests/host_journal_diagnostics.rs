@@ -1,10 +1,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 //! F-LOG-HOST-6 (#981) focused journal/readiness/epoch/restart-recovery diagnostics via #889 facade only.
-//! Manager-scoped minimal set (6 tests; the 16-case matrix reconciles with caller children in #985):
+//! Manager-scoped minimal set (7 tests; the 16-case matrix reconciles with caller children in #985):
 //! T1 denominator + source/diff guard (issue cases 1, 16); T2 owner-epoch reopen (case 2);
 //! T3 append requested vs durable vs unknown + replay-as-readback (cases 3, 4, 11);
 //! T4 readiness evidence vs grant (cases 5, 6); T5 restart pending vs durable vs fenced (cases 7, 8, 9, 10);
 //! T6 one terminal + sink noninterference + redaction + determinism + cleanup primacy (cases 12, 13, 14, 15).
+//!
+//! Case 16 is the forbidden-construct guard: it scans the nine files for a new
+//! authority type, a duplicate facade call site, widened `pub` visibility, or a
+//! marker outside the file set, and never asserts that a label exists.
 use eliot_host::host_diagnostics::{
     DiagnosticSink, EntrypointStage, bound_detail, bound_field, observe_entrypoint_with_detail,
     observe_terminal_error, sink_status,
@@ -65,21 +69,19 @@ fn restart_req(id: &str, m: &str) -> eliot_host::HostRuntimeControlRequest {
     )
     .expect("req")
 }
+const NINE: [&str; 9] = [
+    "src/host_epoch_reopen.rs",
+    "src/journal_append.rs",
+    "src/journal_append/readiness_append.rs",
+    "src/readiness_gate.rs",
+    "src/readiness_gate/contract.rs",
+    "src/runtime_restart_state.rs",
+    "src/runtime_restart_state/pending_codec.rs",
+    "src/store_recovery_evidence.rs",
+    "src/store_recovery_fence.rs",
+];
 fn nine() -> String {
-    [
-        "src/host_epoch_reopen.rs",
-        "src/journal_append.rs",
-        "src/journal_append/readiness_append.rs",
-        "src/readiness_gate.rs",
-        "src/readiness_gate/contract.rs",
-        "src/runtime_restart_state.rs",
-        "src/runtime_restart_state/pending_codec.rs",
-        "src/store_recovery_evidence.rs",
-        "src/store_recovery_fence.rs",
-    ]
-    .into_iter()
-    .map(src)
-    .collect()
+    NINE.iter().map(|path| src(path)).collect()
 }
 // WORK_UNIT_CASE: 981/1
 #[test]
@@ -291,4 +293,142 @@ fn journal_06_terminal_sink_redaction_cleanup() {
             < r.find("pending_remove_attempt").expect("ord")
     );
     assert_eq!(f["stdout_protocol_contamination"].as_bool(), Some(false));
+}
+// WORK_UNIT_CASE: 981/16
+#[test]
+fn journal_16_no_new_authority_duplicate_facade_or_visibility() {
+    // Source/diff guard. This case scans for FORBIDDEN constructs only: a new
+    // schema/enum that could mint journal, epoch or recovery authority; a
+    // second `observe_*` facade call site beside the one per file; widened
+    // `pub` visibility; and a `#981` marker outside the nine-file set. It
+    // never asserts that any label exists, so it cannot pass by naming a
+    // string the implementation does not emit.
+    let all = nine();
+    // No new authority type: the nine files declare exactly the types the
+    // issue froze. A ninth vocabulary enum (a second fence, epoch, journal
+    // or recovery state machine) fails here instead of shipping silently.
+    let mut declared: Vec<String> = Vec::new();
+    for line in all.lines() {
+        let mut rest = line.trim_start();
+        for visibility in ["pub(crate) ", "pub(super) ", "pub "] {
+            if let Some(stripped) = rest.strip_prefix(visibility) {
+                rest = stripped;
+                break;
+            }
+        }
+        for keyword in ["struct ", "enum ", "trait "] {
+            if let Some(stripped) = rest.strip_prefix(keyword) {
+                let name = stripped
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    declared.push(format!("{keyword}{name}"));
+                }
+            }
+        }
+    }
+    declared.sort();
+    declared.dedup();
+    // Sorted so the frozen list below is compared as a set, not by position.
+    let expected: Vec<String> = [
+        "enum ActivePhaseBRebindRecoveryKind",
+        "enum ReadinessFailureKind",
+        "enum ReadinessGateAction",
+        "enum RuntimeRestartPendingPublication",
+        "enum StoreRecoveryStartupFence",
+        "struct ActivationIngress",
+        "struct HostReadinessGate",
+        "struct HostRestartBudget",
+        "struct ReadinessCadence",
+        "struct ReadinessContourIdentity",
+        "struct ReadinessLease",
+        "struct ReadinessRetry",
+        "struct RestartBudgetRecord",
+        "struct RuntimeRestartPendingIdentity",
+        "struct RuntimeRestartPendingRecord",
+        "struct StoreRecoveryInnerBinding",
+        "struct StoreRecoveryReopenFence",
+        "struct StoreRecoveryReopenInnerBinding",
+        "struct StoreRecoveryReopenTermination",
+        "struct StoreRecoveryTerminationEvidence",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        declared, expected,
+        "a new schema/enum in the nine files would create journal/epoch/recovery authority"
+    );
+    // No duplicate facade: exactly one observation helper and one facade call
+    // per instrumented file. A second `observe_*` call site is a second
+    // emitter; a second helper is a parallel vocabulary owner.
+    assert_eq!(
+        count(&all, "observe_entrypoint_with_detail("),
+        8,
+        "one facade call site per instrumented file"
+    );
+    assert_eq!(
+        count(&all, "observe_terminal_error"),
+        0,
+        "no second terminal emitter in the nine files"
+    );
+    for helper in [
+        "host_epoch_observe",
+        "host_journal_observe",
+        "host_readiness_append_observe",
+        "host_readiness_gate_observe",
+        "host_restart_observe",
+        "host_restart_pending_observe",
+        "host_recovery_observe",
+        "host_recovery_fence_observe",
+    ] {
+        assert_eq!(
+            count(&all, &format!("fn {helper}(")),
+            1,
+            "{helper} must be declared exactly once"
+        );
+    }
+    // No widened visibility: nothing in the nine files is crate-exported, so
+    // diagnostics gained no public logging surface. `pub(crate)` stays inside
+    // the readiness contract child and its parent only.
+    for line in all.lines() {
+        assert!(
+            !line.trim_start().starts_with("pub "),
+            "no bare pub item may be added: {line}"
+        );
+    }
+    for path in [
+        "src/host_epoch_reopen.rs",
+        "src/journal_append.rs",
+        "src/journal_append/readiness_append.rs",
+        "src/runtime_restart_state.rs",
+        "src/runtime_restart_state/pending_codec.rs",
+        "src/store_recovery_evidence.rs",
+        "src/store_recovery_fence.rs",
+        "src/readiness_gate.rs",
+    ] {
+        assert_eq!(
+            count(&src(path), "pub(crate) "),
+            0,
+            "{path} may not widen visibility beyond pub(super)"
+        );
+    }
+    // No unowned edit: the #981 marker appears only inside the nine-file set,
+    // and `contract.rs` stays a declared non-boundary that never observes.
+    for path in NINE {
+        let text = src(path);
+        if path.ends_with("contract.rs") {
+            assert!(
+                !text.contains("F-LOG-HOST-6 (#981)") && !text.contains("observe_"),
+                "contract.rs is an explicit non-boundary and must never observe"
+            );
+        } else {
+            assert_eq!(
+                count(&text, "F-LOG-HOST-6 (#981)"),
+                1,
+                "{path} must carry exactly one #981 instrumentation block"
+            );
+        }
+    }
 }
