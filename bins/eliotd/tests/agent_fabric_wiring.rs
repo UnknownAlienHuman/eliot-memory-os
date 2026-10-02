@@ -2047,7 +2047,9 @@ fn durable_swarm_commit<T: serde::Serialize>(
         canonical_request_hash: sha256_hex(bytes.as_slice()),
         transition_class: TransitionClass::TaskControl,
         status: WriteReceiptStatus::Committed,
-        commit_id: Some(CommitId::new(&format!("commit-1702-{owner_id}-{revision}"))?),
+        commit_id: Some(CommitId::new(&format!(
+            "commit-1702-{owner_id}-{revision}"
+        ))?),
         state_fence: fence.clone(),
         ordering_sequences: vec![OrderingHead {
             scope,
@@ -2104,8 +2106,7 @@ impl SwarmStateRoot {
             .map_err(|error| format!("state root {}: {error}", root.display()))?;
         let root = std::fs::canonicalize(&root)
             .map_err(|error| format!("canonicalize state root {}: {error}", root.display()))?;
-        let override_root =
-            eliot_platform_windows::test_support::override_protected_root(&root);
+        let override_root = eliot_platform_windows::test_support::override_protected_root(&root);
         Ok(Self {
             root,
             _override: override_root,
@@ -2211,7 +2212,9 @@ fn mechanical_semantic_execution_update_is_admitted_and_committed() -> TestResul
         false,
     )?;
     let state_root = SwarmStateRoot::new("advance")?;
-    world.fabric.attach_semantic_revision_store(state_root.path());
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
     let fence = test_fence()?;
     let running = admitted_running_execution(&mut world.fabric, &fence, "advance", 1)?;
 
@@ -2275,7 +2278,9 @@ fn semantic_execution_update_changing_frozen_wave_is_refused_typed() -> TestResu
         false,
     )?;
     let state_root = SwarmStateRoot::new("drift")?;
-    world.fabric.attach_semantic_revision_store(state_root.path());
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
     let fence = test_fence()?;
     let running = admitted_running_execution(&mut world.fabric, &fence, "drift", 1)?;
 
@@ -2339,10 +2344,9 @@ fn assert_semantic_drift(result: Result<(), FabricError>, field: &str, case: &st
             assert_eq!(refused, field, "{case} must refuse the exact drifted field");
             Ok(())
         }
-        other => Err(format!(
-            "{case} must refuse typed SemanticDrift({field}), got {other:?}"
-        )
-        .into()),
+        other => {
+            Err(format!("{case} must refuse typed SemanticDrift({field}), got {other:?}").into())
+        }
     }
 }
 
@@ -2362,10 +2366,7 @@ struct FrozenSwarmContent {
 /// Reads back the frozen plan content the live definition, admission and
 /// execution really carry, from the fabric's own maps rather than from a
 /// restated fixture.
-fn frozen_swarm_content(
-    snapshot: &FabricSnapshot,
-    suffix: &str,
-) -> TestResult<FrozenSwarmContent> {
+fn frozen_swarm_content(snapshot: &FabricSnapshot, suffix: &str) -> TestResult<FrozenSwarmContent> {
     let definition = snapshot
         .semantic_definitions
         .get(&format!("definition-1702-{suffix}"))
@@ -2429,7 +2430,9 @@ fn assert_claimed_dimension_refused(
         false,
     )?;
     let state_root = SwarmStateRoot::new(name)?;
-    world.fabric.attach_semantic_revision_store(state_root.path());
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
     let fence = test_fence()?;
     let running = admitted_running_execution(&mut world.fabric, &fence, name, 1)?;
 
@@ -2452,7 +2455,11 @@ fn assert_claimed_dimension_refused(
     )?;
     // Refused is refused: the current revision never moved.
     assert_eq!(
-        world.fabric.snapshot()?.semantic_executions.get(running.execution_id.as_str()),
+        world
+            .fabric
+            .snapshot()?
+            .semantic_executions
+            .get(running.execution_id.as_str()),
         Some(&running),
         "{name} must leave the current execution revision untouched"
     );
@@ -2464,45 +2471,33 @@ fn assert_claimed_dimension_refused(
 // `SemanticDrift("update.work_graph_digest")`.
 #[test]
 fn claimed_work_graph_change_is_refused_typed() -> TestResult {
-    assert_claimed_dimension_refused(
-        "workgraph",
-        "update.work_graph_digest",
-        |frozen| {
-            claimed_semantic_proposal(frozen, |proposal| {
-                proposal.work_graph_digest = Some(sha256_hex(b"work-graph-rewritten"));
-            })
-        },
-    )
+    assert_claimed_dimension_refused("workgraph", "update.work_graph_digest", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.work_graph_digest = Some(sha256_hex(b"work-graph-rewritten"));
+        })
+    })
 }
 
 // WORK_UNIT_CASE: 1702/A1 — a claimed objective change is refused with
 // `SemanticDrift("update.objective_ref")`.
 #[test]
 fn claimed_objective_change_is_refused_typed() -> TestResult {
-    assert_claimed_dimension_refused(
-        "objective",
-        "update.objective_ref",
-        |frozen| {
-            claimed_semantic_proposal(frozen, |proposal| {
-                proposal.objective_ref = Some("objective-rewritten-1702".to_owned());
-            })
-        },
-    )
+    assert_claimed_dimension_refused("objective", "update.objective_ref", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.objective_ref = Some("objective-rewritten-1702".to_owned());
+        })
+    })
 }
 
 // WORK_UNIT_CASE: 1702/A1 — a claimed acceptance change is refused with
 // `SemanticDrift("update.acceptance_refs")`.
 #[test]
 fn claimed_acceptance_change_is_refused_typed() -> TestResult {
-    assert_claimed_dimension_refused(
-        "acceptance",
-        "update.acceptance_refs",
-        |frozen| {
-            claimed_semantic_proposal(frozen, |proposal| {
-                proposal.acceptance_refs = Some(vec!["acceptance-rewritten-1702".to_owned()]);
-            })
-        },
-    )
+    assert_claimed_dimension_refused("acceptance", "update.acceptance_refs", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.acceptance_refs = Some(vec!["acceptance-rewritten-1702".to_owned()]);
+        })
+    })
 }
 
 // WORK_UNIT_CASE: 1702/A1 — a claimed budget/privacy/route-ceiling widening is
@@ -2514,24 +2509,36 @@ fn claimed_budget_privacy_route_ceiling_widening_is_refused_typed() -> TestResul
     // The budget envelope handle the plan was admitted under.
     assert_claimed_dimension_refused("ceilingbudget", "update.ceilings", |frozen| {
         claimed_semantic_proposal(frozen, |proposal| {
-            proposal.ceilings.as_mut().expect("ceilings are claimed").budget_ref =
-                "budget-ref-widened-1702".to_owned();
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .budget_ref = "budget-ref-widened-1702".to_owned();
         })
     })?;
 
     // The privacy class the plan was admitted under.
     assert_claimed_dimension_refused("ceilingprivacy", "update.ceilings", |frozen| {
         claimed_semantic_proposal(frozen, |proposal| {
-            proposal.ceilings.as_mut().expect("ceilings are claimed").privacy_class =
-                "privacy-widened-1702".to_owned();
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .privacy_class = "privacy-widened-1702".to_owned();
         })
     })?;
 
     // The admissible route classes the plan was admitted under.
     assert_claimed_dimension_refused("ceilingsroute", "update.ceilings", |frozen| {
         claimed_semantic_proposal(frozen, |proposal| {
-            proposal.ceilings.as_mut().expect("ceilings are claimed").route_classes =
-                vec!["route-class-a".to_owned(), "route-class-widened-1702".to_owned()];
+            proposal
+                .ceilings
+                .as_mut()
+                .expect("ceilings are claimed")
+                .route_classes = vec![
+                "route-class-a".to_owned(),
+                "route-class-widened-1702".to_owned(),
+            ];
         })
     })
 }
@@ -2555,31 +2562,23 @@ fn claimed_stop_conditions_change_is_refused_typed() -> TestResult {
 // `SemanticDrift("update.root_context_revision")`.
 #[test]
 fn claimed_root_context_change_is_refused_typed() -> TestResult {
-    assert_claimed_dimension_refused(
-        "rootcontext",
-        "update.root_context_revision",
-        |frozen| {
-            claimed_semantic_proposal(frozen, |proposal| {
-                proposal.root_context_revision = Some("root-rewritten-1702".to_owned());
-            })
-        },
-    )
+    assert_claimed_dimension_refused("rootcontext", "update.root_context_revision", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.root_context_revision = Some("root-rewritten-1702".to_owned());
+        })
+    })
 }
 
 // WORK_UNIT_CASE: 1702/A1 — a claimed foreign-execution change is refused with
 // `ForeignOwnerField("update.execution_id")`.
 #[test]
 fn claimed_foreign_execution_change_is_refused_typed() -> TestResult {
-    assert_claimed_dimension_refused(
-        "foreignexecution",
-        "update.execution_id",
-        |frozen| {
-            claimed_semantic_proposal(frozen, |proposal| {
-                proposal.execution_id = SwarmExecutionId::new("execution-foreign-1702")
-                    .expect("foreign execution id");
-            })
-        },
-    )
+    assert_claimed_dimension_refused("foreignexecution", "update.execution_id", |frozen| {
+        claimed_semantic_proposal(frozen, |proposal| {
+            proposal.execution_id =
+                SwarmExecutionId::new("execution-foreign-1702").expect("foreign execution id");
+        })
+    })
 }
 
 // WORK_UNIT_CASE: 1702/A1 — the FULLY CLAIMED, UNCHANGED proposal is admitted.
@@ -2598,7 +2597,9 @@ fn fully_claimed_unchanged_proposal_is_admitted() -> TestResult {
         false,
     )?;
     let state_root = SwarmStateRoot::new("allclaimed")?;
-    world.fabric.attach_semantic_revision_store(state_root.path());
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
     let fence = test_fence()?;
     let running = admitted_running_execution(&mut world.fabric, &fence, "allclaimed", 1)?;
     let frozen = frozen_swarm_content(&world.fabric.snapshot()?, "allclaimed")?;
@@ -2632,7 +2633,9 @@ fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_type
         false,
     )?;
     let state_root = SwarmStateRoot::new("digest")?;
-    world.fabric.attach_semantic_revision_store(state_root.path());
+    world
+        .fabric
+        .attach_semantic_revision_store(state_root.path());
     let fence = test_fence()?;
     let running = admitted_running_execution(&mut world.fabric, &fence, "digest", 1)?;
 
@@ -2678,7 +2681,9 @@ fn semantic_execution_update_binding_a_foreign_definition_digest_is_refused_type
     // this fabric holds, and nothing was recorded as an update.
     let stored = world.fabric.snapshot()?;
     assert_eq!(
-        stored.semantic_executions.get(running.execution_id.as_str()),
+        stored
+            .semantic_executions
+            .get(running.execution_id.as_str()),
         Some(&running),
         "a foreign-digest update must leave the current revision untouched"
     );

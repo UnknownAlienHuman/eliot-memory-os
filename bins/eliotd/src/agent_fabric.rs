@@ -81,9 +81,9 @@ use eliot_agent_contracts::{
     ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
     SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
     SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
-    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_transition,
-    check_execution_update, check_owner_join, check_stored_links, check_supersession, join_view,
-    reassign_coordinator,
+    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author,
+    check_execution_transition, check_execution_update, check_owner_join, check_stored_links,
+    check_supersession, join_view, reassign_coordinator,
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
