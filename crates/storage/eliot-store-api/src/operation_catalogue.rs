@@ -17,7 +17,7 @@
 //! with the closed record-kind filter and proven adapter handlers in this
 //! slice), and the activated audit
 //! range read (`GetAuditRange`: fence-gated envelope-candidate range over
-//! durable capture evidence with proven adapter handlers in this slice), the four `CaptureObservation` /
+//! durable capture evidence with proven adapter handlers in this slice), the three `CaptureObservation` /
 //! `AppendAuditEvent` / `ApplyLifecyclePolicy` mutations (AUD-C01:
 //! `CaptureObservation` and `AppendAuditEvent` persist
 //! `TransitionClass::CaptureCandidate` with the `EffectClass::Candidate`
@@ -58,26 +58,71 @@
 //! (issue #1941 C4: exact `session_id` / `uri` selectors, no scope),
 //! plus the `GetUserAutomationState` read
 //! (issue #1779: closed query discriminator with exact selectors, no scope),
+//! plus the `RecordAuthorityRevocation` mutation (issue #686: persists
+//! `TransitionClass::RecoverySchema` with the
+//! `EffectClass::ReversibleMutation` ceiling and the owner-approved
+//! seven-field authority-revocation contract, at exactly the class and
+//! ceiling the Governor's own `authority_revocation_envelope` emits),
 //! plus the provider-independent genesis bootstrap entry sourced by
-//! [`genesis_manifest`](crate::genesis_manifest). Every other operation stays
-//! known-but-unsupported and unadvertised: this includes issue #1814's
+//! [`genesis_manifest`](crate::genesis_manifest). The rows described above are
+//! a prose selection, not the complete activation list: every activated
+//! operation carries a row in one of the two declaration tables below,
+//! twenty-three rows in `ACTIVATED_READS` and twenty-four in
+//! `ACTIVATED_MUTATIONS`, forty-seven rows between them, and the
+//! provider-independent genesis bootstrap entry named above supplies the
+//! forty-eighth, so the generated set is forty-eight entries. Every operation
+//! that has no row in those two tables
+//! stays known-but-unsupported and unadvertised: this includes issue #1814's
 //! typed `GetInstrumentRegistryState` / `ApplyInstrumentRegistryState`
-//! contract until canonical read/write handlers are available. No other
-//! mutation on base has a
-//! proven handler, schema, and consumer triple, so C1 advertises no other
-//! mutation entry and any transition carrying another named command fails
-//! closed against the generated set.
+//! contract until canonical read/write handlers are available, and
+//! `GetAuthorityRevocationHistory`, whose typed read contract and Governor
+//! evidence decoder are closed but whose read row, proven per-backend handler
+//! and consumer triple are not. What is different about
+//! `RecordAuthorityRevocation` is the read-back leg, not the write leg: unlike
+//! an activated row whose write and read both carry a proven per-backend handler
+//! and a consumer triple, its paired named read
+//! `GetAuthorityRevocationHistory` still carries none of the three, because the
+//! Kernel serves that read from the retained P-07 ORS before the store bridge
+//! sees it. Recording a revocation is therefore not reading it back, and no
+//! other activated operation's status changes with this row.
 //!
-//! Issue #686 notes: `RecordAuthorityRevocation` and
-//! `GetAuthorityRevocationHistory` are deliberately known-but-unsupported
-//! here. Their typed parameter contracts
-//! (`operation_parameters::declared_mutation_parameters` /
-//! `declared_read_parameters`) and the Governor decision edge (revocation
-//! envelope, history evidence decoding) are already closed, but catalogue
-//! activation (row, proven per-backend handlers, consumer triple, and the
-//! count-test migration in `tests/operation_manifest_catalogue.rs`) belongs
-//! to a store-owned follow-up slice. Until then both operations fail closed
-//! with [`StoreError::UnknownOperation`] at this gate.
+//! Issue #686: `RecordAuthorityRevocation` is activated here. It was
+//! deliberately known-but-unsupported because its typed parameter contract
+//! (`operation_parameters::declared_mutation_parameters`) and the Governor
+//! decision edge (revocation envelope, history evidence decoding) were closed
+//! while its catalogue row, proven per-backend handlers, and consumer triple
+//! did not yet exist. That was the historical reason for its
+//! known-but-unsupported state; it is not its state now. This slice supplied the
+//! catalogue row and the typed-validation arm, so an admitted revocation resolves
+//! to a mutation entry instead of failing closed with
+//! [`StoreError::UnknownOperation`] at this gate. The proven per-backend WRITE
+//! handler has since landed too
+//! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`: a
+//! create-only durable `recovery_owner` row in its own namespace of that
+//! existing table, no new table, registered by a `pub(crate) mod` line in that
+//! crate's `apply.rs` and appended into the canonical atomic transaction by
+//! `append_authority_revocation_statements`), and the count-test migration in
+//! `tests/operation_manifest_catalogue.rs` now expects the true entry count of
+//! forty-eight. Committing the row records the closure the authority owner
+//! already committed and durably fenced, and grants no re-grant, restoration, or
+//! support: a revoked influence is never revived by writing this row.
+//!
+//! What is still absent is the consumer triple of the PAIRED READ, and nothing
+//! about the write leg supplies it. `GetAuthorityRevocationHistory` has no read
+//! row, no proven per-backend read handler, and no consumer triple, because the
+//! Kernel intercepts that named read and serves it from the retained P-07 ORS
+//! before the store bridge ever sees it (`bins/eliot-kernel/src/daemon_request_dispatch.rs`,
+//! handler `crates/kernel/eliot-kernel-service/src/owner_history.rs`). So the
+//! write leg being proven is not a claim that a recorded revocation can be read
+//! back from the store: it cannot, and this catalogue does not advertise that it
+//! can.
+//!
+//! `GetAuthorityRevocationHistory` remains known-but-unsupported at this gate
+//! and still fails closed with [`StoreError::UnknownOperation`] in
+//! [`validate_read_against_catalogue`]: its typed read contract
+//! (`operation_parameters::declared_read_parameters`) and the Governor
+//! history-evidence decoder are closed, but its read row, proven per-backend
+//! handler and consumer triple are not.
 //!
 //! Authority split (one authority, two mechanisms over the same table):
 //!
@@ -453,7 +498,7 @@ struct ActivatedMutationDescriptor {
 /// `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
-/// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
+/// `Candidate` through the `Epistemic` family; `ApplyErasure`
 /// persists `ReversibleMutation` through the `Erasure` family (issue #1712:
 /// explicit user request ONLY, with the closed five-field erasure typed
 /// contract); `ApplyNotificationState` persists `ReversibleMutation` through
@@ -494,11 +539,15 @@ struct ActivatedMutationDescriptor {
 /// record of one `TaskContract` revision's acceptance obligations, keyed by
 /// `(task_id, task_revision)` — committing it asserts only what the contract
 /// owner already required and grants no coverage, support, admission or
-/// completion). All
+/// completion); `RecordAuthorityRevocation` persists `ReversibleMutation`
+/// through the `RecoverySchema` family (issue #686: the create-only durable
+/// record of one committed transitive influence revocation, bound to the
+/// already-decided closure; committing it records what the authority owner
+/// already fenced and restores no revoked influence). All
 /// activated mutation rows address no store scope, mirroring the scope-free read
-/// descriptors. Every
-/// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
+/// descriptors. The one other mutation, `ApplyInstrumentRegistryState`, stays
+/// known-but-unsupported.
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 24] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -668,6 +717,47 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // JSON inside the parameters object, so the bulk bound covers escaping
         // and the enclosing structure without loosening the record's own
         // closed validator.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    // Issue #686: `RecordAuthorityRevocation` is the create-only durable record
+    // of one committed transitive influence revocation. Its class and ceiling
+    // are read from the owner that emits it, never chosen here:
+    // `authority_revocation_envelope` binds `transition_class:
+    // TransitionClass::RecoverySchema` and `requested_effect_ceiling:
+    // EffectClass::ReversibleMutation`
+    // (`crates/governor/eliot-governor/src/authority_revocation.rs:242-243`),
+    // and `NamedMutationOperation::transition_class` maps this variant to the
+    // same `RecoverySchema` family the other owner-snapshot rows already use,
+    // so the catalogue admits exactly what the Governor emits. Activating the
+    // row is what lets an admitted revocation reach the canonical write path at
+    // all; it asserts only the closure the authority owner already committed
+    // and durably fenced, and it grants no re-grant, restoration, or support —
+    // a revoked influence is never revived by writing this row.
+    //
+    // The execution behind this row is now proven on the store side as well:
+    // `eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`
+    // renders the create-only `recovery_owner` row and
+    // `apply/atomic_write.rs::append_authority_revocation_statements` appends it
+    // into the same canonical transaction that carries every other owner row,
+    // so a durable revocation and its receipt can never disagree. What that does
+    // NOT supply is the paired read: `GetAuthorityRevocationHistory` stays
+    // known-but-unsupported here, with no read row, no proven per-backend read
+    // handler and no consumer triple, because the Kernel serves that named read
+    // from the retained P-07 ORS before the store bridge sees it. Writing one
+    // revocation is therefore not reading it back.
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordAuthorityRevocation,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // One revocation record is seven bounded binding fields (an origin ref,
+        // a closure identity, two decimal counters, two digests and a terminal
+        // reason), not a bulk payload. The closed seven-field typed contract
+        // and the input-bound check in `validate_parameter_size` apply
+        // unchanged; the 2 MiB bulk bound is the same one the other bounded
+        // owner-record rows (`RecordModuleCatalogSnapshot`,
+        // `ApplyProblemOwnerState`, `RecordTaskContractAcceptanceSet`) use and
+        // only covers canonical JSON escaping and the enclosing parameters
+        // structure — it does not loosen any per-field bound.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
@@ -891,16 +981,20 @@ pub fn validate_read_against_catalogue(
 /// the catalogue set digest, resolve every command (in order, never sorted)
 /// to a mutation entry, stay within that entry's ceiling, carry only the
 /// owner-approved typed parameters for the approved command, and stay within
-/// the entry input bound. Only `CaptureObservation`, `AppendAuditEvent`,
-/// `ApplyLifecyclePolicy`, `ReconcileRecovery`, `UpdateTaskState`,
-/// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
-/// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
-/// `CommitExperienceBank`, `CommitAgentFeedback`,
-/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
-/// `ApplyProblemOwnerState`, and
-/// `RecordModuleCatalogSnapshot` have activated
-/// mutation entries; any other named
-/// command fails closed here until a later slice proves its handler, schema,
+/// the entry input bound. Every named mutation operation except
+/// `ApplyInstrumentRegistryState` has an activated mutation entry, the
+/// twenty-four rows of `ACTIVATED_MUTATIONS`: `CaptureObservation`,
+/// `AppendAuditEvent`, `ApplyLifecyclePolicy`, `ReconcileRecovery`,
+/// `RecordFinishDecision`, `RecordFinishEvidence`,
+/// `RecordModuleCatalogSnapshot`, `UpdateTaskState`,
+/// `ApplySwarmOwnerRevisions`, `ApplyEpistemicRevision`, `ApplyErasure`,
+/// `ApplyNotificationState`, `ApplyReactiveInjectionState`,
+/// `ApplyResourceSnapshot`, `ApplyUserAutomationState`,
+/// `CommitExperienceBank`, `CommitAgentFeedback`, `ApplyBlackboardItem`,
+/// `AdmitMailboxMessage`, `RecordLearningRecord`,
+/// `RecordCapabilityEvidenceRecord`, `RecordTaskContractAcceptanceSet`,
+/// `ApplyProblemOwnerState`, and `RecordAuthorityRevocation`. That one
+/// exception fails closed here until a later slice proves its handler, schema,
 /// consumer triple, and semantic owner-authority gate.
 /// `ApplySwarmOwnerRevisions` is activated (issue #1702): its owner-specific
 /// authorization evidence travels inside the record and is verified by
@@ -971,7 +1065,11 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
             | NamedMutationOperation::ApplySwarmOwnerRevisions
-            | NamedMutationOperation::ApplyInstrumentRegistryState => {
+            | NamedMutationOperation::ApplyInstrumentRegistryState
+            // Issue #686: activated by this crate's catalogue row, so it takes
+            // the same closed typed-parameter validation as every other
+            // activated operation above.
+            | NamedMutationOperation::RecordAuthorityRevocation => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
             }
             NamedMutationOperation::ApplyNotificationState => {
@@ -1011,9 +1109,6 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::RecordTaskContractAcceptanceSet => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
-            }
-            NamedMutationOperation::RecordAuthorityRevocation => {
-                return Err(StoreError::UnknownOperation);
             }
             NamedMutationOperation::ApplyProblemOwnerState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;

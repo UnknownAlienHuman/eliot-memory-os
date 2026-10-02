@@ -50,15 +50,46 @@
 //! identity/fence/response-binding mismatches are [`CompositionError::Provider`];
 //! every other deterministic admission refusal is [`CompositionError::Owner`].
 //!
-//! Honest gaps: `RecordAuthorityRevocation` and
-//! `GetAuthorityRevocationHistory` are known-but-unsupported at the store
-//! catalogue gate until a store-owned slice activates their rows with
-//! proven handlers (see `operation_catalogue`). The envelope therefore
-//! binds the generated catalogue set digest so it passes that gate
-//! unchanged once the row exists; until then commits fail closed with
-//! `UnknownOperation`, never as silent success. The `scope:governor`
-//! ordering-head expectation mirrors the operator/recovery precedent (the
-//! store enforces the live sequence).
+//! Honest gaps: the two halves of this issue reached the store catalogue
+//! gate for different reasons and now sit at different states (see
+//! `operation_catalogue`). `RecordAuthorityRevocation` was
+//! known-but-unsupported for a stated reason — its typed seven-field
+//! parameter contract and this Governor decision edge were closed while its
+//! catalogue row, proven per-backend handlers, and consumer triple did not
+//! yet exist — and the store-owned slice has since supplied the row and its
+//! typed-validation arm, so a well-formed revocation now resolves to a
+//! mutation entry instead of failing closed at that gate. The per-backend
+//! WRITE leg has since landed too
+//! (`eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+//! appended into the canonical atomic transaction by
+//! `append_authority_revocation_statements`), so an envelope this module
+//! renders through [`authority_revocation_envelope`] and
+//! `finish_canonical_revocation` is RENDERED into the canonical transaction as
+//! a create-only `recovery_owner` statement. Rendering is the whole proven
+//! contract of this slice: the leg is wired, and it is not committed. No code
+//! on this tree drives a revocation envelope end to end through that leg, and
+//! the durable precondition it would need — a Kernel-ORS-committed `Revoked`
+//! `GrantClosureReceipt` at the live composition fence — has no production
+//! producer. Should that row ever be committed it still records only the
+//! closure the authority owner already committed and durably fenced, and
+//! grants no re-grant, restoration, or support.
+//! What is still open is the consumer triple of the PAIRED READ, and this
+//! module's decision edge cannot supply it: `GetAuthorityRevocationHistory`
+//! remains known-but-unsupported at that gate and still fails closed with
+//! `UnknownOperation` — not as a deficiency in the Governor half, whose typed
+//! read contract and [`decode_revocation_history_evidence`] are closed, but
+//! because the Kernel intercepts the named read before the store bridge and
+//! serves it from the retained P-07 ORS, so the store never serves it and
+//! truthfully does not advertise it. Its read row, proven per-backend read
+//! handler and consumer triple remain a store-owned follow-up. A write leg
+//! that commits is therefore not a read leg that serves: this module can
+//! record that a revocation committed, and cannot yet read it back from the
+//! store.
+//! The envelope binds the generated catalogue set digest so it passes the
+//! gate unchanged now that the row exists; before that slice the row was
+//! absent and every commit failed closed with `UnknownOperation`, never as
+//! silent success. The `scope:governor` ordering-head expectation mirrors the
+//! operator/recovery precedent (the store enforces the live sequence).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,8 +149,10 @@ fn canonical_digest(value: &impl serde::Serialize) -> Result<String, Composition
 /// Binds the generated catalogue set digest into the revocation envelope.
 ///
 /// The digest covers the closed activated-operation table, so the envelope
-/// passes the store pre-dispatch gate unchanged once the
-/// `RecordAuthorityRevocation` row is activated by its owning slice.
+/// passes the store pre-dispatch gate unchanged: the
+/// `RecordAuthorityRevocation` row it needs is now activated by its owning
+/// store slice, and the gate admits it through the closed typed-parameter
+/// arm rather than refusing it as an unknown operation.
 fn catalogue_set_digest() -> Result<OperationManifestDigest, CompositionError> {
     let entries =
         generated_operation_manifests().map_err(|error| owner_refused(error.to_string()))?;

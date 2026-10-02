@@ -2,9 +2,9 @@
 //!
 //! Pure in-crate proofs only: no Surreal/Blob edge, no authority issuance.
 //! Deferred cases are listed in the owning work report: the global catalogue
-//! beyond the five activated reads, a universal parameter-schema framework,
-//! new adapter defaults, C2 enforcement (scope/role/fence/expiry), and the
-//! null/absent/false/zero matrix beyond the activated operations.
+//! beyond the twenty-three activated reads, a universal parameter-schema
+//! framework, new adapter defaults, C2 enforcement (scope/role/fence/expiry),
+//! and the null/absent/false/zero matrix beyond the activated operations.
 
 #![allow(clippy::unwrap_used)]
 
@@ -16,11 +16,12 @@ use eliot_contracts::{
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, GENESIS_MANIFEST_NAME,
     NamedMutationOperation, NamedMutationRequest, NamedOperationManifest, NamedReadOperation,
-    NamedReadRequest, OperationIdentity, OperationManifestDigest, OperationManifestSpec,
-    OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence, StoreError,
-    StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
-    StoreMutationDisposition, TransitionClass, canonical_json_bytes, generated_operation_manifests,
-    genesis_manifest, genesis_transition, named_read_operation_name, operation_manifest_set_digest,
+    NamedReadRequest, OperationIdentity, OperationKind, OperationManifestDigest,
+    OperationManifestSpec, OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence,
+    StoreError, StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext,
+    StoreGenesisRequest, StoreMutationDisposition, TransitionClass, canonical_json_bytes,
+    generated_operation_manifests, genesis_manifest, genesis_transition,
+    named_mutation_operation_name, named_read_operation_name, operation_manifest_set_digest,
     sha256_hex,
 };
 use serde_json::{Value, json};
@@ -71,7 +72,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -530,8 +531,13 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
     let entries = generated_operation_manifests().unwrap();
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
-    // AUD-C01 activates exactly five mutations: the approved CaptureObservation
-    // plan binds the set digest and passes the whole catalogue path.
+    // Scoped to AUD-C01, which activated exactly five mutations —
+    // CaptureObservation, AppendAuditEvent, ApplyLifecyclePolicy,
+    // ReconcileRecovery and UpdateTaskState (see the catalogue module doc).
+    // That is this audit's slice, NOT the whole `ACTIVATED_MUTATIONS` array,
+    // which carries twenty-four rows. This test exercises the first of the
+    // five: the approved CaptureObservation plan binds the set digest and
+    // passes the whole catalogue path.
     let plan = mutation_plan(&set_digest);
     assert!(plan.validate_against_catalogue(&entries).is_ok());
 
@@ -547,7 +553,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -594,7 +600,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -605,7 +611,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -616,7 +622,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -663,7 +669,7 @@ fn reconcile_recovery_passes_whole_path() {
 #[test]
 fn update_task_state_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), 48);
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved task-control params pass catalogue validation without bypass.
@@ -700,12 +706,15 @@ fn still_unactivated_mutation_is_refused() {
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // A still-unadmitted mutation has no catalogue entry and fails closed.
-    // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision, so the
-    // remaining unactivated mutation is RecordAuthorityRevocation.
+    // T11.2 activates both UpdateTaskState and ApplyEpistemicRevision and
+    // issue #686 activates RecordAuthorityRevocation, so the remaining
+    // unactivated mutation named by the catalogue module doc is
+    // ApplyInstrumentRegistryState (issue #1814, pending canonical handlers).
     let mut plan = mutation_plan(&set_digest);
-    plan.transition_class = TransitionClass::RecoverySchema;
+    plan.transition_class = TransitionClass::InstrumentRegistry;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
     plan.named_operations = vec![NamedMutationRequest {
-        operation: NamedMutationOperation::RecordAuthorityRevocation,
+        operation: NamedMutationOperation::ApplyInstrumentRegistryState,
         parameters: BTreeMap::new(),
     }];
     // Re-derive the bound digests after the plan mutation so the catalogue
@@ -715,6 +724,77 @@ fn still_unactivated_mutation_is_refused() {
         plan.validate_against_catalogue(&entries),
         Err(StoreError::UnknownOperation)
     );
+}
+
+fn revocation_params() -> BTreeMap<String, Value> {
+    // Exactly the seven declared fields, every one a JSON string, including
+    // the two decimal counters, as the Governor's `authority_revocation_envelope`
+    // emits them (`crates/governor/eliot-governor/src/authority_revocation.rs`).
+    BTreeMap::from([
+        ("origin_ref".to_owned(), json!("origin-1")),
+        ("closure_id".to_owned(), json!("closure-1")),
+        ("closure_revision".to_owned(), json!("1")),
+        ("affected_digest".to_owned(), json!("a".repeat(64))),
+        ("affected_count".to_owned(), json!("3")),
+        ("invalidation_reason".to_owned(), json!("SOURCE_RETIRED")),
+        ("fence_digest".to_owned(), json!("b".repeat(64))),
+    ])
+}
+
+fn revocation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::PreparedTransition {
+    let mut plan = mutation_plan(set_digest);
+    plan.transition_class = TransitionClass::RecoverySchema;
+    plan.requested_effect_ceiling = EffectClass::ReversibleMutation;
+    plan.named_operations = vec![NamedMutationRequest {
+        operation: NamedMutationOperation::RecordAuthorityRevocation,
+        parameters: revocation_params(),
+    }];
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
+    plan
+}
+
+#[test]
+fn record_authority_revocation_passes_whole_path() {
+    let entries = generated_operation_manifests().unwrap();
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Issue #686: the activated row resolves to a mutation entry and the
+    // owner-shaped seven-field revocation command passes catalogue validation
+    // at exactly the class and ceiling the Governor emits.
+    let plan = revocation_plan(&set_digest);
+    assert!(plan.validate_against_catalogue(&entries).is_ok());
+    let name = named_mutation_operation_name(NamedMutationOperation::RecordAuthorityRevocation);
+    let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+    assert_eq!(entry.operation_kind, OperationKind::Mutation);
+    assert!(
+        entry
+            .transition_classes
+            .contains(&TransitionClass::RecoverySchema)
+    );
+    assert_eq!(entry.maximum_effect, EffectClass::ReversibleMutation);
+}
+
+#[test]
+fn record_authority_revocation_requires_every_declared_parameter() {
+    let entries = generated_operation_manifests().unwrap();
+    let set_digest = operation_manifest_set_digest(&entries).unwrap();
+
+    // Every declared field is required: removing one fails closed in the typed
+    // parameter gate, never by falling back to a default.
+    let mut missing = revocation_params();
+    missing.remove("affected_count");
+    let mut plan = revocation_plan(&set_digest);
+    plan.named_operations[0].parameters = missing;
+    // Re-derive the bound digests after the plan mutation so the typed
+    // parameter gate (not a stale binding) decides the outcome.
+    eliot_store_api::bind_issue18_digests(&mut plan).unwrap();
+    assert!(matches!(
+        plan.validate_against_catalogue(&entries),
+        Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            ..
+        })
+    ));
 }
 
 #[test]

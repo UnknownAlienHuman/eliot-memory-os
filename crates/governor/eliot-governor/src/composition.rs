@@ -5219,8 +5219,13 @@ pub(crate) fn evaluate_testd_verification_current(
     Ok(run)
 }
 
-/// The typed terminal result of one production authority request dispatched
-/// through [`GovernorComposition::apply_authority_request`].
+/// The typed terminal result of one authority request dispatched through
+/// [`GovernorComposition::apply_authority_request`].
+///
+/// That dispatcher has no production caller on this tree, so this receipt is
+/// currently returned by no production path. See the "Live status" paragraph of
+/// [`GovernorComposition::apply_authority_request`] for the measurement and for
+/// the owning work that would give it one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthorityActionReceipt {
     /// A validated Kernel activation receipt.
@@ -7249,8 +7254,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// and a fresh `MATCHED` guard check at the retained fence. Persist the
     /// minted owner with [`Self::install_admitted_work_scope_owner`]. Live
     /// status: no production caller. `git grep -n admit_initial_scope_binding`
-    /// returns only this definition and one intra-doc link in
-    /// [`Self::install_admitted_work_scope_owner`]'s own doc. The nearest live
+    /// finds no call site at all: its only other occurrences are this
+    /// definition and intra-doc prose. The absence of a caller is the fact that
+    /// matters, so no hit count is asserted here — a count of doc references
+    /// goes stale the moment anyone edits a comment. The nearest live
     /// rebind entry is [`Self::admit_observed_scope_attach`], reached from the
     /// daemon scope-attach ingress and persisting through the same
     /// installer; no bootstrap ingress supplies the described scope this entry
@@ -9469,19 +9476,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// presented operation against the live composition generation before
     /// the saga starts.
     ///
-    /// Live status: NO production caller. Measured on this tree, this method has
-    /// exactly four textual occurrences: two intra-doc links, this paragraph,
-    /// and its own definition. Nothing outside `#[cfg(test)]` calls it, so every
-    /// method it reaches — `apply_admitted_authority_revocation`,
+    /// Live status: NO production caller. Measured on this tree, the only
+    /// occurrences of the name `apply_authority_request` are this method's own
+    /// `pub async fn` definition and intra-doc prose, and ZERO of them is a call
+    /// site. The absence of a caller is what matters here, so it is stated
+    /// WITHOUT a hit count on purpose: a count of doc references goes stale the
+    /// moment anyone edits a comment. So nothing outside `#[cfg(test)]` enters
+    /// this method, and every method it reaches —
+    /// `apply_admitted_authority_revocation`,
     /// `revoke_grant_and_reconcile`, `revoke_grant`, `activate_grant`,
     /// `activate_root_transition`, `activate_introduction` and
-    /// `revoke_introduction` — has zero production callers as well. The daemon
-    /// composition root that owns the only `GovernorComposition` calls none of
-    /// them. The reason is named in the "Live status" paragraph of
-    /// [`Self::apply_admitted_authority_revocation`]: the Kernel-first revoke it
-    /// re-strikes is refused with `NotAdmitted` for a grant the Kernel's own
-    /// owner already fences, and no fresh revocation ingress originates one
-    /// today. This doc must not be read as proof that any of them is reached.
+    /// `revoke_introduction` — is itself reached, in production, only from this
+    /// dispatcher or from another method on that same unentered chain, so all of
+    /// them also have zero production call sites. The daemon composition root
+    /// that owns the only `GovernorComposition` calls none of them, and it is
+    /// NOT this entry that the daemon drives: the daemon drives
+    /// [`Self::apply_pending_canonical_revocation`] instead, called directly
+    /// from `bins/eliotd/src/daemon_runtime.rs`.
+    ///
+    /// Its input type has no production ORIGINATOR either, and that too is a
+    /// structural fact rather than a count. Every construction of
+    /// [`PresentedAuthorityRequest`] inside this file sits in a method of this
+    /// composition and wraps a request value that method was itself handed — a
+    /// clone of one of its own parameters — so no PRODUCTION code outside this
+    /// composition ever supplies one. The construction sites outside this file
+    /// are all in `bins/eliotd/src/kernel_authority_client.rs`, and each sits
+    /// inside that crate's `#[cfg(test)] mod tests`, so the qualifier above is
+    /// load-bearing rather than decorative: those two sites are exactly the
+    /// "outside this composition" code the claim has to survive. Read the
+    /// consequence precisely: what is missing is an ingress that ORIGINATES a
+    /// fresh authority request, not a method
+    /// capable of forwarding one. [`Self::apply_pending_canonical_revocation`]
+    /// does run in production and does build the presented wrapper itself, out
+    /// of the [`GrantRevocationRequest`] its own caller passes, so the daemon
+    /// supplies the request and never the presentation. The reason this entry is
+    /// not the one to wire, and the missing producer that #1110 owns, are named
+    /// in the "Live status" paragraph of
+    /// [`Self::apply_admitted_authority_revocation`]. This doc must not be read
+    /// as proof that any of them is reached.
     ///
     /// The pending-canonical-revision half of the saga IS reached, through the
     /// separate [`Self::apply_pending_canonical_revocation`] entry, which never
@@ -9531,17 +9563,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Applies one admitted grant revocation through the complete
     /// Kernel-first saga under the live composition generation (#686).
     ///
-    /// This is the production ingress for the revocation half of
-    /// [`Self::apply_authority_request`], and the only entry that reaches
+    /// It is the only entry that reaches
     /// [`Self::revoke_grant_and_reconcile`] and through it
     /// [`Self::revoke_grant`], the `GrantGraph` closure revoke, and the
-    /// `RetainedAuthorityRequest` unknown-outcome surface. It admits nothing
-    /// itself: the daemon composition root still builds the
-    /// [`GrantRevocationRequest`] and both canonical identities from its own
-    /// admitted ingress, and both durable boundary ports are still the
-    /// existing owners that hold the ORS first-phase row and the
-    /// Kernel-issued receipt. No second graph, ledger, authority machine or
-    /// Store client is introduced here.
+    /// `RetainedAuthorityRequest` unknown-outcome surface, and its only caller
+    /// is the `GrantRevocation` arm of [`Self::apply_authority_request`] — which
+    /// itself has no production caller, so "only entry" means only in-caller,
+    /// not production ingress. See the "Live status" paragraph at the end of
+    /// this documentation for the measurement.
+    ///
+    /// It admits nothing itself, and it constructs nothing either: the
+    /// [`GrantRevocationRequest`] and both canonical identities it takes must
+    /// arrive from an owner that actually originates that revocation decision,
+    /// and no such owner exists in production today (named in the same "Live
+    /// status" paragraph). The two durable boundary ports are the existing
+    /// owners that hold the ORS first-phase row and the Kernel-issued receipt.
+    /// No second graph, ledger, authority machine or Store client is introduced
+    /// here.
     ///
     /// Fail-closed order, all of it ahead of any transport:
     /// - The composition must be `Ready` and must still retain a live P-07
@@ -9588,8 +9626,56 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// daemon drives: the daemon's authority-revocation ingress drives
     /// [`Self::apply_pending_canonical_revocation`] instead, because this method
     /// re-strikes a `revoke_grant` the Kernel refuses with `NotAdmitted` for a
-    /// grant its own owner already fences, and no fresh revocation ingress
-    /// originates such a request today (#1692).
+    /// grant its own owner already fences.
+    ///
+    /// WHAT IS MISSING IS A PRODUCER, NOT A PATH. No production code originates
+    /// a fresh presented authority request for this arm. The daemon's only
+    /// admitted revocation value is
+    /// `AdmittedMaintenanceRevocation::readmit_pending_closure`
+    /// (`bins/eliotd/src/maintenance_trigger_evaluator.rs`), and that owner
+    /// re-admits the exact operation the owners already committed, field for
+    /// field from the Kernel P-07 owner's committed `GrantClosureReceipt`; it
+    /// originates no new revocation decision and by its own documented
+    /// boundary must never be presented here. There is no authenticated
+    /// Human/CLI revocation ingress either: `MaintenanceTriggerInput`'s
+    /// `explicit_request` is a hardcoded `false` in that same module. So the
+    /// smallest lawful producer is an ingress owner that emits an admitted
+    /// [`GrantRevocationRequest`] plus the canonical operation id, canonical
+    /// request identity and five-coordinate `RevocationOperationIdentity` under
+    /// the live fence — an owner decision this tree does not have, and one that
+    /// must not be synthesized here.
+    ///
+    /// Owning work: #1110, "[authority/kernel] Connect G-01 grant and
+    /// introduction lifecycle to the real P-07 owner". Its acceptance text is
+    /// deliberately not quoted here, because this measurement does not read it
+    /// and a restatement of it is not evidence. What is measured on this tree,
+    /// and is therefore the part of that work still outstanding for this arm,
+    /// is three things: the production ingress that presents an owner-published
+    /// revocation decision to [`Self::apply_authority_request`]; a
+    /// daemon-reachable `GrantClosureReceiptPort` for the second port argument
+    /// of that same callerless entry, which has no daemon-reachable
+    /// implementation; and a durable owner-published revocation DECISION
+    /// record. The `P07AuthorityPort` half is no longer outstanding, and
+    /// quoting a criterion that demands "a real non-test `P07AuthorityPort`
+    /// implementation" as still owed by #1110 would be false: two real
+    /// non-test implementations already exist — `KernelAuthorityClient` in the
+    /// daemon binary and the in-Kernel `GrantActivationPort` — behind a
+    /// production factory in the daemon composition root. What remains for this
+    /// arm is the ingress and the durable decision behind it, not the port
+    /// adapter.
+    ///
+    /// CITATION CORRECTION: the earlier "(#1692)" here was unsupported as the
+    /// owner of THIS gap. `gh issue view 1692` is "[I14-audit] Enforce
+    /// maintenance automation modes and service-safe route restrictions"; it owns
+    /// maintenance mode selection and route/session policy evidence, and it
+    /// does own the maintenance-request ingress and its
+    /// `explicit_request = false` default
+    /// (`bins/eliotd/src/maintenance_trigger_evaluator.rs`). That is a different
+    /// subject — that default gates maintenance automation, not grant-revocation
+    /// ingress — so it neither names this gap nor contradicts the correction
+    /// above. #1692 names nothing about grant revocation ingress or a P-07
+    /// production caller; #1110 is the issue that owns the missing
+    /// grant-revocation ingress producer, which is the gap measured here.
     pub async fn apply_admitted_authority_revocation<L, C>(
         &mut self,
         request: &GrantRevocationRequest,
@@ -9710,13 +9796,45 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// on the authenticated Kernel route that owns ORS inside the Kernel
     /// process; the daemon holds no ORS handle and gains none.
     ///
-    /// What is still incomplete is downstream of this entry, not in it: the
-    /// canonical `RecordAuthorityRevocation` commit is known-but-unsupported in
-    /// the closed Store catalogue, so a resumed obligation fails closed there
-    /// and stays recorded as a pending stricter revocation. See
-    /// `AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED` in
+    /// What is still incomplete is downstream of this entry, not in it, and the
+    /// closed Store catalogue is no longer the place it starts. Issue #686
+    /// activated the `RecordAuthorityRevocation` row, so a well-formed
+    /// canonical commit is admitted and typed-validated at that gate instead of
+    /// failing closed there, and it wired the per-backend WRITE handler
+    /// (`crates/storage/eliot-store-surreal-adapter/src/apply/surreal_authority_revocation.rs`,
+    /// registered in that crate's `apply.rs`, appended into the canonical
+    /// atomic transaction by `append_authority_revocation_statements`) into this
+    /// leg. That handler RENDERS a create-only `recovery_owner` row as part of
+    /// the one canonical transaction. What it does not yet do is COMMIT the
+    /// row: no real-Surreal edge proof of this leg exists yet, so the rendered
+    /// statements are unit-proven while the commit is not, and nothing here
+    /// may be described as a durable row until such a proof exists. No
+    /// production code drives a revocation envelope end to end through this leg
+    /// either; the render is what this branch proves, not the durable write.
+    ///
+    /// What remains absent is the CONSUMER TRIPLE of the PAIRED READ, and that
+    /// is the whole of the remaining gap. `GetAuthorityRevocationHistory` is
+    /// deliberately and truthfully unactivated, because the Kernel intercepts
+    /// that named read and serves it from the retained P-07 ORS before the
+    /// store bridge sees it. So a revocation this entry can now write still
+    /// cannot be read back from the store, and a row being writable is not the
+    /// same as a resumed obligation being PROVED to commit end to end: this
+    /// entry still reports the resumed obligation as a pending stricter
+    /// revocation, never as a recorded one.
+    ///
+    /// See `AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED` in
     /// `bins/eliotd/src/authority_revocation_ingress.rs` for the owner-side
-    /// statement of that same gap.
+    /// statement of that same gap; the constant's own doc comment there
+    /// carries the full telling, and this entry adds nothing to it. Its VALUE
+    /// was corrected on this branch rather than left as it stood, because the
+    /// constant is `pub`, is re-exported from `bins/eliotd/src/lib.rs`, and is
+    /// emitted by a `tracing::warn!`
+    /// (`eliotd.authority_revocation_second_phase_pending`) on every pending
+    /// revocation: a reason clause still naming the catalogue gate would have
+    /// sent an operator to debug a gate that now admits the operation. The
+    /// corrected value states the residual gap as this branch leaves it — the
+    /// paired read's missing consumer triple — and nothing in this repository
+    /// matches on the literal, so no in-tree consumer constrains its text.
     pub async fn apply_pending_canonical_revocation<L>(
         &mut self,
         request: &GrantRevocationRequest,
@@ -10087,7 +10205,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// revoke half — including the `GrantGraph` closure revoke behind
     /// [`Self::revoke_grant`] — is present as compiled code yet unentered in
     /// production. See the "Live status" paragraph of
-    /// [`Self::apply_pending_canonical_revocation`].
+    /// [`Self::apply_admitted_authority_revocation`], which names the missing
+    /// producer and its owning issue, and the "Live status" paragraph of
+    /// [`Self::apply_authority_request`], which records the zero-call-site
+    /// measurement.
     pub async fn revoke_grant_and_reconcile<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
