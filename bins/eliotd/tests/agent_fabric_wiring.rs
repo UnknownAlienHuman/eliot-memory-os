@@ -15,7 +15,11 @@ use eliot_agent_api::{
     AgentLaunchRequest, AgentWorkUnitBrief, AttemptId, BudgetEnvelope, EffectCeiling, EffectKind,
     LaunchRequestId, LowercaseSha256, RouteFingerprint, TaskId, WorkUnitId,
 };
-use eliot_agent_contracts::RevisionId;
+use eliot_agent_contracts::{
+    RevisionId, SemanticCeilings, SwarmAdmissionId, SwarmCoordinatorLease, SwarmExecutionId,
+    SwarmExecutionRevision, SwarmExecutionState, SwarmPlanAdmission, SwarmPlanDefinition,
+    SwarmPlanDefinitionLifecycle, TaskControllerLease,
+};
 use eliot_agent_coordinator::{
     CandidateId, CoordinatorConfig, LearningRole, RecipeId, RecipeManifest, RoleProfileId,
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
@@ -27,6 +31,11 @@ use eliot_governor::{
     CapabilityEvidenceRecord, CapabilitySource, CapabilityStatus, RouteScopeFingerprint,
 };
 use eliot_security_contracts::PrivacyClass;
+use eliot_store_api::{
+    CommitId, OperationId, OperationManifestDigest, OrderingHead, Resubmission,
+    SwarmOwnerAuthorization, SwarmOwnerRevision, SwarmSemanticOwnerKind, TransitionClass,
+    WriteReceipt, WriteReceiptStatus,
+};
 use eliotd::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE, CancellationLifecycle, DispatchAck,
@@ -1916,5 +1925,404 @@ fn work_class_unknown_rejects_before_launch_without_capacity() -> TestResult {
     );
     assert_eq!(counter_value(&world.admission.stage_calls), 0);
     assert_eq!(counter_value(&world.admission.commit_calls), 0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1702 A1: the production caller of the contract refusal.
+//
+// `AgentFabric::record_semantic_execution` is the one production path that
+// accepts a coordinator `SwarmExecutionRevision` and publishes it through the
+// canonical `SemanticRevisionStore::commit`. A second revision presented under
+// an execution identity the fabric already holds is an execution UPDATE, so
+// that path runs `AgentFabric::check_semantic_execution_update` — which applies
+// the old-wave disposition gate and then the contract owner's own
+// `check_execution_update` — before the revision can become current. The
+// fixtures below build the real records and the real durable Store evidence
+// those methods require; no authority is short-circuited.
+// ---------------------------------------------------------------------------
+
+const SWARM_TASK_CONTROLLER: &str = "task-controller-1702";
+const SWARM_COORDINATOR: &str = "swarm-coordinator-1702";
+
+fn swarm_ceilings() -> SemanticCeilings {
+    SemanticCeilings {
+        privacy_class: "privacy-internal".to_owned(),
+        budget_ref: "budget-ref-1702".to_owned(),
+        route_classes: vec!["route-class-a".to_owned()],
+        max_depth: 3,
+        max_fanout: 4,
+        max_wip: 2,
+    }
+}
+
+/// A frozen Task-Controller definition whose `definition_digest` really binds
+/// its own frozen content, so the contract validator accepts it.
+fn frozen_swarm_definition(fence: &StateFence, suffix: &str) -> SwarmPlanDefinition {
+    let mut definition = SwarmPlanDefinition {
+        definition_id: format!("definition-1702-{suffix}"),
+        definition_revision: RevisionId::new("1").expect("definition revision"),
+        lifecycle: SwarmPlanDefinitionLifecycle::Frozen,
+        task_id: format!("task-1702-{suffix}"),
+        task_revision: RevisionId::new("1").expect("task revision"),
+        recipe_id: "recipe-1702".to_owned(),
+        recipe_revision: RevisionId::new("1").expect("recipe revision"),
+        controller: TaskControllerLease {
+            holder: SWARM_TASK_CONTROLLER.to_owned(),
+            epoch: 1,
+        },
+        objective_ref: "objective-1702".to_owned(),
+        acceptance_refs: vec!["acceptance-1702-a".to_owned()],
+        root_context_revision: "root-1702".to_owned(),
+        work_graph_digest: sha256_hex(b"work-graph-1702"),
+        definition_digest: String::new(),
+        ceilings: swarm_ceilings(),
+        stop_conditions_digest: sha256_hex(b"stop-conditions-1702"),
+        supersedes: None,
+        state_fence: fence.clone(),
+    };
+    definition.definition_digest = definition
+        .content_digest()
+        .expect("definition content digest");
+    definition
+}
+
+fn admitted_swarm_admission(definition: &SwarmPlanDefinition, fence: &StateFence) -> SwarmPlanAdmission {
+    SwarmPlanAdmission::admit_for(
+        definition,
+        SwarmAdmissionId::new("admission-1702").expect("admission id"),
+        definition.ceilings.clone(),
+        "governor-receipt-1702".to_owned(),
+        fence.clone(),
+    )
+    .expect("admitted admission")
+}
+
+/// The real owner-issued Store evidence one semantic write requires: canonical
+/// record bytes, the owner revision that commits exactly those bytes, and a
+/// `Committed` task-control receipt carrying that revision's ordering head.
+struct DurableSwarmCommit {
+    revision: SwarmOwnerRevision,
+    receipt: WriteReceipt,
+}
+
+fn durable_swarm_commit<T: serde::Serialize>(
+    owner_kind: SwarmSemanticOwnerKind,
+    owner_id: &str,
+    record: &T,
+    fence: &StateFence,
+    revision: u64,
+) -> TestResult<DurableSwarmCommit> {
+    let value = serde_json::to_value(record).map_err(|error| format!("encode record: {error}"))?;
+    let bytes = eliot_contracts::canonical_json_bytes(&value)?;
+    let content_digest = sha256_hex(&bytes);
+    let owner_revision = SwarmOwnerRevision {
+        owner_kind,
+        authorization: SwarmOwnerAuthorization {
+            owner_kind,
+            presenter: match owner_kind {
+                SwarmSemanticOwnerKind::AgentCoordinator => SWARM_COORDINATOR.to_owned(),
+                SwarmSemanticOwnerKind::TaskController => SWARM_TASK_CONTROLLER.to_owned(),
+                SwarmSemanticOwnerKind::Governor => "governor-1702".to_owned(),
+            },
+            epoch: 1,
+        },
+        owner_id: owner_id.to_owned(),
+        revision,
+        expected_predecessor: revision.checked_sub(1),
+        content_digest,
+        record_json: String::from_utf8(bytes)
+            .map_err(|error| format!("canonical record bytes are not utf-8: {error}"))?,
+    };
+    owner_revision
+        .validate()
+        .map_err(|error| format!("owner revision fixture must validate: {error}"))?;
+    let scope = owner_revision.ordering_scope()?;
+    let receipt = WriteReceipt {
+        operation_id: OperationId::new(&format!("operation-1702-{owner_id}-{revision}"))?,
+        idempotency_key: format!("idempotency-1702-{owner_id}-{revision}"),
+        canonical_request_hash: sha256_hex(bytes.as_slice()),
+        transition_class: TransitionClass::TaskControl,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(CommitId::new(&format!("commit-1702-{owner_id}-{revision}"))?),
+        state_fence: fence.clone(),
+        ordering_sequences: vec![OrderingHead {
+            scope,
+            sequence: revision,
+            state_fence: fence.clone(),
+        }],
+        revision_before_after: Vec::new(),
+        applied_command_ids: vec![format!("command-1702-{owner_id}")],
+        emitted_event_ids: Vec::new(),
+        projection_refs: Vec::new(),
+        outbox_refs: Vec::new(),
+        operation_manifest_digest: OperationManifestDigest::new(&format!(
+            "manifest-1702-{owner_id}"
+        ))?,
+        admission_digest: sha256_hex(b"admission-digest-1702"),
+        mutation_plan_digest: sha256_hex(b"mutation-plan-digest-1702"),
+        semantic_source_revisions: Vec::new(),
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+            policy_revision: fence.policy_revision,
+            config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+            schema_revision: eliot_store_api::CONTRACT_VERSION,
+        },
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some("2026-01-01T00:00:00Z".to_owned()),
+        envelope: None,
+    };
+    receipt
+        .validate()
+        .map_err(|error| format!("receipt fixture must validate: {error}"))?;
+    Ok(DurableSwarmCommit {
+        revision: owner_revision,
+        receipt,
+    })
+}
+
+/// A private protected state root for one test's owner-separated revision
+/// envelope. The store writes under a protected runtime path lease whose root
+/// is this exact directory, so the test's envelope lands on real durable
+/// storage rather than in-memory state, and both are torn down with the value.
+struct SwarmStateRoot {
+    root: std::path::PathBuf,
+    _override: eliot_platform_windows::test_support::ProtectedRootOverride,
+}
+
+impl SwarmStateRoot {
+    fn new(suffix: &str) -> TestResult<Self> {
+        let root = std::env::temp_dir().join(format!(
+            "eliotd-1702-semantic-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("state root {}: {error}", root.display()))?;
+        let root = std::fs::canonicalize(&root)
+            .map_err(|error| format!("canonicalize state root {}: {error}", root.display()))?;
+        let override_root =
+            eliot_platform_windows::test_support::override_protected_root(&root);
+        Ok(Self {
+            root,
+            _override: override_root,
+        })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+
+impl Drop for SwarmStateRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Registers, admits and launches one live semantic wave, returning the running
+/// execution revision this fabric now holds as current.
+fn admitted_running_execution(
+    fabric: &mut AgentFabric,
+    fence: &StateFence,
+    suffix: &str,
+    revision: u64,
+) -> TestResult<SwarmExecutionRevision> {
+    let definition = frozen_swarm_definition(fence, suffix);
+    let admission = admitted_swarm_admission(&definition, fence);
+    let execution = SwarmExecutionRevision::begin(
+        &definition,
+        &admission,
+        SwarmExecutionId::new("execution-1702").expect("execution id"),
+        SwarmCoordinatorLease {
+            holder: SWARM_COORDINATOR.to_owned(),
+            epoch: 1,
+        },
+        RevisionId::new("1").expect("wave"),
+        sha256_hex(b"coverage-1702-empty"),
+    )
+    .expect("execution begun");
+    let running = SwarmExecutionRevision {
+        state: SwarmExecutionState::Running,
+        ..execution
+    };
+
+    let definition_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::TaskController,
+        definition.definition_id.as_str(),
+        &definition,
+        fence,
+        revision,
+    )?;
+    fabric.register_semantic_definition(
+        definition.clone(),
+        SWARM_TASK_CONTROLLER,
+        1,
+        &definition_commit.revision,
+        &definition_commit.receipt,
+    )?;
+    let admission_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::Governor,
+        admission.admission_id.as_str(),
+        &admission,
+        fence,
+        revision,
+    )?;
+    fabric.bind_semantic_admission(
+        admission.clone(),
+        &admission_commit.revision,
+        &admission_commit.receipt,
+    )?;
+    let execution_commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        running.execution_id.as_str(),
+        &running,
+        fence,
+        revision,
+    )?;
+    fabric.record_semantic_execution(
+        running.clone(),
+        SWARM_COORDINATOR,
+        1,
+        &execution_commit.revision,
+        &execution_commit.receipt,
+    )?;
+    Ok(running)
+}
+
+// WORK_UNIT_CASE: 1702/A1 — mechanical execution update is admitted. The
+// production caller `AgentFabric::record_semantic_execution` routes a changed
+// revision under a held execution identity through the contract refusal before
+// accepting it; a coordinator advancing its own running wave — the recorded
+// state edge and the coverage handle moving, wave and root unchanged — passes
+// that guard and is durably committed, so the update path is reachable rather
+// than refused for every input.
+#[test]
+fn mechanical_semantic_execution_update_is_admitted_and_committed() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("advance")?;
+    world.fabric.attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "advance", 1)?;
+
+    // The mechanical advance: RUNNING -> PAUSED, new coverage, same wave, same
+    // root, same frozen definition digest, same admitted ceilings.
+    let advanced = SwarmExecutionRevision {
+        state: SwarmExecutionState::Paused,
+        coverage_digest: sha256_hex(b"coverage-1702-advanced"),
+        ..running.clone()
+    };
+    let commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        advanced.execution_id.as_str(),
+        &advanced,
+        &fence,
+        2,
+    )?;
+    world.fabric.record_semantic_execution(
+        advanced.clone(),
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    )?;
+
+    // The advance is current, durably, under its own execution identity.
+    let stored = world.fabric.snapshot()?;
+    let current = stored
+        .semantic_executions
+        .get(advanced.execution_id.as_str())
+        .ok_or("advanced execution must be current")?;
+    assert_eq!(current, &advanced);
+    assert_eq!(
+        world
+            .fabric
+            .ledger_events()
+            .into_iter()
+            .filter(|event| event == "semantic_execution_updated")
+            .count(),
+        1,
+        "the update must record itself on the ledger"
+    );
+    Ok(())
+}
+
+// WORK_UNIT_CASE: 1702/A1 — a semantic execution update is refused. The same
+// production caller refuses an update that moves a frozen dimension: here the
+// wave is substituted in place, which is the exact change
+// `check_execution_update` reports as `SemanticDrift("update.wave")`. The
+// typed refusal reaches the caller — nothing is swallowed, and the previously
+// current revision stays current because the guard refuses before the map moves
+// or the durable commit runs.
+#[test]
+fn semantic_execution_update_changing_frozen_wave_is_refused_typed() -> TestResult {
+    let route = test_route()?;
+    let mut world = test_world(
+        Some(route),
+        AdmitMode::Admit,
+        ActivateMode::Activate,
+        EgressMode::Ack,
+        false,
+    )?;
+    let state_root = SwarmStateRoot::new("drift")?;
+    world.fabric.attach_semantic_revision_store(state_root.path());
+    let fence = test_fence()?;
+    let running = admitted_running_execution(&mut world.fabric, &fence, "drift", 1)?;
+
+    // In-place wave substitution: the wave moves while the definition digest is
+    // unchanged, so the frozen root/wave pairing this execution was admitted
+    // under is rewritten rather than re-admitted.
+    let drifted = SwarmExecutionRevision {
+        wave: RevisionId::new("2").expect("drifted wave"),
+        state: SwarmExecutionState::Paused,
+        coverage_digest: sha256_hex(b"coverage-1702-drifted"),
+        ..running.clone()
+    };
+    let commit = durable_swarm_commit(
+        SwarmSemanticOwnerKind::AgentCoordinator,
+        drifted.execution_id.as_str(),
+        &drifted,
+        &fence,
+        2,
+    )?;
+    match world.fabric.record_semantic_execution(
+        drifted,
+        SWARM_COORDINATOR,
+        1,
+        &commit.revision,
+        &commit.receipt,
+    ) {
+        Err(FabricError::SemanticDrift(field)) => assert_eq!(field, "update.wave"),
+        other => {
+            return Err(format!(
+                "semantic wave change must refuse typed SemanticDrift, got {other:?}"
+            )
+            .into());
+        }
+    }
+
+    // Nothing moved: the previously current revision is still exactly what this
+    // fabric holds, and the refused update was never recorded as current.
+    let stored = world.fabric.snapshot()?;
+    let current = stored
+        .semantic_executions
+        .get(running.execution_id.as_str())
+        .ok_or("execution must remain current")?;
+    assert_eq!(current, &running);
+    assert!(
+        !world
+            .fabric
+            .ledger_events()
+            .into_iter()
+            .any(|event| event == "semantic_execution_updated"),
+        "a refused update must not record an update"
+    );
     Ok(())
 }

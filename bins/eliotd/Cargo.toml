@@ -145,5 +145,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The owner-separated revision store writes under a protected runtime path lease
+# whose root is the installed daemon state root. `test-support` selects one
+# explicit disposable root for a bounded test (issue #1702 A1 wiring proof),
+# exactly as `bins/eliot-watchdog` and `bins/eliot-kernel` do; production builds
+# contain no such surface.
+eliot-platform-windows = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true
