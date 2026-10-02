@@ -1,9 +1,16 @@
 //! Single retained provider-process and data-root owner. No socket or RPC state.
-//! The accepted kill-on-drop fallback is unchanged; drop is not clean-exit proof.
+//!
+//! The provider child is assigned to a kill-on-close Windows Job Object at
+//! launch and the owning handle is retained for the child's whole life
+//! (issue #1888, package K-STORE), so the provider now ends with this owner for
+//! any reason the owner ends. `kill_on_drop` remains as the cooperative path for
+//! ordinary drops; it is still not proof of clean exit, and the Job Object is
+//! what covers the cases `Drop` never reaches.
 use super::millis;
 use super::rpc_parse::ProviderVersion;
 use crate::config::{StoreDataRootLease, SurrealAdapterConfig};
 use crate::error::AdapterError;
+use crate::provider_job::ProviderKillOnCloseLease;
 use eliot_platform_windows::{
     ProcessIdentity, RetainedProcessPathLease, is_eliot_governor_running,
     observe_loopback_tcp_connection_peer_owner, observe_loopback_tcp_listener_owner,
@@ -27,6 +34,12 @@ pub(crate) struct ProviderOwner {
     pub(super) provider_child: Mutex<Child>,
     pub(super) provider_process_id: u32,
     pub(super) provider_process_identity: ProcessIdentity,
+    /// Sole owning handle of the kill-on-close Job Object the provider child is
+    /// assigned to (#1888, K-STORE). Held for the child's whole life, so the
+    /// provider ends with this owner even when the owner is terminated from
+    /// outside and no `Drop` runs. `_kill_on_close` is retained for its `Drop`,
+    /// not read.
+    pub(crate) kill_on_close_job: ProviderKillOnCloseLease,
     data_root_lease: StoreDataRootLease,
     /// Server version proved by the last ownership-verified authentication
     /// on this provider child (issue #1932). Set only after the full
@@ -90,7 +103,7 @@ impl ProviderOwner {
         // gap, closing the TOCTOU in which two generations could each observe a
         // free endpoint and spawn a provider against one data root.
         reject_occupied_endpoint(config, connect_timeout).await?;
-        let mut provider_child = spawn_provider(config)?;
+        let (mut provider_child, kill_on_close_job) = spawn_provider(config)?;
         let provider_process_id = provider_child.id().ok_or_else(|| {
             AdapterError::Config("canonical provider child PID is unavailable".to_owned())
         })?;
@@ -108,6 +121,7 @@ impl ProviderOwner {
                 provider_child: Mutex::new(provider_child),
                 provider_process_id,
                 provider_process_identity: identity_before_listener,
+                kill_on_close_job,
                 data_root_lease,
                 authenticated_version: std::sync::Mutex::new(None),
             }),
@@ -268,13 +282,23 @@ pub(super) async fn reject_occupied_endpoint(
     Ok(())
 }
 
-fn spawn_provider(config: &SurrealAdapterConfig) -> Result<Child, AdapterError> {
+fn spawn_provider(
+    config: &SurrealAdapterConfig,
+) -> Result<(Child, ProviderKillOnCloseLease), AdapterError> {
     let environment = provider_environment(config)?;
     let mut command = Command::new(&config.provider_executable_path);
     configure_provider_command(&mut command, config, &environment);
-    command
-        .spawn()
-        .map_err(|_| AdapterError::Config("canonical provider process launch failed".to_owned()))
+    // One launch path (issue #1888, K-STORE): the spawned provider is admitted
+    // into the kill-on-close Job Object immediately, and the returned lease is
+    // held for the child's whole life. A refused assignment terminates and
+    // reaps the child instead of leaving an unassigned provider running.
+    crate::provider_job::spawn_provider_kill_on_close(
+        || command.spawn(),
+        |child: &Child| child.id(),
+        |child: &mut Child| {
+            let _kill_result = child.start_kill();
+        },
+    )
 }
 
 pub(super) trait ProviderCommand {
