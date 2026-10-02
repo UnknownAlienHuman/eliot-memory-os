@@ -25,7 +25,7 @@ use super::super::{
     AuthenticatedKernelReadiness, PublishedSupervisionIdentity, fresh_identity, operation,
 };
 use eliot_host_state::{
-    AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
+    AppendDisposition, AppendReceipt, HostStateJournalService, JournalBackend, JournalError,
     KernelReadinessObservationRecord, ReadinessApprovedContour,
 };
 #[cfg(windows)]
@@ -51,16 +51,41 @@ use eliot_runtime_contracts::{
 // refs, digests, or arbitrary error text — so bounding limits size, not
 // sensitivity (I15.4). Appended evidence and granted readiness stay
 // distinct: this child observes the evidence funnel; the readiness grant
-// stays with the gate owner (I1.10). These primitives own no terminal: a
-// single terminal per failed readiness operation is enforced by the
-// outermost owner boundary, while these phases correlate by stage order
-// only. Sink outcome never alters result/order/cleanup.
+// stays with the gate owner (I1.10). A NEW durable readiness commit and an
+// EXACT COMMITTED REPLAY/readback of an existing observation stay distinct
+// (I14.20 `RECONCILING` cannot create a new effect; case 11): the owner
+// receipt's own disposition is never collapsed into "another durable append".
+// These primitives own no terminal: a single terminal per failed readiness
+// operation is enforced by the outermost owner boundary, while these phases
+// correlate by stage order only. Sink outcome never alters
+// result/order/cleanup.
 fn host_readiness_append_observe(detail: &str) {
     let _ = crate::windows_event_log::event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,
     );
+}
+
+/// Names the owner-issued disposition of one committed readiness-append
+/// receipt without creating, repeating or re-interpreting an effect.
+///
+/// I14.20 (`RECONCILING` cannot create a new effect) and case 11 require the
+/// two owner dispositions to stay distinct on this path too: the journal owner
+/// returns `Applied` for this call's NEW durable commit and `Replayed` for the
+/// exact readback of an already committed readiness observation, which is not
+/// another append. The receipt is the owner's own verdict; this branch only
+/// observes which one the owner returned, in this module's readiness
+/// vocabulary and through this module's existing facade helper.
+fn observe_readiness_append_outcome(receipt: &AppendReceipt) {
+    match receipt.disposition() {
+        AppendDisposition::Applied => {
+            host_readiness_append_observe("host.readiness append durable observed");
+        }
+        AppendDisposition::Replayed => {
+            host_readiness_append_observe("host.readiness append committed replay observed");
+        }
+    }
 }
 
 fn append_reconciled_readiness<B: JournalBackend>(
@@ -71,15 +96,30 @@ fn append_reconciled_readiness<B: JournalBackend>(
     host_readiness_append_observe("host.readiness append requested");
     match journal.append_readiness_observation(observation.clone(), expected) {
         Ok(receipt) => {
-            host_readiness_append_observe("host.readiness append durable observed");
+            observe_readiness_append_outcome(&receipt);
             Ok(receipt)
         }
         Err(JournalError::OutcomeUnknown { transaction_id }) => {
             host_readiness_append_observe("host.readiness append outcome unknown observed");
             if super::reconcile_unknown_outcome(journal, &transaction_id)? {
-                journal
-                    .append_readiness_observation(observation, expected)
-                    .map_err(HostError::Journal)
+                // Reconciliation proved the exact original transaction committed,
+                // so re-entering the idempotent readiness append owner only
+                // VERIFIES that commit through its replay receipt; it creates no
+                // new effect. A failed readback keeps "commit known, readback
+                // failed" in the diagnostic history while the owner's own error
+                // propagates unchanged to this caller.
+                match journal.append_readiness_observation(observation, expected) {
+                    Ok(receipt) => {
+                        observe_readiness_append_outcome(&receipt);
+                        Ok(receipt)
+                    }
+                    Err(error) => {
+                        host_readiness_append_observe(
+                            "host.readiness commit known readback failed observed",
+                        );
+                        Err(HostError::Journal(error))
+                    }
+                }
             } else {
                 // Unreachable today: the choke fails closed instead of returning
                 // `Ok(false)`. Retained fail-closed so semantics stay identical
