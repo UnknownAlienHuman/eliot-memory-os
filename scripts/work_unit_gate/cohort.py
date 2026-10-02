@@ -147,10 +147,22 @@ class OwnerRole(str, Enum):
 
 @dataclass(frozen=True)
 class IntegrationOwnerEntry:
-    """One exact accepted integration-owner binding: issue plus unit."""
+    """One exact accepted integration-owner binding: issue plus unit.
+
+    Both halves are required and exactly typed. An unvalidated entry would
+    compare unequal to a typed lookup and silently drop a declared owner's
+    authority instead of failing, so a mistyped half is rejected here rather
+    than degrading into "ordinary leaf" without an error.
+    """
 
     issue: c.IssueIdentity
     unit: c.WorkUnitIdentity
+
+    def __post_init__(self) -> None:
+        if type(self.issue) is not c.IssueIdentity:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owner issue mistyped")
+        if type(self.unit) is not c.WorkUnitIdentity:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owner unit mistyped")
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,18 @@ class IntegrationOwnerProfile:
     Only a listed (issue, unit) pair holds the INTEGRATION_OWNER role; every
     other identity is LEAF. Name prefixes, substrings and bare issue numbers
     never confer authority.
+
+    Known accepted-source ceiling, stated so it is not mistaken for coverage:
+    no accepted data source populates this profile yet. The committed
+    aggregate lock's closed row schema (`_LOCK_ROW_KEYS`: issue, unit,
+    body_sha256, disposition, prerequisites) and its closed disposition set
+    carry no owner-role field, the #850 descriptor schema admits no extra
+    field, and the accepted AssignmentSource relation channel is a
+    caller-asserted expectation that the source only echoes. Production
+    therefore has an empty classification, which is fail-closed: every
+    shared/root/generated claim stays rejected. Populating it needs a
+    classification field in an accepted catalogue contract, not a local
+    inference.
     """
 
     owners: Tuple[IntegrationOwnerEntry, ...] = ()
@@ -177,32 +201,43 @@ class IntegrationOwnerProfile:
             raise CohortError(CohortProblem.DUPLICATE_UNIT, "duplicate integration owner entry")
         object.__setattr__(self, "owners", tuple(sorted(entries, key=lambda e: (e.issue, e.unit))))
 
-    def role_of(self, unit: c.WorkUnitIdentity, issue: Optional[c.IssueIdentity] = None) -> OwnerRole:
-        """Return the typed role for an identity under this profile."""
+    def role_of(self, unit: c.WorkUnitIdentity, issue: c.IssueIdentity) -> OwnerRole:
+        """Return the typed role for one exact (issue, unit) identity pair.
+
+        The issue half is mandatory: unit identity is not unique across the
+        whole catalogue (uniqueness is enforced only among active rows, see
+        `materialize_catalogue`), so a unit-only lookup would let one issue's
+        accepted integration-owner binding hand the same unit spelling's
+        restricted-root authority to a different issue. Authority is the exact
+        pair or nothing.
+        """
         if type(unit) is not c.WorkUnitIdentity:
             raise CohortError(CohortProblem.INTERNAL_ERROR, "owner lookup unit mistyped")
-        if issue is not None and type(issue) is not c.IssueIdentity:
+        if type(issue) is not c.IssueIdentity:
             raise CohortError(CohortProblem.INTERNAL_ERROR, "owner lookup issue mistyped")
         for entry in self.owners:
-            if entry.unit == unit and (issue is None or entry.issue == issue):
+            if entry.unit == unit and entry.issue == issue:
                 return OwnerRole.INTEGRATION_OWNER
         return OwnerRole.LEAF
 
 
 def is_integration_owner(
     unit: c.WorkUnitIdentity,
-    issue: Optional[c.IssueIdentity] = None,
+    issue: c.IssueIdentity,
     *,
     profile: Optional[IntegrationOwnerProfile] = None,
 ) -> bool:
-    """Determine whether a work-unit identity is an authorized integration owner.
+    """Determine whether one exact work-unit identity is an authorized integration owner.
 
-    Typed authority only: True exactly when the (unit, issue) pair is a member
+    Typed authority only: True exactly when the (issue, unit) pair is a member
     of the supplied accepted profile. Without a profile there is no authority
-    (False); spelling heuristics and magic issue numbers never apply.
+    (False); spelling heuristics, unit-only lookup and magic issue numbers
+    never apply.
     """
     if type(unit) is not c.WorkUnitIdentity:
         raise CohortError(CohortProblem.INTERNAL_ERROR, "integration owner unit mistyped")
+    if type(issue) is not c.IssueIdentity:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "integration owner issue mistyped")
     if profile is None:
         return False
     if type(profile) is not IntegrationOwnerProfile:
@@ -282,7 +317,18 @@ class PackageSharingEdge:
     """One explicit typed package-sharing declaration between finite parties.
 
     Covers the exact sharing parties for one package; order labels alone never
-    suffice, and validation always re-checks scopes and order together.
+    suffice, and validation always re-checks scopes and order together. Module
+    identity is deliberately not a sharing target: an accepted descriptor may
+    name the same module under different packages (a module is the runner or
+    non-crate owner, not an exclusive ownership claim), so only package
+    ownership requires an explicit decomposition.
+
+    Known accepted-source ceiling: no accepted data source declares a sharing
+    edge. The closed lock row schema and the closed #850 descriptor schema
+    admit none, and `AssignmentSourceRequest.relation` is caller-asserted
+    rather than observed. Production supplies the empty tuple, so every
+    same-package pair is rejected — the fail-closed side of the contract, not
+    the represented one.
     """
 
     package: c.PackageIdentity
@@ -320,7 +366,8 @@ def _require_package_sharing(
     DISJOINT requires no overlapping mutable (source) scopes. SERIALIZED
     requires a typed prerequisite edge in one direction plus exactly one
     typed integration owner on the pair. Test roots are read scopes and may
-    stay shared. Without a covering validated edge the pair stays a conflict.
+    stay shared. Without a covering validated edge the pair stays a conflict;
+    a declared edge never substitutes for the scope and order facts it claims.
     """
     pair = {first.issue, second.issue}
     for edge in sharing:
@@ -417,7 +464,7 @@ def materialize_catalogue(
     for r in rows:
         if r.descriptor is not None and r.descriptor.package is not None:
             holders_by_package.setdefault(r.descriptor.package.name, []).append(r.descriptor)
-    for package_name, holders in holders_by_package.items():
+    for package_name, holders in sorted(holders_by_package.items()):
         for i, first in enumerate(holders):
             for second in holders[i + 1:]:
                 if (first.issue, first.unit) == (second.issue, second.unit):
