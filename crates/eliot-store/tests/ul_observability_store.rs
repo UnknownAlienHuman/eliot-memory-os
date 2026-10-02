@@ -12,8 +12,10 @@ use eliot_types::{
 };
 use serde_json::{Value, json};
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -424,147 +426,192 @@ fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
     Ok(true)
 }
 
+/// Prefix of the per-run runtime root, and the guard on teardown: only a
+/// directory this harness created directly below the test runtime root is ever
+/// removed.
+const RUN_ID_PREFIX: &str = "eliot-ul-t02-store-";
+
+/// The exact `SurrealDB` release this issue is accepted against, pinned by
+/// `config/dependency-policy.toml` (`external_executables.surrealdb`).
+const PINNED_SURREAL_VERSION: &str = "3.1.4";
+
+/// One isolated, path-backed `SurrealDB` runtime per test run.
+///
+/// The runtime root is unique per run and `rocksdb:`-backed because
+/// `SurrealServerSupervisor` refuses any non-path-backed storage before it can
+/// read a credential, take a start lock, or spawn a server. The supervisor is
+/// also the only launch seam: `CanonicalStore` runs `start_or_connect` and
+/// `shutdown_if_spawned` around each named operation, so this harness owns the
+/// isolated root and configuration only, and never launches a second,
+/// test-owned server.
 struct Harness {
-    root: PathBuf,
     store: CanonicalStore,
-    surreal: OwnedChild,
+    root: RuntimeRoot,
 }
 
 impl Harness {
     async fn start(name: &str) -> TestResult<Self> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = test_runtime_root()?.join(format!(
-            "eliot-ul-t02-store-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root)?;
-        fs::write(root.join("surreal-root.txt"), "ul-t02-test-secret")?;
+        let root = RuntimeRoot::create(name)?;
         let surreal_exe = pinned_surreal_exe()?;
-        let port = test_port(name)?;
-        let surreal = start_surreal(&surreal_exe, port)?;
-        wait_for_tcp(port, Duration::from_secs(20))?;
+        let port = free_local_port()?;
+        let run_id = root
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("test runtime name missing")?;
 
         let mut config = GovernorConfig::default();
         config.db.surreal.exe = slash(&surreal_exe);
         config.db.surreal.bind = format!("127.0.0.1:{port}");
         config.db.surreal.endpoint = format!("ws://127.0.0.1:{port}/rpc");
-        "memory".clone_into(&mut config.db.surreal.storage);
+        // The supervisor derives its pid receipt, start lock, client leases and
+        // server log from the parent of this directory, so the whole runtime
+        // stays inside the unique per-run root and is removed with it.
+        config.db.surreal.storage =
+            format!("rocksdb:{}", slash(&root.path().join("surrealdb-rocks")));
         "ultest".clone_into(&mut config.db.surreal.ns);
         "ultest".clone_into(&mut config.db.surreal.db);
         "root".clone_into(&mut config.db.surreal.user);
         config.db.surreal.credential_provider = CredentialProviderKind::LegacyPasswordFile;
         "test-only/ul-t02-store".clone_into(&mut config.db.surreal.credential_id);
-        let run_id = root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("test runtime name missing")?;
+        // No credential is authored by this test: the supervisor generates a
+        // per-run root password into this isolated, ACL-restricted file below
+        // the run root, and the run root is removed on teardown.
         config.db.surreal.password_file =
             format!("%LOCALAPPDATA%/Eliot/tests/{run_id}/surreal-root.txt");
         let store = CanonicalStore::new(config.db.surreal);
         store.migrate_schema().await?;
-        Ok(Self {
-            root,
-            store,
-            surreal,
-        })
+        Ok(Self { store, root })
     }
 }
 
-impl Drop for Harness {
+/// The unique per-run `SurrealDB` runtime root, created before any other start
+/// step and removed on drop.
+///
+/// This owner exists instead of a `Harness::drop` because `Harness::start`
+/// returns `Err` before the harness value is ever constructed, so a harness that
+/// removed its root only from `Drop` leaked the root of every failed start.
+/// Owning the path from the moment it is created removes it on success, on a
+/// failed start, and on a mid-test failure alike.
+struct RuntimeRoot {
+    path: PathBuf,
+}
+
+impl RuntimeRoot {
+    fn create(name: &str) -> TestResult<Self> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = test_runtime_root()?.join(format!(
+            "{RUN_ID_PREFIX}{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RuntimeRoot {
     fn drop(&mut self) {
-        let _ = self.surreal.stop();
-        if self
-            .root
+        remove_runtime_root(&self.path);
+    }
+}
+
+/// Removes one runtime root this harness created.
+///
+/// The guard is deliberately narrow: the directory must sit directly below the
+/// test runtime root and carry the harness run-id prefix, so a path that escaped
+/// the per-run root is never deleted.
+fn remove_runtime_root(path: &Path) {
+    let Ok(runtime_root) = test_runtime_root() else {
+        return;
+    };
+    let owned = path.parent() == Some(runtime_root.as_path())
+        && path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("eliot-ul-t02-store-"))
-            && self
-                .root
-                .starts_with(test_runtime_root().unwrap_or_else(|_| PathBuf::new()))
-        {
-            let _ = fs::remove_dir_all(&self.root);
+            .is_some_and(|name| name.starts_with(RUN_ID_PREFIX));
+    if !owned || !path.exists() {
+        return;
+    }
+    // `CanonicalStore` stops the server around every operation, so no live
+    // process owns this root when it is dropped. Windows can still hold a
+    // transient handle on a rocksdb file just after exit, so removal is retried
+    // inside a bounded window instead of leaving the root behind.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fs::remove_dir_all(path).is_ok() || Instant::now() >= deadline {
+            // Removed, or the retry window closed with removal still failing: either
+            // way the root is left for an operator sweep rather than blocking the run.
+            return;
         }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
-struct OwnedChild(Option<Child>);
-
-impl OwnedChild {
-    fn stop(&mut self) -> TestResult {
-        if let Some(mut child) = self.0.take() {
-            if child.try_wait()?.is_none() {
-                child.kill()?;
-            }
-            let _ = child.wait()?;
-        }
-        Ok(())
-    }
+/// Reserves an ephemeral loopback port for one run. A fixed port would be a
+/// resource shared with every other process on the host, and the four UL tests
+/// run concurrently.
+fn free_local_port() -> TestResult<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
 }
 
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
-    let child = Command::new(exe)
-        .env("SURREAL_USER", "root")
-        .env("SURREAL_PASS", "ul-t02-test-secret")
-        .arg("start")
-        .arg("--bind")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--log")
-        .arg("warn")
-        .arg("--deny-all")
-        .arg("--allow-funcs")
-        .arg("array,string,time,type,math,vector,search")
-        .arg("--deny-net")
-        .arg("--")
-        .arg("memory")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    Ok(OwnedChild(Some(child)))
-}
-
+/// The pinned `SurrealDB` executable this issue is accepted against.
+///
+/// Resolution is `ELIOT_SURREAL_EXE` first, then the configured install path.
+/// An absent executable, a failing probe, or any reported version other than the
+/// pinned release fails the test: an unavailable provider is reported as a
+/// failed run, never as a green one.
 fn pinned_surreal_exe() -> TestResult<PathBuf> {
     let path = std::env::var_os("ELIOT_SURREAL_EXE").map_or_else(
         || PathBuf::from(r"C:\Tools\SurrealDB\surreal.exe"),
         PathBuf::from,
     );
-    let output = Command::new(&path).arg("version").output()?;
-    let version = String::from_utf8(output.stdout)?;
-    if !output.status.success() || !version.trim().starts_with("3.1.4") {
-        return Err(format!("UL-02 requires SurrealDB 3.1.4, got {}", version.trim()).into());
+    let output = Command::new(&path)
+        .arg("version")
+        .output()
+        .map_err(|error| {
+            format!(
+                "UL-02 requires the pinned SurrealDB {PINNED_SURREAL_VERSION} at {}: {error}",
+                path.display()
+            )
+        })?;
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = reported.trim();
+    if !output.status.success() {
+        return Err(format!(
+            "UL-02 requires SurrealDB {PINNED_SURREAL_VERSION}; {} version failed: {reported}",
+            path.display()
+        )
+        .into());
+    }
+    if !reports_pinned_version(reported) {
+        return Err(format!(
+            "UL-02 requires SurrealDB {PINNED_SURREAL_VERSION}, got {reported} from {}",
+            path.display()
+        )
+        .into());
     }
     Ok(path)
 }
 
-fn test_port(name: &str) -> TestResult<u16> {
-    let port = match name {
-        "replay" => 8601,
-        "conflict" => 8602,
-        "memory-grant" => 8603,
-        "grant-redemption" => 8604,
-        other => return Err(format!("unknown UL-02 store test {other}").into()),
-    };
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|error| format!("UL-02 store test port {port} is unavailable: {error}"))?;
-    drop(listener);
-    Ok(port)
-}
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("SurrealDB did not listen on port {port}").into())
+/// True when the probe output leads with the pinned release.
+///
+/// `surreal version` prints the bare version on the pinned build and a
+/// `surrealdb-`-prefixed version on other builds, so the product prefix is
+/// stripped before the pinned release is required.
+fn reports_pinned_version(reported: &str) -> bool {
+    reported
+        .strip_prefix("surrealdb-")
+        .unwrap_or(reported)
+        .starts_with(PINNED_SURREAL_VERSION)
 }
 
 fn slash(path: &Path) -> String {
