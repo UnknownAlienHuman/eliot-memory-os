@@ -1325,7 +1325,6 @@ mod curation_member_identity_tests {
                 )
                 .expect("valid position"),
             ],
-            missing_positions: Vec::new(),
             evidence_refs: BTreeSet::new(),
             owners: BTreeSet::from([owner.clone(), rival.clone()]),
             common_lineage: BTreeSet::new(),
