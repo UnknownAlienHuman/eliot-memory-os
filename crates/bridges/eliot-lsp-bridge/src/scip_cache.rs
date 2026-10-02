@@ -137,6 +137,7 @@ struct ScipInvocationCommitmentV1<'a> {
     candidate_identity_at_dispatch: &'a Option<CandidateIdentity>,
     build_fingerprint_at_dispatch: &'a Option<eliot_build_test_graph::BuildFingerprint>,
     config: &'a AnalyzerConfig,
+    sidecar_file_name: &'static str,
     operation: &'a SemanticOperation,
     instrument: &'a str,
     instrument_kind: &'a eliot_instrument_api::InstrumentKind,
@@ -671,6 +672,12 @@ fn invocation_cache_identity(
     let root_disposition = match root_observation.disposition() {
         eliot_platform_windows::RetainedRootDisposition::Direct => RootDisposition::Direct,
     };
+    // The owner-chosen per-invocation directory changes on every run to make
+    // stale files fail the bridge's empty-root preflight. Its pathname is a
+    // transport destination, not a semantic analyzer setting; the measured
+    // retained root and the fixed sidecar leaf bind output provenance below.
+    let mut cache_config = invocation.config.clone();
+    cache_config.scip_output_path = None;
     let commitment = ScipInvocationCommitmentV1 {
         schema_version: 1,
         candidate: &invocation.source_candidate,
@@ -681,7 +688,8 @@ fn invocation_cache_identity(
         source_scope_at_dispatch: &invocation.source_scope_at_dispatch,
         candidate_identity_at_dispatch: &invocation.candidate_identity,
         build_fingerprint_at_dispatch: &invocation.build_fingerprint,
-        config: &invocation.config,
+        config: &cache_config,
+        sidecar_file_name: super::LSP_SCIP_SIDECAR_FILE_NAME,
         operation: &invocation.operation,
         instrument: invocation.instrument_invocation.instrument.as_str(),
         instrument_kind: &invocation.instrument_invocation.kind,
