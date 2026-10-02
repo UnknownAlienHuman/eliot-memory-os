@@ -71,7 +71,7 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, NormalizedEvidence, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError,
+    Lease, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError, TestdProviderEvidence,
     TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
@@ -736,26 +736,21 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     } = outcome;
     let finished_at = observation_clock(current_clock_ms());
     let records = collector.snapshot();
-    let synthetic = match capture_inline_previews(
+    if let Err(error) = capture_inline_previews(
         collector,
         &claimed.invocation.profile,
         &records,
         finished_at,
     ) {
-        Ok(synthetic) => synthetic,
-        Err(error) => {
-            finish_unknown(
-                store,
-                claimed,
-                lease,
-                collector,
-                format!(
-                    "raw capture failed after execution; outcome rescheduled as unknown: {error}"
-                ),
-            )?;
-            return Ok(());
-        }
-    };
+        finish_unknown(
+            store,
+            claimed,
+            lease,
+            collector,
+            format!("raw capture failed after execution; outcome rescheduled as unknown: {error}"),
+        )?;
+        return Ok(());
+    }
     let (source_observation, observation_fault) =
         observe_terminal_source(observed, contour, &mut execution);
     if let Some(message) = observation_fault {
@@ -764,20 +759,15 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     let mut receipt =
         collector.verification_receipt_at(claimed, execution, started_at, finished_at);
     receipt.source_observation = source_observation;
-    for handle in &synthetic {
-        receipt.normalized.push(NormalizedEvidence {
-            kind: "process.observation".to_owned(),
-            summary: format!("one-shot worker observed inline stream {handle}"),
-            raw_handles: vec![handle.clone()],
-            execution,
-        });
+    if !attach_provider_evidence(store, claimed, lease, collector, &records, &mut receipt)? {
+        return Ok(());
     }
     if receipt.validate(claimed).is_err() {
         finish_unknown(
             store,
             claimed,
             lease,
-            &EvidenceCollector::default(),
+            collector,
             "enriched receipt failed validation; outcome rescheduled as unknown without evidence promotion"
                 .to_owned(),
         )?;
@@ -808,6 +798,57 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         Some(truncate_reason(reason)),
     )?;
     Ok(())
+}
+
+fn attach_provider_evidence(
+    store: &TestdStore,
+    claimed: &TestJob,
+    lease: &Lease,
+    collector: &EvidenceCollector,
+    records: &[ProcessEvidence],
+    receipt: &mut eliot_testd_core::VerificationReceipt,
+) -> Result<bool, TestdError> {
+    let Some(registry) = claimed.provider_registry_snapshot.as_ref() else {
+        return Ok(true);
+    };
+    let stdout_process_index = receipt
+        .raw_artifacts
+        .iter()
+        .find(|artifact| artifact.stream == RawArtifactStream::Stdout)
+        .and_then(|artifact| process_evidence_index_for_stdout(&artifact.handle, records));
+    match TestdProviderEvidence::from_receipt_inputs(
+        claimed,
+        receipt.execution,
+        registry,
+        &receipt.raw_artifacts,
+        &receipt.typed_evidence,
+        stdout_process_index,
+    ) {
+        Ok(Some(evidence)) => receipt.provider_evidence = Some(evidence),
+        Ok(None) if eliot_testd_core::is_productive_testd_profile(&claimed.invocation.profile) => {
+            finish_unknown(
+                store,
+                claimed,
+                lease,
+                collector,
+                "productive provider parser profile was not supported by the retained parser"
+                    .to_owned(),
+            )?;
+            return Ok(false);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            finish_unknown(
+                store,
+                claimed,
+                lease,
+                collector,
+                format!("retained provider metadata refused parser binding: {error}"),
+            )?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn reconcile_operation<E: ProcessExecutor + 'static>(
@@ -968,6 +1009,14 @@ fn capture_inline_previews(
         }
     }
     Ok(synthetic)
+}
+
+fn process_evidence_index_for_stdout(handle: &str, records: &[ProcessEvidence]) -> Option<usize> {
+    records.iter().enumerate().find_map(|(index, record)| {
+        let direct_handle = record.stdout_ref() == Some(handle);
+        let inline_handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-stdout") == handle;
+        (direct_handle || inline_handle).then_some(index)
+    })
 }
 
 fn observation_clock(now: u64) -> ClockReading {

@@ -36,6 +36,7 @@ use uuid::Uuid;
 
 mod claim;
 mod nextest_partition;
+mod provider_evidence;
 mod resources;
 mod target_layout;
 mod typed_evidence;
@@ -43,6 +44,10 @@ mod typed_evidence;
 pub use claim::{
     ClaimBindingExpectation, ExpiredRunningReconciliation, reconcile_expired_running,
     validate_claim_binding,
+};
+pub use provider_evidence::{
+    ParsedProviderOutput, ProviderCleanupStatus, ProviderContractIdentity, ProviderIdentitySet,
+    ProviderIndependence, ProviderRawSource, TestdProviderEvidence,
 };
 pub use resources::{
     JobClass, NextestLanePlan, ResourceClaim, ResourceError, ResourceKind, ResourceLease,
@@ -1451,6 +1456,11 @@ pub struct TestJob {
     /// the daemon rehydrates and compares the Governor-owned plan at publish.
     #[serde(default)]
     pub verifier_dispatch: Option<TestdVerifierDispatchBinding>,
+    /// Original provider-registry snapshot retained before productive dispatch.
+    /// Its bytes and recorded digest are validated by `RawArtifact`; provider
+    /// semantics and currentness remain owned by the composition boundary.
+    #[serde(default)]
+    pub provider_registry_snapshot: Option<RawArtifact>,
     /// Actual repository identity observed immediately before productive
     /// worker claim. The terminal receipt must retain this exact baseline.
     #[serde(default)]
@@ -2682,6 +2692,11 @@ pub struct VerificationReceipt {
     /// receipts; populated additively without changing legacy handle lineage.
     #[serde(default)]
     pub typed_evidence: Vec<TestdProcessEvidenceBundle>,
+    /// TestD's productive provider parser result, bound to the original
+    /// registry snapshot and exact retained stdout bytes. Legacy/probe
+    /// receipts omit this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_evidence: Option<TestdProviderEvidence>,
     /// Lane identity the emitting work item was allocated in (issue #1897):
     /// build fingerprint digest, candidate, and contract revision. `None`
     /// preserves the pre-lane authority for receipts of jobs admitted
@@ -2878,6 +2893,26 @@ impl VerificationReceipt {
                 .validate()
                 .map_err(|error| TestdError::Contract(error.to_string()))?;
         }
+        match (
+            job.provider_registry_snapshot.as_ref(),
+            self.provider_evidence.as_ref(),
+        ) {
+            (Some(registry), Some(evidence)) => {
+                if !is_productive_testd_profile(&job.invocation.profile)
+                    || evidence.execution != self.execution
+                {
+                    return Err(TestdError::InvalidBinding);
+                }
+                evidence.validate_against(
+                    job,
+                    registry,
+                    &self.raw_artifacts,
+                    &self.typed_evidence,
+                )?;
+            }
+            (None, Some(_)) => return Err(TestdError::InvalidBinding),
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -3059,12 +3094,22 @@ impl EvidenceCollector {
                 }
             }
         }
+        // Include raw artifacts retained by the TestD owner even when the
+        // process evidence exposed only an inline prefix and no durable
+        // handle. Their content still needs an explicit receipt reference.
+        for artifact in raw.values() {
+            if handles.insert(artifact.handle.clone()) {
+                let mut artifact = artifact.clone();
+                artifact.lane_identity.clone_from(&lane_identity);
+                raw_artifacts.push(artifact);
+            }
+        }
         raw_artifacts.sort_by(|left, right| {
             left.capture_sequence
                 .cmp(&right.capture_sequence)
                 .then_with(|| left.handle.cmp(&right.handle))
         });
-        let normalized = records
+        let mut normalized: Vec<NormalizedEvidence> = records
             .iter()
             .map(|record| NormalizedEvidence {
                 kind: "process.observation".to_owned(),
@@ -3077,6 +3122,19 @@ impl EvidenceCollector {
                 execution,
             })
             .collect();
+        for artifact in &raw_artifacts {
+            if !normalized
+                .iter()
+                .any(|evidence| evidence.raw_handles.contains(&artifact.handle))
+            {
+                normalized.push(NormalizedEvidence {
+                    kind: "process.observation".to_owned(),
+                    summary: format!("one-shot worker observed inline stream {}", artifact.handle),
+                    raw_handles: vec![artifact.handle.clone()],
+                    execution,
+                });
+            }
+        }
         VerificationReceipt {
             job_id: job.job_id.clone(),
             operation_id: job.process.operation_id.clone(),
@@ -3100,6 +3158,7 @@ impl EvidenceCollector {
             raw_artifacts,
             normalized,
             typed_evidence: self.typed_bundles(),
+            provider_evidence: None,
             // Issue #1897 (W5): attach the retained lane identity to the
             // emitted result, from the same value every emitted artifact
             // record was bound to above. The envelope was validated when the
@@ -3644,6 +3703,75 @@ impl TestdStore {
             "verifier-source-observation",
             now,
             Some("actual branch, commit, and dirty state captured before dispatch".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Retains the original provider-registry snapshot before a productive
+    /// dispatch. Exact retries are idempotent; changed bytes, foreign
+    /// operation handles, and post-claim writes are refused.
+    pub fn bind_provider_registry_snapshot_before_dispatch(
+        &self,
+        job_id: &str,
+        snapshot: RawArtifact,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        snapshot.validate()?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "provider_registry_snapshot",
+                reason: "snapshot time must be non-zero",
+            });
+        }
+        if snapshot.truncated
+            || snapshot.content_type != "application/vnd.eliot.provider-registry+json"
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if !is_productive_testd_profile(&job.invocation.profile)
+            || job.state != JobState::Queued
+            || job.attempts != 0
+            || job.lease.is_some()
+            || job.job_id != job_id
+            || job.process.job_id != job.job_id
+            || job.process.operation_id != job.invocation.request.request_id.as_str()
+            || snapshot.handle != format!("provider-registry:{}", job.process.operation_id)
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        if let Some(existing) = &job.provider_registry_snapshot {
+            if existing == &snapshot {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        job.provider_registry_snapshot = Some(snapshot);
+        job.updated_at_ms = now;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let mut table = write.open_table(JOBS).map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
+        drop(table);
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "provider-registry-snapshot",
+            now,
+            Some("original provider registry snapshot retained before dispatch".to_owned()),
         )?;
         write.commit().map_err(database)?;
         Ok(job)
@@ -4281,6 +4409,7 @@ impl TestdStore {
             receipt: None,
             verification_receipt: None,
             verifier_dispatch: None,
+            provider_registry_snapshot: None,
             source_observation_before: None,
             terminal_publication: None,
             updated_at_ms: at_ms,
@@ -5536,6 +5665,243 @@ mod tests {
         .expect("valid test epoch")
     }
 
+    fn provider_registry_store(
+        profile: &str,
+        state: JobState,
+        attempts: u32,
+        lease: Option<Lease>,
+    ) -> Result<(TestdStore, PathBuf), Box<dyn std::error::Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-testd-provider-registry-{}.redb",
+            Uuid::new_v4()
+        ));
+        let store = TestdStore::open(&path, RetryPolicy::default())?;
+        let epoch = test_epoch(7);
+        let generation = eliot_contracts::ResourceGeneration::new(1)?;
+        let state_fence = eliot_contracts::StateFence::new(epoch.clone(), generation);
+        let operation_id = "operation";
+        let invocation = InstrumentInvocation {
+            request: eliot_contracts::RequestMetadata {
+                request_id: RequestId::new(operation_id)?,
+                session_id: None,
+                task_id: None,
+                product_id: eliot_contracts::ProductId::new("product")?,
+                source_id: eliot_contracts::SourceId::new("source")?,
+                state_fence,
+                clock: ClockReading::default(),
+            },
+            instrument: ContractId::new("eliot.instrument.nextest")?,
+            kind: InstrumentKind::Test,
+            profile: profile.to_owned(),
+            target: "target".to_owned(),
+            arguments: Vec::new(),
+            input_artifacts: Vec::new(),
+            declared_scope: "scope".to_owned(),
+            requested_at: ClockReading::default(),
+        };
+        let job = TestJob {
+            job_id: "job".to_owned(),
+            project_id: "project".to_owned(),
+            project_sequence: 1,
+            invocation,
+            process: ProcessAdmission {
+                job_id: "job".to_owned(),
+                operation_id: operation_id.to_owned(),
+                process_tree_id: "tree".to_owned(),
+                generation: 1,
+                authority_epoch: epoch,
+                invocation_digest: "invocation-digest".to_owned(),
+            },
+            target_roots: TargetRoots {
+                allowed_contour_root: "contour".to_owned(),
+                source_root: "source".to_owned(),
+                target_root: "target".to_owned(),
+                cache_root: "target".to_owned(),
+            },
+            target_layout: None,
+            work_envelope: None,
+            fixture_namespace: None,
+            priority: 0,
+            job_class: JobClass::Verification,
+            resource_profile: TestResourceProfile::default(),
+            scheduling: None,
+            state,
+            attempts,
+            not_before_ms: 1,
+            lease,
+            execution: None,
+            verification: None,
+            receipt: None,
+            verification_receipt: None,
+            verifier_dispatch: None,
+            provider_registry_snapshot: None,
+            source_observation_before: None,
+            terminal_publication: None,
+            updated_at_ms: 1,
+            payload_digest: "payload-digest".to_owned(),
+        };
+        let write = store.database.begin_write()?;
+        let encoded = serde_json::to_vec(&job)?;
+        {
+            let mut table = write.open_table(JOBS)?;
+            table.insert(job.job_id.as_str(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok((store, path))
+    }
+
+    fn provider_registry_artifact(
+        operation_id: &str,
+        bytes: &[u8],
+    ) -> Result<RawArtifact, TestdError> {
+        RawArtifact::from_bytes(
+            format!("provider-registry:{operation_id}"),
+            "application/vnd.eliot.provider-registry+json",
+            bytes.to_vec(),
+            false,
+        )
+    }
+
+    fn provider_test_registry_artifact(
+        profile: &str,
+        parser: &str,
+    ) -> Result<RawArtifact, TestdError> {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "job_id": "job",
+            "operation_id": "operation",
+            "profile": profile,
+            "invocation_target": "target",
+            "invocation_arguments": [],
+            "source_root": "source",
+            "target_root": "target",
+            "cache_root": "target",
+            "original": { "parser_image_sha256": "a".repeat(64) },
+            "metadata": {
+                "profile": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+                "profile_version": "1.0.0",
+                "instrument": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+                "adapter": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+                "adapter_version": "1.0.0",
+                "parser": parser,
+                "normalizer": "eliot.instrument.diagnostic",
+                "evaluator": eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+                "verifier": "eliot.instrument.verifier",
+                "supports_test": true
+            }
+        }))
+        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        provider_registry_artifact("operation", &bytes)
+    }
+
+    fn provider_process_evidence(
+        bytes: &[u8],
+    ) -> Result<eliot_process::ProcessEvidence, Box<dyn std::error::Error>> {
+        let binding: eliot_process::ProcessExecutionBinding = serde_json::from_value(
+            serde_json::json!({
+                "operation_id": "operation",
+                "process_tree_id": "tree",
+                "job_id": "job",
+                "image_id": "image-1",
+                "session_id": "session-1",
+                "generation": 3,
+                "action_lease_ref": "lease-1",
+                "authority_id": "authority-1",
+                "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
+                "state_fence": {
+                    "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 7},
+                    "generation": 3,
+                    "nonce": "fence-1"
+                },
+                "request_digest": "a".repeat(64),
+                "permit_digest": "b".repeat(64),
+                "effect_digest": "c".repeat(64),
+                "validation_revision": 2
+            }),
+        )?;
+        let view: eliot_process::ProcessExecutionView = serde_json::from_value(
+            serde_json::json!({
+                "binding": serde_json::to_value(&binding)?,
+                "lifecycle": "running",
+                "health": {"status": "healthy", "ready": true, "observed_at_unix_ms": 10, "detail": null},
+                "cancellation": "not_requested",
+                "identity": null,
+                "exit": null,
+                "descendants": null
+            }),
+        )?;
+        let digest = sha256_hex(bytes);
+        let stdout = eliot_process::ProcessStreamEvidence::new_raw(
+            binding.clone(),
+            eliot_process::ProcessStreamKind::Stdout,
+            eliot_process::ProcessStreamPolicyBinding::new(
+                "policy:1",
+                "privacy:project",
+                "visibility:owner",
+                "retention:task",
+                "redaction:exact-v1",
+            )?,
+            eliot_process::StreamTransportStatus::Complete,
+            eliot_process::StreamPersistenceStatus::SourceUnavailable,
+            digest,
+            u64::try_from(bytes.len())?,
+            eliot_process::ProcessStreamPrefixPreview::from_transport_prefix(
+                bytes.to_vec(),
+                u64::try_from(bytes.len())?,
+            )?,
+            None,
+            vec![eliot_process::StreamEvidenceGap::PersistenceUnavailable],
+        )?;
+        Ok(eliot_process::ProcessEvidence::new_typed(
+            view,
+            Some(stdout),
+            None,
+            eliot_instrument_api::EvidenceAxes::observed(),
+        )?)
+    }
+
+    fn provider_receipt_fixture(
+        bytes: &[u8],
+        truncated: bool,
+        parser_id: &str,
+    ) -> Result<(TestdStore, TestJob, VerificationReceipt, PathBuf), Box<dyn std::error::Error>>
+    {
+        let (store, path) = provider_registry_store(
+            TESTD_PRODUCTIVE_PROFILE,
+            JobState::Running,
+            1,
+            Some(lease()),
+        )?;
+        let mut job = store
+            .get("job")?
+            .ok_or_else(|| std::io::Error::other("provider test job missing"))?;
+        let registry = provider_test_registry_artifact(TESTD_PRODUCTIVE_PROFILE, parser_id)?;
+        job.provider_registry_snapshot = Some(registry.clone());
+        let encoded = serde_json::to_vec(&job)?;
+        let write = store.database.begin_write()?;
+        {
+            let mut table = write.open_table(JOBS)?;
+            table.insert(job.job_id.as_str(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        let collector = EvidenceCollector::default();
+        collector.record_raw_artifact_at(
+            "testd-inline-stream-0-stdout",
+            "application/x-nextest-libtest-json-plus",
+            bytes.to_vec(),
+            truncated,
+            RawArtifactStream::Stdout,
+            ClockReading::default(),
+        )?;
+        eliot_process::ProcessEvidenceSink::record(&collector, provider_process_evidence(bytes)?)?;
+        let receipt = collector.verification_receipt_at(
+            &job,
+            ExecutionStatus::Unknown,
+            ClockReading::default(),
+            ClockReading::default(),
+        );
+        Ok((store, job, receipt, path))
+    }
+
     fn lease() -> Lease {
         Lease {
             owner: "worker-a".to_owned(),
@@ -5713,5 +6079,391 @@ mod tests {
             ),
             Err(TestdError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn provider_registry_snapshot_exact_retry_is_idempotent_and_changes_conflict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Keep the expected productive-profile corpus independent of the
+        // production predicate exercised by the binder.
+        const PRODUCTIVE_PROFILE_CORPUS: [&str; 3] = [
+            "cargo-nextest",
+            "cargo-nextest-list",
+            "cargo-nextest-scoped",
+        ];
+
+        for profile in PRODUCTIVE_PROFILE_CORPUS {
+            let (store, path) = provider_registry_store(profile, JobState::Queued, 0, None)?;
+            let original = provider_registry_artifact("operation", br#"{"generation":7}"#)?;
+            let first = store.bind_provider_registry_snapshot_before_dispatch(
+                "job",
+                original.clone(),
+                20,
+            )?;
+            assert_eq!(first.provider_registry_snapshot, Some(original.clone()));
+            drop(store);
+
+            // Reopen the same database through the normal store constructor,
+            // then retry and read the persisted row from that reopened store.
+            let reopened = TestdStore::open(&path, RetryPolicy::default())?;
+            let retry = reopened.bind_provider_registry_snapshot_before_dispatch(
+                "job",
+                original.clone(),
+                30,
+            )?;
+            assert_eq!(retry.provider_registry_snapshot, Some(original.clone()));
+            assert_eq!(retry.updated_at_ms, 20);
+
+            let changed = provider_registry_artifact("operation", br#"{"generation":8}"#)?;
+            assert!(matches!(
+                reopened.bind_provider_registry_snapshot_before_dispatch("job", changed, 40),
+                Err(TestdError::JobConflict(job_id)) if job_id == "job"
+            ));
+            let persisted = reopened
+                .get("job")?
+                .ok_or_else(|| std::io::Error::other("job missing after database reopen"))?;
+            assert_eq!(persisted.provider_registry_snapshot, Some(original));
+            assert_eq!(persisted.updated_at_ms, 20);
+
+            drop(reopened);
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_registry_snapshot_rejects_corrupt_original_artifact_digest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, path) =
+            provider_registry_store(TESTD_PRODUCTIVE_PROFILE, JobState::Queued, 0, None)?;
+        let mut corrupt = provider_registry_artifact("operation", br#"{"generation":7}"#)?;
+        let replacement = if corrupt.sha256.starts_with('0') {
+            '1'
+        } else {
+            '0'
+        };
+        corrupt.sha256.replace_range(..1, &replacement.to_string());
+
+        assert!(matches!(
+            store.bind_provider_registry_snapshot_before_dispatch("job", corrupt, 20),
+            Err(TestdError::InvalidBinding)
+        ));
+        let unchanged = store
+            .get("job")?
+            .ok_or_else(|| std::io::Error::other("job missing after corrupt digest refusal"))?;
+        assert!(unchanged.provider_registry_snapshot.is_none());
+
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_registry_snapshot_rejects_foreign_operation_and_postclaim_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, path) =
+            provider_registry_store(TESTD_PRODUCTIVE_PROFILE, JobState::Queued, 0, None)?;
+        let foreign = RawArtifact::from_bytes(
+            "provider-registry:other-operation",
+            "application/vnd.eliot.provider-registry+json",
+            br#"{"generation":7}"#.to_vec(),
+            false,
+        )?;
+        assert!(matches!(
+            store.bind_provider_registry_snapshot_before_dispatch("job", foreign, 20),
+            Err(TestdError::InvalidBinding)
+        ));
+        assert!(
+            store
+                .get("job")?
+                .ok_or_else(|| std::io::Error::other(
+                    "queued job missing after foreign bind refusal"
+                ))?
+                .provider_registry_snapshot
+                .is_none()
+        );
+        drop(store);
+        std::fs::remove_file(path)?;
+
+        let (store, path) = provider_registry_store(
+            TESTD_PRODUCTIVE_PROFILE,
+            JobState::Running,
+            1,
+            Some(lease()),
+        )?;
+        let snapshot = provider_registry_artifact("operation", br#"{"generation":7}"#)?;
+        assert!(matches!(
+            store.bind_provider_registry_snapshot_before_dispatch("job", snapshot, 20),
+            Err(TestdError::InvalidBinding)
+        ));
+        assert!(
+            store
+                .get("job")?
+                .ok_or_else(|| std::io::Error::other(
+                    "running job missing after postclaim bind refusal"
+                ))?
+                .provider_registry_snapshot
+                .is_none()
+        );
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_evidence_full_receipt_binds_parser_output_and_survives_testd_store_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RUN_EVENTS: &[u8] = br#"{"type":"test","event":"started","name":"package::works"}
+{"type":"test","event":"ok","name":"package::works"}
+"#;
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            RUN_EVENTS,
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        let mut receipt = receipt;
+        let legacy_digest = verification_receipt_sha256(&receipt)?;
+        let legacy_bytes = serde_json::to_vec(&receipt)?;
+        let legacy_value: serde_json::Value = serde_json::from_slice(&legacy_bytes)?;
+        assert!(legacy_value.get("provider_evidence").is_none());
+        let legacy_readback: VerificationReceipt = serde_json::from_slice(&legacy_bytes)?;
+        assert_eq!(
+            verification_receipt_sha256(&legacy_readback)?,
+            legacy_digest
+        );
+        let registry = job
+            .provider_registry_snapshot
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider registry missing"))?;
+        receipt.provider_evidence = Some(
+            TestdProviderEvidence::from_receipt_inputs(
+                &job,
+                ExecutionStatus::Unknown,
+                registry,
+                &receipt.raw_artifacts,
+                &receipt.typed_evidence,
+                Some(0),
+            )?
+            .ok_or_else(|| std::io::Error::other("provider parser profile missing"))?,
+        );
+        receipt.validate(&job)?;
+        store.finish(
+            "job",
+            &lease(),
+            ExecutionStatus::Unknown,
+            None,
+            &receipt,
+            20,
+            None,
+        )?;
+        let persisted = store
+            .get("job")?
+            .ok_or_else(|| std::io::Error::other("provider job missing after durable finish"))?;
+        let readback = persisted.verification_receipt.as_ref().ok_or_else(|| {
+            std::io::Error::other("provider receipt missing after durable finish")
+        })?;
+        readback.validate(&persisted)?;
+        let provider = readback
+            .provider_evidence
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider evidence omitted after readback"))?;
+        assert_eq!(provider.parser.status, TestdParsingStatus::Parsed);
+        assert!(matches!(
+            provider.parsed.as_ref(),
+            Some(ParsedProviderOutput::Run {
+                started: 1,
+                completed: 1,
+                passed: 1,
+                ..
+            })
+        ));
+        assert_eq!(provider.evaluator.status, TestdEvaluationStatus::Unassessed);
+        assert_eq!(
+            provider.verifier_outcome,
+            eliot_instrument_api::VerificationOutcome::Unknown
+        );
+        assert_eq!(
+            provider.coverage,
+            eliot_instrument_api::EvidenceCoverage::Unknown
+        );
+        let mut foreign_job = persisted.clone();
+        foreign_job.provider_registry_snapshot = Some(provider_test_registry_artifact(
+            TESTD_PRODUCTIVE_PROFILE,
+            "foreign.parser",
+        )?);
+        assert!(readback.validate(&foreign_job).is_err());
+        let mut forged = readback.clone();
+        if let Some(provider) = forged.provider_evidence.as_mut() {
+            provider.registry_sha256 = "b".repeat(64);
+        }
+        assert!(forged.validate(&job).is_err());
+        let mut detached = readback.clone();
+        if let Some(provider) = detached.provider_evidence.as_mut()
+            && let Some(source) = provider.source.as_mut()
+        {
+            source.handle = "foreign-stdout-handle".to_owned();
+        }
+        assert!(detached.validate(&job).is_err());
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_evidence_full_receipt_retains_malformed_output_as_parse_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            b"{malformed\n",
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        let mut receipt = receipt;
+        let registry = job
+            .provider_registry_snapshot
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider registry missing"))?;
+        receipt.provider_evidence = Some(
+            TestdProviderEvidence::from_receipt_inputs(
+                &job,
+                ExecutionStatus::Unknown,
+                registry,
+                &receipt.raw_artifacts,
+                &receipt.typed_evidence,
+                Some(0),
+            )?
+            .ok_or_else(|| std::io::Error::other("provider parser profile missing"))?,
+        );
+        receipt.validate(&job)?;
+        let provider = receipt
+            .provider_evidence
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider evidence missing"))?;
+        assert_eq!(provider.parser.status, TestdParsingStatus::ParseFailed);
+        assert!(provider.parsed.is_none());
+        assert_eq!(
+            provider.artifact_binding,
+            TestdArtifactBinding::BoundExact("testd-inline-stream-0-stdout".to_owned())
+        );
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_evidence_skipped_only_run_never_promotes_semantic_pass_or_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SKIPPED_EVENTS: &[u8] =
+            br#"{"type":"test","event":"started","name":"package::skipped"}
+{"type":"test","event":"ignored","name":"package::skipped"}
+"#;
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            SKIPPED_EVENTS,
+            false,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        let mut receipt = receipt;
+        let registry = job
+            .provider_registry_snapshot
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider registry missing"))?;
+        receipt.provider_evidence = Some(
+            TestdProviderEvidence::from_receipt_inputs(
+                &job,
+                ExecutionStatus::Unknown,
+                registry,
+                &receipt.raw_artifacts,
+                &receipt.typed_evidence,
+                Some(0),
+            )?
+            .ok_or_else(|| std::io::Error::other("provider parser profile missing"))?,
+        );
+        receipt.validate(&job)?;
+        let provider = receipt
+            .provider_evidence
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider evidence missing"))?;
+        assert!(matches!(
+            provider.parsed.as_ref(),
+            Some(ParsedProviderOutput::Run {
+                passed: 0,
+                skipped: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            provider.verifier_outcome,
+            eliot_instrument_api::VerificationOutcome::Unknown
+        );
+        assert_eq!(
+            provider.coverage,
+            eliot_instrument_api::EvidenceCoverage::Unknown
+        );
+        assert_eq!(provider.evaluator.status, TestdEvaluationStatus::Unassessed);
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_evidence_full_receipt_refuses_truncated_and_resealed_foreign_parser_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const RUN_EVENTS: &[u8] = br#"{"type":"test","event":"started","name":"package::works"}
+{"type":"test","event":"ok","name":"package::works"}
+"#;
+        let (store, job, receipt, path) = provider_receipt_fixture(
+            RUN_EVENTS,
+            true,
+            eliot_instrument_nextest::NEXTEST_INSTRUMENT,
+        )?;
+        let mut receipt = receipt;
+        let registry = job
+            .provider_registry_snapshot
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider registry missing"))?;
+        receipt.provider_evidence = Some(
+            TestdProviderEvidence::from_receipt_inputs(
+                &job,
+                ExecutionStatus::Unknown,
+                registry,
+                &receipt.raw_artifacts,
+                &receipt.typed_evidence,
+                Some(0),
+            )?
+            .ok_or_else(|| std::io::Error::other("provider parser profile missing"))?,
+        );
+        receipt.validate(&job)?;
+        let provider = receipt
+            .provider_evidence
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider evidence missing"))?;
+        assert_eq!(
+            provider.parser.status,
+            TestdParsingStatus::SourceUnavailable
+        );
+        assert!(provider.parsed.is_none());
+        assert_eq!(provider.artifact_binding, TestdArtifactBinding::Unbound);
+        drop(store);
+        std::fs::remove_file(path)?;
+
+        let (store, job, receipt, path) =
+            provider_receipt_fixture(RUN_EVENTS, false, "foreign.parser")?;
+        let registry = job
+            .provider_registry_snapshot
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("provider registry missing"))?;
+        assert!(
+            TestdProviderEvidence::from_receipt_inputs(
+                &job,
+                ExecutionStatus::Unknown,
+                registry,
+                &receipt.raw_artifacts,
+                &receipt.typed_evidence,
+                Some(0),
+            )
+            .is_err()
+        );
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 }
