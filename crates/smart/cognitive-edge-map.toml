@@ -484,3 +484,44 @@ owner = "A-19r"
 implementation_owner = "B-RCTX"
 consumer = "Host queue/service/transport"
 relation = "plan_to_delivery_boundary"
+
+# ---------------------------------------------------------------------------
+# #261 r12 edge rows for the four families that had NO field-contract row before
+# r12. Each names a consumer located with git grep on the r12 base commit, not
+# one chosen for plausibility.
+#
+# There is deliberately NO edge for the learning binding: its single measured
+# consumer constructs SourceDenominator inside eliot-learning-state-view and does
+# not consume the binding across a crate boundary, so naming an edge for it would
+# be an invented producer-to-consumer pair.
+# ---------------------------------------------------------------------------
+
+[[edge]]
+producer = "eliot-observation (Governor observation admission and classifier owner)"
+contract = "eliot_observation::ObservationAdmissionResult"
+consumer = "eliot-governor"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-observation (Governor observation admission and classifier owner)"
+contract = "eliot_observation::ObservationAdmissionReceipt"
+consumer = "eliot-cue-binding"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-dreamer-self-query (brief projector over a validated source closure)"
+contract = "eliot_dreamer_contracts::self_query::AcceptedSourceProjection"
+consumer = "eliot-dreamer-self-query, eliot-understanding-assessment"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-admission (producer of the admitted set the view is validated against)"
+contract = "eliot_context_contracts::ActiveUnderstandingView"
+consumer = "eliotd, eliot-context-assembly"
+compile_link = "contract_only"
+
+[[edge]]
+producer = "eliot-context-assembly (projection-only assembler; it performs no membership selection)"
+contract = "eliot_context_contracts::OmissionRecord"
+consumer = "eliot-context-assembly, eliotd"
+compile_link = "contract_only"
