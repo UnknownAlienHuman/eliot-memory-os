@@ -4,7 +4,10 @@
 //! Implementation: I5.1, I5.9, I5.22, I2.23.
 //! Ownership: pure `RpcResponse` envelope and `surrealdb-3.1`/`3.2` `ProviderVersion` parsing only; no transport, auth, handshake, process-spawn, or lifecycle ownership (see `crates/storage/eliot-store-surreal-adapter/src/client.rs`).
 
+use std::fmt;
+
 use eliot_types::strict_json_has_no_duplicate_members;
+use serde::de::Visitor;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -28,12 +31,73 @@ use crate::error::AdapterError;
 /// `cause`) — `surrealdb/types/src/error.rs` — so closing it would refuse every
 /// genuine provider error frame. Its `data` member is never emitted by this
 /// provider; that under-specified shape is a separate, unowned schema question.
+///
+/// Closure admits *which members are named*; it does not assert that one of
+/// them is present. `result` therefore records member presence explicitly
+/// (see [`RpcResultMember`]) so [`rpc_result`] can refuse a frame that names
+/// neither `result` nor `error`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RpcResponse {
     pub(super) id: Option<Value>,
-    result: Option<Value>,
+    #[serde(default)]
+    result: RpcResultMember,
     error: Option<RpcErrorBody>,
+}
+
+/// The `result` member with its *presence* distinguished from its value.
+///
+/// `Option<Value>` cannot carry that distinction: `serde_json` reports a JSON
+/// `null` through `Deserializer::deserialize_option` as `visit_none`, so a
+/// `"result": null` frame — the wire form of a SurrealQL `NONE` value — decodes
+/// exactly like a frame carrying no `result` member at all. `#[serde(default)]`
+/// is therefore required on the field: an absent member is filled from
+/// `Default` (no member), while a present `null` reaches this `Deserialize` impl
+/// and is recorded as a present member. Refusing the absent case in
+/// [`rpc_result`] depends on that separation; an `Option<Value>` field would
+/// refuse a legitimate `NONE` result as well.
+#[derive(Debug, Default)]
+struct RpcResultMember(Option<Value>);
+
+impl RpcResultMember {
+    /// The member's value, or `None` only when the member was absent.
+    fn into_present(self) -> Option<Value> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RpcResultMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PresentMemberVisitor;
+
+        impl<'de> Visitor<'de> for PresentMemberVisitor {
+            type Value = RpcResultMember;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an RPC response result member")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RpcResultMember(Some(Value::Null)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(RpcResultMember(Some(Value::Null)))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Value::deserialize(deserializer).map(|value| RpcResultMember(Some(value)))
+            }
+        }
+
+        deserializer.deserialize_option(PresentMemberVisitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,10 +234,40 @@ pub(super) fn parse_response(text: &str) -> Result<RpcResponse, AdapterError> {
     serde_json::from_str(text).map_err(|error| AdapterError::Serialization(error.to_string()))
 }
 
+/// Reduces one admitted RPC envelope to the outcome it actually reports
+/// (#937, #938, #940).
+///
+/// A provider outcome is one of three observable states, and this maps each to
+/// exactly one result:
+///
+/// * `error` present — refused as [`AdapterError::ProviderUnavailable`],
+///   unchanged; the code/message/data stay unread and never reach a message.
+/// * `result` member present — that member's value, including a real JSON
+///   `null`, which is how a SurrealQL `NONE` value arrives on the wire. A
+///   genuine null payload is therefore an admitted `Ok(Value::Null)` here and
+///   stays distinguishable from the refused case below before any caller
+///   inspects the value.
+/// * neither member present — refused. `DbResponse::into_value` builds `result`
+///   or `error`, so the pinned provider emits no such frame; a frame that
+///   reports neither carries no outcome at all, and returning
+///   `unwrap_or(Value::Null)` for it would promote "unknown" into "a successful
+///   null" at a call site that cannot tell the two apart: `signin` and `use`
+///   discard the value with `.map(|_| ())`
+///   (`client/session.rs:98` and `:108`), so a refusal-as-default would read as
+///   a completed authentication. This is refused as a bounded
+///   [`AdapterError::Serialization`] with static text — the same disposition as
+///   every other malformed-response refusal in this cell (`parse_response`
+///   above, `RpcResults::from_value` in `client.rs:161`) — so it stays a
+///   deterministic decode-class failure rather than a retryable or reconciling
+///   outcome the frame itself never earned. The response body is never echoed.
 pub(super) fn rpc_result(response: RpcResponse) -> Result<Value, AdapterError> {
     if let Some(error) = response.error {
         let _ = (error.code, error.message, error.data);
         return Err(AdapterError::ProviderUnavailable);
     }
-    Ok(response.result.unwrap_or(Value::Null))
+    response.result.into_present().ok_or_else(|| {
+        AdapterError::Serialization(
+            "provider RPC response carried neither a result nor an error".to_owned(),
+        )
+    })
 }
