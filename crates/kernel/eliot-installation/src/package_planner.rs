@@ -2902,6 +2902,28 @@ impl SealedPackagePlanner {
         let manifest =
             PackageManifest::new(&package_manifest.generation, package_manifest.files.clone())
                 .map_err(|e| package_plan_error(&e))?;
+        // The profile-bound immutable destination for this candidate. A
+        // profile-bound `StagePackage` must carry it explicitly:
+        // `validate_stage_package_effects` in `package.rs` rejects an absent
+        // `destination_root` unless `staging_root\<generation>` already equals
+        // `runtime_launch.profile_governed_roots.immutable_binaries`, which is
+        // not the case for a non-`portable_dev` profile (staging is
+        // `<profile root>\packages`). Emitting `None` made every planned
+        // package fail admission with
+        // `IncompleteObservation("profile-bound StagePackage must retain its
+        // exact immutable destination")`, so the real destination is resolved
+        // from the candidate's own I3.1 profile binding and carried here.
+        let destination_root = PlatformHandle::new(
+            candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries
+                .clone(),
+        )
+        .map_err(|error| InstallationError::InvalidField {
+            field: "generation.destination_root".to_owned(),
+            reason: error.to_string(),
+        })?;
         if manifest.generation != candidate_manifest.generation.as_str() {
             return Err(InstallationError::IdentityConflict);
         }
@@ -2972,7 +2994,19 @@ impl SealedPackagePlanner {
             generation: candidate_manifest.generation.clone(),
             manifest: manifest.clone(),
             staging_root: staging_root.clone(),
-            destination_root: None,
+            // The profile-bound immutable destination is already resolved above
+            // as `destination_root` from
+            // `profile_resolution.roots.immutable_binaries`.
+            // `validate_stage_package_effects` in `package.rs` rejects a
+            // profile-bound `StagePackage` whose `destination_root` is absent
+            // unless `staging_root\<generation>` already equals that immutable
+            // root, which is not the case for a non-`portable_dev` profile
+            // (staging is `<profile root>\packages`). Emitting `None` therefore
+            // made every planned package fail admission with
+            // `IncompleteObservation("profile-bound StagePackage must retain
+            // its exact immutable destination")`. The real destination is now
+            // carried on the effect.
+            destination_root: Some(destination_root.clone()),
             expected_file_digests,
             candidate_manifest_digest,
             package_manifest_digest,
@@ -3885,8 +3919,20 @@ mod tests {
         artifact_set_evidence_digest(manifest, &expected).unwrap()
     }
 
+    // Role-set drift: `PHASE_A_TEMPLATE_ROLES` in this file is the contract for
+    // the Phase-A template derivation input and is `[(&str, bool); 12]`, whose
+    // doc comment reads "The input is the typed twelve-role expected fact set.
+    // The helper validates that exact set and hashes it in the fixed order
+    // above." Commit 1a786e7cf raised that set from 11 to 12 by adding
+    // `("eliot-user-broker.exe", true)` and updated four other role lists in
+    // this file, but never updated this test's literal, so it still supplies
+    // eleven facts and is rejected by the count gate with
+    // `IncompleteObservation("Phase-A template facts require exactly twelve
+    // immutable roles")`. The literal is completed with the missing real role
+    // from the contract's own table; every assertion below (canonical order,
+    // missing/extra/duplicate rejection) is unchanged.
     #[test]
-    fn phase_a_template_digest_requires_exact_typed_seven_role_facts() {
+    fn phase_a_template_digest_requires_exact_typed_twelve_role_facts() {
         let roles = [
             "eliot-host.exe",
             "eliot-watchdog.exe",
@@ -3898,6 +3944,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliotd-governor.json",
         ];
         let facts = roles
@@ -3910,7 +3957,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let digest = GenerationPackagePlanner::phase_a_template_content_digest(&facts)
-            .expect("exact eleven typed template facts must be accepted");
+            .expect("exact twelve typed template facts must be accepted");
         let mut reordered = facts.clone();
         reordered.swap(0, 6);
         assert_eq!(
@@ -3944,6 +3991,14 @@ mod tests {
         );
     }
 
+    // Role-set drift: this literal must match `PHASE_A_TEMPLATE_ROLES` (the
+    // twelve-role contract table in this file, raised from 11 to 12 by
+    // 1a786e7cf which added `eliot-user-broker.exe`). This second Phase-A test
+    // literal was missed by that commit in the same way as
+    // `phase_a_template_digest_requires_exact_typed_twelve_role_facts`, so the
+    // count gate rejected it before any per-role sensitivity could be checked.
+    // Only the missing real role is added; the loop still requires every one of
+    // the twelve roles to change the derived digest.
     #[test]
     fn phase_a_template_digest_changes_for_every_immutable_template_fact() {
         let roles = [
@@ -3957,6 +4012,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliotd-governor.json",
         ];
         let facts = roles

@@ -1223,9 +1223,23 @@ mod tests {
             wire_version: AGENT_BRIDGE_CLIENT_DECLARATION_WIRE_VERSION,
             module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
             profile_id: "caller-value".to_owned(),
+            // Protocol-range drift: production derives this range from
+            // `eliot_protocol::ProtocolVersion::CURRENT` (see `derive` in this
+            // file) and admission requires the declaration to overlap it. This
+            // fixture instead hardcoded EBP/1.0. Commit b733bb781 raised
+            // `EBP_MINOR` from 0 to 1 in
+            // `crates/foundation/eliot-protocol/src/lib.rs` ("Minimum EBP minor
+            // version carrying the native-worker frame payload") and did not
+            // touch this crate, so a pinned 1.0 range no longer overlaps the
+            // current 1.1 and every declaration built from this fixture was
+            // rejected with `InvalidField { field:
+            // "agent_bridge.client_declaration.protocol_range", reason: "must
+            // overlap the current EBP protocol version" }`. The fixture now
+            // takes the real admitted value from the protocol crate instead of
+            // a literal.
             protocol_range: ProtocolRange {
-                minimum: ProtocolVersion { major: 1, minor: 0 },
-                maximum: ProtocolVersion { major: 1, minor: 0 },
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
             },
             module_contract: contract,
             module_generation: generation,

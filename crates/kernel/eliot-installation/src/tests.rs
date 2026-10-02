@@ -65,6 +65,26 @@ fn live_host_capability() -> (HostOwnerLease, HostOwnerEpochCapability) {
     (lease, capability)
 }
 
+/// Acquires a Host owner capability bound to *this* transaction's installation
+/// identity.
+///
+/// `host_capability()` and `live_host_capability()` mint a fresh
+/// `test-host-owner[-live]-<counter>` installation id on every call, so a
+/// capability from either can never satisfy
+/// `validate_host_owner_binding_for_identity` for a transaction whose
+/// `installation_epoch.installation` is the fixture's `installation:test`; that
+/// check requires `host.is_for_installation(installation_id)` and returns
+/// `IdentityConflict` otherwise. The registry commit boundary enforces the
+/// binding, so the capability must be acquired for the transaction's own
+/// installation id. The lease is leaked exactly as the existing helpers do,
+/// because the capability borrows it for the test's lifetime.
+#[cfg(windows)]
+fn host_capability_for(transaction: &InstallationTransaction) -> HostOwnerEpochCapability {
+    let lease = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
+        .unwrap_or_else(|error| panic!("test Host owner lease: {error}"));
+    Box::leak(Box::new(lease)).activation_capability()
+}
+
 #[cfg(windows)]
 fn pending_registry_for_owner_gate() -> (ApprovedGenerationRegistry, InstallationTransaction) {
     let transaction = registering_transaction();
@@ -1255,6 +1275,13 @@ fn secret_bytes_are_absent_from_json_debug_and_evidence() {
     assert!(!evidence.contains(&secret_hex));
 }
 
+// Migration-target pin: `26.0.0` is `INSTALLATION_TRANSACTION_WIRE_VERSION`
+// from `src/lib.rs` ("Version 26 adds the original `UserMode` authority key
+// receipt and terminal no-effect-abort progress. Older wires require explicit
+// migration and are never synthesized."). Commit 0b52d8bc3 raised the constant
+// to 26.0.0 but left this assertion at the 25.0.0 target it never replaced.
+// Only the stale target is corrected; both the source-version and
+// migration-required expectations are unchanged.
 #[test]
 fn v21_and_missing_secret_proof_require_explicit_migration() {
     let transaction = planned_transaction();
@@ -1264,7 +1291,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&legacy_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("21.0.0") && reason.contains("25.0.0")
+            if reason.contains("21.0.0") && reason.contains("26.0.0")
     ));
 
     let mut missing = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
@@ -1282,7 +1309,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&missing_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("creation proof") && reason.contains("v25")
+            if reason.contains("creation proof") && reason.contains("v26")
     ));
 }
 
@@ -1911,10 +1938,11 @@ fn registering_transaction() -> InstallationTransaction {
 fn system_registration_transaction() -> InstallationTransaction {
     let portable = registering_transaction();
     let program_data = must(protected_program_data_root());
+    let installation_key = "b".repeat(64);
     let roots = must(RuntimeStateRoots::derive_profiled(
         InstallationProfile::SystemService,
         test_handle(program_data.to_string_lossy().into_owned()),
-        &"b".repeat(64),
+        &installation_key,
     ));
     let system_path =
         |name: &str| test_handle(format!(r"{}\{name}", roots.installation_root.as_str()));
@@ -1924,6 +1952,53 @@ fn system_registration_transaction() -> InstallationTransaction {
     descriptor.portable_root = None;
     descriptor.runtime_state_roots = roots.clone();
     descriptor.kernel_work_root = roots.kernel_work_root.clone();
+    // Profile-root binding drift: this fixture switched `profile` to
+    // `SystemService` but kept the `PortableDev` `profile_governed_roots`
+    // cloned from `registering_transaction()`, whose `user_config` and
+    // `user_cache` are the separate siblings `.eliot-dev\config` and
+    // `.eliot-dev\cache`. `InstallationRoots::validate` requires
+    // `system_service` to retain ONE shared user configuration and cache root,
+    // so every test reaching this fixture aborted in the `must()` helper with
+    // `ProfileViolation("system_service must retain one shared user
+    // configuration and cache root")` before reaching its own subject.
+    //
+    // The values below are the real I3.1 `system_service` contour from
+    // `docs/architecture/I03-01-installation-form.md`, whose profile-path table
+    // requires immutable binaries `%ProgramFiles%\Eliot\<component>\<version>`,
+    // durable/service data `%ProgramData%\Eliot`, and user config/cache
+    // `%LocalAppData%\Eliot` (one shared user root). `roots` above is already
+    // the OS-resolved `derive_profiled(SystemService, %ProgramData%, ...)`
+    // topology, so `durable_data` is taken from it rather than restated.
+    let program_files = must(program_files_root());
+    let local_app_data = must(current_user_local_app_data_root());
+    let shared_user_root = joined_windows_path(local_app_data.to_string_lossy().as_ref(), "Eliot");
+    // `profile_installation_key` must be the same lowercase SHA-256-derived key
+    // `derive_profiled` was given above, because
+    // `RuntimeLaunchDescriptor::validate` requires it to equal the last
+    // component of `runtime_state_roots.installation_root`
+    // (`%ProgramData%\Eliot\installations\<key>`). The `PortableDev` value
+    // cloned from `registering_transaction()` is `None`, which a profiled
+    // Windows launch may not carry.
+    descriptor.profile_installation_key = Some(test_handle(installation_key));
+    // `immutable_binaries` must end in `<profile_component>\<profile_version>`,
+    // per the `profiled immutable root must end in the selected component and
+    // version` rule in `RuntimeLaunchDescriptor::validate`. `profile_component`
+    // and `profile_version` are the `"eliot"` / `"test-version"` handles set by
+    // `registering_transaction()`, so the version leaf is spelled from
+    // `profile_version` rather than from the generation label.
+    descriptor.profile_governed_roots = InstallationRoots {
+        binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: format!(
+            r"{}\Eliot\{}\{}",
+            program_files.to_string_lossy(),
+            descriptor.profile_component.as_str(),
+            descriptor.profile_version.as_str()
+        ),
+        durable_data: joined_windows_path(roots.profile_anchor_root.as_str(), "Eliot"),
+        user_config: shared_user_root.clone(),
+        user_cache: shared_user_root,
+        runtime_state_roots: roots.clone(),
+    };
     descriptor.authority_descriptor_path = system_path("authority.json");
     descriptor.eliotd_executable_path = system_path("eliotd.exe");
     descriptor.eliotd_config_path = system_path("eliotd-governor.json");
@@ -1985,7 +2060,24 @@ fn system_registration_transaction() -> InstallationTransaction {
         generation: manifest.generation.clone(),
         manifest: package_manifest.clone(),
         staging_root: staging_root.clone(),
-        destination_root: None,
+        // `StagePackage` must name the profile-bound immutable destination.
+        // `validate_stage_package_effects` in `package.rs` requires either an
+        // explicit `destination_root` equal to
+        // `runtime_launch.profile_governed_roots.immutable_binaries`, or, when
+        // `None`, that `staging_root\<generation>` already equals it. The
+        // `SystemService` staging root is `%ProgramData%\Eliot\packages`, which
+        // is not under `%ProgramFiles%\Eliot\...`, so the `None` form cannot
+        // hold for this profile and admission failed with
+        // `IncompleteObservation("profile-bound StagePackage must retain its
+        // exact immutable destination")`. The real destination from the I3.1
+        // profile binding is supplied instead of leaving it absent.
+        destination_root: Some(test_handle(
+            manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries
+                .clone(),
+        )),
         expected_file_digests: Vec::new(),
         candidate_manifest_digest: must(candidate_manifest_digest(&manifest)),
         package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
@@ -2072,6 +2164,7 @@ fn system_registration_transaction() -> InstallationTransaction {
             static_template,
             host_state_root_digest,
             watchdog_selector_digest,
+            supervision_authority,
             ..
         } = effect
         {
@@ -2079,6 +2172,14 @@ fn system_registration_transaction() -> InstallationTransaction {
             *static_template = must(phase_b_static_template_for_candidate(&manifest));
             *host_state_root_digest = must(phase_b_host_state_root_digest(&manifest));
             *watchdog_selector_digest = must(phase_b_watchdog_selector_digest(&manifest));
+            // `validate_phase_b_effect_bindings` in `plan.rs` also requires the
+            // Phase-B supervision authority's `candidate_generation` to equal the
+            // candidate's generation. The effect is cloned from the portable
+            // transaction, whose authority still named the portable generation
+            // label, so it is rebound here with the other four Phase-B bindings
+            // instead of being left to fail admission with
+            // `IdentityConflict`.
+            supervision_authority.candidate_generation = manifest.generation.clone();
         }
     }
     for change in &mut planned_changes {
@@ -2109,6 +2210,21 @@ fn system_registration_transaction() -> InstallationTransaction {
         portable.precondition_evidence,
         portable.recovery_command,
     ));
+    // The durable transaction projection must carry the same retained I3.1
+    // profile-root binding as its candidate launch descriptor.
+    // `InstallationTransaction::validate` calls
+    // `rehydrate_profile_binding`, which rejects a `None`
+    // `profile_governed_roots` and requires the retained value to equal
+    // `candidate_manifest.runtime_launch.profile_governed_roots` exactly. The
+    // transaction is constructed unbound, so the binding established above for
+    // the `SystemService` descriptor is bound here.
+    transaction.profile_governed_roots = Some(
+        transaction
+            .candidate_manifest
+            .runtime_launch
+            .profile_governed_roots
+            .clone(),
+    );
 
     let bootstrap = transaction.candidate_manifest.runtime_launch.clone();
     for (effect, progress) in transaction
@@ -2119,6 +2235,7 @@ fn system_registration_transaction() -> InstallationTransaction {
         let InstallerEffectPlan::StagePackage {
             manifest,
             staging_root,
+            destination_root,
             ..
         } = effect
         else {
@@ -2179,7 +2296,19 @@ fn system_registration_transaction() -> InstallationTransaction {
         ));
         let receipt = StagingReceipt {
             generation: manifest.generation.clone(),
-            root_path: Path::new(staging_root.as_str()).join(&manifest.generation),
+            // The receipt must describe the root the package was actually
+            // staged into. `validate_staging_receipt_for_plan` in `package.rs`
+            // computes the expected root as the effect's `destination_root`
+            // when it is present, and only falls back to
+            // `staging_root\<generation>` when it is absent. A profile-bound
+            // `StagePackage` now carries an explicit destination, so the
+            // receipt root is taken from the effect itself rather than
+            // recomputed from the staging root, which pointed at a different
+            // directory and produced `IdentityConflict`.
+            root_path: match destination_root {
+                Some(destination) => PathBuf::from(destination.as_str()),
+                None => Path::new(staging_root.as_str()).join(&manifest.generation),
+            },
             root_identity: FileIdentity {
                 volume_serial_number: 1,
                 file_index: 2,
@@ -5501,8 +5630,21 @@ fn pre_v7_transaction_json_requires_explicit_migration() {
     ));
 }
 
+// Migration-target pin: these `vN_transaction_json_*_to_v26` tests assert the
+// explicit-migration target named by the product contract
+// `INSTALLATION_TRANSACTION_WIRE_VERSION` in `src/lib.rs`, which is
+// `ContractVersion::new(26, 0, 0)`. Its normative doc comment reads:
+// "Version 25 requires the retained I3.1 profile-root binding on every current
+// executable transaction and carries the corresponding launch descriptor
+// shape. Version 26 adds the original `UserMode` authority key receipt and
+// terminal no-effect-abort progress. Older wires require explicit migration
+// and are never synthesized."
+// Commit 0b52d8bc3 raised the constant from 24.0.0 to 26.0.0 and updated these
+// assertions only as far as 25.0.0, so every one of them pinned a target the
+// product never emits. The expected version is corrected to the contracted
+// 26.0.0; no assertion is weakened.
 #[test]
-fn v8_transaction_json_requires_explicit_migration_to_v25() {
+fn v8_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5516,7 +5658,7 @@ fn v8_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("requires explicit migration to 25.0.0")
+            if reason.contains("requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5565,7 +5707,7 @@ fn v9_transaction_json_requires_explicit_migration_without_start_synthesis() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 9.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 9.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5585,7 +5727,7 @@ fn v4_transaction_json_requires_explicit_migration_without_defaults() {
 }
 
 #[test]
-fn v10_transaction_json_requires_explicit_migration_to_v25() {
+fn v10_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5611,12 +5753,12 @@ fn v10_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 10.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 10.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
 #[test]
-fn v13_transaction_json_requires_explicit_migration_to_v25() {
+fn v13_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5627,12 +5769,12 @@ fn v13_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 13.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 13.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
 #[test]
-fn v14_transaction_json_requires_explicit_migration_to_v25() {
+fn v14_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.insert(
@@ -5643,36 +5785,36 @@ fn v14_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 14.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 14.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
 #[test]
-fn v15_transaction_json_requires_explicit_migration_to_v25() {
+fn v15_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(15, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 15.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 15.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
 #[test]
-fn v16_transaction_json_requires_explicit_migration_to_v25() {
+fn v16_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(16, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 16.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 16.0.0") && reason.contains("26.0.0")
     ));
 }
 
 #[test]
-fn v17_transaction_json_requires_explicit_migration_to_v25() {
+fn v17_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(17, 0, 0)));
     for progress in legacy["effect_progress"]
@@ -5688,12 +5830,12 @@ fn v17_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 17.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 17.0.0") && reason.contains("26.0.0")
     ));
 }
 
 #[test]
-fn v18_transaction_json_requires_explicit_migration_to_v25() {
+fn v18_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(18, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
@@ -5703,19 +5845,19 @@ fn v18_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 18.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 18.0.0") && reason.contains("26.0.0")
     ));
 }
 
 #[test]
-fn v20_transaction_json_requires_explicit_migration_to_v25() {
+fn v20_transaction_json_requires_explicit_migration_to_v26() {
     let mut legacy = must(serde_json::to_value(planned_transaction()));
     legacy["transaction_wire_version"] = must(serde_json::to_value(ContractVersion::new(20, 0, 0)));
     let bytes = must(serde_json::to_vec(&legacy));
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 20.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 20.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5730,7 +5872,7 @@ fn v22_transaction_json_is_rejected_before_payload_authority() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 22.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 22.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5757,7 +5899,7 @@ fn current_transaction_missing_nonce_or_deadline_is_corrupt_not_synthesized() {
 
 #[cfg(windows)]
 #[test]
-fn current_v25_ownership_members_are_mandatory_and_never_synthesized() {
+fn current_v26_ownership_members_are_mandatory_and_never_synthesized() {
     for field in [
         "reference",
         "create_disposition",
@@ -5782,7 +5924,7 @@ fn current_v25_ownership_members_are_mandatory_and_never_synthesized() {
         ownership.remove(field);
         let bytes = must(serde_json::to_vec(&value));
         let error = decode_installation_transaction_json(&bytes)
-            .expect_err("missing current-v25 ownership member must reject the record");
+            .expect_err("missing current-v26 ownership member must reject the record");
         assert!(
             matches!(
                 error,
@@ -7356,7 +7498,7 @@ fn active_phase_b_rebind_completed_receipt_requires_fresh_owner_recovery_cas() {
     ));
     let _ = std::fs::remove_file(&path);
     let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
-    let host = host_capability();
+    let host = host_capability_for(&transaction);
     let transaction_store = SharedStore::default();
     *transaction_store.state.lock().unwrap() = Some(transaction.clone());
     must(registry.stage_pending_activation_from_transaction_store(
@@ -7754,7 +7896,7 @@ fn active_phase_b_rebind_intent_is_durable_and_idempotent_under_host_capability(
     ));
     let _ = std::fs::remove_file(&path);
     let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
-    let host = host_capability();
+    let host = host_capability_for(&transaction);
     let transaction_store = SharedStore::default();
     *transaction_store
         .state
@@ -8027,7 +8169,7 @@ fn registry_rejects_pending_and_active_coexistence_via_validate_and_both_orders(
 #[test]
 fn registry_rejects_active_rebind_while_pending_is_active() {
     let transaction = registering_transaction();
-    let host = host_capability();
+    let host = host_capability_for(&transaction);
     let mut registry = ApprovedGenerationRegistry::new();
     must(registry.stage_pending_activation(
         transaction.transaction_id.clone(),
@@ -8107,7 +8249,7 @@ fn registry_rejects_pending_while_active_rebind_is_active() {
     ));
     let _ = std::fs::remove_file(&path);
     let registry = RedbInstallationRegistry::from_database_for_test(must(Database::create(&path)));
-    let host = host_capability();
+    let host = host_capability_for(&transaction);
     let transaction_store = SharedStore::default();
     *transaction_store.state.lock().unwrap() = Some(transaction.clone());
     must(registry.stage_pending_activation_from_transaction_store(
@@ -8335,7 +8477,7 @@ fn registry_commit_rejects_scm_pending_selector_as_phase_b_live_proof() {
 #[test]
 fn pending_activation_is_not_active_until_host_commit_and_retries_by_digest() {
     let transaction = registering_transaction();
-    let host = host_capability();
+    let host = host_capability_for(&transaction);
     let mut registry = ApprovedGenerationRegistry::new();
     must(registry.stage_pending_activation(
         transaction.transaction_id.clone(),

@@ -55,7 +55,7 @@ use eliot_platform_windows::{
     WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
     WindowsStoreCredentialTargetGenerator, WindowsSupervisionAuthorityKeyStore,
     WindowsUserModeSupervisionAuthorityCredentialProvider, current_user_local_app_data_root,
-    fresh_service_registration_nonce, observe_running_eliot_host_process,
+    fresh_service_registration_nonce, observe_running_eliot_host_process, program_files_root,
     protected_program_data_root, require_protected_program_data_path, resolve_service_sid,
 };
 #[cfg(test)]
