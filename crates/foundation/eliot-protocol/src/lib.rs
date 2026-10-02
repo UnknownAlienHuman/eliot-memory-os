@@ -1897,16 +1897,29 @@ impl ModuleLifecycle {
         Ok(ModuleControlEffect::DrainReported(self.drain_report()))
     }
 
+    /// Admits one correlated `Start` restart frame that resumes `Quiesced` to
+    /// `Active`.
+    ///
+    /// Frame admissibility is settled before any owner state is read. `Start`
+    /// is legal in both its `Control` handshake form and its correlated
+    /// `Request` resume form (`Frame::validate`), so only this owner can
+    /// require the request form; that check therefore precedes the
+    /// idempotency replay lookup. A `Control`-kind `Start` presenting a
+    /// recorded resume key is refused here rather than answered from
+    /// `control_effects`: a recorded `Resumed` reports an effect this frame
+    /// never requested and would answer a handshake as if it were the
+    /// correlated restart. A legitimate `Request` retry passes this check
+    /// unchanged and still replays its recorded `Resumed` disposition.
     fn apply_resume(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         let identity = Self::control_identity(frame)?;
-        if let Some(effect) = self.replay_control(frame, identity)? {
-            return Ok(effect);
-        }
         if frame.kind != FrameKind::Request {
             return Err(ProtocolError::InvalidField {
                 field: "kind/message_type",
                 reason: "lifecycle resume requires a Start request carrying the checkpoint correlation",
             });
+        }
+        if let Some(effect) = self.replay_control(frame, identity)? {
+            return Ok(effect);
         }
         if self.phase != ModuleLifecyclePhase::Quiesced {
             return Err(ProtocolError::InvalidField {
@@ -8237,6 +8250,43 @@ mod tests {
         assert_eq!(
             lifecycle.apply(&execute)?,
             ModuleControlEffect::ExecuteRecorded(ExecuteDisposition::Duplicate(request_id))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resume_refuses_a_control_kind_start_bearing_a_recorded_resume_key()
+    -> Result<(), ProtocolError> {
+        let checkpoint = ModuleCheckpoint {
+            checkpoint_id: "checkpoint-1".to_owned(),
+            request_id: RequestId::new("checkpoint-1")?,
+            idempotency_key: "idem-checkpoint".to_owned(),
+            bytes: b"{\"snapshot\":true}".to_vec(),
+        };
+        let mut lifecycle = ModuleLifecycle::new();
+        lifecycle.restore_retained(checkpoint)?;
+        let mut resume = frame()?;
+        resume.message_type = MessageType::Start;
+        let Some(identity) = resume.request_identity.as_mut() else {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "the shared request frame carries a request identity",
+            });
+        };
+        identity.idempotency_key = "idem-checkpoint".to_owned();
+        assert_eq!(lifecycle.apply(&resume)?, ModuleControlEffect::Resumed);
+        // A legitimate correlated retry replays the recorded disposition.
+        assert_eq!(lifecycle.apply(&resume)?, ModuleControlEffect::Resumed);
+        let handshake = Frame {
+            kind: FrameKind::Control,
+            ..resume.clone()
+        };
+        assert_eq!(
+            lifecycle.apply(&handshake),
+            Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle resume requires a Start request carrying the checkpoint correlation",
+            })
         );
         Ok(())
     }
