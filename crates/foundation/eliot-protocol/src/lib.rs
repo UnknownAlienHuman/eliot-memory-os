@@ -8523,15 +8523,12 @@ mod tests {
     ) -> Result<Frame, ProtocolError> {
         let mut frame = frame()?;
         frame.message_type = message_type;
-        frame.kind = match message_type {
-            MessageType::Execute
-            | MessageType::Quiesce
-            | MessageType::Checkpoint
-            | MessageType::RestoreCheckpoint
-            | MessageType::DrainStatus
-            | MessageType::Shutdown => FrameKind::Request,
-            MessageType::Fatal => FrameKind::Control,
-            _ => FrameKind::Request,
+        // `Fatal` has no request form: its canonical frame kind is `Control`
+        // and it carries no request identity.
+        frame.kind = if message_type == MessageType::Fatal {
+            FrameKind::Control
+        } else {
+            FrameKind::Request
         };
         let Some(identity) = frame.request_identity.as_mut() else {
             return Err(ProtocolError::InvalidField {
