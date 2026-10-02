@@ -511,15 +511,15 @@ pub use eliot_kernel_service::{
 #[cfg(test)]
 use eliot_ors::CanonicalEvidenceProvider;
 use eliot_ors::{AuthorityHandoffBegin, AuthorityHandoffRecord, AuthorityHandoffState, OrsError};
-use eliot_ors::{
-    OperationIdentity, OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseOperation,
-    SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
-};
 /// I1.9 Kernel/ORS-owned Generation Registry operational records, re-exported
 /// so the kernel generation control surface can name the exact registry types.
 pub use eliot_ors::{
     GenerationDrainState, GenerationOperationalState, GenerationProcessHandles, GenerationRegistry,
     GenerationRegistryRecord, GenerationRouteState,
+};
+use eliot_ors::{
+    OperationIdentity, OperationalRecoveryStore, RedbRecoveryStore, SupervisionLeaseOperation,
+    SupervisionLeasePrepareRequest, SupervisionLeaseSnapshot,
 };
 #[cfg(test)]
 pub use eliot_ors::{SupervisionLeaseCommitTicket, SupervisionLeaseStageReceipt};
