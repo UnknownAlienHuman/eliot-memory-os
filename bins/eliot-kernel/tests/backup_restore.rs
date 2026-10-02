@@ -101,7 +101,7 @@ fn test_bundle(target: &str) -> BackupBundle {
 /// admits an interval only as `(None, None, 0)` or as bounds whose width equals
 /// the count, so a non-empty member set must state its bounds.
 fn test_bundle_with_events(target: &str, event_ids: &[&str]) -> BackupBundle {
-    let events = event_ids
+    let events: Vec<eliot_backup::CanonicalRecord> = event_ids
         .iter()
         .map(|id| {
             eliot_backup::CanonicalRecord::new(
