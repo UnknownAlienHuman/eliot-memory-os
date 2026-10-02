@@ -242,3 +242,90 @@ fn check_residual_markers(contract: &toml::Value) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CELL_CONTRACT, ELIOTD_MANIFEST, cell_declaration_guard};
+    use toml::Value;
+
+    /// The declaration readback agrees with the real baked manifests, and the
+    /// facade guard rides the startup entry gate.
+    ///
+    /// [`cell_declaration_guard`] — the last step of
+    /// `disposition::run_facade_disposition_guards`, which `main` calls before
+    /// any command dispatch — opens `bins/eliotd/Cargo.toml` and the #13
+    /// contract with `include_str!` and accepts them only when the eight
+    /// declared daemon cells each carry exactly one mutable-state owner and
+    /// the contract projection mirrors them one to one. Executable evidence
+    /// for issue #18 W1: the ownership claim is rechecked at startup from the
+    /// real files, not from the hand-written row list beside them.
+    #[test]
+    fn real_declaration_and_contract_mirror_is_accepted_by_the_startup_guard()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(cell_declaration_guard(), Ok(()));
+
+        let manifest: Value = toml::from_str(ELIOTD_MANIFEST)?;
+        let contract: Value = toml::from_str(CELL_CONTRACT)?;
+        let eliot = manifest
+            .get("package")
+            .and_then(|package| package.get("metadata"))
+            .and_then(|metadata| metadata.get("eliot"))
+            .ok_or("baked eliotd manifest has no [package.metadata.eliot]")?;
+        let cells = eliot
+            .get("functional_cell_refs")
+            .and_then(Value::as_array)
+            .ok_or("baked eliotd declaration has no functional_cell_refs")?;
+        assert!(
+            !cells.is_empty(),
+            "baked eliotd declaration names no capability cell"
+        );
+        let declared = contract
+            .get("declared_functional_cell")
+            .and_then(Value::as_array)
+            .ok_or("baked cell contract projects no cell")?;
+        assert_eq!(
+            declared.len(),
+            cells.len(),
+            "the contract projects {} cells for {} declared daemon cells",
+            declared.len(),
+            cells.len()
+        );
+        Ok(())
+    }
+
+    /// The declared proof ceiling is preserved, not papered over: while only a
+    /// declaration projection exists, the contract must keep publishing the
+    /// executable-registry residual in its support, status and proof-ceiling
+    /// markers. Lifting any of them without the #13 executable
+    /// `CapabilityCellRegistry` behind them is an overclaim this guard refuses.
+    #[test]
+    fn contract_keeps_declaring_the_missing_executable_registry_ceiling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract: Value = toml::from_str(CELL_CONTRACT)?;
+        let support = contract
+            .get("implementation_support")
+            .and_then(Value::as_str)
+            .ok_or("cell contract has no implementation_support")?;
+        assert!(
+            support.contains("EXECUTABLE_REGISTRY_MISSING"),
+            "implementation_support {support} stops declaring the executable-registry residual"
+        );
+        let status = contract
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("cell contract has no status")?;
+        assert!(
+            status.contains("PENDING"),
+            "status {status} stops declaring the executable registry as pending"
+        );
+        let ceiling = contract
+            .get("proof_ceiling")
+            .and_then(Value::as_str)
+            .ok_or("cell contract has no proof_ceiling")?;
+        assert_eq!(
+            ceiling, "CAPABILITY_CELL_REGISTRY_SOURCE_EDGE_CANDIDATE",
+            "the proof ceiling was raised above what only a declaration projection supports"
+        );
+        Ok(())
+    }
+}
