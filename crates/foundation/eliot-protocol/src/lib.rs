@@ -5489,7 +5489,7 @@ impl LocalReadExecutionEvidence {
             validate_local_read_actual_route_receipt(self, receipt)?;
         }
         if let Some(value) = &self.activation_resolution_result {
-            let result: AgentActivationResolutionResult = serde_json::from_value(value.clone())
+            let result: crate::AgentActivationResolutionResult = serde_json::from_value(value.clone())
                 .map_err(|_| ProtocolError::InvalidField {
                     field: "local_read_execution_evidence.activation_resolution_result",
                     reason: "must be a typed activation resolution result",
