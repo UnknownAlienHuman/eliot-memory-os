@@ -875,9 +875,8 @@ mod tests {
         serde_json::from_value::<T>(value.clone())
             .unwrap_or_else(|error| panic!("the complete fixture must decode: {error}"));
 
-        let error = match serde_json::from_value::<T>(without(value, field)) {
-            Ok(_) => panic!("an omitted effect-bearing member `{field}` must be refused"),
-            Err(error) => error,
+        let Err(error) = serde_json::from_value::<T>(without(value, field)) else {
+            panic!("an omitted effect-bearing member `{field}` must be refused")
         };
         let message = error.to_string();
         assert!(
@@ -966,9 +965,8 @@ mod tests {
         for version in ["0", "2", "", "1.0"] {
             let mut value = manifest_value();
             value["schema_version"] = Value::String(version.to_owned());
-            let error = match serde_json::from_value::<BackupManifest>(value) {
-                Ok(_) => panic!("a misselected schema_version `{version}` must be refused"),
-                Err(error) => error,
+            let Err(error) = serde_json::from_value::<BackupManifest>(value) else {
+                panic!("a misselected schema_version `{version}` must be refused")
             };
             let message = error.to_string();
             assert!(
