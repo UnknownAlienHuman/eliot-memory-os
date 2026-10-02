@@ -1629,8 +1629,27 @@ mod tests {
     /// Pinned digest of [`golden_chain_envelope`], derived by running the
     /// shared hash over those fixed inputs (not hand-written):
     /// `eliot-store-api` and `eliot-store-memory` assert the same literal.
+    ///
+    /// Restamped 2026-10-02 to
+    /// `998bd1e25acbc61df7ba3b368050a0cabc7a730226e280d868d3ef8aebff7837`
+    /// (the `left` value read from the failing assertion of this very test on
+    /// the delivered head, not a hand-computed value). The hashed input gained
+    /// the code-derived `admission_contract_set_digest`
+    /// ([`supported_admission_contract_set_digest`], replacing the former
+    /// `"c".repeat(64)` fixture placeholder — that field is itself hashed, so
+    /// removing the placeholder forked the digest) and, per the corrected
+    /// `eliot-store-api/src/request_hash.rs` docs, the hash-bound
+    /// `semantic_source_revisions` and `ordering_scopes` of
+    /// [`CanonicalRequestView`]. Under the documented hash-version and
+    /// legacy-replay discipline (`request_hash.rs`: the canonical bytes ARE
+    /// the versioned encoding — there is no hash-version field, no migration
+    /// and no restamp path), extending the hashed input changes the digest BY
+    /// DESIGN; a digest computed under the narrower pre-binding bytes is never
+    /// reinterpreted under the new ones. So this pin restates the current
+    /// contract, it does not weaken it — do not re-litigate it as a
+    /// compatibility break, and do not read a stale baseline log for the value.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "32d9235499c0e63f72509808c0b1439cd7e879c754fbc1bc5e965bb6af4d6a36";
+        "998bd1e25acbc61df7ba3b368050a0cabc7a730226e280d868d3ef8aebff7837";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
