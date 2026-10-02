@@ -726,16 +726,7 @@ impl RestoreService {
             ));
         }
         let restore_report: RestoreReport = serde_json::from_reader(fs::File::open(&evidence)?)?;
-        if restore_report.receipt.status != RestoreStatus::RestoredToNewRoot
-            || !restore_report.receipt.verified_manifest
-            || !restore_report.receipt.verified_checksums
-            || !same_path(Path::new(&restore_report.receipt.target_data_root), target)
-        {
-            return Err(service_error(
-                "restore_rollback",
-                "restore evidence does not authorize rollback of this target",
-            ));
-        }
+        validate_owner_issued_restore_receipt(&restore_report, target)?;
         let evidence_checksum = checksum_file(&evidence)?;
         let exact_action_hash = rollback_action_hash(target, &evidence_checksum.digest_hex)?;
         let quarantine = rollback_quarantine_path(target, &exact_action_hash)?;
@@ -2416,6 +2407,106 @@ fn restore_blob_payloads(
     Ok(restored)
 }
 
+/// Owner-issued restore receipt validation for the rollback precondition
+/// (#938, audit comment 5917060171, required step 6).
+///
+/// `RestoreService::run_logical` is the only issuer of the retained
+/// `restore-evidence/restore-receipt.json`: it seals one exact restore action
+/// hash into both the `RestorePlan` and the `RestoreReceipt` it writes, mints
+/// both identities with `WriteId::new_v7`, records the restored `target`, and
+/// writes that evidence only after an executed (non-dry-run) restore. A
+/// decoded `RestoreReport` is not owner issuance, so a receipt is admissible
+/// here only when it reproduces those originally recorded owner values.
+///
+/// Documented basis:
+/// * I5.13 restore list: "restore to isolated root; ... verify receipt/event
+///   chain" — the retained receipt is checked as an owner-issued chain link,
+///   not read as an assertion.
+/// * I5.16: "Absence of a closure or coverage record means `unknown`, not
+///   unrestricted/complete." A `RestoredToNewRoot` status without the sealed
+///   action binding is `unknown`, not a completed restore.
+/// * Appendix P: "authority, scope, effect, privacy, ordering and receipt
+///   fields are never silently defaulted."
+/// * I5.27: "fields affecting authority, scope, ordering, privacy or effect
+///   cannot be omitted/defaulted silently."
+///
+/// Every binding below is compared against the ORIGINAL recorded value in the
+/// retained owner record; nothing is recomputed as a substitute, and no second
+/// digest, nonce or layer is introduced. The typed refusal is
+/// `EngineError::ServiceNotReady`, the same typed failure the surrounding
+/// restore path already returns.
+fn validate_owner_issued_restore_receipt(
+    report: &RestoreReport,
+    target: &Path,
+) -> Result<(), EngineError> {
+    fn refuse(reason: &str) -> EngineError {
+        service_error(
+            "restore_rollback",
+            format!("restore evidence does not authorize rollback of this target: {reason}"),
+        )
+    }
+    let receipt = &report.receipt;
+    let plan = &report.plan;
+    if plan.restore_mode == RestoreMode::VerifyOnly {
+        return Err(refuse("the retained plan is verify-only and seals no restore effect"));
+    }
+    // (a) A success/effect status cannot carry a missing action binding.
+    let sealed_action_hash = match plan.exact_action_hash.as_deref() {
+        Some(sealed) if !sealed.is_empty() => sealed,
+        _ => return Err(refuse("the retained plan seals no exact restore action")),
+    };
+    // (c) Owner issuance: the receipt is the one the restore path issued for
+    // this plan, compared against the originally recorded values.
+    if !owner_issued_id(&plan.restore_plan_id, "restore-plan-")
+        || !owner_issued_id(&receipt.restore_receipt_id, "restore-receipt-")
+    {
+        return Err(refuse(
+            "the retained record carries no owner-issued restore identity",
+        ));
+    }
+    if receipt.restore_plan_id != plan.restore_plan_id {
+        return Err(refuse(
+            "the receipt was not issued for the retained restore plan",
+        ));
+    }
+    if receipt.exact_action_hash.as_deref() != Some(sealed_action_hash) {
+        return Err(refuse(
+            "the receipt is not bound to the sealed exact restore action",
+        ));
+    }
+    if !same_path(Path::new(&plan.target_data_root), target)
+        || !same_path(Path::new(&receipt.target_data_root), target)
+    {
+        return Err(refuse("the retained receipt restores a different data root"));
+    }
+    // (b) A dry-run receipt cannot stand for an executed restore.
+    if receipt.dry_run {
+        return Err(refuse(
+            "the retained receipt is a dry-run and executed no restore",
+        ));
+    }
+    if receipt.status != RestoreStatus::RestoredToNewRoot
+        || !receipt.verified_manifest
+        || !receipt.verified_checksums
+    {
+        return Err(refuse(
+            "the retained receipt is not a verified executed restore",
+        ));
+    }
+    Ok(())
+}
+
+/// True when `value` is the owner-issued `<prefix><uuid-v7>` identity that
+/// `RestoreService` mints with `WriteId::new_v7()`. This reads the recorded
+/// identity; it introduces no new identifier or digest.
+fn owner_issued_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|identity| {
+        identity
+            .parse::<WriteId>()
+            .is_ok_and(|id| id.as_uuid().get_version_num() == 7)
+    })
+}
+
 fn rollback_action_hash(target: &Path, evidence_hash: &str) -> Result<String, EngineError> {
     let material = serde_json::json!({
         "action": "rollback_isolated_restore_to_quarantine",
@@ -2932,5 +3023,176 @@ mod security_tests {
         for safe in ["eliot-governor.toml", "policy.json", "runbook.md"] {
             assert!(!secret_like_path(Path::new(safe)), "{safe}");
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_owner_issuance_tests {
+    use super::{validate_owner_issued_restore_receipt, RestoreService};
+    use crate::error::EngineError;
+    use eliot_types::{
+        RestoreCheck, RestoreMode, RestorePlan, RestoreReceipt, RestoreReport, RestoreStatus, WriteId,
+    };
+    use std::path::{Path, PathBuf};
+    use time::OffsetDateTime;
+
+    const SEALED_ACTION: &str = "sealed-restore-action-hash";
+
+    /// The exact shape `RestoreService::run_logical` issues and writes to
+    /// `restore-evidence/restore-receipt.json` after an executed restore.
+    fn owner_issued_report(target: &Path) -> RestoreReport {
+        let now = OffsetDateTime::now_utc();
+        let plan_id = format!("restore-plan-{}", WriteId::new_v7());
+        RestoreReport {
+            component: "restore".to_owned(),
+            plan: RestorePlan {
+                restore_plan_id: plan_id.clone(),
+                backup_id: "backup-1".to_owned(),
+                backup_manifest_ref: "backups/backup-1/manifest.json".to_owned(),
+                target_data_root: target.display().to_string(),
+                restore_mode: RestoreMode::RestoreToNewRoot,
+                target_endpoint: Some("ws://127.0.0.1:9000".to_owned()),
+                target_storage_ref: Some("target-store".to_owned()),
+                exact_action_hash: Some(SEALED_ACTION.to_owned()),
+                checks: vec![RestoreCheck {
+                    name: "manifest_present".to_owned(),
+                    passed: true,
+                    message: "backup manifest parsed".to_owned(),
+                }],
+                created_at: now,
+            },
+            receipt: RestoreReceipt {
+                restore_receipt_id: format!("restore-receipt-{}", WriteId::new_v7()),
+                restore_plan_id: plan_id,
+                status: RestoreStatus::RestoredToNewRoot,
+                target_data_root: target.display().to_string(),
+                verified_manifest: true,
+                verified_checksums: true,
+                restored_objects: 1,
+                restored_blobs: 0,
+                exact_action_hash: Some(SEALED_ACTION.to_owned()),
+                dry_run: false,
+                started_at: now,
+                finished_at: now,
+                errors: Vec::new(),
+            },
+            generated_at: now,
+        }
+    }
+
+    #[test]
+    fn owner_issued_restore_receipt_authorizes_its_own_rollback_target() {
+        let target = PathBuf::from("isolated-restored-root");
+        assert!(validate_owner_issued_restore_receipt(&owner_issued_report(&target), &target).is_ok());
+    }
+
+    #[test]
+    fn restore_receipt_without_sealed_action_binding_is_refused() {
+        let target = PathBuf::from("isolated-restored-root");
+        let mut report = owner_issued_report(&target);
+        report.receipt.exact_action_hash = None;
+        report.plan.exact_action_hash = None;
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+
+        let mut report = owner_issued_report(&target);
+        report.plan.exact_action_hash = Some(String::new());
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+    }
+
+    #[test]
+    fn dry_run_restore_receipt_cannot_stand_for_an_executed_restore() {
+        let target = PathBuf::from("isolated-restored-root");
+        let mut report = owner_issued_report(&target);
+        report.receipt.dry_run = true;
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+    }
+
+    #[test]
+    fn foreign_receipt_is_not_owner_issued_for_the_retained_plan() {
+        let target = PathBuf::from("isolated-restored-root");
+
+        let mut report = owner_issued_report(&target);
+        report.receipt.restore_plan_id = format!("restore-plan-{}", WriteId::new_v7());
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+
+        let mut report = owner_issued_report(&target);
+        report.receipt.restore_receipt_id = "forged-receipt".to_owned();
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+
+        let mut report = owner_issued_report(&target);
+        report.receipt.exact_action_hash = Some("foreign-action-hash".to_owned());
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+
+        let mut report = owner_issued_report(&target);
+        report.plan.restore_mode = RestoreMode::VerifyOnly;
+        assert!(validate_owner_issued_restore_receipt(&report, &target).is_err());
+    }
+
+    /// A case directory holding an active data root and, beside it (never
+    /// inside it), the isolated restored target `rollback_isolated` accepts.
+    fn test_case(name: &str) -> Result<(PathBuf, PathBuf, PathBuf), EngineError> {
+        let base = std::env::temp_dir().join(format!(
+            "eliot-938-{name}-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let root = base.join("data-root");
+        let target = base.join("restored");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&target)?;
+        Ok((base, root, target))
+    }
+
+    /// Write retained restore evidence exactly as `RestoreService::run_logical`
+    /// does, so these cases exercise the production precondition.
+    fn write_restore_evidence(target: &Path, report: &RestoreReport) -> Result<(), EngineError> {
+        let evidence = target.join("restore-evidence");
+        std::fs::create_dir_all(&evidence)?;
+        std::fs::write(
+            evidence.join("restore-receipt.json"),
+            serde_json::to_vec_pretty(report)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_issued_restore_evidence_authorizes_a_planned_rollback() -> Result<(), EngineError> {
+        let (base, root, target) = test_case("rollback-owner-issued")?;
+        write_restore_evidence(&target, &owner_issued_report(&target))?;
+
+        let planned = RestoreService::new(&root).rollback_isolated(&target, true, "", true)?;
+        assert_eq!(planned.status, "planned");
+        assert!(target.exists(), "a planned rollback moves nothing");
+        let _ = std::fs::remove_dir_all(base);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_a_dry_run_restore_receipt_on_disk() -> Result<(), EngineError> {
+        let (base, root, target) = test_case("rollback-dry-run-receipt")?;
+        let mut report = owner_issued_report(&target);
+        report.receipt.dry_run = true;
+        write_restore_evidence(&target, &report)?;
+
+        assert!(RestoreService::new(&root)
+            .rollback_isolated(&target, true, "", false)
+            .is_err());
+        assert!(
+            target.exists(),
+            "a refused rollback must not quarantine the target"
+        );
+        let _ = std::fs::remove_dir_all(base);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_refuses_a_target_without_owner_evidence() -> Result<(), EngineError> {
+        let (base, root, target) = test_case("rollback-no-evidence")?;
+        assert!(RestoreService::new(&root)
+            .rollback_isolated(&target, true, "", false)
+            .is_err());
+        assert!(target.exists());
+        let _ = std::fs::remove_dir_all(base);
+        Ok(())
     }
 }

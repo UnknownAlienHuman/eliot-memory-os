@@ -87,6 +87,31 @@ where
     Ok(value)
 }
 
+/// # Effect-bearing safety records carry no silent wire default (#938, audit
+/// comment 5917060171, defect 2)
+///
+/// Appendix P, "Rust public boundary interfaces": "authority, scope, effect,
+/// privacy, ordering and receipt fields are never silently defaulted".
+/// I5.27: "fields affecting authority, scope, ordering, privacy or effect
+/// cannot be omitted/defaulted silently". I5.16: "Absence of a closure or
+/// coverage record means `unknown`, not unrestricted/complete" and "Fields that
+/// do not apply remain explicit `None`; they are not silently omitted from the
+/// semantic model".
+///
+/// Every effect-bearing field of [`BackupManifest`], [`RestorePlan`] and
+/// [`RestoreReceipt`] below is therefore REQUIRED on the wire. A producer must
+/// write the field explicitly, and `null` is the only admitted spelling of "does
+/// not apply"; an omitted member is refused at decode. There is no silent
+/// default and no historical wire form to interpret: the sole admitted manifest
+/// version is the current one, pinned at decode to [`crate::SCHEMA_VERSION`] by
+/// [`deserialize_manifest_schema_version`], which refuses every other value, so
+/// no versioned legacy interpretation of an omitted effect field exists and
+/// none is admitted here.
+///
+/// A required member is still not a proof. `null` remains explicit `unknown`
+/// (I5.16), so a success/effect-shaped record that does not carry its binding
+/// cannot become an effect proof: the owner that consumes a decoded record
+/// refuses it before any effect, and does not recompute a substitute binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupManifest {
@@ -102,13 +127,18 @@ pub struct BackupManifest {
     pub config_snapshot_refs: Vec<String>,
     pub surreal_export_ref: Option<String>,
     pub surreal_export_status: String,
-    #[serde(default)]
+    /// Required on the wire. `null` records that this backup sealed no logical
+    /// source endpoint; a consumer must treat that as `unknown`, never as proof
+    /// that a restore target is isolated from the backup source.
     pub surreal_source_endpoint: Option<String>,
-    #[serde(default)]
+    /// Required on the wire. `null` records that the logical source sealed no
+    /// storage root (I5.16 explicit `None`, not an omission).
     pub surreal_source_storage_ref: Option<PathRef>,
     pub control_wal_snapshot_ref: Option<String>,
     pub blob_manifest_ref: String,
-    #[serde(default)]
+    /// Required on the wire. A completed (`dry_run == false`) backup must carry
+    /// the payload root it actually copied; `null` is only the recorded absence
+    /// for a planned backup, never a silent default for a completed one.
     pub blob_payload_root: Option<PathRef>,
     pub blob_payloads: Vec<BackupBlobEntry>,
     pub report_manifest_ref: Option<String>,
@@ -196,11 +226,16 @@ pub struct RestorePlan {
     pub backup_manifest_ref: String,
     pub target_data_root: PathRef,
     pub restore_mode: RestoreMode,
-    #[serde(default)]
+    /// Required on the wire. `null` records that this plan was sealed without a
+    /// logical target endpoint; a consumer must treat that as `unknown`.
     pub target_endpoint: Option<String>,
-    #[serde(default)]
+    /// Required on the wire. `null` records that the plan was sealed without a
+    /// logical target storage root (I5.16 explicit `None`, not an omission).
     pub target_storage_ref: Option<PathRef>,
-    #[serde(default)]
+    /// Required on the wire. `null` records that the owner sealed no exact
+    /// action binding for this plan. A plan without that binding is explicit
+    /// `unknown` about its effect identity (I5.27), so it can never authorize
+    /// an effect on the strength of the record alone.
     pub exact_action_hash: Option<String>,
     pub checks: Vec<RestoreCheck>,
     pub created_at: OffsetDateTime,
@@ -233,7 +268,13 @@ pub struct RestoreReceipt {
     pub verified_checksums: bool,
     pub restored_objects: u64,
     pub restored_blobs: u64,
-    #[serde(default)]
+    /// Required on the wire. The owner always seals the exact action hash of an
+    /// executed restore, so a receipt that omits it decodes as explicit `null`
+    /// = `unknown`, never as a successfully bound effect record. A
+    /// success/effect status is not admissible without this binding, and a
+    /// dry-run receipt never stands for an executed restore: the consuming owner
+    /// refuses both before any effect, comparing against the originally recorded
+    /// value rather than a recomputed substitute.
     pub exact_action_hash: Option<String>,
     pub dry_run: bool,
     pub started_at: OffsetDateTime,
@@ -680,4 +721,210 @@ pub struct ProductionCutoverManifest {
     pub approval_required: bool,
     pub dry_run: bool,
     pub generated_at: OffsetDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BackupKind, BackupManifest, RestoreMode, RestorePlan, RestoreReceipt, RestoreReport,
+        RestoreStatus,
+    };
+    use crate::SCHEMA_VERSION;
+    use serde_json::{json, Value};
+
+    /// `OffsetDateTime` decodes from `time`'s tuple encoding: this crate's
+    /// `time` build keeps `serde-human-readable` disabled, so the wire form of
+    /// a timestamp is `(year, ordinal, hour, minute, second, nanosecond,
+    /// offset_hours, offset_minutes, offset_seconds)`.
+    fn wire_time() -> Value {
+        json!([2026, 1, 0, 0, 0, 0, 0, 0, 0])
+    }
+
+    fn manifest_value() -> Value {
+        json!({
+            "backup_id": "backup-1",
+            "created_at": wire_time(),
+            "source_data_root": "C:/data",
+            "backup_root": "C:/data/backups/backup-1",
+            "backup_kind": "logical_export",
+            "governor_version": "0.1.0",
+            "schema_version": SCHEMA_VERSION,
+            "policy_snapshot_refs": [],
+            "config_snapshot_refs": [],
+            "surreal_export_ref": "C:/data/backups/backup-1/surreal-export.surql",
+            "surreal_export_status": "validated",
+            "surreal_source_endpoint": "ws://127.0.0.1:8000",
+            "surreal_source_storage_ref": "C:/data/store",
+            "control_wal_snapshot_ref": null,
+            "blob_manifest_ref": "C:/data/backups/backup-1/blob-manifest.json",
+            "blob_payload_root": "C:/data/backups/backup-1/blob-payloads",
+            "blob_payloads": [],
+            "report_manifest_ref": null,
+            "checksums": [],
+            "copied_live_db_files": false,
+            "dry_run": false,
+            "warnings": [],
+        })
+    }
+
+    fn plan_value() -> Value {
+        json!({
+            "restore_plan_id": "restore-plan-1",
+            "backup_id": "backup-1",
+            "backup_manifest_ref": "C:/data/backups/backup-1/manifest.json",
+            "target_data_root": "C:/restore/restored",
+            "restore_mode": "restore_to_new_root",
+            "target_endpoint": "ws://127.0.0.1:9000",
+            "target_storage_ref": "C:/restore/store",
+            "exact_action_hash": "sealed-action",
+            "checks": [],
+            "created_at": wire_time(),
+        })
+    }
+
+    fn receipt_value() -> Value {
+        json!({
+            "restore_receipt_id": "restore-receipt-1",
+            "restore_plan_id": "restore-plan-1",
+            "status": "restored_to_new_root",
+            "target_data_root": "C:/restore/restored",
+            "verified_manifest": true,
+            "verified_checksums": true,
+            "restored_objects": 1,
+            "restored_blobs": 0,
+            "exact_action_hash": "sealed-action",
+            "dry_run": false,
+            "started_at": wire_time(),
+            "finished_at": wire_time(),
+            "errors": [],
+        })
+    }
+
+    fn without(value: &Value, field: &str) -> Value {
+        let mut object = value.as_object().expect("object").clone();
+        object.remove(field);
+        Value::Object(object)
+    }
+
+    /// Positive case: a current owner-written record with every effect field
+    /// present (explicit `null` included) decodes.
+    #[test]
+    fn owner_written_safety_records_with_explicit_effect_fields_decode(
+    ) -> Result<(), serde_json::Error> {
+        let manifest: BackupManifest = serde_json::from_value(manifest_value())?;
+        assert_eq!(manifest.backup_kind, BackupKind::LogicalExport);
+        assert_eq!(
+            manifest.surreal_source_endpoint.as_deref(),
+            Some("ws://127.0.0.1:8000")
+        );
+        assert!(manifest.blob_payload_root.is_some());
+        let plan: RestorePlan = serde_json::from_value(plan_value())?;
+        assert_eq!(plan.restore_mode, RestoreMode::RestoreToNewRoot);
+        assert_eq!(plan.exact_action_hash.as_deref(), Some("sealed-action"));
+        let receipt: RestoreReceipt = serde_json::from_value(receipt_value())?;
+        assert_eq!(receipt.status, RestoreStatus::RestoredToNewRoot);
+        assert_eq!(receipt.exact_action_hash.as_deref(), Some("sealed-action"));
+        let report: RestoreReport = serde_json::from_value(json!({
+            "component": "restore",
+            "plan": plan_value(),
+            "receipt": receipt_value(),
+            "generated_at": wire_time(),
+        }))?;
+        assert_eq!(report.receipt.restore_plan_id, report.plan.restore_plan_id);
+        Ok(())
+    }
+
+    /// Refusal case: an omitted effect-bearing field is refused at decode, so
+    /// no historical form can silently become a completed effect record.
+    #[test]
+    fn omitted_effect_bearing_safety_fields_are_refused_at_decode() {
+        for field in [
+            "surreal_source_endpoint",
+            "surreal_source_storage_ref",
+            "blob_payload_root",
+        ] {
+            assert!(
+                serde_json::from_value::<BackupManifest>(&without(&manifest_value(), field))
+                    .is_err(),
+                "BackupManifest must refuse an omitted {field}"
+            );
+        }
+        for field in ["target_endpoint", "target_storage_ref", "exact_action_hash"] {
+            assert!(
+                serde_json::from_value::<RestorePlan>(&without(&plan_value(), field)).is_err(),
+                "RestorePlan must refuse an omitted {field}"
+            );
+        }
+        assert!(serde_json::from_value::<RestoreReceipt>(&without(
+            &receipt_value(),
+            "exact_action_hash"
+        ))
+        .is_err());
+    }
+
+    /// Refusal case: an explicit `null` is the recorded absence, never a
+    /// successful effect record — the value decodes as `None` so a consumer
+    /// sees explicit unknown rather than a completed restore.
+    #[test]
+    fn explicit_null_effect_fields_decode_as_recorded_absence(
+    ) -> Result<(), serde_json::Error> {
+        let mut value = receipt_value();
+        value["exact_action_hash"] = Value::Null;
+        let receipt: RestoreReceipt = serde_json::from_value(value)?;
+        assert!(receipt.exact_action_hash.is_none());
+        assert_eq!(receipt.status, RestoreStatus::RestoredToNewRoot);
+
+        let mut value = plan_value();
+        value["exact_action_hash"] = Value::Null;
+        let plan: RestorePlan = serde_json::from_value(value)?;
+        assert!(plan.exact_action_hash.is_none());
+
+        let mut value = manifest_value();
+        value["blob_payload_root"] = Value::Null;
+        let manifest: BackupManifest = serde_json::from_value(value)?;
+        assert!(manifest.blob_payload_root.is_none());
+        Ok(())
+    }
+
+    /// Refusal case: the pinned current schema version admits no other
+    /// version, so there is no historical wire form whose omitted effect
+    /// fields would need a versioned compatibility owner.
+    #[test]
+    fn no_other_schema_version_is_admitted_for_effect_bearing_manifests() {
+        for version in ["0", "2", "", "1.0"] {
+            let mut value = manifest_value();
+            value["schema_version"] = Value::String(version.to_owned());
+            assert!(serde_json::from_value::<BackupManifest>(&value).is_err());
+        }
+    }
+
+    /// The owner-written record round-trips through the owner's own
+    /// encode/decode path unchanged: making the effect fields required
+    /// accepted no new spelling and dropped none.
+    #[test]
+    fn owner_written_records_round_trip_unchanged() -> Result<(), serde_json::Error> {
+        fn round_trip<T>(value: Value) -> Result<T, serde_json::Error>
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+        {
+            let decoded: T = serde_json::from_value(value)?;
+            let reencoded = serde_json::to_value(&decoded)?;
+            assert_eq!(
+                serde_json::from_value::<T>(reencoded)?,
+                decoded,
+                "the owner encode/decode path must be stable"
+            );
+            Ok(decoded)
+        }
+
+        let manifest: BackupManifest = round_trip(manifest_value())?;
+        assert!(!manifest.dry_run);
+        assert!(manifest.blob_payload_root.is_some());
+        let plan: RestorePlan = round_trip(plan_value())?;
+        assert_eq!(plan.exact_action_hash.as_deref(), Some("sealed-action"));
+        let receipt: RestoreReceipt = round_trip(receipt_value())?;
+        assert!(!receipt.dry_run);
+        assert_eq!(receipt.exact_action_hash.as_deref(), Some("sealed-action"));
+        Ok(())
+    }
 }
