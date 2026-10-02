@@ -8,8 +8,10 @@
 //! [`ClaudeSidecarRequest`](crate::ClaudeSidecarRequest), the sealed X2
 //! [`ProcessRequest`](eliot_process::ProcessRequest), a credential
 //! [`SecretRef`](eliot_process::SecretRef) reference (never a raw secret),
-//! the prior idempotency record, and the [`UnknownOutcomeGate`](crate::UnknownOutcomeGate).
-//! Every rejection happens before any process or credential acquisition.
+//! the prior idempotency record, the [`UnknownOutcomeGate`](crate::UnknownOutcomeGate),
+//! and the I6.5 `BridgeContract` declaration bound to the exact admitted route
+//! generation. Every rejection happens before any process or credential
+//! acquisition.
 //!
 //! [`ClaudeSidecarFactory`] then drives exactly one immutable sidecar
 //! generation through the shared
@@ -353,8 +355,9 @@ pub enum ClaudeFactoryOutcome {
 
 /// Admit one exact attempt from frozen inputs. Order is load-bearing: request
 /// shape, Claude family, attempt/lease/fence/generation agreement, exact
-/// descriptor revision, sealed process binding, idempotency, and the
-/// unknown-outcome gate are all decided before anything is acquired. This
+/// descriptor revision, the I6.5 bridge contract bound to that admitted
+/// descriptor and route generation, sealed process binding, idempotency, and
+/// the unknown-outcome gate are all decided before anything is acquired. This
 /// function cannot contact an executor: preparation starts no process.
 pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, ClaudeSidecarError> {
     if input.request.kind != ClaudeRequestKind::Query {
@@ -373,6 +376,24 @@ pub fn prepare(input: ClaudeFactoryInput) -> Result<ClaudeFactoryOutcome, Claude
     .map_err(map_agent_contract)?;
     input.admitted.validate().map_err(map_agent_contract)?;
     input.descriptor.validate_for(&input.binding)?;
+    // I6.5 (issue #1797 A1/W5): this is the consuming gate for the Claude
+    // sidecar declaration. The contract is derived from the exact admitted
+    // descriptor and the exact route of the admitted attempt - the route
+    // `validate_execution_binding` just proved equal to the bound route - and
+    // then re-validated against that same pair, so a declaration presented for
+    // another route generation cannot pass. The refusal lands before the
+    // sealed process binding is consumed and before any operation identity,
+    // credential or task decision exists.
+    let admitted_route = &input.admitted.route;
+    let contract =
+        crate::bridge_contract::claude_adapter_contract(&input.descriptor, admitted_route)
+            .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))?;
+    crate::bridge_contract::validate_claude_adapter_contract(
+        &contract,
+        &input.descriptor,
+        admitted_route,
+    )
+    .map_err(|error| ClaudeSidecarError::BindingMismatch(error.to_string()))?;
     input
         .process_request
         .validate()

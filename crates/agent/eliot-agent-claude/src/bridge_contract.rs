@@ -11,6 +11,14 @@
 //! fingerprint digest for that admitted route
 //! ([`eliot_agent_api::route_fingerprint_digest_for`]), not to a mutable README
 //! or a self-reported version alone.
+//!
+//! Consuming gate: [`crate::execution::prepare`], the factory admission owner
+//! that already refuses a stale descriptor revision and a descriptor route
+//! that differs from the bound one, builds the declaration from that exact
+//! admitted descriptor and the admitted attempt's route and re-validates it
+//! against that same pair before the sealed process binding is consumed. The
+//! refusal is typed and lands before any operation identity, credential or
+//! task decision exists.
 
 use eliot_agent_api::{RouteFingerprint, route_fingerprint_digest_for};
 use eliot_contracts::{
