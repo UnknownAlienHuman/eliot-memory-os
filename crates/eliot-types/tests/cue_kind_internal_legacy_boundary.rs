@@ -1169,6 +1169,12 @@ fn case_19_exact_scope_plus_reservation_removal_and_seam_handoff() -> TestResult
 // WORK_UNIT_CASE: 831/20
 #[test]
 fn case_20_no_normalization_binding_index_or_activation_algorithm_change() -> TestResult {
+    // The retired assertion expected 3 for an 11-byte payload; the canonical
+    // Source Token Unit owner (#704, `STU(bytes) = ceil(bytes / 3)`) yields 4,
+    // so an `eliot-types` oracle expecting 3 was asserting a number no owner
+    // produces.
+    const HELLO_WORLD_BYTES: u64 = 11;
+    const HELLO_WORLD_CANONICAL_UNITS: u64 = 4;
     // Exhaustive matching over the closed enum still compiles without a
     // wildcard: the kind Leibniz holds per-variant behavior.
     fn tag(kind: LegacyCueKindV1) -> &'static str {
@@ -1201,6 +1207,13 @@ fn case_20_no_normalization_binding_index_or_activation_algorithm_change() -> Te
     // ratio locally. `strip_code` is this file's existing comment/string
     // masker, so a `//` inside a string or a doc comment cannot satisfy or
     // defeat the check.
+    // The retired assertion expected 3 for an 11-byte payload; the canonical
+    // Source Token Unit owner (#704, `STU(bytes) = ceil(bytes / 3)`) yields 4,
+    // so an `eliot-types` oracle expecting 3 was asserting a number no owner
+    // produces. `eliot-types` cannot link that owner — it is the contract hub
+    // the engine depends on, and `case_11_no_upward_smart_dependency`
+    // forbids a `smart` dependency here — so this oracle pins the canonical
+    // divisor and its exact value against the owner's own source.
     let canonical = strip_code(&read_workspace(
         "crates/smart/eliot-context-measurement/src/stu.rs",
     )?);
@@ -1216,10 +1229,8 @@ fn case_20_no_normalization_binding_index_or_activation_algorithm_change() -> Te
     // The value the retired assertion used to expect, re-derived: the exact
     // canonical estimate of the same 11-byte payload is 4, so an `eliot-types`
     // oracle that still expected 3 was asserting a number no owner produces.
-    const HELLO_WORLD_BYTES: u64 = 11;
-    const HELLO_WORLD_CANONICAL_UNITS: u64 = 4;
     assert_eq!(
-        (HELLO_WORLD_BYTES + 2) / 3,
+        HELLO_WORLD_BYTES.div_ceil(3),
         HELLO_WORLD_CANONICAL_UNITS,
         "the canonical estimate of an 11-byte payload changed"
     );

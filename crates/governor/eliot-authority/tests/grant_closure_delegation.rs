@@ -5,6 +5,8 @@
 //! affected set at one revision so the Kernel never fences from caller
 //! material or process memory alone.
 
+#![allow(clippy::expect_used)] // test-only panic-acceptable, mirroring the in-crate closure tests.
+
 use std::error::Error;
 
 use eliot_authority::{

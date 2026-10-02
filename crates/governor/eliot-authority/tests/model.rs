@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)] // test-only panic-acceptable, mirroring the in-crate closure tests.
+
 use std::collections::BTreeSet;
 use std::error::Error;
 
