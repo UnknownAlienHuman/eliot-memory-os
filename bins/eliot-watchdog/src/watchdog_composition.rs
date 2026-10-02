@@ -1117,12 +1117,35 @@ fn bind_recovery_target(
 
 /// Fresh boundary-evidence seam (#1757 step 4, STITCH).
 ///
-/// The fence revalidates approved registration, runtime identity, and
-/// expected generation against a readback taken at the boundary itself, never
-/// against the challenge-time observation. The registration-comparison and
-/// generation readbacks have no production reader on this contour yet, so no
-/// evidence is produced here. Returns `None` until they land; the fence is
-/// never reached without them.
+/// The fence revalidates approved registration, runtime identity, and expected
+/// generation against a readback taken at the boundary itself, never against the
+/// challenge-time observation, and it compares each observed value by content
+/// with the values the operation recorded (`host_recovery::revalidate_boundary`).
+///
+/// Measured state of the three legs on this contour:
+///
+/// * **approved registration — owner exists, not plumbed.** The installer
+///   approval projection (`service_registration_projection::read_approved_service_registration`
+///   -> `ApprovedHostRegistration`) plus the atomic live readback
+///   (`host_identity_observation::read_host_registration_runtime` ->
+///   `WatchdogRuntimeReadback::{Matching, Mismatched, Absent, Unknown}`) already
+///   compare the live SCM configuration against the approved registration, and
+///   `Matching { process }` also carries the handle-bound runtime identity. What
+///   is missing is that the composition MOVES the retained `ApprovedHostRegistration`
+///   into the supervision task: `WatchdogComposition::start_with_shutdown` hands
+///   it to `LiveHostObservationSource::try_new` and keeps no copy, and
+///   `HostObservationSource` exposes no registration accessor.
+/// * **expected generation — no owner.** Nothing on this contour attributes a
+///   LIVE Host process to an approved generation. `HostIdentityMonitor`'s
+///   `sensor_binding` is the installer-selected generation the Watchdog itself
+///   holds, so feeding it back as an observation would compare the Watchdog's
+///   own copy with itself. The Host composition lane must expose a readback
+///   (`CompleteKernelControl` already records `kernel_generation`).
+///
+/// Returns `None` until the registration leg is plumbed AND the generation leg
+/// has an owner: a partial readback would refuse as
+/// `BoundaryRefusal::GenerationUnavailable` anyway, and the fence is never
+/// reached without evidence.
 fn read_boundary_evidence(_target: &RecoveryTarget) -> Option<BoundaryEvidence> {
     None
 }
