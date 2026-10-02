@@ -547,45 +547,6 @@ pub fn dispatch_lifecycle_cancel(
     Ok(registry.cancel_stable(&identity.cancellation_id))
 }
 
-/// Records a deadline expiry for one lifecycle request frame (A3).
-///
-/// The frame must be a validated `Request` carrying its `RequestIdentity`;
-/// any other kind or an invalid frame is rejected with the existing typed
-/// protocol failure and never touches the registry. The presented
-/// `RequestIdentity.cancellation_id` is applied through the existing
-/// [`CancellationRegistry::expire`] point, so the recorded terminal is
-/// [`CancellationState::Expired`]: distinguishable from the explicit-cancel
-/// [`CancellationState::Cancelled`] terminal recorded by
-/// [`dispatch_lifecycle_cancel`] via [`CancellationRegistry::state`], stable
-/// across retries and reconnects. The registry is owned by the lifecycle
-/// owner, never by the fenced session, and entries persist until an explicit
-/// `reap`. An unregistered identity reports
-/// [`CancellationDisposition::Unknown`] without minting state.
-///
-/// # Errors
-///
-/// Returns the existing typed protocol failure for invalid frames,
-/// non-`Request` frames, and identities that fail validation.
-pub fn dispatch_lifecycle_expire(
-    frame: &Frame,
-    registry: &mut CancellationRegistry,
-) -> Result<CancellationDisposition, TransportError> {
-    frame.validate()?;
-    if frame.kind != FrameKind::Request {
-        return Err(TransportError::Protocol(ProtocolError::InvalidField {
-            field: "kind/message_type",
-            reason: "lifecycle expiry dispatch requires a Request frame carrying its RequestIdentity",
-        }));
-    }
-    let identity = frame.request_identity.as_ref().ok_or({
-        TransportError::Protocol(ProtocolError::InvalidField {
-            field: "request_identity",
-            reason: "required for request and cancel frames",
-        })
-    })?;
-    Ok(registry.expire(&identity.cancellation_id))
-}
-
 /// Applies one lifecycle control frame as an explicit transition on the
 /// module-lifecycle owner (W4: I7.4 `Quiesce`/`Checkpoint`/`RestoreCheckpoint`/
 /// `DrainStatus`/`Shutdown`/`Fatal` as explicit I7.2 control flows, plus the
