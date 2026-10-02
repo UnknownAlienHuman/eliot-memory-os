@@ -765,7 +765,7 @@ impl CandidateActivation {
 
     /// Returns the exact structured refusal, when admission was refused.
     #[must_use]
-    pub const fn refusal(&self) -> Option<&CompatibilityMismatch> {
+    pub fn refusal(&self) -> Option<&CompatibilityMismatch> {
         self.refusal.as_ref()
     }
 
@@ -1239,6 +1239,10 @@ mod tests {
         )?;
         let mismatch = activation.require_admitted().unwrap_err();
         assert_eq!(mismatch.field(), MismatchField::CanonicalFormatRange);
+        assert_eq!(
+            activation.refusal().map(CompatibilityMismatch::field),
+            Some(MismatchField::CanonicalFormatRange)
+        );
         let evidence = activation.evidence();
         // The protocol range DID overlap, and the refusal names the field that
         // did not: the protocol version is claimed only on a full admission.
