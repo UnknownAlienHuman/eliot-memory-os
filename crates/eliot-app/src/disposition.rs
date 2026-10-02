@@ -1953,3 +1953,72 @@ pub fn run_facade_disposition_guards() -> Result<(), String> {
     crate::cell_declaration_registry::cell_declaration_guard()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONSUMER_SURFACES, MIGRATED_CONSUMER_EDGES, assert_no_new_ownership,
+        current_consumer_inventory, default_members_guard, expiry_condition_guard,
+        migrated_edge_guard, run_facade_disposition_guards,
+    };
+
+    /// Every disposition guard accepts the real tree, so
+    /// [`run_facade_disposition_guards`] — the function `main` calls at
+    /// `dispatch_command` before any arm handler runs — lets the facade reach
+    /// its own front-door cutover instead of aborting startup.
+    #[test]
+    fn facade_disposition_guards_accept_the_real_tree() {
+        assert_eq!(
+            run_facade_disposition_guards(),
+            Ok(()),
+            "the startup disposition guards must accept the real baked tree"
+        );
+    }
+
+    /// A migrated edge has left the facade: its proof is no longer a declared
+    /// live consumer surface, and the retired legacy invocation is absent from
+    /// that proof while the current-owner route is present in it. A migrated
+    /// file is therefore proven by the route it now launches, not by the
+    /// facade inventory it must not re-enter.
+    #[test]
+    fn migrated_edges_left_the_facade_inventory_and_run_their_current_owner() {
+        assert!(
+            !MIGRATED_CONSUMER_EDGES.is_empty(),
+            "no migrated consumer edge is recorded; the migration guard would be blind"
+        );
+        for edge in MIGRATED_CONSUMER_EDGES {
+            assert!(
+                !CONSUMER_SURFACES
+                    .iter()
+                    .any(|surface| surface.path == edge.proof),
+                "migrated edge {} is still declared a live consumer surface of the facade",
+                edge.proof
+            );
+            assert!(
+                !edge.current_owner.is_empty() && !edge.evidence.is_empty(),
+                "migrated edge {} records no current owner or evidence",
+                edge.proof
+            );
+        }
+        assert_eq!(migrated_edge_guard(), Ok(()));
+    }
+
+    /// The ownership guard is not the constant-shape check the audit rejected:
+    /// it reads the facade's real dependency list out of its own baked
+    /// manifest and its real command tree out of its own baked `main.rs`, and
+    /// refuses any name that carries a forbidden owner word under a name the
+    /// facade did not already use at the issue #18 revision.
+    #[test]
+    fn ownership_guard_reads_the_real_dependency_and_command_surface() {
+        assert_eq!(assert_no_new_ownership(), Ok(()));
+        for entry in current_consumer_inventory() {
+            assert!(
+                !entry.consumer.is_empty() && !entry.proof.is_empty(),
+                "inventory entry {} names no consumer or proof",
+                entry.proof
+            );
+        }
+        assert_eq!(expiry_condition_guard(), Ok(()));
+        assert_eq!(default_members_guard(), Ok(()));
+    }
+}
