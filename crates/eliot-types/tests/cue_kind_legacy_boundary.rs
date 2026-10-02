@@ -751,9 +751,7 @@ fn stale_bare_cue_kind_rows<'text>(
             // Rung 3 is the kind, rung 4 is the type name. Requiring a kind
             // rung before the type name is what the old needle could not do.
             let (_kind, after_kind) = tail.split_once(':')?;
-            after_kind
-                .starts_with(type_rung.as_str())
-                .then_some(line)
+            after_kind.starts_with(type_rung.as_str()).then_some(line)
         })
         .collect()
 }
@@ -1438,15 +1436,7 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
     .join("/");
     let kind_row = |kind: &str, type_name: &str, function: &str| {
         [
-            "id = \"",
-            seam,
-            ":",
-            kind,
-            ":",
-            type_name,
-            ":",
-            function,
-            "\"",
+            "id = \"", seam, ":", kind, ":", type_name, ":", function, "\"",
         ]
         .concat()
     };
