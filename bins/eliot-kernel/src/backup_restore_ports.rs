@@ -2157,9 +2157,18 @@ impl OrsRestoreJournal {
 /// Rules held here:
 ///
 /// - No typed cause is flattened into an opaque code. Each ORS failure class
-///   keeps a semantically exact [`BackupError`] variant, and the ORS record
-///   type, reason or operation identity travels in the variant's own subject
-///   field rather than being discarded.
+///   keeps a semantically exact [`BackupError`] variant that names the class it
+///   reports. Where related refusals deliberately share one arm, that arm names
+///   the shared class once instead of one subject per refusal, so the ORS
+///   payload fields of the individual refusals (record type, reason, module and
+///   generation identity) are not echoed onto this seam. Where a sibling owner
+///   keeps the finer distinction because its own value type can carry it, that
+///   owner is where the distinction lives and this seam must not invent a
+///   second spelling of it: the effect-lease refusals are one class here and two
+///   fields in
+///   `KernelServiceError` (`crates/kernel/eliot-kernel-service/src/
+///   storage_replacement.rs`), which is a difference of this seam's vocabulary,
+///   not a contradiction about what ORS refused.
 /// - `IntegrityProblem` is subdivided by its `record_type` because the ORS
 ///   owner uses one variant for four genuinely different journal refusals: a
 ///   binding mismatch, a rewritten operation in an occupied phase slot, a
@@ -2173,7 +2182,7 @@ impl OrsRestoreJournal {
 ///   future ORS call that can reach them still reports a real class.
 #[allow(
     clippy::too_many_lines,
-    reason = "an exhaustive 55-variant owner mapping stays readable as one reviewed table"
+    reason = "an exhaustive owner mapping stays readable as one reviewed table"
 )]
 pub fn ors_to_backup(error: OrsError) -> BackupError {
     match error {
@@ -2680,5 +2689,119 @@ impl RestoreJournalPort for OrsRestoreJournal {
             self.prune_superseded_payloads(journal_key, &locator);
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ors_effect_operation_lease_restore_boundary_tests {
+    //! Issue #1884 restore-boundary proof: the effect-operation-lease refusals
+    //! are load-bearing arms of the exhaustive `ors_to_backup` table, not a
+    //! decorative wildcard. Each ORS cause this delivery routes at the restore
+    //! boundary is frozen to the exact `BackupError` it produces, and no other
+    //! ORS cause may reach that subject, so a future edit cannot repoint one
+    //! cause at another's answer or widen the arm into a catch-all.
+    //!
+    //! The causal property is the seam itself: a restore that cannot present an
+    //! effect operation lease must say so as a lease fence, and only because
+    //! of that cause.
+
+    use super::*;
+
+    /// The refusal ORS raises when lease issuance is withheld because the
+    /// affected generation is already recorded degraded or quarantined.
+    fn test_degraded_lease_refusal() -> OrsError {
+        OrsError::EffectOperationLeaseGenerationDegraded {
+            module_id: "kernel-worker".to_owned(),
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+            disposition: "Quarantined".to_owned(),
+        }
+    }
+
+    /// The refusal ORS raises when no generation disposition could be read back
+    /// at all, which is absence of evidence and therefore fails closed.
+    fn test_unrecorded_lease_refusal() -> OrsError {
+        OrsError::EffectOperationLeaseGenerationUnrecorded {
+            module_id: "kernel-worker".to_owned(),
+            generation: eliot_contracts::ResourceGeneration::genesis(),
+        }
+    }
+
+    /// The refusal ORS raises when the issuance input's manifest binding
+    /// disagrees with the bound execution manifest.
+    fn test_manifest_binding_mismatch_refusal() -> OrsError {
+        OrsError::EffectOperationLeaseManifestBindingMismatch {
+            field: "manifest_generation",
+        }
+    }
+
+    #[test]
+    fn every_effect_operation_lease_refusal_routes_to_the_restore_effect_lease_fence() {
+        let lease_fence = BackupError::FenceMismatch {
+            subject: "restore journal effect operation lease".to_owned(),
+        };
+
+        // One exact value per ORS cause, asserted rather than counted: a
+        // distinctness count still passes when an arm is deleted and another
+        // is repointed at the same literal.
+        assert_eq!(&ors_to_backup(test_degraded_lease_refusal()), &lease_fence);
+        assert_eq!(
+            &ors_to_backup(test_unrecorded_lease_refusal()),
+            &lease_fence
+        );
+        assert_eq!(
+            &ors_to_backup(test_manifest_binding_mismatch_refusal()),
+            &lease_fence
+        );
+
+        // Negative half of the same proof: a cause that is not an
+        // effect-operation-lease refusal keeps its own subject, so this arm
+        // cannot absorb the sibling lease classes or the writer fences.
+        for (cause_name, cause) in [
+            ("supervision lease", OrsError::SupervisionLeaseStaleRevision),
+            (
+                "supervision ticket",
+                OrsError::SupervisionLeaseTicketConflict,
+            ),
+            ("writer fence", OrsError::FenceMismatch),
+            ("authority epoch", OrsError::EpochMismatch),
+        ] {
+            assert_ne!(
+                &ors_to_backup(cause),
+                &lease_fence,
+                "{cause_name} must not collapse onto the effect operation lease subject"
+            );
+        }
+    }
+
+    #[test]
+    fn the_restore_lease_subjects_stay_pairwise_distinct() {
+        // Additional check, deliberately not the oracle above: the subjects a
+        // restore can report for a lease-shaped ORS refusal are all different,
+        // so reusing one is visible before it becomes a second silent cause.
+        let routed = [
+            (
+                "effect operation lease",
+                ors_to_backup(test_manifest_binding_mismatch_refusal()),
+            ),
+            (
+                "supervision lease",
+                ors_to_backup(OrsError::SupervisionLeaseStaleRevision),
+            ),
+            (
+                "supervision ticket",
+                ors_to_backup(OrsError::SupervisionLeaseBindingMismatch),
+            ),
+            ("writer fence", ors_to_backup(OrsError::FenceMismatch)),
+            ("authority epoch", ors_to_backup(OrsError::EpochMismatch)),
+        ];
+
+        for (index, (name, mapped)) in routed.iter().enumerate() {
+            for (other_name, other) in &routed[index + 1..] {
+                assert_ne!(
+                    mapped, other,
+                    "{name} and {other_name} must keep distinct subjects"
+                );
+            }
+        }
     }
 }

@@ -3480,30 +3480,82 @@ const GRANT_GRAPH_REVISION_CURRENT: TableDefinition<&str, &str> =
 const EFFECT_OPERATION_LEASES: TableDefinition<&str, &str> =
     TableDefinition::new("ors_effect_operation_leases_v1");
 /// Durable execution manifests copied into the Generation Registry (issue
-/// #1885; I1.9). Keyed by `{module_id}::{generation}`. The row is the exact
-/// immutable manifest, so a restart reads the same artifact/config/protocol
-/// hashes, start command, restart class and accepted Catalog revision.
+/// #1885; I1.9). Keyed by `{module_id}::{generation:020}`, the same identity
+/// key `GENERATION_LIFECYCLES` uses, with `module_id` the escaped component
+/// produced by `encode_key_component`. The row is the exact immutable manifest,
+/// so a restart reads the same artifact/config/protocol hashes, start command,
+/// restart class and accepted Catalog revision.
 const KERNEL_EXECUTION_MANIFESTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_kernel_execution_manifests_v1");
 /// Durable effect-replay reconciliation intents (issue #1885; I1.9). Keyed by
-/// `{module_id}::{generation}::{operation_id}::{attempt}`, where `attempt` is
-/// the next ordinal under that identity prefix, so a byte-identical re-persist
-/// of one recorded refusal is an idempotent replay while a DIFFERING refusal of
-/// the same exact operation is appended as a new attempt and never erases the
-/// previous cause. Every distinct denied operation keeps its own durable
-/// escalation, and the store-stop census re-derives the identity prefix from the
-/// decoded item so a key that does not belong to its item still fails closed.
+/// `{module_id}::{generation:020}::{operation_id}::{attempt:020}`, where
+/// `attempt` is the next ordinal under that identity prefix, so a byte-identical
+/// re-persist of one recorded refusal is an idempotent replay while a DIFFERING
+/// refusal of the same exact operation is appended as a new attempt and never
+/// erases the previous cause. `module_id` and `operation_id` are the escaped
+/// components produced by `encode_key_component`, so `::` is an unambiguous
+/// delimiter; `generation` and `attempt` are zero-padded decimals. A row written
+/// before the append discipline is keyed the same series key with no trailing
+/// `::` and no ordinal, and is that series' attempt 0. Every distinct denied
+/// operation keeps its own durable escalation, and the store-stop census
+/// re-derives the identity prefix from the decoded item so a key that does not
+/// belong to its item still fails closed.
 const EFFECT_REPLAY_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_effect_replay_reconciliations_v1");
 /// Durable manifest-side restart reconciliation intents (issue #1884; I1.9).
-/// Keyed by `{module_id}::{generation}::{attempt}` with the same identity
-/// prefix the execution manifest uses plus an attempt ordinal, so a
-/// byte-identical re-persist is idempotent while a differing refusal of one
-/// generation is appended and never replaces the previous cause. A restart is
-/// not an effect replay, so these items name no operation identity and cannot
-/// use the effect-replay family.
+/// Keyed by `{module_id}::{generation:020}::{attempt:020}` with the same
+/// identity prefix the execution manifest uses plus a zero-padded attempt
+/// ordinal, so a byte-identical re-persist is idempotent while a differing
+/// refusal of one generation is appended and never replaces the previous cause.
+/// `module_id` is the escaped component produced by `encode_key_component`, so
+/// `::` is an unambiguous delimiter. A row written before the append discipline
+/// is keyed `{module_id}::{generation:020}` with no trailing `::`, which is a
+/// strict prefix of this series prefix and therefore sorts before every
+/// appended row; that legacy key is probed explicitly and is never rewritten,
+/// re-keyed or deleted. A restart is not an effect replay, so these items name no
+/// operation identity and cannot use the effect-replay family.
 const KERNEL_RESTART_RECONCILIATIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_kernel_restart_reconciliations_v1");
+/// Canonical Governor Module Catalog admission receipts (issue #1884; I1.9,
+/// W1.1). Keyed by the receipt's own canonical operation identity, exactly as
+/// the receipt records it, so the row is found by the identity the sealed
+/// admission names and a caller cannot point one receipt at another operation's
+/// receipt by naming a key. One row per Governor-issued admission; an exact replay
+/// of the same receipt is idempotent and a different receipt under the same
+/// operation identity is refused, never overwritten.
+const GOVERNOR_ADMISSION_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_governor_admission_receipts_v1");
+/// The real generation lifecycle owner of the Generation Registry (issue #1884;
+/// I1.9 line 8, W1.5). Keyed by `{module_id}::{generation:020}`, the same
+/// identity key the execution manifest row uses, with `module_id` the escaped
+/// component produced by `encode_key_component`. Exactly one row per affected
+/// generation records its current disposition and the FIRST cause it degraded
+/// for; a manifest refusal moves it to `Degraded`, the recorded manifest's own
+/// spent restart budget moves it to `Quarantined`, and neither transition ever
+/// runs backwards or overwrites the first cause. A row exists only once a real
+/// refusal or a recorded admitted manifest has been observed, so an absent row
+/// is an absent readback and never reads as `Undegraded`.
+const GENERATION_LIFECYCLES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_generation_lifecycles_v1");
+/// Durable revocation events observed for one effect operation lease (issue
+/// #1884; I1.9 line 48, AUD5). Keyed by the lease identity, exactly as the
+/// lease's own `lease_id` records it. This is the revocation-event readback the
+/// effect replay gate and the lease issuer consult: with no row there is no
+/// observed event, and with a row the current acknowledgement is the OBSERVED
+/// one rather than a literal the gate invents. An observed event is a record of
+/// a fact, so a changed acknowledgement under the same lease identity is a
+/// durable conflict and is refused rather than overwritten.
+const EFFECT_REVOCATION_EVENTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_revocation_events_v1");
+/// Durable delivery acknowledgements observed for one effect operation lease
+/// (issue #1884; I1.9 line 48, AUD5). Keyed by the lease identity, exactly as
+/// the lease's own `lease_id` records it. This is the delivery readback the
+/// effect replay gate and the lease issuer consult, so the current delivery
+/// state is the OBSERVED acknowledgement of a real row rather than a literal
+/// the gate fabricates. A changed acknowledgement under the same lease identity
+/// is a durable conflict and is refused rather than overwritten.
+const EFFECT_DELIVERY_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_effect_delivery_records_v1");
 const NEXT_GLOBAL_ORDER: &str = "next_global_order";
 const RECOVERY_RESERVATION_REVISION: &str = "ors_recovery_reservations_revision_v1";
 const RECOVERY_OPERATIONAL_CURRENT_REVISION: &str = "ors_recovery_operational_current_revision_v1";
@@ -26871,10 +26923,12 @@ impl RedbRecoveryStore {
     /// operation (issue #1885; I1.9).
     ///
     /// Keyed by the lease identity, exactly like the supervision-lease current
-    /// projection. The row is re-validated on readback and the key is checked
-    /// against the row's own lease identity, so a mismatched row fails closed
-    /// as corruption. Returns `Ok(None)` for an absent lease: the effect
-    /// replay gate reads that as "no lease" and denies the replay.
+    /// projection. The key is checked against the row's own lease identity, so a
+    /// mismatched row fails closed as corruption. The row is decoded but not
+    /// re-validated here; a caller that admits an effect re-runs
+    /// [`crate::EffectOperationLease::validate`] through the canonical verifier.
+    /// Returns `Ok(None)` for an absent lease: the effect replay gate reads that
+    /// as "no lease" and denies the replay.
     pub fn load_effect_operation_lease(
         &self,
         lease_id: &OperationIdentity,
@@ -26950,17 +27004,31 @@ impl RedbRecoveryStore {
 
     /// Persists one already-issued effect operation lease (issue #1885; I1.9).
     ///
-    /// This is the only write path into `EFFECT_OPERATION_LEASES`, and it makes
-    /// a lease row able to exist at all: the issuance side
-    /// ([`crate::EffectOperationLease::issue`]) decides the bindings and this
-    /// side makes the decided lease durable. It never mints a lease — it takes
-    /// one that `issue` already produced, and re-runs that record's own
-    /// [`crate::EffectOperationLease::validate`] before the write transaction is
-    /// opened, so a malformed or unsupported-lease-version record is refused
+    /// This is the only write path into `EFFECT_OPERATION_LEASES`. It never mints
+    /// a lease — it takes one that
+    /// [`Self::issue_effect_operation_lease_for_operation`] already produced
+    /// through [`crate::EffectOperationLease::issue`], and re-runs that record's
+    /// own [`crate::EffectOperationLease::validate`] before the write transaction
+    /// is opened, so a malformed or unsupported-lease-version record is refused
     /// with the lease type's own typed error and ORS is never mutated.
     ///
+    /// # Live status
+    ///
+    /// This method itself has no direct production caller. The one method that
+    /// reaches it is the issuer
+    /// [`Self::issue_effect_operation_lease_for_operation`], which reads the
+    /// manifest, the observed generation lifecycle, the revocation and delivery
+    /// readbacks and the recorded restart budget, and builds the lease through
+    /// [`crate::EffectOperationLease::issue`] before writing it here. That issuer
+    /// is on the production call chain and is currently REFUSED at its delivery
+    /// coordinate, because the delivery observation it requires has no producer
+    /// on this branch (issue #1885 owns that contract), so no production lease row
+    /// is created yet. The chain itself is not missing and is not bypassed: when
+    /// the observation exists, the lease check and the actual effect dispatch
+    /// share this single production path.
+    ///
     /// The row is keyed by the lease's own `lease_id`, never by
-    /// `{module_id}::{generation}`: one generation may hold several leases for
+    /// `{module_id}::{generation:020}`: one generation may hold several leases for
     /// distinct already-authorized effects, and one lease authorizes exactly one
     /// operation, so the lease identity is the only key both
     /// [`Self::load_effect_operation_lease`] and
@@ -27032,10 +27100,18 @@ impl RedbRecoveryStore {
     /// Loads the recorded execution manifest for one generation (issue #1885;
     /// I1.9).
     ///
-    /// Keyed by `{module_id}::{generation}` in the Generation Registry. The
-    /// stored manifest re-verifies its own bound digest on readback, so a
-    /// tampered row cannot authorize a restart. Returns `Ok(None)` for an
-    /// absent manifest, which the effect replay gate treats as `ManifestAbsent`.
+    /// Keyed by `{module_id}::{generation:020}` in the Generation Registry, with
+    /// `module_id` the escaped component `encode_key_component` produces. This
+    /// reader DECODES the row and checks that the decoded record's module and
+    /// generation equal the requested key, so a row filed under the wrong key
+    /// fails closed as corruption. It does NOT re-validate the record: it does
+    /// not recompute `manifest_sha256`, does not re-run
+    /// [`crate::KernelExecutionManifest::validate`] and does not re-verify the
+    /// sealed Governor admission. Callers that need that must validate
+    /// explicitly — `load_and_verify_kernel_execution_restart` does so through
+    /// the pure verifier, and the effect replay gate does so on the row it
+    /// loaded. Returns `Ok(None)` for an absent manifest, which the effect replay
+    /// gate treats as `ManifestAbsent`.
     pub fn load_kernel_execution_manifest(
         &self,
         module_id: &str,
@@ -27070,12 +27146,15 @@ impl RedbRecoveryStore {
     /// generation (issue #22; I1.9).
     ///
     /// The manifest comes from the Generation Registry row keyed by the
-    /// request's exact module and generation. Readback validates the stored
-    /// manifest digest and key identity; the existing pure verifier then checks
-    /// the request's bound digest, Authority Epoch, candidate launch binding,
-    /// compatibility evidence, restart budget, and authorization-class
-    /// specific Catalog/Policy view, revocation, and delivery state. An absent
-    /// row remains a typed `ManifestAbsent` decision.
+    /// request's exact module and generation. The row itself is only decoded and
+    /// key-checked by `load_kernel_execution_manifest`; the stored manifest digest
+    /// is validated HERE, by the pure verifier, which re-runs
+    /// [`crate::KernelExecutionManifest::validate`] and recomputes the bound digest
+    /// before any decision. The verifier then checks the request's bound digest,
+    /// Authority Epoch, candidate launch binding, compatibility evidence, restart
+    /// budget, and authorization-class specific Catalog/Policy view, revocation,
+    /// and delivery state. An absent row remains a typed `ManifestAbsent`
+    /// decision.
     ///
     /// The returned admitted decision carries the sealed immutable manifest,
     /// including its exact digest, launch binding, Job Object/resource limits,
@@ -27085,6 +27164,14 @@ impl RedbRecoveryStore {
     /// preserved evidence and the affected generation stays visibly degraded; a
     /// clean admission writes nothing. The decision itself acquires no State
     /// Fence, certifies no live process/Job lineage, and starts no process.
+    ///
+    /// A refused or shadowed decision moves the affected generation in the REAL
+    /// lifecycle owner too, not only in the side table: each item this persists
+    /// carries the same write transaction into `GENERATION_LIFECYCLES` through
+    /// `persist_kernel_restart_reconciliation`, so a generation that degraded is
+    /// durably recorded as degraded or quarantined and therefore blocks launch,
+    /// routes and new leases. A clean admission carries no item and writes
+    /// nothing.
     pub fn load_and_verify_kernel_execution_restart(
         &self,
         request: &crate::KernelExecutionRestartRequest,
@@ -27114,7 +27201,7 @@ impl RedbRecoveryStore {
     /// W1.1).
     ///
     /// This is the only write path into `KERNEL_EXECUTION_MANIFESTS`, and the
-    /// row it owns is immutable under its `{module_id}::{generation}` key.
+    /// row it owns is immutable under its `{module_id}::{generation:020}` key.
     ///
     /// The candidate is built by [`crate::KernelExecutionManifest::admit`] from
     /// the Governor-issued [`crate::AdmittedModuleGeneration`] and the technical
@@ -27127,8 +27214,23 @@ impl RedbRecoveryStore {
     /// non-admission lifecycle disposition, or a recorded canonical owner digest
     /// that does not recompute over the seal's own fields — is therefore refused
     /// here with the manifest type's own typed refusal, and ORS is never mutated:
-    /// no table is opened and no transaction is begun for a forged, invented or
-    /// cross-generation admission.
+    /// for such a forged, invented or cross-generation admission no table is
+    /// opened and no transaction is begun, because that check precedes the write
+    /// transaction entirely.
+    ///
+    /// That seal is a BINDING, not an issuer proof, so this ingress also
+    /// requires the canonical owner receipt the Governor accept path persisted
+    /// for exactly this seal's operation identity, and verifies the recorded
+    /// receipt against the seal FIELD BY FIELD before any manifest row is
+    /// touched: operation identity, idempotency key, module, generation, exact
+    /// Catalog revision, exact Policy revision, exact accepted manifest digest,
+    /// exact State Fence, lifecycle admission disposition and the owner
+    /// canonical digest must all agree, and a difference is a refusal with
+    /// nothing written. An absent canonical receipt, an invented non-blank
+    /// receipt, a receipt issued for another generation, and a receipt whose text
+    /// identity matches but whose accepted manifest digest differs are all
+    /// therefore refused here rather than admitted, because receipt text and a
+    /// caller-chosen non-zero revision are not authority.
     ///
     /// The seal's `accepted_manifest_sha256` is the Module Catalog owner's
     /// recorded accepted-execution-manifest digest, bound by that canonical
@@ -27183,6 +27285,10 @@ impl RedbRecoveryStore {
         );
         let payload = encode(&manifest)?;
         let write = self.database.begin_write().map_err(storage)?;
+        // #1884 AUD1: the canonical owner receipt is read and verified FIRST,
+        // inside the very transaction that would write, and before any manifest
+        // mutation.
+        verify_canonical_admission_receipt(&write, &manifest)?;
         // #1884 W1.1: read-then-decide under the same transaction that would
         // overwrite. Taking the decision here means an exact replay, a widened
         // or changed manifest and a first persist are all decided against the
@@ -27232,8 +27338,166 @@ impl RedbRecoveryStore {
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        // #1884 W1.5: a generation is `Undegraded` only when its admitted
+        // manifest is recorded and intact, so the positive lifecycle row is
+        // written here, in the same transaction as the manifest row it describes
+        // and only on this first-persist path. An exact replay returns above
+        // without committing, so a replay neither rewrites the lifecycle row nor
+        // manufactures one for a generation that never reached this path.
+        write_undegraded_generation_lifecycle(
+            &write,
+            manifest.admission.module_id.as_str(),
+            manifest.admission.generation,
+        )?;
         write.commit().map_err(storage)?;
         Ok(manifest.manifest_sha256)
+    }
+
+    /// Persists the canonical Governor Module Catalog admission receipt for one
+    /// accepted generation (issue #1884; I1.9 line 35, W1.1, AUD1).
+    ///
+    /// This is the only write path into `GOVERNOR_ADMISSION_RECEIPTS` and it is
+    /// the Governor accept path's durable half. The typed
+    /// [`crate::GovernorAdmissionReceipt`] it takes is the canonical receipt the
+    /// Governor Module Catalog owner issued; this method does not compute, infer
+    /// or re-issue one, and it accepts no receipt text, no non-zero revision and
+    /// no caller-chosen scope in place of one.
+    ///
+    /// The row is keyed by the receipt's own canonical operation identity, so a
+    /// receipt is found by the identity it records and cannot be filed under
+    /// another operation's receipt. The existing row is read and decoded inside
+    /// the write transaction that would replace it:
+    ///
+    /// * **no row** — the receipt is written;
+    /// * **a byte-identical row** — an exact replay. Nothing is written and the
+    ///   stored receipt is returned, so re-presenting the same admission cannot
+    ///   change the durable issuer evidence;
+    /// * **any other row under the same operation identity** — nothing is written
+    ///   and [`OrsError::IntegrityProblem`] is returned carrying
+    ///   `IDENTITY_CONFLICT` and naming the operation identity, so a second,
+    ///   different receipt for one accepted generation is refused rather than
+    ///   substituted. A different accepted generation is a different operation
+    ///   identity and therefore a different key.
+    ///
+    /// The receipt itself is validated here before any transaction is opened, so
+    /// a malformed or unsupported-schema receipt is refused with the receipt
+    /// type's own typed error and ORS is never mutated. This is the receipt
+    /// `persist_admitted_kernel_execution_manifest` requires to exist before it
+    /// will write a Generation Registry manifest row.
+    ///
+    /// # Live status
+    ///
+    /// It HAS a production caller, and it is step 3 of the Governor accept path:
+    /// `eliot_governor::admit_accepted_generation_into_generation_registry`
+    /// (`crates/governor/eliot-governor/src/module_registry_admission.rs:339`),
+    /// which issues the [`crate::GovernorAdmissionReceipt`] from the same sealed
+    /// facts the canonical seal carries and persists it here, before
+    /// `persist_admitted_kernel_execution_manifest` is reached. This method's
+    /// other in-tree call sites are `#[cfg(test)]` fixture code, not writers.
+    ///
+    /// What still has no in-tree caller is one link further up that same chain:
+    /// `eliot_governor::accept_candidate_generation_into_generation_registry`
+    /// (`crates/governor/eliot-governor/src/module_registry_admission.rs:431`).
+    /// The only references to it are its own definition and the `eliot_governor`
+    /// re-export (`crates/governor/eliot-governor/src/lib.rs:84`), so no
+    /// composition root has entered the accept chain, and that is the whole of
+    /// the remaining gap. The manifest ingress is consequently still unreachable
+    /// in a running system and no live store holds a manifest row — because the
+    /// chain that writes the receipt the ingress requires has not been entered,
+    /// not because a receipt is missing from a chain that ran. The fail-closed
+    /// behaviour is unchanged and still intended: the ingress refuses any
+    /// manifest whose seal has no canonical receipt row recorded under that
+    /// seal's own operation identity.
+    pub fn persist_governor_admission_receipt(
+        &self,
+        receipt: &crate::GovernorAdmissionReceipt,
+    ) -> Result<crate::GovernorAdmissionReceipt, OrsError> {
+        receipt.validate()?;
+        let key = receipt.operation_id.as_str().to_owned();
+        let payload = encode(receipt)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let stored_payload = {
+            let receipts = write
+                .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+                .map_err(storage)?;
+            receipts
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(stored_payload) = stored_payload {
+            let stored: crate::GovernorAdmissionReceipt = decode(stored_payload.as_str())?;
+            if stored.operation_id.as_str() != key.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "governor_admission_receipt",
+                    reason: "durable admission receipt key does not match the recorded operation identity"
+                        .to_owned(),
+                });
+            }
+            if stored_payload != payload {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "governor_admission_receipt",
+                    reason: format!(
+                        "IDENTITY_CONFLICT: durable Governor admission receipt for operation {} records accepted manifest {} under catalog revision {} and cannot be replaced by accepted manifest {} under catalog revision {}",
+                        key,
+                        stored.accepted_manifest_sha256,
+                        stored.catalog_revision,
+                        receipt.accepted_manifest_sha256,
+                        receipt.catalog_revision
+                    ),
+                });
+            }
+            // Exact replay: the stored issuer evidence is kept exactly as issued.
+            return Ok(stored);
+        }
+        {
+            let mut receipts = write
+                .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+                .map_err(storage)?;
+            receipts
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(receipt.clone())
+    }
+
+    /// Loads the canonical Governor admission receipt for one operation identity
+    /// (issue #1884; W1.1, AUD1).
+    ///
+    /// Keyed by the receipt's own operation identity, and the stored receipt's
+    /// identity is checked against the key so a mismatched row fails closed as
+    /// corruption. Returns `Ok(None)` for an absent receipt, which the manifest
+    /// ingress reads as "the Governor owner never receipted this admission" and
+    /// refuses before any ORS mutation.
+    pub fn load_governor_admission_receipt(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<crate::GovernorAdmissionReceipt>, OrsError> {
+        crate::model::validate_text(
+            operation_id.as_str(),
+            "governor_admission_receipt_operation_id",
+        )?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let receipts = read
+            .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+            .map_err(storage)?;
+        receipts
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let receipt: crate::GovernorAdmissionReceipt = decode(value.value())?;
+                if receipt.operation_id != *operation_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "governor_admission_receipt",
+                        reason:
+                            "admission receipt key does not match the recorded operation identity"
+                                .to_owned(),
+                    });
+                }
+                Ok(receipt)
+            })
+            .transpose()
     }
 
     /// Persists one manifest-side restart escalation (issue #1884; I1.9, W1.5).
@@ -27248,10 +27512,10 @@ impl RedbRecoveryStore {
     /// `validate()`, same persistence codec.
     ///
     /// Evidence APPENDS: the row is keyed
-    /// `{module_id}::{generation}::{attempt}`, where `attempt` is the next free
-    /// ordinal under that key. A later, differently-caused refusal of the same
-    /// generation is therefore stored alongside the earlier one and never
-    /// truncates it, so the first cause a generation degraded for is still
+    /// `{module_id}::{generation:020}::{attempt:020}`, where `attempt` is the
+    /// next free ordinal under that key. A later, differently-caused refusal of
+    /// the same generation is therefore stored alongside the earlier one and
+    /// never truncates it, so the first cause a generation degraded for is still
     /// readable after a second cause is observed. The idempotence test is
     /// IDENTITY AND CAUSE, and the observation clock is first-write-wins: the
     /// item's `observed_at_ms` is stated by the caller's restart request and is
@@ -27260,10 +27524,36 @@ impl RedbRecoveryStore {
     /// commits nothing; a DIFFERENT kind or manifest digest is a different cause
     /// and still appends beside the earlier one, which is never truncated.
     ///
+    /// `encode_key_component` escapes only `%` and `:`, so `::` is an
+    /// unambiguous delimiter and the pre-append key `{M}::{G:020}` is a STRICT
+    /// PREFIX of the series prefix `{M}::{G:020}::`. In redb's byte-ordered key
+    /// space a strict prefix always sorts before its extensions, so a
+    /// `range(prefix..)` scan can never return the legacy row. The exact legacy
+    /// key is therefore probed with `get()` alongside the series scan, inside
+    /// this same write transaction and BEFORE the ordinal is decided: an
+    /// identical recorded cause there returns `Ok` without committing, so
+    /// re-persisting the identical legacy-recorded cause after an upgrade adds
+    /// no duplicate attempt-0 row, and a DIFFERENT cause falls through to the
+    /// unchanged append path. The legacy row is only read and identity-checked;
+    /// it is never rewritten, re-keyed or deleted, and the ordinal arithmetic is
+    /// unchanged because no reader parses it.
+    ///
     /// `KernelReconciliationItem` has no attempt field, so the ordinal is
     /// derived here from the keys already under the prefix and is not part of
     /// the item payload; the item therefore needs no new field to be preserved
     /// as a distinct row.
+    ///
+    /// # Real generation lifecycle
+    ///
+    /// The row alone is not degradation. In this same write transaction, and
+    /// ORDERED AFTER the escalation append so the attempt history is never lost,
+    /// the affected generation's `GENERATION_LIFECYCLES` row is read and
+    /// `transition_to_degraded` is applied with this item's `kind`; the recorded
+    /// manifest's own restart budget and quarantine rule decide whether
+    /// `transition_to_quarantined` applies instead. The transition never runs
+    /// backwards and `first_refusal_cause` keeps the FIRST recorded cause when a
+    /// later, different refusal of the same generation arrives, so a new
+    /// observation adds history rather than erasing the reason.
     pub fn persist_kernel_restart_reconciliation(
         &self,
         item: &crate::KernelReconciliationItem,
@@ -27284,55 +27574,16 @@ impl RedbRecoveryStore {
         // #1884 W1.5: every row already under this key is decoded before any
         // write, inside the transaction that would write, so the same-cause
         // idempotence test and the next free ordinal are both decided against
-        // durable state.
-        let attempt = {
-            let escalations = write
-                .open_table(KERNEL_RESTART_RECONCILIATIONS)
-                .map_err(storage)?;
-            let mut next = 0_u64;
-            for row in escalations.range(prefix.as_str()..).map_err(storage)? {
-                let (key, value) = row.map_err(storage)?;
-                if !key.value().starts_with(prefix.as_str()) {
-                    break;
-                }
-                let stored: crate::KernelReconciliationItem = decode(value.value())?;
-                if stored.module_id != item.module_id
-                    || stored.generation.value() != item.generation.value()
-                {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "kernel_restart_reconciliation",
-                        reason: "restart reconciliation key does not match the recorded identity"
-                            .to_owned(),
-                    });
-                }
-                if stored.kind == item.kind
-                    && stored.module_id == item.module_id
-                    && stored.generation.value() == item.generation.value()
-                    && stored.operation_id == item.operation_id
-                    && stored.lease_id == item.lease_id
-                    && stored.bound_manifest_sha256 == item.bound_manifest_sha256
-                    && stored.recorded_manifest_sha256 == item.recorded_manifest_sha256
-                {
-                    // #1884 W1.5 idempotent replay: the same cause of the same
-                    // escalation is already recorded, and `observed_at_ms` is
-                    // first-write-wins, so a later stated observation time is NOT
-                    // a new cause. The stored row is kept exactly as first
-                    // recorded, the transaction is dropped without a commit, and
-                    // a retrying caller cannot grow the table. A differing kind
-                    // or digest falls through and appends beside this row, so
-                    // nothing recorded is ever overwritten.
-                    return Ok(());
-                }
-                if let Some(ordinal) = key
-                    .value()
-                    .strip_prefix(prefix.as_str())
-                    .and_then(|rest| rest.parse::<u64>().ok())
-                {
-                    next = next.max(ordinal.saturating_add(1));
-                }
-            }
-            next
-        };
+        // durable state. #1884 W4: the exact pre-append legacy key is probed
+        // first, because a strict prefix sorts before its extensions and the
+        // series range can never return it.
+        if restart_refusal_already_recorded(&write, item)? {
+            // The recorded row is kept exactly as it stands: it is not rewritten,
+            // re-keyed or deleted, and the transaction is dropped without a
+            // commit, so neither the appended nor the legacy series grows.
+            return Ok(());
+        }
+        let attempt = next_restart_reconciliation_attempt(&write, item)?;
         let key = format!("{prefix}{attempt:020}");
         {
             let mut escalations = write
@@ -27342,14 +27593,26 @@ impl RedbRecoveryStore {
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        // #1884 W1.5/AUD5: the append is durable in this transaction but not
+        // yet committed, so the real generation lifecycle transition runs now,
+        // ORDERED AFTER it: if the lifecycle update cannot be written, the
+        // transaction is dropped and the attempt is not lost. Both land in one
+        // commit.
+        record_refusal_in_generation_lifecycle(
+            &write,
+            item.module_id.as_str(),
+            item.generation,
+            item.kind,
+            item.observed_at_ms,
+        )?;
         write.commit().map_err(storage)
     }
 
     /// Loads the newest durable manifest-side restart escalation for one
     /// generation (issue #1884; I1.9, W1.5).
     ///
-    /// Keyed by the `{module_id}::{generation}` prefix of
-    /// `{module_id}::{generation}::{attempt:020}`. Escalations append, so a
+    /// Keyed by the `{module_id}::{generation:020}::` prefix of
+    /// `{module_id}::{generation:020}::{attempt:020}`. Escalations append, so a
     /// generation that degraded more than once keeps every recorded cause; this
     /// resolves the newest one — the highest attempt ordinal, which is the last
     /// key in ascending order — and the earlier causes remain durable for audit.
@@ -27403,13 +27666,8 @@ impl RedbRecoveryStore {
         // at all. It is read and identity-checked here and nowhere else: nothing
         // is written, re-keyed or deleted, and a later, differently-caused refusal
         // still appends beside it.
-        let legacy_key = format!(
-            "{}::{:020}",
-            Self::encode_key_component(module_id),
-            generation
-        );
         escalations
-            .get(legacy_key.as_str())
+            .get(Self::legacy_kernel_restart_reconciliation_key(module_id, generation).as_str())
             .map_err(storage)?
             .map(|value| {
                 let item: crate::KernelReconciliationItem = decode(value.value())?;
@@ -27426,12 +27684,144 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Counts the durable rows of one generation's restart-escalation family
+    /// (issue #1884; I1.9, W1.5).
+    ///
+    /// `load_kernel_restart_reconciliation` resolves only the NEWEST attempt while
+    /// the append discipline keeps every earlier attempt beside it, so the row
+    /// COUNT of that family — the thing a same-cause re-persist must not change —
+    /// is not observable through that reader alone. This is the public count, and
+    /// it is what a check that "the same cause re-persisted leaves exactly one
+    /// row" needs: the only other reader of these rows was the private
+    /// `require_restart_budget_room`, which is itself reached only for a
+    /// generation with no recorded restart refusal.
+    ///
+    /// The counted keys are exactly the keys the loader can read:
+    ///
+    /// * every row whose key starts with the series prefix
+    ///   `{module_id}::{generation:020}::` — the appended
+    ///   `{module_id}::{generation:020}::{attempt:020}` attempts, with
+    ///   `module_id` the escaped component `encode_key_component` produces and
+    ///   `::` the unambiguous delimiter that escaping guarantees; and
+    /// * the one exact pre-append legacy key `{module_id}::{generation:020}`,
+    ///   which is `legacy_kernel_restart_reconciliation_key` — the series key
+    ///   with no trailing `::` and no attempt ordinal — when a row is filed under
+    ///   it. In redb's byte-ordered key space a strict prefix always sorts before
+    ///   its extensions, so a `range(series_prefix..)` scan can never return that
+    ///   row and the loader probes it with `get()`; this reader does the same two
+    ///   steps, which is why the two agree on which rows exist.
+    ///
+    /// Every counted row is decoded and identity-checked exactly as the loader
+    /// checks it, so a row filed under another generation's prefix fails closed
+    /// as [`OrsError::IntegrityProblem`] instead of being counted as this
+    /// generation's evidence. The result is a number of recorded attempts and
+    /// nothing else: it is not restart spend (nothing in this store measures
+    /// that) and it is not a disposition.
+    ///
+    /// It is a pure READER. It opens no write transaction, inserts nothing,
+    /// mutates nothing and does not touch the recorded generation lifecycle, so
+    /// counting this family can never create, replace or erase the evidence it
+    /// counts.
+    pub fn count_kernel_restart_reconciliations(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<u64, OrsError> {
+        crate::model::validate_text(module_id, "kernel_execution_manifest_module_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let escalations = read
+            .open_table(KERNEL_RESTART_RECONCILIATIONS)
+            .map_err(storage)?;
+        let prefix = Self::kernel_restart_reconciliation_prefix(module_id, generation);
+        let mut recorded = 0_u64;
+        for row in escalations.range(prefix.as_str()..).map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            let item: crate::KernelReconciliationItem = decode(value.value())?;
+            Self::require_counted_restart_reconciliation_identity(&item, module_id, generation)?;
+            recorded = recorded.saturating_add(1);
+        }
+        if escalations
+            .get(Self::legacy_kernel_restart_reconciliation_key(module_id, generation).as_str())
+            .map_err(storage)?
+            .is_some()
+        {
+            recorded = recorded.saturating_add(1);
+        }
+        Ok(recorded)
+    }
+
+    /// Refuses a counted restart row whose own decoded item names another
+    /// generation than the key it was counted under.
+    ///
+    /// The same identity check the loader applies to the row it returns, with the
+    /// requested key as the other side: a row misfiled under this generation's
+    /// series is corruption for the whole family, and counting it would turn a
+    /// misfiled row into evidence about the requested generation.
+    fn require_counted_restart_reconciliation_identity(
+        item: &crate::KernelReconciliationItem,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<(), OrsError> {
+        if item.module_id == module_id && item.generation.value() == generation {
+            return Ok(());
+        }
+        Err(OrsError::IntegrityProblem {
+            record_type: "kernel_restart_reconciliation",
+            reason: "restart reconciliation key does not match the recorded identity".to_owned(),
+        })
+    }
+
     /// The key prefix every restart escalation of one generation shares.
     fn kernel_restart_reconciliation_prefix(module_id: &str, generation: u64) -> String {
         format!(
             "{}::{:020}::",
             Self::encode_key_component(module_id),
             generation
+        )
+    }
+
+    /// The exact pre-append restart-escalation key of one generation.
+    ///
+    /// `encode_key_component` escapes only `%` and `:`, so `::` is an
+    /// unambiguous delimiter: this key is `{module_id}::{generation:020}` with no
+    /// trailing `::` and no ordinal, and it is a strict prefix of
+    /// `kernel_restart_reconciliation_prefix`. In redb's byte-ordered key space a
+    /// strict prefix always sorts before its extensions, so a
+    /// `range(series_prefix..)` scan can never return it; this key is therefore
+    /// probed with `get()`. It is the loader's legacy read and both writers'
+    /// legacy idempotence probe, and it is never written by either writer.
+    fn legacy_kernel_restart_reconciliation_key(module_id: &str, generation: u64) -> String {
+        format!(
+            "{}::{:020}",
+            Self::encode_key_component(module_id),
+            generation
+        )
+    }
+
+    /// The exact pre-append effect-replay reconciliation key of one operation.
+    ///
+    /// The same escaping rule and the same strict-prefix argument as
+    /// `legacy_kernel_restart_reconciliation_key`: this key is
+    /// `{module_id}::{generation:020}::{operation_id}` with no trailing `::` and
+    /// no ordinal, so the series scan under
+    /// `effect_replay_reconciliation_prefix` can never return it. It is that
+    /// series' attempt 0, and
+    /// `crate::store::stop_census::observe_effect_replay_reconciliations` already
+    /// accepts it as such. It is probed with `get()` for the writers' idempotence
+    /// test and is never written by either writer.
+    fn legacy_effect_replay_reconciliation_key(
+        module_id: &str,
+        generation: u64,
+        operation_id: &str,
+    ) -> String {
+        format!(
+            "{}::{:020}::{}",
+            Self::encode_key_component(module_id),
+            generation,
+            Self::encode_key_component(operation_id)
         )
     }
 
@@ -27446,12 +27836,23 @@ impl RedbRecoveryStore {
     ///
     /// Evidence APPENDS, exactly like the manifest-side restart family in
     /// [`Self::persist_kernel_restart_reconciliation`]: the row is keyed
-    /// `{module_id}::{generation}::{operation_id}::{attempt}`, where `attempt`
-    /// is the next free ordinal under the identity prefix. A differently-caused
-    /// second denial of one operation is therefore stored alongside the first and
-    /// never replaces or truncates it, so both causes survive for audit; the
-    /// table grows with distinct observed refusals, not with repeated identical
-    /// ones.
+    /// `{module_id}::{generation:020}::{operation_id}::{attempt:020}`, where
+    /// `attempt` is the next free ordinal under the identity prefix. A
+    /// differently-caused second denial of one operation is therefore stored
+    /// alongside the first and never replaces or truncates it, so both causes
+    /// survive for audit; the table grows with distinct observed refusals, not
+    /// with repeated identical ones.
+    ///
+    /// The pre-append key `{module_id}::{generation:020}::{operation_id}` is a
+    /// strict prefix of the series prefix, so the series range can never return
+    /// it; the exact legacy key is probed with `get()` inside this same write
+    /// transaction and BEFORE the ordinal is decided, exactly as in the
+    /// manifest-side family. An identical recorded cause there returns `Ok`
+    /// without committing, so re-persisting the identical legacy-recorded cause
+    /// after an upgrade adds no duplicate attempt-0 row, and a DIFFERENT cause
+    /// falls through to the unchanged append path. The legacy row is never
+    /// rewritten, re-keyed or deleted, and the ordinal arithmetic is unchanged
+    /// because no reader parses it.
     ///
     /// The idempotence test is IDENTITY AND CAUSE, and the observation clock is
     /// first-write-wins. `require_effect_replay_authority` states a fresh
@@ -27473,12 +27874,24 @@ impl RedbRecoveryStore {
     ///
     /// This key shape and this single-item payload are load-bearing outside this
     /// method: `crate::store::stop_census::observe_effect_replay_reconciliations`
-    /// re-derives the `{module_id}::{generation}::{operation_id}` prefix from
+    /// re-derives the `{module_id}::{generation:020}::{operation_id}` prefix from
     /// the item's own typed fields and refuses any row whose key is not exactly
     /// that prefix, either followed by a decimal attempt ordinal or ending in the
     /// pre-append exact key that is this series' attempt 0, so the census keeps
     /// checking the decoded item against its key rather than trusting either
     /// alone.
+    ///
+    /// # Real generation lifecycle
+    ///
+    /// As in the manifest-side family, the escalation row alone is not
+    /// degradation. In this same write transaction, ORDERED AFTER the append so
+    /// the attempt history is never lost, the affected generation's
+    /// `GENERATION_LIFECYCLES` row is read and `transition_to_degraded` is
+    /// applied with this item's `kind`, or `transition_to_quarantined` when the
+    /// recorded manifest's own restart budget and quarantine rule say so. The
+    /// transition never runs backwards and `first_refusal_cause` keeps the FIRST
+    /// recorded cause, so a later, differently-caused denial of the same
+    /// generation adds history instead of erasing the reason.
     pub fn persist_effect_replay_reconciliation(
         &self,
         item: &crate::KernelReconciliationItem,
@@ -27501,56 +27914,16 @@ impl RedbRecoveryStore {
         // before any write, inside the transaction that would write, so the
         // same-cause idempotence test and the next free ordinal are both decided
         // against the exact durable state and cannot interleave with another
-        // writer.
-        let attempt = {
-            let intents = write
-                .open_table(EFFECT_REPLAY_RECONCILIATIONS)
-                .map_err(storage)?;
-            let mut next = 0_u64;
-            for row in intents.range(prefix.as_str()..).map_err(storage)? {
-                let (key, value) = row.map_err(storage)?;
-                if !key.value().starts_with(prefix.as_str()) {
-                    break;
-                }
-                let stored: crate::KernelReconciliationItem = decode(value.value())?;
-                if stored.module_id != item.module_id
-                    || stored.generation.value() != item.generation.value()
-                    || stored.operation_id.as_ref() != Some(operation_id)
-                {
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "effect_replay_reconciliation",
-                        reason: "effect reconciliation key does not match the recorded identity"
-                            .to_owned(),
-                    });
-                }
-                if stored.kind == item.kind
-                    && stored.module_id == item.module_id
-                    && stored.generation.value() == item.generation.value()
-                    && stored.operation_id.as_ref() == Some(operation_id)
-                    && stored.lease_id == item.lease_id
-                    && stored.bound_manifest_sha256 == item.bound_manifest_sha256
-                    && stored.recorded_manifest_sha256 == item.recorded_manifest_sha256
-                {
-                    // #1884 W1.5 idempotent replay: the same cause of the same
-                    // refusal is already recorded for this operation, and
-                    // `observed_at_ms` is first-write-wins, so the caller's later
-                    // observation time is NOT a new cause. The stored row is kept
-                    // exactly as first recorded, the transaction is dropped
-                    // without a commit, and a retrying loop cannot grow the table.
-                    // A differing kind, lease or digest falls through and appends
-                    // beside this row, so nothing recorded is ever overwritten.
-                    return Ok(());
-                }
-                if let Some(ordinal) = key
-                    .value()
-                    .strip_prefix(prefix.as_str())
-                    .and_then(|rest| rest.parse::<u64>().ok())
-                {
-                    next = next.max(ordinal.saturating_add(1));
-                }
-            }
-            next
-        };
+        // writer. #1884 W4: the exact pre-append legacy key is probed with
+        // `get()` first, because a strict prefix sorts before its extensions and
+        // the series range can never return it.
+        if effect_replay_refusal_already_recorded(&write, item, operation_id)? {
+            // The recorded row is kept exactly as it stands: it is not rewritten,
+            // re-keyed or deleted, and the transaction is dropped without a
+            // commit, so neither the appended nor the legacy series grows.
+            return Ok(());
+        }
+        let attempt = next_effect_replay_reconciliation_attempt(&write, item, operation_id)?;
         let key = format!("{prefix}{attempt:020}");
         {
             let mut intents = write
@@ -27560,6 +27933,18 @@ impl RedbRecoveryStore {
                 .insert(key.as_str(), payload.as_str())
                 .map_err(storage)?;
         }
+        // #1884 W1.5/AUD5: the append is durable in this transaction but not yet
+        // committed, so the real generation lifecycle transition runs now,
+        // ORDERED AFTER it: a lifecycle row that cannot be written drops the
+        // transaction rather than leaving a recorded denial with no degraded
+        // generation behind it. Both land in one commit.
+        record_refusal_in_generation_lifecycle(
+            &write,
+            item.module_id.as_str(),
+            item.generation,
+            item.kind,
+            item.observed_at_ms,
+        )?;
         write.commit().map_err(storage)
     }
 
@@ -27613,49 +27998,99 @@ impl RedbRecoveryStore {
     /// `catalog_revision` and `policy_revision` are the **loaded manifest's**
     /// admitting revisions — the exact revisions the lease was issued against.
     ///
-    /// `current.catalog_view` is `Current` exactly when the recorded manifest
-    /// carries an intact Governor admission whose admitting Catalog/Policy
-    /// revisions equal the lease's own, and whose recorded class is
-    /// `effect_exact_lease` — the class I1.9 defines as effect capable
-    /// "without needing a fresh Catalog view for the restart itself". The
-    /// recorded admission is the newest Governor truth this seam holds, so
-    /// agreement means no recorded supersession. Anything else (an absent or
-    /// receipt-less manifest, revision drift, or a `current_catalog_required`
-    /// class, which by definition refuses without a live current view) stays
+    /// `current.catalog_view` is `Current` only when the recorded manifest carries
+    /// an intact Governor admission whose admitting Catalog/Policy revisions equal
+    /// the lease's own AND whose recorded class is `effect_exact_lease`. I1.9 lines
+    /// 44-46 grant that class exactly one thing — an effect-capable generation may
+    /// "resume only exact already-authorized operations covered by an unexpired
+    /// operation lease", and "new effect admission requires a current Module
+    /// Catalog/Policy view". I1.9 grants no `effect_exact_lease` waiver of the
+    /// current Catalog/Policy view for the *general* restart, so `Current` here
+    /// means the two durable admission revisions agree with the lease's and
+    /// nothing more: it does NOT mean the class waived a fresh view. The recorded
+    /// admission is the newest Governor truth this seam holds, so agreement means
+    /// no recorded supersession. Anything else (an absent or receipt-less
+    /// manifest, revision drift, or a `current_catalog_required` class, which by
+    /// definition refuses without a live current view) stays
     /// [`crate::CatalogPolicyView::Unavailable`], and I1.9 lines 48-49 then
     /// require denial rather than an unproven admission: the verifier produces
-    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`].
+    /// [`crate::KernelReconciliationKind::EffectCatalogPolicyStale`]. Only the
+    /// exact leased operation reaches
+    /// [`crate::verify_exact_effect_replay`]; a stale or unavailable view never
+    /// opens a general effect service.
     /// ASSUMPTION (issue #1885 A1): a Governor supersession that never
     /// re-admits this generation is unobservable at this seam — there is no live
     /// Module Catalog/Policy owner here. That residual is bounded by the lease
     /// expiry and the live Authority Epoch check, both still enforced below.
     ///
-    /// ORS has **no revocation-event readback and no delivery-state readback** at
-    /// this seam: there is no revocation-event table to read, and the loaded
-    /// manifest carries no delivery acknowledgement —
-    /// [`crate::KernelExecutionManifest`] holds only the schema version, the
-    /// Governor-issued admission, the execution projection and the manifest
-    /// digest. Neither current state may be taken from the lease that is under
-    /// test, because the lease's own recorded value would confirm itself.
-    /// `current.revocation` is therefore
-    /// [`crate::RevocationAcknowledgement::Unacknowledged`] — an outstanding
-    /// event whose acknowledgement this seam cannot observe — and
-    /// `current.delivery` is [`crate::EffectDeliveryAcknowledgement::GapOpen`]
-    /// — an unproven delivery outcome — rather than the fabricated "no event" and
-    /// "fully delivered" readings. This query therefore refuses **every** replay
-    /// while those readbacks are absent: the verifier denies with the first
-    /// unmet condition it reaches (`EffectCatalogPolicyStale`,
-    /// `EffectLeaseRevocationUnacknowledged` or `EffectDeliveryGapOpen`), and the
-    /// denial is escalated durably below. Only a real revocation-event and
-    /// delivery readback can lift it.
+    /// The current revocation and delivery state are now READ BACK from the
+    /// durable `EFFECT_REVOCATION_EVENTS` and `EFFECT_DELIVERY_RECORDS` rows for
+    /// this exact lease identity, and the observed acknowledgements are what the
+    /// verifier receives. They are never taken from the lease that is under test,
+    /// because the lease's own recorded value would confirm itself. The three
+    /// revocation values are three different facts and are handed over as three
+    /// different facts: no revocation-event row recorded for the lease means no
+    /// revocation EVENT exists at all, so `current.revocation` is
+    /// [`crate::RevocationAcknowledgement::None`]; a recorded
+    /// [`crate::RevocationAcknowledgement::Unacknowledged`] event is outstanding
+    /// and unproven and the verifier denies it with
+    /// [`crate::KernelReconciliationKind::EffectLeaseRevocationUnacknowledged`];
+    /// and a recorded [`crate::RevocationAcknowledgement::Acknowledged`] event is
+    /// a DISCHARGED revocation — the event was delivered and acknowledged, and
+    /// the authority it revoked stays revoked — so the verifier denies it with
+    /// [`crate::KernelReconciliationKind::EffectLeaseRevoked`]. No value is
+    /// fabricated and no observation is defaulted: each is exactly what the
+    /// durable rows state, and only a real recorded row can produce anything but
+    /// `None`.
+    ///
+    /// The delivery side is read as an OBSERVATION that may be absent, which is
+    /// the sibling fact `RevocationEventRecord` already is. `Self::
+    /// observed_lease_acknowledgements` returns `None` when no
+    /// `EFFECT_DELIVERY_RECORDS` row is recorded for this exact lease identity,
+    /// and `None` is the honest absence of an observation: it is not an
+    /// [`crate::EffectDeliveryAcknowledgement::GapOpen`], because no row states
+    /// that a gap is open, and it is certainly not
+    /// [`crate::EffectDeliveryAcknowledgement::Acknowledged`], because an
+    /// unobserved delivery is not a delivered one. The replay of an exact
+    /// operation therefore REFUSES here — an unobserved delivery is not a
+    /// delivered one, so no bounded replay authority is granted on its strength —
+    /// with the attempt escalated through
+    /// [`Self::persist_effect_replay_reconciliation`] first, so the refusal is
+    /// preserved evidence rather than a bare field error. A recorded row is
+    /// reported exactly as it records itself and hands the canonical verifier the
+    /// real value: `GapOpen` is refused there as
+    /// [`crate::KernelReconciliationKind::EffectDeliveryGapOpen`], and
+    /// `Acknowledged` is not refused at all. Which of the two durable facts an
+    /// auditor sees — no row at all, or a row stating a gap — is preserved by the
+    /// table itself, because a refused replay never writes one.
+    ///
+    /// The generation lifecycle readback is consulted too: a generation ORS has
+    /// already recorded as `Degraded` or `Quarantined` cannot have an existing
+    /// leased operation replayed, because a manifest refusal degraded it and the
+    /// lease's authority survives only while its generation is undegraded. The
+    /// refusal is the existing typed
+    /// [`OrsError::EffectOperationLeaseGenerationDegraded`], carrying the affected
+    /// module, generation and recorded disposition. "Undegraded" there is the
+    /// COMPOSED OBSERVATION of [`Self::load_observed_generation_lifecycle`], which
+    /// answers from a recorded lifecycle row for this exact key or, when none is
+    /// recorded, from an intact admitted manifest for the same key; a generation
+    /// that recorded no degradation at all is therefore not refused for that
+    /// absence alone when its admitted manifest is recorded and intact.
     ///
     /// A replay is denied whenever no lease covers the operation, the recorded
     /// manifest is missing or receipt-less, the lease is not active or is
-    /// expired, any recorded binding disagrees with the caller's identity, or the
-    /// current revocation or delivery state cannot be established here.
-    /// Every denied, expired or unknown replay is escalated durably through
+    /// expired, any recorded binding disagrees with the caller's identity, the
+    /// generation is not undegraded, or the current revocation or delivery state
+    /// cannot be established here. The lease's own expiry, active flag, recorded
+    /// manifest digest, generation and Authority Epoch are all still checked, by
+    /// the same canonical verifier as before, with the observed revocation and
+    /// delivery state substituted for the two former literals. Every denied,
+    /// expired or unknown replay is escalated durably through
     /// [`Self::persist_effect_replay_reconciliation`] before this returns, so a
-    /// denied attempt is never discarded (W5). Only
+    /// denied attempt is never discarded (W5), and a generation-lifecycle refusal
+    /// is escalated through that same writer before it is returned, because that
+    /// refusal is raised before the decision exists and would otherwise carry no
+    /// evidence at all. Only
     /// `decision.authority.authorized_lease()` carries effect authority; the
     /// shadow decision carries none and can produce no external effect or
     /// canonical write admission.
@@ -27697,15 +28132,117 @@ impl RedbRecoveryStore {
             }
             return Ok(decision);
         };
+        // I1.9 (AUD5): a generation ORS already recorded as degraded or
+        // quarantined for a manifest refusal cannot have an existing leased
+        // operation replayed either. The OBSERVED lifecycle is consulted before
+        // the request is built, so a degraded generation is refused with the
+        // existing typed disposition rather than admitted because its lease
+        // happens to still be unexpired, and a generation that has never
+        // degraded keeps composing from its recorded admitted manifest rather
+        // than being refused for the mere absence of a degradation record.
+        //
+        // #1884 AUD5: the decision does not exist yet on this path, so the
+        // lifecycle refusal is made durable BEFORE it is returned rather than
+        // through `?`. Raising it alone was the defect on this path: this one
+        // cause refused the replay and dropped the evidence for the refusal while
+        // every other cause below appended a row, so a generation that degraded
+        // had no recorded attempt behind it. The gate itself is unchanged — the
+        // very error `require_undegraded_generation` produced is returned by the
+        // `?` below, and the gate is never skipped or reordered.
+        let lifecycle_admission = self.require_undegraded_generation(module_id, generation);
+        if let Err(refusal) = &lifecycle_admission {
+            self.persist_generation_lifecycle_replay_refusal(
+                refusal,
+                &lease,
+                &manifest,
+                replayed_operation_id,
+                observed_at_ms,
+            )?;
+        }
+        lifecycle_admission?;
+        // #1884 W4: the current revocation and delivery state are read back from
+        // the durable rows for THIS lease identity, never from the lease under
+        // test. The delivery readback is an OBSERVATION and may be ABSENT, and
+        // absence is absence: `None` is not read as a recorded open gap and not
+        // read as an acknowledged delivery either. A replay of an exact operation
+        // is refused here when its delivery was never observed, because an
+        // unobserved delivery is not a delivered one, and the refusal is made
+        // durable BEFORE it is returned — through the same existing writer every
+        // other effect-replay refusal uses, and with the same
+        // `KernelReconciliationKind::EffectDeliveryGapOpen` escalation, because
+        // that is the one kind this domain already states for "the replayed
+        // effect's delivery is not proven" — so the refusal preserves evidence and
+        // degrades the affected generation exactly as it did before, instead of
+        // becoming an opaque field error with no record behind it.
+        let (revocation, delivery) = self.observed_lease_acknowledgements(&lease)?;
+        let Some(delivery) = delivery else {
+            self.persist_unobserved_effect_delivery_refusal(&lease, &manifest, observed_at_ms)?;
+            return Err(OrsError::InvalidField {
+                field: "effect_replay_delivery",
+                reason: "no delivery record is read back for this lease identity, so the replayed effect's delivery is unobserved and an unobserved delivery is not an acknowledged delivery",
+            });
+        };
+        // The OBSERVED lifecycle itself is what the pure verifier re-validates,
+        // so the composed observation is handed over as itself rather than
+        // restated as a record or as a bare disposition: nothing is invented for
+        // a generation that has none, and a degradation recorded after the gate
+        // above is the conservative direction, because the verifier refuses this
+        // newer observation.
+        let observation = self.load_observed_generation_lifecycle(module_id, generation)?;
+        let request = Self::effect_replay_request_for_lease(
+            &lease,
+            &manifest,
+            replayed_operation_id,
+            module_id,
+            generation,
+            current_authority_epoch,
+            revocation,
+            delivery,
+            observed_at_ms,
+        )?;
+        let decision =
+            crate::authorize_effect_replay(Some(&lease), Some(&manifest), &observation, &request)?;
+        if let Some(item) = decision.reconciliation.as_ref() {
+            self.persist_effect_replay_reconciliation(item)?;
+        }
+        Ok(decision)
+    }
+
+    /// Builds the one effect-replay request this gate verifies.
+    ///
+    /// The request side of every comparison is the caller's own observation or a
+    /// durable readback, never a copy of the lease's own field. `revocation` and
+    /// `delivery` are handed in as the values
+    /// [`Self::observed_lease_acknowledgements`] read back from the durable rows
+    /// for this exact lease identity, so the readback happens exactly once per
+    /// query, on the seam that decides what an absent row means — and this
+    /// builder has no absence case left to restate, because the caller has
+    /// already refused an absent delivery before it got here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one durable readback per coordinate, never restated"
+    )]
+    fn effect_replay_request_for_lease(
+        lease: &crate::EffectOperationLease,
+        manifest: &crate::KernelExecutionManifest,
+        replayed_operation_id: &OperationIdentity,
+        module_id: &str,
+        generation: u64,
+        current_authority_epoch: AuthorityEpoch,
+        revocation: crate::RevocationAcknowledgement,
+        delivery: crate::EffectDeliveryAcknowledgement,
+        observed_at_ms: i64,
+    ) -> Result<crate::EffectReplayRequest, OrsError> {
         // I1.9 currency is read from the durable Governor-issued rows, never
         // assumed. The recorded manifest's admitting revisions are the newest
         // Governor truth this seam holds, so the reported view is `Current`
-        // exactly when the intact recorded admission agrees with the lease's
-        // own admitting revisions and the recorded class waives a fresh view
-        // (`EffectExactLease` needs "no fresh Catalog view for the restart
-        // itself", I1.9). A receipt-less or changed admission, any revision
-        // drift, or a `CurrentCatalogRequired` class stays `Unavailable`, and
-        // the verifier then denies as `EffectCatalogPolicyStale`.
+        // exactly when the intact recorded admission agrees with the lease's own
+        // admitting revisions and the recorded class is `effect_exact_lease`.
+        // I1.9 lines 44-46 grant that class no general fresh-view waiver, so
+        // `Current` asserts exactly the revision agreement and nothing more. A
+        // receipt-less or changed admission, any revision drift, or a
+        // `CurrentCatalogRequired` class stays `Unavailable`, and the verifier
+        // then denies as `EffectCatalogPolicyStale`.
         let catalog_view = if manifest.has_governor_admission()
             && manifest.validate().is_ok()
             && manifest.restart_authorization_class()
@@ -27717,7 +28254,14 @@ impl RedbRecoveryStore {
         } else {
             crate::CatalogPolicyView::Unavailable
         };
-        let request = crate::EffectReplayRequest {
+        // #1884 AUD5/W4: `revocation` and `delivery` are the acknowledgements
+        // the durable rows for THIS lease identity record, read once by the
+        // caller above. An absent revocation row is the absence of a revocation
+        // EVENT and is reported as `None`; a recorded delivery row is reported
+        // exactly as it records itself. An absent delivery row never reaches this
+        // builder: the caller refused it before the request exists, so nothing
+        // here has to restate an absence as either value.
+        Ok(crate::EffectReplayRequest {
             // The operation actually being replayed, as the caller states it —
             // never a copy of the lease's own field, so
             // `EffectOperationIdentityMismatch` compares two independent
@@ -27750,39 +28294,377 @@ impl RedbRecoveryStore {
                 authority_epoch: current_authority_epoch,
                 // Admitting Catalog/Policy revisions of the loaded manifest — the
                 // exact revisions this lease was issued against, never defaulted.
-                // Both are non-zero on any row that loaded: the read path
-                // re-validates each row through `KernelExecutionManifest::validate`,
-                // which requires a non-zero Catalog revision, a non-zero Policy
-                // revision and a non-blank admission receipt, so a receipt-less
-                // row fails closed as corruption here rather than reaching this
-                // query as a usable manifest.
                 catalog_revision: manifest.admission.catalog_revision,
                 policy_revision: manifest.admission.policy_revision,
                 catalog_view,
-                // ORS has no revocation-event readback yet, so the current
-                // revocation state cannot be established at this seam. It is not
-                // reported as `None`: an event whose acknowledgement this seam
-                // cannot observe is an outstanding (`Unacknowledged`) event, the
-                // non-fabricated reading, so every replay is refused with
-                // `EffectLeaseRevocationUnacknowledged` until a revocation-event
-                // readback exists.
-                revocation: crate::RevocationAcknowledgement::Unacknowledged,
-                // The current delivery state is read from no independent row
-                // either: the recorded manifest carries no delivery
-                // acknowledgement, so `lease.delivery` is the lease's own
-                // recorded value and cannot stand in for the current state. The
-                // unverifiable outcome is reported as an open gap
-                // (`GapOpen`), the `EffectDeliveryGapOpen` refusal, rather than
-                // as a fully acknowledged delivery nobody observed.
-                delivery: crate::EffectDeliveryAcknowledgement::GapOpen,
+                revocation,
+                delivery,
             },
             observed_at_ms,
-        };
-        let decision = crate::authorize_effect_replay(Some(&lease), Some(&manifest), &request)?;
-        if let Some(item) = decision.reconciliation.as_ref() {
-            self.persist_effect_replay_reconciliation(item)?;
+        })
+    }
+
+    /// Reads the observed current revocation and delivery state of one lease.
+    ///
+    /// #1884 AUD5: the two acknowledgements come from the durable
+    /// `EFFECT_REVOCATION_EVENTS` and `EFFECT_DELIVERY_RECORDS` rows keyed by
+    /// this exact lease identity, so the current state is an observation read back
+    /// from ORS state rather than a literal a caller of the gate hardcoded.
+    ///
+    /// #1884 W4: the three `RevocationAcknowledgement` values are three different
+    /// facts and are reported as three different facts.
+    /// `RevocationEventRecord::validate` refuses a recorded
+    /// `RevocationAcknowledgement::None`, because a row here exists to record a
+    /// revocation EVENT and an absent event is the ABSENCE of a row, never a
+    /// value inside one. So an absent row is read here as
+    /// `RevocationAcknowledgement::None` — no revocation event is recorded for
+    /// this lease identity — and that is the only one of the three values I1.9
+    /// lines 48-49 does not block on, because what it blocks on is a revocation
+    /// event that is UNACKNOWLEDGED. A row that IS recorded is reported exactly as
+    /// it records itself and is never restated:
+    ///
+    /// * `Unacknowledged` — a revocation event EXISTS and nobody has acknowledged
+    ///   it, so the authority it affects is unusable until the event is delivered.
+    ///   That is NOT clear: both callers below refuse it, and on the replay path it
+    ///   is `KernelReconciliationKind::EffectLeaseRevocationUnacknowledged`.
+    /// * `Acknowledged` — a revocation event exists AND has been acknowledged.
+    ///   What ACKNOWLEDGES it is the delivery of the event to the authority it
+    ///   fenced; acknowledgement discharges the pending event, it does not cancel
+    ///   the revocation, restore the authority, or restore it by default. The
+    ///   operation lease the event revoked therefore stays revoked: it cannot be
+    ///   replayed (`KernelReconciliationKind::EffectLeaseRevoked`) and it cannot
+    ///   be issued again. "Acknowledged" must never be read as "no revocation ever
+    ///   happened" — collapsing the two loses the fact that a revocation was
+    ///   discharged, and reporting an ABSENT row as a recorded outstanding event
+    ///   loses the opposite fact, that none was recorded at all.
+    ///
+    /// The delivery side is the SAME absence case, reported the same honest way:
+    /// an absent `EFFECT_DELIVERY_RECORDS` row is the ABSENCE OF AN OBSERVATION of
+    /// this operation's delivery, and it is returned here as `None` — never as
+    /// `GapOpen`, because no row states that a gap is open, and never as
+    /// `Acknowledged`, because an unobserved delivery is not a delivered one. This
+    /// is why the return type is an `Option` here even though
+    /// [`crate::EffectDeliveryAcknowledgement`] itself has only two values: the
+    /// two values are two RECORDED states of a row, and this reader is allowed to
+    /// report that no row exists. Each caller decides what its own seam means,
+    /// which is the point, and BOTH callers refuse the absent row for the same
+    /// reason: an unobserved delivery is not a delivered one, so the replay gate
+    /// refuses to replay and the issuance gate refuses to grant. Neither caller
+    /// substitutes a value for the absence. A recorded row is reported exactly as
+    /// it records itself in both cases and is never restated.
+    fn observed_lease_acknowledgements(
+        &self,
+        lease: &crate::EffectOperationLease,
+    ) -> Result<
+        (
+            crate::RevocationAcknowledgement,
+            Option<crate::EffectDeliveryAcknowledgement>,
+        ),
+        OrsError,
+    > {
+        // Absence is absence: no durable revocation-event row for this exact lease
+        // identity is `None`, which is the reading `RevocationEventRecord::validate`
+        // makes unrepresentable INSIDE a row, and never a fabricated event.
+        let revocation = self
+            .load_revocation_event(&lease.lease_id)?
+            .map_or(crate::RevocationAcknowledgement::None, |event| {
+                event.acknowledgement
+            });
+        // The same absence, reported as absence: no durable delivery row for this
+        // exact lease identity is `None`, and `None` stays `None` all the way to
+        // each caller, which is what keeps an unobserved delivery from ever being
+        // reported as a recorded open gap.
+        let delivery = self
+            .load_effect_delivery_record(&lease.lease_id)?
+            .map(|record| record.acknowledgement);
+        Ok((revocation, delivery))
+    }
+
+    /// Makes one refusal whose delivery was never recorded durable (issue #1884;
+    /// I1.9 line 48).
+    ///
+    /// #1884 W4: the replay gate refuses such a replay before any
+    /// [`crate::EffectReplayDecision`] exists, because an unobserved delivery is
+    /// not an acknowledged one and there is no recorded delivery state to hand the
+    /// canonical verifier. Raising the typed error on its own would therefore
+    /// leave a refusal with no evidence at all, while every other cause of the
+    /// same gate appends one and degrades the affected generation. This is the
+    /// durable half of that refusal, and it appends through
+    /// [`Self::persist_effect_replay_reconciliation`], the one existing writer
+    /// that accepts a [`crate::KernelReconciliationItem`] naming both a lease
+    /// identity and an operation identity, so it opens no second insert site and
+    /// writes no new table. The issuance seam refuses the same absent observation
+    /// for the same reason and records it through THIS writer, so a refusal is
+    /// never raised on either seam with its evidence dropped.
+    ///
+    /// The kind is the one the domain already raises for exactly this decision,
+    /// never an invented third spelling:
+    /// [`crate::KernelReconciliationKind::EffectDeliveryGapOpen`] is what
+    /// [`crate::authorize_effect_replay`] returns for a delivery that is not
+    /// proven, and I1.9 lines 48-49 route both "not proven" cases to the same
+    /// shadow/no-effect escalation. What distinguishes this cause from a recorded
+    /// open gap is the durable state itself and is not lost by sharing the kind: a
+    /// replay refused here leaves NO `EFFECT_DELIVERY_RECORDS` row for the lease,
+    /// while a replay refused on a recorded `GapOpen` has one on disk. The
+    /// escalation item carries the same kind, so no second vocabulary is invented
+    /// for it here.
+    ///
+    /// The item is built from the lease's own recorded values and the digest of
+    /// the manifest row this query actually loaded, never from the lease's own
+    /// digest, so the escalation names the exact operation and the exact manifest
+    /// binding the lease was issued against.
+    fn persist_unobserved_effect_delivery_refusal(
+        &self,
+        lease: &crate::EffectOperationLease,
+        manifest: &crate::KernelExecutionManifest,
+        observed_at_ms: i64,
+    ) -> Result<(), OrsError> {
+        self.persist_effect_replay_reconciliation(&crate::KernelReconciliationItem {
+            kind: crate::KernelReconciliationKind::EffectDeliveryGapOpen,
+            module_id: lease.manifest_module_id.clone(),
+            generation: lease.manifest_generation,
+            bound_manifest_sha256: Some(lease.bound_manifest_sha256.clone()),
+            recorded_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+            lease_id: Some(lease.lease_id.clone()),
+            operation_id: Some(lease.operation_id.clone()),
+            observed_at_ms,
+        })
+    }
+
+    /// Answers what ORS OBSERVED about this generation's lifecycle, from two
+    /// durable facts (issue #1884; I1.9 lines 8, 24 and 52).
+    ///
+    /// The lifecycle table is a record of DEGRADATION, not a registry of the
+    /// generations that exist, so an absent `GENERATION_LIFECYCLES` row is not
+    /// "unknown" and is not by itself a refusal. This is the ONE place that reads
+    /// both facts and composes them, through
+    /// [`crate::ObservedGenerationLifecycle::compose`], and it returns the
+    /// OBSERVATION rather than a disposition: the disposition is read off the
+    /// observation with
+    /// [`crate::ObservedGenerationLifecycle::disposition`] and is never restated
+    /// in a second spelling here.
+    ///
+    /// * the first fact is a `GENERATION_LIFECYCLES` row for
+    ///   `{module_id}::{generation:020}` read back and validated on its own
+    ///   `validate()`, and the answer is
+    ///   [`crate::ObservedGenerationLifecycle::Recorded`] of exactly that row. This
+    ///   fact is read FIRST and it STANDS: a recorded `Degraded` or `Quarantined`
+    ///   row is never overridden by the manifest's presence, and a recorded
+    ///   degradation is never replaced by the `Undegraded` an intact manifest
+    ///   would compose to. That is why a recorded row whose manifest row is absent
+    ///   is returned here directly instead of as
+    ///   [`OrsError::EffectOperationLeaseGenerationUnrecorded`]: the weaker
+    ///   "never observed" refusal would report a generation ORS has recorded as
+    ///   degraded as one it holds no evidence about, which is a regression of an
+    ///   existing refusal kind and not a stricter one;
+    /// * the second fact, consulted only when the first is absent, is an intact
+    ///   `KERNEL_EXECUTION_MANIFESTS` row for the SAME key, and the answer is
+    ///   [`crate::ObservedGenerationLifecycle::AdmittedWithoutDegradation`] — the
+    ///   POSITIVE `Undegraded` answer two durable owner facts support. This is a
+    ///   readback and not a default: the manifest's recorded presence and its own
+    ///   successful [`crate::KernelExecutionManifest::validate`] are the evidence,
+    ///   and the composition runs that validation itself. A generation whose
+    ///   manifest row is absent, filed under a key that does not match its
+    ///   recorded identity, or fails that validation is NOT covered by it;
+    /// * with NEITHER fact the answer is the typed
+    ///   [`OrsError::EffectOperationLeaseGenerationUnrecorded`], because a
+    ///   generation ORS has never positively observed is not `Undegraded`. That
+    ///   refusal is reachable only when both facts are missing.
+    ///
+    /// Both facts are read even when the first one already answers, because the
+    /// composition needs the manifest to prove that a recorded row names this
+    /// exact `{module_id, generation}` and not another generation's.
+    ///
+    /// This is the I1.9 line 52 rule read across its two sides. "Missing, stale
+    /// or incompatible manifest means visible degradation and escalation, not an
+    /// improvised restart" is the refusal side — an absent or unusable manifest
+    /// never composes to `Undegraded`, so there is nothing to restart from — while
+    /// an intact admitted manifest is the positive side a restart within the
+    /// recorded class is allowed to come from.
+    ///
+    /// The composed `Undegraded` does NOT prove:
+    ///
+    /// * that a process is running for this generation;
+    /// * that its routes are live, drained or cut;
+    /// * that the generation is healthy — the health and readiness contract is
+    ///   the recorded manifest's, and it is observed elsewhere;
+    ///
+    /// and a recorded `Degraded` or `Quarantined` row is never overridden by the
+    /// manifest's presence, because the recorded degradation is read first and
+    /// stands.
+    ///
+    /// A caller that needs to know "is this degraded" reads
+    /// [`crate::ObservedGenerationLifecycle::disposition`] or
+    /// [`crate::ObservedGenerationLifecycle::admits_new_effect_leases`] on the
+    /// observation this returns. A caller that needs the recorded refusal cause,
+    /// or the honest absence of any degradation record, asks
+    /// [`Self::load_generation_lifecycle`], which keeps its `Option` meaning and
+    /// never invents a row; this method does not replace that reader and never
+    /// widens its absence into a recorded state.
+    ///
+    /// The observation is composed here and is never persisted: nothing in this
+    /// crate writes an observation into `GENERATION_LIFECYCLES`, and a caller
+    /// cannot recover one from bytes either, because
+    /// [`crate::ObservedGenerationLifecycle`] deliberately has no `Deserialize`.
+    pub fn load_observed_generation_lifecycle(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<crate::ObservedGenerationLifecycle, OrsError> {
+        let record = self.load_generation_lifecycle(module_id, generation)?;
+        // `load_kernel_execution_manifest` DECODES the row and checks that its
+        // recorded module and generation equal this key, so a row filed under the
+        // wrong key fails closed as corruption instead of counting as evidence.
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        match (record, manifest) {
+            // A recorded degradation STANDS without a manifest beside it, so this
+            // arm returns the validated row itself rather than composing and never
+            // reports the generation as one ORS has no observation of.
+            (Some(record), None) => Ok(crate::ObservedGenerationLifecycle::Recorded(record)),
+            (Some(record), Some(manifest)) => {
+                crate::ObservedGenerationLifecycle::compose(Some(record), &manifest)
+            }
+            (None, Some(manifest)) => crate::ObservedGenerationLifecycle::compose(None, &manifest),
+            (None, None) => Err(OrsError::EffectOperationLeaseGenerationUnrecorded {
+                module_id: module_id.to_owned(),
+                generation: eliot_contracts::ResourceGeneration::new(generation).map_err(
+                    |_error| OrsError::InvalidField {
+                        field: "generation_lifecycle_generation",
+                        reason: "must be greater than zero",
+                    },
+                )?,
+            }),
         }
-        Ok(decision)
+    }
+
+    /// Refuses unless the OBSERVED generation lifecycle admits a new effect
+    /// operation lease.
+    ///
+    /// #1884 AUD5: the observation is composed by
+    /// `load_observed_generation_lifecycle` from the recorded degradation (if any)
+    /// and the recorded admitted manifest (if any), and this method only turns
+    /// that composed answer into a refusal. A recorded `Degraded` or
+    /// `Quarantined` generation is
+    /// [`OrsError::EffectOperationLeaseGenerationDegraded`] with the observed
+    /// disposition named, and a generation ORS has positively observed for
+    /// neither fact keeps the composed
+    /// [`OrsError::EffectOperationLeaseGenerationUnrecorded`]. Both refusals fail
+    /// closed, so a generation ORS has no evidence about cannot receive or replay
+    /// an effect operation.
+    ///
+    /// The `disposition` payload is `format!("{:?}", ...)` of the observation's own
+    /// [`crate::ObservedGenerationLifecycle::disposition`], so it still reads
+    /// `Undegraded`, `Degraded` or `Quarantined` exactly as it did when this
+    /// method compared a composed disposition directly. The predicate is the
+    /// observation's own
+    /// [`crate::ObservedGenerationLifecycle::admits_new_effect_leases`], never a
+    /// comparison restated here, and the observation is never defaulted to
+    /// `Undegraded` on the strength of an absence: a generation holding neither
+    /// durable fact is refused by the composition before this method sees it.
+    ///
+    /// This method writes nothing and dispatches nothing. It is the gate the
+    /// effect replay and lease issuance paths both run before they build a
+    /// request or a lease, and refusing here is what blocks both.
+    fn require_undegraded_generation(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<(), OrsError> {
+        let observation = self.load_observed_generation_lifecycle(module_id, generation)?;
+        if observation.admits_new_effect_leases() {
+            return Ok(());
+        }
+        Err(OrsError::EffectOperationLeaseGenerationDegraded {
+            module_id: module_id.to_owned(),
+            generation: eliot_contracts::ResourceGeneration::new(generation).map_err(|_error| {
+                OrsError::InvalidField {
+                    field: "generation_lifecycle_generation",
+                    reason: "must be greater than zero",
+                }
+            })?,
+            disposition: format!("{:?}", observation.disposition()),
+        })
+    }
+
+    /// Makes one generation-lifecycle refusal of a replayed operation durable.
+    ///
+    /// #1884 AUD5: the replay gate runs its lifecycle gate BEFORE the decision
+    /// exists, so a refusal returned from there has no
+    /// [`crate::EffectReplayDecision`] to carry a reconciliation item, and
+    /// returning it on its own raised a lifecycle refusal whose evidence was then
+    /// dropped while every other cause on the same path appended a row. This
+    /// helper is the durable half of that refusal: it appends through
+    /// [`Self::persist_effect_replay_reconciliation`], the one existing writer of
+    /// `EFFECT_REPLAY_RECONCILIATIONS`, and opens no second insert site of its
+    /// own.
+    ///
+    /// The refusal is mapped onto the kind the domain already raises for exactly
+    /// this condition, never onto an invented third one:
+    /// [`OrsError::EffectOperationLeaseGenerationDegraded`] is
+    /// [`crate::KernelReconciliationKind::EffectGenerationDegraded`] and
+    /// [`OrsError::EffectOperationLeaseGenerationUnrecorded`] is
+    /// [`crate::KernelReconciliationKind::EffectGenerationLifecycleUnrecorded`].
+    /// Any other typed error appends nothing and is left for the caller to
+    /// propagate untouched: composing the observation can also fail on a
+    /// lifecycle row that does not satisfy its own `validate()` or names another
+    /// generation, and that is corruption for which the domain states no cause,
+    /// so naming one here would fabricate it.
+    ///
+    /// The item names the real replayed `operation_id`, the real lease identity
+    /// and the real affected generation, and BOTH manifest digests are the digest
+    /// of the manifest row this query actually loaded — never a digest copied out
+    /// of the lease being refused. The affected `{module_id, generation}` is that
+    /// loaded manifest's own admitted pair, which
+    /// [`Self::load_kernel_execution_manifest`] has already proved equal to the
+    /// requested key, so the recorded identity cannot drift from the caller's own.
+    ///
+    /// What is durable on this path, in ONE write transaction: the refusal cause,
+    /// the replayed operation identity, the lease identity, the bound and recorded
+    /// manifest digests, the observation time, and the affected generation's
+    /// `GENERATION_LIFECYCLES` disposition with its first refusal cause — the
+    /// append happens first and `record_refusal_in_generation_lifecycle` runs after
+    /// it inside that same transaction, so the attempt history is never lost and
+    /// the lifecycle transition lands with the escalation exactly as it does for
+    /// every other effect-replay refusal. On this path the generation is normally
+    /// already recorded as degraded, so the transition keeps the disposition and
+    /// the first cause it already had and never runs backwards; an identical
+    /// refusal retried by a caller adds no second row.
+    ///
+    /// What is NOT durable, and is not claimed: no effect is dispatched, no route
+    /// is withdrawn, no lease is revoked, and no process is started or stopped.
+    /// This records the refusal; performing its consequences belongs to the
+    /// launching path, which consults the lifecycle row this transaction moved.
+    /// A store fault on the way surfaces as its own typed error instead of the
+    /// lifecycle refusal, which still admits nothing — the evidence is never
+    /// reported as saved when it was not.
+    fn persist_generation_lifecycle_replay_refusal(
+        &self,
+        refusal: &OrsError,
+        lease: &crate::EffectOperationLease,
+        manifest: &crate::KernelExecutionManifest,
+        replayed_operation_id: &OperationIdentity,
+        observed_at_ms: i64,
+    ) -> Result<(), OrsError> {
+        let kind = match refusal {
+            OrsError::EffectOperationLeaseGenerationDegraded { .. } => {
+                crate::KernelReconciliationKind::EffectGenerationDegraded
+            }
+            OrsError::EffectOperationLeaseGenerationUnrecorded { .. } => {
+                crate::KernelReconciliationKind::EffectGenerationLifecycleUnrecorded
+            }
+            _ => return Ok(()),
+        };
+        let item = crate::KernelReconciliationItem {
+            kind,
+            module_id: manifest.admission.module_id.clone(),
+            generation: manifest.admission.generation,
+            bound_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+            recorded_manifest_sha256: Some(manifest.manifest_sha256.clone()),
+            lease_id: Some(lease.lease_id.clone()),
+            operation_id: Some(replayed_operation_id.clone()),
+            observed_at_ms,
+        };
+        self.persist_effect_replay_reconciliation(&item)
     }
 
     /// Denies one replay that no effect operation lease covers, and makes the
@@ -27825,6 +28707,688 @@ impl RedbRecoveryStore {
             self.persist_effect_replay_reconciliation(item)?;
         }
         Ok(decision)
+    }
+
+    /// Loads the recorded lifecycle disposition of one generation (issue #1884;
+    /// I1.9 line 8, W1.5).
+    ///
+    /// This is the REAL lifecycle owner the restart and effect gates consult, not
+    /// a side table. Keyed by `{module_id}::{generation:020}` with the escaped
+    /// `module_id` component, and the stored record's module and generation are
+    /// checked against that key so a mismatched row fails closed as corruption.
+    ///
+    /// `Ok(None)` means ORS has recorded NO lifecycle for the generation, and
+    /// that is deliberately not reported as a disposition here: this reader
+    /// answers only "was a degradation recorded for this generation", never "is
+    /// this generation undegraded". Absence stays an absent readback and is never
+    /// turned into a row. A caller that needs an answer about this generation's
+    /// lifecycle composes the observation through
+    /// [`Self::load_observed_generation_lifecycle`], which is the one place that
+    /// reads this absence next to the recorded admitted manifest. This reader
+    /// never composes and never widens its own `Option` meaning.
+    pub fn load_generation_lifecycle(
+        &self,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<Option<crate::GenerationLifecycleRecord>, OrsError> {
+        crate::model::validate_text(module_id, "kernel_execution_manifest_module_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let lifecycles = read.open_table(GENERATION_LIFECYCLES).map_err(storage)?;
+        let key = generation_lifecycle_key(module_id, generation);
+        lifecycles
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::GenerationLifecycleRecord = decode(value.value())?;
+                if record.module_id != module_id || record.generation.value() != generation {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "generation_lifecycle",
+                        reason: "generation lifecycle key does not match the recorded identity"
+                            .to_owned(),
+                    });
+                }
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Persists one observed revocation event for one effect operation lease
+    /// (issue #1884; I1.9 line 48, AUD5).
+    ///
+    /// This is the only write path into `EFFECT_REVOCATION_EVENTS` and the
+    /// revocation-event readback the effect replay gate and the lease issuer
+    /// consult. It records an OBSERVED event; it never derives one from the lease
+    /// under test, and it accepts no acknowledgement on the record's behalf. An
+    /// observed event is a fact about a past observation, so the existing row is
+    /// read inside the write transaction that would replace it: a byte-identical
+    /// row is an exact replay that writes nothing, and any other content under
+    /// the same lease identity is refused with
+    /// [`OrsError::IntegrityProblem`] carrying `IDENTITY_CONFLICT` rather than
+    /// rewritten.
+    pub fn persist_revocation_event(
+        &self,
+        event: &crate::RevocationEventRecord,
+    ) -> Result<(), OrsError> {
+        event.validate()?;
+        let key = event.lease_id.as_str().to_owned();
+        let payload = encode(event)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let stored_payload = {
+            let events = write
+                .open_table(EFFECT_REVOCATION_EVENTS)
+                .map_err(storage)?;
+            events
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(stored_payload) = stored_payload {
+            let stored: crate::RevocationEventRecord = decode(stored_payload.as_str())?;
+            if stored.lease_id.as_str() != key.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_revocation_event",
+                    reason: "durable revocation event key does not match lease identity".to_owned(),
+                });
+            }
+            if stored_payload != payload {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_revocation_event",
+                    reason: format!(
+                        "IDENTITY_CONFLICT: durable revocation event for lease {} records acknowledgement {:?} and cannot be updated to {:?}",
+                        key, stored.acknowledgement, event.acknowledgement
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        {
+            let mut events = write
+                .open_table(EFFECT_REVOCATION_EVENTS)
+                .map_err(storage)?;
+            events
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Loads the observed revocation event for one lease (issue #1884; AUD5).
+    ///
+    /// Keyed by the lease identity, checked against the key on readback so a
+    /// mismatched row fails closed as corruption. `Ok(None)` means no revocation
+    /// event was ever recorded for the lease, which is an unobserved state and
+    /// not a proven absence of revocation.
+    pub fn load_revocation_event(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<crate::RevocationEventRecord>, OrsError> {
+        crate::model::validate_text(lease_id.as_str(), "effect_revocation_event_lease_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let events = read.open_table(EFFECT_REVOCATION_EVENTS).map_err(storage)?;
+        events
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let event: crate::RevocationEventRecord = decode(value.value())?;
+                if event.lease_id != *lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "effect_revocation_event",
+                        reason: "revocation event key does not match lease identity".to_owned(),
+                    });
+                }
+                event.validate()?;
+                Ok(event)
+            })
+            .transpose()
+    }
+
+    /// Persists one observed delivery acknowledgement for one effect operation
+    /// lease (issue #1884; I1.9 line 48, AUD5).
+    ///
+    /// This is the only write path into `EFFECT_DELIVERY_RECORDS` and the delivery
+    /// readback the effect replay gate consults. It records an OBSERVED
+    /// acknowledgement and never derives one from the lease under test.
+    ///
+    /// # No production writer on this branch
+    ///
+    /// This method has NO production writer on this branch. Nothing outside this
+    /// crate's own tests calls it, and no call chain in the Kernel records a row
+    /// for a dispatched effect. I1.9 line 48 names "delivery gap open" as a
+    /// refusal state and the mutable-state ownership matrix (I1.9 line 86) names
+    /// delivery cursors as a Kernel/ORS-owned fact, but neither states WHO writes
+    /// the row or on what observation, so no writer is invented here: the owning
+    /// contract is issue #1885 ("[I1-audit] Gate effect-capable restart on exact
+    /// unexpired operation leases"), which introduces the operation-lease record
+    /// bound to the exact operation identity and effect receipt together with its
+    /// revocation and delivery acknowledgement state.
+    ///
+    /// The consequence is deliberate and is the whole reason this row exists
+    /// un-written: every reader below treats an ABSENT row as the absence of an
+    /// observation, so an unobserved delivery is never reported as a delivered
+    /// one. The replay seam
+    /// ([`Self::authorize_effect_replay_for_operation`]) refuses such a replay and
+    /// makes the refusal durable, and the issuance seam
+    /// ([`Self::issue_effect_operation_lease_for_operation`]) refuses to grant a
+    /// lease on one, because an unproven delivery is not an acknowledged delivery.
+    /// Both are fail-closed, and neither defaults the value.
+    ///
+    /// The existing row is read inside the write transaction that would replace
+    /// it: a byte-identical row is an exact replay that writes nothing, and any
+    /// other content under the same lease identity is refused with
+    /// [`OrsError::IntegrityProblem`] carrying `IDENTITY_CONFLICT` rather than
+    /// rewritten.
+    pub fn persist_effect_delivery_record(
+        &self,
+        record: &crate::EffectDeliveryRecord,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        let key = record.lease_id.as_str().to_owned();
+        let payload = encode(record)?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let stored_payload = {
+            let records = write.open_table(EFFECT_DELIVERY_RECORDS).map_err(storage)?;
+            records
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(stored_payload) = stored_payload {
+            let stored: crate::EffectDeliveryRecord = decode(stored_payload.as_str())?;
+            if stored.lease_id.as_str() != key.as_str() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_delivery_record",
+                    reason: "durable delivery record key does not match lease identity".to_owned(),
+                });
+            }
+            if stored_payload != payload {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "effect_delivery_record",
+                    reason: format!(
+                        "IDENTITY_CONFLICT: durable delivery record for lease {} records acknowledgement {:?} and cannot be updated to {:?}",
+                        key, stored.acknowledgement, record.acknowledgement
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        {
+            let mut records = write.open_table(EFFECT_DELIVERY_RECORDS).map_err(storage)?;
+            records
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)
+    }
+
+    /// Loads the observed delivery acknowledgement for one lease (issue #1884;
+    /// AUD5).
+    ///
+    /// Keyed by the lease identity, checked against the key on readback so a
+    /// mismatched row fails closed as corruption. `Ok(None)` means the delivery
+    /// outcome was never recorded, which is an unproven outcome and not an
+    /// acknowledged delivery. No production writer records this row on this branch
+    /// (see [`Self::persist_effect_delivery_record`]), so in production this
+    /// reader observes absence; a recorded row exists only where a writer such as
+    /// a test writes one through this same public API.
+    pub fn load_effect_delivery_record(
+        &self,
+        lease_id: &OperationIdentity,
+    ) -> Result<Option<crate::EffectDeliveryRecord>, OrsError> {
+        crate::model::validate_text(lease_id.as_str(), "effect_delivery_record_lease_id")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let records = read.open_table(EFFECT_DELIVERY_RECORDS).map_err(storage)?;
+        records
+            .get(lease_id.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: crate::EffectDeliveryRecord = decode(value.value())?;
+                if record.lease_id != *lease_id {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "effect_delivery_record",
+                        reason: "delivery record key does not match lease identity".to_owned(),
+                    });
+                }
+                record.validate()?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Issues the effect operation lease for one already-authorized exact
+    /// operation (issue #1884; I1.9 lines 44-46, AUD4).
+    ///
+    /// This is the production issuer the Kernel effect path was missing. The
+    /// issuer supplies the lease's own bindings; every gate below reads the
+    /// disposition, the manifest, the current revocation and delivery state, and
+    /// the recorded restart budget from DURABLE state rather than from the
+    /// caller, so no caller can present a lease for a generation ORS has
+    /// degraded. Before it issues anything it requires:
+    ///
+    /// * **the observed generation lifecycle admits a new effect operation
+    ///   lease.** A recorded `Degraded` or `Quarantined` generation is
+    ///   [`OrsError::EffectOperationLeaseGenerationDegraded`], and a generation
+    ///   ORS has positively observed for neither a recorded degradation nor an
+    ///   intact admitted manifest is
+    ///   [`OrsError::EffectOperationLeaseGenerationUnrecorded`]. Absence of a
+    ///   degradation record alone is not a refusal: see
+    ///   [`Self::load_observed_generation_lifecycle`]. A generation a manifest
+    ///   refusal already degraded gets no new operation lease, which is what
+    ///   makes "block new leases" a real lifecycle transition rather than a
+    ///   side-table note;
+    /// * **the manifest is recorded and validates** for the lease's own
+    ///   module/generation, so a lease can never be issued against an absent or
+    ///   malformed manifest;
+    /// * **the operation identity and effect receipt are present**, validated as
+    ///   the lease's own text and digest before any write;
+    /// * **the recorded revocation event readback states the current revocation
+    ///   state** for this exact lease identity. An absent revocation-event row is
+    ///   the absence of a revocation EVENT, which is the state issuance needs; a
+    ///   recorded `Unacknowledged` event is an outstanding event and refuses, and
+    ///   a recorded `Acknowledged` event is a DISCHARGED revocation whose fenced
+    ///   lease stays fenced and refuses as well;
+    /// * **the recorded delivery readback for this exact lease identity is an
+    ///   ACKNOWLEDGED observation**, read through
+    ///   [`Self::observed_lease_acknowledgements`] — the same per-lease delivery
+    ///   observation, at the same scope, that
+    ///   [`Self::authorize_effect_replay_for_operation`] reads for the replay. A
+    ///   recorded `GapOpen` refuses, and so does an ABSENT row: absence is the
+    ///   absence of an observation, and an unobserved delivery is not an
+    ///   acknowledged delivery, so it is not restated as a recorded gap here or
+    ///   anywhere. It is also never widened into a generation-level aggregation
+    ///   across every row of the affected generation, which is a different fact
+    ///   than the one I1.9 states for this seam and one that would be a validator
+    ///   around nothing. The absence refusal is made durable through
+    ///   [`Self::persist_unobserved_effect_delivery_refusal`], the same writer the
+    ///   replay seam uses, so it is never raised with its evidence dropped.
+    /// * **the recorded restart escalations have not reached the recorded
+    ///   ceiling**: the number of restart escalations ORS has recorded for this
+    ///   generation is compared against the manifest's recorded
+    ///   `restart_budget.max_restarts`, and a generation that has reached that
+    ///   ceiling issues no lease. This is a count of recorded refusals, not a
+    ///   measurement of restart spend, and on this path it is also only ever read
+    ///   for a count of zero; `require_restart_budget_room` says exactly that and
+    ///   names where a real restart-spend ledger has to be inserted instead.
+    ///
+    /// The lease itself is built by [`crate::EffectOperationLease::issue`], which
+    /// copies the manifest identity, generation and digest from the recorded
+    /// manifest and re-runs its own `validate()`. The observed generation
+    /// lifecycle, revocation and delivery values handed to it are the ones read
+    /// here, so a caller cannot declare a generation fresh.
+    ///
+    /// # Durable refusals
+    ///
+    /// Every refusal this method raises leaves durable evidence before it is
+    /// returned, through the existing reconciliation writers and no new table and
+    /// no new insert site. The lifecycle refusal is raised before any decision
+    /// exists, so it is made durable by `persist_lease_issuance_lifecycle_refusal`
+    /// immediately before the very error `require_undegraded_generation` produced
+    /// is returned — the gate is neither skipped nor reordered, only preceded by
+    /// its own evidence. The absent-delivery refusal is raised on the same
+    /// footing — before any lease exists — so it is made durable by
+    /// [`Self::persist_unobserved_effect_delivery_refusal`], the one existing
+    /// writer the replay seam already uses for the identical cause, immediately
+    /// before it is returned. The recorded restart-budget refusal below is a count
+    /// comparison over durable rows, not an observation of a new external fact, so
+    /// it appends nothing new: every row it could count was already written with
+    /// its own escalation and lifecycle transition. The revocation, recorded
+    /// delivery-gap, manifest and identity refusals are refusals about facts that
+    /// are already durable ORS state, and a generation they refuse is already
+    /// recorded degraded by whichever writer recorded the cause; this method
+    /// states no new disposition and invents no cause for them.
+    ///
+    /// # Live status
+    ///
+    /// The lease check and the actual effect dispatcher ARE one production call
+    /// chain: the `Acquired` arm of `run_process_start`
+    /// (`bins/eliot-kernel/src/process_execution.rs`) calls
+    /// `ProcessExecutionGateway::require_new_effect_operation_authority`, which
+    /// calls `issue_new_effect_operation_lease`, which calls this method, and the
+    /// same `run_process_start` invocation then hands the start to the executor.
+    /// The sibling `Existing` arm of the same pipeline gates its resume with
+    /// [`Self::authorize_effect_replay_for_operation`], which reads the same
+    /// per-lease delivery observation this method reads.
+    ///
+    /// Issuance is nevertheless REFUSED in production on this branch, and that is
+    /// the honest state rather than a defect in the gate: the delivery
+    /// observation it requires has no producer. No production call chain records
+    /// an [`Self::persist_effect_delivery_record`] row, so the per-lease readback
+    /// is absent for every lease and this method refuses at the delivery
+    /// coordinate — a validator around the observation, not around a substituted
+    /// default. The effect-capable process start stays closed behind that
+    /// refusal, which is the fail-closed direction I1.9 line 48 requires. The
+    /// owning contract for the observation is issue #1885 ("[I1-audit] Gate
+    /// effect-capable restart on exact unexpired operation leases"), which
+    /// introduces the operation-lease record bound to the exact operation identity
+    /// and effect receipt together with its revocation and delivery
+    /// acknowledgement state. The gate below is not weakened to reach an
+    /// admission that observation has to justify.
+    pub fn issue_effect_operation_lease_for_operation(
+        &self,
+        lease: &crate::EffectOperationLease,
+    ) -> Result<crate::EffectOperationLease, OrsError> {
+        lease.validate()?;
+        let module_id = lease.manifest_module_id.as_str();
+        let generation = lease.manifest_generation.value();
+        // #1884 AUD4/AUD5: the observed lifecycle first. A recorded degraded or
+        // quarantined generation fails with the observed disposition named, and a
+        // generation ORS has positively observed for neither a recorded
+        // degradation nor an intact admitted manifest fails closed as
+        // `Unrecorded`.
+        // #1884 W4: this refusal is made durable BEFORE it is returned instead of
+        // through `?`, because on this path no decision and no lease exist yet to
+        // carry an escalation item, and every other cause of the same issuance
+        // already appends one. The gate itself is unchanged: the very error
+        // `require_undegraded_generation` produced is returned by the `?` below,
+        // and the gate is neither skipped nor reordered.
+        let lifecycle_admission = self.require_undegraded_generation(module_id, generation);
+        if let Err(refusal) = &lifecycle_admission {
+            self.persist_lease_issuance_lifecycle_refusal(refusal, lease)?;
+        }
+        lifecycle_admission?;
+        // The same lifecycle is OBSERVED AGAIN for the sealed admission below,
+        // which now carries the composed observation itself rather than a record
+        // or a disposition this method restates: nothing is invented for a
+        // generation that has none, and a degradation recorded after the gate
+        // above is the conservative direction, because
+        // `EffectOperationLease::issue` revalidates this newer observation and
+        // refuses it.
+        let observation = self.load_observed_generation_lifecycle(module_id, generation)?;
+        let manifest = self.load_kernel_execution_manifest(module_id, generation)?;
+        let Some(manifest) = manifest else {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_manifest",
+                reason: "no recorded execution manifest is admitted for this lease's module and generation",
+            });
+        };
+        manifest.validate()?;
+        if manifest.manifest_sha256 != lease.bound_manifest_sha256 {
+            return Err(OrsError::EffectOperationLeaseManifestBindingMismatch {
+                field: "effect_operation_lease_bound_manifest_sha256",
+            });
+        }
+        // The recorded operation identity and effect receipt must be present
+        // before any write, so a lease with neither is refused here rather than
+        // persisted as a grant over nothing.
+        crate::model::validate_text(
+            lease.operation_id.as_str(),
+            "effect_operation_lease_operation_id",
+        )?;
+        crate::model::validate_digest(
+            lease.effect_receipt_sha256.as_str(),
+            "effect_operation_lease_effect_receipt_sha256",
+        )?;
+        self.require_restart_budget_room(&manifest, module_id, generation)?;
+        // #1884 AUD5/W4: the current revocation state must be stated by a real
+        // readback. A `None` revocation is the ABSENCE of a revocation event and is
+        // the state issuance requires; a recorded `Unacknowledged` event and a
+        // recorded `Acknowledged` — a DISCHARGED revocation, whose fenced lease
+        // stays fenced — are both refused here.
+        //
+        // The DELIVERY readback is the SAME per-lease observation the replay
+        // gate reads, at the same scope, and it is the condition I1.9 line 48
+        // states for this seam. An ABSENT row is the absence of an observation
+        // and is refused, exactly as it is at the replay seam: it is not
+        // restated as a recorded open gap, it is not substituted with a
+        // default, and it is not widened into a generation-level aggregation
+        // over every row this method would otherwise have to scan. Because no
+        // production writer records such a row on this branch, the absence is
+        // the only outcome reachable in production and issuance is therefore
+        // refused here — which is the fail-closed direction, not a gap in the
+        // gate. The refusal is made durable BEFORE it is returned, through the
+        // same writer the replay seam uses for the same cause, so it is never
+        // raised with its evidence dropped. Issue #1885 owns the missing
+        // observation contract.
+        let (revocation, delivery) = self.observed_lease_acknowledgements(lease)?;
+        if revocation != crate::RevocationAcknowledgement::None {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_revocation",
+                reason: "no revocation event may be outstanding or acknowledged for the affected generation at issuance",
+            });
+        }
+        let Some(delivery) = delivery else {
+            self.persist_unobserved_effect_delivery_refusal(lease, &manifest, lease.issued_at_ms)?;
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_delivery",
+                reason: "no delivery record is read back for this lease identity, so the leased effect's delivery is unobserved and an unobserved delivery is not an acknowledged delivery",
+            });
+        };
+        if delivery != crate::EffectDeliveryAcknowledgement::Acknowledged {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_delivery",
+                reason: "a recorded delivery gap may not be open for this lease identity at issuance",
+            });
+        }
+        let issued = crate::EffectOperationLease::issue(
+            &manifest,
+            crate::EffectOperationLeaseAdmission {
+                lease_id: lease.lease_id.clone(),
+                operation_id: lease.operation_id.clone(),
+                effect_receipt_sha256: lease.effect_receipt_sha256.clone(),
+                allowed_scope: lease.allowed_scope.clone(),
+                authority_epoch: lease.authority_epoch,
+                catalog_revision: lease.catalog_revision,
+                policy_revision: lease.policy_revision,
+                revocation,
+                delivery,
+                generation_lifecycle: observation,
+                issued_at_ms: lease.issued_at_ms,
+                expires_at_ms: lease.expires_at_ms,
+            },
+        )?;
+        self.persist_effect_operation_lease(&issued)?;
+        Ok(issued)
+    }
+
+    /// Makes one generation-lifecycle refusal of a lease ISSUANCE durable
+    /// (issue #1884; I1.9, AUD5).
+    ///
+    /// This path raises its lifecycle refusal before any
+    /// [`crate::EffectReplayDecision`] and before any lease exists, so returning
+    /// it on its own left a refusal with NO evidence at all, while every other
+    /// cause of the same issuance persisted one. This is the durable half of that
+    /// refusal, and it appends through
+    /// [`Self::persist_effect_replay_reconciliation`], the one existing writer
+    /// that accepts a `KernelReconciliationItem` naming both a lease identity and
+    /// an operation identity, so it opens no second insert site of its own and
+    /// writes no new table.
+    ///
+    /// The manifest-side restart family is NOT the home for this item and cannot
+    /// be: its own writer refuses any item carrying a lease or operation
+    /// identity, because a restart escalation is not an effect attempt, and its
+    /// key shape `{module_id}::{generation:020}::{attempt:020}` carries no
+    /// operation component at all, so two issuances refused for two DIFFERENT
+    /// operations of one generation would land in the same series and the second
+    /// would be indistinguishable from a second observation of the first. An
+    /// issuance refusal is per-operation, so its attempt history is recorded per
+    /// operation, which is the same decision the replay path already made for
+    /// the identical refusal.
+    ///
+    /// The kind is the one the domain already raises for exactly this condition,
+    /// never an invented third spelling:
+    /// [`OrsError::EffectOperationLeaseGenerationDegraded`] is
+    /// [`crate::KernelReconciliationKind::EffectGenerationDegraded`] and
+    /// [`OrsError::EffectOperationLeaseGenerationUnrecorded`] is
+    /// [`crate::KernelReconciliationKind::EffectGenerationLifecycleUnrecorded`].
+    /// Any other typed error appends nothing and is left for the caller to
+    /// propagate untouched: composing the observation can also fail on a
+    /// lifecycle row that does not satisfy its own `validate()` or names another
+    /// generation, and the domain states no cause for that, so naming one here
+    /// would fabricate it.
+    ///
+    /// The affected `{module_id, generation}` and BOTH manifest digests come from
+    /// the `KERNEL_EXECUTION_MANIFESTS` row this readback loaded for that key,
+    /// never from the lease under test — the rule the replay path's equivalent
+    /// helper already applies — and `load_kernel_execution_manifest` has proved
+    /// that row's own admitted pair equals the key, so the recorded identity
+    /// cannot drift from the one the gate refused. When no such row is recorded,
+    /// the refusal can only be `EffectGenerationLifecycleUnrecorded`, because that
+    /// is the composition's answer when ORS holds neither a recorded lifecycle
+    /// row nor an intact admitted manifest; the item then names the
+    /// `{module_id, generation}` this issuance was refused for, with the lease's
+    /// own claimed bound digest and no recorded manifest digest, because there is
+    /// no recorded manifest to name and no second identity to invent.
+    ///
+    /// The operation identity and the lease identity are the real ones in both
+    /// cases: `lease.validate()` has already run at the top of the issuing method,
+    /// so both are validated non-blank identities of the exact operation this
+    /// issuance is for, and neither is fabricated, defaulted or omitted. The
+    /// observation time is `lease.issued_at_ms`, the clock this issuance attempt
+    /// itself states; no other clock is available here and none is read.
+    ///
+    /// What this makes durable, in ONE write transaction: the refusal cause, the
+    /// exact operation identity, the lease identity, the manifest digests and the
+    /// affected generation's `GENERATION_LIFECYCLES` disposition with its first
+    /// refusal cause, because that writer runs the escalation append and the
+    /// lifecycle transition in the same transaction. An `Unrecorded` generation
+    /// therefore becomes visibly degraded rather than staying unobservable, which
+    /// is the point of recording the refusal at all. A same-cause retried issuance
+    /// adds no second row, and a later different cause appends beside the earlier
+    /// one instead of erasing it.
+    ///
+    /// What is NOT durable and is not claimed: no effect is dispatched, no route
+    /// is withdrawn, no lease is revoked, and no process is started or stopped.
+    /// A store fault on the way surfaces as its own typed error instead of the
+    /// lifecycle refusal, which still admits nothing — the evidence is never
+    /// reported as saved when it was not.
+    fn persist_lease_issuance_lifecycle_refusal(
+        &self,
+        refusal: &OrsError,
+        lease: &crate::EffectOperationLease,
+    ) -> Result<(), OrsError> {
+        let kind = match refusal {
+            OrsError::EffectOperationLeaseGenerationDegraded { .. } => {
+                crate::KernelReconciliationKind::EffectGenerationDegraded
+            }
+            OrsError::EffectOperationLeaseGenerationUnrecorded { .. } => {
+                crate::KernelReconciliationKind::EffectGenerationLifecycleUnrecorded
+            }
+            _ => return Ok(()),
+        };
+        let module_id = lease.manifest_module_id.as_str();
+        let generation = lease.manifest_generation;
+        // The affected identity starts as the `{module_id, generation}` this
+        // issuance was refused for, and a recorded manifest row replaces it with
+        // that row's own admitted pair and digest. Neither branch invents a
+        // digest: with no row there is no recorded manifest digest to name.
+        let mut item = crate::KernelReconciliationItem {
+            kind,
+            module_id: module_id.to_owned(),
+            generation,
+            bound_manifest_sha256: Some(lease.bound_manifest_sha256.clone()),
+            recorded_manifest_sha256: None,
+            lease_id: Some(lease.lease_id.clone()),
+            operation_id: Some(lease.operation_id.clone()),
+            observed_at_ms: lease.issued_at_ms,
+        };
+        if let Some(manifest) =
+            self.load_kernel_execution_manifest(module_id, generation.value())?
+        {
+            item.module_id = manifest.admission.module_id;
+            item.generation = manifest.admission.generation;
+            item.bound_manifest_sha256 = Some(manifest.manifest_sha256.clone());
+            item.recorded_manifest_sha256 = Some(manifest.manifest_sha256);
+        }
+        self.persist_effect_replay_reconciliation(&item)
+    }
+
+    /// Refuses issuance when the generation's recorded restart escalations have
+    /// reached its recorded restart ceiling.
+    ///
+    /// What is counted here is the number of durable restart escalations ORS has
+    /// RECORDED for this `{module_id, generation}` in
+    /// `KERNEL_RESTART_RECONCILIATIONS`, compared against the manifest's recorded
+    /// `restart_budget.max_restarts`. That count is compared against the recorded
+    /// ceiling; it is NOT the manifest's own restart-budget accounting and this
+    /// refusal does not claim it is. On this branch there is no durable
+    /// restart-spend counter anywhere: [`crate::ManifestRestartBudget`] carries
+    /// only the `max_restarts` ceiling, and the `restarts_spent` of a
+    /// [`crate::KernelExecutionRestartRequest`] is caller-supplied, so the store
+    /// cannot measure restart spend and does not report having measured it.
+    ///
+    /// # This comparison cannot fire on the issuance path as it is ordered
+    ///
+    /// It runs AFTER `require_undegraded_generation`, and that ordering is what
+    /// makes it unreachable here. Every row this count could read was appended by
+    /// [`Self::persist_kernel_restart_reconciliation`], which moves the affected
+    /// generation in the real `GENERATION_LIFECYCLES` owner in the SAME write
+    /// transaction, through `record_refusal_in_generation_lifecycle`. So a
+    /// generation that has any recorded restart refusal is already recorded
+    /// `Degraded` or `Quarantined`, and that recorded disposition is exactly what
+    /// the lifecycle gate refuses. On this path the count is therefore only ever
+    /// reached for a generation with NO recorded refusal — that is, only when the
+    /// count is zero — and the comparison below is never reached with a non-zero
+    /// left-hand side.
+    ///
+    /// Stated exactly, because the seam matters: this
+    /// `recorded_escalations >= recorded_ceiling` comparison CANNOT be the restart
+    /// budget's enforcement point, and a real budget ledger cannot simply be
+    /// dropped in HERE to make it one. A durable per-generation restart-spend
+    /// counter has to be read BEFORE the lifecycle gate on the issuance path — a
+    /// reader of that counter placed ahead of `require_undegraded_generation` —
+    /// because a ledger read after that gate is subject to this same
+    /// unreachability. Until such a counter exists, the store cannot measure
+    /// restart spend and does not report having measured it.
+    ///
+    /// The recorded ceiling IS enforced today, but on the restart path and by the
+    /// pure verifier, as
+    /// [`crate::KernelReconciliationKind::ManifestRestartBudgetExhausted`] from a
+    /// genuinely spent caller-supplied `restarts_spent`. That is a DIFFERENT
+    /// refusal from this one and is not claimed here; this reason text
+    /// deliberately says "recorded refusals reached the recorded ceiling" rather
+    /// than "the restart budget is spent".
+    ///
+    /// The order is deliberately left as it is. Moving this check ahead of the
+    /// lifecycle gate would also require moving it ahead of the manifest load whose
+    /// recorded ceiling it reads, and it would replace
+    /// `OrsError::EffectOperationLeaseGenerationDegraded` with this field error
+    /// for every generation that is BOTH recorded degraded and at its ceiling, so
+    /// the lifecycle refusal that path raises today would no longer be the refusal
+    /// a caller sees. Nothing is weakened and nothing is invented: the gate stays,
+    /// the count stays the same count of the same recorded rows, and the fact that
+    /// this seam cannot enforce the budget is recorded here instead of being
+    /// papered over with a claim it cannot support.
+    ///
+    /// The appended series is counted under its own prefix and the pre-append
+    /// legacy key is counted explicitly, because a strict prefix sorts before its
+    /// extensions and the range can never return it. The count is therefore the
+    /// same set of rows `count_kernel_restart_reconciliations` reports and the
+    /// same set `load_kernel_restart_reconciliation` can read. When the count has
+    /// reached the recorded ceiling, no new effect operation lease is issued for
+    /// that generation.
+    fn require_restart_budget_room(
+        &self,
+        manifest: &crate::KernelExecutionManifest,
+        module_id: &str,
+        generation: u64,
+    ) -> Result<(), OrsError> {
+        let prefix = Self::kernel_restart_reconciliation_prefix(module_id, generation);
+        let read = self.database.begin_read().map_err(storage)?;
+        let escalations = read
+            .open_table(KERNEL_RESTART_RECONCILIATIONS)
+            .map_err(storage)?;
+        let mut recorded = 0_u64;
+        for row in escalations.range(prefix.as_str()..).map_err(storage)? {
+            let (key, _) = row.map_err(storage)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            recorded = recorded.saturating_add(1);
+        }
+        if escalations
+            .get(Self::legacy_kernel_restart_reconciliation_key(module_id, generation).as_str())
+            .map_err(storage)?
+            .is_some()
+        {
+            recorded = recorded.saturating_add(1);
+        }
+        if recorded >= u64::from(manifest.projection.restart_budget.max_restarts) {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_restart_budget",
+                reason: "the restart escalations ORS has recorded for this generation have reached the manifest's recorded restart ceiling; no restart spend was measured, and this is not the pure verifier's ManifestRestartBudgetExhausted",
+            });
+        }
+        Ok(())
     }
 
     /// Reads newest-first bounded committed history for one lease.
@@ -28415,6 +29979,26 @@ impl RedbRecoveryStore {
                 .open_table(KERNEL_RESTART_RECONCILIATIONS)
                 .map_err(storage)?,
         );
+        // #1884 (W1.1, W1.5, AUD5): the canonical admission-receipt, generation
+        // lifecycle, revocation-event and delivery-readback families are part of
+        // the base family too, materialized empty on every open like every other
+        // base table, so a manifest ingress on a store that never admitted a
+        // generation reads authoritatively absent instead of failing on a
+        // missing table. No row is backfilled or inferred here, and in
+        // particular no generation is inferred to be undegraded from the
+        // absence of a lifecycle row.
+        drop(
+            write
+                .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(GENERATION_LIFECYCLES).map_err(storage)?);
+        drop(
+            write
+                .open_table(EFFECT_REVOCATION_EVENTS)
+                .map_err(storage)?,
+        );
+        drop(write.open_table(EFFECT_DELIVERY_RECORDS).map_err(storage)?);
         // #2571: the logical host-request index is part of the base family,
         // materialized empty on every open like every other base table, so a
         // lookup on a pre-index store reads authoritatively absent instead
@@ -32547,6 +34131,563 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)?;
         Self::grant_closure_projection_from_record(closure, Some(canonical_receipt.clone()))
     }
+}
+
+/// Whether this exact manifest-side restart refusal is already recorded.
+///
+/// #1884 W1.5/W4: the same-cause idempotence test, decided inside the write
+/// transaction that would append. Both key shapes of the one series are probed:
+/// the appended rows under `{module_id}::{generation:020}::` and, because a
+/// strict prefix sorts before its extensions and a `range` can never return it,
+/// the exact pre-append legacy key `{module_id}::{generation:020}`. The identity
+/// guard runs first, so a row filed under this key that does not belong to this
+/// generation fails closed as corruption rather than being treated as a match. An
+/// identical recorded cause returns `true` and the caller returns `Ok` without
+/// committing, so a retried refusal grows neither series. A DIFFERENT cause
+/// returns `false` and the caller takes the unchanged append path, so the earlier
+/// row survives beside the new observation. The observation clock stays
+/// first-write-wins: `observed_at_ms` is not part of the comparison, so a later
+/// stated observation time is not a new cause.
+fn restart_refusal_already_recorded(
+    write: &redb::WriteTransaction,
+    item: &crate::KernelReconciliationItem,
+) -> Result<bool, OrsError> {
+    let legacy = read_restart_reconciliation_at(
+        write,
+        &RedbRecoveryStore::legacy_kernel_restart_reconciliation_key(
+            item.module_id.as_str(),
+            item.generation.value(),
+        ),
+        item,
+    )?;
+    if restart_reconciliation_records_same_cause(legacy.as_ref(), item) {
+        return Ok(true);
+    }
+    let prefix = RedbRecoveryStore::kernel_restart_reconciliation_prefix(
+        item.module_id.as_str(),
+        item.generation.value(),
+    );
+    let escalations = write
+        .open_table(KERNEL_RESTART_RECONCILIATIONS)
+        .map_err(storage)?;
+    for row in escalations.range(prefix.as_str()..).map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        if !key.value().starts_with(prefix.as_str()) {
+            break;
+        }
+        let stored: crate::KernelReconciliationItem = decode(value.value())?;
+        check_restart_reconciliation_identity(&stored, item, false)?;
+        if restart_reconciliation_records_same_cause(Some(&stored), item) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The next free attempt ordinal in one generation's restart-escalation series.
+///
+/// Decided against durable state inside the caller's write transaction. The
+/// ordinal is write-only metadata that no reader parses, so the arithmetic is
+/// unchanged from the append discipline: the greatest ordinal already under the
+/// series prefix plus one, or zero when the series is empty. A pre-append legacy
+/// row is deliberately NOT counted here, because it is this series' attempt 0 and
+/// counting it would shift every later ordinal for no reader-visible reason.
+fn next_restart_reconciliation_attempt(
+    write: &redb::WriteTransaction,
+    item: &crate::KernelReconciliationItem,
+) -> Result<u64, OrsError> {
+    let prefix = RedbRecoveryStore::kernel_restart_reconciliation_prefix(
+        item.module_id.as_str(),
+        item.generation.value(),
+    );
+    let escalations = write
+        .open_table(KERNEL_RESTART_RECONCILIATIONS)
+        .map_err(storage)?;
+    let mut next = 0_u64;
+    for row in escalations.range(prefix.as_str()..).map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        if !key.value().starts_with(prefix.as_str()) {
+            break;
+        }
+        let stored: crate::KernelReconciliationItem = decode(value.value())?;
+        check_restart_reconciliation_identity(&stored, item, false)?;
+        if let Some(ordinal) = key
+            .value()
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.parse::<u64>().ok())
+        {
+            next = next.max(ordinal.saturating_add(1));
+        }
+    }
+    Ok(next)
+}
+
+/// Reads and identity-checks the restart escalation stored at one exact key.
+fn read_restart_reconciliation_at(
+    write: &redb::WriteTransaction,
+    key: &str,
+    item: &crate::KernelReconciliationItem,
+) -> Result<Option<crate::KernelReconciliationItem>, OrsError> {
+    let escalations = write
+        .open_table(KERNEL_RESTART_RECONCILIATIONS)
+        .map_err(storage)?;
+    escalations
+        .get(key)
+        .map_err(storage)?
+        .map(|value| {
+            let stored: crate::KernelReconciliationItem = decode(value.value())?;
+            check_restart_reconciliation_identity(&stored, item, true)?;
+            Ok(stored)
+        })
+        .transpose()
+}
+
+/// Refuses a restart escalation whose key does not belong to its own item.
+///
+/// The guard is the one the append discipline already applied, unchanged; only the
+/// reason text differs so a row found under the pre-append legacy key names that
+/// key shape. A restart escalation names no operation identity, so the module and
+/// generation are the whole of its identity here.
+fn check_restart_reconciliation_identity(
+    stored: &crate::KernelReconciliationItem,
+    item: &crate::KernelReconciliationItem,
+    legacy: bool,
+) -> Result<(), OrsError> {
+    if stored.module_id == item.module_id && stored.generation.value() == item.generation.value() {
+        return Ok(());
+    }
+    Err(OrsError::IntegrityProblem {
+        record_type: "kernel_restart_reconciliation",
+        reason: if legacy {
+            "legacy restart reconciliation key does not match the recorded identity"
+        } else {
+            "restart reconciliation key does not match the recorded identity"
+        }
+        .to_owned(),
+    })
+}
+
+/// Whether a recorded restart escalation is the identical cause of this refusal.
+///
+/// The identity and cause predicate the append discipline already used, unchanged:
+/// kind, module, generation, operation identity, lease identity, bound manifest
+/// digest and recorded manifest digest. `observed_at_ms` is deliberately excluded
+/// so the first recorded row keeps its own observation time and a retried refusal
+/// is not a new cause.
+fn restart_reconciliation_records_same_cause(
+    stored: Option<&crate::KernelReconciliationItem>,
+    item: &crate::KernelReconciliationItem,
+) -> bool {
+    stored.is_some_and(|stored| {
+        stored.kind == item.kind
+            && stored.module_id == item.module_id
+            && stored.generation.value() == item.generation.value()
+            && stored.operation_id == item.operation_id
+            && stored.lease_id == item.lease_id
+            && stored.bound_manifest_sha256 == item.bound_manifest_sha256
+            && stored.recorded_manifest_sha256 == item.recorded_manifest_sha256
+    })
+}
+
+/// Whether this exact effect-replay refusal is already recorded.
+///
+/// #1884 W1.5/W4: the same same-cause idempotence test as the manifest-side
+/// family, over the one operation-identity series. Both key shapes are probed:
+/// the appended rows under `{module_id}::{generation:020}::{operation_id}::` and,
+/// because a strict prefix sorts before its extensions, the exact pre-append
+/// legacy key `{module_id}::{generation:020}::{operation_id}`. The identity
+/// guard runs first on each. An identical recorded cause returns `true` and the
+/// caller returns `Ok` without committing; a DIFFERENT cause returns `false` and
+/// the caller appends beside the earlier row, so a new observation never erases
+/// the previous cause.
+fn effect_replay_refusal_already_recorded(
+    write: &redb::WriteTransaction,
+    item: &crate::KernelReconciliationItem,
+    operation_id: &OperationIdentity,
+) -> Result<bool, OrsError> {
+    let legacy = read_effect_replay_reconciliation_at(
+        write,
+        &RedbRecoveryStore::legacy_effect_replay_reconciliation_key(
+            item.module_id.as_str(),
+            item.generation.value(),
+            operation_id.as_str(),
+        ),
+        item,
+        operation_id,
+    )?;
+    if effect_replay_reconciliation_records_same_cause(legacy.as_ref(), item, operation_id) {
+        return Ok(true);
+    }
+    let prefix = RedbRecoveryStore::effect_replay_reconciliation_prefix(
+        item.module_id.as_str(),
+        item.generation.value(),
+        operation_id.as_str(),
+    );
+    let intents = write
+        .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+        .map_err(storage)?;
+    for row in intents.range(prefix.as_str()..).map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        if !key.value().starts_with(prefix.as_str()) {
+            break;
+        }
+        let stored: crate::KernelReconciliationItem = decode(value.value())?;
+        check_effect_replay_reconciliation_identity(&stored, item, operation_id, false)?;
+        if effect_replay_reconciliation_records_same_cause(Some(&stored), item, operation_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The next free attempt ordinal in one operation-identity's refusal series.
+///
+/// The same unchanged ordinal arithmetic as the manifest-side family, decided
+/// against durable state inside the caller's write transaction: the greatest
+/// ordinal already under the series prefix plus one, or zero when the series is
+/// empty. A pre-append legacy row is not counted, because it is this series'
+/// attempt 0 and shifting later ordinals has no reader-visible effect.
+fn next_effect_replay_reconciliation_attempt(
+    write: &redb::WriteTransaction,
+    item: &crate::KernelReconciliationItem,
+    operation_id: &OperationIdentity,
+) -> Result<u64, OrsError> {
+    let prefix = RedbRecoveryStore::effect_replay_reconciliation_prefix(
+        item.module_id.as_str(),
+        item.generation.value(),
+        operation_id.as_str(),
+    );
+    let intents = write
+        .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+        .map_err(storage)?;
+    let mut next = 0_u64;
+    for row in intents.range(prefix.as_str()..).map_err(storage)? {
+        let (key, value) = row.map_err(storage)?;
+        if !key.value().starts_with(prefix.as_str()) {
+            break;
+        }
+        let stored: crate::KernelReconciliationItem = decode(value.value())?;
+        check_effect_replay_reconciliation_identity(&stored, item, operation_id, false)?;
+        if let Some(ordinal) = key
+            .value()
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.parse::<u64>().ok())
+        {
+            next = next.max(ordinal.saturating_add(1));
+        }
+    }
+    Ok(next)
+}
+
+/// Reads and identity-checks the effect-replay refusal stored at one exact key.
+fn read_effect_replay_reconciliation_at(
+    write: &redb::WriteTransaction,
+    key: &str,
+    item: &crate::KernelReconciliationItem,
+    operation_id: &OperationIdentity,
+) -> Result<Option<crate::KernelReconciliationItem>, OrsError> {
+    let intents = write
+        .open_table(EFFECT_REPLAY_RECONCILIATIONS)
+        .map_err(storage)?;
+    intents
+        .get(key)
+        .map_err(storage)?
+        .map(|value| {
+            let stored: crate::KernelReconciliationItem = decode(value.value())?;
+            check_effect_replay_reconciliation_identity(&stored, item, operation_id, true)?;
+            Ok(stored)
+        })
+        .transpose()
+}
+
+/// Refuses an effect-replay reconciliation whose key does not belong to its item.
+fn check_effect_replay_reconciliation_identity(
+    stored: &crate::KernelReconciliationItem,
+    item: &crate::KernelReconciliationItem,
+    operation_id: &OperationIdentity,
+    legacy: bool,
+) -> Result<(), OrsError> {
+    if stored.module_id == item.module_id
+        && stored.generation.value() == item.generation.value()
+        && stored.operation_id.as_ref() == Some(operation_id)
+    {
+        return Ok(());
+    }
+    Err(OrsError::IntegrityProblem {
+        record_type: "effect_replay_reconciliation",
+        reason: if legacy {
+            "legacy effect reconciliation key does not match the recorded identity"
+        } else {
+            "effect reconciliation key does not match the recorded identity"
+        }
+        .to_owned(),
+    })
+}
+
+/// Whether a recorded effect-replay refusal is the identical cause of this one.
+///
+/// The identity and cause predicate the append discipline already used, unchanged:
+/// kind, module, generation, operation identity, lease identity, bound manifest
+/// digest and recorded manifest digest, with `observed_at_ms` excluded so the
+/// first recorded row keeps its own observation time.
+fn effect_replay_reconciliation_records_same_cause(
+    stored: Option<&crate::KernelReconciliationItem>,
+    item: &crate::KernelReconciliationItem,
+    operation_id: &OperationIdentity,
+) -> bool {
+    stored.is_some_and(|stored| {
+        stored.kind == item.kind
+            && stored.module_id == item.module_id
+            && stored.generation.value() == item.generation.value()
+            && stored.operation_id.as_ref() == Some(operation_id)
+            && stored.lease_id == item.lease_id
+            && stored.bound_manifest_sha256 == item.bound_manifest_sha256
+            && stored.recorded_manifest_sha256 == item.recorded_manifest_sha256
+    })
+}
+
+/// Requires the canonical Governor admission receipt for this manifest's seal.
+///
+/// #1884 AUD1: the seal binds an admission; it does not prove who issued it. This
+/// reads the receipt the Governor accept path persisted for the seal's own
+/// operation identity and verifies it against the seal FIELD BY FIELD, so an
+/// invented non-blank receipt, a receipt for another generation, and a receipt
+/// whose identity matches but whose accepted manifest digest differs all refuse
+/// here. It runs inside the caller's write transaction and before any manifest
+/// mutation, so a refusal leaves ORS completely unmutated.
+fn verify_canonical_admission_receipt(
+    write: &redb::WriteTransaction,
+    manifest: &crate::KernelExecutionManifest,
+) -> Result<(), OrsError> {
+    let receipts = write
+        .open_table(GOVERNOR_ADMISSION_RECEIPTS)
+        .map_err(storage)?;
+    let operation_id = manifest.admission.governor_admission_seal.operation_id();
+    let Some(value) = receipts.get(operation_id.as_str()).map_err(storage)? else {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "governor_admission_receipt",
+            reason: format!(
+                "GovernorAdmissionSealAbsent: no canonical Governor admission receipt is recorded for operation {}",
+                operation_id.as_str()
+            ),
+        });
+    };
+    let receipt: crate::GovernorAdmissionReceipt = decode(value.value())?;
+    if receipt.operation_id.as_str() != operation_id.as_str() {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "governor_admission_receipt",
+            reason:
+                "canonical admission receipt key does not match the recorded operation identity"
+                    .to_owned(),
+        });
+    }
+    // The seal comparison is field by field and never a repair or a re-seal, so
+    // its own typed refusal carries the exact `KernelReconciliationKind` that
+    // disagrees and is carried through unchanged instead of being summarized
+    // here.
+    receipt.verify_seal(&manifest.admission.governor_admission_seal)
+}
+
+/// The key one generation's lifecycle row is stored under.
+///
+/// `{module_id}::{generation:020}` with `module_id` the escaped component
+/// `RedbRecoveryStore::encode_key_component` produces, so `::` is an unambiguous
+/// delimiter. This is the same identity key the execution manifest row uses, and
+/// it is used by the lifecycle reader, the refusal transition and the positive
+/// `Undegraded` write alike.
+fn generation_lifecycle_key(module_id: &str, generation: u64) -> String {
+    format!(
+        "{}::{:020}",
+        RedbRecoveryStore::encode_key_component(module_id),
+        generation
+    )
+}
+
+/// Records the positive `Undegraded` lifecycle row for one admitted generation.
+///
+/// This is the ONLY path that writes `Undegraded`, and its only caller is the
+/// successful first-persist branch of
+/// `RedbRecoveryStore::persist_admitted_kernel_execution_manifest`, inside that
+/// method's own write transaction. The honest reading of I1.9 is that a
+/// generation is undegraded only when its admitted manifest is recorded and
+/// intact, so a manifest row and its lifecycle row land together in one commit
+/// and absence is never reported as `Undegraded`.
+///
+/// An existing `Degraded` or `Quarantined` row is never overwritten here: this
+/// records a first persist, and a generation that already degraded for a refusal
+/// keeps the disposition and the first cause it recorded.
+fn write_undegraded_generation_lifecycle(
+    write: &redb::WriteTransaction,
+    module_id: &str,
+    generation: eliot_contracts::ResourceGeneration,
+) -> Result<(), OrsError> {
+    let key = generation_lifecycle_key(module_id, generation.value());
+    let mut lifecycles = write.open_table(GENERATION_LIFECYCLES).map_err(storage)?;
+    if let Some(value) = lifecycles.get(key.as_str()).map_err(storage)? {
+        let stored: crate::GenerationLifecycleRecord = decode(value.value())?;
+        if stored.module_id != module_id || stored.generation != generation {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "generation_lifecycle",
+                reason: "generation lifecycle key does not match the recorded identity".to_owned(),
+            });
+        }
+        return Ok(());
+    }
+    let record = crate::GenerationLifecycleRecord {
+        schema_version: crate::GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        module_id: module_id.to_owned(),
+        generation,
+        disposition: crate::GenerationDisposition::Undegraded,
+        first_refusal_cause: None,
+        recorded_at_ms: current_unix_ms()?,
+    };
+    record.validate()?;
+    let payload = encode(&record)?;
+    lifecycles
+        .insert(key.as_str(), payload.as_str())
+        .map_err(storage)?;
+    Ok(())
+}
+
+/// Applies one recorded refusal to the real generation lifecycle owner.
+///
+/// Both reconciliation writers call this inside the very write transaction that
+/// appended their escalation row, and they call it AFTER that append so the
+/// attempt history is never lost. It reads the affected generation's
+/// `GENERATION_LIFECYCLES` row and moves it with the typed transitions, so a
+/// manifest refusal changes the launch/route/lease-admission state the Kernel
+/// actually consults and not only a side table.
+///
+/// The transition never runs backwards: a row that is already `Degraded` or
+/// `Quarantined` is left exactly as recorded, and a generation with no row at all
+/// gets one whose disposition is set by these transitions. `first_refusal_cause`
+/// therefore records the FIRST cause a generation degraded for, and a later,
+/// different refusal never overwrites it.
+///
+/// The degradation is applied before the quarantine decision, because quarantine
+/// is the recorded manifest's own rule applied AFTER a refusal:
+/// `transition_to_quarantined` refuses to quarantine a generation that has not
+/// degraded, so a spent-budget refusal degrades and then quarantines in the same
+/// transaction rather than manufacturing a quarantine history.
+fn record_refusal_in_generation_lifecycle(
+    write: &redb::WriteTransaction,
+    module_id: &str,
+    generation: eliot_contracts::ResourceGeneration,
+    cause: crate::KernelReconciliationKind,
+    observed_at_ms: i64,
+) -> Result<(), OrsError> {
+    let key = generation_lifecycle_key(module_id, generation.value());
+    let recorded = {
+        let lifecycles = write.open_table(GENERATION_LIFECYCLES).map_err(storage)?;
+        match lifecycles.get(key.as_str()).map_err(storage)? {
+            Some(value) => {
+                let stored: crate::GenerationLifecycleRecord = decode(value.value())?;
+                if stored.module_id != module_id || stored.generation != generation {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "generation_lifecycle",
+                        reason: "generation lifecycle key does not match the recorded identity"
+                            .to_owned(),
+                    });
+                }
+                Some(stored)
+            }
+            None => None,
+        }
+    };
+    let mut record = recorded.unwrap_or_else(|| crate::GenerationLifecycleRecord {
+        schema_version: crate::GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        module_id: module_id.to_owned(),
+        generation,
+        disposition: crate::GenerationDisposition::Undegraded,
+        first_refusal_cause: None,
+        recorded_at_ms: observed_at_ms,
+    });
+    // Never downgrade and never overwrite the first cause: a row that is already
+    // `Degraded` or `Quarantined` is left exactly as recorded.
+    if !matches!(record.disposition, crate::GenerationDisposition::Undegraded) {
+        return Ok(());
+    }
+    // The degradation is recorded FIRST, because quarantine is the recorded
+    // manifest's own rule applied after a refusal and `transition_to_quarantined`
+    // refuses to quarantine a generation that has not degraded. The quarantine
+    // transition then keeps the cause recorded here as the first cause.
+    record.transition_to_degraded(cause, observed_at_ms);
+    if refusal_quarantines_generation(write, module_id, generation, cause)? {
+        record.transition_to_quarantined(cause, observed_at_ms);
+    }
+    record.validate()?;
+    let payload = encode(&record)?;
+    let mut lifecycles = write.open_table(GENERATION_LIFECYCLES).map_err(storage)?;
+    lifecycles
+        .insert(key.as_str(), payload.as_str())
+        .map_err(storage)?;
+    Ok(())
+}
+
+/// Whether the recorded manifest's own restart budget and quarantine rule send
+/// this refusal to quarantine rather than plain degradation.
+///
+/// A recorded refusal that exhausts the manifest's bounded restart budget, or
+/// that observes the manifest revoked or its delivery path gapped, is the
+/// recorded manifest's own quarantine rule saying so, and such a generation is
+/// quarantined rather than merely degraded. Every other refusal degrades. A
+/// generation with no recorded manifest cannot be quarantined by a budget, because
+/// there is no recorded ceiling to have spent.
+fn refusal_quarantines_generation(
+    write: &redb::WriteTransaction,
+    module_id: &str,
+    generation: eliot_contracts::ResourceGeneration,
+    cause: crate::KernelReconciliationKind,
+) -> Result<bool, OrsError> {
+    let manifest = read_manifest_in_write(write, module_id, generation)?;
+    let Some(manifest) = manifest else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        cause,
+        crate::KernelReconciliationKind::ManifestRestartBudgetExhausted
+            | crate::KernelReconciliationKind::ManifestRevoked
+            | crate::KernelReconciliationKind::ManifestRevocationUnacknowledged
+            | crate::KernelReconciliationKind::ManifestDeliveryGapOpen
+    ) && !manifest
+        .projection
+        .restart_budget
+        .quarantine_rule
+        .trim()
+        .is_empty())
+}
+
+/// Reads one generation's recorded manifest inside an open write transaction.
+fn read_manifest_in_write(
+    write: &redb::WriteTransaction,
+    module_id: &str,
+    generation: eliot_contracts::ResourceGeneration,
+) -> Result<Option<crate::KernelExecutionManifest>, OrsError> {
+    let key = format!(
+        "{}::{:020}",
+        RedbRecoveryStore::encode_key_component(module_id),
+        generation.value()
+    );
+    let manifests = write
+        .open_table(KERNEL_EXECUTION_MANIFESTS)
+        .map_err(storage)?;
+    manifests
+        .get(key.as_str())
+        .map_err(storage)?
+        .map(|value| {
+            let manifest: crate::KernelExecutionManifest = decode(value.value())?;
+            if manifest.admission.module_id != module_id
+                || manifest.admission.generation != generation
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "kernel_execution_manifest",
+                    reason: "durable kernel execution manifest key does not match the recorded admission"
+                        .to_owned(),
+                });
+            }
+            Ok(manifest)
+        })
+        .transpose()
 }
 
 /// Target-specific evidence carried by one reservation transition.
@@ -38311,6 +40452,451 @@ mod capability_grant_identity_tests {
         }
         drop(store);
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod effect_delivery_current_state_tests {
+    //! Issue #1884 W4: the durable effect-delivery current state the exact replay
+    //! gate reads, its immutability, and the honest ABSENCE that is neither a
+    //! recorded open gap nor an acknowledged delivery.
+    //!
+    //! There is NO production writer for this row on this branch: no Kernel call
+    //! chain records it, because neither I1.9 nor issue #1884 states WHO writes it
+    //! or on what observation. The producer is BLOCKED, `blocked_by` issue #1885
+    //! ("[I1-audit] Gate effect-capable restart on exact unexpired operation
+    //! leases"), which owns the operation-lease record bound to the exact
+    //! operation identity and effect receipt together with its revocation and
+    //! delivery acknowledgement state. These cases therefore write the row
+    //! through the real public persistence API as a FIXTURE and then read the real
+    //! gate: they prove the READER, the REPLAY GATE and the row's immutability —
+    //! never a producer, which does not exist yet. For the same reason the lease
+    //! row each case needs is recorded directly through
+    //! [`RedbRecoveryStore::persist_effect_operation_lease`], because the
+    //! production issuer refuses at its delivery coordinate while the delivery
+    //! observation has no producer.
+    //!
+    //! Every fixture value is built through the crate's own canonical
+    //! constructors and every refusal is matched against its typed `OrsError`
+    //! variant, never against "it did not succeed".
+
+    use std::error::Error;
+    use std::num::NonZeroU64;
+
+    use eliot_contracts::{
+        AuthorityEpoch, EpochId, EpochLineageId, ResourceGeneration, StateFence,
+    };
+
+    use super::*;
+    use crate::test_support::KernelRouteStoreFixture;
+    use crate::{
+        AdmittedModuleGeneration, CapabilityRouteScope, EFFECT_CURRENT_STATE_SCHEMA_VERSION,
+        EFFECT_OPERATION_LEASE_SCHEMA_VERSION, EffectDeliveryAcknowledgement, EffectDeliveryRecord,
+        EffectOperationLease, GenerationDisposition, GovernorAdmissionReceipt,
+        GovernorGenerationAdmissionSeal, GovernorGenerationAdmissionSealParts,
+        KernelExecutionManifest, KernelExecutionProjection, KernelReconciliationKind,
+        LifecycleAdmissionDisposition, ManifestDependencyEntry, ManifestEffectCeiling,
+        ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
+        RevocationAcknowledgement, StateFenceSnapshot, StateMigrationDecision,
+    };
+
+    const MODULE_ID: &str = "module-ors-1884-delivery";
+    const GENERATION: u64 = 1;
+    const EPOCH_SEQUENCE: u64 = 1;
+    const CATALOG_REVISION: u64 = 7;
+    const POLICY_REVISION: u64 = 11;
+    const LINEAGE_ID: &str = "550e8400-e29b-41d4-a716-446655440188";
+    const OBSERVED_AT_MS: i64 = 1_700_000_000_000;
+    const ADMISSION_OPERATION_ID: &str = "operation-ors-1884-delivery-admission";
+    const ADMISSION_IDEMPOTENCY_KEY: &str = "idempotency-ors-1884-delivery-admission";
+    const OPERATION_ID: &str = "operation-ors-1884-delivery-effect";
+
+    fn hex_digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
+    fn fence_snapshot() -> Result<StateFenceSnapshot, Box<dyn Error>> {
+        let lineage = EpochLineageId::new(LINEAGE_ID)?;
+        let epoch = EpochId::new(
+            lineage,
+            NonZeroU64::new(EPOCH_SEQUENCE).ok_or("1884: the epoch sequence must be non-zero")?,
+        )?;
+        let fence = StateFence::new(epoch, ResourceGeneration::new(GENERATION)?);
+        Ok(StateFenceSnapshot::capture(&fence, EPOCH_SEQUENCE)?)
+    }
+
+    fn declared_scope() -> Result<CapabilityRouteScope, Box<dyn Error>> {
+        Ok(CapabilityRouteScope::declare(
+            MODULE_ID,
+            "restart",
+            "work-scope-1884-delivery",
+            "effect-domain-1884-delivery",
+        )?)
+    }
+
+    /// Builds the sealed owner parts and computes the owner digest with the
+    /// canonical function the seal verifies against.
+    fn seal_parts(
+        scope: &CapabilityRouteScope,
+    ) -> Result<GovernorGenerationAdmissionSealParts, Box<dyn Error>> {
+        let mut parts = GovernorGenerationAdmissionSealParts {
+            operation_id: OperationIdentity::new(ADMISSION_OPERATION_ID)?,
+            idempotency_key: ADMISSION_IDEMPOTENCY_KEY.to_owned(),
+            module_id: MODULE_ID.to_owned(),
+            generation: ResourceGeneration::new(GENERATION)?,
+            catalog_revision: CATALOG_REVISION,
+            policy_revision: POLICY_REVISION,
+            accepted_manifest_sha256: hex_digest('a'),
+            state_fence: fence_snapshot()?,
+            lifecycle_disposition: LifecycleAdmissionDisposition::Admitted,
+            restart_authorization_class: RestartAuthorizationClass::EffectExactLease,
+            admitted_effect_ceiling: ManifestEffectCeiling::EffectExactLease,
+            admitted_allowed_scopes: vec![scope.clone()],
+            owner_canonical_sha256: String::new(),
+        };
+        parts.owner_canonical_sha256 = GovernorGenerationAdmissionSeal::canonical_sha256(&parts)?;
+        Ok(parts)
+    }
+
+    fn projection(scope: &CapabilityRouteScope) -> KernelExecutionProjection {
+        KernelExecutionProjection {
+            artifact_sha256: hex_digest('a'),
+            config_sha256: hex_digest('b'),
+            protocol_sha256: hex_digest('c'),
+            start_command: "eliot-module-1884 --serve".to_owned(),
+            dependency_order: vec![ManifestDependencyEntry {
+                module_id: "module-ors-1884-delivery-dependency".to_owned(),
+                startup_order: 0,
+            }],
+            resource_limits: ManifestResourceLimits {
+                job_object_policy: "job-object-1884-delivery".to_owned(),
+                max_processes: 4,
+                max_working_set_bytes: 1_073_741_824,
+                cpu_rate_control_percent: 80,
+            },
+            health_readiness_contract_ref: "readiness-contract-1884-delivery".to_owned(),
+            restart_budget: ManifestRestartBudget {
+                max_restarts: 3,
+                quarantine_rule: "quarantine-1884-delivery".to_owned(),
+            },
+            effect_ceiling: ManifestEffectCeiling::EffectExactLease,
+            allowed_scopes: vec![scope.clone()],
+            state_class_behavior: StateMigrationDecision::RebuildFromSnapshot,
+        }
+    }
+
+    /// Records the canonical Governor receipt and then the Generation Registry
+    /// manifest, exactly in the order the Governor accept path uses.
+    fn persist_effect_manifest(
+        store: &RedbRecoveryStore,
+    ) -> Result<KernelExecutionManifest, Box<dyn Error>> {
+        let scope = declared_scope()?;
+        let parts = seal_parts(&scope)?;
+        let seal = GovernorGenerationAdmissionSeal::seal(parts.clone())?;
+        store.persist_governor_admission_receipt(&GovernorAdmissionReceipt::issue(
+            &parts,
+            OBSERVED_AT_MS,
+        )?)?;
+        let admission = AdmittedModuleGeneration {
+            module_id: parts.module_id.clone(),
+            generation: parts.generation,
+            authority_epoch: AuthorityEpoch::new(EPOCH_SEQUENCE)?,
+            catalog_revision: parts.catalog_revision,
+            policy_revision: parts.policy_revision,
+            governor_admission_seal: seal,
+            restart_authorization_class: parts.restart_authorization_class,
+            admitted_effect_ceiling: parts.admitted_effect_ceiling,
+            admitted_allowed_scopes: parts.admitted_allowed_scopes.clone(),
+        };
+        store.persist_admitted_kernel_execution_manifest(&admission, &projection(&scope))?;
+        let manifest = store
+            .load_kernel_execution_manifest(MODULE_ID, GENERATION)?
+            .ok_or("1884: the recorded execution manifest must be readable")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// The lease one exact leased operation is recorded under, shaped exactly as
+    /// `EffectOperationLease::validate` requires.
+    ///
+    /// This is the CANDIDATE the production issuance seam builds, byte for byte.
+    fn candidate_lease(
+        manifest: &KernelExecutionManifest,
+        scope: &CapabilityRouteScope,
+    ) -> Result<EffectOperationLease, Box<dyn Error>> {
+        Ok(EffectOperationLease {
+            schema_version: EFFECT_OPERATION_LEASE_SCHEMA_VERSION,
+            lease_id: OperationIdentity::new(format!(
+                "effect-operation-lease:{MODULE_ID}:{GENERATION:020}:{OPERATION_ID}"
+            ))?,
+            manifest_module_id: manifest.admission.module_id.clone(),
+            manifest_generation: manifest.admission.generation,
+            bound_manifest_sha256: manifest.manifest_sha256.clone(),
+            authority_epoch: AuthorityEpoch::new(EPOCH_SEQUENCE)?,
+            operation_id: OperationIdentity::new(OPERATION_ID)?,
+            effect_receipt_sha256: hex_digest('7'),
+            allowed_scope: scope.clone(),
+            expires_at_ms: OBSERVED_AT_MS + 60_000,
+            catalog_revision: manifest.admission.catalog_revision,
+            policy_revision: manifest.admission.policy_revision,
+            state: eliot_runtime_contracts::LeaseState::Active,
+            revocation: RevocationAcknowledgement::None,
+            delivery: EffectDeliveryAcknowledgement::Acknowledged,
+            issued_at_ms: OBSERVED_AT_MS,
+        })
+    }
+
+    /// The lease row a case needs, recorded through the public
+    /// [`RedbRecoveryStore::persist_effect_operation_lease`] writer rather than
+    /// through the production issuer, because the issuer refuses while the
+    /// delivery observation has no producer (issue #1885 owns that contract) —
+    /// which is exactly the state the issuance refusal case proves directly.
+    fn recorded_lease(
+        store: &RedbRecoveryStore,
+        manifest: &KernelExecutionManifest,
+        scope: &CapabilityRouteScope,
+    ) -> Result<EffectOperationLease, Box<dyn Error>> {
+        let lease = candidate_lease(manifest, scope)?;
+        store.persist_effect_operation_lease(&lease)?;
+        Ok(lease)
+    }
+
+    /// The delivery row these cases record through the real public persistence
+    /// API, shaped exactly as `EffectDeliveryRecord::validate` requires.
+    ///
+    /// It is a FIXTURE row, not a production observation: the production writer
+    /// is BLOCKED, `blocked_by` issue #1885, so the row is written here by the
+    /// test and the case that uses it proves the reader and the replay gate.
+    fn recorded_delivery(
+        lease: &EffectOperationLease,
+        acknowledgement: EffectDeliveryAcknowledgement,
+    ) -> EffectDeliveryRecord {
+        EffectDeliveryRecord {
+            schema_version: EFFECT_CURRENT_STATE_SCHEMA_VERSION,
+            lease_id: lease.lease_id.clone(),
+            operation_id: lease.operation_id.clone(),
+            module_id: lease.manifest_module_id.clone(),
+            generation: lease.manifest_generation,
+            acknowledgement,
+            observed_at_ms: OBSERVED_AT_MS + 1_000,
+        }
+    }
+
+    /// Returns the store's OWN typed error, not a boxed one: the refusal cases
+    /// below match the exact `OrsError` variant the gate raises, and boxing it
+    /// here would hide the variant this module exists to assert. `?` in a caller
+    /// returning `Box<dyn Error>` still converts it.
+    fn authorize(store: &RedbRecoveryStore) -> Result<crate::EffectReplayDecision, OrsError> {
+        // The epoch is built here and mapped into ORS's own typed failure rather
+        // than boxed away: a contract refusal on the test's authority epoch is a
+        // real refusal, and it must not be laundered into the gate's answer.
+        // `reason` is a STABLE code, never interpolated prose, so the contract's
+        // own wording stays in the contract.
+        let epoch =
+            AuthorityEpoch::new(EPOCH_SEQUENCE).map_err(|_error| OrsError::InvalidField {
+                field: "effect_replay_authority_epoch",
+                reason: "the replay authority epoch is refused by its contract",
+            })?;
+        store.authorize_effect_replay_for_operation(
+            &OperationIdentity::new(OPERATION_ID).map_err(|_error| OrsError::InvalidField {
+                field: "effect_replay_operation_id",
+                reason: "the replay operation identity is refused by its contract",
+            })?,
+            MODULE_ID,
+            GENERATION,
+            epoch,
+            OBSERVED_AT_MS + 2_000,
+        )
+    }
+
+    /// Positive case: the delivery row is written HERE, by this test, through the
+    /// real public persistence API, because the production writer is BLOCKED
+    /// `blocked_by` issue #1885 and does not exist on this branch — so this case
+    /// proves the READER and the REPLAY GATE reading a real recorded row, and it
+    /// proves nothing about a producer. With that row recorded as acknowledged
+    /// for the exact lease, the later exact replay of THAT operation is
+    /// authorized on the strength of the recorded delivery row and nothing else.
+    #[test]
+    fn a_recorded_delivery_admits_the_exact_later_replay() -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("effect-delivery-recorded")?;
+        let store = fixture.store();
+        let manifest = persist_effect_manifest(store)?;
+        let scope = declared_scope()?;
+        let issued = recorded_lease(store, &manifest, &scope)?;
+        // Fixture write through the real public persistence API: there is no
+        // production writer for this row on this branch.
+        store.persist_effect_delivery_record(&recorded_delivery(
+            &issued,
+            EffectDeliveryAcknowledgement::Acknowledged,
+        ))?;
+        let decision = authorize(store)?;
+        assert!(
+            decision.authority.authorized_lease().is_some(),
+            "an exact replay covered by an unexpired lease whose delivery is recorded as acknowledged is authorized"
+        );
+        Ok(())
+    }
+
+    /// Issuance refusal: the delivery observation issuance requires has no
+    /// producer on this branch, so the production issuer refuses the lease at the
+    /// delivery coordinate instead of substituting a default, and the refusal
+    /// leaves durable evidence through the same writer the replay seam uses.
+    #[test]
+    fn issuance_refuses_while_the_delivery_observation_is_unrecorded() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = KernelRouteStoreFixture::open("effect-delivery-issuance-absent")?;
+        let store = fixture.store();
+        let manifest = persist_effect_manifest(store)?;
+        let scope = declared_scope()?;
+        let candidate = candidate_lease(&manifest, &scope)?;
+        match store.issue_effect_operation_lease_for_operation(&candidate) {
+            Err(OrsError::InvalidField { field, .. }) => assert_eq!(
+                field, "effect_operation_lease_delivery",
+                "an unobserved delivery is refused at the issuance delivery coordinate"
+            ),
+            other => {
+                return Err(
+                    format!("issuance must refuse an unobserved delivery, got {other:?}").into(),
+                );
+            }
+        }
+        assert!(
+            store
+                .load_effect_operation_lease_for_operation(&candidate.operation_id)?
+                .is_none(),
+            "a refused issuance writes no lease row"
+        );
+        // The refusal is durable through the one existing reconciliation writer,
+        // with the domain's own unproven-delivery kind, so it is never raised with
+        // its evidence dropped.
+        let lifecycle = store
+            .load_generation_lifecycle(MODULE_ID, GENERATION)?
+            .ok_or("1884: the refused issuance must leave a recorded lifecycle row")?;
+        assert_eq!(
+            lifecycle.disposition,
+            GenerationDisposition::Degraded,
+            "a refused issuance degrades the affected generation"
+        );
+        assert_eq!(
+            lifecycle.first_refusal_cause,
+            Some(KernelReconciliationKind::EffectDeliveryGapOpen),
+            "the refusal cause is the domain's own unproven-delivery kind"
+        );
+        Ok(())
+    }
+
+    /// Refusal case: the lease exists but its delivery was NEVER recorded, so the
+    /// exact replay is refused and the refusal leaves durable evidence.
+    #[test]
+    fn a_replay_whose_delivery_was_never_recorded_is_refused() -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("effect-delivery-unrecorded")?;
+        let store = fixture.store();
+        let manifest = persist_effect_manifest(store)?;
+        let scope = declared_scope()?;
+        recorded_lease(store, &manifest, &scope)?;
+        assert!(
+            store
+                .load_effect_delivery_record(&OperationIdentity::new(format!(
+                    "effect-operation-lease:{MODULE_ID}:{GENERATION:020}:{OPERATION_ID}"
+                ))?)?
+                .is_none(),
+            "the fixture must hold no delivery row before the replay is attempted"
+        );
+        match authorize(store) {
+            Err(OrsError::InvalidField { field, .. }) => assert_eq!(
+                field, "effect_replay_delivery",
+                "an unobserved delivery is refused at the delivery coordinate"
+            ),
+            other => {
+                return Err(
+                    format!("an unobserved delivery must be refused, got {other:?}").into(),
+                );
+            }
+        }
+        // The refusal is durable: only the effect-replay reconciliation writer
+        // moves the affected generation in the real lifecycle owner, so a recorded
+        // degradation is the proof that the attempt was recorded.
+        let lifecycle = store
+            .load_generation_lifecycle(MODULE_ID, GENERATION)?
+            .ok_or("1884: the refused replay must leave a recorded lifecycle row")?;
+        assert_eq!(
+            lifecycle.disposition,
+            GenerationDisposition::Degraded,
+            "a refused exact replay degrades the affected generation"
+        );
+        assert_eq!(
+            lifecycle.first_refusal_cause,
+            Some(KernelReconciliationKind::EffectDeliveryGapOpen),
+            "the refusal cause is the domain's own unproven-delivery kind"
+        );
+        Ok(())
+    }
+
+    /// Absence is absence: an absent row is read as `None` by the reader itself,
+    /// never as `GapOpen` and never as `Acknowledged`, and a recorded row is
+    /// reported exactly as it records itself.
+    #[test]
+    fn an_absent_delivery_row_is_neither_a_recorded_gap_nor_a_delivery()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("effect-delivery-absence")?;
+        let store = fixture.store();
+        let manifest = persist_effect_manifest(store)?;
+        let scope = declared_scope()?;
+        let issued = recorded_lease(store, &manifest, &scope)?;
+        assert_eq!(
+            store.observed_lease_acknowledgements(&issued)?,
+            (RevocationAcknowledgement::None, None),
+            "an absent delivery row is the ABSENCE of an observation, not a recorded gap and not a delivery"
+        );
+        // A recorded row is reported exactly as it records itself.
+        store.persist_effect_delivery_record(&recorded_delivery(
+            &issued,
+            EffectDeliveryAcknowledgement::GapOpen,
+        ))?;
+        assert_eq!(
+            store.observed_lease_acknowledgements(&issued)?,
+            (
+                RevocationAcknowledgement::None,
+                Some(EffectDeliveryAcknowledgement::GapOpen)
+            ),
+        );
+        Ok(())
+    }
+
+    /// Immutability: an exact replay of the same observation writes nothing, and
+    /// a DIFFERENT observation for the same operation identity is an
+    /// `IDENTITY_CONFLICT` that never overwrites the earlier evidence.
+    #[test]
+    fn a_changed_delivery_observation_conflicts_and_keeps_the_recorded_one()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = KernelRouteStoreFixture::open("effect-delivery-immutable")?;
+        let store = fixture.store();
+        let manifest = persist_effect_manifest(store)?;
+        let scope = declared_scope()?;
+        let issued = recorded_lease(store, &manifest, &scope)?;
+        let acknowledged = recorded_delivery(&issued, EffectDeliveryAcknowledgement::Acknowledged);
+        store.persist_effect_delivery_record(&acknowledged)?;
+        // Exact replay of the identical observation is idempotent.
+        store.persist_effect_delivery_record(&acknowledged)?;
+        // A different observation for the same operation identity conflicts.
+        let gap = recorded_delivery(&issued, EffectDeliveryAcknowledgement::GapOpen);
+        match store.persist_effect_delivery_record(&gap) {
+            Err(OrsError::IntegrityProblem { reason, .. }) => assert!(
+                reason.contains("IDENTITY_CONFLICT"),
+                "a changed delivery observation must be refused as IDENTITY_CONFLICT, got {reason}"
+            ),
+            other => {
+                return Err(
+                    format!("a changed delivery observation must conflict, got {other:?}").into(),
+                );
+            }
+        }
+        assert_eq!(
+            store.load_effect_delivery_record(&issued.lease_id)?,
+            Some(acknowledged),
+            "the earlier recorded delivery evidence survives the conflicting observation"
+        );
         Ok(())
     }
 }

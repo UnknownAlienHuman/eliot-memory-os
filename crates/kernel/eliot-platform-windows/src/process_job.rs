@@ -24,7 +24,8 @@
 //!
 //! This module states physical Job/process lifecycle only: creation,
 //! suspended launch, consuming validation-before-resume, assignment,
-//! kill-on-close, termination, and reap. It forbids authority/token/lease
+//! kill-on-close, CPU/memory/process/rate ceilings, termination, and reap. It
+//! forbids authority/token/lease
 //! minting, semantic ownership/decision/readiness, retry/default/repair and
 //! carries no semantic authority.
 
@@ -147,24 +148,35 @@ pub struct JobObjectLimits {
     cpu_time_ms: Option<u64>,
     memory_bytes: Option<u64>,
     active_process_limit: Option<u32>,
+    cpu_rate_control_percent: Option<u16>,
 }
 
 #[cfg(windows)]
 impl JobObjectLimits {
     /// Creates validated optional Job limits.
     ///
+    /// `cpu_rate_control_percent` is the Job's share-of-a-CPU hard cap in whole
+    /// percent. `None` installs no rate control at all; a stated percentage is
+    /// written to the Job as `JOB_OBJECT_CPU_RATE_CONTROL_ENABLE` with
+    /// `JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`, in the Win32 unit of cycles per
+    /// 10 000 cycles, so a whole-percent value is scaled by
+    /// `CPU_RATE_CONTROL_UNITS_PER_PERCENT`.
+    ///
     /// # Errors
     /// Returns `InvalidInput` when a supplied ceiling is zero or cannot be
-    /// represented by the Win32 Job Object structures.
+    /// represented by the Win32 Job Object structures, or when a stated CPU
+    /// rate-control percentage is zero or above 100.
     pub fn new(
         cpu_time_ms: Option<u64>,
         memory_bytes: Option<u64>,
         active_process_limit: Option<u32>,
+        cpu_rate_control_percent: Option<u16>,
     ) -> Result<Self, WindowsAdapterError> {
         if matches!(cpu_time_ms, Some(0))
             || matches!(memory_bytes, Some(0))
             || matches!(active_process_limit, Some(0))
             || memory_bytes.is_some_and(|value| usize::try_from(value).is_err())
+            || cpu_rate_control_percent.is_some_and(|percent| !(1..=100).contains(&percent))
         {
             return Err(WindowsAdapterError::InvalidInput);
         }
@@ -178,6 +190,7 @@ impl JobObjectLimits {
             cpu_time_ms,
             memory_bytes,
             active_process_limit,
+            cpu_rate_control_percent,
         })
     }
 
@@ -191,16 +204,23 @@ impl JobObjectLimits {
     /// # Errors
     /// Returns `InvalidInput` when the required memory ceiling is absent, is
     /// zero, or cannot be represented by the Win32 Job Object structures, or
-    /// when any other supplied ceiling is zero or unrepresentable.
+    /// when any other supplied ceiling is zero or unrepresentable, or when a
+    /// stated CPU rate-control percentage is zero or above 100.
     pub fn require_memory_ceiling(
         cpu_time_ms: Option<u64>,
         memory_bytes: Option<u64>,
         active_process_limit: Option<u32>,
+        cpu_rate_control_percent: Option<u16>,
     ) -> Result<Self, WindowsAdapterError> {
         if memory_bytes.is_none() {
             return Err(WindowsAdapterError::InvalidInput);
         }
-        Self::new(cpu_time_ms, memory_bytes, active_process_limit)
+        Self::new(
+            cpu_time_ms,
+            memory_bytes,
+            active_process_limit,
+            cpu_rate_control_percent,
+        )
     }
 
     /// Returns the admitted CPU-time ceiling, if one was installed.
@@ -223,6 +243,16 @@ impl JobObjectLimits {
     #[must_use]
     pub const fn active_process_limit(&self) -> Option<u32> {
         self.active_process_limit
+    }
+
+    /// Returns the admitted CPU rate-control percentage, if one was installed.
+    ///
+    /// `None` is an explicitly unthrottled Job, never a zero reading: callers
+    /// binding requested and observed enforced limits must preserve the
+    /// distinction instead of projecting an absent cap as a 0% cap.
+    #[must_use]
+    pub const fn cpu_rate_control_percent(&self) -> Option<u16> {
+        self.cpu_rate_control_percent
     }
 }
 
@@ -308,6 +338,16 @@ impl OuterKillDomain {
 
 #[cfg(windows)]
 static JOB_OBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Win32 `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::CpuRate` units per whole
+/// percent.
+///
+/// MSDN documents `CpuRate` as the number of cycles per 10,000 cycles, and states
+/// that to let a job use 20% of the CPU the value is 20 times 100, that is 2,000.
+/// A 1..=100 percent coordinate therefore maps to 100..=10 000, and never to the
+/// `0` that `SetInformationJobObject` rejects with `ERROR_INVALID_PARAMETER`.
+#[cfg(windows)]
+const CPU_RATE_CONTROL_UNITS_PER_PERCENT: u32 = 100;
 
 /// RAII wrapper for a named Windows Job Object configured to terminate
 /// assigned processes when the sole owning handle closes.
@@ -410,10 +450,12 @@ impl JobObject {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
-            JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
+            CreateJobObjectW, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+            JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectCpuRateControlInformation,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
         let name = nul_terminated_wide(std::ffi::OsStr::new(identity.name()))
             .map_err(|error| windows_adapter_from_io(&error))?;
@@ -468,6 +510,43 @@ impl JobObject {
         if !configured {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
             return Err(last_windows_adapter_error());
+        }
+        // CPU rate control is a separate `JOBOBJECTINFOCLASS`, so it is a
+        // second `SetInformationJobObject` call on the same Job handle and not a
+        // `LimitFlags` bit. A stated percentage is installed as a hard cap
+        // before any process can be assigned, exactly like the ceilings above:
+        // a Job that rejects it is destroyed rather than published unthrottled.
+        if let Some(cpu_rate_control_percent) = resource_limits.cpu_rate_control_percent {
+            // `CpuRate` counts cycles per 10 000 cycles, so a whole-percent cap
+            // of at most 100 scales to at most 10 000 and can never be the zero
+            // `SetInformationJobObject` rejects.
+            let cpu_rate = u32::from(cpu_rate_control_percent) * CPU_RATE_CONTROL_UNITS_PER_PERCENT;
+            let mut rate_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+                ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                    | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+                ..JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default()
+            };
+            // `CpuRate` is the union member those two control flags select, and
+            // `cpu_rate` fits its `u32` width. Writing a union field needs no
+            // `unsafe`; only READING an uninitialised member would, and nothing
+            // on this path reads one - the whole structure is passed to the
+            // kernel by reference and read back through
+            // `QueryInformationJobObject`.
+            rate_info.Anonymous.CpuRate = cpu_rate;
+            let length = u32::try_from(std::mem::size_of_val(&rate_info))
+                .map_err(|_| WindowsAdapterError::Failed)?;
+            let rate_configured = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JobObjectCpuRateControlInformation,
+                    (&raw const rate_info).cast(),
+                    length,
+                )
+            } != 0;
+            if !rate_configured {
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                return Err(last_windows_adapter_error());
+            }
         }
         Ok(Self {
             handle,
