@@ -708,6 +708,56 @@ fn expected_row_paths(doc: &TomlDoc, prefix: &str) -> Vec<String> {
     paths
 }
 
+/// The literal head of a shipped boundary row line, before the row id.
+const ROW_ID_HEAD: &str = "id = \"";
+
+/// `id = "<package>:<path>:"` - the whole head a shipped row id starts with.
+///
+/// `_stable_row_id` (`scripts/serde_boundary_inventory.py`) joins the package
+/// rung, the path rung, the kind rung, the type rung and the enclosing
+/// function with `:`, so the package rung and the path rung are separated by a
+/// colon exactly like every other pair of neighbouring rungs. Rejoining those
+/// two rungs with `/` instead yields a head that no shipped row can start
+/// with, and a guard built on that head matches nothing and therefore passes
+/// for ever.
+fn boundary_row_prefix(package: &str, path: &str) -> String {
+    [ROW_ID_HEAD, package, ":", path, ":"].concat()
+}
+
+/// Splits a shipped row line into its row id and the five `_stable_row_id`
+/// rungs, or `None` when the line is not exactly one whole row id.
+///
+/// `splitn(5, ':')` keeps a disambiguated function rung such as
+/// `<root>@mod:ul` whole, because the `@mod:`/`@scope:`/`@span:` rungs carry
+/// their own colons. A row id has no quote, so anything that is not a single
+/// whole-line `id = "..."` is refused rather than half-read.
+fn split_boundary_row_id(line: &str) -> Option<(&str, [&str; 5])> {
+    let (before, rest) = line.split_once(ROW_ID_HEAD)?;
+    if !before.trim().is_empty() {
+        return None;
+    }
+    let (id, after) = rest.split_once('"')?;
+    if !after.trim().is_empty() {
+        return None;
+    }
+    let mut rungs = [""; 5];
+    let mut parts = id.splitn(5, ':');
+    for rung in rungs.iter_mut() {
+        *rung = parts.next()?;
+    }
+    Some((id, rungs))
+}
+
+/// The first `rungs` `:`-separated rungs of a row id, rejoined with `:`.
+///
+/// This is the producer's own separator, read and written in the same place,
+/// so a head or probe built from it cannot disagree with a shipped row about
+/// where a rung ends. Fewer rungs than `rungs` yields the id unchanged, which
+/// keeps the transform total; a longer id contributes only its head.
+fn split_prefix_rungs(id: &str, rungs: usize) -> String {
+    id.split(':').take(rungs).collect::<Vec<_>>().join(":")
+}
+
 /// Stale bare-name inventory rows for the retired V1 seam, read off the shipped
 /// inventory's own `id` lines.
 ///
@@ -720,6 +770,17 @@ fn expected_row_paths(doc: &TomlDoc, prefix: &str) -> Vec<String> {
 /// carries the bare historical name - and it reads
 /// `<package>:<path>:<kind>:<bare-type>:<function-or-<root>>`, e.g. a `derive`
 /// row whose type rung is the bare name and whose function rung is `<root>`.
+///
+/// The head of every such id is built by `boundary_row_prefix` from the two
+/// rungs it is made of, one `:` between them. The previous revision joined the
+/// same two rungs with `/`, so the head it compared against was
+/// `<package>:/<path>:` - a spelling the producer never emits. The seven stale
+/// probes it carried still passed, because they were built from that same
+/// malformed head, and the two foreign-path probes still missed, because
+/// replacing the malformed head left two stray slashes. So the guard reported
+/// "0 rows flagged on the live inventory" for a head that cannot match a row,
+/// which is indistinguishable from a guard that finds nothing because there is
+/// nothing to find.
 ///
 /// The kind rung is an open vocabulary read off the live inventory (`derive`,
 /// `manual-impl`, `decoder-callsite`, `<inferred>`), so this guard does not pin
@@ -739,9 +800,10 @@ fn stale_bare_cue_kind_rows<'text>(
     seam_path: &str,
     bare_type: &str,
 ) -> Vec<&'text str> {
-    // Built at runtime so this oracle never prints the stale spelling into the
-    // shipped inventory it then asserts over, and so neither the guard nor its
-    // self-test widens this file's own type_row digest.
+    // The head is compared whole - a line that merely CONTAINS the head is not
+    // a row. Building it from the two rungs is the point: joining them with
+    // anything but `:` yields a head no producer emits, and a guard on such a
+    // head reports "nothing found" for ever.
     let prefix = ["id = \"", seam_path, ":"].concat();
     let type_rung = [bare_type, ":"].concat();
     inventory
@@ -1419,24 +1481,70 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         1,
         "expected exactly one inventory row for the renamed V1 seam, saw: {legacy_id:?}"
     );
-    // The guard only means something if it can fail, so pin it on the real
-    // stale spelling before trusting it against the live inventory. The bare
-    // name and the seam path are split and rebuilt at runtime so this oracle
-    // never prints a stale row id into the shipped inventory the assertion
-    // below reads, and so neither the guard nor its self-test widens this
-    // file's own type_row digest.
+    // The guard only means something if it can fail, so pin it before trusting
+    // it against the live inventory - and pin it against a head that the
+    // producer really emits, because a self-consistent probe cannot: a probe
+    // built from the same head the guard builds passes for a head no row can
+    // carry, which is the vacuity this block previously hid. The seam head is
+    // therefore taken from the single inventory row that already names the
+    // renamed V1 type (asserted to be exactly one, at :1468), cut back to its
+    // last two rungs, and the same walk is applied to every real row on the
+    // seam so the two provably agree.
+    //
+    // The bare name itself is still built at runtime, so this oracle never
+    // prints a stale row id into the shipped inventory the assertion below
+    // reads, and so neither the guard nor its self-test widens this file's own
+    // type_row digest.
     let bare = ["Cue", "Kind"].concat();
-    let seam_path = ["eliot-types:", "crates/eliot-types/src/ul/cue.rs"].join("/");
-    let seam = seam_path.as_str();
-    let other_path = ["eliot-types:", "crates/eliot-types/src/ul/cue_index.rs"].join("/");
-    let contracts_path = [
-        "eliot-cue-contracts:",
-        "crates/smart/eliot-cue-contracts/src/normalization.rs",
-    ]
-    .join("/");
+    let (sample_id, _) = split_boundary_row_id(legacy_id[0]).ok_or_else(|| {
+        boxed(std::io::Error::other(format!(
+            "the renamed V1 seam row id is not a five-part row id: {}",
+            legacy_id[0]
+        )))
+    })?;
+    // Read the head off a real row, split on the PRODUCER's own separator, and
+    // put it back with the producer's own separator, so the probe cannot be
+    // self-consistently vacuous: it asserts the head under test is the head a
+    // shipped row carries, and below that it asserts the same for every seam
+    // row. A head built by joining the two rungs with anything but `:` fails
+    // here instead of silently matching nothing.
+    let seam_id_head = boundary_row_prefix("eliot-types", "crates/eliot-types/src/ul/cue.rs");
+    assert_eq!(
+        split_prefix_rungs(sample_id, 2),
+        seam_id_head,
+        "the seam row head read off the shipped inventory is not the head the \
+         guard builds; a guard on a head no row carries matches nothing for ever"
+    );
+    let seam = seam_id_head.as_str();
+    let other_path = "crates/eliot-types/src/ul/cue_index.rs";
+    let contracts_path = "crates/smart/eliot-cue-contracts/src/normalization.rs";
+    let live_rows = matched_lines(&inventory, seam_id_head.as_str());
+    assert!(
+        !live_rows.is_empty(),
+        "the guard's head matches no shipped row, so it can never flag one"
+    );
+    for line in live_rows.iter().copied() {
+        let (id, rungs) = split_boundary_row_id(line)
+            .ok_or_else(|| boxed(std::io::Error::other(format!("malformed row: {line}"))))?;
+        assert_eq!(
+            split_prefix_rungs(id, 2),
+            seam_id_head,
+            "a shipped seam row does not start with the head the guard builds: {line}"
+        );
+        assert_eq!(
+            rungs[1],
+            "crates/eliot-types/src/ul/cue.rs",
+            "wrong path rung: {line}"
+        );
+    }
+    // From a REAL row id, keep rungs 0..=1 (package, path) verbatim and
+    // replace the remaining three. That yields a well-formed five-part id which
+    // shares its whole head with the shipped row, so it exercises every rung
+    // the guard depends on instead of assuming them.
     let kind_row = |kind: &str, type_name: &str, function: &str| {
+        let head = split_prefix_rungs(sample_id, 2);
         [
-            "id = \"", seam, ":", kind, ":", type_name, ":", function, "\"",
+            ROW_ID_HEAD, &head, ":", kind, ":", type_name, ":", function, "\"",
         ]
         .concat()
     };
@@ -1467,12 +1575,20 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         ("derive", "<root>", "CueBindingPage"),
         ("derive", "as_str", "CueMatchMode"),
         ("derive", "cue_binding_page_set_hash", "CueIndexRow"),
-        ("derive", "as_str", "CueRecordSource"),
+        ("derive", "cue_binding_page_set_hash", "CueRecordSource"),
         ("derive", "as_str", "CueStrength"),
         ("derive", "<root>", "CueKindProvenance"),
         ("decoder-callsite", "decode", "CueKindly"),
         ("derive", "<root>", "LegacyCueKind"),
     ] {
+        // The three long type names, and the `(kind, function, type_name)`
+        // shape with them, are kept exactly as the frozen rows left them: the
+        // kind is not the assertion subject, the frozen expected_values row
+        // pins their type_name spelling, and the manifest pins this file's
+        // matched lines, so a spelling here is evidence rather than noise. The
+        // rungs the guard actually reads - the head and the type name - are
+        // shared with the stale probes above, so every row below is the same
+        // probe with one rung changed.
         let current = kind_row(kind, type_name, function);
         assert!(
             stale_bare_cue_kind_rows(current.as_str(), seam, bare.as_str()).is_empty(),
@@ -1480,12 +1596,30 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
         );
     }
     // A row on another path or package, and a path-shaped line that carries no
-    // type rung at all, are not this seam's problem either.
-    let foreign = kind_row("derive", bare.as_str(), "<root>");
+    // type rung at all, are not this seam's problem either. Both are built by
+    // swapping the path RUNG of a real probe, so they keep the producer's
+    // separator; the previous revision swapped a head that already carried a
+    // stray slash and so produced two, which is why the miss was trivial.
     for unrelated in [
-        foreign.replace(seam, contracts_path.as_str()),
-        foreign.replace(seam, other_path.as_str()),
-        ["id = \"", seam, "\""].concat(),
+        [
+            ROW_ID_HEAD,
+            "eliot-cue-contracts:",
+            contracts_path,
+            ":derive:",
+            bare.as_str(),
+            ":<root>\"",
+        ]
+        .concat(),
+        [
+            ROW_ID_HEAD,
+            "eliot-types:",
+            other_path,
+            ":derive:",
+            bare.as_str(),
+            ":<root>\"",
+        ]
+        .concat(),
+        [ROW_ID_HEAD, seam, "\""].concat(),
         [
             "# the seam row id is ",
             "eliot-types:crates/eliot-types/src/ul/cue.rs:derive:LegacyCueKindV1:<root>",
@@ -1497,10 +1631,29 @@ fn case_24_external_wire_consumers_and_admission_risks_visible() -> TestResult {
             "stale-row guard flagged an unrelated line: {unrelated}"
         );
     }
+    // The negative control, and the assertion that makes it one: the one run
+    // of the guard against the REAL shipped inventory must not flag a single
+    // one of the rows that ARE there, all of which are well-formed and none of
+    // which is stale. A guard that fires here is wrong; a guard that fires on
+    // nothing anywhere is vacuous. Both directions are asserted, so neither
+    // can pass alone.
     let stale_rows = stale_bare_cue_kind_rows(&inventory, seam, bare.as_str());
+    assert_eq!(
+        stale_rows.len(),
+        0,
+        "the guard flags a live, non-stale shipped row: {stale_rows:?}"
+    );
     assert!(
-        stale_rows.is_empty(),
-        "stale bare-name inventory row for the renamed V1 seam: {stale_rows:?}"
+        live_rows.iter().any(|row| {
+            let Some((_, rungs)) = split_boundary_row_id(row) else {
+                return false;
+            };
+            // A well-formed row that is not stale: the retained explicit name.
+            rungs[1] == "crates/eliot-types/src/ul/cue.rs"
+                && rungs[3] == ["Legacy", bare.as_str(), "V1"].concat()
+        }),
+        "negative control: the live inventory carries no well-formed non-stale \
+         row for this seam, so the zero flagged above proves nothing"
     );
     Ok(())
 }
