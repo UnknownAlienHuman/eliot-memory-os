@@ -109,8 +109,8 @@ impl Drop for Sandbox {
 
 /// True while Windows still reports `process_id` as a live process.
 fn provider_is_running(process_id: u32) -> bool {
-    let platform =
-        WindowsPlatform::new(std::env::temp_dir()).unwrap_or_else(|error| panic!("platform: {error}"));
+    let platform = WindowsPlatform::new(std::env::temp_dir())
+        .unwrap_or_else(|error| panic!("platform: {error}"));
     platform.process_identity(process_id).is_ok()
 }
 
@@ -122,8 +122,8 @@ fn provider_is_running(process_id: u32) -> bool {
 /// gone, polled until the OS reports it absent". The loop returns only on a
 /// positive absence observation.
 fn poll_until_absent(process_id: u32) -> bool {
-    let platform =
-        WindowsPlatform::new(std::env::temp_dir()).unwrap_or_else(|error| panic!("platform: {error}"));
+    let platform = WindowsPlatform::new(std::env::temp_dir())
+        .unwrap_or_else(|error| panic!("platform: {error}"));
     loop {
         if platform.process_identity(process_id).is_err() {
             return true;
@@ -209,7 +209,10 @@ fn refused_launch_reaps_provider_and_returns_typed_refusal() -> RefusalResult {
     );
 
     let refused_pid = provider_process_id.get();
-    assert_ne!(refused_pid, 0, "the launch path must have spawned a provider");
+    assert_ne!(
+        refused_pid, 0,
+        "the launch path must have spawned a provider"
+    );
     assert!(
         provider_was_running.get(),
         "the spawned provider must have been a live process when the launch path refused it, \

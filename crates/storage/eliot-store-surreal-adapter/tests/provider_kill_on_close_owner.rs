@@ -127,7 +127,9 @@ impl OwnerReport {
     fn read(sandbox: &Sandbox) -> OwnerResult<OwnerReport> {
         let text = std::fs::read_to_string(sandbox.child_report())?;
         let provider_process_id = text.trim().parse::<u32>()?;
-        Ok(Self { provider_process_id })
+        Ok(Self {
+            provider_process_id,
+        })
     }
 }
 
@@ -222,7 +224,9 @@ fn provider_owner_entrypoint() -> OwnerResult {
     let deadline = Instant::now() + Duration::from_secs(60);
     while TcpStream::connect(&bind_address).is_err() {
         if Instant::now() >= deadline {
-            return Err(std::io::Error::other("owner provider never accepted a connection"));
+            return Err(std::io::Error::other(
+                "owner provider never accepted a connection",
+            ));
         }
         std::thread::sleep(PARENT_POLL_INTERVAL);
     }
