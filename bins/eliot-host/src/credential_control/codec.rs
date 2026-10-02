@@ -33,9 +33,13 @@ const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 //
 // Through the #889 facade only
 // (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// sink disposition is observed only through the canonical bounded observer
+// `crate::host_diagnostics::note_event_log_sink_status`, which consumes the
+// live `crate::windows_event_log::event_log_sink_status` answer. #984's safe
+// port is landed, so that answer is `Ok` on Windows (nothing to note) and the
+// typed `EventLogUnavailable` elsewhere, where the canonical observer records
+// the standing seam state on the shared `tracing` sink. No sink state is read
+// or interpreted here.
 //
 // Observation-only contract (mirrors `host_composition_phase_b.rs:30-41`):
 // every call projects a boundary already decided by the semantic owner.
@@ -47,10 +51,6 @@ const MARKER_VERSION: &str = "eliot.store-credential-marker.v1";
 // failed operation stays with the credential operation guard, while these inner
 // phases refine — and never contradict — that terminal's reason code. Rejected
 // input keeps its original typed failure with zero byte leakage.
-fn credential_codec_note_event_log_unavailable() {
-    let _ = crate::windows_event_log::event_log_sink_status();
-}
-
 /// Closed reason discriminant for one rejected credential wire record
 /// (F-LOG-HOST-5, #980).
 ///
@@ -160,7 +160,10 @@ impl CodecRejectReason {
 /// supplied discriminant, so no rejected byte, key, or `serde` text can reach
 /// the record; `observe_entrypoint_with_detail` bounds the result.
 fn credential_codec_observe(reason: CodecRejectReason) {
-    credential_codec_note_event_log_unavailable();
+    // Sink disposition is load-bearing for this record: the canonical bounded
+    // observer states where a codec rejection stayed, in the same place in the
+    // sequence the discarded status read used to occupy.
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::ScmDispatch,
         &format!(
