@@ -72,14 +72,20 @@ const PHASE_B_QUEUE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration:
 // sensitivity (I15.4).
 // Stale/foreign/conflict reasons stay in the frozen labels. Sink outcome
 // never alters result/order/status/cleanup. There is no mutable global dedup
-// cache: one terminal emission per failed credential-owned operation is
-// enforced by the single outermost observer per operation (the `handle`
-// outcome check for request outcomes, the guard for `serve_one` transport),
-// while relayed Phase-B outcomes keep the terminal owned by their Phase-B
-// handler. The three pre-request marks (`acquire requested`, `acquired
-// owner-epoch`, `serve requested`) keep frozen labels only: no operation
-// identity exists yet at those boundaries, and a pre-subject terminal says
-// correlation is unavailable instead of relying on order.
+// cache. Terminal emission is not owned by a single outermost observer per
+// operation: `handle` emits for a credential-owned Unknown request outcome,
+// and the `serve_one` guard emits for a transport failure, so both sites can
+// emit for one request. When the outcome is Unknown and the subsequent
+// response frame or `send_frame` then fails, `handle` has already emitted
+// and the still-armed guard emits a second `host.terminal_error` for that
+// request; `serve_one` therefore disarms the guard once `handle` has
+// emitted (`credential_handle_emitted_terminal`). This is an interaction
+// closed at that boundary, not an enforced single-terminal property.
+// Relayed Phase-B outcomes keep the terminal owned by their Phase-B handler.
+// The three pre-request marks (`acquire requested`, `acquired owner-epoch`,
+// `serve requested`) keep frozen labels only: no operation identity exists
+// yet at those boundaries, and a pre-subject terminal says correlation is
+// unavailable instead of relying on order.
 fn credential_control_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
@@ -133,6 +139,28 @@ fn credential_operation_label(operation: HostCredentialControlOperation) -> &'st
         HostCredentialControlOperation::ReconcilePhaseB => "reconcile-phase-b",
         HostCredentialControlOperation::FinalizePhaseB => "finalize-phase-b",
     }
+}
+
+/// Whether `handle` emits the credential-owned Unknown terminal for this
+/// exact request/response pair (F-LOG-HOST-2 W3).
+///
+/// This mirrors `handle`'s emission condition exactly: an Unknown outcome on a
+/// credential-owned operation. Relayed Phase-B operations return before the
+/// credential-owned branch and keep their terminal in their Phase-B handler,
+/// so they are excluded here. Pure inspection of the request and the response
+/// the owner already returned: no probe, no re-read, no effect on any response,
+/// ordering or error.
+fn credential_handle_emitted_terminal(
+    request: &HostCredentialControlRequest,
+    response: &HostCredentialControlResponse,
+) -> bool {
+    matches!(response, HostCredentialControlResponse::Unknown { .. })
+        && !matches!(
+            request.intent.operation,
+            HostCredentialControlOperation::MaterializePhaseB
+                | HostCredentialControlOperation::ReconcilePhaseB
+                | HostCredentialControlOperation::FinalizePhaseB
+        )
 }
 
 /// Current nonsecret identities bound to one credential observation
@@ -572,6 +600,14 @@ impl HostCredentialControl {
             decode_credential_control_request_frame(&frame).map_err(|error| error.to_string())?;
         serve_terminal.bind_request(&request);
         let response = self.handle(&request).await;
+        // F-LOG-HOST-2 (#893): `handle` may have already emitted this
+        // request's terminal above. Disarm here so a later response-frame or
+        // send failure cannot record a second `host.terminal_error` for the
+        // one request. Disarm only: the response, the `Result`, and the call
+        // order below are unchanged.
+        if credential_handle_emitted_terminal(&request, &response) {
+            serve_terminal.disarm();
+        }
         let response = credential_control_response_frame(connection_id, &response)
             .map_err(|error| error.to_string())?;
         server
