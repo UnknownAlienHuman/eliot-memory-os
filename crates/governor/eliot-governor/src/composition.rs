@@ -9429,9 +9429,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Dispatches one exact durable authority request through the retained
     /// production P-07 port. The daemon composition root owns construction of
-    /// the request from its admitted canonical source; this method is the
-    /// single application seam that gives all four authority operations a
-    /// production caller without reimplementing receipt reconciliation.
+    /// the request from its admitted canonical source; this method is the one
+    /// application seam that would give all four authority operations a single
+    /// dispatch point without reimplementing receipt reconciliation.
     ///
     /// A grant revocation is the only arm with a canonical second phase, so it
     /// is the only arm that reads `canonical_operation_id`,
@@ -9459,10 +9459,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// The grant-revocation arm runs through
     /// [`Self::apply_admitted_authority_revocation`], which admits the
     /// presented operation against the live composition generation before
-    /// the saga starts. Live status: production seam for all four authority
-    /// families; the daemon composition root's authority pass is its one
-    /// production caller (BLOCKED-BY authority-transport: that pass does not
-    /// yet build one of these requests from an admitted canonical source).
+    /// the saga starts.
+    ///
+    /// Live status: NO production caller. Measured on this tree, this method has
+    /// exactly four textual occurrences: two intra-doc links, this paragraph,
+    /// and its own definition. Nothing outside `#[cfg(test)]` calls it, so every
+    /// method it reaches — `apply_admitted_authority_revocation`,
+    /// `revoke_grant_and_reconcile`, `revoke_grant`, `activate_grant`,
+    /// `activate_root_transition`, `activate_introduction` and
+    /// `revoke_introduction` — has zero production callers as well. The daemon
+    /// composition root that owns the only `GovernorComposition` calls none of
+    /// them. The blocking inputs are named in the "Live status" paragraphs of
+    /// [`Self::apply_pending_canonical_revocation`] and of
+    /// [`Self::apply_admitted_authority_revocation`]; this doc must not be read
+    /// as proof that any of them is reached.
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
@@ -9558,11 +9568,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// under, forwarded verbatim to [`Self::revoke_grant_and_reconcile`]. It
     /// is required, never defaulted.
     ///
-    /// Live status: production ingress for the revocation half; the daemon
-    /// composition root's polled authority pass is its one production caller
-    /// (BLOCKED-BY authority-revocation-transport: that pass builds no
-    /// revocation request and holds no `GrantClosureReceiptPort` /
-    /// `GrantClosureCanonicalLinkPort` adapter yet).
+    /// Live status: NO production caller. Measured on this tree, the only
+    /// non-definition reference to this method is the `GrantRevocation` arm of
+    /// [`Self::apply_authority_request`], which itself has no caller, so the
+    /// production call count is zero rather than one. The two blocking inputs
+    /// are named in the "Live status" paragraph of
+    /// [`Self::apply_pending_canonical_revocation`] and must not be read here as
+    /// evidence that any pass builds the request or holds the two boundary
+    /// ports.
     pub async fn apply_admitted_authority_revocation<L, C>(
         &mut self,
         request: &GrantRevocationRequest,
@@ -9616,6 +9629,243 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             closure_source,
         )
         .await
+    }
+
+    /// Applies ONLY the canonical second phase of an already committed
+    /// Kernel/ORS first phase, from the owner's own committed closure bytes
+    /// (`#686`, audit 5924750035 item 2).
+    ///
+    /// This is the entry the production grant-revocation ingress needs and the
+    /// Kernel-first saga cannot serve. A committed first phase whose second
+    /// phase never completed is exactly the case
+    /// [`Self::apply_admitted_authority_revocation`] must NOT be given: it
+    /// re-strikes `revoke_grant`, and the Kernel correctly refuses that with
+    /// `NotAdmitted` because its own owner already fences the target. So this
+    /// entry never presents a request to the P-07 port and never calls
+    /// [`Self::revoke_grant`]; it resumes the exact committed operation instead.
+    ///
+    /// Fail-closed order, all of it ahead of any transport:
+    /// - The composition must be `Ready`. No P-07 port is required or consulted:
+    ///   the mechanical fence already took effect in the owner's process.
+    /// - `committed_closure` is the ORIGINAL recorded value and revalidates
+    ///   under its own `GrantClosureReceipt::validate()`. Nothing is recomputed,
+    ///   defaulted or minted, and no digest is substituted for the served bytes.
+    /// - Only a `Revoked` closure whose `canonical_receipt` is `None` is a
+    ///   pending obligation. An already-linked closure is refused rather than
+    ///   committed a second time, and a non-revoked closure would mint a
+    ///   revocation nobody committed.
+    /// - The closure's own authority State Fence must equal the LIVE composition
+    ///   State Fence, and the presented request and admitted canonical request
+    ///   identity must carry that same fence. A closure committed under a
+    ///   superseded generation refuses here (A00-03: restoration of revoked
+    ///   influence after recovery is a hard boundary) instead of resuming under
+    ///   the wrong fence.
+    /// - The closure must name the presented target grant and the presented
+    ///   snapshot exactly. A retained presentation for the same grant must
+    ///   carry the exact same bytes, or the presentation is an
+    ///   `IdentityConflict` and nothing moves (I5.27).
+    ///
+    /// The first phase's acknowledgement was lost to this composition by
+    /// construction — it never presented the revoke — so the exact presented
+    /// request is filed through the retained
+    /// [`RetainedAuthorityRequest`] unknown-outcome surface before the saga
+    /// runs, and only the exact same snapshot can reconcile it. A refusal never
+    /// clears it: the retained record moves to revocation intent, the
+    /// [`PendingCanonicalRevocation`] for this grant is retained, and the
+    /// composition keeps reporting the grant as revoked and keeps refusing to
+    /// activate it.
+    ///
+    /// `canonical_operation_id`, `canonical_request_identity` and `operation`
+    /// are the same indivisible admitted identity
+    /// [`Self::apply_admitted_authority_revocation`] takes, and they are still
+    /// required and never defaulted: the committed closure carries a fence, a
+    /// membership and a digest, but none of the operation identity's five
+    /// coordinates.
+    ///
+    /// Live status: no production caller. The production caller is the daemon
+    /// composition root's polled authority-revocation ingress pass, which
+    /// already reads these committed closures over the authenticated front door
+    /// and already re-admits each pending one through its own maintenance
+    /// request owner (`bins/eliotd/src/daemon_runtime.rs` ->
+    /// `report_authority_revocation_ingress`, ->
+    /// `bins/eliotd/src/authority_revocation_ingress.rs` ->
+    /// `scan_authority_revocation_ingress`). That pass is outside this crate and
+    /// is not wired here. It additionally needs a `GrantClosureCanonicalLinkPort`
+    /// in the `eliotd` process, whose only existing implementation is
+    /// `Arc<dyn eliot_ors::OperationalRecoveryStore>` — an ORS handle the
+    /// Kernel owns in its own process, so no `eliotd` dependency can supply it
+    /// today. This entry is therefore honest prerequisite work, not completion:
+    /// see `AUTHORITY_REVOCATION_RESUME_BLOCKED` in
+    /// `bins/eliotd/src/authority_revocation_ingress.rs` for the owner-side
+    /// statement of the same gap.
+    pub async fn apply_pending_canonical_revocation<L>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        committed_closure: &GrantClosureReceipt,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        durable_link: &L,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+    {
+        self.require_ready_for_authority()?;
+        let authority_receipt = self.admit_pending_canonical_revocation(
+            request,
+            committed_closure,
+            canonical_request_identity,
+        )?;
+        let commit = CanonicalRevocationCommit {
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+        };
+        match self
+            .finish_canonical_revocation(
+                request,
+                &authority_receipt,
+                committed_closure,
+                &commit,
+                durable_link,
+            )
+            .await
+        {
+            Ok(reconciliation) => {
+                self.pending_canonical_revocations
+                    .remove(request.grant_id.as_str());
+                // The retained unknown outcome is reconciled by the exact
+                // Kernel-issued receipt this closure recorded; the presentation
+                // keeps reporting the grant revoked instead of leaving a stale
+                // pending record behind a completed second phase.
+                let completed =
+                    PresentedAuthorityRequest::GrantRevocation(request.clone());
+                if let Ok(retained) = self.retain_presentation(completed)
+                    && retained
+                        .note_revoked(&reconciliation.authority_receipt)
+                        .is_err()
+                {
+                    retained.note_revocation_intended();
+                }
+                Ok(reconciliation)
+            }
+            Err(pending) => {
+                self.retain_pending_canonical_revocation(
+                    request,
+                    &authority_receipt,
+                    pending.phase,
+                );
+                Err(pending.error)
+            }
+        }
+    }
+
+    /// Proves one committed closure really is this composition's pending
+    /// canonical-revocation obligation, files the lost first-phase
+    /// acknowledgement against the retained presentation, and returns the
+    /// Kernel-issued revocation receipt the closure itself records.
+    ///
+    /// The returned receipt is a faithful projection of the owner's committed
+    /// [`GrantClosureAuthorityReceiptRef`](eliot_receipts::GrantClosureAuthorityReceiptRef):
+    /// the closure's own `validate()` has already proved that reference's
+    /// identity, authority epoch and terminal state, so no value here is
+    /// recomputed and no acknowledgement is invented.
+    fn admit_pending_canonical_revocation(
+        &mut self,
+        request: &GrantRevocationRequest,
+        committed_closure: &GrantClosureReceipt,
+        canonical_request_identity: &RequestIdentity,
+    ) -> Result<AuthorityRevocationReceipt, CompositionError> {
+        committed_closure
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        if committed_closure.state != eliot_receipts::GrantClosureState::Revoked {
+            return Err(CompositionError::Owner(
+                "pending canonical revocation requires a committed revoked closure".to_owned(),
+            ));
+        }
+        if committed_closure.canonical_receipt.is_some() {
+            return Err(CompositionError::Owner(
+                "canonical second phase is already linked; there is no pending obligation to apply"
+                    .to_owned(),
+            ));
+        }
+        let live_fence = self.snapshot.state_fence();
+        if committed_closure.authority.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "committed closure is not bound to the live composition State Fence".to_owned(),
+            ));
+        }
+        if request.binding.state_fence != committed_closure.authority.state_fence
+            || canonical_request_identity.request.metadata.state_fence
+                != committed_closure.authority.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "pending canonical revocation is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if committed_closure.declaration.target_grant_id != request.grant_id.as_str()
+            || committed_closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Recovery(
+                "committed closure does not bind the presented target grant and snapshot".to_owned(),
+            ));
+        }
+        // The first phase's acknowledgement was lost to this composition: it
+        // never presented the revoke, so the exact presented request is filed
+        // against the retained unknown-outcome surface before the saga runs.
+        // `note_unknown_outcome` compares the presented snapshot with the
+        // retained request, so a superseded snapshot can never reconcile it.
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        if let Some(retained) = self.authority_presentations.get(presented.ledger_key().as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        self.note_unknown_outcome(presented, &request.snapshot_id)?;
+        Ok(AuthorityRevocationReceipt {
+            revocation_id: committed_closure.authority_receipt.receipt_id.clone(),
+            snapshot_id: committed_closure.authority_receipt.snapshot_id.clone(),
+            authority_epoch: committed_closure.authority_receipt.authority_epoch.clone(),
+            state: AuthorityState::Revoked,
+        })
+    }
+
+    /// Retains the visible stricter revocation intent for one Kernel-first
+    /// revocation whose canonical second phase did not complete.
+    ///
+    /// The mechanical fence already took effect at the owner, so every
+    /// projection here is strictly stronger than any right the graph or a stale
+    /// presentation still shows. The retained presentation moves to revocation
+    /// intent rather than being cleared, so a failed retry can never restore the
+    /// right and a later exact reconciliation still has its record.
+    ///
+    /// The presentation filing cannot weaken anything and is therefore not a
+    /// second error to report: the [`PendingCanonicalRevocation`] record is
+    /// inserted first, and `authority_grant_status` already reports `Revoked`
+    /// from it, so a refusal here cannot restore the right. Reporting a second
+    /// composition error would replace the saga's typed refusal with an
+    /// unrelated one and hide which canonical phase actually failed.
+    fn retain_pending_canonical_revocation(
+        &mut self,
+        request: &GrantRevocationRequest,
+        authority_receipt: &AuthorityRevocationReceipt,
+        phase: CanonicalRevocationPhase,
+    ) {
+        self.pending_canonical_revocations.insert(
+            request.grant_id.as_str().to_owned(),
+            PendingCanonicalRevocation {
+                grant_id: request.grant_id.as_str().to_owned(),
+                snapshot_id: authority_receipt.snapshot_id.clone(),
+                revocation_id: authority_receipt.revocation_id.clone(),
+                phase,
+            },
+        );
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        if let Ok(retained) = self.retain_presentation(presented) {
+            retained.note_revocation_intended();
+        }
     }
 
     /// Presents one canonical grant activation to the retained P-07 port and
@@ -9808,11 +10058,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// record is removed only when the second-phase link commits, which is the
     /// one outcome that proves canonical reconciliation completed.
     ///
-    /// Its one production ingress is [`Self::apply_admitted_authority_revocation`],
+    /// Its only in-crate ingress is [`Self::apply_admitted_authority_revocation`],
     /// which admits the presented operation against the live composition
-    /// generation before the Kernel first phase is struck;
+    /// generation before the Kernel first phase is struck, and
     /// [`Self::apply_authority_request`] reaches it through the
-    /// `GrantRevocation` arm.
+    /// `GrantRevocation` arm. Both have zero production callers, so the whole
+    /// revoke half — including the `GrantGraph` closure revoke behind
+    /// [`Self::revoke_grant`] — is present as compiled code yet unentered in
+    /// production. See the "Live status" paragraph of
+    /// [`Self::apply_pending_canonical_revocation`].
     pub async fn revoke_grant_and_reconcile<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
@@ -9898,6 +10152,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 phase: CanonicalRevocationPhase::ClosureReadback,
                 error: CompositionError::Owner(error.to_string()),
             })?;
+        self.finish_canonical_revocation(
+            request,
+            authority_receipt,
+            &closure,
+            commit,
+            durable_link,
+        )
+        .await
+    }
+
+    /// Runs the canonical second phase over an ALREADY admitted closure and the
+    /// Kernel-issued revocation receipt that closure itself records.
+    ///
+    /// This is the one body both revocation entries share:
+    /// [`Self::revoke_grant_and_reconcile`] reaches it after reading the
+    /// closure back through [`GrantClosureReceiptPort`], and
+    /// [`Self::apply_pending_canonical_revocation`] reaches it with the owner's
+    /// own committed closure after admitting the pending obligation. The
+    /// required order is unchanged and is not a second scheme:
+    ///
+    /// 1. the committed closure must bind the exact request, snapshot and fence,
+    ///    and the Kernel-issued receipt must be the same revoked receipt the
+    ///    closure records;
+    /// 2. the authority graph's own origin-bound re-derivation is proven to bind
+    ///    that durable closure — before this projection advances its own graph
+    ///    revision;
+    /// 3. the declared membership is fenced in this projection;
+    /// 4. the canonical envelope is compiled from the durable closure and
+    ///    committed through the retained Kernel port;
+    /// 5. the Store-issued canonical receipt identity is linked to the
+    ///    immutable first-phase row and read back by content.
+    ///
+    /// Every refusal is returned as a [`PendingCanonicalHandoff`] carrying the
+    /// phase, and never as evidence that the canonical writer completed.
+    async fn finish_canonical_revocation<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        authority_receipt: &AuthorityRevocationReceipt,
+        closure: &GrantClosureReceipt,
+        commit: &CanonicalRevocationCommit<'_>,
+        durable_link: &L,
+    ) -> Result<AuthorityRevocationReconciliation, PendingCanonicalHandoff> {
         if closure.state != eliot_receipts::GrantClosureState::Revoked
             || closure.declaration.target_grant_id != request.grant_id.as_str()
             || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
@@ -9934,7 +10230,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // the canonical revocation transition over the SAME target and
         // closure and proves that its own origin-bound re-derivation binds
         // the durable declaration this saga is about to commit.
-        self.prepare_revocation_transition_for_commit(request, &closure, commit)
+        self.prepare_revocation_transition_for_commit(request, closure, commit)
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::ClosureReadback,
                 error,
@@ -9957,7 +10253,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let envelope = authority_revocation_envelope_from_closure(
             commit.canonical_request_identity,
             commit.canonical_operation_id,
-            &closure,
+            closure,
         )
         .map_err(|error| PendingCanonicalHandoff {
             phase: CanonicalRevocationPhase::CanonicalCommit,
@@ -9982,9 +10278,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // an adapter that needs a typed ORS operation identity rebuilds it from
         // these same bytes at the boundary that actually calls the store.
         let closure_projection =
-            Self::link_closure_second_phase(durable_link, &closure, &receipt_identity)?;
+            Self::link_closure_second_phase(durable_link, closure, &receipt_identity)?;
         Ok(AuthorityRevocationReconciliation {
-            authority_receipt: authority_receipt.clone(),
+            authority_receipt: (*authority_receipt).clone(),
             canonical_receipt,
             closure_projection,
         })
@@ -13967,6 +14263,236 @@ mod tests {
             error,
             CompositionError::Authority(P07PortError::Unavailable)
         ));
+    }
+
+    /// Link boundary double for the canonical second phase proofs below.
+    ///
+    /// It exists only so a proof can prove the durable link is NOT reached
+    /// while admission runs. Any call is a failure of the proof, recorded
+    /// rather than returned, so the assertion reads the recorded count instead
+    /// of trusting a `Result`.
+    #[derive(Default)]
+    struct CountingClosureLinkPort {
+        calls: Mutex<usize>,
+    }
+
+    impl GrantClosureCanonicalLinkPort for CountingClosureLinkPort {
+        fn link_grant_closure_canonical_receipt(
+            &self,
+            _operation_id: &str,
+            _canonical_receipt: &ReceiptIdentity,
+        ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+            *self.calls.lock().expect("link call lock") += 1;
+            Err(KernelPortError::NotAdmitted(
+                "the durable link must not be reached while canonical admission refuses".to_owned(),
+            ))
+        }
+    }
+
+    /// Owner-admitted revocation operation identity for the closure proofs.
+    fn revocation_operation_fixture() -> RevocationOperationIdentity {
+        RevocationOperationIdentity::admit(
+            "principal:issuer",
+            TaskId::new("task-closure").expect("task id"),
+            "scope:work",
+            eliot_receipts::ReceiptId::new("receipt-observed").expect("receipt id"),
+            ClockReading {
+                valid_time_ms: Some(1_800_000_000_000),
+                known_time_ms: Some(1_800_000_000_000),
+                transaction_sequence: Some(eliot_contracts::TransactionSequence::genesis()),
+                monotonic_ns: None,
+            },
+        )
+        .expect("admitted revocation operation identity")
+    }
+
+    /// The owner's own committed pending first-phase closure bytes.
+    ///
+    /// Every field is the shape the `GrantClosureReceipt` contract itself
+    /// requires: the authority-receipt reference carries the exact
+    /// `revocation-{operation_id}` identity and the same authority epoch the
+    /// binding names, there is one ORS member receipt per declared member, and
+    /// `canonical_receipt` is the one field the proof varies.
+    fn pending_closure_fixture(
+        fence: &StateFence,
+        canonical_receipt: Option<ReceiptIdentity>,
+    ) -> GrantClosureReceipt {
+        GrantClosureReceipt {
+            schema: eliot_receipts::GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: eliot_receipts::GRANT_CLOSURE_VERSION,
+            operation_id: "closure-op-1".to_owned(),
+            idempotency_digest: "d".repeat(64),
+            declaration: eliot_receipts::GrantClosureDeclaration {
+                schema: eliot_receipts::GRANT_CLOSURE_SCHEMA.to_owned(),
+                version: eliot_receipts::GRANT_CLOSURE_VERSION,
+                target_grant_id: "grant-a".to_owned(),
+                authority_root_ref: "authority:test-root".to_owned(),
+                grant_graph_revision: 1,
+                members: vec![eliot_receipts::GrantClosureMemberDeclaration {
+                    grant_id: "grant-a".to_owned(),
+                    parent_grant_id: None,
+                }],
+                preserved: Vec::new(),
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            authority: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            authority_receipt: eliot_receipts::GrantClosureAuthorityReceiptRef {
+                receipt_id: "revocation-closure-op-1".to_owned(),
+                snapshot_id: "snap-1".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state: eliot_receipts::GrantClosureState::Revoked,
+            },
+            ors_member_receipts: vec![eliot_receipts::GrantClosureOrsReceiptRef {
+                record_id: "ors-member-1".to_owned(),
+                subject_id: "grant-a".to_owned(),
+                operation_order: 1,
+                state: eliot_receipts::GrantClosureState::Revoked,
+                state_sha256: "e".repeat(64),
+            }],
+            fenced_introductions: Vec::new(),
+            ors_introduction_receipts: Vec::new(),
+            canonical_receipt,
+            state: eliot_receipts::GrantClosureState::Revoked,
+        }
+    }
+
+    /// Positive case: the second-phase-only resume admits the owner's committed
+    /// pending closure on a composition that holds NO live P-07 port, files the
+    /// lost first-phase acknowledgement against the retained presentation, and
+    /// then lets the saga's own content gate refuse — without re-striking the
+    /// Kernel, without committing a canonical envelope, and without reaching
+    /// the durable link.
+    ///
+    /// WHY IT FAILS WITHOUT THIS CHANGE: `apply_pending_canonical_revocation`
+    /// does not exist at base, so this proof cannot even name the entry. The
+    /// existing `apply_admitted_authority_revocation` is not a substitute: it
+    /// re-strikes `revoke_grant` through the P-07 port, which a composition
+    /// without one refuses, and it never looks at committed closure bytes, so
+    /// nothing at base can file the lost acknowledgement of a first phase this
+    /// composition never presented. The asserted `Revoked` projection and the
+    /// zero call counts are therefore base-unreachable, not base-passing.
+    #[test]
+    fn pending_canonical_revocation_is_admitted_without_re_striking_the_kernel() {
+        let (kernel, mut composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        // No retained authority port: the resume must complete its admission on
+        // a composition whose P-07 boundary is unavailable, which is exactly
+        // the state the Kernel-first saga cannot serve.
+        assert!(!composition.authority_activation_available());
+        let request = eliot_authority::GrantRevocationRequest {
+            grant_id: eliot_authority::GrantId::new("grant-a").expect("grant id"),
+            snapshot_id: eliot_authority::SnapshotId::new("snap-1").expect("snapshot id"),
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+        };
+        let closure = pending_closure_fixture(&fence, None);
+        let identity = commit_identity(&fence);
+        let link = CountingClosureLinkPort::default();
+
+        block_on(composition.apply_pending_canonical_revocation(
+            &request,
+            &closure,
+            &OperationId::new("op-closure-resume").expect("operation id"),
+            &identity,
+            &revocation_operation_fixture(),
+            &link,
+        ))
+        .expect_err("the saga still refuses while this projection cannot re-derive the closure");
+
+        // The visible stricter revocation intent is retained: the grant reads
+        // revoked and no activation may revive it, which is the fail-closed
+        // direction A0.3 requires of an unresolved canonical revocation.
+        let grant_a = eliot_authority::GrantId::new("grant-a").expect("grant id");
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            Some(eliot_authority::GrantStatus::Revoked)
+        );
+        // Nothing durable was manufactured: no canonical envelope was
+        // committed, and the durable ORS link was never reached.
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert_eq!(*link.calls.lock().expect("link call lock"), 0);
+    }
+
+    /// Refusal case: a committed closure whose canonical second phase is
+    /// ALREADY linked is not a pending obligation, so the resume refuses it
+    /// before it can file anything, reach the saga, or touch the durable link.
+    ///
+    /// WHY IT FAILS WITHOUT THIS CHANGE: the entry does not exist at base, and
+    /// no base method inspects `GrantClosureReceipt::canonical_receipt`. At
+    /// base the nearest behaviour is `apply_admitted_authority_revocation`,
+    /// which re-strikes the Kernel revoke for an operation that is already
+    /// canonically reconciled — turning a finished obligation into a second,
+    /// differently shaped revocation attempt. The proof's `link.calls() == 0`
+    /// and the absence of any retained `Revoked` projection pin the refusal to
+    /// before the saga.
+    #[test]
+    fn already_linked_closure_is_refused_as_no_pending_obligation() {
+        let (kernel, mut composition) = committed_composition();
+        let fence = composition.kernel_snapshot().state_fence().clone();
+        let request = eliot_authority::GrantRevocationRequest {
+            grant_id: eliot_authority::GrantId::new("grant-a").expect("grant id"),
+            snapshot_id: eliot_authority::SnapshotId::new("snap-1").expect("snapshot id"),
+            binding: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+        };
+        let linked = ReceiptIdentity {
+            receipt_id: eliot_receipts::ReceiptId::new("receipt-linked").expect("receipt id"),
+            canonical_sha256: "f".repeat(64),
+        };
+        let closure = pending_closure_fixture(&fence, Some(linked.clone()));
+        // The ORIGINAL recorded bytes are still validated by the closure's own
+        // contract before they are read as an obligation.
+        closure
+            .validate()
+            .expect("the committed closure satisfies its own receipt contract");
+        let identity = commit_identity(&fence);
+        let link = CountingClosureLinkPort::default();
+
+        let error = block_on(composition.apply_pending_canonical_revocation(
+            &request,
+            &closure,
+            &OperationId::new("op-closure-relink").expect("operation id"),
+            &identity,
+            &revocation_operation_fixture(),
+            &link,
+        ))
+        .expect_err("an already reconciled closure is not a pending obligation");
+        match error {
+            CompositionError::Owner(ref message) => assert!(
+                message.contains("already linked"),
+                "the refusal must name the completed second phase: {message}"
+            ),
+            other => panic!("expected an owner refusal, got {other:?}"),
+        }
+        // Nothing was filed, nothing was committed, and the link stayed out.
+        let grant_a = eliot_authority::GrantId::new("grant-a").expect("grant id");
+        assert_eq!(
+            composition.authority_grant_status(&grant_a),
+            None,
+            "a refused admission must not leave a retained revocation behind"
+        );
+        assert_eq!(*kernel.apply_calls.lock().expect("apply call lock"), 0);
+        assert_eq!(*link.calls.lock().expect("link call lock"), 0);
     }
 
     fn r1_publish(
