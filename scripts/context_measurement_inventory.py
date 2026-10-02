@@ -66,7 +66,25 @@ workset exceeds the I2.16 upper review band, as a new closed top-level
 classification set, the 72-case denominator and the owner allocations are
 unchanged, so every existing row keeps its identity and digest inputs.
 
-Classification rules (RULE_REVISION 866.3, first match wins, evidence kept):
+Revision 866.4 changes no classification rule either, and adds, removes and
+reclassifies nothing outside one row. It re-anchors case 880/16, whose frozen
+signal was the curator's pre-migration cost limb
+``context_cost(skill).is_some_and(|cost| cost >= 180)``: #880 deleted that
+limb rather than retuning it, so the exact expression the row existed to detect
+is legitimately absent and ``_locate_signal`` fails closed with SIGNAL_ABSENT.
+The row is RETIRED-AND-RE-ANCHORED, not deleted, because erasing it would
+erase a requirement that still exists -- the curator's canonical measured Skill
+context cost is still taken on every proposal and still reported as the
+proposal's cost evidence. The new anchor is the surviving function that decides
+what that measurement does (see the comment on 880/16 in CONSUMER_SEAM_CASES).
+The denominator stays 72 cases, ``EXPECTED_DENOMINATOR_COUNT`` and
+``EXPECTED_OWNER_ALLOCATIONS`` are untouched, ``unresolved_count`` stays 4 and
+``coverage_disposition`` stays INCOMPLETE. The fifteen-class closed set and
+every classification arm are unchanged; 880/16's own classification is reported
+as the site it now anchors actually earns, which is the one honest consequence
+of re-anchoring and is visible in the row's successor_scope and evidence.
+
+Classification rules (RULE_REVISION 866.4, first match wins, evidence kept):
   1. signal is "#[test]" or "cfg(test)", or the enclosing item scope is a
      real test scope -> test-only
   2. signal contains "stu_for_bytes" or signal is "StuEstimate"
@@ -193,7 +211,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.context-measurement-inventory.v2"
-RULE_REVISION = "866.3"
+RULE_REVISION = "866.4"
 TOOL_VERSION = "0.2.0"
 OWNED_TOML = Path(".github/work-units/context-measurement-inventory.toml")
 OWNER_MAP_PATH = Path(".github/work-units/context-measurement-owner-map.toml")
@@ -338,7 +356,58 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("880/13", "#880", "crates/eliot-engine/src/skill_curator.rs", "context_cost(skill: &SkillCardV2) -> Option<u64> {"),
     ("880/14", "#880", "crates/eliot-engine/src/skill_curator.rs", ".map(|measurement| measurement.estimated_context_cost())"),
     ("880/15", "#880", "crates/eliot-engine/src/skill_curator.rs", "context_cost_delta_tokens: expected_context_delta(action, skill)"),
-    ("880/16", "#880", "crates/eliot-engine/src/skill_curator.rs", "context_cost(skill).is_some_and(|cost| cost >= 180)"),
+    # 880/16 is RETIRED-AND-RE-ANCHORED by rule revision 866.4, not deleted.
+    #
+    # The row froze the pre-migration expression
+    # `context_cost(skill).is_some_and(|cost| cost >= 180)`, the cost arm that
+    # read an unvalidated STU through a hard-coded 180 threshold inside `fn
+    # low_utility_high_cost`. #880 migrated the curator: the cost arm is DELETED,
+    # not retuned, because the owner cannot produce a proven Skill measurement at
+    # all -- `SkillContextEnvelopeMeasurement` carries no route/model/tokenizer
+    # identity and `proves_fit` returns UnknownMeasurement for ConservativeStu --
+    # so the limb compared an unvalidated planning estimate against a lifecycle
+    # threshold. No replacement threshold, constant or field was introduced.
+    #
+    # The requirement the row stands for is therefore NOT erased, exactly as
+    # #866's contract requires ("Preserve baseline row identity through migration
+    # reconciliation; do not erase a finding merely because its old expression
+    # disappeared") and as #787 requires ("Removal of the old formula alone cannot
+    # erase its underlying requirement"). The underlying requirement -- the
+    # curator's canonical measured Skill context cost -- SURVIVES in the very same
+    # file and is still measured on every proposal: 880/13 freezes its
+    # declaration, 880/14 freezes the `estimated_context_cost()` projection
+    # inside it, and 880/15 freezes `expected_context_delta`, which reports the
+    # measurement as the proposal's cost evidence. The doc comment at
+    # skill_curator.rs records that the measurement "is still taken and still
+    # reported as the proposal's cost evidence by `expected_context_delta`; it
+    # stopped being a lifecycle trigger", so the surviving measurement and the
+    # retired trigger are both machine-derivable from source.
+    #
+    # The anchor is `fn expected_context_delta`, a whole-item span (a needle
+    # starting with "fn " anchors its enclosing item via `_locate_signal` ->
+    # `_item_extent`), so the row pins the exact multi-line function that still
+    # decides what the measured cost DOES, rather than collapsing onto one line.
+    # This is the same anchor shape revision 866.2's own writer used for 878/11
+    # ("fn estimate_tokens(packet: &ContextPacketL3)") and the same re-anchor
+    # discipline the #783 migration applied to 783/14 in 4eb7a9a9e: keep the
+    # case_ref, keep the owner, and re-point the anchor at the surviving
+    # measurement the migration left behind. It is measured to claim no span any
+    # other denominator row already claims.
+    #
+    # The classification therefore moves from
+    # `bare_measurement_field_or_conversion` (the retired arm was read by rule
+    # 13, MEASURED_FIELD) to `token_estimate_without_tokenizer` (the surviving
+    # function is read by ESTIMATOR_CALL_RE). That is not a rule change and not
+    # a weakening: the fifteen-class closed set is untouched, no arm was added
+    # or widened, and every one of these rows was already measured at this class
+    # before this revision. It is the accurate report of a site whose arm
+    # genuinely moved from "reads a measured field" to "calls a declared local
+    # estimator that consumes an unvalidated ratio". 880/15 already classified at
+    # `token_estimate_without_tokenizer` for the same estimator from the call
+    # site, so the pre-existing evidence that this estimator has no run route
+    # tokenizer is preserved on the row; what is recorded now is that the
+    # anchor covers the whole site rather than one field on one line.
+    ("880/16", "#880", "crates/eliot-engine/src/skill_curator.rs", "fn expected_context_delta(action: SkillCurationAction, skill: &SkillCardV2) -> i64 {"),
     ("880/17", "#880", "crates/eliot-engine/src/memory_distillation.rs", ".saturating_add(record.serialized_bytes.div_ceil(1024));"),
     ("880/18", "#880", "crates/eliot-engine/src/memory_distillation.rs", "MemoryUtilitySignalKind::ContextTokenCost => {"),
     ("880/19", "#880", "crates/eliot-engine/src/memory_distillation.rs", ".map(|item| canonical_bytes_for_measured_units(item.token_units))"),
