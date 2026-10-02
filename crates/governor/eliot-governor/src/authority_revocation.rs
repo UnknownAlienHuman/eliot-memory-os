@@ -82,7 +82,7 @@ use eliot_store_api::{
 
 use crate::{
     CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort,
-    GrantClosureSecondPhaseLink, KernelPortError,
+    GrantClosureSecondPhaseLink, KernelPortError, KernelPortFuture,
 };
 use eliot_authority::{
     AuthorityRevocationClosureEvidence, GrantRevocationRequest,
@@ -754,47 +754,49 @@ fn closure_link_error(error: OrsError) -> KernelPortError {
 /// what lets a transport client with no in-process ORS implement the same port
 /// from the far side of the authenticated transport.
 impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
-    fn link_grant_closure_canonical_receipt(
-        &self,
-        operation_id: &str,
-        canonical_receipt: &ReceiptIdentity,
-    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
-        // The typed ORS operation identity is rebuilt here, from the ORIGINAL
-        // recorded first-phase bytes the caller presents, because this is the
-        // boundary that calls the store. `OperationIdentity::new` applies the
-        // bounded non-blank/control-character check the neutral port signature
-        // cannot express, so the constraint is enforced rather than dropped; an
-        // unusable identity is a determinate contract refusal, not a link.
-        let operation_id = OperationIdentity::new(operation_id).map_err(|error| {
-            KernelPortError::Contract(format!(
-                "unusable grant closure operation identity: {error}"
+    fn link_grant_closure_canonical_receipt<'a>(
+        &'a self,
+        operation_id: &'a str,
+        canonical_receipt: &'a ReceiptIdentity,
+    ) -> KernelPortFuture<'a, GrantClosureSecondPhaseLink> {
+        Box::pin(async move {
+            // The typed ORS operation identity is rebuilt here, from the ORIGINAL
+            // recorded first-phase bytes the caller presents, because this is the
+            // boundary that calls the store. `OperationIdentity::new` applies the
+            // bounded non-blank/control-character check the neutral port signature
+            // cannot express, so the constraint is enforced rather than dropped; an
+            // unusable identity is a determinate contract refusal, not a link.
+            let operation_id = OperationIdentity::new(operation_id).map_err(|error| {
+                KernelPortError::Contract(format!(
+                    "unusable grant closure operation identity: {error}"
+                ))
+            })?;
+            let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
+                self.as_ref(),
+                &operation_id,
+                canonical_receipt,
+            )
+            .map_err(closure_link_error)?;
+            let commit = projection.commit();
+            if commit.operation_id != operation_id.as_str()
+                || projection.second_phase() != Some(canonical_receipt)
+                || commit
+                    .canonical_receipt
+                    .as_ref()
+                    .is_some_and(|first_phase| first_phase != canonical_receipt)
+            {
+                return Err(KernelPortError::Contract(
+                    "canonical closure receipt link read-back disagrees".to_owned(),
+                ));
+            }
+            // The ORIGINAL committed first-phase bytes, copied verbatim out of the
+            // owner's own read-back. The first-phase row is not edited here; only
+            // the second-phase link was added, above, by the store itself.
+            Ok(GrantClosureSecondPhaseLink::new(
+                commit.clone(),
+                canonical_receipt.clone(),
             ))
-        })?;
-        let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
-            self.as_ref(),
-            &operation_id,
-            canonical_receipt,
-        )
-        .map_err(closure_link_error)?;
-        let commit = projection.commit();
-        if commit.operation_id != operation_id.as_str()
-            || projection.second_phase() != Some(canonical_receipt)
-            || commit
-                .canonical_receipt
-                .as_ref()
-                .is_some_and(|first_phase| first_phase != canonical_receipt)
-        {
-            return Err(KernelPortError::Contract(
-                "canonical closure receipt link read-back disagrees".to_owned(),
-            ));
-        }
-        // The ORIGINAL committed first-phase bytes, copied verbatim out of the
-        // owner's own read-back. The first-phase row is not edited here; only
-        // the second-phase link was added, above, by the store itself.
-        Ok(GrantClosureSecondPhaseLink::new(
-            commit.clone(),
-            canonical_receipt.clone(),
-        ))
+        })
     }
 }
 

@@ -52,30 +52,37 @@
 //!    field from the Kernel owner's committed closure bytes plus the live
 //!    admitted fence. Nothing is derived from the restored graph and nothing
 //!    from a diagnostic row: a diagnostic tick alone stays non-authoritative.
-//! 2. **The admitted handoff is still unreachable through that method.** A
-//!    committed first phase whose second phase never completed is exactly the
-//!    case `apply_admitted_authority_revocation` exists to resume, but that
-//!    method re-strikes the Kernel-first `revoke_grant`, and the Kernel
-//!    correctly refuses it: `admitted_grant_hydrations` retains out every
+//! 2. **The admitted handoff is unreachable through that method.** A committed
+//!    first phase whose second phase never completed is exactly the case
+//!    `apply_admitted_authority_revocation` exists to resume, but that method
+//!    re-strikes the Kernel-first `revoke_grant`, and the Kernel correctly
+//!    refuses it: `admitted_grant_hydrations` retains out every
 //!    `non_admissible` grant
 //!    (`crates/kernel/eliot-kernel-core/src/governor_closure_source.rs`), and
 //!    `admit_p07_target_against_current_grant_graph` answers `NotAdmitted` for
 //!    any target outside that set
-//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs`). The second-phase
-//!    resume the pass below tenders therefore needs a public second-phase-only
-//!    entry in `eliot-governor`, which does not exist:
-//!    `GovernorComposition::reconcile_canonical_revocation` and
-//!    `GovernorComposition::link_closure_second_phase` are both private. The
-//!    admitted value this pass tenders is typed and documented for that entry
-//!    alone; presenting it to the fresh Kernel-first saga is forbidden.
+//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs`). Presenting the
+//!    admitted value to that fresh Kernel-first saga is therefore forbidden.
+//!
+//! # What this module DOES drive
+//!
+//! The admitted handoff is tendered to
+//! `GovernorComposition::apply_pending_canonical_revocation` — the public
+//! second-phase-only resume, which never re-strikes the Kernel — through
+//! [`admit_canonical_revocation_resumes`], which composes the three admitted
+//! identities that entry requires. The durable second-phase link travels
+//! through `DaemonKernelClient`'s
+//! [`GrantClosureCanonicalLinkPort`](eliot_governor::GrantClosureCanonicalLinkPort)
+//! implementation, which records it over the Kernel route that owns ORS inside
+//! the Kernel process. The driver is
+//! `bins/eliotd/src/daemon_runtime.rs::report_authority_revocation_ingress`.
 //!
 //! The exact remaining gap is named in
-//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]: `eliot-governor` must expose the
-//! public second-phase-only resume accepting the owner-admitted value. The
-//! maintenance-request half of that contract — the owner that re-admits the
-//! exact operation — now exists in
-//! [`crate::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation`];
-//! only the Governor drive is still missing.
+//! [`AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED`]: the canonical
+//! `RecordAuthorityRevocation` commit is still known-but-unsupported in the
+//! closed Store catalogue, so a resumed obligation fails closed at that commit
+//! and stays recorded as a pending stricter revocation instead of being reported
+//! as a recorded revocation.
 //!
 //! Forbidden boundary: no ORS access (the Kernel owns ORS in its own
 //! process), no second grant graph, no fabricated request, identity or
@@ -85,9 +92,14 @@
 
 use std::sync::Arc;
 
-use eliot_authority::GrantStatus;
+use eliot_authority::{GrantRevocationRequest, GrantStatus, RevocationOperationIdentity};
 use eliot_contracts::StateFence;
+use eliot_contracts::{
+    ClockReading, OperationId, ReceiptId, TaskId, TransactionSequence, canonical_json_bytes,
+    sha256_hex,
+};
 use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider};
+use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
 use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
 
@@ -109,30 +121,46 @@ const GRANT_CLOSURE_RECEIPT_REFUSAL_KIND: &str = "grant_closure_receipt_refused"
 /// The same literal and the same `StoreError` variant are already bound in
 /// `owner_feed.rs` (`RECEIPT_NOT_FOUND_REASON`).
 const RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
-
-/// The exact remaining gap before any daemon pass can drive the canonical
-/// second phase of a grant revocation, reported on every pending record this
-/// pass finds.
+/// Closed semantic command kind of the canonical second-phase resume write.
 ///
-/// The authenticated Human/Policy maintenance-request owner now re-admits the
-/// exact committed operation for each pending closure
-/// ([`AdmittedMaintenanceRevocation`]), so the obligation is held by an owner
-/// instead of merely diagnosed. What is still missing is the Governor drive:
-/// `eliot-governor` must expose a public second-phase-only resume accepting
-/// that admitted value.
+/// It is the daemon's I5.27 identity coordinate for this operation, so it is
+/// named once here and reused for both the transport request identity and the
+/// canonical revocation operation id rather than spelled at each use.
+const CANONICAL_REVOCATION_RESUME_OPERATION: &str = "authority.revocation.resume";
+/// Domain separator and version of the pass-level observation digest below.
+const CLOSURE_RECEIPT_READ_DIGEST_INPUT: &str =
+    "authority-revocation-ingress.closure-receipt-read.v1";
+/// Typed degradation emitted when no admitted revocation operation identity
+/// reaches the Governor resume, naming the exact owner that must supply one.
+const REVOCATION_OPERATION_IDENTITY_ABSENT: &str = "revocation operation identity absent";
+
+/// The exact remaining gap in the canonical second phase of a grant
+/// revocation, reported on every pending record this pass finds.
+///
+/// The drive itself is no longer missing: the authenticated Human/Policy
+/// maintenance-request owner re-admits the exact committed operation for each
+/// pending closure ([`AdmittedMaintenanceRevocation`]), and
+/// `daemon_runtime::report_authority_revocation_ingress` feeds that admitted
+/// value to `GovernorComposition::apply_pending_canonical_revocation`, whose
+/// durable link half runs through the Kernel route that owns ORS.
+///
+/// What still cannot complete is the canonical record itself:
+/// `NamedMutationOperation::RecordAuthorityRevocation` is deliberately
+/// known-but-unsupported in the closed Store catalogue
+/// (`crates/storage/eliot-store-api/src/operation_catalogue.rs`), so the
+/// canonical commit refuses with `StoreError::UnknownOperation` and the second
+/// phase stays pending. Activating that catalogue row (row, proven per-backend
+/// handler, consumer triple, and the count-test migration) is store-owned work.
 ///
 /// Naming it here rather than leaving the pass silent is the point: a pending
 /// canonical second phase is real, actionable, durable state. Reporting it
 /// without naming the blocker would present an unfinished obligation as a
 /// handled one.
-pub const AUTHORITY_REVOCATION_RESUME_BLOCKED: &str = "no Governor entry drives the canonical second phase: eliot-governor \
-     must expose a public second-phase-only resume accepting the owner-admitted \
-     AdmittedMaintenanceRevocation, because \
-     GovernorComposition::apply_admitted_authority_revocation re-strikes the \
-     Kernel-first revoke_grant that the Kernel refuses with NotAdmitted for a \
-     grant its own owner already fences, and its \
-     reconcile_canonical_revocation/link_closure_second_phase helpers are \
-     private";
+pub const AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED: &str =
+    "canonical second phase cannot complete: the Store catalogue keeps \
+     NamedMutationOperation::RecordAuthorityRevocation known-but-unsupported, so the canonical \
+     revocation commit fails closed and the obligation stays pending instead of becoming a \
+     recorded revocation";
 
 /// One grant the recovered owner graph names, captured before the composition
 /// lock is released.
@@ -167,6 +195,16 @@ impl AuthorityRevocationIngressPlan {
     pub const fn revision(&self) -> u64 {
         self.revision
     }
+
+    /// Returns the exact State Fence this pass is bound to.
+    ///
+    /// The Governor resume composes its admitted identities under this same
+    /// fence, and the composition re-checks each of them against the live fence
+    /// and against the committed closure before it acts.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
 }
 
 /// One committed first-phase closure whose canonical second phase has not been
@@ -198,8 +236,8 @@ pub struct PendingCanonicalSecondPhase {
     /// canonical second phase still did not. Diagnostic only: it never
     /// enters the owner admission.
     pub recovered_status: GrantStatus,
-    /// Why this pass cannot finish the second phase. Always
-    /// [`AUTHORITY_REVOCATION_RESUME_BLOCKED`].
+    /// Why this pass cannot finish the canonical record itself. Always
+    /// [`AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED`].
     pub resume_blocked: &'static str,
     /// What the maintenance-request owner did with this obligation.
     pub admission: PendingRevocationAdmission,
@@ -318,6 +356,213 @@ impl AuthorityRevocationIngressReport {
     }
 }
 
+/// One owner-admitted pending second phase, composed into exactly the inputs
+/// the Governor second-phase-only resume entry consumes.
+///
+/// The three identities are the same indivisible admission
+/// `GovernorComposition::apply_pending_canonical_revocation` takes: the
+/// canonical operation id, the admitted canonical request identity, and the
+/// admitted revocation operation identity. They are composed here, together
+/// and never separately, because the composition refuses a mixture of two
+/// different operations.
+///
+/// Every coordinate is an owner-proved fact, never a value derived from the
+/// graph under audit:
+///
+/// * the request and the committed closure are the owner's own committed bytes,
+///   re-admitted by the maintenance-request owner and carried verbatim;
+/// * the canonical operation id is a pure function of the ORIGINAL recorded
+///   first-phase closure operation id, so an exact replay resolves to the same
+///   operation and a changed closure conflicts under it (I5.27);
+/// * the canonical request identity is this daemon's own I5.27 transport
+///   identity, minted by the single daemon owner over exactly those committed
+///   closure bytes;
+/// * the revocation operation identity's five coordinates are the
+///   Kernel-validated session principal, the admitted generation this pass runs
+///   under, the committed authority root namespace the closure declares, the
+///   pass-level closure-receipt read digest as the observation, and the causal
+///   `transaction_sequence` of the admitted generation — never a wall clock
+///   reading and never a value taken from the recovered graph.
+#[derive(Clone, Debug)]
+pub struct AdmittedCanonicalRevocationResume {
+    request: GrantRevocationRequest,
+    committed_closure: GrantClosureReceipt,
+    canonical_operation_id: OperationId,
+    canonical_request_identity: RequestIdentity,
+    operation: RevocationOperationIdentity,
+}
+
+impl AdmittedCanonicalRevocationResume {
+    /// Returns the exact re-admitted revocation request.
+    #[must_use]
+    pub const fn request(&self) -> &GrantRevocationRequest {
+        &self.request
+    }
+
+    /// Returns the ORIGINAL committed first-phase closure receipt the resume
+    /// runs against.
+    #[must_use]
+    pub const fn committed_closure(&self) -> &GrantClosureReceipt {
+        &self.committed_closure
+    }
+
+    /// Returns the admitted canonical operation identity of this resume.
+    #[must_use]
+    pub const fn canonical_operation_id(&self) -> &OperationId {
+        &self.canonical_operation_id
+    }
+
+    /// Returns the admitted canonical request identity of this resume.
+    #[must_use]
+    pub const fn canonical_request_identity(&self) -> &RequestIdentity {
+        &self.canonical_request_identity
+    }
+
+    /// Returns the admitted revocation operation identity of this resume.
+    #[must_use]
+    pub const fn operation(&self) -> &RevocationOperationIdentity {
+        &self.operation
+    }
+}
+
+/// Composes one Governor second-phase-only resume handoff per owner-admitted
+/// pending closure, under the admitted identities that handoff requires.
+///
+/// An empty admitted set composes nothing and returns an empty vector: a pass
+/// that found no pending canonical second phase performs no Kernel exchange and
+/// mints no identity.
+///
+/// `state_fence` must be the pass's own admitted fence and `revision` its
+/// captured grant-graph revision, so the composed operation identities name
+/// the exact observation this pass made. The composition re-checks each composed
+/// identity against its own live fence and against the committed closure bytes
+/// before it acts, so nothing here is taken on trust.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] when the Kernel has admitted no
+/// validated session binding for this connection — the principal coordinate is
+/// unavailable and is never invented — and [`CompositionError::Owner`] when the
+/// owner facts are present but not admissible (unusable identity text, or a
+/// canonicalization failure over the committed closure bytes).
+pub fn admit_canonical_revocation_resumes(
+    state_fence: &StateFence,
+    revision: u64,
+    admitted: &[&AdmittedMaintenanceRevocation],
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<Vec<AdmittedCanonicalRevocationResume>, CompositionError> {
+    if admitted.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The principal is the Kernel-authenticated session binding this
+    // connection proved during its handshake, and it doubles as the I5.27
+    // principal-and-scope coordinate of the composed request identities. Absent
+    // before any validated handshake, which degrades the pass instead of
+    // inventing a session.
+    let principal = kernel.validated_session_binding().ok_or_else(|| {
+        CompositionError::Recovery(format!(
+            "{REVOCATION_OPERATION_IDENTITY_ABSENT}: no Kernel-validated session binding \
+             (graph revision {revision}, {} admitted pending closure(s))",
+            admitted.len()
+        ))
+    })?;
+    let observing_receipt = observed_closure_receipt_read_identity(state_fence, revision, admitted)?;
+    let epoch = state_fence.authority_epoch.clone();
+    let generation = format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence.get());
+    // The resume is the installation's own recovery work, not product task
+    // work, so the admitted task is the generation the resume runs under. The
+    // coordinate is still required and still refuses blank text.
+    let admitted_task = TaskId::new(format!("kernel-generation:{generation}"))
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let transaction_sequence = TransactionSequence::new(state_fence.resource_generation.value())
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    let mut resumes = Vec::with_capacity(admitted.len());
+    for row in admitted {
+        let committed_closure = row.committed_closure();
+        // The canonical operation id is a pure function of the ORIGINAL recorded
+        // first-phase operation identity: an exact replay of one pending
+        // obligation is the same canonical operation, while a changed closure
+        // under it is the I5.27 changed-payload conflict rather than a second
+        // operation.
+        let canonical_operation_id =
+            OperationId::new(format!("{CANONICAL_REVOCATION_RESUME_OPERATION}:{}", row.closure_operation_id()))
+                .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        // The canonical request bytes are the owner's own committed closure the
+        // resume is about to record against. Nothing is re-derived, so a changed
+        // closure derives a different request identity under the same operation.
+        let canonical_request = serde_json::to_value(committed_closure)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let canonical_request_identity = kernel
+            .canonical_write_identity(
+                CANONICAL_REVOCATION_RESUME_OPERATION,
+                &principal,
+                &canonical_request,
+            )
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let operation = RevocationOperationIdentity::admit(
+            principal.clone(),
+            admitted_task.clone(),
+            committed_closure.declaration.authority_root_ref.clone(),
+            observing_receipt.clone(),
+            ClockReading {
+                valid_time_ms: None,
+                known_time_ms: None,
+                transaction_sequence: Some(transaction_sequence.clone()),
+                monotonic_ns: None,
+            },
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        resumes.push(AdmittedCanonicalRevocationResume {
+            request: row.request().clone(),
+            committed_closure: committed_closure.clone(),
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+        });
+    }
+    Ok(resumes)
+}
+
+/// The pass-level observation identity the composed revocation operation
+/// identities name as their observing receipt.
+///
+/// It is a digest-bound fold over the exact `(closure operation, Kernel-issued
+/// revocation receipt, owner snapshot)` triples this pass read over the
+/// authenticated front door, bound to the admitted authority epoch and graph
+/// revision. It is therefore the identity of the READ, not one of the closures
+/// under recheck, so the origin-bound re-derivation the Governor composition
+/// performs over its own graph cannot certify itself through it.
+fn observed_closure_receipt_read_identity(
+    state_fence: &StateFence,
+    revision: u64,
+    admitted: &[&AdmittedMaintenanceRevocation],
+) -> Result<ReceiptId, CompositionError> {
+    let read: Vec<(&str, &str, &str)> = admitted
+        .iter()
+        .map(|row| {
+            let authority_receipt = &row.committed_closure().authority_receipt;
+            (
+                row.closure_operation_id(),
+                authority_receipt.receipt_id.as_str(),
+                authority_receipt.snapshot_id.as_str(),
+            )
+        })
+        .collect();
+    // The admitted rows arrive in the pass's own candidate order and are pushed
+    // in that order, so the preimage is deterministic across passes and
+    // restarts.
+    let digest = sha256_hex(
+        &canonical_json_bytes(&(
+            CLOSURE_RECEIPT_READ_DIGEST_INPUT,
+            state_fence.authority_epoch.sequence.get(),
+            revision,
+            read,
+        ))
+        .map_err(|error| CompositionError::Owner(error.to_string()))?,
+    );
+    ReceiptId::new(digest).map_err(|error| CompositionError::Owner(error.to_string()))
+}
+
 /// Captures the exact admitted authority state one ingress pass reads from.
 ///
 /// This function is synchronous and performs no Kernel transport calls. The
@@ -377,7 +622,8 @@ pub fn capture_authority_revocation_ingress_plan(
 /// presents a revocation request to a fresh saga: the one revocation value it
 /// builds is the owner's own re-admission of the exact committed operation,
 /// tendered for the Governor second-phase-only resume entry alone (see the
-/// module documentation and [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]). A
+/// module documentation and
+/// [`AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED`]). A
 /// diagnostic tick alone stays non-authoritative: only a
 /// [`PendingRevocationAdmission::Admitted`] row carries authority forward,
 /// and an owner-refused row stays pending/recovery-required.
@@ -434,7 +680,7 @@ pub async fn scan_authority_revocation_ingress(
                 authority_receipt_id: closure.authority_receipt.receipt_id,
                 snapshot_id: closure.authority_receipt.snapshot_id,
                 recovered_status: candidate.status,
-                resume_blocked: AUTHORITY_REVOCATION_RESUME_BLOCKED,
+                resume_blocked: AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED,
                 admission,
             });
         }
@@ -527,4 +773,226 @@ async fn read_committed_closure(
         )));
     }
     Ok(Some(closure))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "tests use expects for fixed-valid protocol fixtures"
+    )]
+
+    use super::*;
+
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "7d3fbb1e-0a2f-4c1f-9a2e-3f5f9d0c1a44";
+    const TEST_PRINCIPAL: &str = "principal:kernel-session-1";
+
+    fn test_fence() -> StateFence {
+        let lineage = EpochLineageId::new(TEST_LINEAGE).expect("test epoch lineage");
+        let epoch = EpochId::new(
+            lineage,
+            NonZeroU64::new(1).expect("test epoch sequence is non-zero"),
+        )
+        .expect("test authority epoch");
+        StateFence::new(
+            epoch,
+            ResourceGeneration::new(1).expect("test resource generation"),
+        )
+    }
+
+    fn kernel_with_session(fence: &StateFence) -> Arc<DaemonKernelClient> {
+        let mut client =
+            DaemonKernelClient::new_for_test(fence.authority_epoch.clone(), fence.clone());
+        *client
+            .validated_session_binding
+            .lock()
+            .expect("session binding lock") = Some(TEST_PRINCIPAL.to_owned());
+        Arc::new(client)
+    }
+
+    /// One committed revoked first phase whose canonical second phase has not
+    /// been linked, in exactly the shape the closure receipt contract requires.
+    fn committed_pending_closure(fence: &StateFence, idempotency_digest: &str) -> GrantClosureReceipt {
+        let closure = GrantClosureReceipt {
+            schema: eliot_receipts::GRANT_CLOSURE_SCHEMA.to_owned(),
+            version: eliot_receipts::GRANT_CLOSURE_VERSION,
+            operation_id: "closure-op-1".to_owned(),
+            idempotency_digest: idempotency_digest.to_owned(),
+            declaration: eliot_receipts::GrantClosureDeclaration {
+                schema: eliot_receipts::GRANT_CLOSURE_SCHEMA.to_owned(),
+                version: eliot_receipts::GRANT_CLOSURE_VERSION,
+                target_grant_id: "grant-a".to_owned(),
+                authority_root_ref: "authority:root-1".to_owned(),
+                grant_graph_revision: 7,
+                members: vec![eliot_receipts::GrantClosureMemberDeclaration {
+                    grant_id: "grant-a".to_owned(),
+                    parent_grant_id: None,
+                }],
+                preserved: Vec::new(),
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            authority: AuthorityBinding {
+                authority_id: ContractId::new("authority:test").expect("authority id"),
+                authority_owner: "test-owner".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state_fence: fence.clone(),
+                allowed_effect: EffectClass::ExternalEffect,
+                proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            },
+            proof_ceiling: ProofCeiling::ObservedExternalEffect,
+            authority_receipt: eliot_receipts::GrantClosureAuthorityReceiptRef {
+                receipt_id: "revocation-closure-op-1".to_owned(),
+                snapshot_id: "snap-1".to_owned(),
+                authority_epoch: fence.authority_epoch.clone(),
+                state: GrantClosureState::Revoked,
+            },
+            ors_member_receipts: vec![eliot_receipts::GrantClosureOrsReceiptRef {
+                record_id: "ors-member-1".to_owned(),
+                subject_id: "grant-a".to_owned(),
+                operation_order: 1,
+                state: GrantClosureState::Revoked,
+                state_sha256: "e".repeat(64),
+            }],
+            fenced_introductions: Vec::new(),
+            ors_introduction_receipts: Vec::new(),
+            canonical_receipt: None,
+            state: GrantClosureState::Revoked,
+        };
+        closure
+            .validate()
+            .expect("the committed closure satisfies its own receipt contract");
+        closure
+    }
+
+    /// Positive case: one owner-admitted pending closure composes exactly one
+    /// resume handoff whose every coordinate is the owner's own committed
+    /// material, and the composition is idempotent for one unchanged closure
+    /// while a changed payload under the same first-phase operation derives a
+    /// different canonical request identity (I5.27).
+    ///
+    /// WHY IT FAILS WITHOUT THIS CHANGE: `admit_canonical_revocation_resumes`
+    /// does not exist at base, and no base method composes the three admitted
+    /// identities the Governor second-phase-only resume entry requires. The
+    /// nearest base surface, `AdmittedMaintenanceRevocation`, carried only the
+    /// derived request and the closure operation id — so the canonical operation
+    /// id, the admitted canonical request identity and the five-coordinate
+    /// revocation operation identity could not be produced from owner material
+    /// at all, and the resume entry had no input to consume. The asserted
+    /// operation-id stability and changed-payload divergence are therefore
+    /// base-unreachable, not base-passing.
+    #[test]
+    fn admitted_pending_closure_composes_one_stable_resume_handoff() {
+        let fence = test_fence();
+        let kernel = kernel_with_session(&fence);
+        let closure = committed_pending_closure(&fence, &"d".repeat(64));
+        let admitted =
+            AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
+                .expect("the committed closure is an admissible pending obligation");
+
+        let resumes =
+            admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
+                .expect("an admitted pending closure composes a resume handoff");
+        assert_eq!(resumes.len(), 1, "one admitted row is one resume handoff");
+        let resume = &resumes[0];
+        // The owner's own committed bytes travel verbatim; nothing is re-derived.
+        assert_eq!(resume.committed_closure(), &closure);
+        assert_eq!(resume.request().grant_id.as_str(), "grant-a");
+        assert_eq!(resume.request().snapshot_id.as_str(), "snap-1");
+        // The canonical operation id is a pure function of the ORIGINAL recorded
+        // first-phase operation identity, so an unchanged closure replays into
+        // the same canonical operation.
+        assert_eq!(
+            resume.canonical_operation_id().as_str(),
+            format!("{CANONICAL_REVOCATION_RESUME_OPERATION}:{}", closure.operation_id)
+        );
+
+        let replayed =
+            admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
+                .expect("an exact replay composes the same handoff");
+        assert_eq!(
+            replayed[0].canonical_operation_id(),
+            resume.canonical_operation_id(),
+            "an exact replay must resolve to the same canonical operation"
+        );
+        assert_eq!(
+            replayed[0].canonical_request_identity().idempotency_key,
+            resume.canonical_request_identity().idempotency_key,
+            "an exact replay must resolve to the same idempotency key"
+        );
+
+        // A changed payload under the same first-phase operation keeps the same
+        // canonical operation identity and derives a different request identity,
+        // so the store sees the I5.27 changed-payload conflict rather than a
+        // second operation.
+        let changed = committed_pending_closure(&fence, &"f".repeat(64));
+        assert_eq!(
+            changed.operation_id, closure.operation_id,
+            "the fixture must vary only the payload for this check to mean anything"
+        );
+        let changed_admitted =
+            AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &changed)
+                .expect("the changed committed closure is still admissible");
+        let conflict =
+            admit_canonical_revocation_resumes(&fence, 7, &[&changed_admitted], &kernel)
+                .expect("a changed payload still composes the same canonical operation");
+        assert_eq!(
+            conflict[0].canonical_operation_id(),
+            resume.canonical_operation_id(),
+            "a changed payload must not open a second canonical operation"
+        );
+        assert_ne!(
+            conflict[0].canonical_request_identity().idempotency_key,
+            resume.canonical_request_identity().idempotency_key,
+            "a changed payload must derive a different idempotency key under the same operation"
+        );
+    }
+
+    /// Refusal case: with no Kernel-validated session binding there is no
+    /// admitted principal coordinate, so the composition refuses and mints
+    /// nothing rather than inventing one. An empty admitted set still composes
+    /// nothing successfully, which is what makes the refusal the absent owner
+    /// and not a blanket failure of the pass.
+    ///
+    /// WHY IT FAILS WITHOUT THIS CHANGE: the composition does not exist at base,
+    /// and `AdmittedMaintenanceRevocation` at base is minted from the committed
+    /// closure alone — it never needed a principal, so no base surface could
+    /// report the absent owner. Asserting the typed `Recovery` refusal and the
+    /// empty-set success together pins the refusal to the missing
+    /// principal/session-binding coordinate alone.
+    #[test]
+    fn canonical_revocation_resume_refuses_without_a_validated_session_binding() {
+        let fence = test_fence();
+        // No validated handshake: the session binding is still absent.
+        let kernel = Arc::new(DaemonKernelClient::new_for_test(
+            fence.authority_epoch.clone(),
+            fence.clone(),
+        ));
+        assert!(kernel.validated_session_binding().is_none());
+        let closure = committed_pending_closure(&fence, &"d".repeat(64));
+        let admitted =
+            AdmittedMaintenanceRevocation::readmit_pending_closure(&fence, &closure)
+                .expect("the committed closure is an admissible pending obligation");
+
+        // A pass that admitted nothing composes nothing, without needing a
+        // principal: no identity is minted for an absent obligation.
+        assert!(
+            admit_canonical_revocation_resumes(&fence, 7, &[], &kernel)
+                .expect("an empty admitted set composes no identity")
+                .is_empty()
+        );
+
+        let error = admit_canonical_revocation_resumes(&fence, 7, &[&admitted], &kernel)
+            .expect_err("no admitted principal means no resume handoff");
+        let CompositionError::Recovery(detail) = &error else {
+            panic!("the refusal must be a Recovery refusal, got: {error:?}");
+        };
+        assert!(
+            detail.contains(REVOCATION_OPERATION_IDENTITY_ABSENT),
+            "the refusal must name the absent owner, got: {error:?}"
+        );
+    }
 }

@@ -183,9 +183,10 @@ pub use agent_fabric::{
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
 pub use authority_revocation_ingress::{
-    AUTHORITY_REVOCATION_RESUME_BLOCKED, AuthorityRevocationIngressPlan,
-    AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
-    capture_authority_revocation_ingress_plan, scan_authority_revocation_ingress,
+    AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED, AdmittedCanonicalRevocationResume,
+    AuthorityRevocationIngressPlan, AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
+    admit_canonical_revocation_resumes, capture_authority_revocation_ingress_plan,
+    scan_authority_revocation_ingress,
 };
 
 use controlboard_adapters::SharedOperatorReplay;

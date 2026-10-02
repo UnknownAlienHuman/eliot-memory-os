@@ -376,6 +376,14 @@ impl GrantClosureSecondPhaseLink {
 /// first-phase [`GrantClosureReceipt`]; an adapter that needs a typed ORS
 /// operation identity constructs it from these exact bytes at the boundary
 /// that calls the store, which is where that validation belongs.
+///
+/// The link returns a [`KernelPortFuture`] for the same reason
+/// [`KernelTransitionPort`] does: the two real implementations are an
+/// in-process ORS call in the Kernel and an authenticated front-door round
+/// trip in `eliotd`, and a synchronous signature would force the daemon
+/// composition root to block its own pollable runtime thread — or to build a
+/// nested runtime, which panics. One future type keeps both adapters on the
+/// one asynchronous seam the rest of the canonical write path already uses.
 pub trait GrantClosureCanonicalLinkPort: Send + Sync {
     /// Links the exact Store-issued `ReceiptIdentity` to the immutable
     /// first-phase closure operation, and returns the proved read-back so the
@@ -384,11 +392,11 @@ pub trait GrantClosureCanonicalLinkPort: Send + Sync {
     /// Returns a typed [`KernelPortError`] when the first phase has not
     /// committed for `operation_id`, when the link conflicts with an existing
     /// one, or when the owner's read-back does not bind the presented receipt.
-    fn link_grant_closure_canonical_receipt(
-        &self,
-        operation_id: &str,
-        canonical_receipt: &ReceiptIdentity,
-    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError>;
+    fn link_grant_closure_canonical_receipt<'a>(
+        &'a self,
+        operation_id: &'a str,
+        canonical_receipt: &'a ReceiptIdentity,
+    ) -> KernelPortFuture<'a, GrantClosureSecondPhaseLink>;
 }
 
 /// Readback boundary for the durable closure committed by the first P-07
@@ -9469,10 +9477,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// `activate_root_transition`, `activate_introduction` and
     /// `revoke_introduction` — has zero production callers as well. The daemon
     /// composition root that owns the only `GovernorComposition` calls none of
-    /// them. The blocking inputs are named in the "Live status" paragraphs of
-    /// [`Self::apply_pending_canonical_revocation`] and of
-    /// [`Self::apply_admitted_authority_revocation`]; this doc must not be read
-    /// as proof that any of them is reached.
+    /// them. The reason is named in the "Live status" paragraph of
+    /// [`Self::apply_admitted_authority_revocation`]: the Kernel-first revoke it
+    /// re-strikes is refused with `NotAdmitted` for a grant the Kernel's own
+    /// owner already fences, and no fresh revocation ingress originates one
+    /// today. This doc must not be read as proof that any of them is reached.
+    ///
+    /// The pending-canonical-revision half of the saga IS reached, through the
+    /// separate [`Self::apply_pending_canonical_revocation`] entry, which never
+    /// re-strikes the Kernel.
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
@@ -9571,11 +9584,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Live status: NO production caller. Measured on this tree, the only
     /// non-definition reference to this method is the `GrantRevocation` arm of
     /// [`Self::apply_authority_request`], which itself has no caller, so the
-    /// production call count is zero rather than one. The two blocking inputs
-    /// are named in the "Live status" paragraph of
-    /// [`Self::apply_pending_canonical_revocation`] and must not be read here as
-    /// evidence that any pass builds the request or holds the two boundary
-    /// ports.
+    /// production call count is zero rather than one. It is not the entry the
+    /// daemon drives: the daemon's authority-revocation ingress drives
+    /// [`Self::apply_pending_canonical_revocation`] instead, because this method
+    /// re-strikes a `revoke_grant` the Kernel refuses with `NotAdmitted` for a
+    /// grant its own owner already fences, and no fresh revocation ingress
+    /// originates such a request today (#1692).
     pub async fn apply_admitted_authority_revocation<L, C>(
         &mut self,
         request: &GrantRevocationRequest,
@@ -9682,22 +9696,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// membership and a digest, but none of the operation identity's five
     /// coordinates.
     ///
-    /// Live status: no production caller. The production caller is the daemon
-    /// composition root's polled authority-revocation ingress pass, which
-    /// already reads these committed closures over the authenticated front door
-    /// and already re-admits each pending one through its own maintenance
-    /// request owner (`bins/eliotd/src/daemon_runtime.rs` ->
-    /// `report_authority_revocation_ingress`, ->
-    /// `bins/eliotd/src/authority_revocation_ingress.rs` ->
-    /// `scan_authority_revocation_ingress`). That pass is outside this crate and
-    /// is not wired here. It additionally needs a `GrantClosureCanonicalLinkPort`
-    /// in the `eliotd` process, whose only existing implementation is
-    /// `Arc<dyn eliot_ors::OperationalRecoveryStore>` — an ORS handle the
-    /// Kernel owns in its own process, so no `eliotd` dependency can supply it
-    /// today. This entry is therefore honest prerequisite work, not completion:
-    /// see `AUTHORITY_REVOCATION_RESUME_BLOCKED` in
+    /// Live status: reached in production. The daemon composition root's polled
+    /// authority-revocation ingress pass reads these committed closures over the
+    /// authenticated front door, re-admits each pending one through its own
+    /// maintenance-request owner, composes the three admitted identities, and
+    /// hands each row here: `bins/eliotd/src/daemon_runtime.rs` ->
+    /// `report_authority_revocation_ingress` -> `drive_admitted_canonical_revocations`
+    /// -> `bins/eliotd/src/authority_revocation_ingress.rs` ->
+    /// `admit_canonical_revocation_resumes` -> this method. The
+    /// `GrantClosureCanonicalLinkPort` it needs in the `eliotd` process is
+    /// supplied by `DaemonKernelClient`'s implementation in
+    /// `bins/eliotd/src/daemon_kernel_port_adapters.rs`, which records the link
+    /// on the authenticated Kernel route that owns ORS inside the Kernel
+    /// process; the daemon holds no ORS handle and gains none.
+    ///
+    /// What is still incomplete is downstream of this entry, not in it: the
+    /// canonical `RecordAuthorityRevocation` commit is known-but-unsupported in
+    /// the closed Store catalogue, so a resumed obligation fails closed there
+    /// and stays recorded as a pending stricter revocation. See
+    /// `AUTHORITY_REVOCATION_CANONICAL_RECORD_BLOCKED` in
     /// `bins/eliotd/src/authority_revocation_ingress.rs` for the owner-side
-    /// statement of the same gap.
+    /// statement of that same gap.
     pub async fn apply_pending_canonical_revocation<L>(
         &mut self,
         request: &GrantRevocationRequest,
@@ -10278,7 +10297,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // an adapter that needs a typed ORS operation identity rebuilds it from
         // these same bytes at the boundary that actually calls the store.
         let closure_projection =
-            Self::link_closure_second_phase(durable_link, closure, &receipt_identity)?;
+            Self::link_closure_second_phase(durable_link, closure, &receipt_identity).await?;
         Ok(AuthorityRevocationReconciliation {
             authority_receipt: (*authority_receipt).clone(),
             canonical_receipt,
@@ -10296,13 +10315,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// whole declared closure membership, and the exact linked canonical
     /// receipt. A disagreement is the second-phase refusal the saga retains a
     /// pending stricter revocation for.
-    fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+    async fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
         durable_link: &L,
         closure: &GrantClosureReceipt,
         receipt_identity: &ReceiptIdentity,
     ) -> Result<GrantClosureSecondPhaseLink, PendingCanonicalHandoff> {
         let closure_projection = durable_link
             .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), receipt_identity)
+            .await
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
@@ -14277,15 +14297,18 @@ mod tests {
     }
 
     impl GrantClosureCanonicalLinkPort for CountingClosureLinkPort {
-        fn link_grant_closure_canonical_receipt(
-            &self,
-            _operation_id: &str,
-            _canonical_receipt: &ReceiptIdentity,
-        ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
-            *self.calls.lock().expect("link call lock") += 1;
-            Err(KernelPortError::NotAdmitted(
-                "the durable link must not be reached while canonical admission refuses".to_owned(),
-            ))
+        fn link_grant_closure_canonical_receipt<'a>(
+            &'a self,
+            _operation_id: &'a str,
+            _canonical_receipt: &'a ReceiptIdentity,
+        ) -> KernelPortFuture<'a, GrantClosureSecondPhaseLink> {
+            Box::pin(async move {
+                *self.calls.lock().expect("link call lock") += 1;
+                Err(KernelPortError::NotAdmitted(
+                    "the durable link must not be reached while canonical admission refuses"
+                        .to_owned(),
+                ))
+            })
         }
     }
 
