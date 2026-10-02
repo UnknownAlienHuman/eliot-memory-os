@@ -479,7 +479,14 @@ fn dispatch_orientation(
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
     let admitted = admission_of(admission, job)?;
-    let bundle = bundle_of(admission, job)?;
+    // The same published slice the model and grounding stages received, so all
+    // three derive ONE bundle for this job and the cross-stage rival binding
+    // sees equal bundles.
+    let bundle = bundle_of(
+        admission,
+        job,
+        crate::admitted_material::published_positions(orientation_supply),
+    )?;
     let frame_source = orientation_frame_source(&bundle)?;
     let route_started = Instant::now();
     let model = v1_model_of(admission, job)?;
@@ -1924,7 +1931,7 @@ mod slice_7_native_owner_tests {
         GroundingRequest,
         eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
     ) {
-        let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
+        let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job, &[]) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
         };
@@ -1932,7 +1939,7 @@ mod slice_7_native_owner_tests {
             Ok(draft) => draft,
             Err(error) => panic!("fixture model must prove, got {error:?}"),
         };
-        let request = match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft)
+        let request = match crate::grounding_stage::resolve_grounding_inputs(admission, job, draft, &[])
         {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
@@ -2746,7 +2753,7 @@ mod orientation_packet_mapping_tests {
         let admission = admission();
         let job = job();
         let admitted = admission_of(&admission, &job).expect("admitted job must derive");
-        let bundle = bundle_of(&admission, &job).expect("admitted bundle must derive");
+        let bundle = bundle_of(&admission, &job, &[]).expect("admitted bundle must derive");
         let frame_source = orientation_frame_source(&bundle).expect("frame source must resolve");
         let model = v1_model_of(&admission, &job).expect("admitted model must derive");
         let grounded = v1_grounded_of(&model).expect("admitted grounding must derive");

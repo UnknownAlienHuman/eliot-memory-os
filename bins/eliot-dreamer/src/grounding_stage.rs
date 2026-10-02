@@ -28,14 +28,22 @@ use crate::{DreamJobInput, DreamerError, KernelJobAdmission};
 /// admitted pair through [`admitted_material`], and the manifest digest is
 /// asserted to equal the bundle's digest before the request is built, so a
 /// drifted frozen universe can never reach the owner.
+/// `positions` carries the Governor-published current-epistemic-position
+/// handles read off the owner channel (see
+/// [`published_positions`](crate::admitted_material::published_positions)).
+/// They are threaded into this stage's bundle derivation rather than derived
+/// here, so the model stage, this stage, and dispatch all build ONE bundle for
+/// the job: the cross-stage rival binding requires those bundles to be equal,
+/// and this request's bundle is the one dispatch's bundle is compared against.
 pub(crate) fn resolve_grounding_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     draft: StructuredModelDraft,
+    positions: &[eliot_dreamer_orientation::CurrentEpistemicPositionHandle],
 ) -> Result<GroundingRequest, DreamerError> {
     verify_admitted_binding(admission, job)?;
     let admitted = admission_of(admission, job)?;
-    let bundle = bundle_of(admission, job)?;
+    let bundle = bundle_of(admission, job, positions)?;
     let manifest = manifest_of(&bundle)?;
     if manifest.digest != bundle.manifest_digest {
         return Err(DreamerError::InvalidAdmission("manifest binding drift"));
@@ -232,7 +240,7 @@ mod slice_5_grounding_tests {
         let Ok(admitted) = governed::admission_of(admission, job) else {
             panic!("test admission must derive");
         };
-        let Ok(bundle) = governed::bundle_of(admission, job) else {
+        let Ok(bundle) = governed::bundle_of(admission, job, &[]) else {
             panic!("test bundle must derive");
         };
         let Ok(task_id) = TaskId::new(admitted.task_id.clone()) else {
@@ -311,7 +319,7 @@ mod slice_5_grounding_tests {
     fn stale_admission_fails_closed_before_any_grounding() {
         let admission = admission_with_deadline(1);
         let job = job_for(&admission);
-        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft());
+        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft(), &[]);
         assert!(
             matches!(
                 refused,
@@ -328,7 +336,7 @@ mod slice_5_grounding_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft());
+        let refused = resolve_grounding_inputs(&admission, &job, dummy_draft(), &[]);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -345,7 +353,7 @@ mod slice_5_grounding_tests {
         let mut job = job_for(&admission);
         job.evidence_handles.push("evidence-slice-5".to_owned());
         let draft = governed_draft(&admission, &job);
-        let Ok(request) = resolve_grounding_inputs(&admission, &job, draft) else {
+        let Ok(request) = resolve_grounding_inputs(&admission, &job, draft, &[]) else {
             panic!("valid admission must resolve governed material");
         };
         assert_eq!(
@@ -382,7 +390,7 @@ mod slice_5_grounding_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.evidence_handles.push("evidence-slice-5".to_owned());
-        let Ok(bundle) = governed::bundle_of(&admission, &job) else {
+        let Ok(bundle) = governed::bundle_of(&admission, &job, &[]) else {
             panic!("test bundle must derive");
         };
         let Ok(()) = bundle.validate() else {

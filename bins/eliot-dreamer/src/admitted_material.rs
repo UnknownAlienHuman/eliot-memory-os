@@ -57,7 +57,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{StateFence, TaskId, sha256_hex};
+use eliot_contracts::{StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_dreamer_contracts::budget::{
     ATTEMPTS_CEILING, CANDIDATES_CEILING, INPUT_BYTES_CEILING, MODEL_CALLS_CEILING,
     OUTPUT_BYTES_CEILING, REFERENCE_WIDTH_CEILING, REPORT_BYTES_CEILING, SOURCE_WIDTH_CEILING,
@@ -80,7 +80,7 @@ use eliot_dreamer_contracts::{
     ModelDraft as TextModelDraft, OmissionHandle, PreservationReport, Requester, RequesterOrigin,
     SourceDisposition, SupportState, ValidationPolicy,
 };
-use eliot_dreamer_orientation::LocalOrientationFrame;
+use eliot_dreamer_orientation::{CurrentEpistemicPositionHandle, LocalOrientationFrame};
 
 use crate::PROTOCOL_VERSION;
 use crate::controller::verify_admitted_binding;
@@ -223,6 +223,21 @@ pub(crate) fn admission_of(
     Ok(admitted)
 }
 
+/// Reads the Governor-published position handles off the owner channel.
+///
+/// The owner channel is the ONLY source of these views and this binary may not
+/// synthesize one, so an absent channel is an empty slice — the project's own
+/// documented lawful "no admitted position for this scope" state — and never a
+/// default, a rebuilt view, or a locally derived stand-in. Every stage reads
+/// the channel through this one function, so all stages observe the identical
+/// slice and therefore derive the identical bundle; a per-stage re-read or
+/// re-derivation is what would split one bundle into two.
+pub(crate) fn published_positions<'a>(
+    supply: Option<&'a crate::production_orientation::OrientationSupply<'a>>,
+) -> &'a [CurrentEpistemicPositionHandle] {
+    supply.map_or(&[], |supply| supply.cep_handles)
+}
+
 /// Derives the validated owner input bundle from the admitted pair.
 ///
 /// Evidence handles are carried as materials; memory, architecture,
@@ -233,9 +248,22 @@ pub(crate) fn admission_of(
 /// owner-computed orientation frame digest and byte size, so the projector
 /// binds exactly the frame the bundle plants. The bundle is proved with the
 /// real [`DreamInputBundle::validate`](eliot_dreamer_contracts::DreamInputBundle::validate).
+///
+/// `positions` carries the Governor-published
+/// [`CurrentEpistemicPositionHandle`] values, and it is threaded into EVERY
+/// stage's `bundle_of` call so all stages derive ONE bundle per job: the
+/// cross-stage rival binding at `eliot_dreamer_rival_model` compares the
+/// grounding-stage bundle against the dispatch bundle for equality, so two
+/// different derivations would refuse there rather than at the projector. The
+/// slice is read, never rebuilt: each view's canonical bytes are computed from
+/// the owner-published `position` exactly as
+/// [`CurrentEpistemicPositionHandle::validate_material`] recomputes them, and
+/// a handle naming the frame source — or naming no carried material — is left
+/// UNPLANTED so the projector refuses it rather than binding a stand-in.
 pub(crate) fn bundle_of(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
+    positions: &[CurrentEpistemicPositionHandle],
 ) -> Result<DreamInputBundle, DreamerError> {
     verify_admitted_binding(admission, job)?;
     // Built through `admission_of` (not reassembled) so the canonical
@@ -247,10 +275,24 @@ pub(crate) fn bundle_of(
     for (index, handle) in job.evidence_handles.iter().enumerate() {
         // The frame source is the first non-excluded material in bundle
         // order; every carried material is `Required`, so it is the first
-        // evidence handle on both the planting and the projection sides.
+        // evidence handle on both the planting and the projection sides. It
+        // keeps the frame body: the projector refuses a CEP handle that names
+        // it (`frame and CEP source handles must differ`), so a position
+        // naming it must stay unplanted rather than overwrite the frame.
         let (bytes, digest) = if plant_frame && index == 0 {
             let frame = orientation_frame_of(admission, &admitted, job, handle)?;
             (frame.body_bytes, frame.body_digest.clone())
+        } else if let Some(view) = positions.iter().find(|view| view.source_handle == *handle) {
+            // Read back from the owner-published position, so the projector
+            // binds the exact view the Governor published rather than a
+            // locally built stand-in. The byte length and digest are the
+            // owner's own canonical encoding, matching
+            // `validate_material` exactly.
+            let bytes = canonical_json_bytes(&view.position)
+                .map_err(|_| DreamerError::InvalidAdmission("bundle position encoding"))?;
+            let size = u64::try_from(bytes.len())
+                .map_err(|_| DreamerError::InvalidAdmission("bundle position encoding"))?;
+            (size, sha256_hex(&bytes))
         } else {
             (0, sha_hex(&[handle.as_str()]))
         };

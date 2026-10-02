@@ -793,9 +793,17 @@ fn run_admitted_pipeline(
         ))?;
         return dispatch_stage::dispatch_curation(binding, protection, carrier);
     }
-    let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
+    // One read of the owner channel, threaded into both stages that derive a
+    // bundle, so the model stage, the grounding stage, and dispatch all build
+    // the SAME bundle for this job. The cross-stage rival binding compares the
+    // grounding-stage bundle against the dispatch bundle for equality; two
+    // separate reads or a stage-local re-derivation would split them and
+    // refuse there instead of at the projector.
+    let positions = admitted_material::published_positions(orientation_supply);
+    let model_inputs = model_stage::resolve_model_inputs(admission, job, positions)?;
     let draft = model_stage::run_admitted_model(model_inputs)?;
-    let grounding_request = grounding_stage::resolve_grounding_inputs(admission, job, draft)?;
+    let grounding_request =
+        grounding_stage::resolve_grounding_inputs(admission, job, draft, positions)?;
     // The grounding owner takes its request by value; the same admitted request
     // is retained here so the Orientation carrier joins the exact one this
     // stage ran under instead of rebuilding a lookalike.

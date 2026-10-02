@@ -52,9 +52,17 @@ pub(crate) struct ModelInputs {
 /// closed owner draft is derived from the admitted pair and proved with the
 /// real [`StructuredModelDraft::validate`] plus [`StructuredModelDraft::computed_digest`]: a
 /// draft that fails owner validation never leaves this stage.
+/// `positions` carries the Governor-published current-epistemic-position
+/// handles read off the owner channel (see
+/// [`published_positions`](crate::admitted_material::published_positions)).
+/// They reach the draft's bundle rather than being re-derived here, so this
+/// stage, the grounding stage, and dispatch all build ONE bundle for the job:
+/// the cross-stage rival binding requires those bundles to be equal, and a
+/// stage that built its own would refuse there instead of at the projector.
 pub(crate) fn resolve_model_inputs(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
+    positions: &[eliot_dreamer_orientation::CurrentEpistemicPositionHandle],
 ) -> Result<ModelInputs, DreamerError> {
     verify_admitted_binding(admission, job)?;
     let route = job
@@ -70,7 +78,7 @@ pub(crate) fn resolve_model_inputs(
         ));
     }
     let admitted = admission_of(admission, job)?;
-    let draft = build_model_draft(admission, job, &admitted, &route)?;
+    let draft = build_model_draft(admission, job, &admitted, &route, positions)?;
     let recomputed = draft
         .computed_digest()
         .map_err(|error| model_denied(&error))?;
@@ -118,6 +126,7 @@ fn build_model_draft(
     job: &DreamJobInput,
     admitted: &DreamJobAdmission,
     route_text: &str,
+    positions: &[eliot_dreamer_orientation::CurrentEpistemicPositionHandle],
 ) -> Result<StructuredModelDraft, DreamerError> {
     let task_id = TaskId::new(admitted.task_id.clone())
         .map_err(|_| DreamerError::InvalidAdmission("task_id"))?;
@@ -138,8 +147,12 @@ fn build_model_draft(
     route.fingerprint = route_fingerprint(&route).map_err(|error| model_denied(&error))?;
     let canonical_id = admitted.canonical_id();
     // The canonical shared bundle: byte-identical to the value the grounding
-    // stage derives, so draft and request preimages cannot drift.
-    let bundle = bundle_of(admission, job)?;
+    // stage derives, so draft and request preimages cannot drift. That
+    // equality is why the published positions are threaded in here rather
+    // than re-derived: the grounding stage and dispatch build the same bundle
+    // from the same published slice, and the cross-stage rival binding
+    // compares them for equality.
+    let bundle = bundle_of(admission, job, positions)?;
     let screen = screen_binding_for(admission, job)?;
     let mut draft = StructuredModelDraft {
         schema_version: GROUNDING_SCHEMA_VERSION,
@@ -440,7 +453,7 @@ mod slice_4_model_tests {
     fn stale_admission_fails_closed_before_any_model_call() {
         let admission = admission_with_deadline(1);
         let job = job_for(&admission);
-        let refused = resolve_model_inputs(&admission, &job);
+        let refused = resolve_model_inputs(&admission, &job, &[]);
         assert!(
             matches!(
                 refused,
@@ -457,7 +470,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.job_id = "caller-switched-job".to_owned();
-        let refused = resolve_model_inputs(&admission, &job);
+        let refused = resolve_model_inputs(&admission, &job, &[]);
         assert_eq!(
             refused.map_err(|error| error.code()),
             Err(KERNEL_ADMISSION_REQUIRED)
@@ -472,7 +485,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.allowed_model_routes.clear();
-        let refused = resolve_model_inputs(&admission, &job);
+        let refused = resolve_model_inputs(&admission, &job, &[]);
         assert!(
             matches!(
                 refused,
@@ -489,7 +502,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let mut job = job_for(&admission);
         job.budget_units = 0;
-        let refused = resolve_model_inputs(&admission, &job);
+        let refused = resolve_model_inputs(&admission, &job, &[]);
         assert!(
             matches!(refused, Err(DreamerError::InvalidAdmission("budget"))),
             "zero budget must refuse, got {refused:?}"
@@ -505,7 +518,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_for(&admission);
         let inputs =
-            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+            resolve_model_inputs(&admission, &job, &[]).expect("valid inputs must build a draft");
         assert_eq!(
             inputs.route, "route-test",
             "route must be the admitted route"
@@ -533,7 +546,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_for(&admission);
         let inputs =
-            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+            resolve_model_inputs(&admission, &job, &[]).expect("valid inputs must build a draft");
         let expected = inputs.draft.draft_digest.clone();
         let calls = AtomicU64::new(0);
         let draft = run_admitted_model_with(inputs, |owned| {
@@ -560,7 +573,7 @@ mod slice_4_model_tests {
         let admission = admission_with_deadline(u64::MAX);
         let job = job_for(&admission);
         let inputs =
-            resolve_model_inputs(&admission, &job).expect("valid inputs must build a draft");
+            resolve_model_inputs(&admission, &job, &[]).expect("valid inputs must build a draft");
         let expected = inputs.draft.draft_digest.clone();
         let draft = run_admitted_model(inputs).expect("production call must return the draft");
         assert_eq!(
