@@ -3295,13 +3295,26 @@ impl<'a> KernelRestoreTarget<'a> {
     /// foreign member could stand in for a member the archive requires, and a
     /// member published under a name the archive never named passed too.
     ///
-    /// What is compared here instead is the exact SET of member names, relative to
-    /// the class directory, derived from the ARCHIVE's own identities through
+    /// What is compared here instead is the exact SET of member names, relative
+    /// to the class directory, derived from the ARCHIVE's own identities through
     /// the same `format!` spellings [`KernelRestoreTarget::apply_blob`],
     /// [`Self::import_canonical_event`], [`Self::import_receipt`] and
     /// [`Self::import_projection`] write, against the exact set of names
-    /// actually present in that directory. Two set differences are both
-    /// refusals, and they are distinct facts:
+    /// actually present in that directory.
+    ///
+    /// Both sides are in the same NAME SPACE, and that is the whole contract:
+    /// the observed side is one [`std::fs::DirEntry::file_name`] per entry of
+    /// THIS directory, so an expected name carrying the class prefix
+    /// (`events/x.json` against an observed `x.json`) is not a missing member —
+    /// it is a set that can never intersect its own destination, and every
+    /// archive member would read as missing against a complete import. The
+    /// class directory is the SCOPE of the comparison, not part of a member's
+    /// identity; [`Self::expected_members`] therefore builds names in exactly
+    /// this space. A closure check that refuses a correct destination is the
+    /// same defect as one that admits an incomplete one: both decide
+    /// completeness against something other than the archive.
+    ///
+    /// Two set differences are both refusals, and they are distinct facts:
     ///
     /// - an expected name that is absent is a MISSING member: the archive's
     ///   material did not all arrive;
@@ -3361,8 +3374,21 @@ impl<'a> KernelRestoreTarget<'a> {
 
     /// The exact member names one archive class must have published, spelled
     /// through the same `format!` the corresponding import arm writes.
-    fn expected_members(relative: &str, names: impl Iterator<Item = String>) -> BTreeSet<String> {
-        names.map(|name| format!("{relative}/{name}")).collect()
+    ///
+    /// A name here is RELATIVE TO THE CLASS DIRECTORY, and carries no class
+    /// prefix — the class directory is not part of a member's identity, it is
+    /// the scope the comparison happens in. [`Self::check_import_closure`] reads
+    /// that directory and observes exactly one name per entry, the entry's own
+    /// [`std::fs::DirEntry::file_name`], and that is what this set must hold or
+    /// the two are not comparable: prefixing the expected names with the class
+    /// directory would make every archive member look missing against its own
+    /// destination and refuse a complete import as
+    /// [`BackupError::RestoreEvidenceIncomplete`].
+    ///
+    /// The set is derived from the ARCHIVE, never from what this execution
+    /// wrote, so it is independent of the destination it is compared against.
+    fn expected_members(names: impl Iterator<Item = String>) -> BTreeSet<String> {
+        names.collect()
     }
 
     /// Rejects a directory entry that is not an ordinary member file.
@@ -3567,28 +3593,24 @@ impl<'a> KernelRestoreTarget<'a> {
         // against the admitted archive — not of this run's own bookkeeping
         // compared against itself.
         let blobs = Self::expected_members(
-            "blobs",
             bundle
                 .blobs
                 .iter()
                 .map(|blob| blob.locator.hash.to_string()),
         );
         let events = Self::expected_members(
-            "events",
             bundle
                 .canonical_events
                 .iter()
                 .map(|record| format!("{}.json", record.record_id)),
         );
         let receipts = Self::expected_members(
-            "receipts",
             bundle
                 .receipts
                 .iter()
                 .map(|receipt| format!("{}.json", receipt.operation_id)),
         );
         let projections = Self::expected_members(
-            "projections",
             bundle
                 .projections
                 .iter()
