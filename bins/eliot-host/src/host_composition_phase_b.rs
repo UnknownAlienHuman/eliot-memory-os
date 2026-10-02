@@ -17,9 +17,13 @@ use eliot_platform_windows::reconcile_agent_bridge_stage;
 //
 // Through the #889 facade only
 // (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`super::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// sink disposition is observed only through the canonical bounded observer
+// `super::host_diagnostics::note_event_log_sink_status`, which consumes the
+// live `super::windows_event_log::event_log_sink_status` answer. #984's safe
+// port is landed, so that answer is `Ok` on Windows (nothing to note) and the
+// typed `EventLogUnavailable` elsewhere, where the canonical observer records
+// the standing seam state on the shared `tracing` sink. No sink state is read
+// or interpreted here.
 //
 // Observation-only contract (mirrors the #891 `lib.rs` helpers): every call
 // projects a boundary already decided by the semantic owner. The boundary
@@ -39,13 +43,11 @@ use eliot_platform_windows::reconcile_agent_bridge_stage;
 // terminals), while these inner phases correlate by stage order only
 // (case 22).
 #[cfg(windows)]
-fn phase_b_note_event_log_unavailable() {
-    let _ = super::windows_event_log::event_log_sink_status();
-}
-
-#[cfg(windows)]
 fn phase_b_observe(detail: &str) {
-    phase_b_note_event_log_unavailable();
+    // Sink disposition is load-bearing for this record: the canonical bounded
+    // observer states where a Phase-B observation stayed, in the same place in
+    // the sequence the discarded status read used to occupy.
+    super::host_diagnostics::note_event_log_sink_status();
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,
