@@ -281,7 +281,7 @@ pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-s
 /// rule the freeze does not state. The length is recorded next to the digest
 /// in the handoff row and checked by `scripts/read_freeze_digest.py`.
 pub const REQUIRED_FREEZE_DIGEST: &str =
-    "298d2dedd8f1929cc66f147e948e5c3bd7463603864269882206f1615f9f6f1d";
+    "eeb5449712a373c1087496005b97007f8632a885952c812152c46ea537857596";
 
 /// Typed freeze-binding divergence.
 ///
