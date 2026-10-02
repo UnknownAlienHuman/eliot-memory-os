@@ -329,6 +329,26 @@ mod tests {
     }
 
     #[test]
+    fn one_owner_claiming_two_cells_is_refused() {
+        // Arm: the real `governor.daemon.skill-catalogue` row is pointed at the
+        // composition owner. Each cell still carries exactly one owner row and
+        // every row still names a declared cell, so both the duplicate-cell and
+        // the undeclared-cell rules pass; only the no-shared-owner rule can
+        // catch one symbol owning two mutable states, and it must refuse.
+        let row = "  { cell = \"governor.daemon.skill-catalogue\", state = \"skill-catalogue\", owner = \"eliot_skill::SkillCatalogue\" },\n";
+        let result = owners_of_mutated_manifest(
+            row,
+            "  { cell = \"governor.daemon.skill-catalogue\", state = \"skill-catalogue\", owner = \"eliotd::DaemonComposition\" },\n",
+        );
+
+        assert_eq!(
+            result,
+            Err("mutable-state owner eliotd::DaemonComposition (cell governor.daemon.skill-catalogue) owns a second cell state; one owner per state means no shared owner".to_owned()),
+            "one owner across two cells must be refused, naming the owner and cell"
+        );
+    }
+
+    #[test]
     fn one_cell_with_two_mutable_state_owners_is_refused() {
         // Arm (the audit 5848256288 P2 shape): the real declaration gives
         // `governor.daemon.composition` a second mutable-state owner row. The
