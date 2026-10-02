@@ -4186,3 +4186,765 @@ fn generation_cutover_projection_is_canonical_and_recovery_is_forward_only() -> 
     cleanup(&path);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Bridge-event receipt -> retirement -> certified boundary -> position drain
+// (issue #2730, open item AUD1; external audit 5845038022).
+//
+// The audit's defect is precise: `BRIDGE_EVENT_POSITIONS` retained one
+// never-deleted row per staged event, so normal successful traffic grew ORS
+// storage without bound and the drain stalled. The remedy is bounded
+// owner/incarnation range commitments behind a certified compacted boundary,
+// and old-sequence non-reuse must survive that deletion.
+//
+// These tests exercise the ONLY public chain that can prove it:
+//   `stage_bridge_event_checked` -> `record_bridge_event_handoff_checked`
+//   -> `acknowledge_bridge_event_batch`
+//   -> `reconcile_bridge_event_handoffs_checked`
+//   -> `record_bridge_event_owner_receipt_checked`
+//   -> `retire_bridge_event_handoffs_checked`
+//
+// The I7.2 receipt phases are respected throughout: the owner-bound
+// acknowledgement batch advances only the producer receipt-acknowledged
+// frontier, the handoff reconcile carries local staging plus that
+// acknowledgement, and NEITHER may retire an event. Only the receiving owner's
+// retained acceptance receipt (the one leg whose writer is the receiver) may,
+// which is exactly the join at `RedbRecoveryStore::retire_bridge_handoffs_in`
+// these tests pin.
+
+/// The store's own on-disk table names, restated here so this module reads
+/// durable state directly. Reusing the owner's exact table-name strings keeps
+/// the assertions on the real tables rather than on a parallel projection;
+/// `store.rs` keeps the definitions private, so the literal is repeated rather
+/// than its symbol imported.
+const BRIDGE_POSITIONS_TABLE: redb::TableDefinition<&str, &str> =
+    redb::TableDefinition::new("ors_bridge_event_positions_v1");
+const BRIDGE_CURSORS_TABLE: redb::TableDefinition<&str, &str> =
+    redb::TableDefinition::new("ors_bridge_event_cursors_v1");
+const BRIDGE_OWNER_RECEIPTS_TABLE: redb::TableDefinition<&str, &str> =
+    redb::TableDefinition::new("ors_bridge_event_owner_receipts_v1");
+const BRIDGE_COMPACTED_RANGES_TABLE: redb::TableDefinition<&str, &str> =
+    redb::TableDefinition::new("ors_bridge_event_compacted_ranges_v1");
+
+/// Receiving-owner dispositions in the store's own vocabulary
+/// (`store.rs::parse_bridge_owner_receipt_checked`). `APPLIED` is a determined
+/// terminal outcome; `UNKNOWN` is terminal for the receiver's knowledge but
+/// never for the obligation.
+const RECEIPT_TERMINAL: &str = "APPLIED";
+const RECEIPT_UNDETERMINED: &str = "UNKNOWN";
+
+/// One admitted bridge-event owner occurrence for these tests.
+///
+/// I7.2's `EventEnvelope` identity legs: the stream, its event, the producer
+/// and its generation, and the authority epoch text `lineage:sequence`. The
+/// owner evidence (lineage, principal, connection, launch nonce, session epoch)
+/// is the #2729 authenticated stream/incarnation binding that
+/// `stage_bridge_event_checked` binds into the stream-owner row.
+struct BridgeStreamFixture {
+    lineage: String,
+    principal: String,
+    producer_id: String,
+    stream_id: String,
+    connection: String,
+    launch_nonce: String,
+    session_epoch: u64,
+    producer_generation: u64,
+}
+
+impl BridgeStreamFixture {
+    fn new(label: &str) -> Self {
+        Self {
+            lineage: TEST_LINEAGE_A.to_owned(),
+            principal: format!("S-1-5-21-2730-{label}"),
+            producer_id: format!("producer-2730-{label}"),
+            stream_id: format!("stream-2730-{label}"),
+            connection: format!("connection-2730-{label}"),
+            launch_nonce: format!("nonce-2730-{label}"),
+            session_epoch: 1,
+            producer_generation: 1,
+        }
+    }
+
+    /// The canonical envelope bytes the ORS stage entry hashes and re-verifies.
+    /// `authority_epoch` is the `lineage:sequence` text the sidecar binds.
+    fn envelope(&self, event_id: &str, sequence: u64) -> serde_json::Value {
+        json!({
+            "stream_id": self.stream_id,
+            "event_id": event_id,
+            "sequence": sequence,
+            "producer_id": self.producer_id,
+            "producer_generation": self.producer_generation,
+            "authority_epoch": format!("{}:{sequence}", self.lineage),
+            "delivery_class": "durable_control",
+            "ack_required": true,
+            "payload_type": "test",
+            "payload_or_blob_ref": format!("payload-{event_id}"),
+        })
+    }
+
+    /// The owner's ADMITTING authorization over exactly these envelope bytes:
+    /// both Governor-owned policy legs `Decided`, the proven source class named
+    /// by the recipient grant, and no `declared_class` (the owner rule declares
+    /// an out-of-scope class only on a rejection).
+    fn admitting_authorization(envelope_bytes: &[u8]) -> serde_json::Value {
+        json!({
+            "verdict": "admitted",
+            "source_sha256": sha256_hex(envelope_bytes),
+            "scope": "b".repeat(64),
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "scope_ref": "scope-2730-permitted",
+            "source_class": "private",
+            "recipient_grant": vec!["private".to_owned()],
+            "provider_restriction": "decided",
+            "retention_terms": "decided",
+        })
+    }
+
+    /// One complete `stage_bridge_event_checked` request. The privacy legs come
+    /// from the store's own public projection over the owner's own rule, exactly
+    /// as the Kernel route composes them, so the persistence gate re-derives the
+    /// same verdict rather than being handed one.
+    fn stage_request(&self, event_id: &str, sequence: u64) -> TestResult<Value> {
+        let envelope = self.envelope(event_id, sequence);
+        let envelope_bytes = eliot_contracts::canonical_json_bytes(&envelope)?;
+        let decision = RedbRecoveryStore::bridge_event_privacy_decision(
+            &envelope_bytes,
+            Some(&Self::admitting_authorization(&envelope_bytes)),
+        );
+        let mut request = json!({
+            "stream_id": self.stream_id,
+            "event_id": event_id,
+            "sequence": sequence,
+            "producer_id": self.producer_id,
+            "producer_generation": self.producer_generation,
+            "authority_epoch": format!("{}:{sequence}", self.lineage),
+            "envelope": envelope,
+            "envelope_sha256": sha256_hex(&envelope_bytes),
+            "staging_connection": self.connection,
+            "adapter_version": "eliot.bridge-event.adapter.v1",
+            "requested_route": "eliot.bridge-event.forward.v1",
+            "owner_principal": self.principal,
+            "owner_authority_lineage": self.lineage,
+            "owner_connection": self.connection,
+            "owner_launch_nonce": self.launch_nonce,
+            "owner_session_epoch": self.session_epoch,
+        });
+        if let (Some(fields), Some(legs)) = (request.as_object_mut(), decision.as_object()) {
+            for (key, value) in legs {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+        Ok(request)
+    }
+}
+
+/// One staged event's durable identity, as the store reported it.
+struct StagedBridgeEvent {
+    namespace: String,
+    event_id: String,
+    sequence: u64,
+    envelope_sha256: String,
+}
+
+/// Stages one event, then persists its handoff — the two steps the Kernel route
+/// performs for every forwarded event. The namespace is read back from the
+/// store's own `stage_bridge_event_checked` answer rather than recomputed here:
+/// the owner-namespace digest is the store's private binding function, and a
+/// test-side re-derivation would be a second scheme.
+fn stage_and_hand_off(
+    store: &RedbRecoveryStore,
+    fixture: &BridgeStreamFixture,
+    event_id: &str,
+    sequence: u64,
+) -> TestResult<StagedBridgeEvent> {
+    let outcome = store.stage_bridge_event_checked(&fixture.stage_request(event_id, sequence)?)?;
+    assert_eq!(
+        outcome.get("fresh").and_then(Value::as_bool),
+        Some(true),
+        "a genuinely new identity above the boundary stages fresh"
+    );
+    let envelope_sha256 = outcome
+        .get("envelope_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "stage outcome must carry its content commitment".into()
+        })?
+        .to_owned();
+    let namespace = outcome
+        .get("owner_namespace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "stage outcome must carry its owner namespace".into()
+        })?
+        .to_owned();
+    let handoff = json!({
+        "owner_namespace": namespace,
+        "event_id": event_id,
+        "sequence": sequence,
+        "envelope_sha256": envelope_sha256,
+        "staging_connection": fixture.connection,
+    });
+    let recorded = store.record_bridge_event_handoff_checked(&handoff)?;
+    assert_eq!(
+        recorded.get("fresh").and_then(Value::as_bool),
+        Some(true),
+        "the first handoff for this identity is a new row"
+    );
+    Ok(StagedBridgeEvent {
+        namespace,
+        event_id: event_id.to_owned(),
+        sequence,
+        envelope_sha256,
+    })
+}
+
+/// Moves one namespace's acknowledged frontier over `through`, then reconciles
+/// the handoffs so the stored reconcile tuple covers it.
+///
+/// The acknowledgement is the OWNER-BOUND batch entry, not the older
+/// `acknowledge_bridge_events(stream_id, ..)`: on the owner-bound path the
+/// cursor row is stored under the owner namespace
+/// (`RedbRecoveryStore::advance_bridge_cursor_in_checked`), while the older
+/// entry resolves `BRIDGE_EVENT_CURSORS` by `stream_id` and would therefore
+/// read a durable frontier of zero. This mirrors the I7.2 split: the producer
+/// receipt acknowledgement is its own phase, distinct from durability and from
+/// the receiving owner's later acceptance.
+///
+/// The reconcile key is this operation's own identity, shaped as the digest the
+/// entry validates.
+fn acknowledge_and_reconcile(
+    store: &RedbRecoveryStore,
+    fixture: &BridgeStreamFixture,
+    namespace: &str,
+    through: u64,
+) -> TestResult {
+    let acknowledged = store.acknowledge_bridge_event_batch(&json!({
+        "items": [{
+            "namespace": namespace,
+            "expected_revision": 1,
+            "expected_incarnation": 1,
+            "sequence": through,
+            "owner_authority_lineage": fixture.lineage,
+            "owner_principal": fixture.principal,
+        }],
+    }))?;
+    let acked_cursor = acknowledged
+        .get("streams")
+        .and_then(Value::as_array)
+        .and_then(|streams| streams.first())
+        .and_then(|entry| entry.get("acked_cursor"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "the acknowledgement batch must report its acked cursor".into()
+        })?;
+    assert_eq!(
+        acked_cursor, through,
+        "the producer receipt-acknowledged frontier advances to the acked sequence"
+    );
+    store.reconcile_bridge_event_handoffs_checked(
+        namespace,
+        through,
+        &sha256_hex(format!("reconcile-{namespace}-{through}").as_bytes()),
+    )?;
+    Ok(())
+}
+
+/// Records the receiving owner's acceptance receipt for one exact handoff.
+///
+/// `disposition` is passed through verbatim so the refusal cases can present a
+/// determined and an undetermined outcome over the same setup.
+fn record_owner_receipt(
+    store: &RedbRecoveryStore,
+    event: &StagedBridgeEvent,
+    disposition: &str,
+) -> TestResult {
+    let receipt = json!({
+        "owner_namespace": event.namespace,
+        "event_id": event.event_id,
+        "sequence": event.sequence,
+        "envelope_sha256": event.envelope_sha256,
+        "receiving_operation_id": format!(
+            "bridge-event-owner-receipt:{}",
+            sha256_hex(
+                format!(
+                    "eliot.bridge-event-owner-receipt|{}|{}|{}",
+                    event.namespace, event.event_id, event.sequence
+                )
+                .as_bytes()
+            )
+        ),
+        "disposition": disposition,
+        "receipt_digest": sha256_hex(
+            format!("receipt|{}|{}|{disposition}", event.event_id, event.sequence).as_bytes()
+        ),
+    });
+    store.record_bridge_event_owner_receipt_checked(&receipt)?;
+    Ok(())
+}
+
+/// Runs the public retirement entry for one namespace and returns its answer.
+///
+/// `expected_revision`/`expected_incarnation` are the owner epoch the entry
+/// resolves under; the store refuses any other epoch, so a caller cannot retire
+/// under a right it did not hold.
+fn retire_handoffs(
+    store: &RedbRecoveryStore,
+    namespace: &str,
+    expected_revision: u64,
+    expected_incarnation: u64,
+) -> TestResult<Value> {
+    Ok(store.retire_bridge_event_handoffs_checked(&json!({
+        "namespace": namespace,
+        "expected_revision": expected_revision,
+        "expected_incarnation": expected_incarnation,
+    }))?)
+}
+
+/// Reads one namespace's durable position rows directly from the on-disk
+/// database: the exact ordered position keys the store retains for it.
+///
+/// The completeness check is against an INDEPENDENT expected set computed from
+/// the sequences the test itself staged, never from the caller's own list.
+///
+/// The caller must have dropped its [`RedbRecoveryStore`] first: this reopens
+/// the same on-disk file, and the store holds it open for the whole session.
+fn bridge_position_keys(path: &PathBuf, namespace: &str) -> TestResult<BTreeMap<u64, String>> {
+    let database = redb::Database::open(path)?;
+    let read = database.begin_read()?;
+    let positions = read.open_table(BRIDGE_POSITIONS_TABLE)?;
+    let prefix = format!("{namespace}::");
+    let end = format!("{prefix}\u{10ffff}");
+    let mut retained = BTreeMap::new();
+    for entry in positions.range::<&str>(prefix.as_str()..=end.as_str())? {
+        let (key, _) = entry?;
+        let key = key.value();
+        let sequence = key
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.parse::<u64>().ok())
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                "position key must be `{namespace}::{sequence}`".into()
+            })?;
+        retained.insert(sequence, key.to_owned());
+    }
+    drop(read);
+    drop(database);
+    Ok(retained)
+}
+
+/// Reads the certified compacted boundary one namespace's cursor row retains.
+///
+/// Requires the store to be dropped first, as [`bridge_position_keys`] does.
+fn bridge_compacted_boundary(path: &PathBuf, namespace: &str) -> TestResult<u64> {
+    let database = redb::Database::open(path)?;
+    let read = database.begin_read()?;
+    let cursors = read.open_table(BRIDGE_CURSORS_TABLE)?;
+    let encoded = cursors
+        .get(namespace)?
+        .map(|value| value.value().to_owned())
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "the admitted stream owner must retain a position cursor".into()
+        })?;
+    drop(read);
+    drop(database);
+    // The cursor row is the store's own persisted JSON; `last_compacted_sequence`
+    // is the boundary field the retirement entry advances.
+    let row: serde_json::Value = serde_json::from_str(&encoded)?;
+    row.get("last_compacted_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "the cursor row must carry its compacted boundary".into()
+        })
+}
+
+/// Counts the receiving-owner receipts one namespace still retains.
+///
+/// Requires the store to be dropped first, as [`bridge_position_keys`] does.
+fn bridge_retained_receipt_count(path: &PathBuf, namespace: &str) -> TestResult<u64> {
+    let database = redb::Database::open(path)?;
+    let read = database.begin_read()?;
+    let receipts = read.open_table(BRIDGE_OWNER_RECEIPTS_TABLE)?;
+    let prefix = format!("{namespace}::");
+    let end = format!("{prefix}\u{10ffff}");
+    let mut retained = 0_u64;
+    for entry in receipts.range::<&str>(prefix.as_str()..=end.as_str())? {
+        entry?;
+        retained += 1;
+    }
+    drop(read);
+    drop(database);
+    Ok(retained)
+}
+
+/// Reads whether one namespace has committed a certified compacted range.
+///
+/// The remedy is ONE cumulative range row per stream, not one row per event, so
+/// a stream that keeps retiring must not grow this count. Requires the store to
+/// be dropped first, as [`bridge_position_keys`] does.
+fn bridge_compacted_range_committed(path: &PathBuf, namespace: &str) -> TestResult<bool> {
+    let database = redb::Database::open(path)?;
+    let read = database.begin_read()?;
+    let ranges = read.open_table(BRIDGE_COMPACTED_RANGES_TABLE)?;
+    let committed = ranges.get(namespace)?.is_some();
+    drop(read);
+    drop(database);
+    Ok(committed)
+}
+
+/// A1/AUD1 case 1 (positive): the full receipt chain terminalizes, certifies the
+/// compacted boundary, and drains the retired position rows.
+///
+/// The audit's claim is that this never happened — the boundary stayed at zero
+/// and every event left one never-deleted position row. Both halves are
+/// asserted as VALUES: the boundary advanced past zero, and the position rows
+/// for the retired sequences are gone.
+#[test]
+fn bridge_receipt_retirement_certifies_boundary_and_drains_positions() -> TestResult {
+    let path = database_path("bridge-retirement-first-cycle");
+    let store = RedbRecoveryStore::open(&path)?;
+    let fixture = BridgeStreamFixture::new("first-cycle");
+    let first = stage_and_hand_off(&store, &fixture, "event-1", 1)?;
+    let second = stage_and_hand_off(&store, &fixture, "event-2", 2)?;
+    let third = stage_and_hand_off(&store, &fixture, "event-3", 3)?;
+    let namespace = first.namespace.clone();
+
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 3)?;
+    for event in [&first, &second, &third] {
+        record_owner_receipt(&store, event, RECEIPT_TERMINAL)?;
+    }
+
+    let retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    let terminalized = retirement
+        .get("terminalized")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "the retirement entry must report its terminalized count".into()
+        })?;
+    assert_eq!(
+        terminalized, 3,
+        "the joined, receipt-complete, contiguous prefix terminalizes in full"
+    );
+    drop(store);
+
+    // Durable state is read after the store releases the on-disk file.
+    assert_eq!(
+        bridge_compacted_boundary(&path, &namespace)?,
+        3,
+        "the certified compacted boundary advances over every terminalized position"
+    );
+
+    // Completeness against an independent expected set: the block staged above
+    // is `{1, 2, 3}`, and NONE of them may remain in the position index.
+    let expected: Vec<u64> = (1_u64..=3).collect();
+    let retained = bridge_position_keys(&path, &namespace)?;
+    let undrained: Vec<u64> = expected
+        .iter()
+        .copied()
+        .filter(|sequence| retained.contains_key(sequence))
+        .collect();
+    assert!(
+        undrained.is_empty(),
+        "no retired position may remain: undrained {undrained:?}, retained {retained:?}"
+    );
+    assert_eq!(
+        bridge_retained_receipt_count(&path, &namespace)?,
+        0,
+        "a terminalized receipt is consumed with its handoff"
+    );
+    assert!(
+        bridge_compacted_range_committed(&path, &namespace)?,
+        "the certified coverage is one cumulative range row, not one row per event"
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// A1/AUD1 case 2 (positive): the boundary is REOPENABLE.
+///
+/// The audit's exact complaint was that the boundary could advance "at most
+/// once" and the drain then stalled behind a stale resume anchor, so the second
+/// block's positions accumulated forever. A single-cycle test passes even with
+/// that defect; this case is the one that discriminates it.
+#[test]
+fn bridge_certified_boundary_reopens_and_drains_the_next_block() -> TestResult {
+    let path = database_path("bridge-retirement-second-cycle");
+    let store = RedbRecoveryStore::open(&path)?;
+    let fixture = BridgeStreamFixture::new("second-cycle");
+
+    let mut first_block = Vec::new();
+    for sequence in 1_u64..=3 {
+        first_block.push(stage_and_hand_off(
+            &store,
+            &fixture,
+            &format!("event-{sequence}"),
+            sequence,
+        )?);
+    }
+    let namespace = first_block[0].namespace.clone();
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 3)?;
+    for event in &first_block {
+        record_owner_receipt(&store, event, RECEIPT_TERMINAL)?;
+    }
+    let first_retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        first_retirement.get("terminalized").and_then(Value::as_u64),
+        Some(3),
+        "the first cycle terminalizes its whole block"
+    );
+    // The store owns the on-disk file for the whole session, so the durable
+    // boundary between cycles is read through a short-lived reopen.
+    drop(store);
+    let first_boundary = bridge_compacted_boundary(&path, &namespace)?;
+    assert_eq!(
+        first_boundary, 3,
+        "the first cycle certifies through sequence 3"
+    );
+    let store = RedbRecoveryStore::open(&path)?;
+
+    // Second cycle: the same stream incarnation keeps producing. A boundary
+    // that refuses to reopen leaves these rows in place forever.
+    let mut second_block = Vec::new();
+    for sequence in 4_u64..=6 {
+        second_block.push(stage_and_hand_off(
+            &store,
+            &fixture,
+            &format!("event-{sequence}"),
+            sequence,
+        )?);
+    }
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 6)?;
+    for event in &second_block {
+        record_owner_receipt(&store, event, RECEIPT_TERMINAL)?;
+    }
+    let second_retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        second_retirement
+            .get("terminalized")
+            .and_then(Value::as_u64),
+        Some(3),
+        "the second block terminalizes: the boundary and drain both reopen"
+    );
+    drop(store);
+
+    let second_boundary = bridge_compacted_boundary(&path, &namespace)?;
+    assert!(
+        second_boundary > first_boundary,
+        "the boundary advances a SECOND time: {second_boundary} must exceed {first_boundary}"
+    );
+    assert_eq!(
+        second_boundary, 6,
+        "the second cycle certifies through sequence 6"
+    );
+
+    // The second block's positions must drain too — this is the half that
+    // stalled while the boundary still moved.
+    let expected_second: Vec<u64> = vec![4, 5, 6];
+    let retained = bridge_position_keys(&path, &namespace)?;
+    let undrained: Vec<u64> = expected_second
+        .iter()
+        .copied()
+        .filter(|sequence| retained.contains_key(sequence))
+        .collect();
+    assert!(
+        undrained.is_empty(),
+        "the second block must drain as well: undrained {undrained:?}, retained {retained:?}"
+    );
+    // And the first block must not have come back.
+    assert!(
+        retained.is_empty(),
+        "every retired position stays drained across both cycles: {retained:?}"
+    );
+    assert!(
+        bridge_compacted_range_committed(&path, &namespace)?,
+        "two cycles of retirement still commit ONE cumulative range row"
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// A1/AUD1 case 3 (positive): deleting the position rows does NOT make an old
+/// sequence reusable.
+///
+/// Issue #2730 work item 2: "A missing row below a retained boundary is not a
+/// new event." The drain removes the per-event position row, so re-staging a
+/// retired identity must answer from retained evidence or with the explicit
+/// retired disposition — never `fresh: true`.
+#[test]
+fn bridge_retired_sequence_is_not_reusable_after_the_drain() -> TestResult {
+    let path = database_path("bridge-retirement-non-reuse");
+    let store = RedbRecoveryStore::open(&path)?;
+    let fixture = BridgeStreamFixture::new("non-reuse");
+
+    let first = stage_and_hand_off(&store, &fixture, "event-1", 1)?;
+    let second = stage_and_hand_off(&store, &fixture, "event-2", 2)?;
+    let namespace = first.namespace.clone();
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 2)?;
+    record_owner_receipt(&store, &first, RECEIPT_TERMINAL)?;
+    record_owner_receipt(&store, &second, RECEIPT_TERMINAL)?;
+    retire_handoffs(&store, &namespace, 1, 1)?;
+    drop(store);
+
+    assert_eq!(bridge_compacted_boundary(&path, &namespace)?, 2);
+    assert!(
+        bridge_position_keys(&path, &namespace)?.is_empty(),
+        "the retired positions are drained, so nothing but the certified boundary remains"
+    );
+
+    // Re-stage the RETIRED identity at its OLD sequence. The position row is
+    // gone and the live record is gone; only the retained commitment and the
+    // certified boundary remain.
+    let store = RedbRecoveryStore::open(&path)?;
+    let replay = store.stage_bridge_event_checked(&fixture.stage_request("event-1", 1)?)?;
+    assert_ne!(
+        replay.get("fresh").and_then(Value::as_bool),
+        Some(true),
+        "a retired event identity below the certified boundary is never re-inserted fresh"
+    );
+    let disposition = replay
+        .get("disposition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "the replay outcome must carry its disposition".into()
+        })?;
+    assert!(
+        disposition == "duplicate" || disposition == "retired",
+        "the replay answers from retained evidence or the explicit retired disposition, got {disposition:?}"
+    );
+    assert_eq!(
+        replay.get("sequence").and_then(Value::as_u64),
+        Some(1),
+        "the answer stays about the retired position"
+    );
+    drop(store);
+
+    assert_eq!(
+        bridge_position_keys(&path, &namespace)?.len(),
+        0,
+        "the refused replay inserts no fresh position row"
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// A1/AUD1 case 4 (refusal): no receiving-owner receipt, no retirement.
+///
+/// Producer acknowledgement plus a full covering reconcile tuple is exactly
+/// what the audit says is NOT enough. This asserts the join at
+/// `retire_bridge_handoffs_in` is load-bearing: without the receiver's own
+/// retained receipt the handoff is not terminalized and the boundary stays put.
+#[test]
+fn bridge_handoff_without_owner_receipt_does_not_retire() -> TestResult {
+    let path = database_path("bridge-retirement-missing-receipt");
+    let store = RedbRecoveryStore::open(&path)?;
+    let fixture = BridgeStreamFixture::new("missing-receipt");
+
+    let first = stage_and_hand_off(&store, &fixture, "event-1", 1)?;
+    let second = stage_and_hand_off(&store, &fixture, "event-2", 2)?;
+    let namespace = first.namespace.clone();
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 2)?;
+
+    let retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        retirement.get("terminalized").and_then(Value::as_u64),
+        Some(0),
+        "an acknowledged and reconciled handoff with no receiver receipt must not terminalize"
+    );
+    drop(store);
+
+    assert_eq!(
+        bridge_retained_receipt_count(&path, &namespace)?,
+        0,
+        "this case is defined by the ABSENCE of any receiving-owner receipt"
+    );
+    assert_eq!(
+        bridge_compacted_boundary(&path, &namespace)?,
+        0,
+        "without a terminalized prefix the certified boundary does not move"
+    );
+    assert_eq!(
+        bridge_position_keys(&path, &namespace)?.len(),
+        2,
+        "an unretired position keeps its row: nothing was deleted"
+    );
+
+    // Adding the missing receipt is what unblocks the SAME state — proving the
+    // receipt, not the acknowledgement, was the gate.
+    let store = RedbRecoveryStore::open(&path)?;
+    record_owner_receipt(&store, &first, RECEIPT_TERMINAL)?;
+    record_owner_receipt(&store, &second, RECEIPT_TERMINAL)?;
+    let retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        retirement.get("terminalized").and_then(Value::as_u64),
+        Some(2),
+        "the same acknowledged and reconciled handoffs retire once the receipt exists"
+    );
+    drop(store);
+
+    assert_eq!(
+        bridge_compacted_boundary(&path, &namespace)?,
+        2,
+        "the certified boundary moves only once the receiver's receipt exists"
+    );
+
+    cleanup(&path);
+    Ok(())
+}
+
+/// A1/AUD1 case 5 (refusal): an UNKNOWN receiving-owner disposition does not
+/// retire.
+///
+/// I7.2's `EventAckReceipt` ends at `APPLIED | REJECTED | UNKNOWN`. An
+/// undetermined obligation must never be read as applied; `retires()` returns
+/// false for `UNKNOWN` explicitly, and this proves the boundary honors that.
+#[test]
+fn bridge_handoff_with_unknown_owner_disposition_does_not_retire() -> TestResult {
+    let path = database_path("bridge-retirement-unknown-receipt");
+    let store = RedbRecoveryStore::open(&path)?;
+    let fixture = BridgeStreamFixture::new("unknown-receipt");
+
+    let first = stage_and_hand_off(&store, &fixture, "event-1", 1)?;
+    let second = stage_and_hand_off(&store, &fixture, "event-2", 2)?;
+    let namespace = first.namespace.clone();
+    acknowledge_and_reconcile(&store, &fixture, &namespace, 2)?;
+    for event in [&first, &second] {
+        record_owner_receipt(&store, event, RECEIPT_UNDETERMINED)?;
+    }
+
+    let retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        retirement.get("terminalized").and_then(Value::as_u64),
+        Some(0),
+        "an UNKNOWN receiving-owner disposition is terminal for knowledge, not for the obligation"
+    );
+
+    // The refusal is not a one-shot accident: repeating the entry changes
+    // nothing, so the obligation is genuinely blocked rather than merely slow.
+    let retirement = retire_handoffs(&store, &namespace, 1, 1)?;
+    assert_eq!(
+        retirement.get("terminalized").and_then(Value::as_u64),
+        Some(0),
+        "a repeated retirement still refuses an UNKNOWN disposition"
+    );
+    drop(store);
+
+    assert_eq!(
+        bridge_retained_receipt_count(&path, &namespace)?,
+        2,
+        "both receipts are retained; their disposition is what is undetermined"
+    );
+    assert_eq!(
+        bridge_compacted_boundary(&path, &namespace)?,
+        0,
+        "an undetermined outcome never certifies a compacted boundary"
+    );
+    assert_eq!(
+        bridge_position_keys(&path, &namespace)?.len(),
+        2,
+        "nothing is deleted while the receiving outcome is undetermined"
+    );
+
+    cleanup(&path);
+    Ok(())
+}

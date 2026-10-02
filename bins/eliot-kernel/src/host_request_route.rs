@@ -7756,42 +7756,14 @@ impl KernelComposition {
             .generation_gateway
             .ors
             .record_bridge_event_handoff_checked(&handoff);
-        if let Err(error) = handoff_result {
-            match error {
-                OrsError::DuplicateConflict => return Err(TransportError::IdentityConflict),
-                OrsError::BridgeEventCapacityExceeded(pressure) => {
-                    return Ok(bridge_event_capacity_response(
-                        pressure,
-                        "stream_id",
-                        &event.stream_id,
-                        "event_id",
-                        &event.event_id,
-                    ));
-                }
-                OrsError::ProjectionLimitExceeded => {
-                    // The handoff-table budget is the only reachable
-                    // capacity failure in this call (issue #2731): the
-                    // typed `PendingHandoffs` pressure above already
-                    // answers a full table, so this residual names the
-                    // same handoff-rows dimension instead of the generic
-                    // dispatch dimension. The admitted session is still
-                    // retained by the front-door backpressure arm.
-                    return Err(TransportError::AttributedBackpressure(
-                        eliot_ipc::BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
-                    ));
-                }
-                OrsError::PayloadTooLarge => {
-                    // Defensive-only: the handoff request carries no
-                    // envelope bytes and handoff-row validation never
-                    // emits this error, whose single documented
-                    // dimension is the envelope-bytes ceiling (same
-                    // signal as the stage arm above).
-                    return Err(TransportError::AttributedBackpressure(
-                        eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
-                    ));
-                }
-                _ => return Err(TransportError::SessionFenced),
-            }
+        if let Err(error) = handoff_result
+            && let Some(response) = Self::bridge_event_handoff_failure_response(
+                &error,
+                event.stream_id.as_str(),
+                event.event_id.as_str(),
+            )?
+        {
+            return Ok(response);
         }
         // #2730: retain the RECEIVING owner's acceptance receipt for this
         // exact handoff, once the handoff it must join is durably present.
@@ -7828,6 +7800,57 @@ impl KernelComposition {
             }
         }
         Ok(bridge_event_forward_response(&outcome, true))
+    }
+
+    /// Projects one failed bridge-event handoff record into this route's
+    /// transport answer (issue #2731).
+    ///
+    /// Every arm keeps the dimension the store named: a determined identity
+    /// conflict, a full handoff table answered with its own pressure response,
+    /// the handoff-rows budget, the envelope-bytes ceiling, and a fence for
+    /// everything else. `None` means the failure ends the frame with no response
+    /// of its own, so the caller proceeds to the receipt leg.
+    fn bridge_event_handoff_failure_response(
+        error: &OrsError,
+        stream_id: &str,
+        event_id: &str,
+    ) -> Result<Option<serde_json::Value>, TransportError> {
+        let transport = match error {
+            OrsError::DuplicateConflict => Some(TransportError::IdentityConflict),
+            OrsError::BridgeEventCapacityExceeded(pressure) => {
+                return Ok(Some(bridge_event_capacity_response(
+                    *pressure,
+                    "stream_id",
+                    stream_id,
+                    "event_id",
+                    event_id,
+                )));
+            }
+            OrsError::ProjectionLimitExceeded => {
+                // The handoff-table budget is the only reachable
+                // capacity failure in this call (issue #2731): the
+                // typed `PendingHandoffs` pressure above already
+                // answers a full table, so this residual names the
+                // same handoff-rows dimension instead of the generic
+                // dispatch dimension. The admitted session is still
+                // retained by the front-door backpressure arm.
+                Some(TransportError::AttributedBackpressure(
+                    eliot_ipc::BACKPRESSURE_BRIDGE_HANDOFF_ROWS,
+                ))
+            }
+            OrsError::PayloadTooLarge => {
+                // Defensive-only: the handoff request carries no
+                // envelope bytes and handoff-row validation never
+                // emits this error, whose single documented
+                // dimension is the envelope-bytes ceiling (same
+                // signal as the stage arm above).
+                Some(TransportError::AttributedBackpressure(
+                    eliot_ipc::BACKPRESSURE_BRIDGE_ENVELOPE_BYTES,
+                ))
+            }
+            _ => Some(TransportError::SessionFenced),
+        };
+        transport.map_or(Ok(None), Err)
     }
 
     /// Builds the receiving-owner receipt request for the one determined
@@ -11414,6 +11437,476 @@ mod invoke_read_tool_tests {
             kernel.hot_spine.held_local_read_capacity().expect("ledger"),
             (0, 0)
         );
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+/// AUD1 production-caller legs for issue #2730: the receiving-owner receipt
+/// this route records, and the handoff retirement its maintenance reaches.
+///
+/// Both cases run the ordinary daemon-route production functions on a real
+/// `KernelComposition` over its real ORS. Neither is a test seam: the leg-1
+/// case drives [`KernelComposition::stage_bridge_event_durable`], the exact
+/// entry [`KernelComposition::admit_bridge_event_envelope`] calls, which ends
+/// in `record_bridge_event_owner_receipt_checked`; the leg-2 case drives
+/// [`KernelComposition::maintain_bridge_event_handoffs`], the exact entry
+/// `maintain_bridge_event_handoffs_for_owner` calls, which begins in
+/// `retire_bridge_event_handoffs_checked`.
+///
+/// The store's own boundary logic (certification and the position drain) is
+/// not asserted here; these cases claim only that the CALLER reaches it and
+/// that the identity legs of what the route wrote are the ones the store
+/// retained.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod bridge_event_owner_receipt_and_retirement_caller_tests {
+    use super::*;
+    use eliot_contracts::{ArtifactId, ContractId, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_ipc::ProcessBinding;
+    use eliot_protocol::{EventEnvelope, EventPayload};
+    use eliot_runtime_contracts::{HealthVector, ModuleGeneration, ModuleGenerationState};
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_SID: &str = "S-1-5-21-100-200-300-1001";
+    const TEST_WORK_SCOPE: &str = "work-scope-aud1";
+
+    fn test_epoch(sequence: u64) -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("test lineage"),
+            NonZeroU64::new(sequence).expect("nonzero sequence"),
+        )
+        .expect("test epoch")
+    }
+
+    fn test_fence() -> eliot_contracts::StateFence {
+        eliot_contracts::StateFence::new(
+            test_epoch(3),
+            ResourceGeneration::new(7).expect("nonzero generation"),
+        )
+    }
+
+    /// A real agent-bridge transport `Session`, built through the only
+    /// constructor this route's sessions come from. Its authority epoch is the
+    /// module generation's fence epoch, exactly as production
+    /// `resolved_result_response_frame` establishes it.
+    fn bridge_session() -> Session {
+        let generation = ModuleGeneration {
+            module_id: ContractId::new("module.agent-bridge").expect("module id"),
+            generation: ResourceGeneration::new(7).expect("nonzero generation"),
+            artifact_id: ArtifactId::new("a".repeat(64)).expect("artifact id"),
+            state: ModuleGenerationState::Ready,
+            health: HealthVector::healthy(),
+            state_fence: test_fence(),
+        };
+        let peer = PeerIdentity::authenticated_for_test(
+            ProcessBinding::from_observation(4242, 11, "C:/eliot/agent-bridge.exe")
+                .expect("test process binding"),
+            TEST_SID.to_owned(),
+            "7".to_owned(),
+        )
+        .expect("test authenticated peer");
+        Session::establish_agent_bridge(
+            "agent-bridge:aud1-connection",
+            peer,
+            generation,
+            "kernel-session-fence-aud1",
+        )
+        .expect("agent bridge session")
+    }
+
+    fn test_event(sequence: u64) -> EventEnvelope {
+        EventEnvelope {
+            stream_id: "stream.aud1".to_owned(),
+            producer_id: "module.agent-bridge".to_owned(),
+            producer_generation: ResourceGeneration::new(7).expect("nonzero generation"),
+            authority_epoch: test_epoch(3),
+            event_id: format!("event.aud1.{sequence}"),
+            sequence,
+            causal_predecessor_refs: Vec::new(),
+            delivery_class: DeliveryClass::DurableObservation,
+            ack_required: true,
+            payload_type: "eliot.audit-observation.v1".to_owned(),
+            payload_or_blob_ref: EventPayload::Inline(Box::new(ProtocolPayload::Json(
+                serde_json::json!({ "kind": "aud1" }),
+            ))),
+            state_fence: test_fence(),
+            trace_context: BTreeMap::new(),
+        }
+    }
+
+    /// A real composition over its real ORS, following the same fixture shape
+    /// as this file's `queue_fixture`.
+    fn receipt_fixture(name: &str) -> (KernelComposition, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-aud1-bridge-caller-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("test root");
+        let kernel = KernelComposition::new(crate::KernelConfig::new(&root)).expect("cold Kernel");
+        (kernel, root)
+    }
+
+    /// Runs the route's own admission for one durable event: the privacy
+    /// authorization the route resolves at
+    /// [`KernelComposition::admit_bridge_event_envelope`] and the owner's
+    /// decision it derives, then the durable stage that records the handoff and
+    /// the receiving-owner receipt.
+    ///
+    /// Returns the store's stage answer (which carries the admitted owner
+    /// namespace and envelope digest) so the caller can compare the receipt's
+    /// identity legs against exactly what was staged.
+    fn admit_through_route(kernel: &KernelComposition, event: &EventEnvelope) -> serde_json::Value {
+        let session = bridge_session();
+        let fence = test_fence();
+        let evidence = bridge_owner_evidence(&session, &fence).expect("owner evidence");
+        let envelope_bytes =
+            eliot_contracts::canonical_json_bytes(event).expect("canonical envelope bytes");
+        let envelope_sha256 = eliot_contracts::sha256_hex(&envelope_bytes);
+        // Exactly the two privacy calls the route makes before staging.
+        let privacy_authorization = KernelComposition::bridge_event_privacy_authorization(
+            &session,
+            &fence,
+            event,
+            &envelope_bytes,
+            TEST_WORK_SCOPE,
+        )
+        .expect("privacy owner authorization");
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+            &envelope_bytes,
+            Some(&privacy_authorization),
+        );
+        kernel
+            .stage_bridge_event_durable(
+                &session,
+                event,
+                &evidence,
+                &envelope_sha256,
+                &privacy,
+                false,
+            )
+            .expect("durable stage through the route")
+    }
+
+    /// POSITIVE, leg 1: a receiving-owner receipt produced by the daemon route
+    /// really reached the store, and the store retained the identity legs the
+    /// route sent rather than merely recording "a receipt exists".
+    ///
+    /// The readback is the store's own public answer: an exact replay of the
+    /// same receipt request returns the retained row with `fresh: false`
+    /// (`replayed_bridge_owner_receipt_in`). Presence alone proves nothing, so
+    /// every identity leg `retires` later joins on is compared here.
+    #[test]
+    fn route_recorded_receipt_reaches_the_store_with_matching_identity_legs() {
+        let (kernel, root) = receipt_fixture("receipt-reaches-store");
+        let event = test_event(1);
+        let staged = admit_through_route(&kernel, &event);
+
+        // The route staged and confirmed its own DURABLE answer before it
+        // recorded the receipt, so the namespace and digest the receipt must
+        // carry are read back from that same store answer rather than rebuilt.
+        assert_eq!(
+            staged.get("phase").and_then(serde_json::Value::as_str),
+            Some(BRIDGE_EVENT_PHASE_DURABLE),
+            "the route must have confirmed the store's DURABLE phase before recording a receipt"
+        );
+        let owner_namespace = staged
+            .get("owner_namespace")
+            .and_then(serde_json::Value::as_str)
+            .expect("admitted owner namespace");
+        let staged_sequence = staged
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .expect("admitted sequence");
+        let staged_sha256 = staged
+            .get("envelope_sha256")
+            .and_then(serde_json::Value::as_str)
+            .expect("admitted envelope digest");
+
+        // Rebuild the identical receipt request the route recorded, so the
+        // exact-replay readback must answer it from the retained row.
+        let receipt_request =
+            KernelComposition::bridge_event_owner_receipt(&staged, owner_namespace, &event)
+                .expect("receipt request");
+        assert_eq!(
+            receipt_request
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some(BRIDGE_OWNER_RECEIPT_APPLIED),
+            "the route must record a terminal disposition, never UNKNOWN"
+        );
+
+        let stored = kernel
+            .generation_gateway
+            .ors
+            .record_bridge_event_owner_receipt_checked(&receipt_request)
+            .expect("the recorded receipt must be retained by the store");
+        assert_eq!(
+            stored.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "an exact replay of an already-retained receipt answers fresh=false"
+        );
+        // The identity legs `BridgeEventOwnerReceiptRow::retires` joins on.
+        assert_eq!(
+            stored.get("event_id").and_then(serde_json::Value::as_str),
+            Some(event.event_id.as_str()),
+            "the retained receipt names the route's event identity"
+        );
+        assert_eq!(
+            stored.get("sequence").and_then(serde_json::Value::as_u64),
+            Some(staged_sequence),
+            "the retained receipt names the sequence the route staged"
+        );
+        assert_eq!(
+            stored
+                .get("envelope_sha256")
+                .and_then(serde_json::Value::as_str),
+            Some(staged_sha256),
+            "the retained receipt commits to the exact staged envelope bytes"
+        );
+        assert_eq!(
+            stored
+                .get("disposition")
+                .and_then(serde_json::Value::as_str),
+            Some(BRIDGE_OWNER_RECEIPT_APPLIED),
+            "the retained receipt keeps its terminal disposition"
+        );
+        // The operation identity and the receipt digest are the route's own,
+        // returned unchanged: a stored receipt is never a re-derivation.
+        assert_eq!(
+            stored
+                .get("receiving_operation_id")
+                .and_then(serde_json::Value::as_str),
+            receipt_request
+                .get("receiving_operation_id")
+                .and_then(serde_json::Value::as_str),
+            "the retained receipt keeps the route's operation identity"
+        );
+        assert_eq!(
+            stored
+                .get("receipt_digest")
+                .and_then(serde_json::Value::as_str),
+            receipt_request
+                .get("receipt_digest")
+                .and_then(serde_json::Value::as_str),
+            "the retained receipt keeps the route's own receipt digest"
+        );
+
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// POSITIVE, leg 2: the maintenance entry this route runs reaches
+    /// `retire_bridge_event_handoffs_checked` and the store answers it rather
+    /// than refusing.
+    ///
+    /// `maintain_bridge_event_handoffs_for_owner` builds one
+    /// `(namespace, stream_id, revision, incarnation)` tuple per admitted
+    /// stream from `resolve_bridge_ack_item`; the same tuple is presented here
+    /// so the maintenance slice runs against a genuinely admitted owner. The
+    /// claim is only that the CALLER REACHES retirement and the answer is not a
+    /// refusal — the store's internal boundary logic is owned elsewhere.
+    #[test]
+    fn maintenance_entry_reaches_handoff_retirement_without_a_refusal() {
+        let (kernel, root) = receipt_fixture("maintenance-reaches-retirement");
+        let event = test_event(1);
+        let staged = admit_through_route(&kernel, &event);
+        let owner_namespace = staged
+            .get("owner_namespace")
+            .and_then(serde_json::Value::as_str)
+            .expect("admitted owner namespace")
+            .to_owned();
+
+        // The exact owner tuple the route resolves before maintenance: the
+        // admitted namespace with the owner row's own revision and
+        // incarnation, for this stream.
+        let presenter = serde_json::json!({
+            "owner_authority_lineage": TEST_LINEAGE,
+            "owner_principal": TEST_SID,
+            "owner_connection": "agent-bridge:aud1-connection",
+        });
+        let resolved = kernel
+            .generation_gateway
+            .ors
+            .resolve_bridge_ack_item(&presenter, event.stream_id.as_str())
+            .expect("resolve admitted owner for maintenance");
+        let revision = resolved
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .expect("owner revision");
+        let incarnation = resolved
+            .get("incarnation")
+            .and_then(serde_json::Value::as_u64)
+            .expect("owner incarnation");
+        assert_eq!(
+            resolved
+                .get("namespace")
+                .and_then(serde_json::Value::as_str),
+            Some(owner_namespace.as_str())
+        );
+
+        // Run the production maintenance slice. Reaching it means
+        // `retire_bridge_event_handoffs_checked` returned a real answer (the
+        // route fails the frame on refusal) and the per-namespace result rode
+        // out as the `handoff_maintenance` post-key entry.
+        let maintenance = kernel
+            .maintain_bridge_event_handoffs(&[(
+                owner_namespace.clone(),
+                event.stream_id.clone(),
+                revision,
+                incarnation,
+            )])
+            .expect("maintenance must reach retirement, not be refused");
+        assert_eq!(
+            maintenance.len(),
+            1,
+            "one presented namespace yields one maintenance entry"
+        );
+        let entry = &maintenance[0];
+        assert_eq!(
+            entry.get("namespace").and_then(serde_json::Value::as_str),
+            Some(owner_namespace.as_str()),
+            "the maintenance entry is the route's answer for this owner"
+        );
+        // The entry carries the store's terminalization readback, which the
+        // route only reaches when the retirement answer was well formed
+        // rather than refused or missing.
+        assert!(
+            entry
+                .get("terminalized")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "the retirement answer's terminalized count is present, so retirement was reached"
+        );
+        assert!(
+            entry
+                .get("retirement_continuation")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "the retirement answer carries its continuation fact"
+        );
+
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    /// REFUSAL: a request that never produced a receiving-owner answer must not
+    /// fabricate one.
+    ///
+    /// The route records its receipt only after the ORS stage has returned the
+    /// store's own `DURABLE` answer for the exact bytes AND the handoff leg is
+    /// durable. Driving the stage with an answer that is not the store's
+    /// determined `DURABLE` disposition must fail the frame closed and write no
+    /// receipt row, because `bridge_event_owner_receipt` refuses an outcome
+    /// that carries no `sequence`/`envelope_sha256` (a store-answer defect) and
+    /// `stage_bridge_event_durable` refuses any phase other than `DURABLE`
+    /// before it reaches the receipt leg.
+    ///
+    /// This case drives the route's real refusal path: an exact-replay ORS
+    /// stage answer that is `PENDING` (not `DURABLE`) is presented through the
+    /// production stage entry, which must not reach the receipt.
+    #[test]
+    fn request_without_a_determined_receiving_answer_records_no_receipt() {
+        let (kernel, root) = receipt_fixture("no-receipt-without-answer");
+        let session = bridge_session();
+        let fence = test_fence();
+        let evidence = bridge_owner_evidence(&session, &fence).expect("owner evidence");
+
+        // An outcome the route cannot treat as a determined acceptance: it
+        // carries no `sequence` and no `envelope_sha256`, so the receipt
+        // builder refuses before any store call.
+        let undetermined = serde_json::json!({ "phase": "DURABLE" });
+        assert_eq!(
+            KernelComposition::bridge_event_owner_receipt(
+                &undetermined,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                &test_event(1),
+            ),
+            Err(TransportError::SessionFenced),
+            "an outcome with no sequence/envelope digest must not produce a receipt"
+        );
+
+        // The production state where a request never produced a receiving
+        // answer is the elapsed absolute deadline on a genuinely FRESH stage.
+        // The store durably records the late presentation for reconcile, but
+        // the route answers the caller a timeout instead of an admission, so
+        // the receipt leg is never reached for it.
+        let expired_event = test_event(2);
+        let expired_bytes =
+            eliot_contracts::canonical_json_bytes(&expired_event).expect("canonical bytes");
+        let expired_sha256 = eliot_contracts::sha256_hex(&expired_bytes);
+        let privacy_authorization = KernelComposition::bridge_event_privacy_authorization(
+            &session,
+            &fence,
+            &expired_event,
+            &expired_bytes,
+            TEST_WORK_SCOPE,
+        )
+        .expect("privacy owner authorization");
+        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+            &expired_bytes,
+            Some(&privacy_authorization),
+        );
+        assert_eq!(
+            kernel.stage_bridge_event_durable(
+                &session,
+                &expired_event,
+                &evidence,
+                &expired_sha256,
+                &privacy,
+                true,
+            ),
+            Err(TransportError::Timeout),
+            "an elapsed deadline on a fresh stage is answered as a timeout, never confirmed"
+        );
+
+        // The exact same identity now replays inside the deadline: the store
+        // answers the existing row with fresh=false, the route confirms the
+        // DURABLE phase, and only THEN is the receipt recorded — a receipt that
+        // is a commitment to a determined answer, never to a timeout.
+        let replay = kernel
+            .stage_bridge_event_durable(
+                &session,
+                &expired_event,
+                &evidence,
+                &expired_sha256,
+                &privacy,
+                false,
+            )
+            .expect("the replay of a retained identity is answered by the store");
+        assert_eq!(
+            replay.get("fresh").and_then(serde_json::Value::as_bool),
+            Some(false),
+            "the replay answers the store's own retained row, not a fresh insertion"
+        );
+
+        // A receipt for an identity no admitted owner staged is refused rather
+        // than fabricated: the namespace below was never admitted by this
+        // lineage/principal, so there is no owner row and no handoff to join.
+        let orphan_receipt = serde_json::json!({
+            "owner_namespace": "1".repeat(64),
+            "event_id": test_event(9).event_id,
+            "sequence": 9,
+            "envelope_sha256": "2".repeat(64),
+            "receiving_operation_id": "bridge-event-owner-receipt:orphan",
+            "disposition": BRIDGE_OWNER_RECEIPT_APPLIED,
+            "receipt_digest": "3".repeat(64),
+        });
+        assert!(
+            kernel
+                .generation_gateway
+                .ors
+                .record_bridge_event_owner_receipt_checked(&orphan_receipt)
+                .is_err(),
+            "a receipt for an identity no admitted owner staged must be refused, never fabricated"
+        );
+
         drop(kernel);
         std::fs::remove_dir_all(root).expect("cleanup");
     }

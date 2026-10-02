@@ -933,6 +933,14 @@ struct DispositionedTable {
 /// here, which is a separate architectural change and deliberately not attempted
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
+/// #2730 (AUD1) found the same omission a second time, for
+/// `BRIDGE_EVENT_COMPACTED_RANGES`: the table is not materialised at open, so it
+/// stays invisible until the first successful compaction certification writes it,
+/// and from that moment every `backup.export` of that store was refused. The
+/// counts above are not restated here because they were already a stale
+/// measurement when that entry was added, and restating them would be a claim
+/// about the whole tree rather than about this table.
+///
 /// Split in four so no half can grow past the point where a reader stops
 /// checking it: 46 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
@@ -1373,6 +1381,26 @@ fn projection_family_exclusions() -> Vec<DispositionedTable> {
             super::BRIDGE_EVENT_REPLAY_COMMITMENTS,
             RowDisposition::ForensicOnly,
             "replay commitments are minted against the committing store's own evidence; a restored one names a commitment this installation never made",
+        ),
+        // #2730 (AUD1). A certified compacted range is THIS installation's own
+        // bounded owner/incarnation range commitment: the evidence that a
+        // sequence range was compacted under the certifying owner revision, and
+        // therefore the authority that makes an old sequence permanently
+        // non-reusable once the payloads are gone. It is the other half of the
+        // same replay guarantee as the commitments above - the commitment says
+        // what a retained identity was, this row says how far non-reuse is
+        // carried - so it is decided the same way, for the same reason. A
+        // restored range would present a foreign owner's compaction boundary as
+        // this installation's, and that boundary is exactly what gates position
+        // deletion and old-sequence refusal: the destination would answer
+        // "already compacted" about a stream it never compacted, against evidence
+        // it never certified. It cannot be `Restorable` either: there is no
+        // row family behind it and no quarantined import path, only the
+        // certification that wrote it in the first place.
+        excluded(
+            super::BRIDGE_EVENT_COMPACTED_RANGES,
+            RowDisposition::ForensicOnly,
+            "a certified compacted range is this installation's own owner/incarnation range commitment, the evidence that makes an old sequence non-reusable once payloads are gone; a restored range would present a foreign owner's compaction boundary as this installation's and would answer already-compacted about a stream it never compacted",
         ),
         // #2730. A receiving-owner receipt is the acceptance of ONE receiving
         // operation, witnessed by that operation and bound to the owner epoch
@@ -4354,4 +4382,184 @@ pub(super) fn reconcile_lost_import_response(
             },
         };
     replayed
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test fixtures use expect for fail-fast setup"
+)]
+mod census_compacted_range_tests {
+    use super::*;
+    use redb::TableDefinition;
+
+    /// A live table no census entry names, used only to prove check 2 still
+    /// fails closed. It is declared HERE rather than in `store.rs` precisely
+    /// because it must never be a declared ORS table: its whole point is to be
+    /// something `list_tables` can report and the census must refuse.
+    const UNKNOWN_TABLE: TableDefinition<&str, &str> =
+        TableDefinition::new("ors_census_unknown_probe_v1");
+
+    /// One real `redb` file per case, following the `temp_store()` shape used by
+    /// `store.rs::bridge_retirement_reachability_tests` (:38807). Each case gets
+    /// its own path, so neither case can observe the other's writes.
+    fn temp_store() -> (super::super::RedbRecoveryStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "eliot-ors-census-compacted-range-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let store = super::super::RedbRecoveryStore::open(&path).expect("temp store opens");
+        (store, path)
+    }
+
+    /// #2730 (AUD1). The positive half: a store that holds a
+    /// [`super::super::BRIDGE_EVENT_COMPACTED_RANGES`] row is no longer refused
+    /// by the census.
+    ///
+    /// This is the omission the issue left behind. The census dispositioned
+    /// every other bridge table and silently skipped this one, so the FIRST
+    /// successful certification - which is what the AUD1 fix makes reachable -
+    /// materialises `ors_bridge_event_compacted_ranges_v1` in the file, and from
+    /// that moment check 2 read its name out of `list_tables()`, found nothing
+    /// claiming it, and returned [`OrsError::MigrationRequired`] naming it. The
+    /// store is written exactly the way `certify_bridge_compacted_range_in`
+    /// writes it - the store's own table constant, opened inside a write
+    /// transaction - because the fact under test is that redb's on-demand
+    /// materialisation is now covered, not any property of the row's bytes.
+    ///
+    /// The assertion is on THAT table's name, not on the census returning `Ok`.
+    /// Check 2 is fail-closed over the whole file and reports the FIRST
+    /// uncensused name redb hands it, so whole-census success would also depend
+    /// on every other declared table being censused - which is a separate,
+    /// larger property this change does not claim and must not be measured by.
+    /// Naming the table under test keeps the case a discriminator for this
+    /// defect: before the entry the refusal names it, after the entry it cannot.
+    #[test]
+    fn a_store_holding_a_compacted_range_row_is_not_refused_by_the_census() {
+        let (store, _path) = temp_store();
+        let write = store
+            .database
+            .begin_write()
+            .map_err(storage)
+            .expect("write opens");
+        {
+            let mut ranges = write
+                .open_table(super::super::BRIDGE_EVENT_COMPACTED_RANGES)
+                .map_err(storage)
+                .expect("compacted ranges table opens");
+            ranges
+                .insert("bridge-owner-namespace", "certified-range-row")
+                .map_err(storage)
+                .expect("certified range row is durable");
+        }
+        write.commit().map_err(storage).expect("write commits");
+
+        let read = store
+            .database
+            .begin_read()
+            .map_err(storage)
+            .expect("read opens");
+        // Matched, not `if let`: an `Ok` must be an EXERCISED pass, not a
+        // skipped assertion. A census that returns `Ok` because it stopped
+        // checking would otherwise satisfy this case without proving anything
+        // about the table under test.
+        match check_row_family_census(&read) {
+            Ok(()) => {}
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    !message.contains(super::super::BRIDGE_EVENT_COMPACTED_RANGES.name()),
+                    "the census must not refuse the certified compacted range table: {message}"
+                );
+            }
+        }
+    }
+
+    /// The negative half, and the reason the positive one above is a repair and
+    /// not a weakening: the census must STILL refuse a live table no entry
+    /// names.
+    ///
+    /// The entry added for `BRIDGE_EVENT_COMPACTED_RANGES` names that ONE
+    /// table. It does not make check 2 permissive, and this is the case that
+    /// proves it. Two independent assertions, because each alone is weak:
+    ///
+    /// 1. The unknown table is genuinely LIVE in the file (`list_tables` reports
+    ///    it), so the case is not vacuous - a table that never materialised is
+    ///    invisible to check 2 and would prove nothing. This is exactly how the
+    ///    AUD1 defect lived: the table was absent from the census AND, until the
+    ///    first certification, absent from the file.
+    /// 2. The census fails closed over that file with the concrete
+    ///    [`OrsError::MigrationRequired`]. Check 2 reports the FIRST uncensused
+    ///    name redb hands it, so the assertion is on the typed refusal and on
+    ///    the census list itself rather than on which name came first.
+    ///
+    /// The list assertion is the part that discriminates the fix: the production
+    /// census claims the compacted-range table and does not claim this one, so
+    /// adding the entry cannot have been a widening of what the census accepts.
+    #[test]
+    fn an_unknown_live_table_still_fails_the_census_closed() {
+        let (store, _path) = temp_store();
+        let write = store
+            .database
+            .begin_write()
+            .map_err(storage)
+            .expect("write opens");
+        drop(
+            write
+                .open_table(UNKNOWN_TABLE)
+                .map_err(storage)
+                .expect("unknown table materializes"),
+        );
+        write.commit().map_err(storage).expect("write commits");
+
+        // The census list is the production list, not a copy of it. Names are
+        // collected as owned strings because the census is a temporary and
+        // `TableHandle::name` borrows from the definition it is called on.
+        let claimed: Vec<String> = dispositioned_tables()
+            .iter()
+            .map(|entry| entry.table.name().to_owned())
+            .collect();
+        assert!(
+            !claimed.iter().any(|name| name == UNKNOWN_TABLE.name()),
+            "the probe table must be uncensused or this case is vacuous"
+        );
+        assert!(
+            claimed
+                .iter()
+                .any(|name| name == super::super::BRIDGE_EVENT_COMPACTED_RANGES.name()),
+            "the census must claim BRIDGE_EVENT_COMPACTED_RANGES after this change"
+        );
+
+        let read = store
+            .database
+            .begin_read()
+            .map_err(storage)
+            .expect("read opens");
+        // Non-vacuity: the probe table really is in this file, and it is really
+        // one of the live names check 2 would refuse, so the typed refusal below
+        // is about an uncensused table rather than about some unrelated gap.
+        let live: Vec<String> = read
+            .list_tables()
+            .map_err(storage)
+            .expect("list_tables answers")
+            .map(|handle| handle.name().to_owned())
+            .collect();
+        let probe_is_live = live.iter().any(|name| name == UNKNOWN_TABLE.name());
+        let probe_is_uncensused = !claimed.iter().any(|name| name == UNKNOWN_TABLE.name());
+        assert!(
+            probe_is_live && probe_is_uncensused,
+            "the probe table must be live and uncensused for this case to discriminate"
+        );
+        // Fail-closed: the census refuses a file carrying an uncensused table.
+        assert!(
+            matches!(
+                check_row_family_census(&read),
+                Err(OrsError::MigrationRequired { .. })
+            ),
+            "a live table with no census disposition must fail closed with MigrationRequired"
+        );
+    }
 }
