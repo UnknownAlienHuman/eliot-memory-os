@@ -533,6 +533,23 @@ mod tests {
     /// straddles the boundary.
     const CR_SPLIT_FILL_CHUNK: usize = 1_048_576 + 1;
 
+    /// Fill size that leaves a CONTENT carriage return on a fill of its own at
+    /// the published 1 MiB ceiling: the ceiling plus one more, so the byte that
+    /// follows the content CR is a fill of its own and the byte after that - the
+    /// terminator's CR - shares a fill with the terminator's LF.
+    ///
+    /// This is the only shape that distinguishes a genuine content CR from the
+    /// CRLF terminator's own CR: `read_bounded_record` holds a lone CR out of
+    /// the charge, and the next fill decides whether it was content. Here the
+    /// next fill after the content CR is not the LF, so the byte is content and
+    /// must be charged exactly once and kept.
+    const CONTENT_CR_FILL_CHUNK: usize = 1_048_576 + 2;
+
+    /// Fill size that leaves the CONTENT carriage return, the terminator's own
+    /// carriage return, and the terminator's LF all on fills of their own, so
+    /// the terminator's CRLF is one fill whose content chunk is empty.
+    const CONTENT_CR_SPLIT_CRLF_FILL_CHUNK: usize = 1_048_577 + 2;
+
     /// Convenience: acquire through the production `acquire_hook_payload` and
     /// decode through the production `decode_hook_payload`, i.e. exactly the
     /// two stages `run_hook_intake` runs before `EliotHookService`.
@@ -782,6 +799,184 @@ mod tests {
         let error = acquire_hook_payload(&mut reader)
             .expect_err("one over the ceiling must be refused on the split-CR arrival");
         assert!(matches!(error, HookIntakeError::StdinOversize { .. }));
+    }
+
+    /// The published ceiling is a function of the byte stream alone, not of the
+    /// caller's read size.
+    ///
+    /// One byte over the published ceiling is REFUSED - `StdinOversize`, the
+    /// published limit, bounded resynchronization - on EVERY fill size, and the
+    /// refusal is observed at the production acquisition the shipped
+    /// `hook <event>` branch runs.
+    ///
+    /// The fixture is the one that distinguishes the two defects from a
+    /// well-behaved record: the content is `max_record_bytes + 1` bytes whose
+    /// LAST CONTENT BYTE is a carriage return, framed `\r\n`. So the byte stream
+    /// ends `...\r\r\n` and the acceptance question is only ever about the
+    /// first of those two CRs.
+    ///
+    /// `read_bounded_record` holds a lone CR out of the ceiling charge and lets
+    /// the next fill resolve it. Resolving it correctly means resolving it from
+    /// the byte that FOLLOWS it: the CR is this record's terminator only when
+    /// the very next byte in the stream is the LF, and content in every other
+    /// case. Resolving it from how many content bytes the next fill happened to
+    /// carry - which is what the boundary did before this fix - accepts this
+    /// record whenever the terminator's CRLF lands alone in one fill:
+    /// `CONTENT_CR_SPLIT_CRLF_FILL_CHUNK` (1_048_579) makes that fill exactly
+    /// `"\r\n"`, so the content CR was declared framing and dropped uncharged,
+    /// the ceiling compared `1_048_577 - 1`, and an over-limit record reached
+    /// `EliotHookService`.
+    ///
+    /// Every fill size below is therefore a real arrival, not a formality: they
+    /// are chosen to cover one fill holding everything, a one-byte fill, the
+    /// fills that divide the ceiling, the two fills that split the trailing CR
+    /// differently (`CONTENT_CR_FILL_CHUNK`, and `CR_SPLIT_FILL_CHUNK`, which
+    /// makes the terminator's CRLF one fill without the content CR ever ending
+    /// a fill), the fill that divides neither the ceiling nor the terminator, the
+    /// shipped 8 KiB arrival, and the contested one.
+    #[test]
+    fn content_cr_record_one_over_the_ceiling_is_refused_for_every_chunking() {
+        let ceiling = HOOK_INPUT_PROFILE.max_record_bytes;
+        let mut over = Vec::with_capacity(ceiling + 3);
+        // Content is JSON whitespace padding, whose last byte is the carriage
+        // return under test. The document prefix keeps the test honest about
+        // what a hook payload looks like without the ceiling being decided by
+        // it: the raw byte stream is what the boundary bounds.
+        over.extend_from_slice(r#"{"a":1}"#);
+        let prefix = r#"{"a":1}"#.len();
+        over.extend(std::iter::repeat_n(b' ', ceiling + 1 - prefix - 1));
+        over.push(b'\r');
+        assert_eq!(over.len(), ceiling + 1);
+        let mut framed = over.clone();
+        framed.push(b'\r');
+        framed.push(b'\n');
+
+        for (arrival, chunk) in [
+            ("one fill holding everything", framed.len()),
+            ("a one-byte fill", 1),
+            ("two-byte fills", 2),
+            ("a fill that divides the ceiling", CHUNK),
+            ("the shipped 8 KiB arrival", 8 * 1024),
+            ("fills dividing neither boundary", 1_000_000),
+            (
+                "the CR and the terminator CR on fills of their own",
+                CR_SPLIT_FILL_CHUNK,
+            ),
+            (
+                "the CR followed by a fill of its own",
+                CONTENT_CR_FILL_CHUNK,
+            ),
+            (
+                "the terminator CRLF alone in one fill",
+                CONTENT_CR_SPLIT_CRLF_FILL_CHUNK,
+            ),
+        ] {
+            assert_ne!(chunk, 0, "arrival {arrival} would not produce fills");
+            let mut reader = ChunkReader::new(&framed, chunk);
+            let error = acquire_hook_payload(&mut reader)
+                .unwrap_or_else(|| panic!("{arrival} must refuse the over-limit record"));
+            match error {
+                HookIntakeError::StdinOversize {
+                    limit_bytes,
+                    found_terminator,
+                    ..
+                } => {
+                    // The published ceiling as a literal, not as the alias this
+                    // test derived it from: an invented ceiling would satisfy
+                    // the alias comparison for any value.
+                    assert_eq!(limit_bytes, 1_048_576, "published limit: {arrival}");
+                    assert!(
+                        found_terminator,
+                        "bounded resynchronization found the terminator: {arrival}"
+                    );
+                }
+                other => panic!("{arrival}: expected StdinOversize, got {other:?}"),
+            }
+        }
+    }
+
+    /// The published ceiling is a function of the byte stream alone, not of the
+    /// caller's read size: a record AT the ceiling is accepted complete on every
+    /// fill size.
+    ///
+    /// This is the acceptance half of the same fixture the refusal above pins:
+    /// content of exactly `max_record_bytes` whose LAST CONTENT BYTE is a
+    /// carriage return, framed `\r\n`, so the byte stream ends `...\r\r\n`.
+    ///
+    /// ACCEPTANCE ALONE IS NOT THE ASSERTION, and that is the point. The
+    /// boundary used to resolve a held carriage return from the next fill's
+    /// CONTENT COUNT rather than from the byte that follows it, and the visible
+    /// symptom was not a wrong disposition but a silently SHORTENED record: when
+    /// the terminator's CRLF landed alone in one fill, the content CR was called
+    /// framing, dropped, and never charged - so the record was accepted at
+    /// `ceiling - 1` bytes and the host was never told one byte had gone
+    /// missing. On the SHIPPED arrival (`BufReader::new(stdin)`, 8 KiB) that is
+    /// exactly what happened to this fixture, every time.
+    ///
+    /// So each arrival asserts the accepted record is byte-identical to the
+    /// content that was written - `record == exact`, which pins both the length
+    /// and every byte - with `record.len() == max_record_bytes` stated directly
+    /// as well, and then decodes, so the accepted bytes are a whole document
+    /// rather than a truncated one.
+    ///
+    /// The fill sizes are the same set as the refusal test's, including the two
+    /// that put the terminator's CRLF alone in a fill and the shipped 8 KiB
+    /// arrival. A one-byte fill must give the byte-complete answer too: that
+    /// arrival puts each byte on its own fill, so the content CR and the
+    /// terminator CR are never in the same fill and the acceptance is decided
+    /// one byte at a time.
+    #[test]
+    fn content_cr_record_at_the_ceiling_is_accepted_byte_complete_for_every_chunking() {
+        let ceiling = HOOK_INPUT_PROFILE.max_record_bytes;
+        let mut exact = Vec::with_capacity(ceiling + 2);
+        exact.extend_from_slice(r#"{"a":1}"#);
+        let prefix = r#"{"a":1}"#.len();
+        exact.extend(std::iter::repeat_n(b' ', ceiling - prefix - 1));
+        exact.push(b'\r');
+        assert_eq!(exact.len(), ceiling);
+        assert_eq!(exact.last(), Some(&b'\r'), "the content CR is the last byte");
+        let mut framed = exact.clone();
+        framed.push(b'\r');
+        framed.push(b'\n');
+
+        for (arrival, chunk) in [
+            ("one fill holding everything", framed.len()),
+            ("a one-byte fill", 1),
+            ("two-byte fills", 2),
+            ("a fill that divides the ceiling", CHUNK),
+            ("the shipped 8 KiB arrival", 8 * 1024),
+            ("fills dividing neither boundary", 1_000_000),
+            (
+                "the CR and the terminator CR on fills of their own",
+                CR_SPLIT_FILL_CHUNK,
+            ),
+            (
+                "the CR followed by a fill of its own",
+                CONTENT_CR_FILL_CHUNK,
+            ),
+            (
+                "the terminator CRLF alone in one fill",
+                CONTENT_CR_SPLIT_CRLF_FILL_CHUNK,
+            ),
+        ] {
+            assert_ne!(chunk, 0, "arrival {arrival} would not produce fills");
+            let mut reader = ChunkReader::new(&framed, chunk);
+            let record = acquire_hook_payload(&mut reader)
+                .unwrap_or_else(|error| panic!("{arrival} must accept the record: {error:?}"));
+            assert_eq!(
+                record.len(),
+                ceiling,
+                "the ceiling-exact record must not lose its content CR: {arrival}"
+            );
+            assert_eq!(
+                record,
+                exact,
+                "the accepted record must be byte-identical to the content written: {arrival}"
+            );
+            // And it decodes: the accepted bytes are a whole document.
+            decode_hook_payload(&record)
+                .unwrap_or_else(|error| panic!("{arrival}: ceiling record parses: {error:?}"));
+        }
     }
 
     /// D7: content of `max_record_bytes + 1` is REFUSED as oversize.
