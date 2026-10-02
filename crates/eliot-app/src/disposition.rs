@@ -1985,4 +1985,16 @@ mod default_members_guard_tests {
         assert!(WORKSPACE_MANIFEST.contains("default-members"));
         assert!(WORKSPACE_MANIFEST.contains("default-members = ["));
     }
+
+    /// Refusal arm: the marker `default-members` is absent from the manifest.
+    /// The guard fails closed with its exact message rather than treating an
+    /// absent section as "no facade present".
+    #[test]
+    fn refuses_when_manifest_has_no_default_members_marker() {
+        let manifest = "[workspace]\nmembers = [\"crates/eliot-app\"]\nresolver = \"3\"\n";
+        assert_eq!(
+            default_members_section_refuses_facade(manifest),
+            Err("root Cargo.toml has no default-members section".to_owned())
+        );
+    }
 }
